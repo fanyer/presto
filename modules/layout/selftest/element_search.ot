@@ -1,0 +1,3617 @@
+/* -*- mode: c++; tab-width: 4; c-basic-offset: 4 -*- */
+
+group "layout.element_search";
+
+require init;
+
+include "modules/layout/traverse/traverse.h";
+include "modules/layout/layout_workplace.h";
+include "modules/dochand/win.h";
+include "modules/pi/OpWindow.h";
+
+global
+{
+	typedef DocumentElementCollection ElementStore;
+	typedef OpDocumentElement Element;
+	typedef DocumentElementType ElementType;
+	typedef DocumentElementRegion RectVector;
+
+	// Check whether two rects are equal, allow one pixel difference, because of rounding issues when transforming rects
+	static BOOL RectEqual(const OpRect& first, const OpRect& second)
+	{
+		return op_abs(first.x - second.x) <= 1 && op_abs(first.y - second.y) <= 1 &&
+			op_abs(first.width - second.width) <= 1 && op_abs(first.height - second.height) <= 1;
+	}
+
+	static UINT TreeCardinal(Tree* tree)
+	{
+		Tree* iter = tree->FirstChild();
+		UINT sum = 1;
+
+		while (iter)
+		{
+			sum += TreeCardinal(iter);
+			iter = iter->Suc();
+		}
+
+		return sum;
+	}
+
+	static UINT TransformTreeCardinal(ElementCollectingObject& element_collecting_object)
+	{
+		return TreeCardinal(&element_collecting_object.m_transform_tree);
+	}
+
+	class ST_ElementCollectingObject : public ElementCollectingObject
+	{
+	public:
+
+		class ST_MinCustomizer : public ElementSearchCustomizer
+		{
+		public:
+
+			ST_MinCustomizer() : ElementSearchCustomizer(FALSE, FALSE, FALSE) {}
+
+			/** Accept spans as inline elements, divs as block elements. */
+			virtual BOOL AcceptElement(HTML_Element* elm, FramesDocument* doc)
+			{
+				Markup::Type type = elm->Type();
+
+				return type == Markup::HTE_DIV || type == Markup::HTE_SPAN;
+			}
+		};
+
+		class ST_AnchorCustomizer : public ElementSearchCustomizer
+		{
+		public:
+
+			ST_AnchorCustomizer() : ElementSearchCustomizer(FALSE, FALSE, FALSE) {}
+
+			/** Accept anchors. */
+			virtual BOOL AcceptElement(HTML_Element* elm, FramesDocument* doc)
+			{
+				return elm->Type() == Markup::HTE_A;
+			}
+		};
+
+		class ST_AnchorCustomizerWithOverlapping : public ElementSearchCustomizer
+		{
+		public:
+
+			ST_AnchorCustomizerWithOverlapping() : ElementSearchCustomizer(FALSE, TRUE, FALSE) {}
+
+			/** Accept anchors. */
+			virtual BOOL AcceptElement(HTML_Element* elm, FramesDocument* doc)
+			{
+				return elm->Type() == Markup::HTE_A;
+			}
+		};
+
+		class ST_UsemapCustomizer : public ElementSearchCustomizer
+		{
+		public:
+
+			ST_UsemapCustomizer() : ElementSearchCustomizer(FALSE, FALSE, FALSE) {}
+
+			/** Accept areas of usemaps. */
+			virtual BOOL AcceptElement(HTML_Element* elm, FramesDocument* doc)
+			{
+				return elm->Type() == Markup::HTE_AREA;
+			}
+		};
+
+		// Accept only scrollbars
+		class ST_ScrollbarCustomizer : public ElementSearchCustomizer
+		{
+		public:
+			ST_ScrollbarCustomizer() : ElementSearchCustomizer(TRUE, FALSE, FALSE) {}
+
+			virtual BOOL AcceptElement(HTML_Element* elm, FramesDocument* doc) {return FALSE;}
+		};
+
+		// Report opaque rects and accept scrollbars additionally
+		class ST_BasicOverlappingCustomizer : public ElementSearchCustomizer
+		{
+		public:
+			ST_BasicOverlappingCustomizer() : ElementSearchCustomizer(TRUE, TRUE, FALSE) {}
+
+			virtual BOOL AcceptElement(HTML_Element* elm, FramesDocument* doc) {return FALSE;}
+		};
+
+		// Report opaque rects and accept some elements.
+		class ST_ElementWithOverlappingCustomizer : public ElementSearchCustomizer
+		{
+		public:
+			ST_ElementWithOverlappingCustomizer() : ElementSearchCustomizer(FALSE, TRUE, FALSE) {}
+
+			/** Accept spans, divs and images. */
+			virtual BOOL AcceptElement(HTML_Element* elm, FramesDocument* doc)
+			{
+				Markup::Type type = elm->Type();
+
+				return type == Markup::HTE_DIV || type == Markup::HTE_SPAN || type == Markup::HTE_IMG;
+			}
+		};
+
+		// Report opaque rects and accept some elements. Cares for opacity property.
+		class ST_ElementWithOverlappingAndOpacityCustomizer : public ElementSearchCustomizer
+		{
+		public:
+			ST_ElementWithOverlappingAndOpacityCustomizer() : ElementSearchCustomizer(FALSE, TRUE, TRUE) {}
+
+			/** Accept spans, divs and images. */
+			virtual BOOL AcceptElement(HTML_Element* elm, FramesDocument* doc)
+			{
+				Markup::Type type = elm->Type();
+
+				return type == Markup::HTE_DIV || type == Markup::HTE_SPAN || type == Markup::HTE_IMG;
+			}
+		};
+
+		ST_ElementCollectingObject(FramesDocument *doc,
+								   const RECT& area,
+								   ElementSearchCustomizer& customizer,
+								   const RECT* extended_area = NULL,
+								   BOOL one_pass_traverse = FALSE)
+			: ElementCollectingObject(doc, area, customizer, extended_area, one_pass_traverse) {}
+
+		virtual BOOL HandleOverlappingRect(HTML_Element* element, const OpRect& overlapping_rect, BOOL extended_area = FALSE)
+		{
+			if (!AddCoveringRect(element, overlapping_rect, extended_area))
+			{
+				SetOutOfMemory();
+				return FALSE;
+			}
+
+			return ElementCollectingObject::HandleOverlappingRect(element, overlapping_rect, extended_area);
+		}
+
+		UINT NumCoveringRects()
+		{
+			return m_covering_rects.Cardinal();
+		}
+
+		UINT NumCoveringRects(const char* id)
+		{
+			CoveringRect* iter = static_cast<CoveringRect*>(m_covering_rects.First());
+			UINT num = 0;
+
+			while (iter)
+			{
+				if (iter->m_elm->GetId() && uni_strcmp(iter->m_elm->GetId(), id) == 0 )
+					num++;
+
+				iter = iter->Suc();
+			}
+
+			return num;
+		}
+
+		BOOL HasCoveringRect(const OpRect& rect, const char* id, BOOL extended = FALSE)
+		{
+			CoveringRect* iter = static_cast<CoveringRect*>(m_covering_rects.First());
+
+			while (iter)
+			{
+				if (iter->m_elm->GetId() && uni_strcmp(iter->m_elm->GetId(), id) == 0 &&
+					extended == iter->extended_area && RectEqual(iter->m_rect, rect))
+					return TRUE;
+
+				iter = iter->Suc();
+			}
+
+			return FALSE;
+		}
+
+		UINT NumTransformTreeNodes()
+		{
+			return TransformTreeCardinal(*this);
+		}
+
+	private:
+
+		BOOL AddCoveringRect(HTML_Element* element, const OpRect& overlapping_rect, BOOL extended_area)
+		{
+			CoveringRect* new_rect = OP_NEW(CoveringRect, ());
+
+			if (new_rect)
+			{
+				new_rect->m_elm = element;
+				new_rect->m_rect = overlapping_rect;
+				new_rect->m_transform = HitTestingTraversalObject::transform_root;
+				new_rect->extended_area = extended_area;
+
+				new_rect->Into(&m_covering_rects);
+
+				return TRUE;
+			}
+			else
+				return FALSE;
+		}
+
+		struct CoveringRect : public Link
+		{
+			CoveringRect*	Suc() const {return static_cast<CoveringRect*>(Link::Suc());}
+			CoveringRect*	Pred() const {return static_cast<CoveringRect*>(Link::Pred());}
+
+			HTML_Element* m_elm;
+			OpRect m_rect;
+			AffinePos m_transform;
+			BOOL extended_area;
+		};
+
+		AutoDeleteHead m_covering_rects;
+	};
+
+	BOOL Exists(ElementStore& store, const char* id, ElementType type)
+	{
+		int count = store.GetCount();
+
+		for (int i=0; i < count; i++)
+		{
+			Element* elm = store.Get(i);
+			if (elm->GetType() == type && elm->GetHtmlElement()->GetId() &&
+				uni_strcmp(elm->GetHtmlElement()->GetId(), id) == 0 )
+				return TRUE;
+		}
+
+		return FALSE;
+	}
+
+	UINT NumElements(ElementStore& store)
+	{
+		return store.GetCount();
+	}
+
+	UINT NumRects(ElementStore& store, const char* id, ElementType type = DOCUMENT_ELEMENT_TYPE_HTML_ELEMENT)
+	{
+		int count = store.GetCount();
+
+		for (int i=0; i < count; i++)
+		{
+			Element* elm = store.Get(i);
+			if (elm->GetType() == type && elm->GetHtmlElement()->GetId() && uni_strcmp(elm->GetHtmlElement()->GetId(), id) == 0 )
+				return elm->GetRegion().GetCount();
+		}
+
+		return 0;
+	}
+
+	BOOL HasRect(ElementStore& store, const OpRect& rect, const char* id, ElementType type)
+	{
+		int count = store.GetCount();
+
+		for (int i=0; i < count; i++)
+		{
+			Element* elm = store.Get(i);
+			if (elm->GetType() == type && elm->GetHtmlElement()->GetId() &&
+				uni_strcmp(elm->GetHtmlElement()->GetId(), id) == 0 )
+			{
+				const RectVector& elm_vector = elm->GetRegion();
+				int rect_count = elm_vector.GetCount();
+
+				for (int i=0; i < rect_count; i++)
+				{
+					OpTransformedRect *elm_rect = elm_vector.Get(i);
+					if (RectEqual(elm_rect->rect,  rect))
+						return TRUE;
+				}
+
+				return FALSE;
+			}
+		}
+
+		return FALSE;
+	}
+
+	// True when an element has at least one element, which AffinePos is a transform
+	BOOL HasTransformedRect(ElementStore& store, const char* id, ElementType type)
+	{
+#ifdef CSS_TRANSFORMS
+		int count = store.GetCount();
+
+		for (int i=0; i < count; i++)
+		{
+			Element* elm = store.Get(i);
+			if (elm->GetType() == type && elm->GetHtmlElement()->GetId() &&
+				uni_strcmp(elm->GetHtmlElement()->GetId(), id) == 0 )
+			{
+				const RectVector& elm_vector = elm->GetRegion();
+				int rect_count = elm_vector.GetCount();
+
+				for (int i=0; i < rect_count; i++)
+				{
+					OpTransformedRect *elm_rect = elm_vector.Get(i);
+					if (elm_rect->affine_pos && elm_rect->affine_pos->IsTransform())
+						return TRUE;
+				}
+
+				return FALSE;
+			}
+		}
+#endif // CSS_TRANSFORMS
+
+		return FALSE;
+	}
+
+	BOOL HasRectOfSize(ElementStore& store, INT32 width, INT32 height, const char* id, ElementType type)
+	{
+		int count = store.GetCount();
+
+		for (int i=0; i < count; i++)
+		{
+			Element* elm = store.Get(i);
+			if (elm->GetType() == type && elm->GetHtmlElement()->GetId() &&
+				uni_strcmp(elm->GetHtmlElement()->GetId(), id) == 0 )
+			{
+				const RectVector& elm_vector = elm->GetRegion();
+				int rect_count = elm_vector.GetCount();
+
+				for (int i=0; i < rect_count; i++)
+				{
+					OpRect rect = elm_vector.Get(i)->rect;
+					if ( (width < 0 || rect.width == width) && (height < 0 || rect.height == height) )
+						return TRUE;
+				}
+
+				return FALSE;
+			}
+		}
+
+		return FALSE;
+	}
+
+	UINT GetScrollbarWidth(ElementStore& store, const char* id, ElementType type)
+	{
+		int count = store.GetCount();
+
+		OP_ASSERT(type == DOCUMENT_ELEMENT_TYPE_VERTICAL_SCROLLBAR || type == DOCUMENT_ELEMENT_TYPE_HORIZONTAL_SCROLLBAR);
+
+		for (int i=0; i < count; i++)
+		{
+			Element* elm = store.Get(i);
+			if ( elm->GetType() == type && elm->GetHtmlElement()->GetId() &&
+				uni_strcmp(elm->GetHtmlElement()->GetId(), id) == 0 )
+			{
+				OpTransformedRect *elm_rect = elm->GetRegion().Get(0);
+
+				if (elm_rect)
+					return (type == DOCUMENT_ELEMENT_TYPE_VERTICAL_SCROLLBAR) ? elm_rect->rect.width : elm_rect->rect.height;
+			}
+		}
+
+		return UINT_MAX;
+	}
+}
+
+test("AHEM")
+{
+	short font_number = styleManager->GetFontNumber(UNI_L("AHEM"));
+	verify(font_number != -1);
+}
+
+test("PRECONDITION: Window big enough.")
+{
+	OpWindow* op_win = state.GetWindow() ?  state.GetWindow()->GetOpWindow() : NULL;
+	UINT32 w, h;
+
+	verify(op_win);
+	op_win->GetInnerSize(&w, &h);
+
+	/* Magic numbers. Too small layout viewport affects the layout of the tested documents in various situations,
+	   in a way that boxes do not have the sizes that are expected in particular tests.
+	   Adjust if needed and make the tests depend on that precondition if needed. */
+	verify(w >= 600 && h >= 300);
+}
+
+html
+{
+//!<!DOCTYPE html>
+//!<html>
+//!<head>
+//!<style>
+//!* { margin:0;padding:0;
+//!	font-family:'AHEM';
+//!}
+//!table
+//!{
+//!	border-spacing:0px;
+//!}
+//!
+//!td
+//!{
+//!	vertical-align:top;
+//!	width:200px;
+//!	height:300px;
+//!}
+//!
+//!td.area_and_filter
+//!{
+//!	background-color:yellow;
+//!}
+//!
+//!td.area_no_filter
+//!{
+//!	background-color:gray;
+//!}
+//!
+//!td.outside_area
+//!{
+//!	background-color:orange;
+//!	vertical-align:middle;
+//!	text-align:center;
+//!}
+//!
+//!#hit_float
+//!{
+//!	width:100px;
+//!	height:100px;
+//!	background-color:red;
+//!	float:left;
+//!}
+//!
+//!#hit_block_normal_flow
+//!{
+//!	width:100px;
+//!	height:100px;
+//!	background-color:blue;
+//!	margin-top:20px;
+//!}
+//!
+//!#hit_block_relative
+//!{
+//!	width:50px;
+//!	height:50px;
+//!	position:relative;
+//!	left:120px;
+//!	top:-120px;
+//!	background-color:lime;
+//!}
+//!
+//!#hit_block_absolute
+//!{
+//!	width:50px;
+//!	height:50px;
+//!	position:absolute;
+//!	left:120px;
+//!	top:220px;
+//!	background-color:green;
+//!}
+//!
+//!#not_hit_float
+//!{
+//!	width:100px;
+//!	height:100px;
+//!	background-color:red;
+//!	float:right;
+//!}
+//!
+//!#not_hit_block_normal_flow
+//!{
+//!	width:100px;
+//!	height:100px;
+//!	background-color:blue;
+//!	margin-top:20px;
+//!}
+//!
+//!#not_hit_block_relative
+//!{
+//!	width:50px;
+//!	height:50px;
+//!	position:relative;
+//!	left:120px;
+//!	top:-90px;
+//!	background-color:lime;
+//!}
+//!
+//!#not_hit_block_absolute
+//!{
+//!	width:50px;
+//!	height:50px;
+//!	position:absolute;
+//!	left:120px;
+//!	top:520px;
+//!	background-color:green;
+//!}
+//!
+//!#block_outside_area
+//!{
+//!	margin-left:50px;
+//!	width:50px;
+//!	height:50px;
+//!	background-color:brown;
+//!}
+//!
+//!#block_relative_outside_area
+//!{
+//!	width:50px;
+//!	height:50px;
+//!	position:relative;
+//!	left:220px;
+//!	top:100px;
+//!	background-color:green;
+//!}
+//!
+//!#overflow
+//!{
+//!	width:100px;
+//!	height:100px;
+//!	background-color:yellow;
+//!	overflow:visible;
+//!}
+//!
+//!#inside_overflow
+//!{
+//!	width:100px;
+//!	height:100px;
+//!	background-color:red;
+//!	margin-left:200px;
+//!}
+//!
+//!span
+//!{
+//!	font-size:20px;
+//!}
+//!
+//!#invisible_inline
+//!{
+//!	visibility:hidden;
+//!}
+//!
+//!#invisible_block
+//!{
+//!	width:30px;
+//!	height:10px;
+//!	background-color:teal;
+//!
+//!	visibility:hidden;
+//!}
+//!
+//!</style>
+//!</head>
+//!<body>
+//!
+//!<table>
+//!<tr>
+//!<td class="area_and_filter">
+//!<div id="hit_float">
+//!<span id="hit_in_float">xxx</span>
+//!</div>
+//!<span id="hit_inline1">xxxxx xxxxx</span>
+//!<br /> <br />
+//!<span id="hit_inline2">xxxxx</span>
+//!
+//!<div id="hit_block_normal_flow">
+//!<div id="block_relative_outside_area">
+//!</div>
+//!</div>
+//!<span id="hit_inline3">xxxxxxxxxx</span>
+//!<span id="invisible_inline">xxxx</span>
+//!<div id="invisible_block"></div>
+//!
+//!<div id="hit_block_relative">
+//!</div>
+//!</td>
+//!<td class="outside_area">
+//!<div id="block_outside_area"></div>
+//!</td>
+//!</tr>
+//!<tr>
+//!<td class="area_no_filter">
+//!<p id="not_hit_float">
+//!<b id="not_hit_in_float">xxx</b>
+//!</p>
+//!<b id="not_hit_inline1">xxxxx xxxxx</b>
+//!<br /> <br />
+//!<b id="not_hit_inline2">xxxxx</b>
+//!
+//!<p id="not_hit_block_normal_flow">
+//!</p>
+//!<b id="not_hit_inline3">xxxxxxxxxx</b>
+//!
+//!<p id="not_hit_block_relative">
+//!</p>
+//!</td>
+//!<td class="outside_area">
+//!<span id="inline_outside_area">xxxxx</span>
+//!</td>
+//!</tr>
+//!
+//!</table>
+//!
+//!<div id="overflow">
+//!<div id="inside_overflow"></div>
+//!</div>
+//!
+//!<div id="hit_block_absolute">
+//!</div>
+//!
+//!<p id="not_hit_block_absolute">
+//!</p>
+//!
+//!</body>
+//!
+//!</html>
+}
+test ("element searching basics (area & filter)")
+	require success "AHEM";
+{
+	ElementStore store1, store2;
+	RECT proper_area_1 = {0, 0, 200, 700},
+		proper_area_2 = {200, 600, 300, 700};
+	ST_ElementCollectingObject::ST_MinCustomizer customizer;
+	ST_ElementCollectingObject element_collecting_obj1(state.doc, proper_area_1, customizer),
+		element_collecting_obj2(state.doc, proper_area_2, customizer);
+
+	OP_STATUS stat = element_collecting_obj1.Init();
+	verify(OpStatus::IsSuccess(stat));
+
+	stat = element_collecting_obj1.Traverse(state.doc->GetLogicalDocument()->GetRoot());
+	verify(OpStatus::IsSuccess(stat));
+
+	stat = element_collecting_obj1.CollectElements(store1);
+	verify(OpStatus::IsSuccess(stat));
+
+	stat = element_collecting_obj2.Init();
+	verify(OpStatus::IsSuccess(stat));
+
+	stat = element_collecting_obj2.Traverse(state.doc->GetLogicalDocument()->GetRoot());
+	verify(OpStatus::IsSuccess(stat));
+
+	stat = element_collecting_obj2.CollectElements(store2);
+	verify(OpStatus::IsSuccess(stat));
+
+	verify(Exists(store1, "hit_float", DOCUMENT_ELEMENT_TYPE_HTML_ELEMENT) == TRUE);
+	verify(Exists(store1, "hit_in_float", DOCUMENT_ELEMENT_TYPE_HTML_ELEMENT) == TRUE);
+	verify(Exists(store1, "hit_inline1", DOCUMENT_ELEMENT_TYPE_HTML_ELEMENT) == TRUE);
+	verify(Exists(store1, "hit_inline2", DOCUMENT_ELEMENT_TYPE_HTML_ELEMENT) == TRUE);
+	verify(Exists(store1, "hit_block_normal_flow", DOCUMENT_ELEMENT_TYPE_HTML_ELEMENT) == TRUE);
+	verify(Exists(store1, "hit_inline3", DOCUMENT_ELEMENT_TYPE_HTML_ELEMENT) == TRUE);
+	verify(Exists(store1, "hit_block_relative", DOCUMENT_ELEMENT_TYPE_HTML_ELEMENT) == TRUE);
+	verify(Exists(store1, "hit_block_absolute", DOCUMENT_ELEMENT_TYPE_HTML_ELEMENT) == TRUE);
+	verify(Exists(store1, "overflow", DOCUMENT_ELEMENT_TYPE_HTML_ELEMENT) == TRUE);
+
+	verify(NumRects(store1, "hit_inline1") == 2);
+	verify(HasRect(store1, OpRect(0, 0, 100, 100), "hit_float", DOCUMENT_ELEMENT_TYPE_HTML_ELEMENT));
+	verify(HasRect(store1, OpRect(120, 220, 50, 50), "hit_block_absolute", DOCUMENT_ELEMENT_TYPE_HTML_ELEMENT));
+	verify(HasRectOfSize(store1, 100, 100, "overflow", DOCUMENT_ELEMENT_TYPE_HTML_ELEMENT));
+	verify(NumElements(store1) == 9); // to make sure multiline elements are stored in one Element
+	verify(element_collecting_obj1.NumCoveringRects() == 0); // no opaque boxes should be reported with the customizer used here
+
+	/** Commented out, because the set of hit elements + the Number check ensures the below falses.
+		Listing all not hit elements just in case. */
+	/*verify(Exists(store1, "not_hit_float", DOCUMENT_ELEMENT_TYPE_HTML_ELEMENT) == FALSE);
+	verify(Exists(store1, "not_hit_in_float", DOCUMENT_ELEMENT_TYPE_HTML_ELEMENT) == FALSE);
+	verify(Exists(store1, "not_hit_inline1", DOCUMENT_ELEMENT_TYPE_HTML_ELEMENT) == FALSE);
+	verify(Exists(store1, "not_hit_inline2", DOCUMENT_ELEMENT_TYPE_HTML_ELEMENT) == FALSE);
+	verify(Exists(store1, "not_hit_block_normal_flow", DOCUMENT_ELEMENT_TYPE_HTML_ELEMENT) == FALSE);
+	verify(Exists(store1, "not_hit_inline3", DOCUMENT_ELEMENT_TYPE_HTML_ELEMENT) == FALSE);
+	verify(Exists(store1, "not_hit_block_relative", DOCUMENT_ELEMENT_TYPE_HTML_ELEMENT) == FALSE);
+	verify(Exists(store1, "not_hit_block_absolute", DOCUMENT_ELEMENT_TYPE_HTML_ELEMENT) == FALSE);
+	verify(Exists(store1, "block_relative_outside_area", DOCUMENT_ELEMENT_TYPE_HTML_ELEMENT) == FALSE);
+	verify(Exists(store1, "block_outside_area", DOCUMENT_ELEMENT_TYPE_HTML_ELEMENT) == FALSE);
+	verify(Exists(store1, "inline_outside_area", DOCUMENT_ELEMENT_TYPE_HTML_ELEMENT) == FALSE);
+	verify(Exists(store1, "inside_overflow", DOCUMENT_ELEMENT_TYPE_HTML_ELEMENT) == FALSE);
+	verify(Exists(store1, "invisible_inline", DOCUMENT_ELEMENT_TYPE_HTML_ELEMENT) == FALSE);
+	verify(Exists(store1, "invisible_block", DOCUMENT_ELEMENT_TYPE_HTML_ELEMENT) == FALSE);*/
+
+	verify(Exists(store2, "inside_overflow", DOCUMENT_ELEMENT_TYPE_HTML_ELEMENT) == TRUE);
+	verify(NumElements(store2) == 1); // to make sure no other was hit
+	verify(HasRect(store2, OpRect(200, 600, 100, 100), "inside_overflow", DOCUMENT_ELEMENT_TYPE_HTML_ELEMENT));
+}
+
+html
+{
+//!<!DOCTYPE html>
+//!<html>
+//!<head>
+//!<style>
+//!* { margin:0;padding:0;
+//!	font-family:'AHEM';
+//!}
+//!table { border-spacing:0px; }
+//!
+//!#first
+//!{
+//!	width:100px;
+//!	height:200px;
+//!max-height:200px;
+//!	background-color:red;
+//!	line-height:20px;
+//!}
+//!
+//!#second
+//!{
+//!	width:100px;
+//!	height:100px;
+//!	background-color:blue;
+//!}
+//!
+//!span
+//!{
+//!font-size:20px;
+//!vertical-align: bottom;
+//!}
+//!
+//!</style>
+//!</head>
+//!<body>
+//!<div id="first">
+//!<span id="not_hit">xxxxx xxxxx xxxxx xxxxx xxxxx</span>
+//!<br /> <br /> <br />
+//!<span id="hit">xxxxx xxxxx xxxxx</span>
+//!</div>
+//!
+//!<div id="second">
+//!<br />
+//!<span id="inside_second">xxxxx</span>
+//!</div>
+//!
+//!</body>
+//!
+//!</html>
+}
+test ("extended area for multilines")
+	require success "AHEM";
+{
+	ElementStore store;
+	OpRect extended_area(0, 0, 200, 300),
+		  proper_area(30, 120, 21, 31);
+	ST_ElementCollectingObject::ST_MinCustomizer customizer;
+	LayoutWorkplace* wp = state.doc->GetLogicalDocument() ? state.doc->GetLogicalDocument()->GetLayoutWorkplace() : NULL;
+
+	verify(wp);
+
+	OP_STATUS stat = wp->SearchForElements(customizer, proper_area, store, &extended_area);
+	verify(OpStatus::IsSuccess(stat));
+
+	verify (Exists(store, "first", DOCUMENT_ELEMENT_TYPE_HTML_ELEMENT) == TRUE);
+	verify (Exists(store, "second", DOCUMENT_ELEMENT_TYPE_HTML_ELEMENT) == FALSE);
+	verify (Exists(store, "not_hit", DOCUMENT_ELEMENT_TYPE_HTML_ELEMENT) == FALSE);
+	verify (Exists(store, "hit", DOCUMENT_ELEMENT_TYPE_HTML_ELEMENT) == TRUE);
+	verify (Exists(store, "inside_second", DOCUMENT_ELEMENT_TYPE_HTML_ELEMENT) == FALSE);
+
+	verify (NumRects(store, "hit") == 3);
+	verify (HasRect(store, OpRect(0, 160, 100, 20), "hit", DOCUMENT_ELEMENT_TYPE_HTML_ELEMENT));
+}
+
+html
+{
+//!<!DOCTYPE html>
+//!<html>
+//!<head>
+//!<style>
+//!* { margin:0;padding:0;
+//!	font-family:'AHEM';
+//!}
+//!table { border-spacing:0px; }
+//!
+//!span
+//!{
+//!	font-size:20px;
+//!}
+//!
+//!span.bigger
+//!{
+//!	font-size:25px;
+//!}
+//!#container
+//!{
+//!	width:400px;
+//!	height:200px;
+//!	background-color:gray;
+//!	line-height:20px;
+//!}
+//!
+//!input.replaced
+//!{
+//!	width:70px;
+//!	height:40px;
+//!	vertical-align:top;
+//!}
+//!
+//!div.inline_block
+//!{
+//!	width:100px;
+//!	height:60px;
+//!	background-color:red;
+//!	vertical-align:top;
+//!	display:inline-block;
+//!	overflow:visible;
+//!	line-height:20px;
+//!}
+//!
+//!</style>
+//!</head>
+//!<body>
+//!<div id="container">
+//!<br />
+//!<span id="big_inline">
+//!xxxx<input type="button" class="replaced"/><span class="bigger">xx</span><div class="inline_block">
+//!<br /> <br /> <br />
+//!<span id="overflow_from_inline_block">xxxx</span>
+//!</div>
+//!<br />
+//!xxxx
+//!</span>
+//!
+//!<br /> <br />
+//!
+//!<a href="#" id="filter_fail">
+//!<span>xxxx</span><input type="button" class="replaced"/>
+//!</a>
+//!
+//!</div>
+//!
+//!</body>
+//!</html>
+}
+test ("complex inline elements")
+	require success "AHEM";
+	require success "PRECONDITION: Window big enough.";
+{
+	ElementStore store;
+	RECT extended_area = {0, 0, 411, 200};
+	RECT proper_area = {0, 0, 121, 200};
+	ST_ElementCollectingObject::ST_MinCustomizer customizer;
+	ST_ElementCollectingObject element_collecting_obj(state.doc, proper_area, customizer, &extended_area);
+
+	OP_STATUS stat = element_collecting_obj.Init();
+	verify(OpStatus::IsSuccess(stat));
+
+	stat = element_collecting_obj.Traverse(state.doc->GetLogicalDocument()->GetRoot());
+	verify(OpStatus::IsSuccess(stat));
+
+	stat = element_collecting_obj.CollectElements(store);
+	verify(OpStatus::IsSuccess(stat));
+
+	verify(Exists(store, "container", DOCUMENT_ELEMENT_TYPE_HTML_ELEMENT) == TRUE);
+	verify(Exists(store, "big_inline", DOCUMENT_ELEMENT_TYPE_HTML_ELEMENT) == TRUE);
+
+	verify(NumRects(store, "container") == 1);
+	verify(NumRects(store, "big_inline") == 5);
+
+	verify (Exists(store, "filter_fail", DOCUMENT_ELEMENT_TYPE_HTML_ELEMENT) == FALSE);
+	verify (Exists(store, "overflow_from_inline_block", DOCUMENT_ELEMENT_TYPE_HTML_ELEMENT) == FALSE);
+	verify (Exists(store, "absolute", DOCUMENT_ELEMENT_TYPE_HTML_ELEMENT) == FALSE);
+}
+
+html
+{
+//!<!DOCTYPE html>
+//!<html>
+//!<head>
+//!<style>
+//!* { margin:0;padding:0;
+//!	font-family:'AHEM';
+//!}
+//!table { border-spacing:0px; }
+//!
+//!div.container
+//!{
+//!	width:210px;
+//!	height:410px;
+//!	background-color:gray;
+//!	margin-left:100px;
+//!	margin-top:100px;
+//!	overflow:hidden;
+//!}
+//!
+//!#usemap_owner
+//!{
+//!	width:400px;
+//!	height:400px;
+//!	padding:5px;
+//!	border:solid 5px;
+//!}
+//!
+//!</style>
+//!</head>
+//!<body>
+//!
+//!<div class="container">
+//!<img id="usemap_owner" usemap="#map" src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAZAAAAGQCAYAAACAvzbMAAAFY0lEQVR42u3KsQ2AABADsR+dzWGBSCd6F+5899wLAL9lAIAlAwAsGQBgyQAASwYAWDIAwJIBAJYMALBkAIAlAwAsGQBgyQAASwYAWDIAwJIBAJYMALBkAIAlAwAsGQBgyQAASwYAWDIAwJIBAJYMALBkAIAlAwAsGQBgyQAASwYAWDIAwJIBAJYMALBkAIAlAwAsGQBgyQAASwYAWDIAwJIBAJYMALBkAIAlAwAsGQBgyQAASwYAWDIAwJIBAJYMALBkAIAlAwAsGQBgyQAASwYAWDIAwJIBAJYMALBkAIAlAwAsGQBgyQAASwYAWDIAwJIBAJYMALBkAIAlAwAsGQBgyQAASwYAWDIAwJIBAJYMALBkAIAlAwAsGQBgyQAASwYAWDIAwJIBAJYMALBkAIAlAwAsGQBgyQAASwYAWDIAwJIBAJYMALBkAIAlAwAsGQBgyQAASwYAWDIAwJIBAJYMALBkAIAlAwAsGQBgyQAASwYAWDIAwJIBAJYMALBkAIAlAwAsGQBgyQAASwYAWDIAwJIBAJYMALBkAIAlAwAsGQBgyQAASwYAWDIAwJIBAJYMALBkAIAlAwAsGQBgyQAASwYAWDIAwJIBAJYMALBkAIAlAwAsGQBgyQAASwYAWDIAwJIBAJYMALBkAIAlAwAsGQBgyQAASwYAWDIAwJIBAJYMALBkAIAlAwAsGQBgyQAASwYAWDIAwJIBAJYMALBkAIAlAwAsGQBgyQAASwYAWDIAwJIBAJYMALBkAIAlAwAsGQBgyQAASwYAWDIAwJIBAJYMALBkAIAlAwAsGQBgyQAASwYAWDIAwJIBAJYMALBkAIAlAwAsGQBgyQAASwYAWDIAwJIBAJYMALBkAIAlAwAsGQBgyQAASwYAWDIAwJIBAJYMALBkAIAlAwAsGQBgyQAASwYAWDIAwJIBAJYMALBkAIAlAwAsGQBgyQAASwYAWDIAwJIBAJYMALBkAIAlAwAsGQBgyQAASwYAWDIAwJIBAJYMALBkAIAlAwAsGQBgyQAASwYAWDIAwJIBAJYMALBkAIAlAwAsGQBgyQAASwYAWDIAwJIBAJYMALBkAIAlAwAsGQBgyQAASwYAWDIAwJIBAJYMALBkAIAlAwAsGQBgyQAASwYAWDIAwJIBAJYMALBkAIAlAwAsGQBgyQAASwYAWDIAwJIBAJYMALBkAIAlAwAsGQBgyQAASwYAWDIAwJIBAJYMALBkAIAlAwAsGQBgyQAASwYAWDIAwJIBAJYMALBkAIAlAwAsGQBgyQAASwYAWDIAwJIBAJYMALBkAIAlAwAsGQBgyQAASwYAWDIAwJIBAJYMALBkAIAlAwAsGQBgyQAASwYAWDIAwJIBAJYMALBkAIAlAwAsGQBgyQAASwYAWDIAwJIBAJYMALBkAIAlAwAsGQBgyQAASwYAWDIAwJIBAJYMALBkAIAlAwAsGQBgyQAASwYAWDIAwJIBAJYMALBkAIAlAwAsGQBgyQAASwYAWDIAwJIBAJYMALBkAIAlAwAsGQBgyQAASwYAWDIAwJIBAJYMALBkAIAlAwAsGQBgyQAASwYAWDIAwJIBAJYMALBkAIAlAwAsGQBgyQAASwYAWDIAwJIBAJYMALBkAIAlAwAsGQBgyQAASwYAWDIAwJIBAJYMALBkAIAlAwAsGQBgyQAASwYAWDIAwJIBAJYMALBkAIAlAwAsGQBgyQAASwYAWDIAwJIBAJYMALBkAIAlAwAsGQBgyQAASwYAWDIAwJIBAJYMALBkAIAlAwAsGQBgyQAASwYAWDIAwJIBAJYMALBkAIAlAwAsGQBgyQAASwYAWDIAwJIBAIYP9J9Fyvc/cDgAAAAASUVORK5CYII=" />
+//!</div>
+//!
+//!</body>
+//!
+//!<map name="map">
+//!<area id="polygon" shape="poly" coords="5,5,55,5,100,30,55,60,25,60"
+//!      href="#">
+//!<area id="rect_partially_clipped" shape="rect" coords="160,50,250,100"
+//!      href="#">
+//!<area id="circle" shape="circle" coords="50,150,50"
+//!      href="#">
+//!<area id="rect_outside_area" shape="rect" coords="50,250,100,300"
+//!      href="#">
+//!<area id="rect_totally_clipped" shape="rect" coords="300,50,350,100"
+//!      href="#">
+//!<area id="total" shape="default" href="#total">
+//!</map>
+//!
+//!</html>
+}
+test ("usemap areas")
+	require success "AHEM";
+{
+	ElementStore store;
+	OpRect area(100, 100, 410, 210);
+	ST_ElementCollectingObject::ST_UsemapCustomizer customizer;
+	LayoutWorkplace* wp = state.doc->GetLogicalDocument() ? state.doc->GetLogicalDocument()->GetLayoutWorkplace() : NULL;
+
+	verify(wp);
+
+	OP_STATUS stat = wp->SearchForElements(customizer, area, store);
+	verify(OpStatus::IsSuccess(stat));
+
+	verify(Exists(store, "polygon", DOCUMENT_ELEMENT_TYPE_HTML_ELEMENT) == TRUE);
+	verify(Exists(store, "rect_partially_clipped", DOCUMENT_ELEMENT_TYPE_HTML_ELEMENT) == TRUE);
+	verify(Exists(store, "circle", DOCUMENT_ELEMENT_TYPE_HTML_ELEMENT) == TRUE);
+	verify(Exists(store, "total", DOCUMENT_ELEMENT_TYPE_HTML_ELEMENT) == TRUE);
+
+	verify(HasRect(store, OpRect(115, 115, 95, 55), "polygon", DOCUMENT_ELEMENT_TYPE_HTML_ELEMENT));
+	verify(HasRect(store, OpRect(270, 160, 40, 50), "rect_partially_clipped", DOCUMENT_ELEMENT_TYPE_HTML_ELEMENT));
+	verify(HasRect(store, OpRect(111, 211, 99, 99), "circle", DOCUMENT_ELEMENT_TYPE_HTML_ELEMENT));
+	verify(HasRect(store, OpRect(100, 100, 210, 410), "total", DOCUMENT_ELEMENT_TYPE_HTML_ELEMENT));
+
+	verify(Exists(store, "rect_outside_area", DOCUMENT_ELEMENT_TYPE_HTML_ELEMENT) == FALSE);
+	verify(Exists(store, "rect_totally_clipped", DOCUMENT_ELEMENT_TYPE_HTML_ELEMENT) == FALSE);
+}
+
+html
+{
+//!<!DOCTYPE html>
+//!<html>
+//!<head>
+//!<style>
+//!* { margin:0;padding:0;
+//!	font-family:'AHEM';
+//!}
+//!table { border-spacing:0px; }
+//!
+//!#outer
+//!{
+//!	width:200px;
+//!	height:200px;
+//!	background-color:gray;
+//!	margin-left:100px;
+//!	margin-top:100px;
+//!	overflow:auto;
+//!}
+//!
+//!#inner
+//!{
+//!	width:100px;
+//!	height:140px;
+//!	background-color:green;
+//!	margin-left:50px;
+//!	margin-top:80px;
+//!	overflow:auto;
+//!	line-height:20px;
+//!	font-size:20px;
+//!}
+//!
+//!span
+//!{
+//!font-size:20px;
+//!}
+//!
+//!
+//!</style>
+//!</head>
+//!<body>
+//!
+//!<div id="outer">
+//!<span id="other_elm">xxxxxxxxxxx</span>
+//!
+//!<div id="inner">
+//!xxxxxx
+//!<br /><br /><br /><br /> <br /><br /> <br />
+//!xxxxx
+//!</div>
+//!
+//!</div>
+//!
+//!</body>
+//!
+//!</html>
+}
+subtest ScrollbarsBigArea(UINT& horizontal_scrollbar_width)
+{
+	ElementStore store;
+	RECT area = {0, 0, 10000, 10000};
+	ST_ElementCollectingObject::ST_ScrollbarCustomizer customizer;
+	ST_ElementCollectingObject element_collecting_obj(state.doc, area, customizer);
+
+	OP_STATUS stat = element_collecting_obj.Init();
+	verify(OpStatus::IsSuccess(stat));
+
+	stat = element_collecting_obj.Traverse(state.doc->GetLogicalDocument()->GetRoot());
+	verify(OpStatus::IsSuccess(stat));
+
+	stat = element_collecting_obj.CollectElements(store);
+	verify(OpStatus::IsSuccess(stat));
+
+	verify(Exists(store, "outer", DOCUMENT_ELEMENT_TYPE_VERTICAL_SCROLLBAR) == TRUE);
+	verify(Exists(store, "outer", DOCUMENT_ELEMENT_TYPE_HORIZONTAL_SCROLLBAR) == TRUE);
+	verify(Exists(store, "inner", DOCUMENT_ELEMENT_TYPE_VERTICAL_SCROLLBAR) == TRUE);
+	verify(Exists(store, "inner", DOCUMENT_ELEMENT_TYPE_HORIZONTAL_SCROLLBAR) == FALSE);
+
+	verify(NumRects(store, "outer", DOCUMENT_ELEMENT_TYPE_VERTICAL_SCROLLBAR) == 1);
+	verify(NumElements(store) == 3);
+
+	horizontal_scrollbar_width = GetScrollbarWidth(store, "outer", DOCUMENT_ELEMENT_TYPE_HORIZONTAL_SCROLLBAR);
+	UINT outer_vertical_scrollbar_width = GetScrollbarWidth(store, "outer", DOCUMENT_ELEMENT_TYPE_VERTICAL_SCROLLBAR);
+
+	verify(HasRectOfSize(store, -1, 200 - horizontal_scrollbar_width, "outer", DOCUMENT_ELEMENT_TYPE_VERTICAL_SCROLLBAR));
+	verify(HasRectOfSize(store, 200 - outer_vertical_scrollbar_width, -1, "outer", DOCUMENT_ELEMENT_TYPE_HORIZONTAL_SCROLLBAR));
+
+	/** This scrollbar's rect should be clipped, 100 - the distance on y between the start of the inner div to the end of the
+		outer div. Substracting outer scrollbar's width, because it is not included in the clip rect. */
+	verify(HasRectOfSize(store, -1, 100 - horizontal_scrollbar_width, "inner", DOCUMENT_ELEMENT_TYPE_VERTICAL_SCROLLBAR));
+}
+subtest ScrollbarsSmallerArea(UINT horizontal_scrollbar_width)
+{
+	ElementStore store;
+	RECT area = {150, 150, 250, 211};
+	ST_ElementCollectingObject::ST_ScrollbarCustomizer customizer;
+	ST_ElementCollectingObject element_collecting_obj(state.doc, area, customizer);
+
+	OP_STATUS stat = element_collecting_obj.Init();
+	verify(OpStatus::IsSuccess(stat));
+
+	stat = element_collecting_obj.Traverse(state.doc->GetLogicalDocument()->GetRoot());
+	verify(OpStatus::IsSuccess(stat));
+
+	stat = element_collecting_obj.CollectElements(store);
+	verify(OpStatus::IsSuccess(stat));
+
+	verify(Exists(store, "inner", DOCUMENT_ELEMENT_TYPE_VERTICAL_SCROLLBAR) == TRUE);
+	verify(NumElements(store) == 1);
+	/** This scrollbar's rect should be clipped, 100 - the distance on y between the start of the inner div to the end of the
+		outer div. Substracting outer scrollbar's width, because it is not included in the clip rect. */
+	verify(HasRectOfSize(store, -1, 100 - horizontal_scrollbar_width, "inner", DOCUMENT_ELEMENT_TYPE_VERTICAL_SCROLLBAR));
+}
+test ("scrollbars")
+	require success "AHEM";
+{
+	UINT horizontal_scrollbar_width;
+	verify(ScrollbarsBigArea(horizontal_scrollbar_width));
+	verify(ScrollbarsSmallerArea(horizontal_scrollbar_width));
+}
+
+html
+{
+//!<!DOCTYPE html>
+//!<html>
+//!<head>
+//!<style>
+//!* { margin:0;padding:0;
+//!	font-family:'AHEM';
+//!}
+//!table
+//!{
+//!	margin-left:100px;
+//!	margin-top:100px;
+//!	border-spacing:0px;
+//!}
+//!
+//!td.single
+//!{
+//!	width:100px;
+//!	height:100px;
+//!	background-color:blue;
+//!}
+//!
+//!td.double
+//!{
+//!	width:100px;
+//!	height:300px;
+//!	vertical-align:top;
+//!	background-color:yellow;
+//!	line-height:20px;
+//!}
+//!
+//!col.collapsed
+//!{
+//!	visibility:collapse;
+//!}
+//!
+//!span
+//!{
+//!	font-size:20px;
+//!	vertical-align:top;
+//!}
+//!
+//!#float
+//!{
+//!	width:80px;
+//!	height:50px;
+//!	float:right;
+//!	background-color:orange;
+//!
+//!}
+//!
+//!#block_partially_clipped
+//!{
+//!	margin-left:50px;
+//!	width:100px;
+//!	height:50px;
+//!	background-color:green;
+//!
+//!}
+//!
+//!#relative
+//!{
+//!	width:100px;
+//!	height:50px;
+//!	background-color:red;
+//!	position:relative;
+//!	left:50px;
+//!}
+//!
+//!#absolute
+//!{
+//!	width:100px;
+//!	height:50px;
+//!	background-color:gray;
+//!	position:absolute;
+//!	left:150px;
+//!	top:300px;
+//!}
+//!
+//!</style>
+//!</head>
+//!<body>
+//!
+//!<table>
+//!<col />
+//!<col class="collapsed" />
+//!
+//!<tr>
+//!<td colspan="2" class="double">
+//!<div id="float">
+//!</div>
+//!
+//!<span id="inline_near_float">xxxxxx
+//!<br />
+//!xxxx
+//!</span>
+//!<br /> <br />
+//!<span>xxxxx <span id="inline_in_td">xxx
+//!<br />
+//!xxx
+//!</span></span>
+//!<br />
+//!
+//!<div id="block_partially_clipped"></div>
+//!<div id="relative" </div>
+//!
+//!</td>
+//!</tr>
+//!
+//!<tr>
+//!<td class="single">
+//!<div id="absolute"></div>
+//!</td>
+//!<td class="single">
+//!</td>
+//!</tr>
+//!
+//!</table>
+//!
+//!</body>
+//!</html>
+}
+test ("elements clipping")
+	require success "AHEM";
+	require success "PRECONDITION: Window big enough.";
+{
+	ElementStore store;
+	RECT area = {0, 0, 10000, 10000};
+	ST_ElementCollectingObject::ST_MinCustomizer customizer;
+	ST_ElementCollectingObject element_collecting_obj(state.doc, area, customizer);
+
+	OP_STATUS stat = element_collecting_obj.Init();
+	verify(OpStatus::IsSuccess(stat));
+
+	stat = element_collecting_obj.Traverse(state.doc->GetLogicalDocument()->GetRoot());
+	verify(OpStatus::IsSuccess(stat));
+
+	stat = element_collecting_obj.CollectElements(store);
+	verify(OpStatus::IsSuccess(stat));
+
+	verify(Exists(store, "inline_near_float", DOCUMENT_ELEMENT_TYPE_HTML_ELEMENT) == TRUE);
+	verify(Exists(store, "inline_in_td", DOCUMENT_ELEMENT_TYPE_HTML_ELEMENT) == TRUE);
+	verify(Exists(store, "block_partially_clipped", DOCUMENT_ELEMENT_TYPE_HTML_ELEMENT) == TRUE);
+	verify(Exists(store, "relative", DOCUMENT_ELEMENT_TYPE_HTML_ELEMENT) == TRUE);
+	verify(Exists(store, "absolute", DOCUMENT_ELEMENT_TYPE_HTML_ELEMENT) == TRUE);
+
+	verify(Exists(store, "float", DOCUMENT_ELEMENT_TYPE_HTML_ELEMENT) == FALSE);
+
+	verify(NumRects(store, "inline_near_float") == 2);
+	verify(NumRects(store, "inline_in_td") == 1);
+
+	verify(HasRect(store, OpRect(100, 100, 100, 20), "inline_near_float", DOCUMENT_ELEMENT_TYPE_HTML_ELEMENT));
+	verify(HasRect(store, OpRect(150, 200, 50, 50), "block_partially_clipped", DOCUMENT_ELEMENT_TYPE_HTML_ELEMENT));
+	verify(HasRect(store, OpRect(150, 250, 50, 50), "relative", DOCUMENT_ELEMENT_TYPE_HTML_ELEMENT));
+	verify(HasRect(store, OpRect(150, 300, 100, 50), "absolute", DOCUMENT_ELEMENT_TYPE_HTML_ELEMENT));
+}
+
+html
+{
+//!<!DOCTYPE html>
+//!<html>
+//!<head>
+//!<style>
+//!*
+//!{
+//!	margin:0;padding:0;
+//!	font-family:'AHEM';
+//!}
+//!
+//!#top_div
+//!{
+//!	width:150px;
+//!	height:150px;
+//!	position:relative;
+//!	top:50px;
+//!	left:50px;
+//!	z-index:0;
+//!	background-color:yellow;
+//!}
+//!
+//!#inside_div
+//!{
+//!	width:100px;
+//!	height:100px;
+//!	background-color:green;
+//!}
+//!
+//!#first_positioned
+//!{
+//!	width:100px;
+//!	height:100px;
+//!	position:relative;
+//!	top:0px;
+//!	left:200px;
+//!	z-index:0;
+//!	background-color:blue;
+//!}
+//!
+//!b.second_positioned
+//!{
+//!	width:100px;
+//!	height:100px;
+//!	position:absolute;
+//!	top:120px;
+//!	left:0px;
+//!	background-color:lime;
+//!	display:block;
+//!	clip: rect(0px, 100px, 100px, 0px);
+//!}
+//!
+//!b.positioned_clipped
+//!{
+//!	width:50px;
+//!	height:50px;
+//!	position:relative;
+//!	top:0px;
+//!	left:100px;
+//!	background-color:orange;
+//!	display:block;
+//!}
+//!
+//!b.positioned_inline
+//!{
+//!	position:relative;
+//!	top:70px;
+//!	left:0px;
+//!	font-size:20px;
+//!	font-weight:normal;
+//!	display:inline;
+//!}
+//!
+//!</style>
+//!</head>
+//!<body>
+//!
+//!<div id="top_div">
+//!<div id="inside_div">
+//!<div id="first_positioned">
+//!<b class="second_positioned">
+//!<b class="positioned_clipped">
+//!</b>
+//!</b>
+//!</div>
+//!</div>
+//!<b class="positioned_inline">
+//!xxxxx
+//!</b>
+//!</div>
+//!
+//!</body>
+//!
+//!</html>
+}
+test ("adding rects to ancestors")
+	require success "AHEM";
+{
+	ElementStore store;
+	RECT area = {0, 0, 10000, 10000};
+	ST_ElementCollectingObject::ST_MinCustomizer customizer;
+	ST_ElementCollectingObject element_collecting_obj(state.doc, area, customizer);
+
+	OP_STATUS stat = element_collecting_obj.Init();
+	verify(OpStatus::IsSuccess(stat));
+
+	stat = element_collecting_obj.Traverse(state.doc->GetLogicalDocument()->GetRoot());
+	verify(OpStatus::IsSuccess(stat));
+
+	stat = element_collecting_obj.CollectElements(store);
+	verify(OpStatus::IsSuccess(stat));
+
+	verify(Exists(store, "top_div", DOCUMENT_ELEMENT_TYPE_HTML_ELEMENT) == TRUE);
+	verify(Exists(store, "inside_div", DOCUMENT_ELEMENT_TYPE_HTML_ELEMENT) == TRUE);
+	verify(Exists(store, "first_positioned", DOCUMENT_ELEMENT_TYPE_HTML_ELEMENT) == TRUE);
+	verify(NumElements(store) == 3);
+
+	verify(NumRects(store, "top_div") == 4);
+	verify(NumRects(store, "inside_div") == 3);
+	verify(NumRects(store, "first_positioned") == 2);
+
+	verify(HasRect(store, OpRect(50, 50, 150, 150), "top_div", DOCUMENT_ELEMENT_TYPE_HTML_ELEMENT));
+	verify(HasRect(store, OpRect(50, 220, 100, 20), "top_div", DOCUMENT_ELEMENT_TYPE_HTML_ELEMENT));
+	verify(HasRect(store, OpRect(250, 50, 100, 100), "top_div", DOCUMENT_ELEMENT_TYPE_HTML_ELEMENT));
+	verify(HasRect(store, OpRect(250, 170, 100, 100), "top_div", DOCUMENT_ELEMENT_TYPE_HTML_ELEMENT));
+
+	verify(HasRect(store, OpRect(50, 50, 100, 100), "inside_div", DOCUMENT_ELEMENT_TYPE_HTML_ELEMENT));
+	verify(HasRect(store, OpRect(250, 50, 100, 100), "inside_div", DOCUMENT_ELEMENT_TYPE_HTML_ELEMENT));
+	verify(HasRect(store, OpRect(250, 170, 100, 100), "inside_div", DOCUMENT_ELEMENT_TYPE_HTML_ELEMENT));
+
+	verify(HasRect(store, OpRect(250, 50, 100, 100), "first_positioned", DOCUMENT_ELEMENT_TYPE_HTML_ELEMENT));
+	verify(HasRect(store, OpRect(250, 170, 100, 100), "first_positioned", DOCUMENT_ELEMENT_TYPE_HTML_ELEMENT));
+}
+
+html
+{
+//!<!DOCTYPE html>
+//!<html>
+//!<head>
+//!<style>
+//!*
+//!{
+//!	margin:0;padding:0;
+//!	font-family:'AHEM';
+//!	font-size:20px;
+//!	vertical-align:bottom;
+//!}
+//!
+//!span.inline_z_root
+//!{
+//!	position:relative;
+//!	top:-20px;
+//!	left:-50px;
+//!	z-index:0;
+//!}
+//!
+//!div.area_container
+//!{
+//!	height:200px;
+//!	width:250px;
+//!	background-color:yellow;
+//!}
+//!
+//!div.inline_block
+//!{
+//!	height:50px;
+//!	width:60px;
+//!	background-color:lime;
+//!	display:inline-block;
+//!}
+//!
+//!div.float
+//!{
+//!	height:50px;
+//!	width:50px;
+//!	float:right;
+//!	background-color:brown;
+//!}
+//!
+//!div.block_in_inline
+//!{
+//!	height:100px;
+//!	width:100px;
+//!	background-color:orange;
+//!}
+//!
+//!span.positioned_inline_inside
+//!{
+//!	position:relative;
+//!	top:20px;
+//!	left:0px;
+//!}
+//!
+//!span.positioned_inline_partially_outside
+//!{
+//!	position:relative;
+//!	top:20px;
+//!	left:60px;
+//!}
+//!
+//!span.positioned_inline_outside
+//!{
+//!	position:relative;
+//!	top:80px;
+//!	left:20px;
+//!}
+//!
+//!div.positioned_neg_z_index
+//!{
+//!	height:40px;
+//!	width:40px;
+//!	position:absolute;
+//!	top:100px;
+//!	left:170px;
+//!	z-index:-1;
+//!	background-color:red;
+//!}
+//!
+//!div.positioned_pos_z_index
+//!{
+//!	height:60px;
+//!	width:85px;
+//!	position:absolute;
+//!	top:90px;
+//!	left:130px;
+//!	z-index:1;
+//!	background-color:green;
+//!}
+//!
+//!div.positioned_far_parent
+//!{
+//!	height:50px;
+//!	width:50px;
+//!	position:absolute;
+//!	top:30px;
+//!	left:350px;
+//!	background-color:red;
+//!}
+//!
+//!div.positioned_far_child
+//!{
+//!	height:80px;
+//!	width:80px;
+//!	position:absolute;
+//!	top:-20px;
+//!	left:-20px;
+//!	background-color:teal;
+//!}
+//!
+//!</style>
+//!</head>
+//!<body>
+//!<div class="area_container">
+//!
+//!<a href="#" id="main_anchor"><div class="float"></div>
+//!xxxx<div class="inline_block"></div><span class="inline_z_root">xx<!--
+//!--><div class="positioned_neg_z_index"></div><div class="positioned_pos_z_index"></div></span>
+//!<div class="block_in_inline">
+//!<span class="positioned_inline_inside">xxxx</span>
+//!<span class="positioned_inline_partially_outside">xxxx</span>
+//!<span class="positioned_inline_outside">xxxx</span>
+//!</div>
+//!<div class="positioned_far_parent">
+//!<div class="positioned_far_child">
+//!</div>
+//!</div>
+//!</a>
+//!
+//!</div>
+//!
+//!</body>
+//!
+//!</html>
+}
+test ("an element with big amount of differently layed out descendants")
+	require success "AHEM";
+{
+	ElementStore store;
+	RECT area = {0, 0, 250, 200};
+	RECT extended_area = {0, 0, 10000, 10000};
+
+	ST_ElementCollectingObject::ST_AnchorCustomizer customizer;
+	ST_ElementCollectingObject element_collecting_obj(state.doc, area, customizer, &extended_area);
+
+	OP_STATUS stat = element_collecting_obj.Init();
+	verify(OpStatus::IsSuccess(stat));
+
+	stat = element_collecting_obj.Traverse(state.doc->GetLogicalDocument()->GetRoot());
+	verify(OpStatus::IsSuccess(stat));
+
+	stat = element_collecting_obj.CollectElements(store);
+	verify(OpStatus::IsSuccess(stat));
+
+	verify(Exists(store, "main_anchor", DOCUMENT_ELEMENT_TYPE_HTML_ELEMENT) == TRUE);
+	verify(NumElements(store) == 1);
+
+	verify(NumRects(store, "main_anchor") == 8);
+
+	// 'block_in_inline'
+	verify(HasRect(store, OpRect(0, 50, 100, 100), "main_anchor", DOCUMENT_ELEMENT_TYPE_HTML_ELEMENT));
+	// 'positioned_inline_outside'
+	verify(HasRect(store, OpRect(20, 170, 80, 20), "main_anchor", DOCUMENT_ELEMENT_TYPE_HTML_ELEMENT));
+	// 'positioned_pos_z_index'
+	verify(HasRect(store, OpRect(220, 100, 85, 60), "main_anchor", DOCUMENT_ELEMENT_TYPE_HTML_ELEMENT));
+	// 'positioned_far_child'
+	verify(HasRect(store, OpRect(330, 10, 80, 80), "main_anchor", DOCUMENT_ELEMENT_TYPE_HTML_ELEMENT));
+
+	// 'positioned_far_parent'
+	verify(HasRect(store, OpRect(350, 30, 50, 50), "main_anchor", DOCUMENT_ELEMENT_TYPE_HTML_ELEMENT) == FALSE);
+	// 'positioned_neg_z_index'
+	verify(HasRect(store, OpRect(260, 110, 40, 40), "main_anchor", DOCUMENT_ELEMENT_TYPE_HTML_ELEMENT) == FALSE);
+}
+
+html
+{
+//!<!DOCTYPE html>
+//!<html>
+//!<head>
+//!<style>
+//!*
+//!{
+//!	margin:0;padding:0;
+//!	font-family:'AHEM';
+//!	font-size:20px;
+//!	vertical-align:bottom;
+//!}
+//!
+//!#main_div
+//!{
+//!	width:150px;
+//!	height:200px;
+//!	margin-top:50px;
+//!	margin-left:50px;
+//!	background-color:yellow;
+//!}
+//!
+//!p.inside_div
+//!{
+//!	width:50px;
+//!	height:50px;
+//!	background-color:green;
+//!	transform-origin:top left;
+//!	transform: translate(80px,20px) rotate(45deg);
+//!}
+//!
+//!b.positioned_inline
+//!{
+//!	transform-origin:top left;
+//!	transform: translate(100px,50px) skewX(30deg) rotate(40deg);
+//!}
+//!
+//!p.outside_div
+//!{
+//!	width:100px;
+//!	height:100px;
+//!	transform-origin:top left;
+//!	transform: translate(50px,150px) scaleX(0.5) scaleY(0.5);
+//!	background-color:blue;
+//!}
+//!
+//!p.outside_neg
+//!{
+//!	width:70px;
+//!	height:70px;
+//!	position:absolute;
+//!	top:40px;
+//!	left:300px;
+//!	background-color:brown;
+//!	z-index:-1;
+//!	transform-origin:top left;
+//!	transform: skewY(30deg);
+//!}
+//!
+//!ul.outside_pos
+//!{
+//!	width:100px;
+//!	height:150px;
+//!	position:absolute;
+//!	top:0px;
+//!	left:230px;
+//!	background-color:lime;
+//!	z-index:1;
+//!	transform-origin:top left;
+//!	transform: skewX(30deg) skewY(30deg);
+//!}
+//!
+//!li.non_angle
+//!{
+//!	width:20px;
+//!	height:20px;
+//!	background-color:orange;
+//!	transform-origin:top left;
+//!	transform: translate(50px,120px) scaleX(2) scaleY(3);
+//!	display:block;
+//!}
+//!
+//!</style>
+//!</head>
+//!<body>
+//!
+//!<div id="main_div">
+//!<p class="inside_div"></p>
+//!<b class="positioned_inline">xxxx</b>
+//!<p class="outside_div"></p>
+//!<p class="outside_neg"></p>
+//!<ul class="outside_pos">
+//!<li class="non_angle"></li>
+//!</ul>
+//!</div>
+//!
+//!</body>
+//!
+//!</html>
+}
+test ("adding rects to ancestors - transforms")
+	require success "AHEM";
+	require CSS_TRANSFORMS;
+{
+	ElementStore store;
+	RECT area = {0, 0, 10000, 10000};
+	ST_ElementCollectingObject::ST_MinCustomizer customizer;
+	ST_ElementCollectingObject element_collecting_obj(state.doc, area, customizer);
+
+	OP_STATUS stat = element_collecting_obj.Init();
+	verify(OpStatus::IsSuccess(stat));
+
+	stat = element_collecting_obj.Traverse(state.doc->GetLogicalDocument()->GetRoot());
+	verify(OpStatus::IsSuccess(stat));
+
+	stat = element_collecting_obj.CollectElements(store);
+	verify(OpStatus::IsSuccess(stat));
+
+	verify(Exists(store, "main_div", DOCUMENT_ELEMENT_TYPE_HTML_ELEMENT) == TRUE);
+	verify(NumElements(store) == 1);
+	verify(NumRects(store, "main_div") == 5);
+}
+
+html
+{
+//!<!DOCTYPE html>
+//!<html>
+//!<head>
+//!<style>
+//!
+//!*
+//!{
+//!	margin:0;padding:0;
+//!	font-family:'AHEM';
+//!	line-height:20px;
+//!	vertical-align:top;
+//!	font-size:20px;
+//!}
+//!
+//!#inline_bckg
+//!{
+//!	background-color:yellow;
+//!}
+//!
+//!#inline_bckg_content
+//!{
+//!	width:30px;
+//!	height:30px;
+//!	padding:10px;
+//!	background-color:orange;
+//!}
+//!
+//!#inline_content
+//!{
+//!	width:30px;
+//!	height:30px;
+//!	padding:10px;
+//!}
+//!
+//!#inline_content_big_border
+//!{
+//!	width:20px;
+//!	height:20px;
+//!	padding:5px;
+//!	border:solid 10px;
+//!}
+//!
+//!#inline_content_small_border
+//!{
+//!	width:20px;
+//!	height:20px;
+//!	padding:10px;
+//!	border:solid 5px;
+//!}
+//!
+//!#block_bckg
+//!{
+//!	background-color:yellow;
+//!	width:50px;
+//!	height:50px;
+//!}
+//!
+//!#block_bckg_content
+//!{
+//!	display:block;
+//!	width:30px;
+//!	height:30px;
+//!	padding:10px;
+//!	background-color:orange;
+//!}
+//!
+//!#block_content
+//!{
+//!	display:block;
+//!	width:30px;
+//!	height:30px;
+//!	padding:10px;
+//!}
+//!
+//!#block_content_big_border
+//!{
+//!	display:block;
+//!	width:20px;
+//!	height:20px;
+//!	padding:5px;
+//!	border:solid 10px;
+//!}
+//!
+//!#block_content_small_border
+//!{
+//!	display:block;
+//!	width:20px;
+//!	height:20px;
+//!	padding:10px;
+//!	border:solid 5px;
+//!}
+//!
+//!#scrollable
+//!{
+//!	overflow:auto;
+//!	width:50px;
+//!	height:50px;
+//!}
+//!
+//!div.inside_scrollable
+//!{
+//!	width:30px;
+//!	height:100px;
+//!}
+//!
+//!</style>
+//!</head>
+//!<body>
+//!
+//!<span id="inline_bckg">x x </span><img id="inline_bckg_content" src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAAXNSR0IArs4c6QAAAAZiS0dEAP8A/wD/oL2nkwAAAAlwSFlzAAALEwAACxMBAJqcGAAAAAd0SU1FB9oLHQwQJ0wAdeQAAAANSURBVAjXY2BoYPgPAAKEAYABADlnAAAAAElFTkSuQmCC=" />
+//!<img id="inline_content" src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAAXNSR0IArs4c6QAAAAZiS0dEAP8A/wD/oL2nkwAAAAlwSFlzAAALEwAACxMBAJqcGAAAAAd0SU1FB9oLHQwQJ0wAdeQAAAANSURBVAjXY2BoYPgPAAKEAYABADlnAAAAAElFTkSuQmCC=" />
+//!<img id="inline_content_big_border" src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAAXNSR0IArs4c6QAAAAZiS0dEAP8A/wD/oL2nkwAAAAlwSFlzAAALEwAACxMBAJqcGAAAAAd0SU1FB9oLHQwQJ0wAdeQAAAANSURBVAjXY2BoYPgPAAKEAYABADlnAAAAAElFTkSuQmCC=" />
+//!<img id="inline_content_small_border" src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAAXNSR0IArs4c6QAAAAZiS0dEAP8A/wD/oL2nkwAAAAlwSFlzAAALEwAACxMBAJqcGAAAAAd0SU1FB9oLHQwQJ0wAdeQAAAANSURBVAjXY2BoYPgPAAKEAYABADlnAAAAAElFTkSuQmCC=" />
+//!<span id="inline_non_overlapping">x x x</span>
+//!
+//!<div id="block_bckg"></div>
+//!<img id="block_bckg_content" src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAAXNSR0IArs4c6QAAAAZiS0dEAP8A/wD/oL2nkwAAAAlwSFlzAAALEwAACxMBAJqcGAAAAAd0SU1FB9oLHQwQJ0wAdeQAAAANSURBVAjXY2BoYPgPAAKEAYABADlnAAAAAElFTkSuQmCC=" />
+//!<img id="block_content" src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAAXNSR0IArs4c6QAAAAZiS0dEAP8A/wD/oL2nkwAAAAlwSFlzAAALEwAACxMBAJqcGAAAAAd0SU1FB9oLHQwQJ0wAdeQAAAANSURBVAjXY2BoYPgPAAKEAYABADlnAAAAAElFTkSuQmCC=" />
+//!<img id="block_content_big_border" src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAAXNSR0IArs4c6QAAAAZiS0dEAP8A/wD/oL2nkwAAAAlwSFlzAAALEwAACxMBAJqcGAAAAAd0SU1FB9oLHQwQJ0wAdeQAAAANSURBVAjXY2BoYPgPAAKEAYABADlnAAAAAElFTkSuQmCC=" />
+//!<img id="block_content_small_border" src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAAXNSR0IArs4c6QAAAAZiS0dEAP8A/wD/oL2nkwAAAAlwSFlzAAALEwAACxMBAJqcGAAAAAd0SU1FB9oLHQwQJ0wAdeQAAAANSURBVAjXY2BoYPgPAAKEAYABADlnAAAAAElFTkSuQmCC=" />
+//!<div id="scrollable"><div class="inside_scrollable"></div></div>
+//!<br />
+//!<div id="block_non_overlapping">x x</div>
+//!
+//!</body>
+//!
+//!</html>
+}
+subtest OpaqueRectsOnePass()
+{
+	ElementStore store;
+	RECT area = {0, 0, 10000, 10000};
+	ST_ElementCollectingObject::ST_BasicOverlappingCustomizer customizer;
+	ST_ElementCollectingObject element_collecting_obj(state.doc, area, customizer, NULL, TRUE);
+
+	OP_STATUS stat = element_collecting_obj.Init();
+	verify(OpStatus::IsSuccess(stat));
+
+	stat = element_collecting_obj.Traverse(state.doc->GetLogicalDocument()->GetRoot());
+	verify(OpStatus::IsSuccess(stat));
+
+	stat = element_collecting_obj.CollectElements(store);
+	verify(OpStatus::IsSuccess(stat));
+
+	verify(Exists(store, "scrollable", DOCUMENT_ELEMENT_TYPE_VERTICAL_SCROLLBAR) == TRUE);
+
+	UINT vertical_scrollbar_width = GetScrollbarWidth(store, "scrollable", DOCUMENT_ELEMENT_TYPE_VERTICAL_SCROLLBAR);
+
+	verify(element_collecting_obj.NumCoveringRects() == 11);
+	verify(element_collecting_obj.HasCoveringRect(OpRect(0, 0, 80, 20), "inline_bckg"));
+	verify(element_collecting_obj.HasCoveringRect(OpRect(80, 0, 50, 50), "inline_bckg_content"));
+	verify(element_collecting_obj.HasCoveringRect(OpRect(160, 10, 30, 30), "inline_content"));
+	verify(element_collecting_obj.HasCoveringRect(OpRect(220, 0, 50, 50), "inline_content_big_border"));
+	verify(element_collecting_obj.HasCoveringRect(OpRect(305, 15, 20, 20), "inline_content_small_border"));
+	verify(element_collecting_obj.HasCoveringRect(OpRect(0, 50, 50, 50), "block_bckg"));
+	verify(element_collecting_obj.HasCoveringRect(OpRect(0, 100, 50, 50), "block_bckg_content"));
+	verify(element_collecting_obj.HasCoveringRect(OpRect(10, 160, 30, 30), "block_content"));
+	verify(element_collecting_obj.HasCoveringRect(OpRect(0, 200, 50, 50), "block_content_big_border"));
+	verify(element_collecting_obj.HasCoveringRect(OpRect(15, 265, 20, 20), "block_content_small_border"));
+	verify(element_collecting_obj.HasCoveringRect(OpRect(50 - vertical_scrollbar_width, 300, vertical_scrollbar_width, 50), "scrollable"));
+}
+subtest OpaqueRectsTwoPass()
+{
+	ElementStore store;
+	RECT area = {0, 0, 10000, 10000};
+	ST_ElementCollectingObject::ST_BasicOverlappingCustomizer customizer;
+	ST_ElementCollectingObject element_collecting_obj(state.doc, area, customizer, NULL, FALSE);
+
+	OP_STATUS stat = element_collecting_obj.Init();
+	verify(OpStatus::IsSuccess(stat));
+
+	stat = element_collecting_obj.Traverse(state.doc->GetLogicalDocument()->GetRoot());
+	verify(OpStatus::IsSuccess(stat));
+
+	stat = element_collecting_obj.CollectElements(store);
+	verify(OpStatus::IsSuccess(stat));
+
+	verify(element_collecting_obj.NumCoveringRects() == 12);
+	verify(element_collecting_obj.NumCoveringRects("block_bckg_content") == 2);
+	verify(element_collecting_obj.NumCoveringRects("inline_bckg_content") == 1);
+
+	verify(element_collecting_obj.HasCoveringRect(OpRect(10, 110, 30, 30), "block_bckg_content"));
+}
+test ("reporting opaque rects")
+	require success "AHEM";
+	require success "PRECONDITION: Window big enough.";
+{
+	verify(OpaqueRectsOnePass());
+	verify(OpaqueRectsTwoPass());
+}
+
+html
+{
+//!<!DOCTYPE html>
+//!<html>
+//!<head>
+//!<style>
+//!
+//!*
+//!{
+//!	margin:0;padding:0;
+//!	font-family:'AHEM';
+//!	line-height:20px;
+//!	vertical-align:top;
+//!	font-size:20px;
+//!}
+//!
+//!div
+//!{
+//!	width:100px;
+//!	height:100px;
+//!	max-height:100px;
+//!	overflow:hidden;
+//!}
+//!
+//!div.overflow2
+//!{
+//!	margin-top:50px;
+//!}
+//!
+//!span
+//!{
+//!	background-color:green;
+//!	position:relative;
+//!	top:10px;
+//!	left:10px;
+//!}
+//!
+//!img
+//!{
+//!	display:block;
+//!	width:60px;
+//!	height:60px;
+//!	padding:10px;
+//!	margin-top:40px;
+//!}
+//!
+//!</style>
+//!</head>
+//!<body>
+//!
+//!<div class="overflow1">
+//!xxx<span id="main_inline">x&nbsp;x</span>
+//!<img id="main_block" src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAAXNSR0IArs4c6QAAAAZiS0dEAP8A/wD/oL2nkwAAAAlwSFlzAAALEwAACxMBAJqcGAAAAAd0SU1FB9oLHQwQJ0wAdeQAAAANSURBVAjXY2BoYPgPAAKEAYABADlnAAAAAElFTkSuQmCC=" />
+//!</div>
+//!
+//!<div class="overflow2">
+//!xxx<span id="ext_inline">x&nbsp;x</span>
+//!<img id="ext_block" src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAAXNSR0IArs4c6QAAAAZiS0dEAP8A/wD/oL2nkwAAAAlwSFlzAAALEwAACxMBAJqcGAAAAAd0SU1FB9oLHQwQJ0wAdeQAAAANSURBVAjXY2BoYPgPAAKEAYABADlnAAAAAElFTkSuQmCC=" />
+//!</div>
+//!
+//!</body>
+//!
+//!</html>
+}
+test("overlapping rects clipping")
+	require success "AHEM";
+{
+	RECT area = {0, 0, 100, 120},
+		extended_area = {0, 0, 100, 301};
+	ST_ElementCollectingObject::ST_BasicOverlappingCustomizer customizer;
+	ST_ElementCollectingObject element_collecting_obj(state.doc, area, customizer, &extended_area);
+
+	OP_STATUS stat = element_collecting_obj.Init();
+	verify(OpStatus::IsSuccess(stat));
+
+	stat = element_collecting_obj.Traverse(state.doc->GetLogicalDocument()->GetRoot());
+	verify(OpStatus::IsSuccess(stat));
+
+	verify(element_collecting_obj.NumCoveringRects() == 4);
+	verify(element_collecting_obj.HasCoveringRect(OpRect(70, 10, 30, 20), "main_inline"), FALSE);
+	verify(element_collecting_obj.HasCoveringRect(OpRect(10, 70, 60, 30), "main_block"), FALSE);
+	verify(element_collecting_obj.HasCoveringRect(OpRect(70, 160, 30, 20), "ext_inline", TRUE));
+	verify(element_collecting_obj.HasCoveringRect(OpRect(10, 220, 60, 30), "ext_block", TRUE));
+}
+
+html
+{
+//!<!DOCTYPE html>
+//!<html>
+//!<head>
+//!<style>
+//!
+//!*
+//!{
+//!	margin:0;padding:0;
+//!}
+//!
+//!div.container
+//!{
+//!	width:100px;
+//!	height:100px;
+//!	max-height:100px;
+//!	overflow:hidden;
+//!}
+//!
+//!#transformed_angle
+//!{
+//!	width:60px;
+//!	height:30px;
+//!	background-color:green;
+//!	transform-origin:top left;
+//!	transform: translate(80px,10px) rotate(15deg);
+//!}
+//!
+//!#transformed_scale
+//!{
+//!	width:40px;
+//!	height:20px;
+//!	background-color:green;
+//!	transform-origin:top left;
+//!	transform: translate(10px,40px) scaleY(3);
+//!}
+//!
+//!</style>
+//!</head>
+//!<body>
+//!
+//!<div class="container">
+//!<div id="transformed_angle"></div>
+//!<div id="transformed_scale"></div>
+//!</div>
+//!
+//!</body>
+//!
+//!</html>
+}
+test("overlapping rects transformed and clipped")
+	require CSS_TRANSFORMS;
+{
+	RECT area = {0, 0, 10000, 10000};
+	ST_ElementCollectingObject::ST_BasicOverlappingCustomizer customizer;
+	ST_ElementCollectingObject element_collecting_obj(state.doc, area, customizer);
+
+	OP_STATUS stat = element_collecting_obj.Init();
+	verify(OpStatus::IsSuccess(stat));
+
+	stat = element_collecting_obj.Traverse(state.doc->GetLogicalDocument()->GetRoot());
+	verify(OpStatus::IsSuccess(stat));
+
+	verify(element_collecting_obj.NumCoveringRects() == 1);
+
+	/** Currently when there is a clip rect present and we enter a transform that makes the transformed polygon
+		to be something different than rectangle with the edges parallel to the axes, all the possible reported
+		opaque rects will be emptied (rough approximation of the clipped rect that does not cover any pixel
+		that is outside the current clip rect). */
+	verify(element_collecting_obj.NumCoveringRects("transformed_angle") == 0);
+
+	/** In case of non-angle changing transform (scale+translation), we can safely report overlapping rect,
+		since the clip rect, after transformation, has still precise geometric representation
+		(a rectangle with edges parallel to the axes). */
+	verify(element_collecting_obj.HasCoveringRect(OpRect(0, 0, 40, 10), "transformed_scale"));
+}
+
+html
+{
+//!<!DOCTYPE html>
+//!<html>
+//!<head>
+//!<style>
+//!
+//!*
+//!{
+//!	margin:0;padding:0;
+//!	font-family:'AHEM';
+//!	line-height:20px;
+//!	vertical-align:top;
+//!	font-size:20px;
+//!	border-spacing:0px;
+//!}
+//!
+//!table
+//!{
+//!	border-collapse:collapse;
+//!}
+//!
+//!td
+//!{
+//!	vertical-aling:top;
+//!	width:200px;
+//!	height:200px;
+//!	border: solid 1px;
+//!}
+//!
+//!#absolute_neg_index
+//!{
+//!	width:30px;
+//!	height:30px;
+//!	position:absolute;
+//!	z-index:-1;
+//!	top:20px;
+//!	left:225px;
+//!	background-color:yellow;
+//!}
+//!
+//!div.with_overflow
+//!{
+//!	width:100px;
+//!	height:100px;
+//!	max-height:100px;
+//!	max-width:100px;
+//!}
+//!
+//!img.negative_covering
+//!{
+//!	width:50px;
+//!	height:50px;
+//!}
+//!
+//!#overflow_covering
+//!{
+//!	width:120px;
+//!	height:50px;
+//!	display:block;
+//!}
+//!
+//!#neg_margin_covered
+//!{
+//!	width:100px;
+//!	height:100px;
+//!	background-color:orange;
+//!}
+//!
+//!
+//!#neg_margin_covering
+//!{
+//!	width:100px;
+//!	height:100px;
+//!	background-color:yellow;
+//!	margin-top:-20px;
+//!}
+//!
+//!#inside_margin_covering
+//!{
+//!	background-color:green;
+//!}
+//!
+//!#two_part_div
+//!{
+//!	width:50px;
+//!	height:50px;
+//!	background-color:lime;
+//!}
+//!
+//!div.abs_child
+//!{
+//!	width:50px;
+//!	height:50px;
+//!	position:absolute;
+//!	left:330px;
+//!	top:250px;
+//!	background-color:lime;
+//!}
+//!
+//!#partially_covered
+//!{
+//!	margin-left:20px;
+//!	width:50px;
+//!	height:50px;
+//!	background-color:brown;
+//!}
+//!
+//!
+//!div.relative_pos_index
+//!{
+//!	width:70px;
+//!	height:70px;
+//!	position:relative;
+//!	left:0px;
+//!	top:-400px;
+//!	background-color:blue;
+//!}
+//!
+//!b.rel_covering
+//!{
+//!	background-color:green;
+//!	position:relative;
+//!	left:-40px;
+//!	top:0px;
+//!	font-weight:normal;
+//!}
+//!
+//!</style>
+//!</head>
+//!<body>
+//!
+//!<table>
+//!<tr>
+//!<td>
+//!<div id="two_part_div">
+//!<div class="abs_child">
+//!</div>
+//!</div>
+//!<div id="partially_covered"></div>
+//!</td>
+//!<td>
+//!<div class="with_overflow">
+//!x<img class="negative_covering" src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAAXNSR0IArs4c6QAAAAZiS0dEAP8A/wD/oL2nkwAAAAlwSFlzAAALEwAACxMBAJqcGAAAAAd0SU1FB9oLHQwQJ0wAdeQAAAANSURBVAjXY2BoYPgPAAKEAYABADlnAAAAAElFTkSuQmCC=" />
+//!<br />
+//!<br />
+//!<br />
+//!<br />
+//!<span id="covered_overflow">xxxxx</span>
+//!</div>
+//!<img id="overflow_covering" src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAAXNSR0IArs4c6QAAAAZiS0dEAP8A/wD/oL2nkwAAAAlwSFlzAAALEwAACxMBAJqcGAAAAAd0SU1FB9oLHQwQJ0wAdeQAAAANSURBVAjXY2BoYPgPAAKEAYABADlnAAAAAElFTkSuQmCC=" />
+//!</td>
+//!</tr>
+//!<tr>
+//!<td>
+//!<span id="inline">xx<br />xx</span><b class="rel_covering">&nbsp;x</b>
+//!</td>
+//!<td>
+//!<div id="neg_margin_covered">
+//!<br />
+//!<span id="inside_margin_covered_visible">xxxx</span>
+//!<br />
+//!<br />
+//!<br />
+//!<span id="inside_margin_covered_covered">xxxx</span>
+//!</div>
+//!<div id="neg_margin_covering">
+//!<span id="inside_margin_covering">x x x</span>
+//!</div>
+//!</td>
+//!</tr>
+//!</table>
+//!
+//!<div id="absolute_neg_index"></div>
+//!<div class="relative_pos_index"></div>
+//!
+//!</body>
+//!</html>
+}
+test("removing visually covered elements")
+	require success "AHEM";
+	require success "PRECONDITION: Window big enough.";
+{
+	ElementStore store;
+	RECT area = {0, 0, 10000, 10000};
+	ST_ElementCollectingObject::ST_ElementWithOverlappingCustomizer customizer;
+	ST_ElementCollectingObject element_collecting_obj(state.doc, area, customizer);
+
+	OP_STATUS stat = element_collecting_obj.Init();
+	verify(OpStatus::IsSuccess(stat));
+
+	stat = element_collecting_obj.Traverse(state.doc->GetLogicalDocument()->GetRoot());
+	verify(OpStatus::IsSuccess(stat));
+
+	stat = element_collecting_obj.CollectElements(store);
+	verify(OpStatus::IsSuccess(stat));
+
+	verify(Exists(store, "absolute_neg_index", DOCUMENT_ELEMENT_TYPE_HTML_ELEMENT) == FALSE);
+	verify(Exists(store, "overflow_covering", DOCUMENT_ELEMENT_TYPE_HTML_ELEMENT) == TRUE);
+	verify(Exists(store, "covered_overflow", DOCUMENT_ELEMENT_TYPE_HTML_ELEMENT) == FALSE);
+
+	verify(Exists(store, "neg_margin_covered", DOCUMENT_ELEMENT_TYPE_HTML_ELEMENT) == TRUE);
+	verify(Exists(store, "neg_margin_covering", DOCUMENT_ELEMENT_TYPE_HTML_ELEMENT) == TRUE);
+	verify(Exists(store, "inside_margin_covered_visible", DOCUMENT_ELEMENT_TYPE_HTML_ELEMENT) == TRUE);
+	verify(Exists(store, "inside_margin_covered_covered", DOCUMENT_ELEMENT_TYPE_HTML_ELEMENT) == FALSE);
+	verify(Exists(store, "inside_margin_covering", DOCUMENT_ELEMENT_TYPE_HTML_ELEMENT) == TRUE);
+
+	verify(Exists(store, "two_part_div", DOCUMENT_ELEMENT_TYPE_HTML_ELEMENT) == TRUE);
+	verify(Exists(store, "partially_covered", DOCUMENT_ELEMENT_TYPE_HTML_ELEMENT) == TRUE);
+
+	verify(Exists(store, "inline", DOCUMENT_ELEMENT_TYPE_HTML_ELEMENT) == TRUE);
+
+	verify(NumRects(store, "neg_margin_covering") == 1);
+	verify(NumRects(store, "inside_margin_covering") == 1);
+
+	// Elements that have two rects each, but from each, one rect is removed during the traverse, because of visually invisible
+	verify(NumRects(store, "two_part_div") == 1);
+	verify(NumRects(store, "inline") == 1);
+}
+
+
+html
+{
+//!<!DOCTYPE html>
+//!<html>
+//!<head>
+//!<style>
+//!*
+//!{
+//!	margin:0;padding:0;
+//!}
+//!
+//!#divided_into_4
+//!{
+//!	width:100px;
+//!	height:100px;
+//!	background-color:orange;
+//!}
+//!
+//!#divided_into_2
+//!{
+//!	width:100px;
+//!	height:100px;
+//!	position:relative;
+//!	top:50px;
+//!	left:50px;
+//!	background-color:orange;
+//!}
+//!
+//!p
+//!{
+//!	position:absolute;
+//!	z-index:1;
+//!	background-color:green;
+//!}
+//!
+//!p.covering_into_4
+//!{
+//!	width:40px;
+//!	height:60px;
+//!	top:20px;
+//!	left:40px;
+//!}
+//!
+//!p.covering_into_2
+//!{
+//!	width:60px;
+//!	height:80px;
+//!	top:120px;
+//!	left:30px;
+//!}
+//!
+//!</style>
+//!</head>
+//!<body>
+//!
+//!<div id="divided_into_4"></div>
+//!<div id="divided_into_2"></div>
+//!
+//!<p class="covering_into_4"></p>
+//!<p class="covering_into_2"></p>
+//!
+//!</body>
+//!
+//!</html>
+}
+test("removing parts of initial rect")
+{
+	ElementStore store;
+	RECT area = {0, 0, 10000, 10000};
+	ST_ElementCollectingObject::ST_ElementWithOverlappingCustomizer customizer;
+	ST_ElementCollectingObject element_collecting_obj(state.doc, area, customizer);
+
+	OP_STATUS stat = element_collecting_obj.Init();
+	verify(OpStatus::IsSuccess(stat));
+
+	stat = element_collecting_obj.Traverse(state.doc->GetLogicalDocument()->GetRoot());
+	verify(OpStatus::IsSuccess(stat));
+
+	stat = element_collecting_obj.CollectElements(store);
+	verify(OpStatus::IsSuccess(stat));
+
+	verify(Exists(store, "divided_into_4", DOCUMENT_ELEMENT_TYPE_HTML_ELEMENT) == TRUE);
+	verify(Exists(store, "divided_into_2", DOCUMENT_ELEMENT_TYPE_HTML_ELEMENT) == TRUE);
+
+	verify(NumRects(store, "divided_into_4") == 4);
+	verify(NumRects(store, "divided_into_2") == 2);
+
+	verify(HasRect(store, OpRect(0, 0, 40, 100), "divided_into_4", DOCUMENT_ELEMENT_TYPE_HTML_ELEMENT));
+	verify(HasRect(store, OpRect(80, 0, 20, 100), "divided_into_4", DOCUMENT_ELEMENT_TYPE_HTML_ELEMENT));
+	verify(HasRect(store, OpRect(40, 0, 40, 20), "divided_into_4", DOCUMENT_ELEMENT_TYPE_HTML_ELEMENT));
+	verify(HasRect(store, OpRect(40, 80, 40, 20), "divided_into_4", DOCUMENT_ELEMENT_TYPE_HTML_ELEMENT));
+
+	verify(HasRect(store, OpRect(90, 150, 60, 100), "divided_into_2", DOCUMENT_ELEMENT_TYPE_HTML_ELEMENT));
+	verify(HasRect(store, OpRect(50, 200, 40, 50), "divided_into_2", DOCUMENT_ELEMENT_TYPE_HTML_ELEMENT));
+}
+
+html
+{
+//!<!DOCTYPE html>
+//!<html>
+//!<head>
+//!<style>
+//!*
+//!{
+//!	margin:0;padding:0;
+//!}
+//!
+//!div
+//!{
+//!	background-color:orange;
+//!}
+//!
+//!#covered_non_angle
+//!{
+//!	width:100px;
+//!	height:100px;
+//!}
+//!
+//!#covered_fully
+//!{
+//!	width:100px;
+//!	height:100px;
+//!	position:relative;
+//!	top:50px;
+//!	left:50px;
+//!}
+//!
+//!#covered_partially
+//!{
+//!	width:100px;
+//!	height:100px;
+//!	position:relative;
+//!	top:100px;
+//!	left:0px;
+//!}
+//!
+//!p
+//!{
+//!	position:absolute;
+//!	z-index:1;
+//!	background-color:green;
+//!}
+//!
+//!p.covering_non_angle
+//!{
+//!	width:100px;
+//!	height:100px;
+//!	top:20px;
+//!	left:70px;
+//!	transform-origin:left top;
+//!	transform: scaleX(0.5) scaleY(0.5)
+//!}
+//!
+//!p.covering_fully
+//!{
+//!	width:160px;
+//!	height:120px;
+//!	top:160px;
+//!	left:0px;
+//!	transform-origin:left top;
+//!	transform: skewX(25deg) skewY(-15deg);
+//!}
+//!
+//!p.covering_partially
+//!{
+//!	width:120px;
+//!	height:30px;
+//!	top:300px;
+//!	left:100px;
+//!	transform-origin:left top;
+//!	transform: rotate(85deg) skewX(-15deg);
+//!}
+//!
+//!</style>
+//!</head>
+//!<body>
+//!
+//!<div id="covered_non_angle"></div>
+//!<div id="covered_fully"></div>
+//!<div id="covered_partially"></div>
+//!
+//!<p class="covering_non_angle"></p>
+//!<p class="covering_fully"></p>
+//!<p class="covering_partially"></p>
+//!
+//!</body>
+//!
+//!</html>
+}
+test("different overlapping behavior with transforms")
+	require CSS_TRANSFORMS;
+{
+	ElementStore store;
+	RECT area = {0, 0, 51, 10000},
+		ext_area = {0, 0, 10000, 10000};
+	ST_ElementCollectingObject::ST_ElementWithOverlappingCustomizer customizer;
+	ST_ElementCollectingObject element_collecting_obj(state.doc, area, customizer, &ext_area);
+
+	OP_STATUS stat = element_collecting_obj.Init();
+	verify(OpStatus::IsSuccess(stat));
+
+	stat = element_collecting_obj.Traverse(state.doc->GetLogicalDocument()->GetRoot());
+	verify(OpStatus::IsSuccess(stat));
+
+	stat = element_collecting_obj.CollectElements(store);
+	verify(OpStatus::IsSuccess(stat));
+
+	/** The transformed rectangle of 'covering_non_angle' is still a rectangle with edges parallel
+		to the axes. It covers 'covered_non_angle' partially. We can keep only the still visible part. */
+	verify(Exists(store, "covered_non_angle", DOCUMENT_ELEMENT_TYPE_HTML_ELEMENT) == TRUE);
+	verify(NumRects(store, "covered_non_angle") == 3);
+
+	// Rect 'covering_fully' is transformed by skew transforms and it fully overlaps the 'covered_fully'.
+	verify(Exists(store, "covered_fully", DOCUMENT_ELEMENT_TYPE_HTML_ELEMENT) == FALSE);
+
+	/** Rect 'covering_partially' is transformed by rotate and skew transforms, but it doesn't
+		fully overlap the 'covered_partially'. Since the transformed rectangle is no longer
+		a rectangle with edges parallel to the axes, we do not perform precise divisions.
+		We just keep the initial rect. */
+	verify(Exists(store, "covered_partially", DOCUMENT_ELEMENT_TYPE_HTML_ELEMENT) == TRUE);
+	verify(NumRects(store, "covered_partially") == 1);
+
+	verify(HasRect(store, OpRect(0, 0, 70, 100), "covered_non_angle", DOCUMENT_ELEMENT_TYPE_HTML_ELEMENT));
+	verify(HasRect(store, OpRect(70, 0, 30, 20), "covered_non_angle", DOCUMENT_ELEMENT_TYPE_HTML_ELEMENT));
+	verify(HasRect(store, OpRect(70, 70, 30, 30), "covered_non_angle", DOCUMENT_ELEMENT_TYPE_HTML_ELEMENT));
+
+	verify(HasRect(store, OpRect(0, 300, 100, 100), "covered_partially", DOCUMENT_ELEMENT_TYPE_HTML_ELEMENT));
+}
+
+html
+{
+//!<!DOCTYPE html>
+//!<html>
+//!<head>
+//!<style>
+//!*
+//!{
+//!	margin:0;padding:0;
+//!	font-family:'AHEM';
+//!	line-height:20px;
+//!	vertical-align:top;
+//!	font-size:20px;
+//!}
+//!
+//!#outer_first
+//!{
+//!	width:150px;
+//!	height:150px;
+//!}
+//!
+//!#inline_first
+//!{
+//!	background-color:green;
+//!}
+//!
+//!#inner_first
+//!{
+//!	width:80px;
+//!	height:50px;
+//!	background-color:green;
+//!	margin-top:50px;
+//!	margin-left:20px;
+//!}
+//!
+//!#outer_second
+//!{
+//!	width:150px;
+//!	height:150px;
+//!	max-height:150px;
+//!	position:absolute;
+//!	left:0px;
+//!	top:0px;
+//!	opacity:0.5;
+//!	background-color:yellow;
+//!}
+//!
+//!#inner_second
+//!{
+//!	width:80px;
+//!	height:50px;
+//!	background-color:brown;
+//!	margin-top:70px;
+//!	margin-left:20px;
+//!}
+//!
+//!#inner2_second
+//!{
+//!	position:relative;
+//!	top:-50px;
+//!	left:20px;
+//!	width:80px;
+//!	height:50px;
+//!	background-color:orange;
+//!}
+//!
+//!#third_layer
+//!{
+//!	width:80px;
+//!	height:50px;
+//!	position:relative;
+//!	left:20px;
+//!	top:-100px;
+//!	opacity:0.3;
+//!	background-color:blue;
+//!	z-index:1;
+//!}
+//!
+//!</style>
+//!</head>
+//!<body>
+//!
+//!<div id="outer_first">
+//!<span id="inline_first">x x x</span>
+//!<div id="inner_first"></div>
+//!</div>
+//!
+//!<div id="outer_second">
+//!<div id="inner_second"></div>
+//!<div id="inner2_second"></div>
+//!
+//!<div id="third_layer">
+//!</div>
+//!</div>
+//!
+//!</body>
+//!
+//!</html>
+}
+subtest CareForOpacityEnabled()
+{
+	ElementStore store;
+	RECT area = {0, 0, 10000, 10000};
+	ST_ElementCollectingObject::ST_ElementWithOverlappingAndOpacityCustomizer customizer;
+	ST_ElementCollectingObject element_collecting_obj(state.doc, area, customizer);
+
+	OP_STATUS stat = element_collecting_obj.Init();
+	verify(OpStatus::IsSuccess(stat));
+
+	stat = element_collecting_obj.Traverse(state.doc->GetLogicalDocument()->GetRoot());
+	verify(OpStatus::IsSuccess(stat));
+
+	stat = element_collecting_obj.CollectElements(store);
+	verify(OpStatus::IsSuccess(stat));
+
+	verify(Exists(store, "outer_first", DOCUMENT_ELEMENT_TYPE_HTML_ELEMENT) == TRUE);
+	verify(Exists(store, "inline_first", DOCUMENT_ELEMENT_TYPE_HTML_ELEMENT) == TRUE);
+	verify(Exists(store, "inner_first", DOCUMENT_ELEMENT_TYPE_HTML_ELEMENT) == TRUE);
+
+	verify(Exists(store, "outer_second", DOCUMENT_ELEMENT_TYPE_HTML_ELEMENT) == TRUE);
+	verify(Exists(store, "inner_second", DOCUMENT_ELEMENT_TYPE_HTML_ELEMENT) == FALSE);
+	verify(Exists(store, "inner2_second", DOCUMENT_ELEMENT_TYPE_HTML_ELEMENT) == TRUE);
+
+	verify(Exists(store, "third_layer", DOCUMENT_ELEMENT_TYPE_HTML_ELEMENT) == TRUE);
+
+}
+subtest CareForOpacityDisabled()
+{
+	ElementStore store;
+	RECT area = {0, 0, 10000, 10000};
+	ST_ElementCollectingObject::ST_ElementWithOverlappingCustomizer customizer;
+	ST_ElementCollectingObject element_collecting_obj(state.doc, area, customizer);
+
+	OP_STATUS stat = element_collecting_obj.Init();
+	verify(OpStatus::IsSuccess(stat));
+
+	stat = element_collecting_obj.Traverse(state.doc->GetLogicalDocument()->GetRoot());
+	verify(OpStatus::IsSuccess(stat));
+
+	stat = element_collecting_obj.CollectElements(store);
+	verify(OpStatus::IsSuccess(stat));
+
+	verify(Exists(store, "outer_first", DOCUMENT_ELEMENT_TYPE_HTML_ELEMENT) == FALSE);
+	verify(Exists(store, "inline_first", DOCUMENT_ELEMENT_TYPE_HTML_ELEMENT) == FALSE);
+	verify(Exists(store, "inner_first", DOCUMENT_ELEMENT_TYPE_HTML_ELEMENT) == FALSE);
+
+	verify(Exists(store, "outer_second", DOCUMENT_ELEMENT_TYPE_HTML_ELEMENT) == TRUE);
+	verify(Exists(store, "inner_second", DOCUMENT_ELEMENT_TYPE_HTML_ELEMENT) == FALSE);
+	verify(Exists(store, "inner2_second", DOCUMENT_ELEMENT_TYPE_HTML_ELEMENT) == FALSE);
+
+	verify(Exists(store, "third_layer", DOCUMENT_ELEMENT_TYPE_HTML_ELEMENT) == TRUE);
+}
+test("overlapping elements with opacity property")
+	require success "AHEM";
+{
+	verify(CareForOpacityEnabled());
+	verify(CareForOpacityDisabled());
+}
+
+html
+{
+//!<!DOCTYPE html>
+//!<html>
+//!<head>
+//!<style>
+//!
+//!*
+//!{
+//!	margin:0;padding:0;
+//!	font-family:'AHEM';
+//!	line-height:20px;
+//!	vertical-align:top;
+//!	font-size:20px;
+//!}
+//!
+//!#neg_margin_covered
+//!{
+//!	width:100px;
+//!	height:100px;
+//!	background-color:orange;
+//!}
+//!
+//!#neg_margin_covering
+//!{
+//!	width:100px;
+//!	height:100px;
+//!	background-color:yellow;
+//!	margin-top:-40px;
+//!}
+//!
+//!#visible_never
+//!{
+//!	background-color:blue;
+//!	width:80px;
+//!	height:20px;
+//!}
+//!
+//!img.covering
+//!{
+//!	width:80px;
+//!	height:20px;
+//!}
+//!
+//!</style>
+//!</head>
+//!<body>
+//!
+//!<div id="neg_margin_covered">
+//!<br />
+//!<span id="visible_always">xxxx</span>
+//!<br /> <br />
+//!<div id="visible_never"></div>
+//!<span id="visible_in_two_pass">xxxx</span>
+//!</div>
+//!<div id="neg_margin_covering">
+//!<img class="covering" src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAAXNSR0IArs4c6QAAAAZiS0dEAP8A/wD/oL2nkwAAAAlwSFlzAAALEwAACxMBAJqcGAAAAAd0SU1FB9oLHQwQJ0wAdeQAAAANSURBVAjXY2BoYPgPAAKEAYABADlnAAAAAElFTkSuQmCC=" />
+//!</div>
+//!
+//!</body>
+//!</html>
+}
+subtest OnePassTraverse()
+{
+	ElementStore store;
+	RECT area = {0, 0, 10000, 10000};
+	ST_ElementCollectingObject::ST_ElementWithOverlappingCustomizer customizer;
+	ST_ElementCollectingObject element_collecting_obj(state.doc, area, customizer, NULL, TRUE);
+
+	OP_STATUS stat = element_collecting_obj.Init();
+	verify(OpStatus::IsSuccess(stat));
+
+	stat = element_collecting_obj.Traverse(state.doc->GetLogicalDocument()->GetRoot());
+	verify(OpStatus::IsSuccess(stat));
+
+	stat = element_collecting_obj.CollectElements(store);
+	verify(OpStatus::IsSuccess(stat));
+
+	verify(Exists(store, "visible_always", DOCUMENT_ELEMENT_TYPE_HTML_ELEMENT) == TRUE);
+	verify(Exists(store, "visible_in_two_pass", DOCUMENT_ELEMENT_TYPE_HTML_ELEMENT) == FALSE);
+	verify(Exists(store, "visible_never", DOCUMENT_ELEMENT_TYPE_HTML_ELEMENT) == FALSE);
+}
+subtest TwoPassTraverse()
+{
+	ElementStore store;
+	RECT area = {0, 0, 10000, 10000};
+	ST_ElementCollectingObject::ST_ElementWithOverlappingCustomizer customizer;
+	ST_ElementCollectingObject element_collecting_obj(state.doc, area, customizer, NULL, FALSE);
+
+	OP_STATUS stat = element_collecting_obj.Init();
+	verify(OpStatus::IsSuccess(stat));
+
+	stat = element_collecting_obj.Traverse(state.doc->GetLogicalDocument()->GetRoot());
+	verify(OpStatus::IsSuccess(stat));
+
+	stat = element_collecting_obj.CollectElements(store);
+	verify(OpStatus::IsSuccess(stat));
+
+	verify(Exists(store, "visible_always", DOCUMENT_ELEMENT_TYPE_HTML_ELEMENT) == TRUE);
+	verify(Exists(store, "visible_in_two_pass", DOCUMENT_ELEMENT_TYPE_HTML_ELEMENT) == TRUE);
+	verify(Exists(store, "visible_never", DOCUMENT_ELEMENT_TYPE_HTML_ELEMENT) == FALSE);
+}
+test("difference between one and two pass traverse")
+	require success "AHEM";
+{
+	verify(OnePassTraverse());
+	verify(TwoPassTraverse());
+}
+
+
+html
+{
+//!<!DOCTYPE html>
+//!<html>
+//!<head>
+//!<style>
+//!
+//!*
+//!{
+//!	margin:0;padding:0;
+//!	font-family:'AHEM';
+//!	line-height:20px;
+//!	vertical-align:top;
+//!	font-size:20px;
+//!}
+//!
+//!div.main_area
+//!{
+//!	width:200px;
+//!	background-color:yellow;
+//!}
+//!
+//!b
+//!{
+//!	font-weight:normal;
+//!}
+//!
+//!b.bigger_font
+//!{
+//!	font-size:25px;
+//!	background-color:green;
+//!}
+//!
+//!b.inline_relative
+//!{
+//!	position:relative;
+//!	top:0px;
+//!	left:210px;
+//!	color:blue;
+//!}
+//!
+//!#from_extended_out
+//!{
+//!	margin-top:20px;
+//!	width:100px;
+//!	height:100px;
+//!	background-color:green;
+//!}
+//!
+//!p.child_of_extended_out
+//!{
+//!	position:relative;
+//!	left:210px;
+//!	top:20px;
+//!	width:50px;
+//!	height:50px;
+//!	background-color:blue;
+//!}
+//!
+//!div.absolute_covering1
+//!{
+//!	position:absolute;
+//!	top:50px;
+//!	left:201px;
+//!	width:70px;
+//!	height:70px;
+//!	opacity:0.3;
+//!	background-color:orange;
+//!	z-index:1;
+//!}
+//!
+//!#from_main_out
+//!{
+//!	margin-top:20px;
+//!	width:100px;
+//!	height:100px;
+//!	background-color:green;
+//!}
+//!
+//!p.child_of_main_out
+//!{
+//!	position:relative;
+//!	left:210px;
+//!	top:20px;
+//!	width:50px;
+//!	height:50px;
+//!	background-color:blue;
+//!}
+//!
+//!div.absolute_covering2
+//!{
+//!	position:absolute;
+//!	top:155px;
+//!	left:0px;
+//!	width:105px;
+//!	height:110px;
+//!	opacity:0.3;
+//!	background-color:orange;
+//!	z-index:1;
+//!}
+//!
+//!#in_ext_with_child_in_main
+//!{
+//!	margin-left:201px;
+//!	width:50px;
+//!	height:50px;
+//!	background-color:green;
+//!}
+//!
+//!p.the_child_of_ext
+//!{
+//!	position:relative;
+//!	top:0px;
+//!	left:-55px;
+//!	width:50px;
+//!	height:50px;
+//!	background-color:blue;
+//!}
+//!
+//!#in_ext_no_child
+//!{
+//!	margin-top:10px;
+//!	margin-left:201px;
+//!	width:50px;
+//!	height:50px;
+//!	background-color:green;
+//!}
+//!</style>
+//!</head>
+//!<body>
+//!
+//!<div class="main_area">
+//!<span id="inline_elm"><b class="inline_relative">xx</b><b class="bigger_font">&nbsp;x&nbsp;x&nbsp;x&nbsp;x&nbsp;x</b>
+//!</span>
+//!<div id="from_extended_out">
+//!<p class="child_of_extended_out"></p>
+//!</div>
+//!<div id="from_main_out">
+//!<p class="child_of_main_out"></p>
+//!</div>
+//!
+//!<div id="in_ext_with_child_in_main">
+//!<p class="the_child_of_ext">
+//!</p>
+//!</div>
+//!
+//!<div id="in_ext_no_child">
+//!</div>
+//!
+//!</div>
+//!
+//!<div class="absolute_covering1"></div>
+//!<div class="absolute_covering2"></div>
+//!
+//!</body>
+//!</html>
+}
+test("various issues with main vs. extended area")
+	require success "AHEM";
+{
+	ElementStore store;
+	RECT area = {0, 0, 201, 10000},
+		ext_area = {0, 0, 10000, 10000};
+	ST_ElementCollectingObject::ST_ElementWithOverlappingCustomizer customizer;
+	ST_ElementCollectingObject element_collecting_obj(state.doc, area, customizer, &ext_area);
+
+	OP_STATUS stat = element_collecting_obj.Init();
+	verify(OpStatus::IsSuccess(stat));
+
+	stat = element_collecting_obj.Traverse(state.doc->GetLogicalDocument()->GetRoot());
+	verify(OpStatus::IsSuccess(stat));
+
+	stat = element_collecting_obj.CollectElements(store);
+	verify(OpStatus::IsSuccess(stat));
+
+	verify(Exists(store, "inline_elm", DOCUMENT_ELEMENT_TYPE_HTML_ELEMENT) == TRUE);
+	verify(NumRects(store, "inline_elm") == 2);
+
+	verify(Exists(store, "from_extended_out", DOCUMENT_ELEMENT_TYPE_HTML_ELEMENT) == TRUE);
+	verify(NumRects(store, "from_extended_out") == 1);
+
+	verify(Exists(store, "from_main_out", DOCUMENT_ELEMENT_TYPE_HTML_ELEMENT) == FALSE);
+
+	verify(Exists(store, "in_ext_with_child_in_main", DOCUMENT_ELEMENT_TYPE_HTML_ELEMENT) == TRUE);
+	verify(NumRects(store, "in_ext_with_child_in_main") == 2);
+
+	verify(Exists(store, "in_ext_no_child", DOCUMENT_ELEMENT_TYPE_HTML_ELEMENT) == FALSE);
+}
+
+
+html
+{
+//!<!DOCTYPE html>
+//!<html>
+//!<head>
+//!<style>
+//!
+//!*
+//!{
+//!	margin:0;padding:0;
+//!	font-family:'AHEM';
+//!	line-height:20px;
+//!	vertical-align:top;
+//!	font-size:20px;
+//!}
+//!
+//!div.inline_container
+//!{
+//!	width:200px;
+//!	height:200px;
+//!	max-height:200px;
+//!	background-color:yellow;
+//!}
+//!
+//!b
+//!{
+//!	font-weight:normal;
+//!}
+//!
+//!b.transform_first
+//!{
+//!	transform:rotate(30deg);
+//!	transform-origin:bottom left;
+//!	color:green;
+//!}
+//!
+//!b.transform_second
+//!{
+//!	transform:translate(0px,10px);
+//!	transform-origin:bottom left;
+//!	color:blue;
+//!}
+//!
+//!b.larger
+//!{
+//!	font-size:30px;
+//!}
+//!
+//!b.fully_inside
+//!{
+//!	color:orange;
+//!	transform:translate(-90px,53px) skewX(15deg) skewY(20deg);
+//!	transform-origin:bottom left;
+//!}
+//!
+//!#absolute_transformed
+//!{
+//!	width:100px;
+//!	height:100px;
+//!	background-color:yellow;
+//!	transform:translate(10px,10px) scaleX(2) scaleY(2);
+//!	transform-origin:top left;
+//!}
+//!
+//!#nested_block_transform1
+//!{
+//!	width:30px;
+//!	height:30px;
+//!	background-color:green;
+//!	transform:translate(10px,10px) skewX(45deg);
+//!	transform-origin:top left;
+//!}
+//!
+//!#nested_block_transform2
+//!{
+//!	width:30px;
+//!	height:30px;
+//!	background-color:green;
+//!	transform:translate(40px,20px) rotate(60deg);
+//!	transform-origin:top left;
+//!}
+//!
+//!</style>
+//!</head>
+//!<body>
+//!<div class="inline_container">
+//!<span id="main_element">xxxx<b class="transform_first">xxx<b class="transform_second">xxx xxx</b><b class="larger">xxxx</b></b><b class="fully_inside">xx</b></span>
+//!</div>
+//!
+//!<div id="absolute_transformed">
+//!<p id="nested_block_transform1">
+//!</p>
+//!<p id="nested_block_transform2">
+//!</p>
+//!</div>
+//!
+//!</body>
+//!
+//!</html>
+}
+test("transforms tree building and line breaked nested transforms")
+	require success "AHEM";
+	require CSS_TRANSFORMS;
+{
+	ElementStore store;
+	RECT area = {0, 0, 10000, 10000};
+	ST_ElementCollectingObject::ST_MinCustomizer customizer;
+	ST_ElementCollectingObject element_collecting_obj(state.doc, area, customizer);
+
+	OP_STATUS stat = element_collecting_obj.Init();
+	verify(OpStatus::IsSuccess(stat));
+
+	stat = element_collecting_obj.Traverse(state.doc->GetLogicalDocument()->GetRoot());
+	verify(OpStatus::IsSuccess(stat));
+
+	verify(element_collecting_obj.NumTransformTreeNodes() == 9);
+
+	stat = element_collecting_obj.CollectElements(store);
+	verify(OpStatus::IsSuccess(stat));
+
+	verify(Exists(store, "main_element", DOCUMENT_ELEMENT_TYPE_HTML_ELEMENT) == TRUE);
+	verify(NumRects(store, "main_element") == 7);
+}
+
+html
+{
+//!<!DOCTYPE html>
+//!<html>
+//!<head>
+//!<style>
+//!
+//!*
+//!{
+//!	margin:0;padding:0;
+//!	font-family:'AHEM';
+//!	line-height:20px;
+//!	vertical-align:top;
+//!	font-size:20px;
+//!}
+//!
+//!div.container_in_root
+//!{
+//!	width:200px;
+//!	height:200px;
+//!	max-height:200px;
+//!	overflow:hidden;
+//!	background-color:yellow;
+//!}
+//!
+//!div.clipped_in_root
+//!{
+//!	width:200px;
+//!	height:100px;
+//!	background-color:orange;
+//!	transform:translate(130px,10px) rotate(30deg);
+//!	transform-origin:top left;
+//!}
+//!
+//!#root_clipping_partially_in
+//!{
+//!	position:relative;
+//!	left:70px;
+//!	top:20px;
+//!}
+//!
+//!#root_clipping_fully_out
+//!{
+//!	position:relative;
+//!	left:150px;
+//!	top:40px;
+//!}
+//!
+//!#clipped_non_angle_in_root
+//!{
+//!	width:40px;
+//!	height:100px;
+//!	background-color:green;
+//!	transform:translate(0px,50px) scaleX(1.5);
+//!	transform-origin:top left;
+//!}
+//!
+//!div.container_in_transform
+//!{
+//!	width:200px;
+//!	height:200px;
+//!	max-height:200px;
+//!	overflow:hidden;
+//!	background-color:yellow;
+//!	transform:translate(0px,150px) rotate(-45deg);
+//!	transform-origin:top left;
+//!}
+//!
+//!div.second_transform
+//!{
+//!	width:200px;
+//!	height:100px;
+//!	background-color:orange;
+//!	transform:translate(100px,120px) rotate(45deg);
+//!	transform-origin:top left;
+//!}
+//!
+//!#transform_clipping_partially_in
+//!{
+//!	position:relative;
+//!	left:40px;
+//!	top:0px;
+//!}
+//!
+//!#transform_clipping_in_clip_bbox
+//!{
+//!	position:relative;
+//!	left:90px;
+//!	top:20px;
+//!}
+//!
+//!#transform_clipping_fully_out
+//!{
+//!	position:relative;
+//!	left:160px;
+//!	top:40px;
+//!}
+//!
+//!</style>
+//!</head>
+//!<body>
+//!
+//!<div class="container_in_root">
+//!
+//!<div class="clipped_in_root">
+//!<span id="root_clipping_fully_in">xxx</span><br />
+//!<span id="root_clipping_partially_in">xxxxx</span> <br />
+//!<span id="root_clipping_fully_out">xx</span>
+//!</div>
+//!
+//!<div id="clipped_non_angle_in_root">
+//!</div>
+//!
+//!</div>
+//!
+//!<div class="container_in_transform">
+//!<div class="second_transform">
+//!<span id="transform_clipping_partially_in">xxxxxxx</span><br />
+//!<span id="transform_clipping_in_clip_bbox">xxxx</span> <br />
+//!<span id="transform_clipping_fully_out">xx</span>
+//!</div>
+//!</div>
+//!
+//!</body>
+//!
+//!</html>
+}
+test("finding and clipping elements in transforms")
+	require success "AHEM";
+	require CSS_TRANSFORMS;
+{
+	ElementStore store;
+	RECT area = {0, 0, 10000, 10000};
+	ST_ElementCollectingObject::ST_MinCustomizer customizer;
+	ST_ElementCollectingObject element_collecting_obj(state.doc, area, customizer);
+
+	OP_STATUS stat = element_collecting_obj.Init();
+	verify(OpStatus::IsSuccess(stat));
+
+	stat = element_collecting_obj.Traverse(state.doc->GetLogicalDocument()->GetRoot());
+	verify(OpStatus::IsSuccess(stat));
+
+	stat = element_collecting_obj.CollectElements(store);
+	verify(OpStatus::IsSuccess(stat));
+
+	verify(Exists(store, "root_clipping_fully_in", DOCUMENT_ELEMENT_TYPE_HTML_ELEMENT) == TRUE);
+	verify(HasRect(store, OpRect(0, 0, 60, 20), "root_clipping_fully_in", DOCUMENT_ELEMENT_TYPE_HTML_ELEMENT));
+
+	verify(Exists(store, "root_clipping_partially_in", DOCUMENT_ELEMENT_TYPE_HTML_ELEMENT) == TRUE);
+	/** The element is only partially in clip rect. But the rectangle of it will still be the full rectangle,
+		because currently we do not store the previous clip rect after entering a transform context. */
+	verify(HasRect(store, OpRect(70, 40, 100, 20), "root_clipping_partially_in", DOCUMENT_ELEMENT_TYPE_HTML_ELEMENT));
+
+	verify(Exists(store, "root_clipping_fully_out", DOCUMENT_ELEMENT_TYPE_HTML_ELEMENT) == FALSE);
+
+	verify(Exists(store, "transform_clipping_partially_in", DOCUMENT_ELEMENT_TYPE_HTML_ELEMENT) == TRUE);
+	// Full rectangle for the same reason as 'root_clipping_partially_in'.
+	verify(HasRect(store, OpRect(40, 0, 140, 20), "transform_clipping_partially_in", DOCUMENT_ELEMENT_TYPE_HTML_ELEMENT));
+
+	/** This is false positive. Before entering second transform context, we intersect the current clipping rectangle, which
+		is in the first transform ctx, with the area. When intersecting, the clip rect grows bigger, because it's bboxed to root.
+		So there is an area, which if something intersects, will be treated as hit. */
+	verify(Exists(store, "transform_clipping_in_clip_bbox", DOCUMENT_ELEMENT_TYPE_HTML_ELEMENT) == TRUE);
+
+	verify(Exists(store, "transform_clipping_fully_out", DOCUMENT_ELEMENT_TYPE_HTML_ELEMENT) == FALSE);
+
+	verify(HasTransformedRect(store, "root_clipping_fully_in", DOCUMENT_ELEMENT_TYPE_HTML_ELEMENT));
+	verify(HasTransformedRect(store, "root_clipping_partially_in", DOCUMENT_ELEMENT_TYPE_HTML_ELEMENT));
+	verify(HasTransformedRect(store, "transform_clipping_partially_in", DOCUMENT_ELEMENT_TYPE_HTML_ELEMENT));
+}
+
+html
+{
+//!<!DOCTYPE html>
+//!<html>
+//!<head>
+//!<style>
+//!
+//!*
+//!{
+//!	margin:0;padding:0;
+//!}
+//!
+//!div.clipping
+//!{
+//!	width:100px;
+//!	height:200px;
+//!	background-color:yellow;
+//!		overflow:auto;
+//!}
+//!
+//!#element1
+//!{
+//!	width:80px;
+//!	height:80px;
+//!	background-color:green;
+//!}
+//!
+//!p.positioned_child1
+//!{
+//!	width:80px;
+//!	height:80px;
+//!	background-color:green;
+//!	position:relative;
+//!	top:0px;
+//!	left:120px;
+//!}
+//!
+//!#element2
+//!{
+//!	position:relative;
+//!	top:10px;
+//!	left:120px;
+//!	width:80px;
+//!	height:80px;
+//!	background-color:blue;
+//!}
+//!
+//!p.positioned_child2
+//!{
+//!	width:80px;
+//!	height:80px;
+//!	background-color:blue;
+//!	position:relative;
+//!	top:0px;
+//!	left:-120px;
+//!}
+//!
+//!div div
+//!{
+//!	transform:rotate(1deg);
+//!	transform-origin:bottom left;
+//!}
+//!
+//!</style>
+//!</head>
+//!<body>
+//!
+//!<div class="clipping">
+//!
+//!<div id="element1">
+//!<p class="positioned_child1">
+//!</p>
+//!</div>
+//!
+//!<div id="element2">
+//!<p class="positioned_child2">
+//!</p>
+//!</div>
+//!
+//!</div>
+//!
+//!</body>
+//!
+//!</html>
+}
+test("empty main area after transform after clipping")
+	require CSS_TRANSFORMS;
+{
+	ElementStore store;
+	RECT area = {100, 0, 200, 201},
+		extended_area = {0, 0, 201, 201};
+	ST_ElementCollectingObject::ST_MinCustomizer customizer;
+	ST_ElementCollectingObject element_collecting_obj(state.doc, area, customizer, &extended_area);
+
+	OP_STATUS stat = element_collecting_obj.Init();
+	verify(OpStatus::IsSuccess(stat));
+
+	stat = element_collecting_obj.Traverse(state.doc->GetLogicalDocument()->GetRoot());
+	verify(OpStatus::IsSuccess(stat));
+
+	stat = element_collecting_obj.CollectElements(store);
+	verify(OpStatus::IsSuccess(stat));
+
+	// Both elements should not be collected, because the parts of them that intersects the main area are outside the clip rect from scrollable.
+	verify(Exists(store, "element1", DOCUMENT_ELEMENT_TYPE_HTML_ELEMENT) == FALSE);
+	verify(Exists(store, "element2", DOCUMENT_ELEMENT_TYPE_HTML_ELEMENT) == FALSE);
+}
+
+html
+{
+//!<!DOCTYPE html>
+//!<html>
+//!<head>
+//!<style>
+//!
+//!*
+//!{
+//!	margin:0;padding:0;
+//!}
+//!
+//!#outer
+//!{
+//!	width:150px;
+//!	height:200px;
+//!	border: solid 1px;
+//!}
+//!
+//!#opacity_non_positioned
+//!{
+//!	width:100px;
+//!	height:100px;
+//!	opacity:0.5;
+//!	background-color:green;
+//!}
+//!
+//!div.positioned_in_opacity
+//!{
+//!	width:100px;
+//!	height:100px;
+//!	background-color:blue;
+//!	position:relative;
+//!	top:0px;
+//!	left:155px;
+//!}
+//!
+//!</style>
+//!</head>
+//!<body>
+//!
+//!<div id="outer">
+//!<div id="opacity_non_positioned">
+//!<div class="positioned_in_opacity">
+//!</div>
+//!</div>
+//!</div>
+//!
+//!</body>
+//!
+//!</html>
+}
+test ("positioned descendant of element with opacity < 1 rect added to ancestors")
+{
+	ElementStore store;
+	RECT area = {0, 0, 10000, 10000};
+	ST_ElementCollectingObject::ST_MinCustomizer customizer;
+	ST_ElementCollectingObject element_collecting_obj(state.doc, area, customizer);
+
+	OP_STATUS stat = element_collecting_obj.Init();
+	verify(OpStatus::IsSuccess(stat));
+
+	stat = element_collecting_obj.Traverse(state.doc->GetLogicalDocument()->GetRoot());
+	verify(OpStatus::IsSuccess(stat));
+
+	stat = element_collecting_obj.CollectElements(store);
+	verify(OpStatus::IsSuccess(stat));
+
+	verify(Exists(store, "opacity_non_positioned", DOCUMENT_ELEMENT_TYPE_HTML_ELEMENT) == TRUE);
+	verify(NumRects(store, "opacity_non_positioned") == 2);
+
+	verify(Exists(store, "outer", DOCUMENT_ELEMENT_TYPE_HTML_ELEMENT) == TRUE);
+	verify(NumRects(store, "outer") == 2);
+}
+
+html
+{
+//!<!DOCTYPE html>
+//!<html>
+//!<head>
+//!<style>
+//!
+//!*
+//!{
+//!	margin:0;padding:0;
+//!}
+//!
+//!#part_in_main_covered
+//!{
+//!	width:100px;
+//!	height:80px;
+//!	margin-left:150px;
+//!	background-color:green;
+//!}
+//!
+//!#two_rects_div
+//!{
+//!	width:100px;
+//!	height:60px;
+//!	margin-left:50px;
+//!	margin-top:50px;
+//!	background-color:lime;
+//!}
+//!
+//!div.positioned_child
+//!{
+//!	width:60px;
+//!	height:100px;
+//!	background-color:teal;
+//!	position:absolute;
+//!	top:110px;
+//!	left:100px;
+//!	z-index:-1;
+//!}
+//!
+//!p.covering1
+//!{
+//!	width:70px;
+//!	height:90px;
+//!	position:absolute;
+//!	top:0px;
+//!	left:140px;
+//!	background-color:orange;
+//!	opacity:0.7;
+//!}
+//!
+//!p.covering2
+//!{
+//!	width:110px;
+//!	height:110px;
+//!	position:absolute;
+//!	top:105px;
+//!	left:0px;
+//!	background-color:orange;
+//!	opacity:0.7;
+//!}
+//!
+//!</style>
+//!</head>
+//!<body>
+//!
+//!<div id="part_in_main_covered">
+//!</div>
+//!
+//!<div id="two_rects_div">
+//!<div class="positioned_child">
+//!</div>
+//!</div>
+//!
+//!<p class="covering1"></p>
+//!<p class="covering2"></p>
+//!
+//!</body>
+//!</html>
+}
+test("rects number change after overlapping")
+	disabled;
+	/** This test fails because of a little bug - in case of overlapping there might happen
+		that the element has suboptimal region or the rects are classified wrongly in terms
+		of main or extended area intersection. See verify comments. */
+{
+	ElementStore store;
+	RECT area = {0, 0, 200, 10000},
+		ext_area = {0, 0, 10000, 10000};
+	ST_ElementCollectingObject::ST_ElementWithOverlappingCustomizer customizer;
+	ST_ElementCollectingObject element_collecting_obj(state.doc, area, customizer, &ext_area);
+
+	OP_STATUS stat = element_collecting_obj.Init();
+	verify(OpStatus::IsSuccess(stat));
+
+	stat = element_collecting_obj.Traverse(state.doc->GetLogicalDocument()->GetRoot());
+	verify(OpStatus::IsSuccess(stat));
+
+	stat = element_collecting_obj.CollectElements(store);
+	verify(OpStatus::IsSuccess(stat));
+
+	// After being overlapped, this element's regions intersects only the extended area.
+	verify(Exists(store, "part_in_main_covered", DOCUMENT_ELEMENT_TYPE_HTML_ELEMENT) == FALSE);
+
+	verify(Exists(store, "two_rects_div", DOCUMENT_ELEMENT_TYPE_HTML_ELEMENT) == TRUE);
+	// After overlapping one rect is fully inside the second one of 'two_rects_div' element region.
+	verify(NumRects(store, "two_rects_div") == 1);
+}
+
+html
+{
+//!<!DOCTYPE html>
+//!<html>
+//!<head>
+//!<style>
+//!*
+//!{
+//!	margin:0;padding:0;
+//!	font-family:'AHEM';
+//!	line-height:20px;
+//!	font-size:20px;
+//!	vertical-align:bottom;
+//!}
+//!
+//!#mc
+//!{
+//!	width:200px;
+//!	height:100px;
+//!	column-count:2;
+//!	column-gap:0;
+//!	orphans:0;
+//!	widows:0;
+//!	overflow:hidden;
+//!}
+//!
+//!a, span
+//!{
+//!	background-color:lime;
+//!}
+//!
+//!#covered_anchor
+//!{
+//!	display:block;
+//!	position:absolute;
+//!	z-index:-1;
+//!	top:20px;
+//!	left:0px;
+//!	height:20px;
+//!	width:120px;
+//!}
+//!
+//!</style>
+//!</head>
+//!<body id="body">
+//!
+//!<div id="mc">
+//!WORD
+//!<a id="not_hit_anchor" href="#">COVERING_ANCHOR</a>
+//!WORD WORD WORD WORD
+//!<span>WORD</span>
+//!WORD WORD
+//!<a id="hit_anchor" href="#">HIT_ANCHOR</a>
+//!</div>
+//!
+//!<a id="covered_anchor" href="#"></a>
+//!
+//!</body>
+//!
+//!</html>
+}
+test("multicol covering, clipping and extended area")
+	require success "AHEM";
+{
+	ElementStore store;
+	RECT area = {100, 0, 200, 100};
+	RECT extended_area = {0, 0, 200, 100};
+
+	ST_ElementCollectingObject::ST_AnchorCustomizerWithOverlapping customizer;
+	ST_ElementCollectingObject element_collecting_obj(state.doc, area, customizer, &extended_area);
+
+	OP_STATUS stat = element_collecting_obj.Init();
+	verify(OpStatus::IsSuccess(stat));
+
+	stat = element_collecting_obj.Traverse(state.doc->GetLogicalDocument()->GetRoot());
+	verify(OpStatus::IsSuccess(stat));
+
+	stat = element_collecting_obj.CollectElements(store);
+	verify(OpStatus::IsSuccess(stat));
+
+	verify(Exists(store, "not_hit_anchor", DOCUMENT_ELEMENT_TYPE_HTML_ELEMENT) == FALSE);
+	verify(Exists(store, "covered_anchor", DOCUMENT_ELEMENT_TYPE_HTML_ELEMENT) == FALSE);
+	verify(Exists(store, "hit_anchor", DOCUMENT_ELEMENT_TYPE_HTML_ELEMENT) == TRUE);
+
+	verify(NumRects(store, "hit_anchor") == 1);
+	verify(HasRect(store, OpRect(100, 80, 100, 20), "hit_anchor", DOCUMENT_ELEMENT_TYPE_HTML_ELEMENT));
+}

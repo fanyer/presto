@@ -1,0 +1,184 @@
+/* -*- Mode: c++; tab-width: 4; indent-tabs-mode: t; c-basic-offset: 4 -*-
+ *
+ * Copyright (C) 1995-2009 Opera Software AS.  All rights reserved.
+ *
+ * This file is part of the Opera web browser.	It may not be distributed
+ * under any circumstances.
+ *
+ * @author Petter Nilsen (pettern@opera.com)
+ */
+
+group "quick.search_field";
+require init; 
+
+include "adjunct/quick/widgets/OpResizeSearchDropDown.h";
+include "adjunct/quick/widgets/OpSearchDropDown.h";
+include "adjunct/desktop_util/search/search_field_history.h";
+include "adjunct/desktop_util/prefs/PrefsCollectionDesktopUI.h";
+
+global
+{
+	OpSearchDropDown* sd; 
+ 
+	void TypeKey(char key) 
+	{ 
+		OpInputAction keypress(OpInputAction::ACTION_LOWLEVEL_KEY_PRESSED); 
+		keypress.SetActionData(key); 
+		sd->edit->OnInputAction(&keypress); 
+	} 
+	void TypeKeys(const char *keys) 
+	{ 
+		while (*keys != 0) 
+		{ 
+			TypeKey(*keys); 
+			keys++; 
+		} 
+	} 
+	void InvokeAction(OpInputAction::Action action) 
+	{ 
+		OpInputAction a(action); 
+		g_input_manager->InvokeAction(&a); 
+	} 
+	INT32 GetSelectedItem() 
+	{ 
+		int position = -1; 
+
+		sd->GetSelectedItem(&position); 
+
+		return position; 
+	} 
+};
+
+test("Show search dropdown") 
+{ 
+	// Close all tabs
+	InvokeAction(OpInputAction::ACTION_CLOSE_PAGE); 
+
+	// Delete all previous searches to get consistent search history
+	InvokeAction(OpInputAction::ACTION_CLEAR_PREVIOUS_SEARCHES); 
+ 
+	g_application->GoToPage(UNI_L("opera:blanker"), TRUE); 
+
+	DocumentDesktopWindow *win = g_application->GetActiveDocumentDesktopWindow(); 
+	verify(win); 
+
+	sd = win->GetSearchDropdown(); 
+	verify(sd); 
+	verify(sd->edit); 
+ 
+    // Focus search field
+	sd->edit->SetFocus(FOCUS_REASON_ACTION); 
+	verify(sd->edit->IsFocused()); 
+	sd->edit->Clear(); 
+ 
+	TypeKey('g'); 
+ 
+	verify(sd->DropdownIsOpen()); 
+	verify(sd->GetModel()->GetCount() > 0); 
+} 
+
+test("Show filtered search history") require success "Show search dropdown";
+{ 
+	// Add some previous searches
+
+	verify(OpStatus::IsSuccess(g_search_field_history->AddEntry(UNI_L("7A8CADE6677811DDBA4B5E9D55D89593"), UNI_L("google search test 1"))));
+	verify(OpStatus::IsSuccess(g_search_field_history->AddEntry(UNI_L("7A8CADE6677811DDBA4B5E9D55D89593"), UNI_L("google search test 2"))));
+	verify(OpStatus::IsSuccess(g_search_field_history->AddEntry(UNI_L("7A8CADE6677811DDBA4B5E9D55D89593"), UNI_L("grongle search test 1"))));
+	verify(OpStatus::IsSuccess(g_search_field_history->AddEntry(UNI_L("7A8CADE6677811DDBA4B5E9D55D89593"), UNI_L("grongle search test 2"))));
+
+    // Focus search field
+	sd->edit->SetFocus(FOCUS_REASON_ACTION); 
+	verify(sd->edit->IsFocused()); 
+	sd->edit->Clear(); 
+
+	TypeKeys("google"); 
+ 
+	verify(sd->DropdownIsOpen()); 
+	verify(sd->GetModel()->GetCount() > 0); 
+
+	int count = 0;
+	int i;
+
+	for(i = 0; i < sd->GetModel()->GetCount(); i++) 
+	{ 
+		SearchDropDownModelItem *item = sd->GetModel()->GetItemByIndex(i);
+		if(item->IsSearchHistoryItem())
+		{
+			SearchHistoryModelItem* search_item = reinterpret_cast<SearchHistoryModelItem *>(item);
+			if(uni_strstr(search_item->GetSearchTerm(), UNI_L("google")))
+			{
+				// we found a previous search matching the entered text
+				count++;
+			}
+		}
+    } 
+	verify(count == 2); 
+} 
+
+test("Show active search on first line") require success "Show search dropdown";
+{ 
+    // Focus search field
+	sd->edit->SetFocus(FOCUS_REASON_ACTION); 
+	verify(sd->edit->IsFocused()); 
+	sd->edit->Clear(); 
+
+	TypeKeys("opera"); 
+ 
+	verify(sd->DropdownIsOpen()); 
+	verify(sd->GetModel()->GetCount() > 0); 
+
+	OpString search_text;
+	int i;
+
+	search_text.Set(UNI_L("opera"));
+
+	for(i = 0; i < sd->GetModel()->GetCount(); i++) 
+	{ 
+		SearchDropDownModelItem *item = reinterpret_cast<SearchDropDownModelItem *>(sd->GetModel()->GetItemByIndex(i));
+		if(item && item->GetSearchItem())
+		{
+			// select the item, then verify that the active search engine item is the same underlying search
+			sd->SetSelectedItem(item, TRUE);
+			verify(OpStatus::IsSuccess(sd->UpdateActiveSearchLine(item->GetSearchItem(), search_text)));
+
+			verify(sd->GetActiveSearchEngineItem());
+			verify(sd->GetActiveSearchEngineItem()->GetSearchItem());
+			verify(sd->GetActiveSearchEngineItem()->GetSearchItem() == item->GetSearchItem());
+
+			OpString search;
+
+			verify(OpStatus::IsSuccess(sd->GetActiveSearchEngineItem()->GetActiveSearch(search)));
+			verify(search.HasContent());
+			verify(uni_strstr(search.CStr(), UNI_L("opera")));
+		} 
+	}
+} 
+
+test("Make sure the size is as defined in prefs")
+{ 
+	verify(sd);
+
+	OpWidget *parent = sd->GetParent();
+
+	verify(parent);
+	while(parent->GetType() != OpTypedObject::WIDGET_TYPE_RESIZE_SEARCH_DROPDOWN)
+	{
+		parent = parent->GetParent();
+	}
+	verify(parent);
+	verify(parent->GetType() == OpTypedObject::WIDGET_TYPE_RESIZE_SEARCH_DROPDOWN);
+
+	OpRect size = parent->GetRect();
+	INT32 width = g_pcui->GetIntegerPref(PrefsCollectionUI::AddressSearchDropDownWeightedWidth);
+
+	if(width < 0)
+	{
+		// on first run, prefs is -1 so nothing to check
+		output("Re-run the selftest to test the size\n");
+	}
+	else
+	{
+		verify(size.width == width);
+	}
+} 
+

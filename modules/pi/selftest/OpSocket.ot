@@ -1,0 +1,1443 @@
+/* -*- Mode: c++; tab-width: 4; indent-tabs-mode: t; c-basic-offset: 4; -*-
+ *
+ * Copyright (C) 1995-2012 Opera Software AS.  All rights reserved.
+ *
+ * This file is part of the Opera web browser.
+ * It may not be distributed under any circumstances.
+ */
+group "pi.opsocket";
+
+include "modules/pi/network/OpSocket.h";
+
+include "modules/hardcore/timer/optimer.h";
+include "modules/pi/network/OpSocketAddress.h";
+include "modules/pi/OpSystemInfo.h";
+include "modules/url/url_socket_wrapper.h";
+
+global {
+#define FOOFOOFOO_1 } // Indentation hack for emacs
+
+class Failer
+{
+public:
+	static void ST_failed(const char* format, ...) {
+		/* Resolve arguments now. The selftest module (ST_failed()) does it too
+		   late (typically when the data has been deleted / re-used). */
+
+		char str[500]; /* ARRAY OK 2009-02-16 mstensho */
+		va_list args;
+		va_start(args, format);
+		op_vsnprintf(str, sizeof(str), format, args);
+		str[sizeof(str)-1] = 0;
+		va_end(args);
+
+		::ST_failed(str);
+	}
+};
+
+class Test : protected Failer
+{
+private:
+	BOOL test_failed;
+
+protected:
+	char* test_buffer;
+	const unsigned int test_buffer_size;
+
+public:
+	Test() : test_failed(FALSE), test_buffer(0), test_buffer_size(100) { }
+	virtual ~Test() { OP_DELETEA(test_buffer); }
+
+	virtual BOOL Init() { test_buffer = OP_NEWA(char, test_buffer_size); return !!test_buffer; }
+
+	virtual BOOL Event(const char* classname, const char* event) { return TRUE; }
+	virtual void SetTestFailed() { test_failed = TRUE; }
+	BOOL HasTestFailed() { return test_failed; }
+};
+
+class Listener : public OpSocketListener, protected Failer
+{
+public:
+	const char* classname;
+	OpSocket* socket;
+	Test* test;
+	BOOL has_failed;
+	const char* expectation;
+
+	Listener(const char* classname)
+		: classname(classname),
+		  socket(0),
+		  test(0),
+		  has_failed(FALSE),
+		  expectation("NONE")
+		{ }
+
+	BOOL Check(OpSocket* socket, const char* event) {
+		BOOL success = FALSE;
+
+		if (!test || test->Event(classname, event))
+			if (expectation && op_strcmp(event, expectation))
+				ST_failed("%s: Unexpected event. Expected %s, got %s", classname, expectation, event);
+			else
+				if (this->socket != socket)
+					ST_failed("%s: Incorrect socket pointer. Expected %p, got %p", classname, this->socket, socket);
+				else
+					success = TRUE;
+
+		if (expectation)
+			expectation = "NONE";
+
+		if (success)
+			return TRUE;
+		else
+		{
+			if (test)
+				test->SetTestFailed();
+
+			return FALSE;
+		}
+	}
+
+	virtual void OnSocketConnected(OpSocket* socket) { Check(socket, "UNEXPECTED_CONNECTED"); }
+	virtual void OnSocketDataReady(OpSocket* socket) { Check(socket, "UNEXPECTED_DATAREADY"); }
+	virtual void OnSocketDataSent(OpSocket* socket, UINT bytes_sent) { Check(socket, "UNEXPECTED_DATASENT"); }
+	virtual void OnSocketClosed(OpSocket* socket) { Check(socket, "UNEXPECTED_CLOSED"); }
+#ifdef SOCKET_LISTEN_SUPPORT
+	virtual void OnSocketConnectionRequest(OpSocket* socket) { Check(socket, "UNEXPECTED_CONNECTIONREQUEST"); }
+	virtual void OnSocketListenError(OpSocket* socket, OpSocket::Error error) { Check(socket, "UNEXPECTED_LISTENERROR"); }
+#endif // SOCKET_LISTEN_SUPPORT
+	virtual void OnSocketConnectError(OpSocket* socket, OpSocket::Error error) { Check(socket, "UNEXPECTED_CONNECTERROR"); }
+	virtual void OnSocketReceiveError(OpSocket* socket, OpSocket::Error error) { Check(socket, "UNEXPECTED_RECEIVEERROR"); }
+	virtual void OnSocketSendError(OpSocket* socket, OpSocket::Error error) { Check(socket, "UNEXPECTED_SENDERROR"); }
+	virtual void OnSocketCloseError(OpSocket* socket, OpSocket::Error error) { Check(socket, "UNEXPECTED_CLOSEERROR"); }
+};
+
+class ServerConnectTest : public Test
+{
+private:
+	BOOL client_connected;
+	BOOL server_connected;
+
+public:
+	ServerConnectTest() : client_connected(FALSE), server_connected(FALSE) { }
+
+	virtual BOOL Event(const char* classname, const char* event) {
+		if (!op_strcmp(classname, "ClientListener"))
+		{
+			if (!op_strcmp(event, "CONNECTED"))
+				if (client_connected)
+				{
+					ST_failed("%s: Event %s occurred more than once", classname, event);
+					return FALSE;
+				}
+				else
+					client_connected = TRUE;
+			else
+			{
+				ST_failed("%s: Unexpected event: %s", classname, event);
+				return FALSE;
+			}
+		}
+		else if (!op_strcmp(classname, "ServerListener"))
+		{
+			if (!op_strcmp(event, "CONNECTED"))
+				if (server_connected)
+				{
+					ST_failed("%s: Event %s occurred more than once", classname, event);
+					return FALSE;
+				}
+				else
+					server_connected = TRUE;
+			else
+			{
+				ST_failed("%s: Unexpected event: %s", classname, event);
+				return FALSE;
+			}
+		}
+		else
+		{
+			ST_failed("%s: No event expected", classname);
+			return FALSE;
+		}
+
+		if (client_connected && server_connected)
+			ST_passed();
+
+		return TRUE;
+	}
+};
+
+class SimpleTransferTest : public Test
+{
+public:
+	class SimpleTransferClientListener : public Listener
+	{
+	public:
+		SimpleTransferClientListener() : Listener("SimpleTransferClientListener") { }
+
+		virtual void OnSocketDataReady(OpSocket* socket) { Check(socket, "DATAREADY"); }
+	} simple_transfer_client_listener;
+
+	class SimpleTransferServerListener : public Listener
+	{
+	public:
+		SimpleTransferServerListener() : Listener("SimpleTransferServerListener") { }
+
+		virtual void OnSocketDataSent(OpSocket* socket, UINT bytes_sent) { ((SimpleTransferTest*) test)->DataSent(bytes_sent); }
+	} simple_transfer_server_listener;
+
+	char small_string[100]; /* ARRAY OK 2009-02-16 mstensho */
+
+	OpSocket* client_socket;
+	OpSocket* server_socket;
+
+	int bytes_sent_total;
+	int total;
+
+	void Start(OpSocket* client_socket, OpSocket* server_socket) {
+		this->client_socket = client_socket;
+		this->server_socket = server_socket;
+
+		simple_transfer_client_listener.socket = client_socket;
+		simple_transfer_client_listener.expectation = "DATAREADY";
+		simple_transfer_client_listener.test = this;
+
+		simple_transfer_server_listener.socket = server_socket;
+		simple_transfer_server_listener.expectation = "DATASENT";
+		simple_transfer_server_listener.test = this;
+
+		client_socket->SetListener(&simple_transfer_client_listener);
+		server_socket->SetListener(&simple_transfer_server_listener);
+
+		op_strcpy(small_string, "Snakker med meg selv");
+		bytes_sent_total = 0;
+		total = op_strlen(small_string) + 1;
+
+		OP_STATUS result = server_socket->Send(small_string, op_strlen(small_string) + 1);
+		if (!HasTestFailed() && OpStatus::IsError(result))
+		{
+			ST_failed("OpSocket::Send() failed with code %d.", result);
+			SetTestFailed();
+		}
+	}
+
+	void DataSent(UINT bytes_sent) {
+		if (HasTestFailed())
+			return;
+
+		bytes_sent_total += bytes_sent;
+
+		if (bytes_sent_total == total)
+		{
+			op_memset(test_buffer, 0xcc, test_buffer_size);
+
+			simple_transfer_client_listener.expectation = "NONE";
+			simple_transfer_server_listener.expectation = "NONE";
+
+			UINT received;
+			UINT bytes_left = op_strlen(small_string) + 1;
+			char* p = test_buffer;
+			do
+			{
+				received = INT_MAX;
+				OP_STATUS result = client_socket->Recv(p, bytes_left, &received);
+				if (OpStatus::IsError(result))
+				{
+					SetTestFailed();
+					ST_failed("OpSocket::Recv() failed with code %d", result);
+					return;
+				}
+
+				if (received > bytes_left)
+				{
+					SetTestFailed();
+					ST_failed("Received more that we requested");
+					return;
+				}
+
+				bytes_left -= received;
+				p += received;
+			}
+			while (bytes_left > 0);
+
+			for (unsigned int i = op_strlen(small_string) + 1; i < test_buffer_size; ++i)
+				if ((unsigned char)test_buffer[i] != 0xcc)
+				{
+					ST_failed("OpSocket::Recv() touched more data than it should");
+					SetTestFailed();
+					return;
+				}
+
+			if (op_strcmp(small_string, test_buffer))
+			{
+				ST_failed("Didn't receive what we sent");
+				SetTestFailed();
+				return;
+			}
+
+			ST_passed();
+		}
+		else
+			if (bytes_sent_total > total)
+			{
+				ST_failed("%d too many byte(s) sent.", bytes_sent_total - total);
+				SetTestFailed();
+			}
+	}
+};
+
+/** This test verifies that the OpSocketListener is notified whenever data is
+ * ready and not only if new data is ready.
+ * The tests connects a client with a server, the server writes data to the
+ * socket. The client expects to be notified that data is available to be read.
+ * The client does reads one byte on the first read-ready notification after all
+ * data was written. Then another read-ready notification is expected.
+ * If there is no other read-read notification, the test fails. */
+class LevelTriggeredReadTest : public Test
+{
+public:
+	class ClientListener : public Listener
+	{
+	public:
+		ClientListener()
+			: Listener("LevelTriggeredReadTest::ClientListener") {}
+
+		virtual void OnSocketDataReady(OpSocket* socket)
+		{
+			static_cast<LevelTriggeredReadTest*>(test)->ReadReady();
+		}
+	} client_listener;
+
+	class ServerListener : public Listener
+	{
+	public:
+		ServerListener()
+			: Listener("LevelTriggeredReadTest::ServerListener") {}
+
+		virtual void OnSocketDataSent(OpSocket* socket, UINT bytes_sent)
+		{
+			static_cast<LevelTriggeredReadTest*>(test)->DataSent(bytes_sent);
+		}
+	} server_listener;
+
+	const char* data;			///< Data to be sent.
+	const size_t data_length;	///< Number of bytes in data.
+
+	OpSocket* client_socket;
+	OpSocket* server_socket;
+
+	/** Numbers of bytes already sent. We don't start reading before
+	 * bytes_sent_total == data_length. */
+	size_t bytes_sent_total;
+
+	/** Number of bytes already read. We don't read all the data on each
+	 * ReadReady(). */
+	size_t bytes_read;
+
+	/** On the first ReadReady() we don't start reading the data. Instead we
+	 * set this member to true, wait for the second ReadReady() and start
+	 * reading then. */
+	bool start_reading;
+
+	LevelTriggeredReadTest()
+		: data("Snakker med meg selv")
+		, data_length(op_strlen(data)+1)
+		, client_socket(NULL)
+		, server_socket(NULL)
+		, bytes_sent_total(0)
+		, bytes_read(0)
+		, start_reading(false)
+		{}
+
+	/** Sets up the listener for the sockets and starts writing data on the
+	 * server socket. */
+	void Start(OpSocket* client_socket, OpSocket* server_socket)
+	{
+		this->client_socket = client_socket;
+		this->server_socket = server_socket;
+
+		client_listener.socket = client_socket;
+		client_listener.expectation = "DATAREADY";
+		client_listener.test = this;
+
+		server_listener.socket = server_socket;
+		server_listener.expectation = "DATASENT";
+		server_listener.test = this;
+
+		client_socket->SetListener(&client_listener);
+		server_socket->SetListener(&server_listener);
+
+		bytes_sent_total = 0;
+		bytes_read = 0;
+
+		start_reading = false;
+
+		OP_STATUS result = server_socket->Send(data, data_length);
+		if (!HasTestFailed() && OpStatus::IsError(result))
+		{
+			ST_failed("OpSocket::Send() failed with code %d.", result);
+			SetTestFailed();
+		}
+	}
+
+	/** To be called when data is waiting to be read on the client-socket. Reads
+	 * at most the specified amount of data from the socket, compares the read
+	 * data with the expected data and adjusts bytes_read.
+	 * Fails the test if the read data does not compare with the expected data.
+	 * @return The number of bytes read in this iteration.
+	 */
+	size_t TestRead(size_t max_bytes_to_read)
+	{
+		OP_ASSERT(!HasTestFailed());
+		OP_ASSERT(bytes_sent_total == data_length);
+
+		op_memset(test_buffer, 0xcc, test_buffer_size);
+		OP_ASSERT(bytes_read < data_length);
+		size_t bytes_left = MIN((data_length - bytes_read), max_bytes_to_read);
+		char* buffer = test_buffer;
+		size_t buffer_size = MIN(test_buffer_size, max_bytes_to_read);
+		size_t buffer_read = 0;
+		UINT received;
+		do
+		{
+			received = UINT_MAX;
+			OP_STATUS result = client_socket->Recv(buffer, buffer_size, &received);
+			if (OpStatus::IsError(result))
+			{
+				SetTestFailed();
+				ST_failed("OpSocket::Recv() failed with code %d", result);
+				return 0;
+			}
+			else if (received > bytes_left)
+			{
+				SetTestFailed();
+				ST_failed("Received more that we requested");
+				return 0;
+			}
+			else
+			{
+				bytes_left -= received;
+				buffer_read += received;
+				buffer += received;
+				buffer_size -= received;
+			}
+		} while (bytes_left > 0 && received > 0);
+
+		if (0 != op_strncmp(data+bytes_read, test_buffer, buffer_read))
+		{
+			ST_failed("Didn't receive what we sent");
+			SetTestFailed();
+			return 0;
+		}
+
+		for (size_t i = buffer_read; i < test_buffer_size; ++i)
+			if ((unsigned char)test_buffer[i] != 0xcc)
+			{
+				ST_failed("OpSocket::Recv() touched more data than it should");
+				SetTestFailed();
+				return 0;
+			}
+
+		bytes_read += buffer_read;
+		OP_ASSERT(bytes_read <= data_length);
+		return buffer_read;
+	}
+
+	void ReadReady()
+	{
+		if (HasTestFailed() || bytes_sent_total < data_length)
+			return;
+
+		if (!start_reading)
+			// don't read anything to verify that we are notified once again:
+			start_reading = true;
+
+		else if (bytes_read == 0)
+		{
+			// read only one byte to verify that we are notified once again:
+			size_t read = TestRead(1);
+			if (read == 0)
+			{
+				SetTestFailed();
+				ST_failed("We expected to read at least one byte");
+				return;
+			}
+		}
+		else // read the rest
+		{
+			// read some bytes (until we read everything):
+			size_t read = TestRead(17);
+			if (read == 0)
+			{
+				SetTestFailed();
+				ST_failed("We expected to read at least one byte");
+				return;
+			}
+
+			if (!HasTestFailed() && bytes_read == data_length)
+				ST_passed();
+		}
+	}
+
+	void DataSent(UINT bytes_sent)
+	{
+		bytes_sent_total += bytes_sent;
+		if (bytes_sent_total > data_length)
+		{
+			SetTestFailed();
+			ST_failed("Sent too much data: %d, expected to send not more than %d",
+					  bytes_sent_total, data_length);
+		}
+	}
+};
+
+class BufferEmptyTest : public Test
+{
+public:
+	class BufferEmptyListener : public Listener
+	{
+	public:
+		BufferEmptyListener() : Listener("BufferEmptyListener") { }
+
+		virtual void OnSocketReceiveError(OpSocket* socket, OpSocket::Error error) {
+			if (Check(socket, "RECEIVEERROR"))
+				if (!test->HasTestFailed() && error != OpSocket::SOCKET_BLOCKING)
+				{
+					ST_failed("Unexpeced error code. Expected %d (SOCKET_BLOCKING), got %d",
+							  OpSocket::SOCKET_BLOCKING, error);
+
+					test->SetTestFailed();
+				}
+		}
+	} buffer_empty_listener;
+
+	void Start(OpSocket* socket) {
+		socket->SetListener(&buffer_empty_listener);
+		buffer_empty_listener.socket = socket;
+		buffer_empty_listener.expectation = "RECEIVEERROR";
+		buffer_empty_listener.test = this;
+
+		UINT received;
+		OP_STATUS result = socket->Recv(test_buffer, 10, &received);
+
+		if (!HasTestFailed())
+			if (result != OpStatus::ERR)
+			{
+				SetTestFailed();
+				ST_failed("OpSocket::Recv() failed or succeeded with unexpected code %d.", result);
+			}
+			else
+				ST_passed();
+	}
+};
+
+/** Send a lot of data from server to client using large buffers, to cause the
+ * Send() implementation to queue data, and report SOCKET_BLOCKING
+ * error. Receive the data on the client side, and verify that we receive what
+ * we sent.
+ */
+class BufferFullTest : public Test
+{
+public:
+	class BufferFullClientListener : public Listener
+	{
+	public:
+		BufferFullClientListener() : Listener("BufferFullClientListener") { }
+
+		virtual void OnSocketDataReady(OpSocket* socket) { ((BufferFullTest*)test)->DataReady(); }
+	} buffer_full_client_listener;
+
+	class BufferFullServerListener : public Listener
+	{
+	public:
+		BufferFullServerListener() : Listener("BufferFullServerListener") { }
+
+		virtual void OnSocketDataSent(OpSocket* socket, UINT bytes_sent) { ((BufferFullTest*)test)->DataSent(bytes_sent); }
+
+		virtual void OnSocketSendError(OpSocket* socket, OpSocket::Error error) {
+			if (has_failed)
+				return;
+
+			if (error == OpSocket::SOCKET_BLOCKING)
+				((BufferFullTest*)test)->Blocking();
+			else
+			{
+				ST_failed("Unexpeced error code. Expected %d (SOCKET_BLOCKING), got %d",
+						  OpSocket::SOCKET_BLOCKING, error);
+
+				test->SetTestFailed();
+			}
+		}
+	} buffer_full_server_listener;
+
+	OpSocket* server_socket;
+	OpSocket* client_socket;
+	UINT8* out_buf;
+	UINT8* in_buf;
+	unsigned int out_queue;
+	unsigned int receive_head;
+	const unsigned int buf_size;
+	const unsigned int counter_limit;
+	UINT32 out_counter;
+	UINT32 in_counter;
+	BOOL blocking;
+	BOOL ever_blocked;
+
+	BufferFullTest()
+		: server_socket(0),
+		  client_socket(0),
+		  out_buf(0),
+		  in_buf(0),
+		  out_queue(0),
+		  receive_head(0),
+		  buf_size(77777 << 2),
+		  counter_limit(10000000),
+		  out_counter(0),
+		  in_counter(0),
+		  blocking(FALSE),
+		  ever_blocked(FALSE)
+		{ }
+
+	BOOL Init() {
+#define BingoHest Test // I have no idea why, but the selftest parser generates uncompilable code if it sees "Test::Init()".
+		if (!BingoHest::Init())
+			return FALSE;
+
+		out_buf = OP_NEWA(UINT8, buf_size);
+		in_buf = OP_NEWA(UINT8, buf_size);
+
+		return out_buf && in_buf;
+	}
+
+	~BufferFullTest() {
+		OP_DELETEA(in_buf);
+		OP_DELETEA(out_buf);
+	}
+
+	void Start(OpSocket* client_socket, OpSocket* server_socket) {
+
+		this->client_socket = client_socket;
+		this->server_socket = server_socket;
+
+		server_socket->SetListener(&buffer_full_server_listener);
+		client_socket->SetListener(&buffer_full_client_listener);
+
+		buffer_full_client_listener.socket = client_socket;
+		buffer_full_server_listener.socket = server_socket;
+
+		buffer_full_client_listener.expectation = "OTHER";
+		buffer_full_server_listener.expectation = "OTHER";
+
+		buffer_full_client_listener.test = this;
+		buffer_full_server_listener.test = this;
+
+		FillBuffer();
+		if (!SendMore())
+			if (blocking)
+			{
+				ST_failed("Initial call to OpSocket::Send() failed with error SOCKET_BLOCKING.");
+				SetTestFailed();
+				return;
+			}
+
+		if (HasTestFailed())
+			return;
+
+		do FillBuffer();
+		while (out_queue && SendMore());
+	}
+
+	void FillBuffer() {
+		if (out_queue) // buffer is still filled...
+			return;
+
+		UINT8* p = out_buf;
+
+		OP_ASSERT(!(buf_size & 3));
+
+		for (unsigned int i = 0;
+			 i < (buf_size >> 2) && out_counter < counter_limit;
+			 ++ i, ++ out_counter)
+		{
+			*p++ = out_counter >> 24;
+			*p++ = (out_counter >> 16) & 0xff;
+			*p++ = (out_counter >> 8) & 0xff;
+			*p++ = out_counter & 0xff;
+			out_queue += 4;
+		}
+	}
+
+	BOOL VerifyBuffer() {
+		const UINT8* p = in_buf;
+
+		OP_ASSERT(!(buf_size & 3));
+
+		for (unsigned int i = 0;
+			 i < (buf_size >> 2) && in_counter < counter_limit;
+			 ++ i, ++ in_counter)
+		{
+			UINT32 val = (*p++ << 24);
+			val |= (*p++ << 16);
+			val |= (*p++ << 8);
+			val |= *p++;
+
+			if (val != in_counter)
+			{
+				ST_failed("Corrupt data. Expected 0x%08x, got 0x%08x", in_counter, val);
+				SetTestFailed();
+				return FALSE;
+			}
+		}
+
+		return TRUE;
+	}
+
+	BOOL SendMore() {
+		blocking = FALSE;
+
+		size_t out_len = out_queue;
+		out_queue = 0;
+		OP_STATUS result = server_socket->Send(out_buf, out_len);
+		if (HasTestFailed())
+			return FALSE;
+
+		if (OpStatus::IsError(result))
+			if (result == OpStatus::ERR)
+			{
+				if (blocking)
+				{	// try to send the same block again later:
+					out_queue = out_len;
+					return FALSE;
+				}
+				else
+				{
+					ST_failed("OpSocket::Send() failed without SOCKET_BLOCKING error.");
+					SetTestFailed();
+					return FALSE;
+				}
+			}
+			else
+			{
+				ST_failed("OpSocket::Send() failed with error code %d", result);
+				SetTestFailed();
+				return FALSE;
+			}
+
+		return TRUE;
+	}
+
+	void DataSent(int bytes) {
+		if (HasTestFailed())
+			return;
+
+		do FillBuffer();
+		while (out_queue && SendMore());
+	}
+
+	void DataReady() {
+		if (HasTestFailed())
+			return;
+
+		if (!ever_blocked)
+			/* We want to trigger a SOCKET_BLOCKING error on the server
+			   side before accepting any data on the client side. */
+
+			return;
+
+		if (in_counter >= counter_limit)
+		{
+			ST_failed("Already received all expected data");
+			SetTestFailed();
+			return;
+		}
+
+		UINT r = 0xfeedbabe;
+
+		OP_ASSERT(receive_head < buf_size);
+
+		OP_STATUS result = client_socket->Recv(in_buf + receive_head, buf_size - receive_head, &r);
+
+		if (OpStatus::IsError(result))
+		{
+			ST_failed("OpSocket::Recv() failed with code %d", result);
+			SetTestFailed();
+			return;
+		}
+
+		if (r == 0xfeedbabe || r == 0)
+		{
+			ST_failed("'received' is %d", r);
+			SetTestFailed();
+			return;
+		}
+
+		receive_head += r;
+
+		if (receive_head == buf_size || receive_head == ((counter_limit - in_counter) << 2))
+		{
+			receive_head = 0;
+
+			if (VerifyBuffer())
+				if (in_counter == counter_limit)
+					ST_passed();
+		}
+	}
+
+	void Blocking() { blocking = TRUE; ever_blocked = TRUE; }
+};
+
+class CloseTest : public Test
+{
+public:
+	class CloseClientListener : public Listener
+	{
+	public:
+		CloseClientListener() : Listener("CloseClientListener") { }
+
+		virtual void OnSocketClosed(OpSocket* socket) { ST_passed(); }
+	} close_client_listener;
+
+	class CloseServerListener : public Listener
+	{
+	public:
+		CloseServerListener() : Listener("CloseServerListener") { }
+	} close_server_listener;
+
+	void Start(OpSocket* client_socket, OpSocket* server_socket) {
+		client_socket->SetListener(&close_client_listener);
+		server_socket->SetListener(&close_server_listener);
+
+		close_client_listener.test = this;
+		close_server_listener.test = this;
+
+		close_client_listener.expectation = "CLOSED";
+		close_server_listener.expectation = "NONE";
+
+		server_socket->Close();
+	}
+};
+
+class SendErrorTest : public Test
+{
+public:
+	BOOL senderror;
+
+	class SendErrorListener : public Listener
+	{
+	public:
+		SendErrorListener() : Listener("SendErrorListener") { }
+
+		virtual void OnSocketSendError(OpSocket* socket, OpSocket::Error error) { ((SendErrorTest*) test)->senderror = TRUE; }
+	} send_error_listener;
+
+	SendErrorTest() : senderror(FALSE) { }
+
+	void Start(OpSocket* socket) {
+		socket->SetListener(&send_error_listener);
+		send_error_listener.socket = socket;
+		send_error_listener.expectation = "SENDERROR";
+		send_error_listener.test = this;
+
+		OP_STATUS result = socket->Send("KOKO", sizeof("KOKO"));
+		if (result == OpStatus::ERR)
+		{
+			if (senderror)
+				ST_passed();
+			else
+				if (!HasTestFailed())
+				{
+					ST_failed("OpSocketListener::OnSocketSendError() not called");
+					SetTestFailed();
+				}
+		}
+		else
+			if (!HasTestFailed())
+			{
+				ST_failed("OpSocket::Send() unexpectedly returned %d", result);
+				SetTestFailed();
+			}
+	}
+};
+
+class RecvErrorTest : public Test
+{
+public:
+	class RecvErrorListener : public Listener
+	{
+	public:
+		RecvErrorListener() : Listener("RecvErrorListener") { }
+
+		virtual void OnSocketReceiveError(OpSocket* socket, OpSocket::Error error) { ((RecvErrorTest*) test)->recverror = TRUE; }
+	} recv_error_listener;
+
+	BOOL recverror;
+
+	RecvErrorTest() : recverror(FALSE) { }
+
+	void Start(OpSocket* socket) {
+		socket->SetListener(&recv_error_listener);
+		recv_error_listener.socket = socket;
+		recv_error_listener.expectation = "RECEIVEERROR";
+		recv_error_listener.test = this;
+		UINT r;
+
+		OP_STATUS result = socket->Recv(test_buffer, 1, &r);
+		if (result == OpStatus::ERR)
+		{
+			if (recverror)
+				ST_passed();
+			else
+				if (!HasTestFailed())
+				{
+					ST_failed("OpSocketListener::OnSocketReceiveError() not called");
+					SetTestFailed();
+				}
+		}
+		else
+			if (!HasTestFailed())
+			{
+				ST_failed("OpSocket::Recv() unexpectedly returned %d", result);
+				SetTestFailed();
+			}
+	}
+};
+
+class ClientListener : public Listener
+{
+public:
+	ClientListener() : Listener("ClientListener") { }
+
+	virtual void OnSocketConnected(OpSocket* socket) { Check(socket, "CONNECTED"); }
+
+	virtual void OnSocketConnectError(OpSocket* socket, OpSocket::Error error) {
+		if (Check(socket, "CONN_ERROR"))
+			if (error == OpSocket::CONNECTION_REFUSED)
+				ST_passed();
+			else
+				ST_failed("Unexpeced error code. Expected %d (CONNECTION_REFUSED), got %d",
+						  OpSocket::CONNECTION_REFUSED, error);
+	}
+};
+
+class ServerListener : public Listener
+{
+public:
+	ServerListener() : Listener("ServerListener") { }
+
+	virtual void OnSocketConnected(OpSocket* socket) { Check(socket, "CONNECTED"); }
+};
+
+class ListeningListener : public Listener
+{
+public:
+	ListeningListener() : Listener("ListeningListener") { }
+
+#ifdef SOCKET_LISTEN_SUPPORT
+	virtual void OnSocketConnectionRequest(OpSocket* socket) { if (Check(socket, "CONNECTION_REQUEST")) ST_passed(); }
+
+	virtual void OnSocketListenError(OpSocket* socket, OpSocket::Error error) {
+		if (Check(socket, "LISTEN_ERROR"))
+			if (error == OpSocket::ADDRESS_IN_USE)
+				ST_passed();
+			else
+				ST_failed("Unexpeced error code. Expected %d (ADDRESS_IN_USE), got %d",
+						  OpSocket::ADDRESS_IN_USE, error);
+	}
+#endif // SOCKET_LISTEN_SUPPORT
+};
+
+class TimeoutListener : public OpTimerListener
+{
+public:
+	virtual void OnTimeOut(OpTimer* timer) { ST_failed("Timed out"); }
+};
+
+OpSystemInfo* system_info;
+OpTimer* timer;
+TimeoutListener* timeout_listener;
+
+OpSocketAddress* address;
+OpSocket* client_socket;
+OpSocket* server_socket;
+OpSocket* listening_socket;
+OpSocket* listening_socket2;
+ServerConnectTest* server_connect_test;
+SimpleTransferTest* simple_transfer_test;
+LevelTriggeredReadTest* level_triggered_read_test;
+BufferEmptyTest* buffer_empty_test;
+BufferFullTest* buffer_full_test;
+CloseTest* close_test;
+SendErrorTest* send_error_test;
+RecvErrorTest* recv_error_test;
+ClientListener* client_listener;
+ServerListener* server_listener;
+ListeningListener* listening_listener;
+
+int local_unused_port = 0x4f70; // It is assumed that nothing (including this selftest) listens on this port on the local host
+int local_listening_port = 0x4f71; // It is assumed that nothing outside this selftest listens on this port on the local host
+
+void StartTimer()
+{
+	OP_DELETE(timer);
+	timer = OP_NEW(OpTimer, ());
+	if (timer)
+	{
+		timer->SetTimerListener(timeout_listener);
+		timer->Start(20000);
+	}
+	else
+		ST_failed("OOM");
+}
+
+void StopTimer()
+{
+	OP_DELETE(timer);
+	timer = 0;
+}
+
+void RestartTimer()
+{
+	StopTimer();
+	StartTimer();
+}
+
+#define FOOFOOFOO_2 { // indentation hack for emacs
+} // global
+
+setup
+{
+	system_info = 0;
+	timer = 0;
+	timeout_listener = OP_NEW(TimeoutListener, ());
+
+	address = 0;
+	client_socket = 0;
+	server_socket = 0;
+	listening_socket = 0;
+	listening_socket2 = 0;
+
+	server_connect_test = OP_NEW(ServerConnectTest, ());
+	simple_transfer_test = OP_NEW(SimpleTransferTest, ());
+	level_triggered_read_test = OP_NEW(LevelTriggeredReadTest, ());
+	buffer_empty_test = OP_NEW(BufferEmptyTest, ());
+	buffer_full_test = OP_NEW(BufferFullTest, ());
+	close_test = OP_NEW(CloseTest, ());
+	send_error_test = OP_NEW(SendErrorTest, ());
+	recv_error_test = OP_NEW(RecvErrorTest, ());
+
+	client_listener = OP_NEW(ClientListener, ());
+	server_listener = OP_NEW(ServerListener, ());
+	listening_listener = OP_NEW(ListeningListener, ());
+
+	if (!timeout_listener ||
+		!server_connect_test || !server_connect_test->Init() ||
+		!simple_transfer_test || !simple_transfer_test->Init() ||
+		!level_triggered_read_test || !level_triggered_read_test->Init() ||
+		!buffer_empty_test || !buffer_empty_test->Init() ||
+		!buffer_full_test || !buffer_full_test->Init() ||
+		!close_test || !close_test->Init() ||
+		!send_error_test || !send_error_test->Init() ||
+		!recv_error_test || !recv_error_test->Init() ||
+		!client_listener ||
+		!server_listener ||
+		!listening_listener)
+		ST_failed("OOM");
+
+	if (OpStatus::IsError(OpSystemInfo::Create(&system_info)))
+		ST_failed("Failed to initialize OpSystemInfo");
+}
+
+exit
+{
+	OP_DELETE(client_socket);
+	OP_DELETE(server_socket);
+	OP_DELETE(listening_socket);
+	OP_DELETE(listening_socket2);
+
+	OP_DELETE(recv_error_test);
+	OP_DELETE(send_error_test);
+	OP_DELETE(close_test);
+	OP_DELETE(buffer_full_test);
+	OP_DELETE(buffer_empty_test);
+	OP_DELETE(simple_transfer_test);
+	OP_DELETE(level_triggered_read_test);
+	OP_DELETE(server_connect_test);
+
+	OP_DELETE(listening_listener);
+	OP_DELETE(server_listener);
+	OP_DELETE(client_listener);
+
+	OP_DELETE(address);
+
+	OP_DELETE(timer);
+	OP_DELETE(timeout_listener);
+	OP_DELETE(system_info);
+}
+
+test("socket type: TCP")
+{
+	OP_DELETE(client_socket);
+	OP_STATUS result = SocketWrapper::CreateTCPSocket(&client_socket, client_listener, SocketWrapper::NO_WRAPPERS);
+	if (OpStatus::IsError(result) || !client_socket)
+		ST_failed("Creating OpSocket object failed with code %d. OpSocket pointer: %p", result, client_socket);
+}
+
+test("connection refused") async;
+{
+	StopTimer();
+	OP_DELETE(client_socket);
+	OP_STATUS result = SocketWrapper::CreateTCPSocket(&client_socket, client_listener, SocketWrapper::NO_WRAPPERS);
+
+	if (OpStatus::IsError(result) || !client_socket)
+		ST_failed("Creating OpSocket object failed with code %d. OpSocket pointer: %p", result, client_socket);
+
+	OpString local_ip;
+
+#ifdef OPSYSTEMINFO_GETSYSTEMIP
+	if (OpStatus::IsError(system_info->GetSystemIp(local_ip)))
+		ST_failed("OpSystemInfo::GetSystemIp() failed");
+#else
+	if (OpStatus::IsError(local_ip.Set("127.0.0.1")))
+		ST_failed("OpString::Set() failed");
+#endif
+
+	OP_DELETE(address);
+	result = OpSocketAddress::Create(&address);
+	if (OpStatus::IsError(result))
+		ST_failed("Creating OpSocketAddress object failed with code %d. OpSocketAddress pointer: %p", result, address);
+
+	result = address->FromString(local_ip.CStr());
+	if (OpStatus::IsError(result))
+		ST_failed("OpSocketAddress::FromString() failed with code %d.", result);
+
+	address->SetPort(local_unused_port);
+
+	client_listener->socket = client_socket;
+	client_listener->expectation = "CONN_ERROR";
+
+	result = client_socket->Connect(address);
+
+	if (OpStatus::IsError(result) && result != OpStatus::ERR)
+		ST_failed("OpSocket::Connect() failed with code", result);
+
+	StartTimer();
+}
+
+test("create listening socket") require SOCKET_LISTEN_SUPPORT;
+{
+	StopTimer();
+	OP_DELETE(listening_socket);
+	OP_STATUS result = SocketWrapper::CreateTCPSocket(&listening_socket, listening_listener, SocketWrapper::NO_WRAPPERS);
+
+	verify(OpStatus::IsSuccess(result));
+	verify(listening_socket);
+
+	// Recreate socket address.
+	OP_DELETE(address);
+	address = NULL;
+	result = OpSocketAddress::Create(&address);
+	verify(OpStatus::IsSuccess(result));
+	verify(address);
+
+	// Find local IP.
+	OpString local_ip;
+#ifdef OPSYSTEMINFO_GETSYSTEMIP
+	result = system_info->GetSystemIp(local_ip);
+#else
+	result = local_ip.Set("127.0.0.1");
+#endif
+	verify(OpStatus::IsSuccess(result));
+
+	// Set local IP and port.
+	result = address->FromString(local_ip.CStr());
+	verify(OpStatus::IsSuccess(result));
+	address->SetPort(local_listening_port);
+
+	listening_listener->expectation = "NONE";
+	listening_listener->socket = listening_socket;
+
+	result = listening_socket->Listen(address, 10);
+
+	verify(OpStatus::IsSuccess(result));
+}
+
+test("invalid listen") async; require SOCKET_LISTEN_SUPPORT; require success "create listening socket";
+{
+	StopTimer();
+	OP_DELETE(listening_socket2);
+	OP_STATUS result = SocketWrapper::CreateTCPSocket(&listening_socket2, listening_listener, SocketWrapper::NO_WRAPPERS);
+
+	if (OpStatus::IsError(result) || !listening_socket2)
+		ST_failed("Creating OpSocket object failed with code %d. OpSocket pointer: %p", result, listening_socket2);
+
+	listening_listener->expectation = "LISTEN_ERROR";
+	listening_listener->socket = listening_socket2;
+
+	result = listening_socket2->Listen(address, 10);
+
+	if (OpStatus::IsError(result) && result != OpStatus::ERR)
+		ST_failed("OpSocket::Listen() failed with code", result);
+
+	StartTimer();
+}
+
+test("receive incoming connection") async; require SOCKET_LISTEN_SUPPORT; require success "invalid listen";
+{
+	StopTimer();
+	OP_DELETE(client_socket);
+	OP_STATUS result = SocketWrapper::CreateTCPSocket(&client_socket, client_listener, SocketWrapper::NO_WRAPPERS);
+
+	if (OpStatus::IsError(result) || !client_socket)
+		ST_failed("Creating OpSocket object failed with code %d. OpSocket pointer: %p", result, client_socket);
+
+	OpString local_ip;
+
+#ifdef OPSYSTEMINFO_GETSYSTEMIP
+	if (OpStatus::IsError(system_info->GetSystemIp(local_ip)))
+		ST_failed("OpSystemInfo::GetSystemIp() failed");
+#else
+	local_ip.Set("127.0.0.1");
+#endif
+
+	OP_DELETE(address);
+	result = OpSocketAddress::Create(&address);
+	if (OpStatus::IsError(result))
+		ST_failed("Creating OpSocketAddress object failed with code %d. OpSocketAddress pointer: %p", result, address);
+
+	result = address->FromString(local_ip.CStr());
+	if (OpStatus::IsError(result))
+		ST_failed("OpSocketAddress::FromString() failed with code %d.", result);
+
+	address->SetPort(local_listening_port);
+
+	client_listener->socket = client_socket;
+	client_listener->expectation = "CONNECTED";
+	client_listener->test = server_connect_test;
+	listening_listener->socket = listening_socket;
+	listening_listener->expectation = "CONNECTION_REQUEST";
+
+	result = client_socket->Connect(address);
+
+	if (OpStatus::IsError(result))
+		ST_failed("OpSocket::Connect() failed with code", result);
+
+	StartTimer();
+}
+
+test("accept incoming connection") async; require SOCKET_LISTEN_SUPPORT; require success "receive incoming connection";
+{
+	StopTimer();
+	OP_DELETE(server_socket);
+	OP_STATUS result = SocketWrapper::CreateTCPSocket(&server_socket, server_listener, SocketWrapper::NO_WRAPPERS);
+
+	if (OpStatus::IsError(result) || !server_socket)
+		ST_failed("Creating OpSocket object failed with code %d. OpSocket pointer: %p", result, server_socket);
+
+	client_listener->socket = client_socket;
+	client_listener->expectation = "CONNECTED";
+	server_listener->socket = server_socket;
+	server_listener->expectation = "CONNECTED";
+	server_listener->test = server_connect_test;
+
+	result = listening_socket->Accept(server_socket);
+
+	if (OpStatus::IsError(result))
+		ST_failed("OpSocket::Accept() failed with code %d.", result);
+
+	StartTimer();
+}
+
+test("connected") require success "accept incoming connection";
+{
+	// Just a meta test for the following tests to depend on.
+}
+
+test("send from server and receive by client") async; require success "connected";
+{
+	RestartTimer();
+
+	client_listener->expectation = "NONE";
+	server_listener->expectation = "NONE";
+	listening_listener->expectation = "NONE";
+
+	simple_transfer_test->Start(client_socket, server_socket);
+}
+
+test("level triggered read") async; require success "connected";
+{
+	RestartTimer();
+
+	client_listener->expectation = "NONE";
+	server_listener->expectation = "NONE";
+	listening_listener->expectation = "NONE";
+
+	level_triggered_read_test->Start(client_socket, server_socket);
+}
+
+test("client: input buffer underrun") async; require success "connected";
+{
+	RestartTimer();
+	buffer_empty_test->Start(client_socket);
+}
+
+test("server: output buffer full") async; require success "connected";
+/* This test is temporarily disabled, see CORE-42298 */
+disabled;
+{
+	RestartTimer();
+	buffer_full_test->Start(client_socket, server_socket);
+}
+
+test("GetLocalSocketAddress")require success "connected";
+	require OPSOCKET_GETLOCALSOCKETADDR;
+{
+	StopTimer();
+
+	OpSocketAddress* test_address = 0;
+
+	verify(OpStatus::IsSuccess(OpSocketAddress::Create(&test_address)));
+	verify(OpStatus::IsSuccess(client_socket->GetLocalSocketAddress(test_address)));
+	// coverage test only, for now
+}
+finally
+{
+	OP_DELETE(test_address);
+}
+
+test("GetSocketAddress") require success "connected";
+{
+	StopTimer();
+
+	OpSocketAddress* test_address = 0;
+
+	verify(OpStatus::IsSuccess(OpSocketAddress::Create(&test_address)));
+	verify(OpStatus::IsSuccess(client_socket->GetSocketAddress(test_address)));
+	verify(test_address->IsHostEqual(address));
+}
+finally
+{
+	OP_DELETE(test_address);
+}
+
+test("SetSocketOption/GetSocketOption")
+	require success "connected";
+	require OPSOCKET_OPTIONS;
+{
+	BOOL original_tcp_nodelay = FALSE;
+	BOOL original_tcp_nodelay_set = FALSE;
+	verify_success(client_socket->GetSocketOption(OpSocket::SO_TCP_NODELAY, original_tcp_nodelay));
+	original_tcp_nodelay_set = TRUE;
+
+	verify_success(client_socket->SetSocketOption(OpSocket::SO_TCP_NODELAY, TRUE));
+
+	BOOL value = FALSE;
+	verify_success(client_socket->GetSocketOption(OpSocket::SO_TCP_NODELAY, value));
+	verify(value);
+}
+finally
+{
+	if (original_tcp_nodelay_set)
+		OP_ASSERT(OpStatus::IsSuccess(client_socket->SetSocketOption(OpSocket::SO_TCP_NODELAY, original_tcp_nodelay)));
+}
+
+test("server: close") async;
+require success "send from server and receive by client";
+require success "client: input buffer underrun";
+require success "server: output buffer full";
+{
+	RestartTimer();
+	close_test->Start(client_socket, server_socket);
+}
+
+test("client: send data over closed connection") async; require success "server: close";
+{
+	RestartTimer();
+	send_error_test->Start(client_socket);
+}
+
+test("client: receive data over closed connection") async; require success "server: close";
+{
+	RestartTimer();
+	recv_error_test->Start(client_socket);
+}
+
+// TODO: work out how to test these, if at all possible:
+test("abortive close")
+	require SOCKET_NEED_ABORTIVE_CLOSE;
+	disabled;
+{
+	// SetAbortiveClose()
+}
+
+test("set timeout")
+	require SOCKET_SUPPORTS_TIMER;
+	disabled;
+{
+	// SetTimeOutInterval
+}
+
+test("pause receive")
+	require OPSOCKET_PAUSE_DOWNLOAD;
+	disabled; // don't enable without also enabling test("continue receive") !
+{
+	// PauseRecv()
+}
+
+test("continue receive")
+	require success "pause receive";
+	require OPSOCKET_PAUSE_DOWNLOAD;
+	disabled;
+{
+	// ContinueRecv()
+}
+
+test("start secure")
+	require _EXTERNAL_SSL_SUPPORT_;
+	disabled;
+{
+	// StartSecure()
+}
+
+test("set ciphers")
+	require _EXTERNAL_SSL_SUPPORT_;
+	disabled;
+{
+	// SetSecureCiphers()
+}
+
+test("get current cipher")
+	require _EXTERNAL_SSL_SUPPORT_;
+	disabled;
+{
+	// GetCurrentCipher()
+}
+
+test("set secure server")
+	require _EXTERNAL_SSL_SUPPORT_;
+	disabled;
+{
+	// SetServerName()
+}
+
+test("set certificate dialog")
+	require _EXTERNAL_SSL_SUPPORT_;
+	disabled;
+{
+	// SetCertificateDialogMode()
+}
+
+test("extract certificate")
+	require _EXTERNAL_SSL_SUPPORT_;
+	require ABSTRACT_CERTIFICATES;
+	disabled;
+{
+	// ExtractCertificate()
+}
+
+test("get last security error")
+	require _EXTERNAL_SSL_SUPPORT_;
+	require OPSOCKET_EXTERNAL_SSL_ERROR_CODES;
+	disabled;
+{
+	// GetLastSecConnError()
+}

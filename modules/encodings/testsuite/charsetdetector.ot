@@ -1,0 +1,1112 @@
+/* -*- Mode: c++; tab-width: 4; indent-tabs-mode: t; c-basic-offset: 4 -*-
+ *
+ * Copyright (C) 2003-2012 Opera Software ASA.  All rights reserved.
+ *
+ * This file is part of the Opera web browser.
+ * It may not be distributed under any circumstances.
+ *
+ * Peter Krefting
+ * Johan Herland
+ */
+group "encodings.detector";
+
+include "modules/encodings/detector/charsetdetector.h";
+include "modules/encodings/utility/charsetnames.h";
+include "modules/encodings/decoders/inputconverter.h";
+include "modules/dochand/win.h";
+include "modules/dochand/winman.h";
+include "modules/pi/system/OpMemory.h";
+include "modules/util/opfile/opfile.h";
+
+include if MSWIN "windows.h";
+include if linux "sys/mman.h";
+include if linux "limits.h";
+
+// -- Global variables ---------------------------------------------------
+
+global
+{
+	const unsigned char utf16le_bom[] = { 0xFF, 0xFE };
+	const unsigned char utf16be_bom[] = { 0xFE, 0xFF };
+	const unsigned char utf8_bom[]    = { 0xEF, 0xBB, 0xBF };
+	const unsigned char utf7_bom[]    = { '+', '/', 'v', '8', '-' };
+
+	Window *w;
+}
+
+setup
+{
+	// Need a window to test the "force encoding" parameter
+	w = g_windowManager->GetAWindow(FALSE, YES, YES, 100, 200);
+	if (!w)
+	{
+		// Could not create a window, probably because we are running in
+		// single window mode. Just overwrite whatever the first window
+		// is.
+		w = g_windowManager->FirstWindow();
+	}
+
+#ifndef ENCODINGS_FAST_AUTODETECTION
+#define DO_TESTS_THAT_FAIL_ON_FAST_AUTODETECTION
+#endif
+}
+
+// -- Subtests -----------------------------------------------------------
+
+// Test for boundary conditions in encoding declarations
+subtest encoding_boundary(const char *buf, size_t buf_len,
+                          size_t encoding_declaration_end,
+						  const char *expected_result,
+						  const char *get_encoding(const void *, unsigned long, BOOL))
+{
+	// Allocate two consecutive memory pages, where the second is
+	// write-protected.
+
+#ifdef MSWIN
+	static const size_t page_size = 65536;
+
+	char *ptr = reinterpret_cast<char *>(::VirtualAlloc(NULL, page_size * 2, MEM_RESERVE, PAGE_NOACCESS));
+	::VirtualAlloc(ptr, page_size, MEM_COMMIT, PAGE_READWRITE);
+#elif defined linux
+	static const size_t page_size = OpMemory::GetPageSize();
+	// Since op_malloc() doesn't return a page aligned
+	// pointer, we allocate three and adjust our pointer.
+	void *real_ptr = op_malloc(page_size * 3);
+	char *ptr =
+		reinterpret_cast<char *>((reinterpret_cast<UINTPTR>(real_ptr) + page_size - 1) & ~(page_size - 1));
+
+	mprotect(ptr + page_size, page_size, PROT_NONE);
+#endif
+
+#if !(defined MSWIN || defined linux)
+	char *newbuf = NULL;
+#endif
+
+	for (size_t buf_idx = 1; buf_idx < buf_len; ++ buf_idx)
+	{
+#if defined MSWIN || defined linux
+		// Put the data at the end of the first allocated page, if there
+		// is an overrun, we will get an access violation.
+		char *newbuf = ptr + page_size - buf_idx;
+#else
+		// Copy the buffer over to new memory to catch overruns.
+		newbuf = OP_NEWA(char, buf_idx);
+		verify_not_oom(newbuf);
+#endif
+		op_memcpy(newbuf, buf, buf_idx);
+
+		const char *encoding = get_encoding(newbuf, buf_idx, TRUE);
+		// output("%04u/%04u \"%c\" -> \"%s\"\n", buf_idx, encoding_declaration_end, buf[buf_idx],
+		//        encoding ? encoding : "-null-");
+		if (buf_idx < encoding_declaration_end)
+		{
+			// Incomplete encoding information, must return NULL
+			verify(encoding == NULL);
+		}
+		else if (buf_idx == encoding_declaration_end)
+		{
+			// Complete, but does allow it do go undetected here
+			verify(encoding == NULL ||
+			       op_strcmp(encoding, expected_result) == 0);
+		}
+		else
+		{
+			// Complete, must be detected here
+			verify(encoding != NULL);
+			verify_string(encoding, expected_result);
+		}
+
+#if !(defined MSWIN || defined linux)
+		OP_DELETEA(newbuf);
+		newbuf = NULL;
+#endif
+	}
+}
+finally
+{
+	// Clean up
+#ifdef MSWIN
+	::VirtualFree(ptr, page_size, MEM_DECOMMIT);
+	::VirtualFree(ptr, 0, MEM_RELEASE);
+#elif defined linux
+	mprotect(ptr + page_size, page_size, PROT_READ | PROT_WRITE);
+	op_free(real_ptr);
+#else
+	OP_DELETEA(newbuf);
+#endif
+}
+
+// -- Tests --------------------------------------------------------------
+
+test("UTF-16 BOM detection")
+{
+	verify(CharsetDetector::StartsWithUTF16BOM(utf16le_bom));
+	verify(CharsetDetector::StartsWithUTF16BOM(utf16be_bom));
+}
+
+test("UTF-8 BOM detection")
+{
+	verify(CharsetDetector::StartsWithUTF8BOM(utf8_bom));
+}
+
+test("UTF-7 BOM detection")
+	require ENCODINGS_HAVE_UTF7;
+{
+	verify(CharsetDetector::StartsWithUTF7BOM(utf7_bom));
+}
+
+test("UTF discovery (UTF-16)")
+{
+	const char *detected;
+	detected = CharsetDetector::GetUTFEncodingFromBOM(utf16le_bom, sizeof utf16le_bom);
+	verify(detected);
+	verify_string(detected, "utf-16");
+
+	detected = CharsetDetector::GetUTFEncodingFromBOM(utf16be_bom, sizeof utf16be_bom);
+	verify(detected);
+	verify_string(detected, "utf-16");
+}
+
+test("UTF discovery (UTF-8)")
+{
+	const char *detected;
+	detected = CharsetDetector::GetUTFEncodingFromBOM(utf8_bom, sizeof utf8_bom);
+	verify(detected);
+	verify_string(detected, "utf-8");
+}
+
+test("UTF discovery (UTF-7) (with UTF-7 disabled)")
+	require ENCODINGS_HAVE_UTF7;
+{
+	const char *detected;
+	detected = CharsetDetector::GetUTFEncodingFromBOM(utf7_bom, sizeof utf7_bom, FALSE);
+	verify(!detected);
+}
+
+test("UTF discovery (UTF-7) (with UTF-7 enabled)")
+	require ENCODINGS_HAVE_UTF7;
+{
+	const char *detected;
+	detected = CharsetDetector::GetUTFEncodingFromBOM(utf7_bom, sizeof utf7_bom, TRUE);
+	verify(detected);
+	verify_string(detected, "utf-7");
+}
+
+test("Language file encoding detection")
+	require LANGUAGE_FILE_SUPPORT;
+	require initialization; // g_memory_manager
+{
+	const char data[] =
+		//!; Opera language file version 2.0
+		//!; This file is part of the Opera web browser.  It may not be distributed
+		//!; under any circumstances.
+		//!; Copyright © 2003 Opera Software ASA. All rights reserved.
+		//!
+		//![Info]
+		//!Language="test"
+		//!LanguageName="selftest"
+		//!Charset="iso-8859-1"
+		//!Build.Linux=42
+		//!Version.Linux=9.0
+		//!DB.Version=666
+		//!
+		//![Translation]
+		//!42="This is a simple ASCII string."
+		//!4711="Detta är en sträng skriven på svenska, kodad enligt ISO 8859-1"
+		;
+
+	const char *encoding =
+		CharsetDetector::GetLanguageFileEncoding(data, sizeof data);
+	verify_string(encoding, "iso-8859-1");
+}
+
+test("XML encoding detection")
+	require initialization; // g_memory_manager
+{
+	// Testcase for DSK-51909 (illegal whitespace before xml declaration)
+	const char bug53090[] =
+		//!
+		//!<?xml version="1.0" encoding="utf-8"?>
+		//!<!DOCTYPE wml PUBLIC "-//WAPFORUM//DTD WML 1.1//EN" "http://www.wapforum.org/DTD/wml_1.1.xml">
+		//!<wml><template><do type="prev" name="Previous" label="Tilbake"><prev/></do></template>
+		//!<card id="splash" title="" ontimer="#meny"><timer value="15"/>
+		//!<p align="center"><img src="http://wap.aftenposten.no/grafikk/ailogo.wbmp" vspace="1" hspace="1" alt="Aftenposten"/>
+		//!<do type="accept" label="Next Card"><go href="#meny"/></do></p></card>
+		//!<card id="meny" title="Aftenposten">
+		//!<p align="center"><anchor>Toppsakene<go href="http://www.aftenposten.no/template/wap/seksjon.jhtml?sec=forsiden"/></anchor></p>
+		//!<p align="center"><anchor>Siste nytt <go href="../../template/wap/siste.jhtml"/></anchor></p>
+		//!<p align="center"><anchor>WAP-s&#248;k<go href="../../template/wap/google.jhtml"/></anchor></p>
+		//!<p align="center"><i><anchor>&lt;-Tips oss -&gt;<go href="../../template/wap/tipsoss.jhtml"/></anchor></i></p>
+		//!<p align="center"><anchor>Flere nyheter<go href="../../template/wap/nyheter.jhtml"/></anchor></p>
+		//!<p align="center"><anchor>Forbruker<go href="../../template/wap/forbruker.jhtml"/></anchor></p>
+		//!<p align="center"><anchor>News in English <go href="../../template/wap/seksjon.jhtml?sec=english"/></anchor></p>
+		//!<p align="center"><anchor>VÃ¦ret<go href="../../template/wap/vaer.jhtml"/></anchor></p>
+		//!<p align="center"><anchor>Kino - Oslo<go href="../../template/wap/kino.jhtml"/></anchor></p>
+		//!</card></wml>
+		;
+
+	const char *encoding =
+		CharsetDetector::GetXMLEncoding(bug53090, sizeof bug53090);
+	verify_string(encoding, "utf-8");
+
+	// Buffer boundary tests
+	size_t encoding_declaration_end = op_strstr(bug53090, "utf-8") - bug53090 + 6;
+	verify(encoding_boundary(bug53090, sizeof bug53090, encoding_declaration_end, "utf-8", CharsetDetector::GetXMLEncoding));
+}
+
+test("XML encoding detection UTF-16")
+	require initialization; // g_memory_manager
+{
+	const UINT16 data[] =
+	{ '<','?','x','m','l',' ','v','e','r','s','i','o','n','=','"','1','.','0','"','?','>' };
+
+	const char *encoding =
+		CharsetDetector::GetXMLEncoding(data, sizeof data);
+	verify(encoding && op_strncmp(encoding, "utf-16", 6) == 0);
+}
+
+test("XML encoding detection quirks")
+	require initialization; // g_memory_manager
+{
+	// Testcase for unreported bug (encoding declaration outside XML prolog
+	const char bugprolog[] =
+		//!<?xml version="1.0"?>
+		//!<document encoding="iso-2022-jp">
+		//!<content />
+		//!</document>
+		;
+
+	const char *encoding =
+		CharsetDetector::GetXMLEncoding(bugprolog, sizeof bugprolog);
+	verify(!encoding);
+
+	// Buffer boundary tests
+	verify(encoding_boundary(bugprolog, sizeof bugprolog, sizeof bugprolog + 1, NULL, CharsetDetector::GetXMLEncoding));
+}
+
+test("CSS encoding detection @charset")
+	require initialization; // g_memory_manager
+{
+	const char data1[] =
+		//!@charset "iso-8859-15";
+		//!p:after { content: "¤" }
+		;
+
+	const char data2[] =
+		//!@CharSet "iso-8859-15";
+		//!p:after { content: "¤" }
+		;
+
+	const char data3[] =
+		//!@CHARSET "iso-8859-15";
+		//!p:after { content: "¤" }
+		;
+
+	const char *encoding1 =
+		CharsetDetector::GetCSSEncoding(data1, sizeof data1);
+	const char *encoding2 =
+		CharsetDetector::GetCSSEncoding(data2, sizeof data2);
+	const char *encoding3 =
+		CharsetDetector::GetCSSEncoding(data3, sizeof data3);
+	verify_string(encoding1, "iso-8859-15");
+	verify_string(encoding2, "iso-8859-15");
+	verify_string(encoding3, "iso-8859-15");
+}
+
+test("CSS encoding detection UTF-16")
+	require initialization; // g_memory_manager
+{
+	// CORE-7711
+	const UINT16 data[] =
+	{ '!','p',':','a','f','t','e','r',' ','{',' ','c','o','n','t','e','n','t',':',' ','"',0244,'"',' ','}' };
+
+	const char *encoding =
+		CharsetDetector::GetCSSEncoding(data, sizeof data);
+	verify(encoding && op_strncmp(encoding, "utf-16", 6) == 0);
+}
+
+test("HTML encoding detection (proper documents)")
+	require initialization; // CharsetManager
+{
+	// Simple test
+	const char data1[] =
+		//!<html>
+		//!<head>
+		//!<title>Test</title>
+		//!<meta http-equiv="Content-Type" content="text/html;charset=iso-8859-2">
+		//!</title>
+		//!</head>
+		//!<body>
+		//!<p>Test</p>
+		//!</body>
+		//!</html>
+		;
+
+	// Flipped attributes
+	const char data2[] =
+		//!<html>
+		//!<head>
+		//!<title>Test</title>
+		//!<meta content="text/html;charset=iso-8859-2" http-equiv="Content-Type">
+		//!</title>
+		//!</head>
+		//!<body>
+		//!<p>Test</p>
+		//!</body>
+		//!</html>
+		;
+
+	// Another <meta>
+	const char data3[] =
+		//!<html>
+		//!<head>
+		//!<title>Test</title>
+		//!<meta http-equiv="Refresh" content="2; http://www.opera.com/">
+		//!<meta http-equiv="Content-Type" content="text/html;charset=iso-8859-2">
+		//!</title>
+		//!</head>
+		//!<body>
+		//!<p>Test</p>
+		//!</body>
+		//!</html>
+		;
+
+	const char *encoding1 =
+		CharsetDetector::GetHTMLEncoding(data1, sizeof data1);
+	const char *encoding2 =
+		CharsetDetector::GetHTMLEncoding(data2, sizeof data2);
+	const char *encoding3 =
+		CharsetDetector::GetHTMLEncoding(data3, sizeof data3);
+	verify(encoding1);
+	verify_string(encoding1, "iso-8859-2");
+	verify(encoding2);
+	verify_string(encoding2, "iso-8859-2");
+	verify(encoding3);
+	verify_string(encoding3, "iso-8859-2");
+
+	// Buffer boundary tests
+	size_t encoding_declaration_end1 = op_strstr(data1, "iso-8859-2") - data1 + 11;
+	size_t encoding_declaration_end2 = op_strstr(data2, "Content-Type\"") - data2 + 14;
+	size_t encoding_declaration_end3 = op_strstr(data3, "iso-8859-2") - data3 + 11;
+	verify(encoding_boundary(data1, sizeof data1, encoding_declaration_end1, "iso-8859-2", CharsetDetector::GetHTMLEncoding));
+	verify(encoding_boundary(data2, sizeof data2, encoding_declaration_end2, "iso-8859-2", CharsetDetector::GetHTMLEncoding));
+	verify(encoding_boundary(data3, sizeof data3, encoding_declaration_end3, "iso-8859-2", CharsetDetector::GetHTMLEncoding));
+}
+
+test("HTML encoding detection (broken syntax)")
+	require initialization; // CharsetManager
+{
+	// Missing quotes (DSK-117212)
+	const char data1[] =
+		//!<META http-equiv=Content-Type content=text/html; charset=gb2312><meta HTTP-EQUIV=REFRESH CONTENT=3>ÕýÔÚµÇÂ½ÂÛÌ³¡­¡­<br><br>±¾ÏµÍ³ÒªÇóÊ¹ÓÃCOOKIES¬¼ÙÈçÄúµÄä¯ÀÀÆ÷½ûÓÃCOOKIES¬Äú½«²»ÄÜµÇÂ¼±¾ÏµÍ³¡­¡­
+		;
+
+	// Totally bogus (DSK-114362)
+	const char data2[] =
+		//!<HTML><HEAD><META HTTP-EQUIV="Expire" CONTENT="now"><META HTTP-EQUIV="cache-control" CONTENT="no-cache"><META HTTP-EQUIV="Pragma" CONTENT="no-cache"><meta name="keywords" content="Haaretz,Ha'aretz,News,Newspaper,Israel,Israeli,breaking news,Israel news,Israel newspaper,Middle East,Mideast,Arabs,Arab,Palestinian,Palestinians,Jerusalem,Tel Aviv,Jewish,Judaism,christianity,Islam,Muslim,business,politics,Syria,Egypt,Jordan,Lebanon,war,conflict,terror,West Bank,Gaza,Territories,PLO,Ariel Sharon,Shimon Peres,Yitzhak Rabin,Yasser Arafat,IDF,Army,Military,Human rights,occupation,US,refugees,peace,peace process,Antisemitism,Knesset,government,health"><meta name="description" content="Haaretz Daily Newspaper Israel"><TITLE>www.Haaretz.co.il</TITLE>
+		//!
+		//!<META CHARSET="iso-8859-8"><META HTTP-EQUIV="Expire" CONTENT="now"><META HTTP-EQUIV="cache-control" CONTENT="no-cache"><META HTTP-EQUIV="Pragma" CONTENT="no-cache">
+		//!<script language="JavaScript1.2" src="/hasite/scripts/Functions.js" type="text/javascript"></script>
+		//!<base target="_top"><script language="JavaScript" type="text/javascript">msnTop = 0</script><META HTTP-EQUIV="Refresh" CONTENT="600"><script language="JavaScript" type="text/javascript">if (document.layers) {document.write('<link href="/hasite/scripts/navMain.css" rel="stylesheet" type="text/css">');currTop = 162;}else{document.write('<link href="/hasite/scripts/main.css" rel="stylesheet" type="text/css">');currTop = 164}currTop+=msnTop</script>
+		//!  </HEAD>
+		;
+
+	const char *encoding1 =
+		CharsetDetector::GetHTMLEncoding(data1, sizeof data1);
+	const char *encoding2 =
+		CharsetDetector::GetHTMLEncoding(data2, sizeof data2);
+	verify(encoding1);
+	verify_string(encoding1, "gbk"); // gb2312 is remapped
+	verify(encoding2);
+	verify_string(encoding2, "iso-8859-8");
+
+	// Buffer boundary tests
+	size_t encoding_declaration_end1 = op_strstr(data1, "gb2312") - data1 + 6;
+	size_t encoding_declaration_end2 = op_strstr(data2, "iso-8859-8") - data2 + 11;
+	verify(encoding_boundary(data1, sizeof data1, encoding_declaration_end1, "gbk", CharsetDetector::GetHTMLEncoding));
+	verify(encoding_boundary(data2, sizeof data2, encoding_declaration_end2, "iso-8859-8", CharsetDetector::GetHTMLEncoding));
+}
+
+test("HTML encoding detection (broken or missing encodings)")
+	require initialization; // CharsetManager
+{
+	// DSK-140388
+	const char bug157913[] =
+		//!
+		//!<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+		//!
+		//!<html>
+		//!<head>
+		//!	<title>Partnerfeed</title>
+		//!	<meta http-equiv="Content-Type" content="text/html; charset=iso-8559-1">
+		;
+
+	// DSK-140477
+	const char bug158049[] =
+		//!<HTML>
+		//!<HEAD>
+		//!<meta http-equiv=Content-Type content="text/html;  charset=">
+		//!<TITLE>nu.nl radio</TITLE>
+		;
+
+	// CORE-37201
+	const char CORE37201_1[] =
+		//!<!DOCTYPE html>
+		//!<html><head>
+		//!<title> parsing meta charset </title>
+		//!<meta http-equiv="Refresh" content="15;javascript:void('ThisLooksLikeAcharset=shift-jis">
+		;
+
+	const char CORE37201_2[] =
+		//!<!DOCTYPE html>
+		//!<html><head>
+		//!<title> parsing meta charset - big5 </title>
+		//!<meta http-equiv="Refresh" content="15;javascript:void('ThisLooksLikeAcharset=big5">
+		;
+
+	const char CORE37201_3[] =
+		//!<title>Meta prescan test</title>
+		//<meta name="description" content="charset=shift_jis">
+		;
+
+	const char *encoding157913 =
+		CharsetDetector::GetHTMLEncoding(bug157913, sizeof bug157913);
+	const char *encoding158049 =
+		CharsetDetector::GetHTMLEncoding(bug158049, sizeof bug158049);
+	const char *encoding37201_1 =
+		CharsetDetector::GetHTMLEncoding(CORE37201_1, sizeof CORE37201_1);
+	const char *encoding37201_2 =
+		CharsetDetector::GetHTMLEncoding(CORE37201_2, sizeof CORE37201_2);
+	const char *encoding37201_3 =
+		CharsetDetector::GetHTMLEncoding(CORE37201_3, sizeof CORE37201_3);
+
+	verify(encoding157913 == NULL);
+	verify(encoding158049 == NULL);
+	verify(encoding37201_1 == NULL);
+	verify(encoding37201_2 == NULL);
+	verify(encoding37201_3 == NULL);
+}
+
+test("HTML encoding detection UTF-16")
+	require initialization; // g_memory_manager
+{
+	const UINT16 data[] =
+	{ '<','h','t','m','l','>','<','h','e','a','d','>','<','/','h','e','a','d','>','<','/','h','t','m','l','>' };
+
+	const char *encoding =
+		CharsetDetector::GetHTMLEncoding(data, sizeof data);
+	verify(encoding && op_strncmp(encoding, "utf-16", 6) == 0);
+}
+
+// DSK-48220
+table html_lies(const char *)
+{
+	{ "<meta http-equiv=\"Content-Type\" content=\"text/html; charset=utf-16\">" },
+	{ "<meta http-equiv=\"Content-Type\" content=\"text/html; charset=utf-16le\">" },
+	{ "<meta http-equiv=\"Content-Type\" content=\"text/html; charset=utf-16be\">" },
+};
+
+// DSK-135985
+table xml_lies(const char *)
+{
+	{ "<?xml version=\"1.0\" encoding=\"utf-16\"?>" },
+	{ "<?xml version=\"1.0\" encoding=\"utf-16le\"?>" },
+	{ "<?xml version=\"1.0\" encoding=\"utf-16be\"?>" },
+};
+
+// Just to be sure
+table xhtml_lies(const char *)
+{
+	{ "<?xml version=\"1.0\" encoding=\"utf-16\"?>\n"
+	  "<meta http-equiv=\"Content-Type\" content=\"text/xhtml; charset=utf-16\" />" },
+	{ "<?xml version=\"1.0\" encoding=\"utf-16le\"?>\n"
+	  "<meta http-equiv=\"Content-Type\" content=\"text/xhtml; charset=utf-16le\" />" },
+	{ "<?xml version=\"1.0\" encoding=\"utf-16be\"?>\n"
+	  "<meta http-equiv=\"Content-Type\" content=\"text/xhtml; charset=utf-16be\" />" },
+};
+
+test("Documents that lie: HTML")
+	require initialization; // CharsetManager
+{
+	iterate (header) from html_lies
+	{
+		verify_string(CharsetDetector::GetHTMLEncoding(header,  op_strlen(header)), "utf-8");
+	}
+}
+
+test("Documents that lie: XHTML as HTML")
+	require initialization; // CharsetManager
+{
+	iterate (header) from xhtml_lies
+	{
+		verify_string(CharsetDetector::GetHTMLEncoding(header, op_strlen(header)), "utf-8");
+	}
+}
+
+test("Documents that lie: XML")
+	require initialization; // CharsetManager
+{
+	iterate (header) from xml_lies
+	{
+		verify(CharsetDetector::GetXMLEncoding(header, op_strlen(header)) == NULL);
+	}
+}
+
+test("Documents that lie: XHTML as XML")
+	require initialization; // CharsetManager
+{
+	iterate (header) from xhtml_lies
+	{
+		verify(CharsetDetector::GetXMLEncoding(header, op_strlen(header)) == NULL);
+	}
+}
+
+test("JS encoding detection")
+	require initialization; // g_memory_manager
+{
+	const char sourcecode[] = "var x = 2;";
+
+	char data1[100]; /* ARRAY OK 2011-11-09 peter */
+	op_memcpy(data1, utf8_bom, ARRAY_SIZE(utf8_bom));
+	op_memcpy(data1 + ARRAY_SIZE(utf8_bom), sourcecode, op_strlen(sourcecode));
+
+	char data2[100];  /* ARRAY OK 2011-11-09 peter */
+	op_memcpy(data2, utf16be_bom, ARRAY_SIZE(utf16be_bom));
+	op_memcpy(data2 + ARRAY_SIZE(utf16be_bom), UNI_L("var x = 2;"), sizeof(uni_char) * uni_strlen(UNI_L("var x = 2;")));
+
+	/* valid @encoding markup, if UserJS supported. */
+	const char data3[] =
+		"//==UserScript==\n// @include me.too.*\n// @encoding iso-8859-15\n//==/UserScript==\nvar chr1 = 'x';";
+
+	/* invalid UserJS heralds. */
+	const char data4[] =
+		"//==User_Script==\n// \n// @encoding iso-8859-15\n//==/User_Script==\nvar chr1 = 'y';";
+
+	/* valid UserJS, no @encoding markup. */
+	const char data5[] =
+		"//==UserScript==\n// \n// @no-encoding iso-8859-15\n//==/UserScript==\nvar chr1 = 'z';";
+
+	const char *encoding1 =	CharsetDetector::GetJSEncoding(data1, op_strlen(data1));
+	const char *encoding2 =	CharsetDetector::GetJSEncoding(data2, sizeof(uni_char) * uni_strlen(reinterpret_cast<uni_char*>(data2)));
+	const char *encoding3_1 = CharsetDetector::GetJSEncoding(data3, sizeof data3, TRUE);
+	const char *encoding3_2 = CharsetDetector::GetJSEncoding(data3, sizeof data3, FALSE);
+	const char *encoding4_1 = CharsetDetector::GetJSEncoding(data4, sizeof data4, TRUE);
+	const char *encoding4_2 = CharsetDetector::GetJSEncoding(data4, sizeof data4, FALSE);
+	const char *encoding5_1 = CharsetDetector::GetJSEncoding(data5, sizeof data5, TRUE);
+	const char *encoding5_2 = CharsetDetector::GetJSEncoding(data5, sizeof data5, FALSE);
+
+	verify_string(encoding1, "utf-8");
+	verify_string(encoding2, "utf-16");
+	verify_string(encoding3_1, "iso-8859-15");
+	verify(encoding3_2 == NULL);
+	verify(encoding4_1 == NULL);
+	verify(encoding4_2 == NULL);
+	verify(encoding5_1 == NULL);
+	verify(encoding5_2 == NULL);
+}
+
+test("Autodetection id mapping (string to id)")
+{
+	verify(CharsetDetector::AutoDetectIdFromString("AUTODETECT") == CharsetDetector::generic);
+#ifdef ENCODINGS_HAVE_JAPANESE
+	verify(CharsetDetector::AutoDetectIdFromString("AUTODETECT-JP") == CharsetDetector::japanese);
+#endif
+#ifdef ENCODINGS_HAVE_CHINESE
+	verify(CharsetDetector::AutoDetectIdFromString("AUTODETECT-ZH") == CharsetDetector::chinese);
+#endif
+#ifdef ENCODINGS_HAVE_KOREAN
+	verify(CharsetDetector::AutoDetectIdFromString("AUTODETECT-KO") == CharsetDetector::korean);
+#endif
+#ifdef ENCODINGS_HAVE_CYRILLIC
+	verify(CharsetDetector::AutoDetectIdFromString("AUTODETECT-RU") == CharsetDetector::cyrillic);
+#endif
+	verify(CharsetDetector::AutoDetectIdFromString(NULL) == CharsetDetector::autodetect_none);
+	verify(CharsetDetector::AutoDetectIdFromString("") == CharsetDetector::autodetect_none);
+	verify(CharsetDetector::AutoDetectIdFromString("BOGUS") == CharsetDetector::autodetect_none);
+}
+
+test("Autodetection id mapping (id to string)")
+{
+	verify_string("AUTODETECT", CharsetDetector::AutoDetectStringFromId(CharsetDetector::generic));
+#ifdef ENCODINGS_HAVE_JAPANESE
+	verify_string("AUTODETECT-JP", CharsetDetector::AutoDetectStringFromId(CharsetDetector::japanese));
+#endif
+#ifdef ENCODINGS_HAVE_CHINESE
+	verify_string("AUTODETECT-ZH", CharsetDetector::AutoDetectStringFromId(CharsetDetector::chinese));
+#endif
+#ifdef ENCODINGS_HAVE_KOREAN
+	verify_string("AUTODETECT-KO", CharsetDetector::AutoDetectStringFromId(CharsetDetector::korean));
+#endif
+#ifdef ENCODINGS_HAVE_CYRILLIC
+	verify_string("AUTODETECT-RU", CharsetDetector::AutoDetectStringFromId(CharsetDetector::cyrillic));
+#endif
+	verify_string("", CharsetDetector::AutoDetectStringFromId(CharsetDetector::autodetect_none));
+}
+
+test("HTML vs XML declaration: Bug 147281") // aka DLBRT-139
+	require initialization; // CharsetManager
+{
+	// Document treated as HTML but only with a XML declaration.
+	const char bug147281[] =
+		//!<?xml version="1.0" encoding="UTF-8"?>
+		//!<html>
+		//!  <head/>
+		/* cut */
+		;
+
+	const char *encoding147281 =
+		CharsetDetector::GetHTMLEncoding(bug147281, sizeof bug147281);
+	verify(encoding147281);
+	verify_string(g_charsetManager->GetCanonicalCharsetName(encoding147281), "utf-8");
+
+	// Buffer boundary tests
+	size_t encoding_declaration_end147281 = op_strstr(bug147281, "UTF-8") - bug147281 + 6;
+	verify(encoding_boundary(bug147281, sizeof bug147281, encoding_declaration_end147281, "UTF-8", CharsetDetector::GetXMLEncoding));
+}
+
+table autodetecttests
+{
+	// Fields:
+	// const char *testname;   // Test name
+	// const char *filename;   // File to load
+	// const char *encoding;   // Encoding that should be detected
+	// const char *detectmode; // Detection mode to use
+	// const char *domain;     // Domain to use
+	// const char *language;   // Language of document
+	// feature;                // Define that needs to be set for this test (SELFTEST if unconditional)
+
+	// testname  filename                encoding         detectmode       domain        language feature
+	{ "ja-001",  "ja/iso2022.html",      "iso-2022-jp",   NULL,            NULL,         NULL, ENCODINGS_HAVE_JAPANESE },
+	{ "ja-002",  "ja/iso2022.html",      "iso-2022-jp",   "autodetect-jp", NULL,         NULL, ENCODINGS_HAVE_JAPANESE },
+	{ "ja-003",  "ja/iso2022.html",      "iso-2022-jp",   NULL,            "example.jp", NULL, ENCODINGS_HAVE_JAPANESE },
+	{ "ja-004",  "ja/iso2022.html",      "iso-2022-jp",   NULL,            NULL,         "ja", ENCODINGS_HAVE_JAPANESE },
+	{ "ja-005",  "ja/iso2022jp1.html",   "iso-2022-jp-1", NULL,            NULL,         NULL, ENCODINGS_HAVE_JAPANESE },
+	{ "ja-006",  "ja/iso2022jp1.html",   "iso-2022-jp-1", "autodetect-jp", NULL,         NULL, ENCODINGS_HAVE_JAPANESE },
+	{ "ja-007",  "ja/iso2022jp1.html",   "iso-2022-jp-1", NULL,            "example.jp", NULL, ENCODINGS_HAVE_JAPANESE },
+	{ "ja-008",  "ja/iso2022jp1.html",   "iso-2022-jp-1", NULL,            NULL,         "ja", ENCODINGS_HAVE_JAPANESE },
+	{ "ja-009",  "ja/eucjp.html",        "euc-jp",        "autodetect-jp", NULL,         NULL, ENCODINGS_HAVE_JAPANESE },
+	{ "ja-010",  "ja/eucjp.html",        "euc-jp",        NULL,            "example.jp", NULL, ENCODINGS_HAVE_JAPANESE },
+	{ "ja-011",  "ja/eucjp.html",        "euc-jp",        NULL,            NULL,         "ja", ENCODINGS_HAVE_JAPANESE },
+	{ "ja-012",  "ja/shiftjis.html",     "shift_jis",     "autodetect-jp", NULL,         NULL, ENCODINGS_HAVE_JAPANESE },
+	{ "ja-013",  "ja/shiftjis.html",     "shift_jis",     NULL,            "example.jp", NULL, ENCODINGS_HAVE_JAPANESE },
+	{ "ja-014",  "ja/shiftjis.html",     "shift_jis",     NULL,            NULL,         "ja", ENCODINGS_HAVE_JAPANESE },
+	{ "ja-015",  "ja/utf8.html",         "utf-8",         NULL,            NULL,         NULL, ENCODINGS_HAVE_JAPANESE },
+	{ "ja-016",  "ja/utf8.html",         "utf-8",         "autodetect-jp", NULL,         NULL, ENCODINGS_HAVE_JAPANESE },
+	{ "ja-017",  "ja/utf8.html",         "utf-8",         NULL,            "example.jp", NULL, ENCODINGS_HAVE_JAPANESE },
+	{ "ja-018",  "ja/utf8.html",         "utf-8",         NULL,            NULL,         "ja", ENCODINGS_HAVE_JAPANESE },
+	{ "ja-019",  "ja/199627.js",         "utf-8",         "autodetect-jp", NULL,         NULL, ENCODINGS_HAVE_JAPANESE },
+	{ "ja-020",  "ja/199627.js",         "utf-8",         NULL,            "mfn.sub.jp", NULL, ENCODINGS_HAVE_JAPANESE },
+
+	{ "ko-001",  "ko/iso-2022-kr.html",  "iso-2022-kr",   NULL,            NULL,         NULL, ENCODINGS_HAVE_KOREAN },
+	{ "ko-002",  "ko/iso-2022-kr.html",  "iso-2022-kr",   "autodetect-ko", NULL,         NULL, ENCODINGS_HAVE_KOREAN },
+	{ "ko-003",  "ko/iso-2022-kr.html",  "iso-2022-kr",   NULL,            "example.kr", NULL, ENCODINGS_HAVE_KOREAN },
+	{ "ko-004",  "ko/iso-2022-kr.html",  "iso-2022-kr",   NULL,            NULL,         "ko", ENCODINGS_HAVE_KOREAN },
+	{ "ko-005",  "ko/euckr.html",        "euc-kr",        "autodetect-ko", NULL,         NULL, ENCODINGS_HAVE_KOREAN },
+	{ "ko-006",  "ko/euckr.html",        "euc-kr",        NULL,            "example.kr", NULL, ENCODINGS_HAVE_KOREAN },
+	{ "ko-007",  "ko/euckr.html",        "euc-kr",        NULL,            NULL,         "ko", ENCODINGS_HAVE_KOREAN },
+	{ "ko-008",  "ko/utf-8.html",        "utf-8",         NULL,            NULL,         NULL, ENCODINGS_HAVE_KOREAN },
+	{ "ko-009",  "ko/utf-8.html",        "utf-8",         "autodetect-ko", NULL,         NULL, ENCODINGS_HAVE_KOREAN },
+	{ "ko-010",  "ko/utf-8.html",        "utf-8",         NULL,            "example.kr", NULL, ENCODINGS_HAVE_KOREAN },
+	{ "ko-011",  "ko/utf-8.html",        "utf-8",         NULL,            NULL,         "ko", ENCODINGS_HAVE_KOREAN },
+
+	{ "ru-001",  "ru/koi8-r.html",       "koi8-u",        "autodetect-ru", NULL,         NULL, ENCODINGS_HAVE_CYRILLIC },
+	{ "ru-002",  "ru/koi8-r.html",       "koi8-u",        NULL,            "example.ru", NULL, ENCODINGS_HAVE_CYRILLIC },
+	{ "ru-003",  "ru/koi8-r.html",       "koi8-u",        NULL,            NULL,         "ru", ENCODINGS_HAVE_CYRILLIC },
+	{ "ru-004",  "ru/iso-8859-5.html",   "iso-8859-5",    "autodetect-ru", NULL,         NULL, ENCODINGS_HAVE_CYRILLIC },
+	{ "ru-005",  "ru/iso-8859-5.html",   "iso-8859-5",    NULL,            "example.ru", NULL, ENCODINGS_HAVE_CYRILLIC },
+	{ "ru-006",  "ru/iso-8859-5.html",   "iso-8859-5",    NULL,            NULL,         "ru", ENCODINGS_HAVE_CYRILLIC },
+	{ "ru-007",  "ru/windows-1251.html", "windows-1251",  "autodetect-ru", NULL,         NULL, ENCODINGS_HAVE_CYRILLIC },
+	{ "ru-008",  "ru/windows-1251.html", "windows-1251",  NULL,            "example.ru", NULL, ENCODINGS_HAVE_CYRILLIC },
+	{ "ru-009",  "ru/windows-1251.html", "windows-1251",  NULL,            NULL,         "ru", ENCODINGS_HAVE_CYRILLIC },
+	{ "ru-010",  "ru/ibm866.html",       "ibm866",        "autodetect-ru", NULL,         NULL, ENCODINGS_HAVE_CYRILLIC },
+	{ "ru-011",  "ru/ibm866.html",       "ibm866",        NULL,            "example.ru", NULL, ENCODINGS_HAVE_CYRILLIC },
+	{ "ru-012",  "ru/ibm866.html",       "ibm866",        NULL,            NULL,         "ru", ENCODINGS_HAVE_CYRILLIC },
+	{ "ru-013",  "ru/utf8.html",         "utf-8",         NULL,            NULL,         NULL, ENCODINGS_HAVE_CYRILLIC },
+	{ "ru-014",  "ru/utf8.html",         "utf-8",         "autodetect-ru", NULL,         NULL, ENCODINGS_HAVE_CYRILLIC },
+	{ "ru-015",  "ru/utf8.html",         "utf-8",         NULL,            "example.ru", NULL, ENCODINGS_HAVE_CYRILLIC },
+	{ "ru-016",  "ru/utf8.html",         "utf-8",         NULL,            NULL,         "ru", ENCODINGS_HAVE_CYRILLIC },
+
+	{ "zh-001",  "zh/gb2312.html",       "gbk",           "autodetect-zh", NULL,         NULL, ENCODINGS_HAVE_CHINESE },
+	{ "zh-002",  "zh/gb2312.html",       "gbk",           NULL,            "example.cn", NULL, ENCODINGS_HAVE_CHINESE },
+	{ "zh-003",  "zh/gb2312.html",       "gbk",           NULL,            "example.hk", NULL, ENCODINGS_HAVE_CHINESE },
+	{ "zh-004",  "zh/gb2312.html",       "gbk",           NULL,            NULL,         "zh", ENCODINGS_HAVE_CHINESE },
+	{ "zh-005",  "zh/gb18030.html",      "gb18030",       "autodetect-zh", NULL,         NULL, ENCODINGS_HAVE_CHINESE },
+	{ "zh-006",  "zh/gb18030.html",      "gb18030",       NULL,            "example.cn", NULL, ENCODINGS_HAVE_CHINESE },
+	{ "zh-007",  "zh/gb18030.html",      "gb18030",       NULL,            "example.hk", NULL, ENCODINGS_HAVE_CHINESE },
+	{ "zh-008",  "zh/gb18030.html",      "gb18030",       NULL,            NULL,         "zh", ENCODINGS_HAVE_CHINESE },
+	{ "zh-009",  "zh/gbk.html",          "gbk",           "autodetect-zh", NULL,         NULL, ENCODINGS_HAVE_CHINESE },
+	{ "zh-010",  "zh/gbk.html",          "gbk",           NULL,            "example.cn", NULL, ENCODINGS_HAVE_CHINESE },
+	{ "zh-011",  "zh/gbk.html",          "gbk",           NULL,            "example.hk", NULL, ENCODINGS_HAVE_CHINESE },
+	{ "zh-012",  "zh/gbk.html",          "gbk",           NULL,            NULL,         "zh", ENCODINGS_HAVE_CHINESE },
+	{ "zh-013",  "zh/hz.html",           "hz-gb-2312",    "autodetect-zh", NULL,         NULL, ENCODINGS_HAVE_CHINESE },
+	{ "zh-014",  "zh/hz.html",           "hz-gb-2312",    NULL,            "example.cn", NULL, ENCODINGS_HAVE_CHINESE },
+	{ "zh-015",  "zh/hz.html",           "hz-gb-2312",    NULL,            "example.hk", NULL, ENCODINGS_HAVE_CHINESE },
+	{ "zh-016",  "zh/hz.html",           "hz-gb-2312",    NULL,            NULL,         "zh", ENCODINGS_HAVE_CHINESE },
+	{ "zh-017",  "zh/big5.html",         "big5",          "autodetect-zh", NULL,         NULL, ENCODINGS_HAVE_CHINESE },
+	{ "zh-018",  "zh/big5.html",         "big5",          NULL,            "example.cn", NULL, ENCODINGS_HAVE_CHINESE },
+	{ "zh-019",  "zh/big5.html",         "big5",          NULL,            "example.hk", NULL, ENCODINGS_HAVE_CHINESE },
+	{ "zh-020",  "zh/big5.html",         "big5",          NULL,            NULL,         "zh", ENCODINGS_HAVE_CHINESE },
+	{ "zh-021",  "zh/euctw.html",        "euc-tw",        "autodetect-zh", NULL,         NULL, ENCODINGS_HAVE_CHINESE },
+	{ "zh-022",  "zh/euctw.html",        "euc-tw",        NULL,            "example.cn", NULL, ENCODINGS_HAVE_CHINESE },
+	{ "zh-023",  "zh/euctw.html",        "euc-tw",        NULL,            "example.hk", NULL, ENCODINGS_HAVE_CHINESE },
+	{ "zh-024",  "zh/euctw.html",        "euc-tw",        NULL,            NULL,         "zh", ENCODINGS_HAVE_CHINESE },
+	{ "zh-025",  "zh/iso2022cn.html",    "iso-2022-cn",   NULL,            NULL,         NULL, ENCODINGS_HAVE_CHINESE },
+	{ "zh-026",  "zh/iso2022cn.html",    "iso-2022-cn",   "autodetect-zh", NULL,         NULL, ENCODINGS_HAVE_CHINESE },
+	{ "zh-027",  "zh/iso2022cn.html",    "iso-2022-cn",   NULL,            "example.cn", NULL, ENCODINGS_HAVE_CHINESE },
+	{ "zh-028",  "zh/iso2022cn.html",    "iso-2022-cn",   NULL,            "example.hk", NULL, ENCODINGS_HAVE_CHINESE },
+	{ "zh-029",  "zh/iso2022cn.html",    "iso-2022-cn",   NULL,            NULL,         "zh", ENCODINGS_HAVE_CHINESE },
+	{ "zh-030",  "zh/utf8.html",         "utf-8",         NULL,            NULL,         NULL, ENCODINGS_HAVE_CHINESE },
+	{ "zh-031",  "zh/utf8.html",         "utf-8",         "autodetect-zh", NULL,         NULL, ENCODINGS_HAVE_CHINESE },
+	{ "zh-032",  "zh/utf8.html",         "utf-8",         NULL,            "example.cn", NULL, ENCODINGS_HAVE_CHINESE },
+	{ "zh-033",  "zh/utf8.html",         "utf-8",         NULL,            "example.hk", NULL, ENCODINGS_HAVE_CHINESE },
+	{ "zh-034",  "zh/utf8.html",         "utf-8",         NULL,            "example.hk", "zh", ENCODINGS_HAVE_CHINESE },
+
+	{ "utf-001", "utf/utf-7.txt",        "utf-7",         NULL,            NULL,         NULL, ENCODINGS_HAVE_UTF7 },
+	{ "utf-002", "utf/utf-8.txt",        "utf-8",         NULL,            NULL,         NULL, SELFTEST },
+	{ "utf-003", "utf/utf-16le.txt",     "utf-16le",      NULL,            NULL,         NULL, SELFTEST },
+	{ "utf-004", "utf/utf-16be.txt",     "utf-16be",      NULL,            NULL,         NULL, SELFTEST },
+
+	// Special tests
+	// DSK-144230: Big5 script in .tw domain mistakenly identified as GBK.
+	// Will fail in fast autodetect mode
+	{ "bug #163809", "zh/bug-163809.js", "big5",          NULL,       "firefxly.idv.tw", NULL, DO_TESTS_THAT_FAIL_ON_FAST_AUTODETECTION },
+	// KBILL2-2319: Big5 script mistakenly identified as GBK.
+	{ "bug #357018", "zh/bug-357018.js", "big5",          "autodetect-zh", "mingpaonews.com", NULL, ENCODINGS_HAVE_CHINESE },
+	// CORE-22216: Big5 script mistakenly identified as GBK.
+	{ "CORE-22216",  "zh/CORE-22216.js", "big5",          "autodetect-zh", "www.udn.com", NULL, ENCODINGS_HAVE_CHINESE },
+}
+
+// The following is needed to include the above files in bauhaus build packages
+table autodetect_filenames (const char *) filelist "charconv/autodetect" recursively;
+
+foreach (testname, filename, encoding, detectmode, domain, language, feature) from autodetecttests
+{
+	test("Content-based testing " testname)
+		require initialization;
+		require feature;
+	{
+		verify(contentdetect(filename, encoding, detectmode, domain, language));
+	}
+}
+
+subtest contentdetect(const char *filename, const char *encoding, const char *detectmode, const char *domain, const char *language)
+{
+	OpFile *f = NULL;
+
+	// Slurp the file
+	OpString fullfilename;
+	verify_success(g_folder_manager->GetFolderPath(OPFILE_SELFTEST_DATA_FOLDER, fullfilename));
+	verify_success(fullfilename.AppendFormat(UNI_L("modules%cencodings%ctestsuite%ccharconv%cautodetect%c"),
+		PATHSEPCHAR, PATHSEPCHAR, PATHSEPCHAR, PATHSEPCHAR, PATHSEPCHAR));
+	verify_success(fullfilename.Append(filename));
+
+	f = OP_NEW(OpFile, ());
+	verify_not_oom(f);
+	verify_success(f->Construct(fullfilename.CStr()));
+
+	verify_success(f->Open(OPFILE_READ));
+
+	char buffer[5000]; /* ARRAY OK 2011-11-09 peter */
+	OpFileLength flen;
+	verify_success(f->Read(buffer, sizeof buffer, &flen));
+	f->Close();
+	verify(static_cast<OpFileLength>(sizeof(buffer)) >= flen);
+
+	// Run it through the detector and check the result
+	w->SetForceEncoding(detectmode);
+	CharsetDetector d(domain, w, detectmode, language, 10, TRUE);
+	d.PeekAtBuffer(buffer, static_cast<unsigned long>(flen));
+	if (encoding)
+	{
+		verify(d.GetDetectedCharset());
+#ifdef ENCODINGS_FAST_AUTODETECTION
+		if (op_strcmp(d.GetDetectedCharset(), encoding) != 0)
+		{
+			// In fast-detect mode, we accept detecting the explicit BOMs
+			// with the imprecise utf-16 labels.
+			if (op_strncmp(encoding, "utf-16", 6) == 0)
+			{
+				verify(op_strncmp(d.GetDetectedCharset(), encoding, 6) == 0);
+			}
+			else
+			{
+				verify_string(d.GetDetectedCharset(), encoding);
+			}
+		}
+		else
+#endif
+		{
+			verify_string(d.GetDetectedCharset(), encoding);
+		}
+	}
+	else
+	{
+		verify(!d.GetDetectedCharset());
+	}
+
+	// Also test BOM detector
+	if (0 == op_strncmp(filename, "utf/", 4))
+	{
+		const char *enc = CharsetDetector::GetUTFEncodingFromBOM(buffer, static_cast<unsigned long>(flen), TRUE);
+		verify(enc);
+		verify(encoding && 0 == op_strncmp(enc, encoding, op_strlen(enc)));
+	}
+	if (0 == op_strncmp(filename, "utf/utf-7.txt", 13))
+	{
+		const char *enc = CharsetDetector::GetUTFEncodingFromBOM(buffer, static_cast<unsigned long>(flen), FALSE);
+		verify(enc == NULL);
+	}
+}
+finally
+{
+
+	OP_DELETE(f);
+}
+
+table morehtmltests
+{
+	// Fields:
+	// const char *testname;   // Test name
+	// const char *filename;   // File to load
+	// const char *encoding;   // Encoding that should be detected
+	// feature;                // Define that needs to be set for this test (SELFTEST if unconditional)
+
+	// testname      filename            encoding         feature
+	// CORE-11600
+	{ "bug #316782", "bugs/316782.html", "shift_jis",     SELFTEST },
+	// CORE-13129
+	{ "bug #335800", "bugs/335800.html", NULL,            SELFTEST }, // default to windows-1252
+
+	// The following TCs are copied from http://hixie.ch/tests/adhoc/html/parsing/encoding/
+	{ "hixie/001",   "hixie/001.html",   NULL,            SELFTEST }, // default to windows-1252
+	{ "hixie/002",   "hixie/002.html",   "windows-1252",  SELFTEST },
+	{ "hixie/003",   "hixie/003.html",   "windows-1254",  SELFTEST }, // iso-8859-9 => windows-1254
+	{ "hixie/004",   "hixie/004.html",   "windows-1254",  SELFTEST }, // iso-8859-9 => windows-1254
+	{ "hixie/005",   "hixie/005.html",   "windows-1254",  SELFTEST }, // iso-8859-9 => windows-1254
+	{ "hixie/006",   "hixie/006.html",   "windows-1254",  SELFTEST }, // iso-8859-9 => windows-1254
+	{ "hixie/007",   "hixie/007.html",   NULL,            SELFTEST }, // default to windows-1252
+	{ "hixie/008",   "hixie/008.html",   "windows-1254",  SELFTEST }, // iso-8859-9 => windows-1254
+	{ "hixie/009",   "hixie/009.html",   "windows-1254",  SELFTEST }, // iso-8859-9 => windows-1254
+	{ "hixie/010",   "hixie/010.html",   "windows-1254",  SELFTEST }, // iso-8859-9 => windows-1254
+// 	{ "hixie/011",   "hixie/011.html",   NULL,            SELFTEST }, // default to windows-1252 // Relies on strict parsing of charset name
+	{ "hixie/012",   "hixie/012.html",   "windows-1254",  SELFTEST }, // iso-8859-9 => windows-1254
+	{ "hixie/013",   "hixie/013.html",   "windows-1254",  SELFTEST }, // iso-8859-9 => windows-1254
+	{ "hixie/014",   "hixie/014.html",   NULL,            SELFTEST }, // default to windows-1252
+	{ "hixie/015",   "hixie/015.html",   NULL,            SELFTEST }, // default to windows-1252
+	{ "hixie/016",   "hixie/016.html",   NULL,            SELFTEST }, // default to windows-1252
+	{ "hixie/017",   "hixie/017.html",   NULL,            SELFTEST }, // default to windows-1252
+	{ "hixie/018",   "hixie/018.html",   NULL,            SELFTEST }, // default to windows-1252
+	{ "hixie/019",   "hixie/019.html",   NULL,            SELFTEST }, // default to windows-1252
+	{ "hixie/020",   "hixie/020.html",   NULL,            SELFTEST }, // default to windows-1252
+	{ "hixie/021",   "hixie/021.html",   NULL,            SELFTEST }, // default to windows-1252
+	{ "hixie/022",   "hixie/022.html",   NULL,            SELFTEST }, // default to windows-1252
+	{ "hixie/023",   "hixie/023.html",   "windows-1254",  SELFTEST }, // iso-8859-9 => windows-1254
+	{ "hixie/024",   "hixie/024.html",   "windows-1254",  SELFTEST }, // iso-8859-9 => windows-1254
+	{ "hixie/025",   "hixie/025.html",   NULL,            SELFTEST }, // default to windows-1252
+// 	{ "hixie/026",   "hixie/026.html",   NULL,            SELFTEST }, // default to windows-1252 // Relies on strict parsing of charset name
+	{ "hixie/027",   "hixie/027.html",   "windows-1254",  SELFTEST }, // iso-8859-9 => windows-1254
+	{ "hixie/028",   "hixie/028.html",   "windows-1254",  SELFTEST }, // iso-8859-9 => windows-1254
+	{ "hixie/029",   "hixie/029.html",   NULL,            SELFTEST }, // default to windows-1252
+	{ "hixie/030",   "hixie/030.html",   NULL,            SELFTEST }, // default to windows-1252
+	{ "hixie/031",   "hixie/031.html",   NULL,            SELFTEST }, // default to windows-1252
+	{ "hixie/032",   "hixie/032.html",   "windows-1254",  SELFTEST }, // iso-8859-9 => windows-1254
+	{ "hixie/033",   "hixie/033.html",   "windows-1254",  SELFTEST }, // iso-8859-9 => windows-1254
+	{ "hixie/034",   "hixie/034.html",   NULL,            SELFTEST }, // default to windows-1252
+	{ "hixie/035",   "hixie/035.html",   NULL,            SELFTEST }, // default to windows-1252
+	{ "hixie/036",   "hixie/036.html",   NULL,            SELFTEST }, // default to windows-1252
+	{ "hixie/037",   "hixie/037.html",   "windows-1254",  SELFTEST }, // iso-8859-9 => windows-1254
+	{ "hixie/038",   "hixie/038.html",   "windows-1252",  SELFTEST },
+	{ "hixie/039",   "hixie/039.html",   "windows-1254",  SELFTEST }, // iso-8859-9 => windows-1254
+	{ "hixie/040",   "hixie/040.html",   "windows-1254",  SELFTEST }, // iso-8859-9 => windows-1254
+	{ "hixie/041",   "hixie/041.html",   "windows-1252",  SELFTEST },
+	{ "hixie/042",   "hixie/042.html",   "utf-8",         SELFTEST },
+	{ "hixie/043",   "hixie/043.html",   "utf-8",         SELFTEST },
+	{ "hixie/044",   "hixie/044.html",   "windows-1254",  SELFTEST }, // iso-8859-9 => windows-1254
+	{ "hixie/045",   "hixie/045.html",   "windows-1254",  SELFTEST }, // iso-8859-9 => windows-1254
+	{ "hixie/046",   "hixie/046.html",   "windows-1254",  SELFTEST }, // iso-8859-9 => windows-1254
+	{ "hixie/047",   "hixie/047.html",   "windows-1254",  SELFTEST }, // iso-8859-9 => windows-1254
+	{ "hixie/048",   "hixie/048.html",   "windows-1254",  SELFTEST }, // iso-8859-9 => windows-1254
+	{ "hixie/049",   "hixie/049.html",   "windows-1254",  DO_TESTS_THAT_FAIL_ON_FAST_AUTODETECTION }, // iso-8859-9 => windows-1254
+	{ "hixie/050",   "hixie/050.html",   "windows-1254",  DO_TESTS_THAT_FAIL_ON_FAST_AUTODETECTION }, // iso-8859-9 => windows-1254
+	{ "hixie/051",   "hixie/051.html",   "windows-1254",  DO_TESTS_THAT_FAIL_ON_FAST_AUTODETECTION }, // iso-8859-9 => windows-1254
+	{ "hixie/052",   "hixie/052.html",   "windows-1254",  DO_TESTS_THAT_FAIL_ON_FAST_AUTODETECTION }, // iso-8859-9 => windows-1254
+	{ "hixie/053",   "hixie/053.html",   "windows-1254",  DO_TESTS_THAT_FAIL_ON_FAST_AUTODETECTION }, // iso-8859-9 => windows-1254
+	{ "hixie/054",   "hixie/054.html",   "windows-1254",  DO_TESTS_THAT_FAIL_ON_FAST_AUTODETECTION }, // iso-8859-9 => windows-1254
+	{ "hixie/055",   "hixie/055.html",   "windows-1254",  DO_TESTS_THAT_FAIL_ON_FAST_AUTODETECTION }, // iso-8859-9 => windows-1254
+//	{ "hixie/056",   "hixie/056.html",   "windows-1254",  SELFTEST }, // Relies on JS execution before encoding detection  // iso-8859-9 => windows-1254
+//	{ "hixie/057",   "hixie/057.html",   "windows-1254",  SELFTEST }, // Relies on JS execution before encoding detection  // iso-8859-9 => windows-1254
+	{ "hixie/058",   "hixie/058.html",   "windows-1254",  SELFTEST }, // iso-8859-9 => windows-1254
+	{ "hixie/059",   "hixie/059.html",   "windows-1254",  SELFTEST }, // iso-8859-9 => windows-1254
+	{ "hixie/060",   "hixie/060.html",   "windows-1254",  SELFTEST }, // iso-8859-9 => windows-1254
+	{ "hixie/061",   "hixie/061.html",   "windows-1254",  SELFTEST }, // iso-8859-9 => windows-1254
+	{ "hixie/062",   "hixie/062.html",   "windows-1254",  SELFTEST }, // iso-8859-9 => windows-1254
+//	{ "hixie/063",   "hixie/063.html",   "windows-1252",  SELFTEST }, // Relies on disregarding <meta charset=...> within <script> element
+//	{ "hixie/064",   "hixie/064.html",   "windows-1252",  SELFTEST }, // Relies on disregarding <meta charset=...> within <style> element
+// 	{ "hixie/065",   "hixie/065.html",   NULL,            SELFTEST }, // default to windows-1252 // Relies on strict parsing of charset name
+// 	{ "hixie/066",   "hixie/066.html",   NULL,            SELFTEST }, // default to windows-1252 // Relies on strict parsing of charset name
+// 	{ "hixie/067",   "hixie/067.html",   NULL,            SELFTEST }, // default to windows-1252 // Relies on strict parsing of charset name
+// 	{ "hixie/068",   "hixie/068.html",   NULL,            SELFTEST }, // default to windows-1252 // Relies on strict parsing of charset name
+// 	{ "hixie/069",   "hixie/069.html",   NULL,            SELFTEST }, // default to windows-1252 // Relies on strict parsing of charset name
+// 	{ "hixie/070",   "hixie/070.html",   NULL,            SELFTEST }, // default to windows-1252 // Relies on strict parsing of charset name
+// 	{ "hixie/071",   "hixie/071.html",   NULL,            SELFTEST }, // default to windows-1252 // Relies on strict parsing of charset name
+// 	{ "hixie/072",   "hixie/072.html",   NULL,            SELFTEST }, // default to windows-1252 // Relies on strict parsing of charset name
+
+	// The following TCs are copied from http://hsivonen.iki.fi/test/wa10/encoding-detection/
+	{ "hsivonen/c-iso-8859-1-with-iso-8859-2-decoy-in-comment",
+	  "hsivonen/c-iso-8859-1-with-iso-8859-2-decoy-in-comment.html",
+	                                     "windows-1252",  SELFTEST }, // iso-8859-1 => windows-1252
+	{ "hsivonen/c-iso-8859-1",
+	  "hsivonen/c-iso-8859-1.html",
+	                                     "windows-1252",  SELFTEST }, // iso-8859-1 => windows-1252
+	{ "hsivonen/c-iso-8859-2-with-iso-8859-1-decoy-in-comment",
+	  "hsivonen/c-iso-8859-2-with-iso-8859-1-decoy-in-comment.html",
+	                                     "iso-8859-2",    SELFTEST },
+	{ "hsivonen/c-iso-8859-2-with-reversed-attribute-order",
+	  "hsivonen/c-iso-8859-2-with-reversed-attribute-order.html",
+	                                     "iso-8859-2",    SELFTEST },
+	{ "hsivonen/c-utf-8-no-bom",
+	  "hsivonen/c-utf-8-no-bom.html",
+	                                     "utf-8",         SELFTEST },
+	{ "hsivonen/c-utf-8-with-bom-no-meta",
+	  "hsivonen/c-utf-8-with-bom-no-meta.html",
+	                                     "utf-8",         SELFTEST },
+	{ "hsivonen/c-utf-8-with-bom",
+	  "hsivonen/c-utf-8-with-bom.html",
+	                                     "utf-8",         SELFTEST },
+	{ "hsivonen/c-utf-16-with-bom-be-no-meta",
+	  "hsivonen/c-utf-16-with-bom-be-no-meta.html",
+	                                     "utf-16",        SELFTEST }, // "utf-16be" -> "utf-16"
+	{ "hsivonen/c-utf-16-with-bom-be",
+	  "hsivonen/c-utf-16-with-bom-be.html",
+	                                     "utf-16",        SELFTEST }, // "utf-16be" -> "utf-16"
+	{ "hsivonen/c-utf-16-with-bom-le-no-meta",
+	  "hsivonen/c-utf-16-with-bom-le-no-meta.html",
+	                                     "utf-16",        SELFTEST }, // "utf-16be" -> "utf-16"
+	{ "hsivonen/c-utf-16-with-bom-le",
+	  "hsivonen/c-utf-16-with-bom-le.html",
+	                                     "utf-16",        SELFTEST }, // "utf-16be" -> "utf-16"
+	{ "hsivonen/c-windows-1252",
+	  "hsivonen/c-windows-1252.html",
+	                                     "windows-1252",  SELFTEST },
+	{ "hsivonen/nc-iso-8859-1-with-iso-8859-2-in-second-meta",
+	  "hsivonen/nc-iso-8859-1-with-iso-8859-2-in-second-meta.html",
+	                                     "windows-1252",  SELFTEST }, // iso-8859-1 => windows-1252
+	{ "hsivonen/nc-iso-8859-2-with-iso-8859-1-in-second-meta",
+	  "hsivonen/nc-iso-8859-2-with-iso-8859-1-in-second-meta.html",
+	                                     "iso-8859-2",    SELFTEST },
+	{ "hsivonen/nc-iso-8859-2-with-line-breaks-in attribute-values",
+	  "hsivonen/nc-iso-8859-2-with-line-breaks-in attribute-values.html",
+	                                     "iso-8859-2",    SELFTEST },
+	{ "hsivonen/nc-iso-8859-2-with-spaces-in-attribute-values",
+	  "hsivonen/nc-iso-8859-2-with-spaces-in-attribute-values.html",
+	                                     "iso-8859-2",    SELFTEST },
+	{ "hsivonen/nc-iso-8859-2-with-tabs-in-attribute-values",
+	  "hsivonen/nc-iso-8859-2-with-tabs-in-attribute-values.html",
+	                                     "iso-8859-2",    SELFTEST },
+	{ "hsivonen/nc-us-ascii-and-utf-16be-changes-after-meta",
+	  "hsivonen/nc-us-ascii-and-utf-16be-changes-after-meta.html",
+	                                     "utf-8",         SELFTEST }, // UTF-8 according to HTML5; document is actually a mix of ASCII and UTF-16
+	{ "hsivonen/nc-utf-16-no-bom-be",
+	  "hsivonen/nc-utf-16-no-bom-be.html",
+	                                     "utf-16",        SELFTEST }, // "utf-16be" -> "utf-16"
+	{ "hsivonen/nc-utf-16-no-bom-le",
+	  "hsivonen/nc-utf-16-no-bom-le.html",
+	                                     "utf-16",        SELFTEST }, // "utf-16be" -> "utf-16"
+}
+
+// The following is needed to include the above files in bauhaus build packages
+table htmldetect_filenames (const char *) filelist "charconv/htmldetect" recursively;
+
+foreach (testname, filename, encoding, feature) from morehtmltests
+{
+	test("More HTML testing: " testname)
+		require initialization;
+		require feature;
+	{
+		verify(htmldetect(filename, encoding));
+	}
+}
+
+subtest htmldetect(const char *filename, const char *encoding)
+{
+	OpFile *f = NULL;
+	InputConverter *converter = NULL;
+
+	// Slurp the file
+	OpString fullfilename;
+	verify_success(g_folder_manager->GetFolderPath(OPFILE_SELFTEST_DATA_FOLDER, fullfilename));
+	verify_success(fullfilename.AppendFormat(UNI_L("modules%cencodings%ctestsuite%ccharconv%chtmldetect%c"),
+		PATHSEPCHAR, PATHSEPCHAR, PATHSEPCHAR, PATHSEPCHAR, PATHSEPCHAR));
+	verify_success(fullfilename.Append(filename));
+
+	f = OP_NEW(OpFile, ());
+	verify_not_oom(f);
+	verify_success(f->Construct(fullfilename.CStr()));
+
+	verify_success(f->Open(OPFILE_READ));
+
+	char buffer[20000]; /* ARRAY OK 2011-11-09 peter */
+	OpFileLength flen;
+	verify_success(f->Read(buffer, sizeof buffer, &flen));
+	f->Close();
+	verify(static_cast<OpFileLength>(sizeof(buffer)) >= flen);
+
+	// Run it through the HTML detector and check the result
+	const char *result = CharsetDetector::GetHTMLEncoding(buffer, static_cast<unsigned long>(flen));
+	if (result) {
+		verify_success(InputConverter::CreateCharConverter(result, &converter));
+		verify(converter != NULL);
+		verify(encoding);
+		verify_string(encoding, converter->GetCharacterSet());
+	}
+	else
+		verify(result == NULL && encoding == NULL);
+}
+finally
+{
+	OP_DELETE(f);
+	OP_DELETE(converter);
+}
+
+table content_type(const char *, const char *)
+{
+	{ "text/html; charset=\"iso-8859-1\"", "iso-8859-1" },
+	{ "text/html;charset=\"iso-8859-2\"", "iso-8859-2" },
+	{ "text/html;charset=iso-8859-3", "iso-8859-3" },
+	{ "text/html; charset=\"iso-8859-4\"", "iso-8859-4" },
+	{ "text/javascript; text/charset=\"utf-8\"; version=5", "utf-8" },
+	{ "text/javascript; version=5; text/charset=\"utf-16\"", "utf-16" },
+
+	{ "text/html; chraset=\"iso-8859-1\"", NULL },
+
+	/* RFC 2045 5.1 */
+	{ "text/plain; charset=us-ascii (Plain text)", "us-ascii" },
+}
+
+test("Get encoding from Content-Type")
+{
+	iterate (header, expect) from content_type
+	{
+		unsigned long int len;
+		const char *encoding =
+			CharsetDetector::EncodingFromContentType(header, &len);
+		if (expect)
+		{
+			verify(encoding);
+			verify(len == op_strlen(expect));
+			verify(op_strncmp(encoding, expect, len) == 0);
+		}
+		else
+		{
+			verify(!encoding);
+			verify(!len);
+		}
+	}
+}
+
+// -- Global cleanup -----------------------------------------------------
+
+exit
+{
+	w->Close();
+}

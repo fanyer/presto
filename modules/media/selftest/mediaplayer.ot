@@ -1,0 +1,409 @@
+/* -*- Mode: c++; tab-width: 4; indent-tabs-mode: t; c-basic-offset: 4; c-file-style: "stroustrup" -*-
+ *
+ * Copyright (C) 2009-2011 Opera Software ASA.  All rights reserved.
+ *
+ * This file is part of the Opera web browser.
+ * It may not be distributed under any circumstances.
+ */
+
+group "Media.MediaPlayer";
+
+require MEDIA_PLAYER_SUPPORT;
+
+require init;
+
+include "modules/media/src/coremediaplayer.h";
+
+global
+{
+	class TestOpMediaPlayer;
+
+	class TestOpMediaManager : public OpMediaManager
+	{
+	public:
+		virtual BOOL3 CanPlayType(const OpStringC8& type, const OpVector<OpStringC8>& codecs)
+		{
+			return MAYBE;
+		}
+		virtual BOOL CanPlayURL(const uni_char* url)
+		{
+			can_play_url = uni_strncmp(url, UNI_L("rtsp://"), 7) == 0;
+			return can_play_url;
+		}
+		virtual OP_STATUS CreatePlayer(OpMediaPlayer** player_out, OpMediaHandle handle)
+		{
+			url_str = FALSE;
+			*player_out = player = OP_NEW(TestOpMediaPlayer, (this));
+			return *player_out ? OpStatus::OK : OpStatus::ERR_NO_MEMORY;
+		}
+		virtual OP_STATUS CreatePlayer(OpMediaPlayer** player_out, OpMediaHandle handle, const uni_char* url)
+		{
+			url_str = TRUE;
+			*player_out = player = OP_NEW(TestOpMediaPlayer, (this));
+			return *player_out ? OpStatus::OK : OpStatus::ERR_NO_MEMORY;
+		}
+		virtual void DestroyPlayer(OpMediaPlayer* player)
+		{
+			OP_DELETE(static_cast<TestOpMediaPlayer*>(player));
+		}
+
+		BOOL can_play_url; // saved return value of CanPlayURL
+		BOOL url_str; // was URL string variant of CreatePlayer used?
+		TestOpMediaPlayer* player;
+		TestOpMediaManager() : can_play_url(FALSE), url_str(FALSE), player(NULL) {}
+		~TestOpMediaManager() { if (player) player->manager = NULL; }
+	};
+
+	class TestOpMediaPlayer : public OpMediaPlayer
+	{
+	public:
+		friend class TestOpMediaManager;
+
+		virtual OP_STATUS Play() { paused = FALSE; return OpStatus::OK; }
+		virtual OP_STATUS Pause() { paused = TRUE; return OpStatus::OK; }
+		virtual OP_STATUS GetBufferedTimeRanges(const OpMediaTimeRanges** ranges) { return OpStatus::ERR; }
+		virtual OP_STATUS GetSeekableTimeRanges(const OpMediaTimeRanges** ranges) { return OpStatus::ERR; }
+		virtual OP_STATUS GetPlayedTimeRanges(const OpMediaTimeRanges** ranges) { return OpStatus::ERR; }
+		virtual OP_STATUS GetPosition(double* position) { return OpStatus::ERR; }
+		virtual OP_STATUS SetPosition(double position) { this->position = position; return OpStatus::OK; }
+		virtual OP_STATUS GetDuration(double* duration) { return OpStatus::ERR; }
+		virtual OP_STATUS SetPlaybackRate(double rate) { this->rate = rate; return OpStatus::OK; }
+		virtual OP_STATUS SetVolume(double volume) { this->volume = volume; return OpStatus::OK; }
+		virtual OP_STATUS SetPreload(double duration) { return OpStatus::OK; }
+		virtual void SetListener(OpMediaPlayerListener* listener) {}
+		virtual OP_STATUS GetFrame(OpBitmap** bitmap) { return OpStatus::ERR; }
+		virtual OP_STATUS GetNativeSize(UINT32* width, UINT32* height, double* pixel_aspect) { return OpStatus::ERR; }
+		virtual OP_STATUS SetSize(UINT32 width, UINT32 height) { return OpStatus::ERR; }
+#ifdef PI_VIDEO_LAYER
+		virtual void SetVideoLayerRect(const OpRect& rect, const OpRect& clipRect) { video_layer_updates += 1; };
+#endif //PI_VIDEO_LAYER
+
+		BOOL paused;
+		double position;
+		double rate;
+		double volume;
+		int video_layer_updates;
+
+		TestOpMediaManager* manager;
+		TestOpMediaPlayer(TestOpMediaManager* manager) :
+			paused(TRUE),
+			position(0),
+			rate(1),
+			volume(0),
+			video_layer_updates(0),
+			manager(manager)
+		{}
+
+	private:
+		~TestOpMediaPlayer() { if (manager) manager->player = NULL; }
+	};
+
+	class TestMediaSource;
+
+	class TestMediaSourceManager : public MediaSourceManager
+	{
+	public:
+		virtual OP_STATUS GetSource(MediaSource*& source_out, const URL& url, const URL& referer_url, MessageHandler* message_handler = NULL)
+		{
+			source_out = source = OP_NEW(TestMediaSource, (this));
+			return source_out ? OpStatus::OK : OpStatus::ERR_NO_MEMORY;
+		}
+		virtual OP_STATUS GetSource(MediaSource*& source, OpMediaHandle handle) { return OpStatus::ERR; }
+		virtual void PutSource(MediaSource* source) { OP_DELETE(static_cast<TestMediaSource*>(source)); source = NULL; }
+
+		TestMediaSource* source;
+		TestMediaSourceManager() : source(NULL) {}
+		~TestMediaSourceManager() { if (source) source->manager = NULL; }
+	};
+
+	class TestMediaSource : public MediaSource
+	{
+	public:
+		virtual void AddClient(MediaSourceClient* client) {}
+		virtual void RemoveClient(MediaSourceClient* client) {}
+		virtual void HandleClientChange() {}
+		virtual const char* GetContentType() { return "video/webm"; }
+		virtual BOOL IsSeekable() { return FALSE; }
+		virtual OpFileLength GetTotalBytes() { return 0; }
+		virtual OP_STATUS GetBufferedBytes(const OpMediaByteRanges** ranges) { return OpStatus::ERR_NOT_SUPPORTED; }
+		virtual OP_STATUS Read(void* buffer, OpFileLength offset, OpFileLength size) { return OpStatus::ERR; }
+		virtual OP_STATUS AddProgressListener(MediaProgressListener* listener) { return OpStatus::OK; }
+		virtual OP_STATUS RemoveProgressListener(MediaProgressListener* listener) { return OpStatus::OK; }
+
+		virtual URL GetOriginURL() { return URL(); }
+
+		TestMediaSourceManager* manager;
+		TestMediaSource(TestMediaSourceManager* manager) : manager(manager) {}
+		~TestMediaSource() { if (manager) manager->source = NULL; }
+	};
+
+	URL src = g_url_api->GetURL(UNI_L("http://example.com/video.ogg"));
+	URL rtsp_src = g_url_api->GetURL(UNI_L("rtsp://example.com/live.webm"));
+	URL origin = g_url_api->GetURL(UNI_L("http://example.com/index.html"));
+}
+
+test("MediaPlayer::Create creates new instance")
+{
+	MediaPlayer* player = NULL;
+	verify(OpStatus::IsSuccess(MediaPlayer::Create(player, src, origin, TRUE, NULL)));
+	verify(player);
+	OP_DELETE(player);
+}
+
+test("Pause")
+{
+	TestOpMediaManager media_manager;
+	TestMediaSourceManager source_manager;
+	CoreMediaPlayer player(src, origin, FALSE, &media_manager, &source_manager, g_main_message_handler, FALSE);
+	player.Pause();
+	player.OnProgress(source_manager.source);
+	verify(media_manager.player->paused == TRUE);
+}
+
+test("Play")
+{
+	TestOpMediaManager media_manager;
+	TestMediaSourceManager source_manager;
+	CoreMediaPlayer player(src, origin, FALSE, &media_manager, &source_manager, g_main_message_handler, FALSE);
+	player.Play();
+	player.OnProgress(source_manager.source);
+	verify(media_manager.player->paused == FALSE);
+}
+
+test("Play (force paused)")
+{
+	TestOpMediaManager media_manager;
+	TestMediaSourceManager source_manager;
+	CoreMediaPlayer player(src, origin, FALSE, &media_manager, &source_manager, g_main_message_handler, TRUE);
+	player.Play();
+	player.OnProgress(source_manager.source);
+	verify(media_manager.player->paused == TRUE);
+}
+
+test("GetBufferedTimeRanges")
+{
+	TestOpMediaManager media_manager;
+	TestMediaSourceManager source_manager;
+	CoreMediaPlayer player(src, origin, FALSE, &media_manager, &source_manager, g_main_message_handler, FALSE);
+
+	const OpMediaTimeRanges* ranges = NULL;
+	verify(OpStatus::IsError(player.GetBufferedTimeRanges(ranges)));
+	verify(ranges == NULL);
+}
+
+test("GetSeekableTimeRanges")
+{
+	TestOpMediaManager media_manager;
+	TestMediaSourceManager source_manager;
+	CoreMediaPlayer player(src, origin, FALSE, &media_manager, &source_manager, g_main_message_handler, FALSE);
+
+	const OpMediaTimeRanges* ranges = NULL;
+	verify(OpStatus::IsError(player.GetSeekableTimeRanges(ranges)));
+	verify(ranges == NULL);
+}
+
+test("GetPlayedTimeRanges")
+{
+	TestOpMediaManager media_manager;
+	TestMediaSourceManager source_manager;
+	CoreMediaPlayer player(src, origin, FALSE, &media_manager, &source_manager, g_main_message_handler, FALSE);
+
+	const OpMediaTimeRanges* ranges = NULL;
+	verify(OpStatus::IsError(player.GetPlayedTimeRanges(ranges)));
+	verify(ranges == NULL);
+}
+
+test("GetPosition")
+{
+	TestOpMediaManager media_manager;
+	TestMediaSourceManager source_manager;
+	CoreMediaPlayer player(src, origin, FALSE, &media_manager, &source_manager, g_main_message_handler, FALSE);
+
+	double t = -1;
+	verify(OpStatus::IsSuccess(player.GetPosition(t)));
+	verify(t == 0);
+}
+
+test("SetPosition")
+{
+	TestOpMediaManager media_manager;
+	TestMediaSourceManager source_manager;
+	CoreMediaPlayer player(src, origin, FALSE, &media_manager, &source_manager, g_main_message_handler, FALSE);
+
+	verify(OpStatus::IsSuccess(player.SetPosition(10)));
+	player.Pause();
+	player.OnProgress(source_manager.source);
+	verify(media_manager.player != NULL);
+	verify(media_manager.player->position == 10);
+}
+
+test("GetDuration")
+{
+	TestOpMediaManager media_manager;
+	TestMediaSourceManager source_manager;
+	CoreMediaPlayer player(src, origin, FALSE, &media_manager, &source_manager, g_main_message_handler, FALSE);
+
+	double t = -1;
+	verify(OpStatus::IsSuccess(player.GetDuration(t)));
+	verify(op_isnan(t));
+}
+
+test("SetPlaybackRate")
+{
+	TestOpMediaManager media_manager;
+	TestMediaSourceManager source_manager;
+	CoreMediaPlayer player(src, origin, FALSE, &media_manager, &source_manager, g_main_message_handler, FALSE);
+
+	verify(OpStatus::IsSuccess(player.SetPlaybackRate(2)));
+	player.Pause();
+	player.OnProgress(source_manager.source);
+	verify(media_manager.player != NULL);
+	verify(media_manager.player->rate == 2);
+}
+
+test("SetVolume")
+{
+	TestOpMediaManager media_manager;
+	TestMediaSourceManager source_manager;
+	CoreMediaPlayer player(src, origin, FALSE, &media_manager, &source_manager, g_main_message_handler, FALSE);
+
+	verify(OpStatus::IsSuccess(player.SetVolume(0.7)));
+	player.Pause();
+	player.OnProgress(source_manager.source);
+	verify(media_manager.player != NULL);
+	verify(media_manager.player->volume == 0.7);
+}
+
+test("GetVideoSize")
+{
+	TestOpMediaManager media_manager;
+	TestMediaSourceManager source_manager;
+	CoreMediaPlayer player(src, origin, FALSE, &media_manager, &source_manager, g_main_message_handler, FALSE);
+
+	UINT32 width, height;
+	player.GetVideoSize(width, height);
+	verify(width == 0);
+	verify(height == 0);
+}
+
+test("GetFrame")
+{
+	TestOpMediaManager media_manager;
+	TestMediaSourceManager source_manager;
+	CoreMediaPlayer player(src, origin, FALSE, &media_manager, &source_manager, g_main_message_handler, FALSE);
+
+	OpBitmap* bm = NULL;
+	verify(OpStatus::IsError(player.GetFrame(bm)));
+	verify(bm == NULL);
+}
+
+test("OnClientCollision() releases source and gets a new one")
+{
+	TestOpMediaManager media_manager;
+	TestMediaSourceManager source_manager;
+	CoreMediaPlayer player(src, origin, FALSE, &media_manager, &source_manager, g_main_message_handler, FALSE);
+	player.Pause();
+	verify(media_manager.player == NULL);
+	const MediaSource* orig_source = source_manager.source;
+	verify(orig_source != NULL);
+	player.OnClientCollision(source_manager.source);
+	verify(media_manager.player == NULL);
+	verify(orig_source != source_manager.source);
+}
+
+test("OnProgress() creates backend")
+{
+	TestOpMediaManager media_manager;
+	TestMediaSourceManager source_manager;
+	CoreMediaPlayer player(src, origin, FALSE, &media_manager, &source_manager, g_main_message_handler, FALSE);
+	player.Pause();
+	verify(media_manager.player == NULL);
+	player.OnProgress(source_manager.source);
+	verify(media_manager.player != NULL);
+}
+
+test("Suspend() destroys source and backend")
+{
+	TestOpMediaManager media_manager;
+	TestMediaSourceManager source_manager;
+	CoreMediaPlayer player(src, origin, FALSE, &media_manager, &source_manager, g_main_message_handler, FALSE);
+	player.Pause();
+	player.OnProgress(source_manager.source);
+	verify(media_manager.player != NULL);
+	verify(source_manager.source != NULL);
+	verify(OpStatus::IsSuccess(player.Suspend()));
+	verify(media_manager.player == NULL);
+	verify(source_manager.source == NULL);
+}
+
+test("Resume() recreates source and OnProgress() the backend")
+{
+	TestOpMediaManager media_manager;
+	TestMediaSourceManager source_manager;
+	CoreMediaPlayer player(src, origin, FALSE, &media_manager, &source_manager, g_main_message_handler, FALSE);
+	player.Pause();
+	player.OnProgress(source_manager.source);
+	player.Suspend();
+	verify(media_manager.player == NULL);
+	verify(source_manager.source == NULL);
+	verify(OpStatus::IsSuccess(player.Resume()));
+	verify(media_manager.player == NULL);
+	verify(source_manager.source != NULL);
+	player.OnProgress(source_manager.source);
+	verify(media_manager.player != NULL);
+	verify(source_manager.source != NULL);
+}
+
+test("URL handle OpMediaManager::CreatePlayer (from OnProgress)")
+{
+	// if CanPlayURL returns FALSE, use the handle variant
+	TestOpMediaManager media_manager;
+	TestMediaSourceManager source_manager;
+	CoreMediaPlayer player(src, origin, FALSE, &media_manager, &source_manager, g_main_message_handler, FALSE);
+	player.Pause();
+	player.OnProgress(source_manager.source);
+	verify(media_manager.can_play_url == FALSE);
+	verify(media_manager.url_str == FALSE);
+}
+
+test("URL handle OpMediaManager::CreatePlayer (from OnIdle)")
+{
+	// if CanPlayURL returns FALSE, use the handle variant
+	TestOpMediaManager media_manager;
+	TestMediaSourceManager source_manager;
+	CoreMediaPlayer player(src, origin, FALSE, &media_manager, &source_manager, g_main_message_handler, FALSE);
+	player.Pause();
+	player.OnIdle(source_manager.source);
+	verify(media_manager.can_play_url == FALSE);
+	verify(media_manager.url_str == FALSE);
+}
+
+test("URL string OpMediaManager::CreatePlayer")
+{
+	// if CanPlayURL returns TRUE, use the string variant
+	TestOpMediaManager media_manager;
+	TestMediaSourceManager source_manager;
+	CoreMediaPlayer player(rtsp_src, origin, FALSE, &media_manager, &source_manager, g_main_message_handler, FALSE);
+	player.Pause();
+	verify(source_manager.source == NULL);
+	verify(media_manager.can_play_url == TRUE);
+	verify(media_manager.url_str == TRUE);
+}
+
+test("SetVideoLayerRect is only called once per change") require PI_VIDEO_LAYER;
+{
+	TestOpMediaManager media_manager;
+	TestMediaSourceManager source_manager;
+	CoreMediaPlayer player(src, origin, FALSE, &media_manager, &source_manager, g_main_message_handler, FALSE);
+	player.Pause();
+	player.OnProgress(source_manager.source);
+
+	OpRect screen = OpRect(10, 10, 40, 40);
+	OpRect clip = OpRect(20, 20, 30, 30);
+
+	verify(media_manager.player->video_layer_updates == 0);
+	player.SetVideoLayerRect(screen, clip);
+	verify(media_manager.player->video_layer_updates == 1);
+	player.SetVideoLayerRect(screen, clip);
+	verify(media_manager.player->video_layer_updates == 1);
+}

@@ -1,0 +1,621 @@
+/* -*- Mode: c++; tab-width: 4; indent-tabs-mode: t; c-basic-offset: 4 -*-
+**
+** Copyright 2010 Opera Software ASA.  All rights reserved.
+**
+** This file is part of the Opera web browser.
+** It may not be distributed under any circumstances.
+*/
+
+group "device_api.JIL.JILAddressBook";
+
+require DAPI_JIL_ADDRESSBOOK_SUPPORT;
+
+include "modules/device_api/jil/JILAddressBook.h";
+
+global
+{
+	JIL_AddressBookMappings* g_mappings;
+
+	BOOL GetAddressBookItemValue(OpAddressBookItem* item, const uni_char* attribute, OpString* value)
+	{
+		int field_index;
+		int value_index;
+		BOOL mapping_exists = g_mappings->GetMapping(attribute, &field_index, &value_index);
+		if (mapping_exists)
+			return OpStatus::IsSuccess(item->GetValue(field_index, value_index, value));
+		else
+			return FALSE;
+	}
+
+	class OpVectorBuilder : public JIL_AddressBookMappings::CollectionBuilder
+	{
+	public:
+		~OpVectorBuilder()
+		{
+			m_attributes.DeleteAll();
+		}
+
+		virtual OP_STATUS Add(const uni_char* attribute_name)
+		{
+			OpString* string = OP_NEW(OpString, ());
+			RETURN_OOM_IF_NULL(string);
+
+			OP_STATUS status = string->Set(attribute_name);
+			if (OpStatus::IsError(status))
+			{
+				OP_DELETE(string);
+				return status;
+			}
+
+			status = m_attributes.Add(string);
+			if (OpStatus::IsError(status))
+			{
+				OP_DELETE(string);
+				return status;
+			}
+			return OpStatus::OK;
+		}
+
+		OP_STATUS ReleaseAttributeNames(OpVector<OpString>* output)
+		{
+			OP_STATUS result = output->DuplicateOf(m_attributes);
+			m_attributes.Clear();
+			return result;
+		}
+
+	private:
+		OpVector<OpString> m_attributes;
+	};
+}
+
+test("Check initialization")
+{
+	verify_success(g_device_api.GetAddressBookMappings(g_mappings));
+}
+
+subtest VerifyContains(const OpVector<OpString>& vector, const uni_char* string)
+{
+	INT32 count = vector.GetCount();
+	BOOL found = FALSE;
+	for (INT32 i = 0; i < count; ++i)
+		if (uni_str_eq(vector.Get(i)->CStr(), string))
+		{
+			found = TRUE;
+			break;
+		}
+
+	verify(found != FALSE, The string is not in vector);
+}
+
+test("GetAvaialbleAttributes returns all the required ones")
+	require success "Check initialization";
+{
+	OpVectorBuilder builder;
+	verify_success(g_mappings->GetAvailableAttributes(NULL, &builder));
+
+	OpAutoVector<OpString> attribute_names;
+	builder.ReleaseAttributeNames(&attribute_names);
+
+	verify(VerifyContains(attribute_names, UNI_L("address")));
+	verify(VerifyContains(attribute_names, UNI_L("company")));
+	verify(VerifyContains(attribute_names, UNI_L("eMail")));
+	verify(VerifyContains(attribute_names, UNI_L("fullName")));
+	verify(VerifyContains(attribute_names, UNI_L("homePhone")));
+	verify(VerifyContains(attribute_names, UNI_L("mobilePhone")));
+	verify(VerifyContains(attribute_names, UNI_L("title")));
+	verify(VerifyContains(attribute_names, UNI_L("workPhone")));
+}
+
+subtest SetAttributeValue(JIL_AddressBookItemData* item_data, const uni_char* attribute_name, const uni_char* value)
+{
+	OpString read_value;
+	item_data->WriteAttributeValue(attribute_name, value);
+	verify(GetAddressBookItemValue(item_data->GetAddressBookItem(), attribute_name, &read_value));
+	if (value != NULL)
+	{
+		verify(read_value.CStr() != NULL);
+		verify_string(read_value.CStr(), value);
+	}
+	else
+		verify(read_value.CStr() == NULL);
+}
+
+subtest GetAttributeNames(OpINT32HashTable<OpString>* attribute_names, const OpAddressBook::OpAddressBookFieldInfo::Meaning* attributes, unsigned int attribute_count)
+{
+	const OpAddressBook::OpAddressBookFieldInfo* field_infos;
+	unsigned int info_count;
+	g_op_address_book->GetFieldInfos(&field_infos, &info_count);
+	for (unsigned int attr_index = 0; attr_index < attribute_count; ++attr_index)
+	{
+		for (unsigned int i = 0; i < info_count; ++i)
+		{
+			if (field_infos[i].meaning == attributes[attr_index])
+			{
+				OpAutoPtr<OpString> ap_attribute_name(OP_NEW(OpString, ()));
+				verify(ap_attribute_name.get() != NULL);
+				verify_success(ap_attribute_name->Set(field_infos[i].name));
+				verify_success(attribute_names->Add(attributes[attr_index], ap_attribute_name.get()));
+				ap_attribute_name.release();
+			}
+		}
+	}
+}
+
+subtest TestVirtualField(const uni_char* field_name, const OpAddressBook::OpAddressBookFieldInfo::Meaning* fields, unsigned field_count, BOOL includes_multiple_values)
+{
+	JIL_AddressBookMappings::Mapping* field_mapping;
+	int value_index;
+	BOOL mapping_exists = g_mappings->GetMapping(field_name, &field_mapping, &value_index);
+
+	if (mapping_exists && field_mapping->IsVirtualField())
+	{	// Perform tests only if fullName is a virtual field
+		OpAddressBookItem* item;
+		verify_success(OpAddressBookItem::Make(&item, g_op_address_book));
+
+		JIL_AutoAddressBookItemData item_data(item);
+
+		OpAutoINT32HashTable<OpString> attribute_names;
+		verify(GetAttributeNames(&attribute_names, fields, field_count));
+		verify(attribute_names.GetCount() > 0);
+
+		OpString expected_virtual_field_value;
+		for (unsigned int i = 0; i < field_count; ++i)
+		{
+			OpString* attr_name;
+			OP_STATUS get_status = attribute_names.GetData(fields[i], &attr_name);
+			if (OpStatus::IsSuccess(get_status))
+			{
+				OpString test_value;
+				test_value.AppendFormat(UNI_L("test_value%d"), i);
+				verify(SetAttributeValue(&item_data, attr_name->CStr(), test_value.CStr()));
+
+				verify_success(expected_virtual_field_value.AppendFormat(UNI_L("%s "), test_value.CStr()));
+
+				if (includes_multiple_values)
+				{
+					// Attempt to add a second value to the field
+					OpString attr_name2;
+					verify_success(attr_name2.AppendFormat(UNI_L("%s2"), attr_name->CStr()));
+
+					verify_success(test_value.Append(UNI_L("_2")));
+					OP_STATUS set_status = item_data.WriteAttributeValue(attr_name2, test_value.CStr());
+					if (OpStatus::IsSuccess(set_status))
+						verify_success(expected_virtual_field_value.AppendFormat(UNI_L("%s "), test_value.CStr()));
+				}
+			}
+		}
+		expected_virtual_field_value.Strip();
+
+		OpString virtual_field_value;
+		verify_success(item_data.ReadAttributeValue(field_name, &virtual_field_value));
+
+		verify(virtual_field_value.CStr() != NULL);
+		verify_string(expected_virtual_field_value.CStr(), virtual_field_value.CStr());
+	}
+	else
+	{
+		OpString8 field_name8;
+		RETURN_IF_ERROR(field_name8.Set(field_name));	// Don't care about OOM much in here
+		output("%s is not a virtual field, nothing to test\n", field_name8.CStr());
+	}
+}
+
+test("Virtual field fullName")
+	require success "Check initialization";
+{
+	OpAddressBook::OpAddressBookFieldInfo::Meaning fields[] = {
+		OpAddressBook::OpAddressBookFieldInfo::MEANING_FIRST_NAME,
+		OpAddressBook::OpAddressBookFieldInfo::MEANING_MIDDLE_NAME,
+		OpAddressBook::OpAddressBookFieldInfo::MEANING_LAST_NAME };
+	verify(TestVirtualField(UNI_L("fullName"), fields, ARRAY_SIZE(fields), TRUE));
+}
+
+test("Virtual field address")
+	require success "Check initialization";
+{
+	OpAddressBook::OpAddressBookFieldInfo::Meaning fields[] =  {
+		OpAddressBook::OpAddressBookFieldInfo::MEANING_ADDRESS_STREET,
+		OpAddressBook::OpAddressBookFieldInfo::MEANING_ADDRESS_NUMBER,
+		OpAddressBook::OpAddressBookFieldInfo::MEANING_ADDRESS_POSTAL_CODE,
+		OpAddressBook::OpAddressBookFieldInfo::MEANING_ADDRESS_CITY,
+		OpAddressBook::OpAddressBookFieldInfo::MEANING_ADDRESS_STATE,
+		OpAddressBook::OpAddressBookFieldInfo::MEANING_ADDRESS_COUNTRY };
+	verify(TestVirtualField(UNI_L("address"), fields, ARRAY_SIZE(fields), FALSE));
+}
+
+table IsMatchSingleTestsTable(const uni_char*, const uni_char*, OP_BOOLEAN)
+{	// attribute value,    search criteria,     expected result
+	{ UNI_L("test value"), UNI_L("test value"), OpBoolean::IS_TRUE }
+	{ UNI_L("test value"), UNI_L("*value"),     OpBoolean::IS_TRUE }
+	{ UNI_L("test value"), UNI_L("test_value"), OpBoolean::IS_FALSE }
+	{ UNI_L("test value"), UNI_L("*"),          OpBoolean::IS_TRUE }
+	{ UNI_L("test value"), UNI_L(""),           OpBoolean::IS_FALSE }
+	{ UNI_L("test value"), NULL,                OpBoolean::IS_TRUE }
+	{ UNI_L(""),           NULL,                OpBoolean::IS_TRUE }
+	{ UNI_L(""),           UNI_L(""),           OpBoolean::IS_TRUE }
+	{ NULL,                UNI_L(""),           OpBoolean::IS_FALSE }
+	{ NULL,                UNI_L("*"),          OpBoolean::IS_TRUE }
+	{ NULL,                NULL,                OpBoolean::IS_TRUE }
+}
+
+test("IsMatch - single attribute")
+	require success "Check initialization";
+{
+	OpVectorBuilder builder;
+	verify_success(g_mappings->GetAvailableAttributes(NULL, &builder));
+
+	OpAutoVector<OpString> attribute_names;
+	verify_success(builder.ReleaseAttributeNames(&attribute_names));
+
+	verify(attribute_names.GetCount() > 0);
+	OpString* attribute_name = attribute_names.Get(0);
+	verify(attribute_name != NULL);
+
+	OpAddressBookItem* item;
+	verify_success(OpAddressBookItem::Make(&item, g_op_address_book));
+	JIL_AutoAddressBookItemData item_data(item);
+
+	OpAddressBookItem* reference_item;
+	verify_success(OpAddressBookItem::Make(&reference_item, g_op_address_book));
+	JIL_AutoAddressBookItemData reference_item_data(reference_item);
+
+	iterate(value, match_value, expected_result) from IsMatchSingleTestsTable
+	{
+		verify_success(item_data.WriteAttributeValue(attribute_name->CStr(), value));
+		verify_success(reference_item_data.WriteAttributeValue(attribute_name->CStr(), match_value));
+
+		OP_BOOLEAN is_match = reference_item_data.IsMatch(&item_data);
+		if (is_match != expected_result)
+		{
+			// Thank you selftest for displaying code verbatim in verify instead, it give so helpful messages.
+			OpString message;
+			message.AppendFormat(UNI_L("The reference string '%s' %s the attribute value '%s' while it %s.\n"),
+				match_value, is_match == OpBoolean::IS_TRUE ? UNI_L("matches") : UNI_L("doesn't match"), value,
+				expected_result == OpBoolean::IS_TRUE ? UNI_L("should") : UNI_L("should not"));
+			OpString8 message8;
+			verify_success(message8.Set(message));
+			output(message8);
+		}
+		verify_status(expected_result, reference_item_data.IsMatch(&item_data));
+	}
+}
+
+table IsMatchMultipleTestsTable(const uni_char*, const uni_char*, const uni_char*, const uni_char*, OP_BOOLEAN)
+{
+	{ UNI_L("test_value_1"), UNI_L("test_value_2"), UNI_L("test_value_1"), UNI_L("test_value_2"), OpBoolean::IS_TRUE }
+	{ UNI_L("test_value_1"), UNI_L("test_value_2"), UNI_L("test_value_1"), UNI_L("test*"),        OpBoolean::IS_TRUE }
+	{ UNI_L("test_value_1"), UNI_L("test_value_2"), UNI_L("test_value_1"), UNI_L("test"),         OpBoolean::IS_FALSE }
+	{ UNI_L("test_value_1"), UNI_L("test_value_2"), UNI_L("test"),         UNI_L("test*"),        OpBoolean::IS_FALSE }
+	{ UNI_L("test_value_1"), UNI_L("test_value_2"), NULL,                  UNI_L("test_value_2"), OpBoolean::IS_TRUE }
+	{ UNI_L("test_value_1"), UNI_L("test_value_2"), NULL,                  UNI_L("*"),            OpBoolean::IS_TRUE }
+	{ UNI_L("test_value_1"), UNI_L("test_value_2"), UNI_L("*"),            UNI_L("*"),            OpBoolean::IS_TRUE }
+	{ NULL,                  NULL,                  UNI_L("*"),            UNI_L("*"),            OpBoolean::IS_TRUE }
+	{ UNI_L(""),             NULL,                  UNI_L("*"),            UNI_L("*"),            OpBoolean::IS_TRUE }
+	{ NULL,                  NULL,                  UNI_L(""),             UNI_L("*"),            OpBoolean::IS_FALSE }
+}
+
+test("IsMatch - two attributes")
+	require success "IsMatch - single attribute";
+{
+	OpVectorBuilder builder;
+	verify_success(g_mappings->GetAvailableAttributes(NULL, &builder));
+
+	OpAutoVector<OpString> attribute_names;
+	verify_success(builder.ReleaseAttributeNames(&attribute_names));
+
+	verify(attribute_names.GetCount() >= 2);
+	OpString* attribute_name_1 = attribute_names.Get(0);
+	OpString* attribute_name_2 = attribute_names.Get(1);
+	verify(attribute_name_1 != NULL);
+	verify(attribute_name_2 != NULL);
+
+	OpAddressBookItem* item;
+	verify_success(OpAddressBookItem::Make(&item, g_op_address_book));
+	JIL_AutoAddressBookItemData item_data(item);
+
+	OpAddressBookItem* reference_item;
+	verify_success(OpAddressBookItem::Make(&reference_item, g_op_address_book));
+	JIL_AutoAddressBookItemData reference_item_data(reference_item);
+
+	iterate(value_1, value_2, match_value_1, match_value_2, expected_result) from IsMatchMultipleTestsTable
+	{
+		verify_success(item_data.WriteAttributeValue(attribute_name_1->CStr(), value_1));
+		verify_success(item_data.WriteAttributeValue(attribute_name_2->CStr(), value_2));
+		verify_success(reference_item_data.WriteAttributeValue(attribute_name_1->CStr(), match_value_1));
+		verify_success(reference_item_data.WriteAttributeValue(attribute_name_2->CStr(), match_value_2));
+
+		OP_BOOLEAN is_match = reference_item_data.IsMatch(&item_data);
+		if (is_match != expected_result)
+		{
+			// Thank you selftest for displaying code verbatim in verify instead, it give so helpful messages.
+			OpString message;
+			message.AppendFormat(UNI_L("The reference item ('%s', '%s') %s the attribute values ('%s', '%s') while it %s.\n"),
+				match_value_1, match_value_2,
+				is_match == OpBoolean::IS_TRUE ? UNI_L("matches") : UNI_L("doesn't match"),
+				value_1, value_2,
+				expected_result == OpBoolean::IS_TRUE ? UNI_L("should") : UNI_L("should not"));
+			OpString8 message8;
+			verify_success(message8.Set(message));
+			output(message8);
+		}
+		verify_status(expected_result, reference_item_data.IsMatch(&item_data));
+	}
+}
+
+table IsMatchVirtualTestTable(const uni_char*, OP_BOOLEAN)
+{//   search criteria      expected result
+	{ UNI_L("test value"), OpBoolean::IS_TRUE }
+	{ UNI_L("*"),          OpBoolean::IS_TRUE }
+	{ UNI_L(""),           OpBoolean::IS_FALSE }
+	{ NULL,                OpBoolean::IS_TRUE }
+	{ UNI_L("value"),      OpBoolean::IS_FALSE }
+	{ UNI_L("test"),       OpBoolean::IS_FALSE }
+}
+
+
+subtest TestVirtualAttributeMatch(const uni_char* real_attr_name_1, const uni_char* real_attr_value_1,
+                                  const uni_char* real_attr_name_2, const uni_char* real_attr_value_2,
+                                  const uni_char* field_name, const uni_char* match_value, OP_BOOLEAN expected_value)
+{
+	OpAddressBookItem* item;
+	verify_success(OpAddressBookItem::Make(&item, g_op_address_book));
+	JIL_AutoAddressBookItemData item_data(item);
+
+	OpAddressBookItem* reference_item;
+	verify_success(OpAddressBookItem::Make(&reference_item, g_op_address_book));
+	JIL_AutoAddressBookItemData reference_item_data(reference_item);
+
+	verify(SetAttributeValue(&item_data, real_attr_name_1, real_attr_value_1));
+	verify(SetAttributeValue(&item_data, real_attr_name_2, real_attr_value_2));
+
+	verify_success(reference_item_data.WriteAttributeValue(field_name, match_value));
+	verify_status(expected_value, reference_item_data.IsMatch(&item_data));
+}
+
+subtest TestIsMatchVirtualAttribute(const uni_char* field_name, const OpAddressBook::OpAddressBookFieldInfo::Meaning* fields, unsigned field_count)
+{
+	JIL_AddressBookMappings::Mapping* field_mapping;
+	int value_index;
+	BOOL mapping_exists = g_mappings->GetMapping(field_name, &field_mapping, &value_index);
+
+	if (mapping_exists && field_mapping->IsVirtualField())
+	{	// Perform tests only if fullName is a virtual field
+
+		OpAutoINT32HashTable<OpString> attribute_names;
+		verify(GetAttributeNames(&attribute_names, fields, field_count));
+		verify(attribute_names.GetCount() >= 2, This test needs fullName to comprise of at least two real fields);
+
+		OpString* attribute_name_1;
+		OpString* attribute_name_2;
+		OpAutoPtr<OpHashIterator> ap_iterator(attribute_names.GetIterator());
+		verify_not_oom(ap_iterator.get());
+
+		verify_success(ap_iterator->First());
+		attribute_name_1 = static_cast<OpString*>(ap_iterator->GetData());
+		verify_success(ap_iterator->Next());
+		attribute_name_2 = static_cast<OpString*>(ap_iterator->GetData());
+
+		verify(TestVirtualAttributeMatch(attribute_name_1->CStr(), UNI_L(""), attribute_name_2->CStr(), UNI_L(""),
+			field_name, UNI_L(""), OpBoolean::IS_TRUE));
+		verify(TestVirtualAttributeMatch(attribute_name_1->CStr(), NULL, attribute_name_2->CStr(), NULL,
+			field_name, UNI_L(""), OpBoolean::IS_FALSE));
+
+		OpAddressBookItem* item;
+		verify_success(OpAddressBookItem::Make(&item, g_op_address_book));
+		JIL_AutoAddressBookItemData item_data(item);
+
+		OpAddressBookItem* reference_item;
+		verify_success(OpAddressBookItem::Make(&reference_item, g_op_address_book));
+		JIL_AutoAddressBookItemData reference_item_data(reference_item);
+
+		verify(SetAttributeValue(&item_data, attribute_name_1->CStr(), UNI_L("test")));
+		verify(SetAttributeValue(&item_data, attribute_name_2->CStr(), UNI_L("value")));
+
+		iterate (match_value, expected_result) from IsMatchVirtualTestTable
+		{
+			verify_success(reference_item_data.WriteAttributeValue(field_name, match_value));
+
+			verify_status(expected_result, reference_item_data.IsMatch(&item_data));
+		}
+	}
+	else
+	{
+		OpString8 field_name8;
+		RETURN_IF_ERROR(field_name8.Set(field_name));	// Don't care about OOM much in here
+		output("%s is not a virtual field, nothing to test\n", field_name8.CStr());
+	}
+}
+
+test("IsMatch - virtual attribute fullName")
+	require success "IsMatch - single attribute";
+	require success "Virtual field fullName";
+{
+	OpAddressBook::OpAddressBookFieldInfo::Meaning fields[] = {
+		OpAddressBook::OpAddressBookFieldInfo::MEANING_FIRST_NAME,
+		OpAddressBook::OpAddressBookFieldInfo::MEANING_MIDDLE_NAME,
+		OpAddressBook::OpAddressBookFieldInfo::MEANING_LAST_NAME };
+	verify(TestIsMatchVirtualAttribute(UNI_L("fullName"), fields, ARRAY_SIZE(fields)));
+}
+
+test("IsMatch - virtual attribute address")
+	require success "IsMatch - single attribute";
+	require success "Virtual field address";
+{
+	OpAddressBook::OpAddressBookFieldInfo::Meaning fields[] =  {
+		OpAddressBook::OpAddressBookFieldInfo::MEANING_ADDRESS_STREET,
+		OpAddressBook::OpAddressBookFieldInfo::MEANING_ADDRESS_NUMBER,
+		OpAddressBook::OpAddressBookFieldInfo::MEANING_ADDRESS_POSTAL_CODE,
+		OpAddressBook::OpAddressBookFieldInfo::MEANING_ADDRESS_CITY,
+		OpAddressBook::OpAddressBookFieldInfo::MEANING_ADDRESS_STATE,
+		OpAddressBook::OpAddressBookFieldInfo::MEANING_ADDRESS_COUNTRY };
+	verify(TestIsMatchVirtualAttribute(UNI_L("address"), fields, ARRAY_SIZE(fields)));
+}
+
+test("GetAvailableAttributes for bounded multiple values")
+	require success "Check initialization";
+{
+	OpVectorBuilder builder;
+	verify_success(g_mappings->GetAvailableAttributes(NULL, &builder));
+	OpAutoVector<OpString> attribute_names;
+	verify_success(builder.ReleaseAttributeNames(&attribute_names));
+
+	OpAutoINT32HashTable<OpINT32Set> field_to_value_indexes;
+
+	INT32 count = attribute_names.GetCount();
+	for (INT32 i = 0; i < count; ++i)
+	{
+		JIL_AddressBookMappings::Mapping *mapping;
+		int value_index;
+		verify(g_mappings->GetMapping(attribute_names.Get(i)->CStr(), &mapping, &value_index));
+
+		if (mapping->multiplicity > 0)
+		{
+			OpString8 name8;
+			name8.Set(attribute_names.Get(i)->CStr());
+			output("Field: %s; multiplicity: %d\n", name8.CStr(), mapping->multiplicity);
+
+			if (!field_to_value_indexes.Contains(mapping->field_index))
+			{	// First time we see this field, add expected value indexes
+				OpINT32Set* field_indexes = OP_NEW(OpINT32Set, ());
+				verify_not_oom(field_indexes);
+				OpAutoPtr<OpINT32Set> field_indexes_anchor(field_indexes);
+				for (INT32 i = 0; i < mapping->multiplicity; ++i)
+					verify_success(field_indexes->Add(i));
+				verify_success(field_to_value_indexes.Add(mapping->field_index, field_indexes));
+				field_indexes_anchor.release();
+			}
+
+			OpINT32Set* field_indexes;
+			if (field_to_value_indexes.GetData(mapping->field_index, &field_indexes) == OpStatus::OK)
+			{
+				OP_STATUS remove_status = field_indexes->Remove(value_index);
+				if (remove_status != OpStatus::OK)
+				{
+					output("Field: %s; multiplicity: %d; the field should not exist for value number: %d\n",
+							name8.CStr(), mapping->multiplicity, value_index);
+					verify_status(OpStatus::OK, remove_status);
+				}
+			}
+		}
+	}
+
+
+	OpAutoPtr<OpHashIterator> ap_iterator(field_to_value_indexes.GetIterator());
+	verify_not_oom(ap_iterator.get());
+
+	const OpAddressBook::OpAddressBookFieldInfo* field_infos;
+	unsigned int info_count;
+	g_op_address_book->GetFieldInfos(&field_infos, &info_count);
+
+	OP_STATUS iterator_status = ap_iterator->First();
+	while (OpStatus::IsSuccess(iterator_status))
+	{
+		OpINT32Set* field_indexes = reinterpret_cast<OpINT32Set*>(ap_iterator->GetData());
+		OpAutoPtr<OpHashIterator> ap_field_iterator(field_indexes->GetIterator());
+		verify_not_oom(ap_field_iterator.get());
+
+		INT32 field_index = static_cast<INT32>(reinterpret_cast<INTPTR>(ap_iterator->GetKey()));
+
+		OP_STATUS field_iterator_status = ap_field_iterator->First();
+		while (OpStatus::IsSuccess(field_iterator_status))
+		{
+			INT32 value_index = static_cast<INT32>(reinterpret_cast<INTPTR>(ap_field_iterator->GetKey()));
+			OpString8 name8;
+			name8.Set(field_infos[field_index].name);
+			output("Attribute for %d (PI name %s), value %d missing\n", field_index, name8.CStr(), value_index);
+
+			field_iterator_status = ap_field_iterator->Next();
+		}
+
+		verify(field_indexes->GetCount() == 0);
+		iterator_status = ap_iterator->Next();
+	}
+}
+
+table TestAttributeValues(const uni_char*)
+{
+	{ UNI_L("") }
+	{ NULL }
+	{ UNI_L("abcde") }
+}
+
+test("GetAvailableAttributes, SetAttributeValue and GetAttributeValue")
+	require success "Check initialization";
+{
+	OpVectorBuilder builder;
+	verify_success(g_mappings->GetAvailableAttributes(NULL, &builder));
+	OpAutoVector<OpString> attribute_names;
+	verify_success(builder.ReleaseAttributeNames(&attribute_names));
+
+	INT32 count = attribute_names.GetCount();
+	for (INT32 attribute_index = 0; attribute_index < count; ++attribute_index)
+	{
+		JIL_AddressBookMappings::Mapping *mapping;
+		int value_index;
+		verify(g_mappings->GetMapping(attribute_names.Get(attribute_index)->CStr(), &mapping, &value_index));
+
+		OpAddressBookItem* item;
+		verify_success(OpAddressBookItem::Make(&item, g_op_address_book));
+
+		JIL_AutoAddressBookItemData item_data(item);
+
+		if (mapping->multiplicity > 0)
+		{
+			OpString attribute_name;
+			verify_success(attribute_name.Set(attribute_names.Get(attribute_index)->CStr()));
+			OpString value;
+
+			verify_success(item_data.ReadAttributeValue(attribute_name.CStr(), &value));
+			verify(value.CStr() == NULL);
+
+			iterate (expected_value) from TestAttributeValues
+			{
+				verify_success(item_data.WriteAttributeValue(attribute_name.CStr(), expected_value));
+				verify_success(item_data.ReadAttributeValue(attribute_name.CStr(), &value));
+				if (expected_value == NULL)
+					verify(value.CStr() == NULL);
+				else
+				{
+					verify(value.CStr() != NULL);
+					verify_string(expected_value, value.CStr());
+				}
+			}
+		}
+		else
+		{
+			OpString attribute_name;
+
+			verify_success(attribute_name.AppendFormat(UNI_L("%s%d"), attribute_names.Get(attribute_index)->CStr(), 5));
+
+			OpString value;
+
+			verify_success(item_data.ReadAttributeValue(attribute_name.CStr(), &value));
+			verify(value.CStr() == NULL);
+
+			iterate (expected_value) from TestAttributeValues
+			{
+				verify_success(item_data.WriteAttributeValue(attribute_name.CStr(), expected_value));
+				verify_success(item_data.ReadAttributeValue(attribute_name.CStr(), &value));
+				if (expected_value == NULL)
+					verify(value.CStr() == NULL);
+				else
+				{
+					verify(value.CStr() != NULL);
+					verify_string(expected_value, value.CStr());
+				}
+			}
+
+			// Read an earlier value that has not been explicitly defined.
+			attribute_name.Empty();
+			verify_success(attribute_name.AppendFormat(UNI_L("%s%d"), attribute_names.Get(attribute_index)->CStr(), 2));
+			verify_success(item_data.ReadAttributeValue(attribute_name.CStr(), &value));
+			verify(value.CStr() == NULL);
+
+			// Read a further value that has not been explicitly defined.
+			attribute_name.Empty();
+			verify_success(attribute_name.AppendFormat(UNI_L("%s%d"), attribute_names.Get(attribute_index)->CStr(), 10));
+			verify_success(item_data.ReadAttributeValue(attribute_name.CStr(), &value));
+			verify(value.CStr() == NULL);
+		}
+	}
+}

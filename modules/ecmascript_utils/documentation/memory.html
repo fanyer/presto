@@ -1,0 +1,244 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01//EN">
+<html lang="en" dir="ltr">
+<head>
+ <meta http-equiv="Content-Type" content="text/html;charset=iso-8859-1">
+ <title>ECMAScript Utils module - Memory documentation</title>
+ <link rev="made" href="mailto:jl@opera.no">
+ <link rel="stylesheet" href="../../coredoc/coredoc.css" type="text/css" media="all">
+ <link rel="contents" href="../../coredoc/index.html" type="text/html" title="Core API">
+ <style type="text/css">
+  pre { border-left: 2px solid #ddd; }
+ </style>
+</head>
+
+<body>
+ <h1>ECMAScript Utils module - Memory documentation</h1>
+ <p>
+  Copyright © 1995-2005 Opera Software AS. All rights reserved.
+  This file is part of the Opera web browser. It may not be distributed
+  under any circumstances.
+  <br>
+  $Id$
+ </p>
+
+ <h2>Used OOM policies / Who is handling OOM?</h2>
+ <p>
+  All functions in the various classes in the module that comprise its
+  public API that can fail due to OOM signal such failures by
+  returning
+
+    <code>OpStatus::ERR_NO_MEMORY</code>.
+
+  In such case, the caller is responsible for handling the out of
+  memory condition.
+
+  When an out of memory condition occurs in a call directly from the
+  message loop (this includes, for instance, all out of memory
+  conditions signalled by the ECMAScript execution engine,) OOM is
+  signalled through a call to
+
+    <code>Window::RaiseCondition</code>
+
+  or
+
+    <code>MemoryManager::RaiseCondition</code>
+
+  (the latter if the ECMAScript environment is not one connected to a
+  document.)
+
+  When an asynchronous operation started through the
+
+    <code>ES_AsyncInterface</code>
+
+  interface fails due to OOM, this is (in addition to what is
+  described above) signalled by calling the registered callback with
+  the status
+
+    <code>ES_ASYNC_NO_MEMORY</code>.
+ </p>
+ <p>
+  In addition to propagating OOM signals to outside the module, out of
+  memory conditions that occur while executing threads are also
+  handled by killing all threads in the affected scheduler (thus
+  returning it to its initial state.)
+ </p>
+
+ <h2>Description of flow</h2>
+ <p>
+  The code flow in the module is divided into two main cases:
+ </p>
+ <dl>
+  <dt>Called from external code</dt>
+  <dd>
+    Calls from external code (code in other modules) primarily
+    initiate new operations by allocating the necessary objects,
+    compiling ECMAScript programs and posting messages to the message
+    loop.
+
+    Typical important entry points are
+
+      <ol>
+        <li><code>ES_ThreadSchedulerImpl::AddRunnable</code></li>
+        <li><code>ES_ThreadSchedulerImpl::AddWaiting</code></li>
+        <li><code>ES_AsyncInterface::Eval</code></li>
+        <li><code>ES_LoadManager::RegisterScript</code></li>
+        <li><code>ES_LoadManager::SetScript</code></li>
+        <li><code>ES_LoadManager::Write</code></li>
+      </ol>
+
+    Functions 3 through 6 typically allocate significant amounts of
+    memory and are thus likely to be handling OOM.
+
+  </dd>
+
+  <dt>Called from message loop</dt>
+  <dd>
+    Calls from the message loop do most of the real work, by
+    evaluating threads and possibly calling the ECMAScript execution
+    engine to execute code.
+
+    The typical call chain is
+
+      <ol>
+       <li>&lt;<i>Message loop</i>&gt;</li>
+       <li><code>ES_ThreadSchedulerImpl::HandleCallback</code></li>
+       <li><code>ES_ThreadSchedulerImpl::RunNow</code></li>
+       <li><code>ES_Thread::Evaluate</code></li>
+       <li>&lt;<i>ECMAScript execution engine</i>&gt;</li>
+      </ol>
+
+    Out of memory conditions that occur during ECMAScript execution or
+    in DOM code will be propagated out from the ECMAScript execution
+    engine at 5, handled internally by 3 (through a call to
+
+      <code>ES_ThreadSchedulerImpl::HandleError</code>)
+
+    and then propagated out of the module by 2.
+  </dd>
+ </dl>
+
+ <h2>Heap memory usage</h2>
+ <p>
+  Most memory allocated is used for control structures such as thread
+  schedulers
+
+    (<code>ES_ThreadSchedulerImpl</code>)
+
+  and threads
+
+    (<code>ES_Thread</code>
+
+   and subclasses) and for script generated document data (text
+  written by a script through a call to either of the functions
+  "document.write" and "document.writeln".)  While both thread
+  schedulers and threads are fairly large objects, there are normally
+  few alive at any given time (at most one scheduler per document, and
+  zero or more threads per thread scheduler.)  Threads are deallocated
+  as soon as they finish executing.  The amount of script generated
+  document data depends entirely on scripts on the page.  There is no
+  upper limit.  Script generated document data is allocated in blocks
+  of fixed size (see "Memory tuning") and freed (blockwise) as soon as
+  it has been consumed by the document (HTML or XML) parser.
+ </p>
+ <p>
+  Some threads own potentially large heap allocated structures from
+  the ECMAScript module, represented by
+
+    <code>ES_Context</code>
+
+  and
+
+    <code>ES_Program</code>
+
+  objects.  Such objects are freed by the threads when the threads are
+  deallocated.  Most memory referenced by such objects are probably
+  owned and freed by the ECMAScript garbage collector at an unknown
+  time after the objects have been freed.
+ </p>
+
+ <h2>Stack memory usage</h2>
+ <p>
+  The module uses insignificant amounts of stack memory.  There are no
+  complex recursive functions or stack allocated arrays larger than a
+  few bytes.
+ </p>
+
+ <h2>Caching and freeing memory</h2>
+ <p>
+  The module has no caching, and there is no non-destructive way to
+  free memory.  It is possible to kill all currently alive threads and
+  thus free them and memory referenced from them by calling the
+  function ES_ThreadScheduler::RemoveThreads.
+ </p>
+
+ <h2>Freeing memory on exit</h2>
+ <p>
+  Freeing memory on exit is dependant on that someone else frees all
+
+    <code>ES_ThreadScheduler</code>
+
+  and
+
+    <code>ES_Environment</code>
+
+  objects.  This is typically the responsibility of the DOM module (in
+  the case of thread schedulers) and whatever code that created the
+
+    <code>ES_Environment</code>
+
+   object (currently only Voice XML code does that.)
+ </p>
+
+ <h2>Temporary buffers</h2>
+ <p>
+  The module uses the shared buffer returned by the function
+
+    <code>MemoryManager::GetTempBuf</code>.
+
+  In one case it is simply to avoid having to allocate a separate
+  string (pure optimization that is easy to remove) and in all other
+  cases the shared buffer is used to return a generated string from a
+  function without making the caller (which is in the ECMAScript
+  module) responsible for deallocating the returned string.  Changing
+  this requires either using a non-shared but still globally allocated
+  buffer, or to rewrite the function and the code that calls it so
+  that the caller deallocates the string.
+ </p>
+
+ <h2>Memory tuning</h2>
+ <p>
+  The class load manager (ES_LoadManager) uses a list of blocks to
+  store script generated data.  The size of the blocks in that list
+  depends on the tweak TWEAK_ESUTILS_BLOCK_DATA_SIZE. No other memory
+  tuning is possible.
+ </p>
+
+ <h2>Tests</h2>
+ <p>
+  There are no tests specificly for testing memory usage.
+ </p>
+
+ <h2>Coverage</h2>
+ <p>
+  Running the "Scheduler regression tests" in the jstest2 CVS module
+  and the selftests in the ECMAScript Utils module ("ESUtils.*")
+  should provide good coverage for the code that is likely to be
+  handling out of memory conditions.
+ </p>
+
+ <h2>Design choices</h2>
+ <p>
+  There are no design choices in the module's design relating directly
+  to balancing memory usage, footprint, performance and/or design.  Or
+  put differently: essentially no compromises between the different
+  priorities have been made.
+ </p>
+
+ <h2>Suggestions of improvements</h2>
+ <p>
+  There are currently no planned improvements with regards to memory
+  handling.
+ </p>
+
+</body>
+</html>

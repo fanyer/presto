@@ -1,0 +1,242 @@
+﻿<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01//EN">
+<html lang="en" dir="ltr">
+<head>
+ <meta http-equiv="Content-Type" content="text/html;charset=utf-8">
+ <title>SPDY implementation notes</title>
+ <link rev="made" href="mailto:kswitalski@opera.com">
+ <link rel="stylesheet" href="../../../coredoc/coredoc.css" type="text/css" media="all">
+ <link rel="contents" href="../../../coredoc/index.html" type="text/html" title="Core API">
+ <link rel="next" href="segmenter.html" type="text/html">
+ <style type="text/css">
+  a[href^="http://www.unicode.org/"]:after { content: " (external link)"; }
+  ul#tocUl { list-style: none; padding-left: 0; }
+ </style>
+ <script type="text/javascript" src="../../../coredoc/createtoc.js"></script>
+</head>
+
+<body>
+ <h1>SPDY implementation notes</h1>
+ <p id="toc">
+  Copyright © 1995-2012 Opera Software ASA. All rights reserved.
+  This file is part of the Opera web browser. It may not be distributed
+  under any circumstances.
+ </p>
+
+ <h2 id="introduction">Introduction</h2>
+  <p>
+    <em>SPDY</em> is a binary protocol designed by Google to mitigate many HTTP problems like additional round trips for connection 
+    setup and slow-start delays.
+  </p>
+  <p>
+    Quoting SPDY Protocol - Draft 3:
+  </p>
+  <p>
+    “ISPDY adds a framing layer for multiplexing multiple, concurrent streams across a single TCP connection (or any reliable transport stream).
+    The framing layer is optimized for HTTP-like request-response streams, such that applications which run over HTTP today can work over SPDY
+    with little or no change on behalf of the web application writer"
+  </p>
+  <p>
+    ...
+  </p>
+  <p>
+    "SPDY is intended to be as compatible as possible with current web-based applications. This means that, from the perspective 
+    of the server business logic or application API, the features of HTTP are unchanged. To achieve this, all of the application 
+    request and response header semantics are preserved, although the syntax of conveying those semantics has changed."
+  </p>
+  <p>
+    This document doesn't describe the protocol itself but only it's imeplementation in the Opera Browser. To learn more about the SPDY protocol please read:
+    <a href="http://www.chromium.org/spdy/spdy-protocol/spdy-protocol-draft2">SPDY/2</a> and <a href="http://www.chromium.org/spdy/spdy-protocol/spdy-protocol-draft3">SPDY/3</a>
+    drafts.
+  </p>
+
+  <h2 id="supportnotes">Support notes</h2>
+  <p>
+    Opera's SPDY implementation currently supports all features of the spdy/2 and spdy/3 protocols, except for:
+    <ul>
+      <li>
+        PUSH and HINT: there is no deployment of PUSH and HINT usage on the web (as far as we know), and no way to use it with mod_spdy so we decided 
+        not to implement it for the time being, until we have something to test it on, and more evidence of actual usage.        
+      </li>
+      <li>
+        The Alternate-Protocol header: neither Chrome nor Firefox have implemented this in the way described in SPDY draft 2, 
+        moreover SPDY draft 3 does not even mention that header anymore, so we decided to not support it.
+      </li>
+    </ul>
+  </p>
+
+  <h3 id="supportnotes">Settings persistence</h3>
+  <p>
+    Quoting SPDY Protocol - Draft 3:
+  </p>
+  <p>
+    "A SETTINGS frame contains a set of id/value pairs for communicating configuration data about how the two endpoints may communicate. 
+    SETTINGS frames can be sent at any time by either endpoint, are optionally sent, and are fully asynchronous. When the server is the sender, 
+    the sender can request that configuration data be persisted by the client across SPDY sessions and returned to the server in future communications."
+  </p>
+  <p>
+    After considering privacy issues, settings persistence feature has been implemented with the following restrictions:
+    <ul>
+      <li>
+        settings are not persisted for domains that we don't allow to persist cookies for (checked with <code>serverName->GetAcceptCookies()</code>),
+      </li>
+      <li>
+        settings are not persisted for connections created for requests made in privacy mode,
+      </li>
+      <li>
+        settings are forgotten after 10 days of being unused (the expire time is controlled by <em>PrefsCollectionNetwork::SpdySettingsPersistenceTimeout</em>),
+      </li>
+      <li>
+        settings persistence can be disabled in preferences (<em>PrefsCollectionNetwork::SpdySettingsPersistence</em>),
+      </li>
+      <li>
+        persisted settings are cleared along with cookies on user's demand (as required by the spec).
+      </li>
+    </ul>
+  </p>
+  
+ <h2 id="designoverview">Design overview</h2>
+  <p>
+    The design goal for the implementation was to minimize changes to existing HTTP protocol stack and thereby lower the
+    regression risk in the good old HTTP. On the other hand we wanted to re-use the code responsible for creating and managing HTTP
+    connections.
+  </p>
+  
+  <h3 id="toplevel">Top level design</h3>
+  <p>
+    From the <em>HTTP_1_1</em> class we've extracted <em>HttpRequestsHandler</em> abstract class, which became a base for all
+    classes capable of handling HTTP requests (represented by <em>HTTP_Request</em> class). In result we've ended up with a model shown on
+    the UML diagram below:
+  </p>
+  <p>
+    <img src="img/HttpStack.png"/>
+    <img src="img/HttpRequestsHandler.png"/>
+  </p>
+
+  <h3 id="spdyconnection">The SpdyConnection class + some overview of Abstract SPDY layer</h3>
+  <p>
+    The <em>SpdyConnection</em> class inherits from <em>HttpRequestsHandler</em> and therefore is able to handle HTTP requests. As opposed to <em>HTTP_1_1</em>,
+    <em>SpdyConnection</em> doesn't need to be known to (or even worse - friended by) <em>HTTP_Request</em> class. It's the connection that handles requests 
+    not the other way around so the request shouldn't be aware of what kind of connection is taking care of it. The dependency between <em>HTTP_1_1</em> and <em>HTTP_Request</em>
+    has been kept though, to avoid the risk of regressions in HTTP protocol. For clarity, the <code>HTTP_1_1 conn</code> field in the <em>HTTP_Request</em> 
+    class has been renamed to <code>HTTP_1_1 http_conn</code>.
+    <em>SpdyConnection</em> doesn't know much about the SPDY protocol, it just handles various connection and protocol events, adding/counting/removing requests, 
+    and when needed - moving unfinished requests to another connection.
+  </p>
+  <p>
+    For dealing with the SPDY protocol the <em>SpdyConnection</em> class needs to know only three of the classes from <em>Abstract SPDY layer</em>.
+    Those three classes constitute the external interface of the <em>Abstract SPDY layer</em> which can also be used for other communication, not necessarily
+    related to HTTP. They are:
+    <ul>
+     <li>SpdyFramesHandler</li>
+     <li>SpdyFramesHandlerListener</li>
+     <li>SpdyStreamController</li>
+    </ul>
+    <p>
+      In the SPDY protocol resources are requested from the server side by opening streams with appropriate headers (and possibly sending data).
+      Then the server side may accept the stream and send it's own headers + data in response, or refuse the stream.
+      The <em>SpdyFrameHandler</em> class is responsible for creating and handling streams, but it needs to know what headers should be sent and what to do
+      with the received data. This is the role of <em>SpdyStreamControler</em>. <em>SpdyStreamControler</em> is a listener and data provider in one.
+      It's responsible for providing all information needed for creating the stream and is fed the data loaded from the stream.
+    </p>
+    <p>
+      In order to make a request the <em>SpdyConnection</em> class calls <code>CreateStreamL()</code> on <code>SpdyFramesHandler</code> and provides 
+      a <em>SpdyHTTPRequestHandler</em> (inherited from <em>SpdyStreamController</em>) associated with a given <em>HTTP_Request</em> as a parameter.
+    </p>
+    <p>
+      The UML diagram below shows the dependencies and responsibilities of each classes.
+    </p>
+    <p>
+      <img src="img/SpdyConnection.png"/>
+      <img src="img/SpdyFramesHandler.png"/>
+      <img src="img/SpdyFramesHandlerListener.png"/>
+      <img src="img/SpdyStreamController.png"/>
+    </p>
+  </p>
+
+  <h3 id="abstractspdy">Abstract SPDY layer</h3>
+  <p>
+    The Abstract SPDY layer provides a framing layer which multiplexes a TCP connection into independent, length-prefixed frames. The goal was to design it in a way 
+    that enables using it also for purposes other then carrying HTTP requests. It's interface (decribed above) enables any communication utilizing concurrent 
+    streams on a single connection. For that reasons it doesn't know anything about HTTP and in particular about HTTP requests.
+  </p>
+  <p>
+    The heart of the <em>Abstract SPDY layer</em> is <em>SpdyFramesHandler</em> which is responsible for the SPDY framing layer. It parses the incoming data in search 
+    of specific headers, handles incoming and outgoing frames for concurrent streams and notifies the listener when it has some data to send or when something requiring it's 
+    attention happens in the protocol (e.g. ping timeout, goaway message, protocol error).
+  </p>
+
+  <h4 id="frameproducers">Frame producers</h4>
+  <p>
+    <em>SpdyFramesHandler</em> doesn't produce SPDY frames on its own but keeps a priority ordered list of <em>FrameProducer</em>s that are responsible for that.
+  </p>
+  <p>
+    Examples of <em>SpdyFrameProducer</em>s:
+    <ul>
+      <li>
+        <em>SpdyPingController</em> - responsible for sending and answering PING frames,
+      </li>
+      <li>
+        <em>SpdySettingsController</em> - responsible for sending and receiving SETTINGS frames,
+      </li>
+      <li>
+        <em>SpdyPushCanceller</em> - responsible for cancelling incoming streams (for the time being we don't support PUSH),
+      </li>
+      <li>
+        <em>SpdyStreamHandler</em> - responsible for receiving and producing all stream-related frames (SYNSTREAM, DATA, RESET, WINDOW_UPDATE, etc.).
+      </li>
+    </ul>
+  </p>
+
+  <h4 id="dataconsumers">Data consumers</h4>
+  <p>
+    When receiving data from a server frames can be retrived in many small chunks. In the worst case scenario we could receive a 1-byte length chunk
+    which cannot even be parsed as a valid frame header. <em>SpdyFramesHandler</em> buffers received data until it can parse it as a valid frame header.
+    In the case of frames having a payload beside the header (like SYN_STREAM, SYN_REPLY, SETTINGS or HEADERS) the incoming payload data is passed to
+    appropriate <em>SpdyDataConsumer</em>s. On a single connection there can be only one <em>DataConsumer</em> awaiting payload associated with a recently 
+    received frame. If there is one then <em>SpdyFramesHandler</em> keeps a pointer to it. When this pointer is NULL an attempt is made to parse the next 
+    incoming data chunk as a frame header again.
+  </p>
+  </p>
+  <p>
+    Examples of <em>SpdyDataConsumer</em>s:
+    <ul>
+      <li>
+        <em>SpdySettingsController</em> - consumes the payload of SETTINGS frames (settings entries),
+      </li>
+      <li>
+        <em>SpdyStreamHandler</em> - cosumes the payload of SYN_REPLY, HEADERS or DATA frames,
+      </li>
+      <li>
+        <em>SpdyDevNullConsumer</em> - consumes the payload of frames that we decided to ignore,
+      </li>
+      <li>
+        <em>SpdyDecompressingConsumer</em> - decompresses (to preserve the consistency of zlib stream) and discards the payload of frames that we decided to ignore.
+      </li>
+    </ul>
+  </p>
+  <p>
+    The UML diagram below shows the described classes and their dependencies:
+  </p>
+  <p>
+    <img src="img/AbstractSpdyLayer.png"/>
+  </p>
+
+  <h3 id="memorymanagement">Memory management</h3>
+  <p>
+    Unlike the <em>HTTP_1_1</em>, <em>SpdyConnection</em> handles multiple requests at the same time and it can not operate on a single static memory buffer.
+    To solve that problem every received data chunk is added the <em>OpData buffer</em> in the <em>SpdyFramesHandler</em> and shared with <em>data consumer</em>s via 
+    copying OpData objects.
+  </p>
+  <p>
+    The diagram below shows the data flow in <em>SPDY</em> protocol:
+  </p>
+  <p>
+    <img src="img/DataFlow.png"/>
+  </p>
+
+  <h2 id="improovements">Possible improvements</h2>
+  <p>
+    PUSH and HINT should be implemented as soon as we have something to test it on, and some evidence of actual usage on the web.
+  </p>
+  </body>
+</html>

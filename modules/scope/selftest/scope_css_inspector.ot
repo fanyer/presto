@@ -1,0 +1,1968 @@
+/* -*- mode: c++; tab-width: 4 -*-
+**
+** Copyright (C) 2009-2012 Opera Software ASA.  All rights reserved.
+**
+** This file is part of the Opera web browser.  It may not be distributed
+** under any circumstances.
+**
+** Test for scope css inspector.
+**
+** Jan Borsodi
+*/
+
+group "scope.cssinspector";
+
+require init;
+require SCOPE_ECMASCRIPT_DEBUGGER;
+
+global {
+	class OtScopeStyleListener : public OpScopeStyleListener
+	{
+	public:
+		class Property
+		{
+		public:
+			Property(OpScopeNodeMatch::Property *prop = NULL) : prop(prop), is_matched(FALSE) {}
+
+			OpScopeNodeMatch::Property *prop;
+			BOOL                        is_matched;
+		};
+
+		OtScopeStyleListener(FramesDocument *doc);
+		~OtScopeStyleListener();
+		OP_STATUS Construct(const uni_char *element_name = UNI_L("itemtotest"));
+
+		static OP_STATUS FindElement(HTML_Element *&elm, FramesDocument *doc, const uni_char *element_name);
+		static ES_Object* GetStylesheetESObject(DOM_Object* dom_obj, DOM_Environment* environment);
+
+		OP_STATUS GetStyleRules(HTML_Element *elm);
+
+		virtual int GetObjectID(HTML_Element* elm);
+		virtual int GetObjectID(DOM_Object* dom_obj);
+		virtual unsigned int GetStylesheetID(DOM_Object* dom_obj);
+		FramesDocument *GetFramesDocument() const { return doc; }
+
+		OpScopeNodeMatch *GetNextMatch()
+		{
+			if (properties != NULL)
+			{
+				// Make sure there are no unmatched properties from previous rule object
+				for (int i = 0; i < property_count; ++i)
+					if (!properties[i].is_matched)
+						return NULL;
+				OP_DELETEA(properties);
+				properties = NULL;
+				property_count = 0;
+			}
+			if (match == NULL)
+			{
+				if (rule != NULL)
+					return NULL;
+				match = FirstMatch();
+			}
+			else
+				match = match->Suc();
+			if (rule != NULL)
+			{
+				// Make sure there are no unmatched rules from previous match object
+				if (rule_index < rule_count - 1)
+				{
+					return NULL;
+				}
+				rule = NULL;
+			}
+			return match;
+		}
+		OpScopeNodeMatch *GetCurrentMatch() const { return match; }
+
+		const OpScopeNodeMatch::Rule *GetNextRule()
+		{
+			if (match == NULL)
+				return NULL;
+			if (properties != NULL)
+			{
+				// Make sure there are no unmatched properties from previous rule object
+				for (int i = 0; i < property_count; ++i)
+					if (!properties[i].is_matched)
+						return NULL;
+				OP_DELETEA(properties);
+				properties = NULL;
+				property_count = 0;
+			}
+			if (rule == NULL)
+			{
+				rules = match->SortedRules(rule_count);
+				if (rules == NULL)
+					return NULL;
+				rule_index = 0;
+				if (rule_count > 0 )
+					rule = rules[0];
+			}
+			else
+			{
+				if (rule_index < rule_count - 1)
+					rule = rules[++rule_index];
+				else
+					rule = NULL;
+			}
+			return rule;
+		}
+		const OpScopeNodeMatch::Rule *GetCurrentRule() const { return rule; }
+
+		int GetPropertyCount() const { return property_count; }
+		OpScopeNodeMatch::Property *GetPropertyAt(int offset)
+		{
+			if (rule == NULL)
+				return NULL;
+			OP_ASSERT(properties != NULL);
+			if (properties == NULL)
+				return NULL;
+			OP_ASSERT(offset >= 0 && offset < property_count);
+			if (offset < 0 || offset >= property_count)
+				return NULL;
+			return properties[offset].prop;
+		}
+		OpScopeNodeMatch::Property *GetMatchingProperty(int prop_idx)
+		{
+			if (rule == NULL)
+				return NULL;
+			if (properties == NULL)
+			{
+				// Copy the property list to a local array
+				OpScopeNodeMatch::Property *prop = rule->FirstProperty();
+				property_count = rule->PropertyCount();
+				properties = OP_NEWA(Property, property_count);
+				if (properties == NULL)
+					return NULL;
+				for (int i = 0; i < property_count; ++i)
+				{
+					OP_ASSERT(prop != NULL);
+					if (prop == NULL)
+						return NULL;
+					properties[i].prop = prop;
+					prop = prop->Suc();
+				}
+			}
+
+			// Find the property object with the same index value, then mark it as matched
+			for (int i = 0; i < property_count; ++i)
+			{
+				OP_ASSERT(properties[i].prop != NULL);
+				if (properties[i].prop->Index() == prop_idx)
+				{
+					OP_ASSERT(!properties[i].is_matched);
+					if (properties[i].is_matched)
+						return NULL;
+					properties[i].is_matched = TRUE;
+					return properties[i].prop;
+				}
+			}
+			return NULL;
+		}
+
+	private:
+		int GetESObjectID(ES_Object* es_obj);
+
+		class ObjectForeach : public OpHashTableForEachListener
+		{
+		public:
+			ObjectForeach(ES_Runtime *runtime)
+				: runtime(runtime)
+			{
+			}
+
+			virtual void HandleKeyData(const void* key, void* data);
+
+		private:
+			ES_Runtime *runtime;
+		};
+		OpHashTable     objecttoid;
+		unsigned        nextid;
+		FramesDocument *doc;
+
+		// Tracking current match, rule and property
+		OpScopeNodeMatch           *match;
+		const OpScopeNodeMatch::Rule *rule;
+		const OpScopeNodeMatch::Rule * const *rules;
+		int                         rule_index;
+		int                         rule_count;
+//		OpScopeNodeMatch::Property *prop;
+		Property                   *properties;
+		int                         property_count;
+	};
+
+	ES_Object*
+	OtScopeStyleListener::GetStylesheetESObject(DOM_Object* dom_obj, DOM_Environment* environment)
+	{
+		if (!dom_obj->IsA(DOM_TYPE_NODE))
+			return 0;
+		ES_Value value;
+		static_cast<DOM_Node *>(dom_obj)->GetStyleSheet(&value, NULL, static_cast<DOM_Runtime *>(environment->GetRuntime()));
+		if (value.type != VALUE_OBJECT)
+			return 0;
+		return DOM_Utils::GetES_Object(DOM_VALUE2OBJECT(value, DOM_Object));
+	}
+
+	OP_STATUS
+	OtScopeStyleListener::FindElement(HTML_Element *&elm, FramesDocument *doc, const uni_char *element_name)
+	{
+		if(doc == NULL)
+			return OpStatus::ERR_NULL_POINTER;
+		LogicalDocument *ldoc = doc->GetLogicalDocument();
+		if (ldoc == NULL)
+			return OpStatus::ERR_NULL_POINTER;
+		HTML_Element *root_elm = ldoc->GetDocRoot();
+		if (root_elm == NULL)
+			return OpStatus::ERR_NULL_POINTER;
+		elm = root_elm->GetElmById(element_name);
+		if (elm == NULL)
+			return OpStatus::ERR_NULL_POINTER;
+		return OpStatus::OK;
+	}
+
+	OP_STATUS
+	OtScopeStyleListener::GetStyleRules(HTML_Element *elm)
+	{
+		if(doc == NULL)
+			return OpStatus::ERR_NULL_POINTER;
+		HLDocProfile *hld_profile = doc->GetHLDocProfile();
+		if (hld_profile == 0)
+			return OpStatus::ERR;
+		CSSCollection *collection = hld_profile->GetCSSCollection();
+		if (collection == NULL)
+			return OpStatus::ERR_NULL_POINTER;
+
+		CSS_Properties css_props;
+		CSS_MatchElement element(elm);
+		OP_STATUS stat = collection->GetMatchingStyleRules(element,
+														   &css_props,
+														   doc->GetMediaType(),
+														   TRUE,
+														   this);
+		if (OpStatus::IsError(stat))
+			return stat;
+		return AdjustDeclarations(css_props);
+	}
+
+	OtScopeStyleListener::OtScopeStyleListener(FramesDocument *doc)
+		: OpScopeStyleListener(NULL, NULL, CSS_PSEUDO_CLASS_UNKNOWN)
+		, nextid(1)
+		, doc(doc)
+		, match(NULL)
+		, rule(NULL)
+		, rules(NULL)
+		, rule_index(0)
+		, rule_count(0)
+		, properties(NULL)
+		, property_count(0)
+	{
+	}
+
+	OtScopeStyleListener::~OtScopeStyleListener()
+	{
+		ObjectForeach cleanup(doc->GetESRuntime());
+		objecttoid.ForEach(&cleanup);
+		OP_DELETEA(properties);
+	}
+
+	OP_STATUS
+	OtScopeStyleListener::Construct(const uni_char *element_name)
+	{
+		HTML_Element *elm;
+		RETURN_IF_ERROR(FindElement(elm, doc, element_name));
+
+		SetEnvironment(doc->GetDOMEnvironment());
+		SetInspectedElement(elm);
+
+		return GetStyleRules(elm);
+	}
+
+	/* virtual */ void
+	OtScopeStyleListener::ObjectForeach::HandleKeyData(const void *key, void *data)
+	{
+		runtime->Unprotect((ES_Object *) key);
+	}
+
+	/*virtual*/
+	int
+	OtScopeStyleListener::GetObjectID(HTML_Element* elm)
+	{
+		DOM_Object *dom_obj;
+		if (OpStatus::IsSuccess(Environment()->ConstructNode(dom_obj, elm)))
+		{
+			return GetObjectID(dom_obj);
+		}
+		return 0;
+	}
+
+	/*virtual*/
+	int
+	OtScopeStyleListener::GetObjectID(DOM_Object* dom_obj)
+	{
+		return GetESObjectID(DOM_Utils::GetES_Object(dom_obj));
+	}
+
+	/*virtual*/
+	unsigned int
+	OtScopeStyleListener::GetStylesheetID(DOM_Object* dom_obj)
+	{
+		ES_Object *css_es = GetStylesheetESObject(dom_obj, Environment());
+		if (!css_es)
+			return 0;
+		return GetESObjectID(css_es);
+	}
+
+	int
+	OtScopeStyleListener::GetESObjectID(ES_Object* object)
+	{
+		if (object)
+		{
+			void *data;
+
+			if (objecttoid.GetData(object, &data) == OpStatus::OK)
+				return (UINTPTR) data;
+			else
+			{
+				int id;
+				data = (void *)(INTPTR) (id = nextid++);
+
+				if (OpStatus::IsMemoryError(objecttoid.Add(object, data)) || !doc->GetESRuntime()->Protect(object))
+					return 0;
+				return id;
+			}
+		}
+		else
+			return 0;
+	}
+}
+
+language c++;
+
+include "modules/scope/src/scope_ecmascript_debugger.h";
+include "modules/ecmascript/ecmascript.h";
+include "modules/dom/domenvironment.h";
+include "modules/dom/domutils.h";
+include "modules/dom/src/domobj.h";
+include "modules/dom/src/domcore/node.h";
+include "modules/doc/frm_doc.h";
+include "modules/logdoc/logdoc.h";
+include "modules/style/css_collection.h";
+include "modules/style/css_all_properties.h";
+include "modules/util/tempbuf.h";
+
+/**
+ * Verifies that the current css match object matches the expected node name.
+ * e.g.
+ * verify(VerifyMatch(l, UNI_L("h1")));
+ *
+ * @param l    The listener object, contains all necessary information on current css rules
+ * @param name Expected name of match object
+ */
+subtest VerifyMatch(OtScopeStyleListener &listener, const uni_char *name)
+{
+	OpScopeNodeMatch *match = listener.GetNextMatch();
+	verify(match != NULL);
+	if (uni_stricmp(match->ElementName(), name) != 0)
+	{
+		OpString8 tmp_act, tmp_exp;
+		tmp_act.Set(match->ElementName());
+		tmp_exp.Set(name);
+		output("Element name \"%s\" does not match expected value \"%s\"\n", tmp_act.CStr(), tmp_exp.CStr());
+		verify(uni_stricmp(match->ElementName(), name) == 0);
+	}
+}
+
+/**
+ * Verifies that the current css user-agent rule matches contains valid data.
+ * Will check all the properties of the rule and verify that they do not
+ * contain important flags and are not overwritten.
+ * Will fail if there is no current match object.
+ * e.g.
+ * verify(VerifyUserAgentRule(l));
+ *
+ * @param l The listener object, contains all necessary information on current css rules
+ */
+subtest VerifyUserAgentRule(OtScopeStyleListener &l)
+{
+	OpScopeNodeMatch *match = l.GetCurrentMatch();
+	verify(match != NULL);
+	const OpScopeNodeMatch::Rule *rule = l.GetNextRule();
+	verify(rule != NULL);
+	verify(rule->Origin() == ES_ScopeDebugFrontend::RULEORIGIN_USER_AGENT);
+	int count = l.GetPropertyCount();
+	for (int i = 0; i < count; ++i)
+	{
+		OpScopeNodeMatch::Property *prop = l.GetPropertyAt(i);
+		verify(prop->IsImportant() == FALSE);
+		verify(prop->Status() == ES_ScopeDebugFrontend::DECLARATIONSTATUS_USED);
+	}
+}
+
+/**
+ * Verifies that the current css author rule matches against the expected rule type,
+ * selector specifity and selector value.
+ * Will fail if there is no current match object.
+ * e.g.
+ * verify(VerifyAuthorRule(l, 1, 1, UNI_L("h1")));
+ *
+ * @param l           The listener object, contains all necessary information on current css rules
+ * @param rule_type   Expected rule type
+ * @param specificity Expected selector specificity
+ * @param selector    Expected selector text
+ */
+subtest VerifyAuthorRule(OtScopeStyleListener &l, int rule_type, unsigned short specificity, const uni_char *selector)
+{
+	OpScopeNodeMatch *match = l.GetCurrentMatch();
+	verify(match != NULL);
+	const OpScopeNodeMatch::Rule *rule = l.GetNextRule();
+	verify(rule != NULL);
+	verify(rule->Origin() == ES_ScopeDebugFrontend::RULEORIGIN_AUTHOR);
+	verify(rule->StylesheetID() > 0);
+	verify(rule->RuleID() > 0);
+	if (rule->RuleType() != rule_type)
+	{
+		output("Value of \"RuleType\" \"%d\" does not match expected value \"%d\"\n", rule->RuleType(), rule_type);
+		verify(rule->RuleType() == rule_type);
+	}
+	if (rule->SelectorSpecificity() != specificity)
+	{
+		output("Value of \"SelectorSpecificity\" \"%d\" does not match expected value \"%d\"\n", rule->SelectorSpecificity(), specificity);
+		verify(rule->SelectorSpecificity() == specificity);
+	}
+	if (rule->SelectorText().CompareI(selector) != 0)
+	{
+		OpString8 tmp_act, tmp_exp;
+		tmp_act.Set(rule->SelectorText().CStr());
+		tmp_exp.Set(selector);
+		output("Value of \"SelectorText\" \"%s\" does not match expected value \"%s\"\n", tmp_act.CStr(), tmp_exp.CStr());
+		verify(rule->SelectorText() == selector);
+	}
+}
+
+/**
+ * Verifies that the current property matches the expected property type (index value),
+ * property value, important flag and status.
+ * Will also fail if there is no current match or rule object.
+ * e.g.
+ * verify(VerifyProperty(l, CSS_PROPERTY_color, UNI_L("rgb(238, 136, 99)"), FALSE, ES_ScopeDebugFrontend::DECLARATIONSTATUS_USED));
+ *
+ * @param l         The listener object, contains all necessary information on current css rules
+ * @param index     Expected index value for property, use one of the CSS_PROPERTY_* enums from css_properties.h
+ * @param value     Expected property value, set to NULL to skip verification
+ * @param important Expected important flag for property
+ * @param status    Expected calculated status for property, either ES_ScopeDebugFrontend::DECLARATIONSTATUS_USED or ES_ScopeDebugFrontend::DECLARATIONSTATUS_OVERWRITTEN
+ */
+subtest VerifyProperty(OtScopeStyleListener &l, unsigned int index, const uni_char *value, BOOL important, ES_ScopeDebugFrontend::DeclarationStatus status)
+{
+	OpScopeNodeMatch *match = l.GetCurrentMatch();
+	verify(match != NULL);
+	const OpScopeNodeMatch::Rule *rule = l.GetCurrentRule();
+	verify(rule != NULL);
+	OpScopeNodeMatch::Property *prop = l.GetMatchingProperty(index);
+	verify(prop != NULL);
+//	verify(prop->Index() == index);
+	if (value != NULL)
+		verify_string(prop->Value().CStr(), value);
+
+	if (prop->IsImportant() != important)
+	{
+		output("Value of \"!important\" flag \"%s\" does not match expected value \"%s\"\n", prop->IsImportant() ? "TRUE" : "FALSE", important ? "TRUE" : "FALSE");
+		verify(prop->IsImportant() == important);
+	}
+	if (prop->Status() != status)
+	{
+		output("Value of \"status\" \"%d\" does not match expected value \"%d\"\n", prop->Status(), status);
+		verify(prop->Status() == status);
+	}
+}
+
+/**
+ * Verifies that there are no more match objects available.
+ */
+subtest VerifyNoMoreMatches(OtScopeStyleListener &l)
+{
+	verify(l.GetNextMatch() == NULL);
+}
+
+html
+{
+    //! <!doctype html>
+    //! <title> </title>
+    //! <p>No matching styles, only defaults.
+    //! <h1 id="itemtotest">Test</h1>
+}
+
+test("No matching styles")
+{
+	// JSON:
+	//"[[0,\"h1\"],"
+	// "["
+	//  "[[1],[33,49,61,81,119],[\"block\",\"2em\",\"0.67em\",\"700\",\"0.67em\"],[0,0,0,0,0],[1,1,1,1,1]]" // last list of values (1) means it is used
+	// "]"
+	//"]";
+	OtScopeStyleListener l(state.doc);
+	verify(OpStatus::IsSuccess(l.Construct(UNI_L("itemtotest"))));
+
+	verify(VerifyMatch(l, UNI_L("h1")));
+	verify(VerifyUserAgentRule(l));
+
+	verify(VerifyNoMoreMatches(l));
+}
+
+html
+{
+    //! <!doctype html>
+    //! <title> </title>
+    //! <style>
+    //! h1 { color: rgb(0, 255, 0) }
+    //! </style>
+    //! <p>Direct matching rule.
+    //! <h1 id="itemtotest">Test</h1>
+}
+
+test("Direct matching rule")
+{
+	// JSON:
+	//"[[0,\"h1\"],"
+	// "["
+	//  "[[3,3,2,1,1,\"h1\"],[13],[\"rgb(0, 255, 0)\"],[0],[1]]," // last value (1) means it is used
+	//  "[[1],[33,49,61,81,119],[\"block\",\"2em\",\"0.67em\",\"700\",\"0.67em\"],[0,0,0,0,0],[1,1,1,1,1]]" // last list of values (1) means it is used
+	// "]"
+	//"]";
+
+	OtScopeStyleListener l(state.doc);
+	verify(OpStatus::IsSuccess(l.Construct(UNI_L("itemtotest"))));
+
+	verify(VerifyMatch(l, UNI_L("h1")));
+	verify(VerifyAuthorRule(l, 1, 1, UNI_L("h1")));
+	verify(VerifyProperty(l, CSS_PROPERTY_color, UNI_L("rgb(0, 255, 0)"), FALSE, ES_ScopeDebugFrontend::DECLARATIONSTATUS_USED));
+	verify(VerifyUserAgentRule(l));
+
+	verify(VerifyNoMoreMatches(l));
+}
+
+html
+{
+    //! <!doctype html>
+    //! <title> </title>
+    //! <style>
+    //! h1 { color: rgb(0, 255, 0)}
+    //! #itemtotest { color: rgb(255, 0, 0)}
+    //! .test { color: rgb(0, 0, 255)}
+    //! </style>
+    //! <p>Multiple matching rules.
+    //! <h1 id="itemtotest" class="test">Test</h1>
+}
+
+test("Multiple matching rules")
+{
+	// JSON:
+	//"[[1,\"h1\"],"
+	// "["
+	//   "[[3,3,4,1,625,\"#itemtotest\"],[13],[\"rgb(255, 0, 0)\"],[0],[1]]" // last value (1) means it is used
+	//  ",[[3,3,2,1,25,\".test\"],[13],[\"rgb(0, 0, 255)\"],[0],[0]]" // last value (1) means it is overwritten
+	//  ",[[3,3,5,1,1,\"h1\"],[13],[\"rgb(0, 255, 0)\"],[0],[0]]" // last value (1) means it is overwritten
+	//  ",[[1],[33,49,61,81,119],[\"block\",\"2em\",\"0.67em\",\"700\",\"0.67em\"],[0,0,0,0,0],[1,1,1,1,1]]" // last list of values (1) means it is used
+	// "]"
+	//"]";
+
+	OtScopeStyleListener l(state.doc);
+	verify(OpStatus::IsSuccess(l.Construct(UNI_L("itemtotest"))));
+
+	verify(VerifyMatch(l, UNI_L("h1")));
+	verify(VerifyAuthorRule(l, 1, 625, UNI_L("#itemtotest")));
+	verify(VerifyProperty(l, CSS_PROPERTY_color, UNI_L("rgb(255, 0, 0)"), FALSE, ES_ScopeDebugFrontend::DECLARATIONSTATUS_USED));
+	verify(VerifyAuthorRule(l, 1, 25, UNI_L(".test")));
+	verify(VerifyProperty(l, CSS_PROPERTY_color, UNI_L("rgb(0, 0, 255)"), FALSE, ES_ScopeDebugFrontend::DECLARATIONSTATUS_OVERWRITTEN));
+	verify(VerifyAuthorRule(l, 1, 1, UNI_L("h1")));
+	verify(VerifyProperty(l, CSS_PROPERTY_color, UNI_L("rgb(0, 255, 0)"), FALSE, ES_ScopeDebugFrontend::DECLARATIONSTATUS_OVERWRITTEN));
+	verify(VerifyUserAgentRule(l));
+
+	verify(VerifyNoMoreMatches(l));
+}
+
+html
+{
+    //! <!doctype html>
+    //! <title> </title>
+    //! <style>
+    //! h1 { color: green !important }
+    //! #itemtotest { color: red}
+    //! </style>
+    //! <p>Matching rule with important flag overwrites higher specificity.
+    //! <h1 id="itemtotest">Test</h1>
+}
+
+test("Matching rule with important flag overwrites higher specificity")
+{
+	// JSON:
+	//"[[1,\"h1\"],"
+	// "["
+	//  "[[3,3,2,1,625,\"#itemtotest\"],[13],[\"red\"],[0],[0]]" // last value (0) means it is overwritten
+	//  ",[[3,3,4,1,1,\"h1\"],[13],[\"green\"],[1],[1]]" // last value (1) means it is used
+	//  ",[[1],[33,49,61,81,119],[\"block\",\"2em\",\"0.67em\",\"700\",\"0.67em\"],[0,0,0,0,0],[1,1,1,1,1]]" // last list of values (1) means it is used
+	// "]"
+	//"]";
+
+	OtScopeStyleListener l(state.doc);
+	verify(OpStatus::IsSuccess(l.Construct(UNI_L("itemtotest"))));
+
+	verify(VerifyMatch(l, UNI_L("h1")));
+	verify(VerifyAuthorRule(l, 1, 625, UNI_L("#itemtotest")));
+	verify(VerifyProperty(l, CSS_PROPERTY_color, UNI_L("red"), FALSE, ES_ScopeDebugFrontend::DECLARATIONSTATUS_OVERWRITTEN));
+	verify(VerifyAuthorRule(l, 1, 1, UNI_L("h1")));
+	verify(VerifyProperty(l, CSS_PROPERTY_color, UNI_L("green"), TRUE, ES_ScopeDebugFrontend::DECLARATIONSTATUS_USED));
+	verify(VerifyUserAgentRule(l));
+
+	verify(VerifyNoMoreMatches(l));
+}
+
+html
+{
+    //! <!doctype html>
+    //! <title> </title>
+    //! <style>
+    //! body { color: red !important }
+    //! #itemtotest { color: green}
+    //! </style>
+    //! <p>Inherited but not matching rule with important flag does not overwrite higher specificity.
+    //! <h1 id="itemtotest">Test</h1>
+}
+
+test("Inherited but not matching rule with important flag does not overwrite higher specificity.")
+{
+	// JSON:
+	//"[[1,\"h1\"],"
+	// "["
+	//  "[[3,3,2,1,625,\"#itemtotest\"],[13],[\"green\"],[0],[1]]," // last value (1) means it is used
+	//  "[[1],[33,49,61,81,119],[\"block\",\"2em\",\"0.67em\",\"700\",\"0.67em\"],[0,0,0,0,0],[1,1,1,1,1]]" // last list of values (1) means it is used
+	// "]"
+	//"]"
+	//"[[4,\"body\"],"
+	// "["
+	//  "[[3,3,5,1,1,\"body\"],[13],[\"red\"],[1],[0]]" // last value (0) means it is overwritten
+	// "]"
+	//"]";
+
+	OtScopeStyleListener l(state.doc);
+	verify(OpStatus::IsSuccess(l.Construct(UNI_L("itemtotest"))));
+
+	verify(VerifyMatch(l, UNI_L("h1")));
+	verify(VerifyAuthorRule(l, 1, 625, UNI_L("#itemtotest")));
+	verify(VerifyProperty(l, CSS_PROPERTY_color, UNI_L("green"), FALSE, ES_ScopeDebugFrontend::DECLARATIONSTATUS_USED));
+	verify(VerifyUserAgentRule(l));
+
+	verify(VerifyMatch(l, UNI_L("body")));
+	verify(VerifyAuthorRule(l, 1, 1, UNI_L("body")));
+	verify(VerifyProperty(l, CSS_PROPERTY_color, UNI_L("red"), TRUE, ES_ScopeDebugFrontend::DECLARATIONSTATUS_OVERWRITTEN));
+
+	verify(VerifyNoMoreMatches(l));
+}
+
+html
+{
+    //! <!doctype html>
+    //! <style>
+    //! *
+    //! {
+    //! color: blue
+    //! }
+    //! </style>
+    //! <p id="itemtotest">some text</p>
+}
+
+test("Shared properties (Bug 358743)")
+{
+	// JSON:
+	//"[[1,\"p\"],"
+	// "["
+	//  "[[3,3,2,1,0,\"*\"],[13],[\"blue\"],[0],[1]],"
+	//  "[[1],[33,61,119],[\"block\",\"1em\",\"1em\"],[0,0,0],[1,1,1]]"
+	// "]"
+	//"]"
+	//"[[4,\"body\"],"
+	// "["
+	//  "[[3,3,2,1,0,\"*\"],[13],[\"blue\"],[0],[0]]"
+	// "]"
+	//"]"
+	//"[[5,\"html\"],"
+	// "["
+	//  "[[3,3,2,1,0,\"*\"],[13],[\"blue\"],[0],[0]]"
+	// "]"
+	//"]";
+
+	OtScopeStyleListener l(state.doc);
+	verify(OpStatus::IsSuccess(l.Construct(UNI_L("itemtotest"))));
+
+	verify(VerifyMatch(l, UNI_L("p")));
+	verify(VerifyAuthorRule(l, 1, 0, UNI_L("*")));
+	verify(VerifyProperty(l, CSS_PROPERTY_color, UNI_L("blue"), FALSE, ES_ScopeDebugFrontend::DECLARATIONSTATUS_USED));
+	verify(VerifyUserAgentRule(l));
+
+	verify(VerifyMatch(l, UNI_L("body")));
+	verify(VerifyAuthorRule(l, 1, 0, UNI_L("*")));
+	verify(VerifyProperty(l, CSS_PROPERTY_color, UNI_L("blue"), FALSE, ES_ScopeDebugFrontend::DECLARATIONSTATUS_OVERWRITTEN));
+
+	verify(VerifyMatch(l, UNI_L("html")));
+	verify(VerifyAuthorRule(l, 1, 0, UNI_L("*")));
+	verify(VerifyProperty(l, CSS_PROPERTY_color, UNI_L("blue"), FALSE, ES_ScopeDebugFrontend::DECLARATIONSTATUS_OVERWRITTEN));
+
+	verify(VerifyNoMoreMatches(l));
+}
+
+html
+{
+    //! <!doctype html>
+    //! <style>
+    //! body
+    //! {
+    //!   font-family: "bitstream vera";
+    //! }
+    //! </style>
+    //! <pre>
+    //! The span inherites the default font-family, font-size and white-space properties from the pre element but no other default values.
+    //! The font-family set on body will be inherited but overwritten.
+    //! </pre>
+    //! <pre><span id="itemtotest">text</span></pre>
+}
+
+test("Inheritable default properties are inherited (Bug 358968)")
+{
+	// JSON:
+	//"[[1,\"pre\"],"
+	// "["
+	//  "[[1],[49,77,80],[\"0.81em\",\"pre\",\"\\\"Courier New\\\"\"],[0,0,0],[1,1,1]]"
+	// "]"
+	//"]"
+	//"[[2,\"body\"],"
+	// "["
+	//  "[[3,4,3,1,1,\"body\"],[80],[\"Verdana\"],[0],[0]]"
+	// "]"
+	//"]";
+
+	OtScopeStyleListener l(state.doc);
+	verify(OpStatus::IsSuccess(l.Construct(UNI_L("itemtotest"))));
+
+	verify(VerifyMatch(l, UNI_L("pre")));
+	verify(VerifyUserAgentRule(l));
+
+	verify(VerifyMatch(l, UNI_L("body")));
+	verify(VerifyAuthorRule(l, 1, 1, UNI_L("body")));
+	const uni_char *name = NULL;
+	// We cannot match against the name of the font as it is not available on all profiles
+	// name = UNI_L("\"bitstream vera\"");
+	verify(VerifyProperty(l, CSS_PROPERTY_font_family, name, FALSE, ES_ScopeDebugFrontend::DECLARATIONSTATUS_OVERWRITTEN)); // NULL is used to not match the font name which depends on available fonts
+
+	verify(VerifyNoMoreMatches(l));
+}
+
+html
+{
+    //! <!doctype html>
+    //! <style>
+    //! span
+    //! {
+    //! font-weight: 700;
+    //! color: rgb(119, 136, 85);
+    //! }
+    //! div#sidebar
+    //! {
+    //! color: rgb(255, 0, 0);
+    //! }
+    //! }</style>
+    //! <div id="sidebar"><span id="itemtotest" href="#sidebar">span</span></div>
+}
+
+test("Specificity only applies on inspected element, not parents (Bug 358982)")
+{
+	// JSON:
+	//"[[1,\"span\"],"
+	// "["
+	//  "[[3,3,2,1,1,\"span\"],[81,13],[\"700\",\"rgb(119, 136, 85)\"],[0,0],[1,1]]"
+	// "]"
+	//"]"
+	//"[[4,\"div\"],"
+	// "["
+	//  "[[3,3,5,1,626,\"div#sidebar\"],[13],[\"rgb(255, 0, 0)\"],[0],[0]]"
+	// "]"
+	//"]";
+
+	OtScopeStyleListener l(state.doc);
+	verify(OpStatus::IsSuccess(l.Construct(UNI_L("itemtotest"))));
+
+	verify(VerifyMatch(l, UNI_L("span")));
+	verify(VerifyAuthorRule(l, 1, 1, UNI_L("span")));
+	verify(VerifyProperty(l, CSS_PROPERTY_font_weight, UNI_L("700"),     FALSE, ES_ScopeDebugFrontend::DECLARATIONSTATUS_USED));
+	verify(VerifyProperty(l, CSS_PROPERTY_color,       UNI_L("rgb(119, 136, 85)"), FALSE, ES_ScopeDebugFrontend::DECLARATIONSTATUS_USED));
+
+	verify(VerifyMatch(l, UNI_L("div")));
+	verify(VerifyAuthorRule(l, 1, 626, UNI_L("div#sidebar")));
+	verify(VerifyProperty(l, CSS_PROPERTY_color, UNI_L("rgb(255, 0, 0)"), FALSE, ES_ScopeDebugFrontend::DECLARATIONSTATUS_OVERWRITTEN));
+
+	verify(VerifyNoMoreMatches(l));
+}
+
+html
+{
+    //! <!doctype html>
+    //! <html>
+    //! <head>
+    //! <title> </title>
+    //! <style>
+    //!
+    //! .test span
+    //! {
+    //!   color: #0f0;
+    //!   margin: 3px;
+    //!   padding: 10px;
+    //!   border: 3px solid green;
+    //!   background: #c6c;
+    //!   font-family: monospace;
+    //!   font-size: 30px;
+    //! }
+    //!
+    //! .test p
+    //! {
+    //!   color: #f00;
+    //!   margin: 3px;
+    //!   padding: 10px;
+    //!   border: 3px solid #f00;
+    //!   background: #6cc;
+    //!   font-family: sans-serif;
+    //!   font-size: 20px;
+    //! }
+    //!
+    //! .test .third-div
+    //! {
+    //!   color: #f0f;
+    //!   margin: 3px;
+    //!   padding: 10px;
+    //!   border: 3px solid #f0f;
+    //!   background: #6c6;
+    //!   font-family: serif;
+    //!   font-size: 15px;
+    //! }
+    //!
+    //! .test #second-div
+    //! {
+    //!   color: #0ff;
+    //!   margin: 3px;
+    //!   padding: 10px;
+    //!   border: 3px solid #0ff;
+    //!   background: #c66;
+    //!   font-family: monospace;
+    //!   font-size: 10px;
+    //! }
+    //!
+    //! </style>
+    //! <body>
+    //! <pre>
+    //! there is for each node in the .test subtree a selector
+    //! with declarations for the same properties:
+    //!
+    //!   color
+    //!   margin
+    //!   padding
+    //!   border
+    //!   background
+    //!   font-family
+    //!   font-size
+    //!
+    //! inheritable are:
+    //!
+    //!   color
+    //!   font-family
+    //!   font-size
+    //!
+    //! selecting any node in the test subtree should show the
+    //! properties of the target node as applied, all others
+    //! from all other nodes as overwritten ( except the default values )
+    //! </pre>
+    //! <div class="test">
+    //!   <div id="second-div">text in the second div
+    //!     <div class="third-div">text in the third div
+    //!       <p> text in the paragraph
+    //!           <span id="itemtotest">text in span</span>
+    //!       </p>
+    //!     </div>
+    //!   </div>
+    //! </div>
+    //! </body>
+    //! </html>
+}
+
+test("Matching rules with inherited properties being overwritten")
+{
+	// JSON:
+	//"[[1,\"span\"],"
+	// "["
+	//  "[[3,3,2,1,26,\".test span\"],[13,61,96,119,84,83,120,134,97,154,170,181,189,156,172,183,191,155,171,182,190,198,169,193,152,153,80,49],[\"green\",\"3px\",\"3px\",\"3px\",\"3px\",\"10px\",\"10px\",\"10px\",\"10px\",\"rgb(0, 128, 0)\",\"rgb(0, 128, 0)\",\"rgb(0, 128, 0)\",\"rgb(0, 128, 0)\",\"3px\",\"3px\",\"3px\",\"3px\",\"solid\",\"solid\",\"solid\",\"solid\",\"scroll\",\"repeat\",\"0% 0%\",\"rgb(204, 102, 204)\",\"none\",\"monospace\",\"30px\"],[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],[1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1]]"
+	// "]"
+	//"]"
+	//"[[4,\"p\"],"
+	// "["
+	//  "[[3,3,5,1,26,\".test p\"],[13,80,49],[\"rgb(255, 0, 0)\",\"sans-serif\",\"20px\"],[0,0,0],[0,0,0]]"
+	// "]"
+	//"]"
+	//"[[6,\"div\"],"
+	// "["
+	//  "[[3,3,7,1,50,\".test .third-div\"],[13,80,49],[\"rgb(255, 0, 255)\",\"serif\",\"15px\"],[0,0,0],[0,0,0]]"
+	// "]"
+	//"]"
+	//"[[8,\"div\"],"
+	// "["
+	//  "[[3,3,9,1,650,\".test #second-div\"],[13,80,49],[\"rgb(0, 255, 255)\",\"monospace\",\"10px\"],[0,0,0],[0,0,0]]"
+	// "]"
+	//"]";
+
+	OtScopeStyleListener l(state.doc);
+	verify(OpStatus::IsSuccess(l.Construct(UNI_L("itemtotest"))));
+
+	//"[[1,\"span\"],"
+	// "["
+	//  "[[3,3,2,1,26,\".test span\"],[13,61,96,119,84,83,120,134,97,154,170,181,189,156,172,183,191,155,171,182,190,198,169,193,152,153,80,49],[\"green\",\"3px\",\"3px\",\"3px\",\"3px\",\"10px\",\"10px\",\"10px\",\"10px\",\"rgb(0, 128, 0)\",\"rgb(0, 128, 0)\",\"rgb(0, 128, 0)\",\"rgb(0, 128, 0)\",\"3px\",\"3px\",\"3px\",\"3px\",\"solid\",\"solid\",\"solid\",\"solid\",\"scroll\",\"repeat\",\"0% 0%\",\"rgb(204, 102, 204)\",\"none\",\"monospace\",\"30px\"],[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],[1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1]]"
+	// "]"
+	//"]"
+	verify(VerifyMatch(l, UNI_L("span")));
+	verify(VerifyAuthorRule(l, 1, 26, UNI_L(".test span")));
+	verify(VerifyProperty(l, CSS_PROPERTY_color, UNI_L("rgb(0, 255, 0)"), FALSE, ES_ScopeDebugFrontend::DECLARATIONSTATUS_USED));
+
+	verify(VerifyProperty(l, CSS_PROPERTY_margin_top,    UNI_L("3px"),  FALSE, ES_ScopeDebugFrontend::DECLARATIONSTATUS_USED));
+	verify(VerifyProperty(l, CSS_PROPERTY_margin_right,  UNI_L("3px"),  FALSE, ES_ScopeDebugFrontend::DECLARATIONSTATUS_USED));
+	verify(VerifyProperty(l, CSS_PROPERTY_margin_bottom, UNI_L("3px"),  FALSE, ES_ScopeDebugFrontend::DECLARATIONSTATUS_USED));
+	verify(VerifyProperty(l, CSS_PROPERTY_margin_left,   UNI_L("3px"),  FALSE, ES_ScopeDebugFrontend::DECLARATIONSTATUS_USED));
+
+	verify(VerifyProperty(l, CSS_PROPERTY_padding_top,    UNI_L("10px"), FALSE, ES_ScopeDebugFrontend::DECLARATIONSTATUS_USED));
+	verify(VerifyProperty(l, CSS_PROPERTY_padding_right,  UNI_L("10px"), FALSE, ES_ScopeDebugFrontend::DECLARATIONSTATUS_USED));
+	verify(VerifyProperty(l, CSS_PROPERTY_padding_bottom, UNI_L("10px"), FALSE, ES_ScopeDebugFrontend::DECLARATIONSTATUS_USED));
+	verify(VerifyProperty(l, CSS_PROPERTY_padding_left,   UNI_L("10px"), FALSE, ES_ScopeDebugFrontend::DECLARATIONSTATUS_USED));
+
+	verify(VerifyProperty(l, CSS_PROPERTY_border_top_color,    UNI_L("green"), FALSE, ES_ScopeDebugFrontend::DECLARATIONSTATUS_USED));
+	verify(VerifyProperty(l, CSS_PROPERTY_border_left_color,   UNI_L("green"), FALSE, ES_ScopeDebugFrontend::DECLARATIONSTATUS_USED));
+	verify(VerifyProperty(l, CSS_PROPERTY_border_right_color,  UNI_L("green"), FALSE, ES_ScopeDebugFrontend::DECLARATIONSTATUS_USED));
+	verify(VerifyProperty(l, CSS_PROPERTY_border_bottom_color, UNI_L("green"), FALSE, ES_ScopeDebugFrontend::DECLARATIONSTATUS_USED));
+
+	verify(VerifyProperty(l, CSS_PROPERTY_border_top_width,    UNI_L("3px"), FALSE, ES_ScopeDebugFrontend::DECLARATIONSTATUS_USED));
+	verify(VerifyProperty(l, CSS_PROPERTY_border_left_width,   UNI_L("3px"), FALSE, ES_ScopeDebugFrontend::DECLARATIONSTATUS_USED));
+	verify(VerifyProperty(l, CSS_PROPERTY_border_right_width,  UNI_L("3px"), FALSE, ES_ScopeDebugFrontend::DECLARATIONSTATUS_USED));
+	verify(VerifyProperty(l, CSS_PROPERTY_border_bottom_width, UNI_L("3px"), FALSE, ES_ScopeDebugFrontend::DECLARATIONSTATUS_USED));
+
+	verify(VerifyProperty(l, CSS_PROPERTY_border_top_style,    UNI_L("solid"), FALSE, ES_ScopeDebugFrontend::DECLARATIONSTATUS_USED));
+	verify(VerifyProperty(l, CSS_PROPERTY_border_left_style,   UNI_L("solid"), FALSE, ES_ScopeDebugFrontend::DECLARATIONSTATUS_USED));
+	verify(VerifyProperty(l, CSS_PROPERTY_border_right_style,  UNI_L("solid"), FALSE, ES_ScopeDebugFrontend::DECLARATIONSTATUS_USED));
+	verify(VerifyProperty(l, CSS_PROPERTY_border_bottom_style, UNI_L("solid"), FALSE, ES_ScopeDebugFrontend::DECLARATIONSTATUS_USED));
+
+	verify(VerifyProperty(l, CSS_PROPERTY_background_attachment, UNI_L("scroll"),  FALSE, ES_ScopeDebugFrontend::DECLARATIONSTATUS_USED));
+	verify(VerifyProperty(l, CSS_PROPERTY_background_repeat,     UNI_L("repeat"),  FALSE, ES_ScopeDebugFrontend::DECLARATIONSTATUS_USED));
+	verify(VerifyProperty(l, CSS_PROPERTY_background_position,   UNI_L("0% 0%"),   FALSE, ES_ScopeDebugFrontend::DECLARATIONSTATUS_USED));
+	verify(VerifyProperty(l, CSS_PROPERTY_background_color,      UNI_L("rgb(204, 102, 204)"), FALSE, ES_ScopeDebugFrontend::DECLARATIONSTATUS_USED));
+	verify(VerifyProperty(l, CSS_PROPERTY_background_image,      UNI_L("none"),    FALSE, ES_ScopeDebugFrontend::DECLARATIONSTATUS_USED));
+	verify(VerifyProperty(l, CSS_PROPERTY_background_size,       UNI_L("auto"),    FALSE, ES_ScopeDebugFrontend::DECLARATIONSTATUS_USED));
+	verify(VerifyProperty(l, CSS_PROPERTY_background_origin,     UNI_L("padding-box"), FALSE, ES_ScopeDebugFrontend::DECLARATIONSTATUS_USED));
+	verify(VerifyProperty(l, CSS_PROPERTY_background_clip,       UNI_L("border-box"),  FALSE, ES_ScopeDebugFrontend::DECLARATIONSTATUS_USED));
+
+	verify(VerifyProperty(l, CSS_PROPERTY_font_family, UNI_L("monospace"), FALSE, ES_ScopeDebugFrontend::DECLARATIONSTATUS_USED));
+	verify(VerifyProperty(l, CSS_PROPERTY_font_size,   UNI_L("30px"),      FALSE, ES_ScopeDebugFrontend::DECLARATIONSTATUS_USED));
+
+	//"[[4,\"p\"],"
+	// "["
+	//  "[[3,3,5,1,26,\".test p\"],[13,80,49],[\"rgb(255, 0, 0)\",\"sans-serif\",\"20px\"],[0,0,0],[0,0,0]]"
+	// "]"
+	//"]"
+	verify(VerifyMatch(l, UNI_L("p")));
+	verify(VerifyAuthorRule(l, 1, 26, UNI_L(".test p")));
+	verify(VerifyProperty(l, CSS_PROPERTY_color,       UNI_L("rgb(255, 0, 0)"),    FALSE, ES_ScopeDebugFrontend::DECLARATIONSTATUS_OVERWRITTEN));
+	verify(VerifyProperty(l, CSS_PROPERTY_font_family, UNI_L("sans-serif"), FALSE, ES_ScopeDebugFrontend::DECLARATIONSTATUS_OVERWRITTEN));
+	verify(VerifyProperty(l, CSS_PROPERTY_font_size,   UNI_L("20px"),       FALSE, ES_ScopeDebugFrontend::DECLARATIONSTATUS_OVERWRITTEN));
+
+	//"[[6,\"div\"],"
+	// "["
+	//  "[[3,3,7,1,50,\".test .third-div\"],[13,80,49],[\"rgb(255, 0, 255)\",\"serif\",\"15px\"],[0,0,0],[0,0,0]]"
+	// "]"
+	//"]"
+	verify(VerifyMatch(l, UNI_L("div")));
+	verify(VerifyAuthorRule(l, 1, 50, UNI_L(".test .third-div")));
+	verify(VerifyProperty(l, CSS_PROPERTY_color,       UNI_L("rgb(255, 0, 255)"), FALSE, ES_ScopeDebugFrontend::DECLARATIONSTATUS_OVERWRITTEN));
+	verify(VerifyProperty(l, CSS_PROPERTY_font_family, UNI_L("serif"),   FALSE, ES_ScopeDebugFrontend::DECLARATIONSTATUS_OVERWRITTEN));
+	verify(VerifyProperty(l, CSS_PROPERTY_font_size,   UNI_L("15px"),    FALSE, ES_ScopeDebugFrontend::DECLARATIONSTATUS_OVERWRITTEN));
+
+	//"[[8,\"div\"],"
+	// "["
+	//  "[[3,3,9,1,650,\".test #second-div\"],[13,80,49],[\"rgb(0, 255, 255)\",\"monospace\",\"10px\"],[0,0,0],[0,0,0]]"
+	// "]"
+	//"]";
+	verify(VerifyMatch(l, UNI_L("div")));
+	verify(VerifyAuthorRule(l, 1, 650, UNI_L(".test #second-div")));
+	verify(VerifyProperty(l, CSS_PROPERTY_color,       UNI_L("rgb(0, 255, 255)"),   FALSE, ES_ScopeDebugFrontend::DECLARATIONSTATUS_OVERWRITTEN));
+	verify(VerifyProperty(l, CSS_PROPERTY_font_family, UNI_L("monospace"), FALSE, ES_ScopeDebugFrontend::DECLARATIONSTATUS_OVERWRITTEN));
+	verify(VerifyProperty(l, CSS_PROPERTY_font_size,   UNI_L("10px"),      FALSE, ES_ScopeDebugFrontend::DECLARATIONSTATUS_OVERWRITTEN));
+
+	verify(VerifyNoMoreMatches(l));
+}
+
+html
+{
+    //! <!doctype html>
+    //! <html>
+    //! <head>
+    //! <title> </title>
+    //! <style>
+    //! /* should be at the bottom */
+    //! .test span
+    //! {
+    //!   color: #0f0; /* overwritten */
+    //!   margin: 3px; /* applied */
+    //!   padding: 10px; /* overwritten */
+    //!   border: 3px solid green; /* overwritten */
+    //!   background: #c6c; /* overwritten */
+    //!   font-family: monospace; /* overwritten */
+    //!   font-size: 30px; /* overwritten */
+    //! }
+    //! /* should be at the third place */
+    //! .test p span
+    //! {
+    //!   color: #f00; /* overwritten */
+    //!   padding: 20px; /* applied */
+    //!   border: 3px solid #f00;
+    //!   background: #6cc; /* overwritten */
+    //!   font-family: sans-serif; /* applied */
+    //!   font-size: 20px; /* overwritten */
+    //! }
+    //! /* should be at the second palce */
+    //! .test .third-div p span
+    //! {
+    //!   color: #f0f; /* applied */
+    //!   border: 3px solid #f0f; /* applied */
+    //!   background: #6c6; /* overwritten */
+    //!   font-size: 15px; /* overwritten */
+    //! }
+    //!
+    //! /* should be at the top */
+    //! .test #second-div .third-div p span
+    //! {
+    //!   background: #c66; /* applied */
+    //!   font-size: 10px; /* applied */
+    //! }
+    //! </style>
+    //! <body>
+    //! <div class="test">
+    //!   <div id="second-div">text in the second div
+    //!     <div class="third-div">text in the third div
+    //!       <p> text in the paragraph
+    //!           <span id="itemtotest">text in span</span>
+    //!       </p>
+    //!     </div>
+    //!   </div>
+    //! </div>
+    //! </body>
+    //! </html>
+}
+
+test("Cascade with multiple matches is ordered correctly (Bug 356464)")
+{
+	// JSON:
+	//"[[1,\"span\"],"
+	// "["
+	//  "[[3,3,2,1,677,\".test #second-div .third-div p span\"],[198,169,193,152,153,49],[\"scroll\",\"repeat\",\"0% 0%\",\"rgb(204, 102, 102)\",\"none\",\"10px\"],[0,0,0,0,0,0],[1,1,1,1,1,1]],"
+	//  "[[3,3,4,1,52,\".test .third-div p span\"],[13,154,170,181,189,156,172,183,191,155,171,182,190,198,169,193,152,153,49],[\"rgb(255, 0, 255)\",\"rgb(255, 0, 255)\",\"rgb(255, 0, 255)\",\"rgb(255, 0, 255)\",\"rgb(255, 0, 255)\",\"3px\",\"3px\",\"3px\",\"3px\",\"solid\",\"solid\",\"solid\",\"solid\",\"scroll\",\"repeat\",\"0% 0%\",\"rgb(102, 204, 102)\",\"none\",\"15px\"],[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],[1,1,1,1,1,1,1,1,1,1,1,1,1,0,0,0,0,0,0]],"
+	//  "[[3,3,5,1,27,\".test p span\"],[13,83,120,134,97,154,170,181,189,156,172,183,191,155,171,182,190,198,169,193,152,153,80,49],[\"rgb(255, 0, 0)\",\"20px\",\"20px\",\"20px\",\"20px\",\"rgb(255, 0, 0)\",\"rgb(255, 0, 0)\",\"rgb(255, 0, 0)\",\"rgb(255, 0, 0)\",\"3px\",\"3px\",\"3px\",\"3px\",\"solid\",\"solid\",\"solid\",\"solid\",\"scroll\",\"repeat\",\"0% 0%\",\"rgb(102, 204, 204)\",\"none\",\"sans-serif\",\"20px\"],[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],[0,1,1,1,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0]],"
+	//  "[[3,3,6,1,26,\".test span\"],[13,61,96,119,84,83,120,134,97,154,170,181,189,156,172,183,191,155,171,182,190,198,169,193,152,153,80,49],[\"rgb(0, 255, 0)\",\"3px\",\"3px\",\"3px\",\"3px\",\"10px\",\"10px\",\"10px\",\"10px\",\"rgb(0, 128, 0)\",\"rgb(0, 128, 0)\",\"rgb(0, 128, 0)\",\"rgb(0, 128, 0)\",\"3px\",\"3px\",\"3px\",\"3px\",\"solid\",\"solid\",\"solid\",\"solid\",\"scroll\",\"repeat\",\"0% 0%\",\"rgb(204, 102, 204)\",\"none\",\"monospace\",\"30px\"],[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],[0,1,1,1,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]]"
+	// "]"
+	//"]";
+
+	OtScopeStyleListener l(state.doc);
+	verify(OpStatus::IsSuccess(l.Construct(UNI_L("itemtotest"))));
+
+	verify(VerifyMatch(l, UNI_L("span")));
+
+	//  "[[3,3,2,1,677,\".test #second-div .third-div p span\"],[198,169,193,152,153,49],[\"scroll\",\"repeat\",\"0% 0%\",\"rgb(204, 102, 102)\",\"none\",\"10px\"],[0,0,0,0,0,0],[1,1,1,1,1,1]],"
+	verify(VerifyAuthorRule(l, 1, 677, UNI_L(".test #second-div .third-div p span")));
+	verify(VerifyProperty(l, CSS_PROPERTY_background_attachment, UNI_L("scroll"),  FALSE, ES_ScopeDebugFrontend::DECLARATIONSTATUS_USED));
+	verify(VerifyProperty(l, CSS_PROPERTY_background_repeat,     UNI_L("repeat"),  FALSE, ES_ScopeDebugFrontend::DECLARATIONSTATUS_USED));
+	verify(VerifyProperty(l, CSS_PROPERTY_background_position,   UNI_L("0% 0%"),   FALSE, ES_ScopeDebugFrontend::DECLARATIONSTATUS_USED));
+	verify(VerifyProperty(l, CSS_PROPERTY_background_color,      UNI_L("rgb(204, 102, 102)"), FALSE, ES_ScopeDebugFrontend::DECLARATIONSTATUS_USED));
+	verify(VerifyProperty(l, CSS_PROPERTY_background_image,      UNI_L("none"),    FALSE, ES_ScopeDebugFrontend::DECLARATIONSTATUS_USED));
+	verify(VerifyProperty(l, CSS_PROPERTY_background_size,       UNI_L("auto"),    FALSE, ES_ScopeDebugFrontend::DECLARATIONSTATUS_USED));
+	verify(VerifyProperty(l, CSS_PROPERTY_background_origin,     UNI_L("padding-box"), FALSE, ES_ScopeDebugFrontend::DECLARATIONSTATUS_USED));
+	verify(VerifyProperty(l, CSS_PROPERTY_background_clip,       UNI_L("border-box"),  FALSE, ES_ScopeDebugFrontend::DECLARATIONSTATUS_USED));
+	verify(VerifyProperty(l, CSS_PROPERTY_font_size,             UNI_L("10px"),    FALSE, ES_ScopeDebugFrontend::DECLARATIONSTATUS_USED));
+
+	//  "[[3,3,4,1,52,\".test .third-div p span\"],[13, 154,170,181,189, 156,172,183,191, 155,171,182,190, 198,169,193,152,153,49],
+	//   [\"rgb(255, 0, 255)\", \"rgb(255, 0, 255)\",\"rgb(255, 0, 255)\",\"rgb(255, 0, 255)\",\"rgb(255, 0, 255)\", \"3px\",\"3px\",\"3px\",\"3px\", \"solid\",\"solid\",\"solid\",\"solid\", \"scroll\",\"repeat\",\"0% 0%\",\"rgb(102, 204, 102)\",\"none\",\"15px\"],[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],[1,1,1,1,1,1,1,1,1,1,1,1,1,0,0,0,0,0,0]],"
+	verify(VerifyAuthorRule(l, 1, 52, UNI_L(".test .third-div p span")));
+	verify(VerifyProperty(l, CSS_PROPERTY_color,               UNI_L("rgb(255, 0, 255)"), FALSE, ES_ScopeDebugFrontend::DECLARATIONSTATUS_USED));
+
+	verify(VerifyProperty(l, CSS_PROPERTY_border_top_color,    UNI_L("rgb(255, 0, 255)"), FALSE, ES_ScopeDebugFrontend::DECLARATIONSTATUS_USED));
+	verify(VerifyProperty(l, CSS_PROPERTY_border_left_color,   UNI_L("rgb(255, 0, 255)"), FALSE, ES_ScopeDebugFrontend::DECLARATIONSTATUS_USED));
+	verify(VerifyProperty(l, CSS_PROPERTY_border_right_color,  UNI_L("rgb(255, 0, 255)"), FALSE, ES_ScopeDebugFrontend::DECLARATIONSTATUS_USED));
+	verify(VerifyProperty(l, CSS_PROPERTY_border_bottom_color, UNI_L("rgb(255, 0, 255)"), FALSE, ES_ScopeDebugFrontend::DECLARATIONSTATUS_USED));
+
+	verify(VerifyProperty(l, CSS_PROPERTY_border_top_width,    UNI_L("3px"), FALSE, ES_ScopeDebugFrontend::DECLARATIONSTATUS_USED));
+	verify(VerifyProperty(l, CSS_PROPERTY_border_left_width,   UNI_L("3px"), FALSE, ES_ScopeDebugFrontend::DECLARATIONSTATUS_USED));
+	verify(VerifyProperty(l, CSS_PROPERTY_border_right_width,  UNI_L("3px"), FALSE, ES_ScopeDebugFrontend::DECLARATIONSTATUS_USED));
+	verify(VerifyProperty(l, CSS_PROPERTY_border_bottom_width, UNI_L("3px"), FALSE, ES_ScopeDebugFrontend::DECLARATIONSTATUS_USED));
+
+	verify(VerifyProperty(l, CSS_PROPERTY_border_top_style,    UNI_L("solid"), FALSE, ES_ScopeDebugFrontend::DECLARATIONSTATUS_USED));
+	verify(VerifyProperty(l, CSS_PROPERTY_border_left_style,   UNI_L("solid"), FALSE, ES_ScopeDebugFrontend::DECLARATIONSTATUS_USED));
+	verify(VerifyProperty(l, CSS_PROPERTY_border_right_style,  UNI_L("solid"), FALSE, ES_ScopeDebugFrontend::DECLARATIONSTATUS_USED));
+	verify(VerifyProperty(l, CSS_PROPERTY_border_bottom_style, UNI_L("solid"), FALSE, ES_ScopeDebugFrontend::DECLARATIONSTATUS_USED));
+
+	verify(VerifyProperty(l, CSS_PROPERTY_background_attachment, UNI_L("scroll"),  FALSE, ES_ScopeDebugFrontend::DECLARATIONSTATUS_OVERWRITTEN));
+	verify(VerifyProperty(l, CSS_PROPERTY_background_repeat,     UNI_L("repeat"),  FALSE, ES_ScopeDebugFrontend::DECLARATIONSTATUS_OVERWRITTEN));
+	verify(VerifyProperty(l, CSS_PROPERTY_background_position,   UNI_L("0% 0%"),   FALSE, ES_ScopeDebugFrontend::DECLARATIONSTATUS_OVERWRITTEN));
+	verify(VerifyProperty(l, CSS_PROPERTY_background_color,      UNI_L("rgb(102, 204, 102)"), FALSE, ES_ScopeDebugFrontend::DECLARATIONSTATUS_OVERWRITTEN));
+	verify(VerifyProperty(l, CSS_PROPERTY_background_image,      UNI_L("none"),    FALSE, ES_ScopeDebugFrontend::DECLARATIONSTATUS_OVERWRITTEN));
+	verify(VerifyProperty(l, CSS_PROPERTY_background_size,       UNI_L("auto"),    FALSE, ES_ScopeDebugFrontend::DECLARATIONSTATUS_OVERWRITTEN));
+	verify(VerifyProperty(l, CSS_PROPERTY_background_origin,     UNI_L("padding-box"), FALSE, ES_ScopeDebugFrontend::DECLARATIONSTATUS_OVERWRITTEN));
+	verify(VerifyProperty(l, CSS_PROPERTY_background_clip,       UNI_L("border-box"),  FALSE, ES_ScopeDebugFrontend::DECLARATIONSTATUS_OVERWRITTEN));
+	verify(VerifyProperty(l, CSS_PROPERTY_font_size,             UNI_L("15px"),    FALSE, ES_ScopeDebugFrontend::DECLARATIONSTATUS_OVERWRITTEN));
+
+	//  "[[3,3,5,1,27,\".test p span\"],[13, 83,120,134,97, 154,170,181,189, 156,172,183,191, 155,171,182,190, 198,169,193,152,153,80,49],
+	// [\"rgb(255, 0, 0)\",\"20px\",\"20px\",\"20px\",\"20px\",\"rgb(255, 0, 0)\",\"rgb(255, 0, 0)\",\"rgb(255, 0, 0)\",\"rgb(255, 0, 0)\",\"3px\",\"3px\",\"3px\",\"3px\",\"solid\",\"solid\",\"solid\",\"solid\",\"scroll\",\"repeat\",\"0% 0%\",\"rgb(102, 204, 204)\",\"none\",\"sans-serif\",\"20px\"],
+	// [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],[0,1,1,1,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0]],"
+	verify(VerifyAuthorRule(l, 1, 27, UNI_L(".test p span")));
+	verify(VerifyProperty(l, CSS_PROPERTY_color,          UNI_L("rgb(255, 0, 0)"), FALSE, ES_ScopeDebugFrontend::DECLARATIONSTATUS_OVERWRITTEN));
+
+	verify(VerifyProperty(l, CSS_PROPERTY_padding_top,    UNI_L("20px"), FALSE, ES_ScopeDebugFrontend::DECLARATIONSTATUS_USED));
+	verify(VerifyProperty(l, CSS_PROPERTY_padding_right,  UNI_L("20px"), FALSE, ES_ScopeDebugFrontend::DECLARATIONSTATUS_USED));
+	verify(VerifyProperty(l, CSS_PROPERTY_padding_bottom, UNI_L("20px"), FALSE, ES_ScopeDebugFrontend::DECLARATIONSTATUS_USED));
+	verify(VerifyProperty(l, CSS_PROPERTY_padding_left,   UNI_L("20px"), FALSE, ES_ScopeDebugFrontend::DECLARATIONSTATUS_USED));
+
+	verify(VerifyProperty(l, CSS_PROPERTY_border_top_color,    UNI_L("rgb(255, 0, 0)"), FALSE, ES_ScopeDebugFrontend::DECLARATIONSTATUS_OVERWRITTEN));
+	verify(VerifyProperty(l, CSS_PROPERTY_border_left_color,   UNI_L("rgb(255, 0, 0)"), FALSE, ES_ScopeDebugFrontend::DECLARATIONSTATUS_OVERWRITTEN));
+	verify(VerifyProperty(l, CSS_PROPERTY_border_right_color,  UNI_L("rgb(255, 0, 0)"), FALSE, ES_ScopeDebugFrontend::DECLARATIONSTATUS_OVERWRITTEN));
+	verify(VerifyProperty(l, CSS_PROPERTY_border_bottom_color, UNI_L("rgb(255, 0, 0)"), FALSE, ES_ScopeDebugFrontend::DECLARATIONSTATUS_OVERWRITTEN));
+
+	verify(VerifyProperty(l, CSS_PROPERTY_border_top_width,    UNI_L("3px"), FALSE, ES_ScopeDebugFrontend::DECLARATIONSTATUS_OVERWRITTEN));
+	verify(VerifyProperty(l, CSS_PROPERTY_border_left_width,   UNI_L("3px"), FALSE, ES_ScopeDebugFrontend::DECLARATIONSTATUS_OVERWRITTEN));
+	verify(VerifyProperty(l, CSS_PROPERTY_border_right_width,  UNI_L("3px"), FALSE, ES_ScopeDebugFrontend::DECLARATIONSTATUS_OVERWRITTEN));
+	verify(VerifyProperty(l, CSS_PROPERTY_border_bottom_width, UNI_L("3px"), FALSE, ES_ScopeDebugFrontend::DECLARATIONSTATUS_OVERWRITTEN));
+
+	verify(VerifyProperty(l, CSS_PROPERTY_border_top_style,    UNI_L("solid"), FALSE, ES_ScopeDebugFrontend::DECLARATIONSTATUS_OVERWRITTEN));
+	verify(VerifyProperty(l, CSS_PROPERTY_border_left_style,   UNI_L("solid"), FALSE, ES_ScopeDebugFrontend::DECLARATIONSTATUS_OVERWRITTEN));
+	verify(VerifyProperty(l, CSS_PROPERTY_border_right_style,  UNI_L("solid"), FALSE, ES_ScopeDebugFrontend::DECLARATIONSTATUS_OVERWRITTEN));
+	verify(VerifyProperty(l, CSS_PROPERTY_border_bottom_style, UNI_L("solid"), FALSE, ES_ScopeDebugFrontend::DECLARATIONSTATUS_OVERWRITTEN));
+
+	verify(VerifyProperty(l, CSS_PROPERTY_background_attachment, UNI_L("scroll"),  FALSE, ES_ScopeDebugFrontend::DECLARATIONSTATUS_OVERWRITTEN));
+	verify(VerifyProperty(l, CSS_PROPERTY_background_repeat,     UNI_L("repeat"),  FALSE, ES_ScopeDebugFrontend::DECLARATIONSTATUS_OVERWRITTEN));
+	verify(VerifyProperty(l, CSS_PROPERTY_background_position,   UNI_L("0% 0%"),   FALSE, ES_ScopeDebugFrontend::DECLARATIONSTATUS_OVERWRITTEN));
+	verify(VerifyProperty(l, CSS_PROPERTY_background_color,      UNI_L("rgb(102, 204, 204)"), FALSE, ES_ScopeDebugFrontend::DECLARATIONSTATUS_OVERWRITTEN));
+	verify(VerifyProperty(l, CSS_PROPERTY_background_image,      UNI_L("none"),    FALSE, ES_ScopeDebugFrontend::DECLARATIONSTATUS_OVERWRITTEN));
+	verify(VerifyProperty(l, CSS_PROPERTY_background_size,       UNI_L("auto"),    FALSE, ES_ScopeDebugFrontend::DECLARATIONSTATUS_OVERWRITTEN));
+	verify(VerifyProperty(l, CSS_PROPERTY_background_origin,     UNI_L("padding-box"), FALSE, ES_ScopeDebugFrontend::DECLARATIONSTATUS_OVERWRITTEN));
+	verify(VerifyProperty(l, CSS_PROPERTY_background_clip,       UNI_L("border-box"),  FALSE, ES_ScopeDebugFrontend::DECLARATIONSTATUS_OVERWRITTEN));
+
+	verify(VerifyProperty(l, CSS_PROPERTY_font_family,           UNI_L("sans-serif"), FALSE, ES_ScopeDebugFrontend::DECLARATIONSTATUS_USED));
+	verify(VerifyProperty(l, CSS_PROPERTY_font_size,             UNI_L("20px"),       FALSE, ES_ScopeDebugFrontend::DECLARATIONSTATUS_OVERWRITTEN));
+
+	//  "[[3,3,6,1,26,\".test span\"],[13, 61,96,119,84, 83,120,134,97, 154,170,181,189, 156,172,183,191, 155,171,182,190, 198,169,193,152,153,80,49],
+	// [\"green\", \"3px\",\"3px\",\"3px\",\"3px\", \"10px\",\"10px\",\"10px\",\"10px\", \"rgb(0, 128, 0)\",\"rgb(0, 128, 0)\",\"rgb(0, 128, 0)\",\"rgb(0, 128, 0)\", \"3px\",\"3px\",\"3px\",\"3px\", \"solid\",\"solid\",\"solid\",\"solid\", \"scroll\",\"repeat\",\"0% 0%\",\"rgb(204, 102, 204)\",\"none\",\"monospace\",\"30px\"],
+	// [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],[0,1,1,1,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]]"
+	verify(VerifyAuthorRule(l, 1, 26, UNI_L(".test span")));
+	verify(VerifyProperty(l, CSS_PROPERTY_color,         UNI_L("rgb(0, 255, 0)"), FALSE, ES_ScopeDebugFrontend::DECLARATIONSTATUS_OVERWRITTEN));
+
+	verify(VerifyProperty(l, CSS_PROPERTY_margin_top,    UNI_L("3px"),  FALSE, ES_ScopeDebugFrontend::DECLARATIONSTATUS_USED));
+	verify(VerifyProperty(l, CSS_PROPERTY_margin_right,  UNI_L("3px"),  FALSE, ES_ScopeDebugFrontend::DECLARATIONSTATUS_USED));
+	verify(VerifyProperty(l, CSS_PROPERTY_margin_bottom, UNI_L("3px"),  FALSE, ES_ScopeDebugFrontend::DECLARATIONSTATUS_USED));
+	verify(VerifyProperty(l, CSS_PROPERTY_margin_left,   UNI_L("3px"),  FALSE, ES_ScopeDebugFrontend::DECLARATIONSTATUS_USED));
+
+	verify(VerifyProperty(l, CSS_PROPERTY_padding_top,    UNI_L("10px"), FALSE, ES_ScopeDebugFrontend::DECLARATIONSTATUS_OVERWRITTEN));
+	verify(VerifyProperty(l, CSS_PROPERTY_padding_right,  UNI_L("10px"), FALSE, ES_ScopeDebugFrontend::DECLARATIONSTATUS_OVERWRITTEN));
+	verify(VerifyProperty(l, CSS_PROPERTY_padding_bottom, UNI_L("10px"), FALSE, ES_ScopeDebugFrontend::DECLARATIONSTATUS_OVERWRITTEN));
+	verify(VerifyProperty(l, CSS_PROPERTY_padding_left,   UNI_L("10px"), FALSE, ES_ScopeDebugFrontend::DECLARATIONSTATUS_OVERWRITTEN));
+
+	verify(VerifyProperty(l, CSS_PROPERTY_border_top_color,    UNI_L("green"), FALSE, ES_ScopeDebugFrontend::DECLARATIONSTATUS_OVERWRITTEN));
+	verify(VerifyProperty(l, CSS_PROPERTY_border_left_color,   UNI_L("green"), FALSE, ES_ScopeDebugFrontend::DECLARATIONSTATUS_OVERWRITTEN));
+	verify(VerifyProperty(l, CSS_PROPERTY_border_right_color,  UNI_L("green"), FALSE, ES_ScopeDebugFrontend::DECLARATIONSTATUS_OVERWRITTEN));
+	verify(VerifyProperty(l, CSS_PROPERTY_border_bottom_color, UNI_L("green"), FALSE, ES_ScopeDebugFrontend::DECLARATIONSTATUS_OVERWRITTEN));
+
+	verify(VerifyProperty(l, CSS_PROPERTY_border_top_width,    UNI_L("3px"), FALSE, ES_ScopeDebugFrontend::DECLARATIONSTATUS_OVERWRITTEN));
+	verify(VerifyProperty(l, CSS_PROPERTY_border_left_width,   UNI_L("3px"), FALSE, ES_ScopeDebugFrontend::DECLARATIONSTATUS_OVERWRITTEN));
+	verify(VerifyProperty(l, CSS_PROPERTY_border_right_width,  UNI_L("3px"), FALSE, ES_ScopeDebugFrontend::DECLARATIONSTATUS_OVERWRITTEN));
+	verify(VerifyProperty(l, CSS_PROPERTY_border_bottom_width, UNI_L("3px"), FALSE, ES_ScopeDebugFrontend::DECLARATIONSTATUS_OVERWRITTEN));
+
+	verify(VerifyProperty(l, CSS_PROPERTY_border_top_style,    UNI_L("solid"), FALSE, ES_ScopeDebugFrontend::DECLARATIONSTATUS_OVERWRITTEN));
+	verify(VerifyProperty(l, CSS_PROPERTY_border_left_style,   UNI_L("solid"), FALSE, ES_ScopeDebugFrontend::DECLARATIONSTATUS_OVERWRITTEN));
+	verify(VerifyProperty(l, CSS_PROPERTY_border_right_style,  UNI_L("solid"), FALSE, ES_ScopeDebugFrontend::DECLARATIONSTATUS_OVERWRITTEN));
+	verify(VerifyProperty(l, CSS_PROPERTY_border_bottom_style, UNI_L("solid"), FALSE, ES_ScopeDebugFrontend::DECLARATIONSTATUS_OVERWRITTEN));
+
+	verify(VerifyProperty(l, CSS_PROPERTY_background_attachment, UNI_L("scroll"),  FALSE, ES_ScopeDebugFrontend::DECLARATIONSTATUS_OVERWRITTEN));
+	verify(VerifyProperty(l, CSS_PROPERTY_background_repeat,     UNI_L("repeat"),  FALSE, ES_ScopeDebugFrontend::DECLARATIONSTATUS_OVERWRITTEN));
+	verify(VerifyProperty(l, CSS_PROPERTY_background_position,   UNI_L("0% 0%"),   FALSE, ES_ScopeDebugFrontend::DECLARATIONSTATUS_OVERWRITTEN));
+	verify(VerifyProperty(l, CSS_PROPERTY_background_color,      UNI_L("rgb(204, 102, 204)"), FALSE, ES_ScopeDebugFrontend::DECLARATIONSTATUS_OVERWRITTEN));
+	verify(VerifyProperty(l, CSS_PROPERTY_background_image,      UNI_L("none"),    FALSE, ES_ScopeDebugFrontend::DECLARATIONSTATUS_OVERWRITTEN));
+	verify(VerifyProperty(l, CSS_PROPERTY_background_size,       UNI_L("auto"),    FALSE, ES_ScopeDebugFrontend::DECLARATIONSTATUS_OVERWRITTEN));
+	verify(VerifyProperty(l, CSS_PROPERTY_background_origin,     UNI_L("padding-box"), FALSE, ES_ScopeDebugFrontend::DECLARATIONSTATUS_OVERWRITTEN));
+	verify(VerifyProperty(l, CSS_PROPERTY_background_clip,       UNI_L("border-box"),  FALSE, ES_ScopeDebugFrontend::DECLARATIONSTATUS_OVERWRITTEN));
+
+	verify(VerifyProperty(l, CSS_PROPERTY_font_family,           UNI_L("monospace"), FALSE, ES_ScopeDebugFrontend::DECLARATIONSTATUS_OVERWRITTEN));
+	verify(VerifyProperty(l, CSS_PROPERTY_font_size,             UNI_L("30px"),       FALSE, ES_ScopeDebugFrontend::DECLARATIONSTATUS_OVERWRITTEN));
+
+	verify(VerifyNoMoreMatches(l));
+}
+
+html
+{
+    //! <!doctype html>
+    //! <html>
+    //! <head>
+    //! <title> </title>
+    //! <style>
+    //! .test span
+    //! {
+    //!   margin: 3px; /* applied */
+    //!   padding: 10px; /* applied */
+    //!   border: 3px solid green; /* applied */
+    //!   background: #c6c; /* applied */
+    //! }
+    //!
+    //! .test p
+    //! {
+    //!   font-size: 20px; /* applied */
+    //! }
+    //!
+    //! .test .third-div
+    //! {
+    //!   font-family: serif; /* applied */
+    //!   font-size: 15px; /* overwritten */
+    //! }
+    //!
+    //! .test #second-div
+    //! {
+    //!   color: #0ff; /* applied */
+    //!   font-family: monospace; /* overwritten */
+    //!   font-size: 10px; /* overwritten */
+    //! }
+    //! </style>
+    //! <body>
+    //! <div class="test">
+    //!   <div id="second-div">text in the second div
+    //!     <div class="third-div">text in the third div
+    //!       <p> text in the paragraph
+    //!           <span id="itemtotest">text in span</span>
+    //!       </p>
+    //!     </div>
+    //!   </div>
+    //! </div>
+    //! </body>
+    //! </html>
+}
+
+test("Cascade with inherited matches")
+{
+	// JSON:
+	//"[[1,\"span\"],"
+	// "["
+	//  "[[3,3,2,1,26,\".test span\"],[61,96,119,84,83,120,134,97,154,170,181,189,156,172,183,191,155,171,182,190,198,169,193,152,153],[\"3px\",\"3px\",\"3px\",\"3px\",\"10px\",\"10px\",\"10px\",\"10px\",\"rgb(0, 128, 0)\",\"rgb(0, 128, 0)\",\"rgb(0, 128, 0)\",\"rgb(0, 128, 0)\",\"3px\",\"3px\",\"3px\",\"3px\",\"solid\",\"solid\",\"solid\",\"solid\",\"scroll\",\"repeat\",\"0% 0%\",\"rgb(204, 102, 204)\",\"none\"],[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],[1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1]]"
+	// "]"
+	//"]"
+	//"[[4,\"p\"],"
+	// "["
+	//  "[[3,3,5,1,26,\".test p\"],[49],[\"20px\"],[0],[1]]"
+	// "]"
+	//"]"
+	//"[[6,\"div\"],"
+	// "["
+	//  "[[3,3,7,1,50,\".test .third-div\"],[80,49],[\"serif\",\"15px\"],[0,0],[1,0]]"
+	// "]"
+	//"]"
+	//"[[8,\"div\"],"
+	// "["
+	//  "[[3,3,9,1,650,\".test #second-div\"],[13,80,49],[\"rgb(0, 255, 255)\",\"monospace\",\"10px\"],[0,0,0],[1,0,0]]"
+	// "]"
+	//"]";
+
+	OtScopeStyleListener l(state.doc);
+	verify(OpStatus::IsSuccess(l.Construct(UNI_L("itemtotest"))));
+
+	//"[[1,\"span\"],"
+	// "["
+	//  "[[3,3,2,1,26,\".test span\"],    [61,96,119,84, 83,120,134,97, 154,170,181,189, 156,172,183,191, 155,171,182,190, 198,169,193,152,153],
+	// [\"3px\",\"3px\",\"3px\",\"3px\", \"10px\",\"10px\",\"10px\",\"10px\", \"green\",\"rgb(0, 128, 0)\",\"rgb(0, 128, 0)\",\"rgb(0, 128, 0)\", \"3px\",\"3px\",\"3px\",\"3px\", \"solid\",\"solid\",\"solid\",\"solid\", \"scroll\",\"repeat\",\"0% 0%\",\"rgb(204, 102, 204)\",\"none\"],
+	// [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],[1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1]]"
+	//"]"
+	verify(VerifyMatch(l, UNI_L("span")));
+
+	verify(VerifyAuthorRule(l, 1, 26, UNI_L(".test span")));
+	verify(VerifyProperty(l, CSS_PROPERTY_margin_top,    UNI_L("3px"),  FALSE, ES_ScopeDebugFrontend::DECLARATIONSTATUS_USED));
+	verify(VerifyProperty(l, CSS_PROPERTY_margin_right,  UNI_L("3px"),  FALSE, ES_ScopeDebugFrontend::DECLARATIONSTATUS_USED));
+	verify(VerifyProperty(l, CSS_PROPERTY_margin_bottom, UNI_L("3px"),  FALSE, ES_ScopeDebugFrontend::DECLARATIONSTATUS_USED));
+	verify(VerifyProperty(l, CSS_PROPERTY_margin_left,   UNI_L("3px"),  FALSE, ES_ScopeDebugFrontend::DECLARATIONSTATUS_USED));
+
+	verify(VerifyProperty(l, CSS_PROPERTY_padding_top,    UNI_L("10px"), FALSE, ES_ScopeDebugFrontend::DECLARATIONSTATUS_USED));
+	verify(VerifyProperty(l, CSS_PROPERTY_padding_right,  UNI_L("10px"), FALSE, ES_ScopeDebugFrontend::DECLARATIONSTATUS_USED));
+	verify(VerifyProperty(l, CSS_PROPERTY_padding_bottom, UNI_L("10px"), FALSE, ES_ScopeDebugFrontend::DECLARATIONSTATUS_USED));
+	verify(VerifyProperty(l, CSS_PROPERTY_padding_left,   UNI_L("10px"), FALSE, ES_ScopeDebugFrontend::DECLARATIONSTATUS_USED));
+
+	verify(VerifyProperty(l, CSS_PROPERTY_border_top_color,    UNI_L("green"), FALSE, ES_ScopeDebugFrontend::DECLARATIONSTATUS_USED));
+	verify(VerifyProperty(l, CSS_PROPERTY_border_left_color,   UNI_L("green"), FALSE, ES_ScopeDebugFrontend::DECLARATIONSTATUS_USED));
+	verify(VerifyProperty(l, CSS_PROPERTY_border_right_color,  UNI_L("green"), FALSE, ES_ScopeDebugFrontend::DECLARATIONSTATUS_USED));
+	verify(VerifyProperty(l, CSS_PROPERTY_border_bottom_color, UNI_L("green"), FALSE, ES_ScopeDebugFrontend::DECLARATIONSTATUS_USED));
+
+	verify(VerifyProperty(l, CSS_PROPERTY_border_top_width,    UNI_L("3px"), FALSE, ES_ScopeDebugFrontend::DECLARATIONSTATUS_USED));
+	verify(VerifyProperty(l, CSS_PROPERTY_border_left_width,   UNI_L("3px"), FALSE, ES_ScopeDebugFrontend::DECLARATIONSTATUS_USED));
+	verify(VerifyProperty(l, CSS_PROPERTY_border_right_width,  UNI_L("3px"), FALSE, ES_ScopeDebugFrontend::DECLARATIONSTATUS_USED));
+	verify(VerifyProperty(l, CSS_PROPERTY_border_bottom_width, UNI_L("3px"), FALSE, ES_ScopeDebugFrontend::DECLARATIONSTATUS_USED));
+
+	verify(VerifyProperty(l, CSS_PROPERTY_border_top_style,    UNI_L("solid"), FALSE, ES_ScopeDebugFrontend::DECLARATIONSTATUS_USED));
+	verify(VerifyProperty(l, CSS_PROPERTY_border_left_style,   UNI_L("solid"), FALSE, ES_ScopeDebugFrontend::DECLARATIONSTATUS_USED));
+	verify(VerifyProperty(l, CSS_PROPERTY_border_right_style,  UNI_L("solid"), FALSE, ES_ScopeDebugFrontend::DECLARATIONSTATUS_USED));
+	verify(VerifyProperty(l, CSS_PROPERTY_border_bottom_style, UNI_L("solid"), FALSE, ES_ScopeDebugFrontend::DECLARATIONSTATUS_USED));
+
+	verify(VerifyProperty(l, CSS_PROPERTY_background_attachment, UNI_L("scroll"),  FALSE, ES_ScopeDebugFrontend::DECLARATIONSTATUS_USED));
+	verify(VerifyProperty(l, CSS_PROPERTY_background_repeat,     UNI_L("repeat"),  FALSE, ES_ScopeDebugFrontend::DECLARATIONSTATUS_USED));
+	verify(VerifyProperty(l, CSS_PROPERTY_background_position,   UNI_L("0% 0%"),   FALSE, ES_ScopeDebugFrontend::DECLARATIONSTATUS_USED));
+	verify(VerifyProperty(l, CSS_PROPERTY_background_color,      UNI_L("rgb(204, 102, 204)"), FALSE, ES_ScopeDebugFrontend::DECLARATIONSTATUS_USED));
+	verify(VerifyProperty(l, CSS_PROPERTY_background_image,      UNI_L("none"),    FALSE, ES_ScopeDebugFrontend::DECLARATIONSTATUS_USED));
+	verify(VerifyProperty(l, CSS_PROPERTY_background_size,       UNI_L("auto"),    FALSE, ES_ScopeDebugFrontend::DECLARATIONSTATUS_USED));
+	verify(VerifyProperty(l, CSS_PROPERTY_background_origin,     UNI_L("padding-box"), FALSE, ES_ScopeDebugFrontend::DECLARATIONSTATUS_USED));
+	verify(VerifyProperty(l, CSS_PROPERTY_background_clip,       UNI_L("border-box"),  FALSE, ES_ScopeDebugFrontend::DECLARATIONSTATUS_USED));
+
+	//"[[4,\"p\"],"
+	// "["
+	//  "[[3,3,5,1,26,\".test p\"],[49],[\"20px\"],[0],[1]]"
+	// "]"
+	//"]"
+	verify(VerifyMatch(l, UNI_L("p")));
+	verify(VerifyAuthorRule(l, 1, 26, UNI_L(".test p")));
+	verify(VerifyProperty(l, CSS_PROPERTY_font_size,   UNI_L("20px"), FALSE, ES_ScopeDebugFrontend::DECLARATIONSTATUS_USED));
+
+	//"[[6,\"div\"],"
+	// "["
+	//  "[[3,3,7,1,50,\".test .third-div\"],[80,49],[\"serif\",\"15px\"],[0,0],[1,0]]"
+	// "]"
+	//"]"
+	verify(VerifyMatch(l, UNI_L("div")));
+	verify(VerifyAuthorRule(l, 1, 50, UNI_L(".test .third-div")));
+	verify(VerifyProperty(l, CSS_PROPERTY_font_family, UNI_L("serif"), FALSE, ES_ScopeDebugFrontend::DECLARATIONSTATUS_USED));
+	verify(VerifyProperty(l, CSS_PROPERTY_font_size,   UNI_L("15px"),  FALSE, ES_ScopeDebugFrontend::DECLARATIONSTATUS_OVERWRITTEN));
+
+	//"[[8,\"div\"],"
+	// "["
+	//  "[[3,3,9,1,650,\".test #second-div\"],[13,80,49],[\"rgb(0, 255, 255)\",\"monospace\",\"10px\"],[0,0,0],[1,0,0]]"
+	// "]"
+	verify(VerifyMatch(l, UNI_L("div")));
+	verify(VerifyAuthorRule(l, 1, 650, UNI_L(".test #second-div")));
+	verify(VerifyProperty(l, CSS_PROPERTY_color,       UNI_L("rgb(0, 255, 255)"),   FALSE, ES_ScopeDebugFrontend::DECLARATIONSTATUS_USED));
+	verify(VerifyProperty(l, CSS_PROPERTY_font_family, UNI_L("monospace"), FALSE, ES_ScopeDebugFrontend::DECLARATIONSTATUS_OVERWRITTEN));
+	verify(VerifyProperty(l, CSS_PROPERTY_font_size,   UNI_L("10px"),      FALSE, ES_ScopeDebugFrontend::DECLARATIONSTATUS_OVERWRITTEN));
+
+	verify(VerifyNoMoreMatches(l));
+}
+
+html
+{
+    //! <!doctype html>
+    //! <html>
+    //! <head>
+    //! <title> </title>
+    //! <style>
+    //!   /*
+    //!   test inheritable properties css 2.1 visual style
+    //!
+    //!   when selecting the span all other nodes should only show all inheritable properties
+    //!
+    //!   all properties of the "span" selector should have status 1, all other properties of all other nodes should have status 0,
+    //!
+    //!   ( visual ) css 2.1 inheritable properties:
+    //!
+    //!     border-collapse
+    //!     border-spacing
+    //!     caption-side
+    //!     color
+    //!     cursor
+    //!     direction
+    //!     empty-cells
+    //!     font-family
+    //!     font-size
+    //!     font-style
+    //!     font-variant
+    //!     font-weight
+    //!     letter-spacing
+    //!     line-height
+    //!     list-style-image
+    //!     list-style-position
+    //!     list-style-type
+    //!     orphans
+    //!     page-break-inside
+    //!     quotes
+    //!     text-align
+    //!     text-indent
+    //!     text-transform
+    //!     visibility
+    //!     white-space
+    //!     widows
+    //!     word-spacing
+    //!
+    //!   */
+    //!
+    //! .test span
+    //! {
+    //!   background-attachment: scroll; /* not inheritable */
+    //!   background-color: transparent; /* not inheritable */
+    //!   background-image: none; /* not inheritable */
+    //!   background-position: 0px 0px; /* not inheritable */
+    //!   background-repeat: repeat; /* not inheritable */
+    //!   border-collapse: separate; /* inheritable */
+    //!   border-spacing: 0px; /* inheritable */
+    //!   border-top-color: #000000; /* not inheritable */
+    //!   border-top-style: none; /* not inheritable */
+    //!   border-top-width: 0px; /* not inheritable */
+    //!   bottom: 6839px; /* not inheritable */
+    //!   caption-side: top; /* inheritable */
+    //!   clear: none; /* not inheritable */
+    //!   clip: rect(0px, 0px, 0px, 0px); /* not inheritable */
+    //!   color: #000000; /* inheritable */
+    //!   content: normal; /* not inheritable */
+    //!   counter-increment: none; /* not inheritable */
+    //!   counter-reset: none; /* not inheritable */
+    //!   cursor: default; /* inheritable */
+    //!   direction: ltr; /* inheritable */
+    //!   display: block; /* not inheritable */
+    //!   empty-cells: show; /* inheritable */
+    //!   float: none; /* not inheritable */
+    //!   font-family: "Times New Roman"; /* inheritable */
+    //!   font-size: 16px; /* inheritable */
+    //!   font-style: normal; /* inheritable */
+    //!   font-variant: normal; /* inheritable */
+    //!   font-weight: 400; /* inheritable */
+    //!   height: 6839px; /* not inheritable */
+    //!   left: 0px; /* not inheritable */
+    //!   letter-spacing: 0px; /* inheritable */
+    //!   line-height: normal; /* inheritable */
+    //!   list-style-image: none; /* inheritable */
+    //!   list-style-position: outside; /* inheritable */
+    //!   list-style-type: disc; /* inheritable */
+    //!   margin-top: 0px; /* not inheritable */
+    //!   margin-left: 0px; /* not inheritable */
+    //!   margin-bottom: 0px; /* not inheritable */
+    //!   margin-right: 0px; /* not inheritable */
+    //!   max-height: none; /* not inheritable */
+    //!   max-width: none; /* not inheritable */
+    //!   min-height: 0px; /* not inheritable */
+    //!   min-width: 0px; /* not inheritable */
+    //!   orphans: 2; /* inheritable */
+    //!   outline-color: invert; /* not inheritable */
+    //!   outline-style: none; /* not inheritable */
+    //!   outline-width: 3px; /* not inheritable */
+    //!   outline: 3px; /* not inheritable */
+    //!   overflow: visible; /* not inheritable */
+    //!   padding-top: 0px; /* not inheritable */
+    //!   padding-left: 0px; /* not inheritable */
+    //!   padding-bottom: 0px; /* not inheritable */
+    //!   padding-right: 0px; /* not inheritable */
+    //!   page-break-after: auto; /* not inheritable */
+    //!   page-break-before: auto; /* not inheritable */
+    //!   page-break-inside: auto; /* inheritable */
+    //!   position: static; /* not inheritable */
+    //!   quotes: none; /* inheritable */
+    //!   right: 921px; /* not inheritable */
+    //!   table-layout: auto; /* not inheritable */
+    //!   text-align: left; /* inheritable */
+    //!   text-decoration: none; /* not inheritable */
+    //!   text-indent: 0px; /* inheritable */
+    //!   text-transform: none; /* inheritable */
+    //!   top: 0px; /* not inheritable */
+    //!   unicode-bidi: normal; /* not inheritable */
+    //!   vertical-align: baseline; /* not inheritable */
+    //!   visibility: visible; /* inheritable */
+    //!   white-space: normal; /* inheritable */
+    //!   widows: 2; /* inheritable */
+    //!   width: 921px; /* not inheritable */
+    //!   word-spacing: 0px; /* inheritable */
+    //!   z-index: auto; /* not inheritable */
+    //! }
+    //!
+    //! .test p
+    //! {
+    //!   background-attachment: scroll; /* not inheritable */
+    //!   background-color: transparent; /* not inheritable */
+    //!   background-image: none; /* not inheritable */
+    //!   background-position: 0px 0px; /* not inheritable */
+    //!   background-repeat: repeat; /* not inheritable */
+    //!   border-collapse: separate; /* inheritable */
+    //!   border-spacing: 0px; /* inheritable */
+    //!   border-top-color: #000000; /* not inheritable */
+    //!   border-top-style: none; /* not inheritable */
+    //!   border-top-width: 0px; /* not inheritable */
+    //!   bottom: 6839px; /* not inheritable */
+    //!   caption-side: top; /* inheritable */
+    //!   clear: none; /* not inheritable */
+    //!   clip: rect(0px, 0px, 0px, 0px); /* not inheritable */
+    //!   color: #000000; /* inheritable */
+    //!   content: normal; /* not inheritable */
+    //!   counter-increment: none; /* not inheritable */
+    //!   counter-reset: none; /* not inheritable */
+    //!   cursor: default; /* inheritable */
+    //!   direction: ltr; /* inheritable */
+    //!   display: block; /* not inheritable */
+    //!   empty-cells: show; /* inheritable */
+    //!   float: none; /* not inheritable */
+    //!   font-family: "Times New Roman"; /* inheritable */
+    //!   font-size: 16px; /* inheritable */
+    //!   font-style: normal; /* inheritable */
+    //!   font-variant: normal; /* inheritable */
+    //!   font-weight: 400; /* inheritable */
+    //!   height: 6839px; /* not inheritable */
+    //!   left: 0px; /* not inheritable */
+    //!   letter-spacing: 0px; /* inheritable */
+    //!   line-height: normal; /* inheritable */
+    //!   list-style-image: none; /* inheritable */
+    //!   list-style-position: outside; /* inheritable */
+    //!   list-style-type: disc; /* inheritable */
+    //!   margin-top: 0px; /* not inheritable */
+    //!   margin-left: 0px; /* not inheritable */
+    //!   margin-bottom: 0px; /* not inheritable */
+    //!   margin-right: 0px; /* not inheritable */
+    //!   max-height: none; /* not inheritable */
+    //!   max-width: none; /* not inheritable */
+    //!   min-height: 0px; /* not inheritable */
+    //!   min-width: 0px; /* not inheritable */
+    //!   orphans: 2; /* inheritable */
+    //!   outline-color: invert; /* not inheritable */
+    //!   outline-style: none; /* not inheritable */
+    //!   outline-width: 3px; /* not inheritable */
+    //!   outline: 3px; /* not inheritable */
+    //!   overflow: visible; /* not inheritable */
+    //!   padding-top: 0px; /* not inheritable */
+    //!   padding-left: 0px; /* not inheritable */
+    //!   padding-bottom: 0px; /* not inheritable */
+    //!   padding-right: 0px; /* not inheritable */
+    //!   page-break-after: auto; /* not inheritable */
+    //!   page-break-before: auto; /* not inheritable */
+    //!   page-break-inside: auto; /* inheritable */
+    //!   position: static; /* not inheritable */
+    //!   quotes: none; /* inheritable */
+    //!   right: 921px; /* not inheritable */
+    //!   table-layout: auto; /* not inheritable */
+    //!   text-align: left; /* inheritable */
+    //!   text-decoration: none; /* not inheritable */
+    //!   text-indent: 0px; /* inheritable */
+    //!   text-transform: none; /* inheritable */
+    //!   top: 0px; /* not inheritable */
+    //!   unicode-bidi: normal; /* not inheritable */
+    //!   vertical-align: baseline; /* not inheritable */
+    //!   visibility: visible; /* inheritable */
+    //!   white-space: normal; /* inheritable */
+    //!   widows: 2; /* inheritable */
+    //!   width: 921px; /* not inheritable */
+    //!   word-spacing: 0px; /* inheritable */
+    //!   z-index: auto; /* not inheritable */
+    //! }
+    //!
+    //! .test .third-div
+    //! {
+    //!   background-attachment: scroll; /* not inheritable */
+    //!   background-color: transparent; /* not inheritable */
+    //!   background-image: none; /* not inheritable */
+    //!   background-position: 0px 0px; /* not inheritable */
+    //!   background-repeat: repeat; /* not inheritable */
+    //!   border-collapse: separate; /* inheritable */
+    //!   border-spacing: 0px; /* inheritable */
+    //!   border-top-color: #000000; /* not inheritable */
+    //!   border-top-style: none; /* not inheritable */
+    //!   border-top-width: 0px; /* not inheritable */
+    //!   bottom: 6839px; /* not inheritable */
+    //!   caption-side: top; /* inheritable */
+    //!   clear: none; /* not inheritable */
+    //!   clip: rect(0px, 0px, 0px, 0px); /* not inheritable */
+    //!   color: #000000; /* inheritable */
+    //!   content: normal; /* not inheritable */
+    //!   counter-increment: none; /* not inheritable */
+    //!   counter-reset: none; /* not inheritable */
+    //!   cursor: default; /* inheritable */
+    //!   direction: ltr; /* inheritable */
+    //!   display: block; /* not inheritable */
+    //!   empty-cells: show; /* inheritable */
+    //!   float: none; /* not inheritable */
+    //!   font-family: "Times New Roman"; /* inheritable */
+    //!   font-size: 16px; /* inheritable */
+    //!   font-style: normal; /* inheritable */
+    //!   font-variant: normal; /* inheritable */
+    //!   font-weight: 400; /* inheritable */
+    //!   height: 6839px; /* not inheritable */
+    //!   left: 0px; /* not inheritable */
+    //!   letter-spacing: 0px; /* inheritable */
+    //!   line-height: normal; /* inheritable */
+    //!   list-style-image: none; /* inheritable */
+    //!   list-style-position: outside; /* inheritable */
+    //!   list-style-type: disc; /* inheritable */
+    //!   margin-top: 0px; /* not inheritable */
+    //!   margin-left: 0px; /* not inheritable */
+    //!   margin-bottom: 0px; /* not inheritable */
+    //!   margin-right: 0px; /* not inheritable */
+    //!   max-height: none; /* not inheritable */
+    //!   max-width: none; /* not inheritable */
+    //!   min-height: 0px; /* not inheritable */
+    //!   min-width: 0px; /* not inheritable */
+    //!   orphans: 2; /* inheritable */
+    //!   outline-color: invert; /* not inheritable */
+    //!   outline-style: none; /* not inheritable */
+    //!   outline-width: 3px; /* not inheritable */
+    //!   outline: 3px; /* not inheritable */
+    //!   overflow: visible; /* not inheritable */
+    //!   padding-top: 0px; /* not inheritable */
+    //!   padding-left: 0px; /* not inheritable */
+    //!   padding-bottom: 0px; /* not inheritable */
+    //!   padding-right: 0px; /* not inheritable */
+    //!   page-break-after: auto; /* not inheritable */
+    //!   page-break-before: auto; /* not inheritable */
+    //!   page-break-inside: auto; /* inheritable */
+    //!   position: static; /* not inheritable */
+    //!   quotes: none; /* inheritable */
+    //!   right: 921px; /* not inheritable */
+    //!   table-layout: auto; /* not inheritable */
+    //!   text-align: left; /* inheritable */
+    //!   text-decoration: none; /* not inheritable */
+    //!   text-indent: 0px; /* inheritable */
+    //!   text-transform: none; /* inheritable */
+    //!   top: 0px; /* not inheritable */
+    //!   unicode-bidi: normal; /* not inheritable */
+    //!   vertical-align: baseline; /* not inheritable */
+    //!   visibility: visible; /* inheritable */
+    //!   white-space: normal; /* inheritable */
+    //!   widows: 2; /* inheritable */
+    //!   width: 921px; /* not inheritable */
+    //!   word-spacing: 0px; /* inheritable */
+    //!   z-index: auto; /* not inheritable */
+    //! }
+    //!
+    //! .test #second-div
+    //! {
+    //!   background-attachment: scroll; /* not inheritable */
+    //!   background-color: transparent; /* not inheritable */
+    //!   background-image: none; /* not inheritable */
+    //!   background-position: 0px 0px; /* not inheritable */
+    //!   background-repeat: repeat; /* not inheritable */
+    //!   border-collapse: separate; /* inheritable */
+    //!   border-spacing: 0px; /* inheritable */
+    //!   border-top-color: #000000; /* not inheritable */
+    //!   border-top-style: none; /* not inheritable */
+    //!   border-top-width: 0px; /* not inheritable */
+    //!   bottom: 6839px; /* not inheritable */
+    //!   caption-side: top; /* inheritable */
+    //!   clear: none; /* not inheritable */
+    //!   clip: rect(0px, 0px, 0px, 0px); /* not inheritable */
+    //!   color: #000000; /* inheritable */
+    //!   content: normal; /* not inheritable */
+    //!   counter-increment: none; /* not inheritable */
+    //!   counter-reset: none; /* not inheritable */
+    //!   cursor: default; /* inheritable */
+    //!   direction: ltr; /* inheritable */
+    //!   display: block; /* not inheritable */
+    //!   empty-cells: show; /* inheritable */
+    //!   float: none; /* not inheritable */
+    //!   font-family: "Times New Roman"; /* inheritable */
+    //!   font-size: 16px; /* inheritable */
+    //!   font-style: normal; /* inheritable */
+    //!   font-variant: normal; /* inheritable */
+    //!   font-weight: 400; /* inheritable */
+    //!   height: 6839px; /* not inheritable */
+    //!   left: 0px; /* not inheritable */
+    //!   letter-spacing: 0px; /* inheritable */
+    //!   line-height: normal; /* inheritable */
+    //!   list-style-image: none; /* inheritable */
+    //!   list-style-position: outside; /* inheritable */
+    //!   list-style-type: disc; /* inheritable */
+    //!   margin-top: 0px; /* not inheritable */
+    //!   margin-left: 0px; /* not inheritable */
+    //!   margin-bottom: 0px; /* not inheritable */
+    //!   margin-right: 0px; /* not inheritable */
+    //!   max-height: none; /* not inheritable */
+    //!   max-width: none; /* not inheritable */
+    //!   min-height: 0px; /* not inheritable */
+    //!   min-width: 0px; /* not inheritable */
+    //!   orphans: 2; /* inheritable */
+    //!   outline-color: invert; /* not inheritable */
+    //!   outline-style: none; /* not inheritable */
+    //!   outline-width: 3px; /* not inheritable */
+    //!   outline: 3px; /* not inheritable */
+    //!   overflow: visible; /* not inheritable */
+    //!   padding-top: 0px; /* not inheritable */
+    //!   padding-left: 0px; /* not inheritable */
+    //!   padding-bottom: 0px; /* not inheritable */
+    //!   padding-right: 0px; /* not inheritable */
+    //!   page-break-after: auto; /* not inheritable */
+    //!   page-break-before: auto; /* not inheritable */
+    //!   page-break-inside: auto; /* inheritable */
+    //!   position: static; /* not inheritable */
+    //!   quotes: none; /* inheritable */
+    //!   right: 921px; /* not inheritable */
+    //!   table-layout: auto; /* not inheritable */
+    //!   text-align: left; /* inheritable */
+    //!   text-decoration: none; /* not inheritable */
+    //!   text-indent: 0px; /* inheritable */
+    //!   text-transform: none; /* inheritable */
+    //!   top: 0px; /* not inheritable */
+    //!   unicode-bidi: normal; /* not inheritable */
+    //!   vertical-align: baseline; /* not inheritable */
+    //!   visibility: visible; /* inheritable */
+    //!   white-space: normal; /* inheritable */
+    //!   widows: 2; /* inheritable */
+    //!   width: 921px; /* not inheritable */
+    //!   word-spacing: 0px; /* inheritable */
+    //!   z-index: auto; /* not inheritable */
+    //! }
+    //! </style>
+    //! <script>
+    //! var a = 0;
+    //! </script>
+    //! </head>
+    //! <body>
+    //! <div class="test">
+    //!   <div id="second-div">text in the second div
+    //!     <div class="third-div">text in the third div
+    //!       <p> text in the paragraph
+    //!           <span id="itemtotest">text in span</span>
+    //!       </p>
+    //!     </div>
+    //!   </div>
+    //! </div>
+    //! </body>
+    //! </html>
+}
+
+test("Cascade with all inherited matches")
+{
+	OtScopeStyleListener l(state.doc);
+	verify(OpStatus::IsSuccess(l.Construct(UNI_L("itemtotest"))));
+	// TODO: Add Verify* calls to check for inherited properties
+}
+
+html
+{
+    //! <!doctype html>
+    //! <html>
+    //! <head>
+    //! <title> </title>
+    //! <style>
+    //! /* order with selected span */
+    //!
+    //! div div span {color: red} /* 13. */
+    //! div span {color: red} /* 15. */
+    //! p span {color: red} /* 14. */
+    //! span {color: red} /* 16. */
+    //!
+    //! body pre + div div div span span {color: green} /* no match */
+    //! pre + div div div span {color: red} /* 11. */
+    //! div div div span {color: red} /* 12. */
+    //!
+
+    //! #second-div body pre + div div div span span {color: green} /* no match */
+    //! #second-div pre + div div div span {color: red} /* no match */
+    //! #second-div div div div span {color: red} /* no match */
+    //! #second-div div div span {color: red} /* no match */
+    //! #second-div div span {color: red} /* 5. */
+    //! #second-div p span {color: red} /* 4. */
+    //! #second-div span {color: red} /* 6. */
+    //!
+    //! .test #second-div body pre + div div div span span {color: green} /* no match */
+    //! .test #second-div pre + div div div span {color: red} /* no match */
+    //! .test #second-div div div div span {color: red} /* no match */
+    //! .test #second-div div div span {color: red} /* no match */
+    //! .test #second-div div span {color: red} /* 2. */
+    //! .test #second-div p span {color: red} /* 1. */
+    //! .test #second-div span {color: red} /* 3. */
+    //!
+    //! .test body pre + div div div span span {color: green} /* no match */
+    //! .test pre + div div div span {color: red} /* no match */
+    //! .test div div div span {color: red} /* no match */
+    //! .test div div span {color: red} /* 7. */
+    //! .test div span {color: red} /* 9. */
+    //! .test p span {color: red} /* 8. */
+    //! .test span {color: red} /* 10. */
+    //! </style>
+    //! </head>
+    //! <body>
+    //! <pre>
+    //! </pre>
+    //! <div class="test">
+    //!   <div id="second-div">text in the second div
+    //!     <div class="third-div">text in the third div
+    //!       <p> text in the paragraph
+    //!           <span id="itemtotest">text in span</span>
+    //!       </p>
+    //!     </div>
+    //!   </div>
+    //! </div>
+    //! </body>
+    //! </html>
+}
+
+test("Cascade with sorting of specificity")
+{
+	// JSON:
+	//"[[1,\"span\"],"
+	// "["
+	//  "[[3,3,8,1,652,\".test #second-div p span\"],[13],[\"red\"],[0],[1]],"
+	//  "[[3,3,9,1,652,\".test #second-div div span\"],[13],[\"red\"],[0],[0]],"
+	//  "[[3,3,7,1,651,\".test #second-div span\"],[13],[\"red\"],[0],[0]],"
+	//  "[[3,3,11,1,627,\"#second-div p span\"],[13],[\"red\"],[0],[0]],"
+	//  "[[3,3,12,1,627,\"#second-div div span\"],[13],[\"red\"],[0],[0]],"
+	//  "[[3,3,10,1,626,\"#second-div span\"],[13],[\"red\"],[0],[0]],"
+	//  "[[3,3,6,1,28,\".test div div span\"],[13],[\"red\"],[0],[0]],"
+	//  "[[3,3,4,1,27,\".test p span\"],[13],[\"red\"],[0],[0]],"
+	//  "[[3,3,5,1,27,\".test div span\"],[13],[\"red\"],[0],[0]],"
+	//  "[[3,3,2,1,26,\".test span\"],[13],[\"red\"],[0],[0]],"
+	//  "[[3,3,14,1,5,\"pre + div div div span\"],[13],[\"red\"],[0],[0]],"
+	//  "[[3,3,13,1,4,\"div div div span\"],[13],[\"red\"],[0],[0]],"
+	//  "[[3,3,18,1,3,\"div div span\"],[13],[\"red\"],[0],[0]],"
+	//  "[[3,3,16,1,2,\"p span\"],[13],[\"red\"],[0],[0]],"
+	//  "[[3,3,17,1,2,\"div span\"],[13],[\"red\"],[0],[0]],"
+	//  "[[3,3,15,1,1,\"span\"],[13],[\"red\"],[0],[0]]"
+	// "]"
+	//"]";
+
+	OtScopeStyleListener l(state.doc);
+	verify(OpStatus::IsSuccess(l.Construct(UNI_L("itemtotest"))));
+
+	verify(VerifyMatch(l, UNI_L("span")));
+
+	//  "[[3,3,8,1,652,\".test #second-div p span\"],[13],[\"red\"],[0],[1]],"
+	verify(VerifyAuthorRule(l, 1, 652, UNI_L(".test #second-div p span")));
+	verify(VerifyProperty(l, CSS_PROPERTY_color, UNI_L("red"), FALSE, ES_ScopeDebugFrontend::DECLARATIONSTATUS_USED));
+
+	//  "[[3,3,9,1,652,\".test #second-div div span\"],[13],[\"red\"],[0],[0]],"
+	verify(VerifyAuthorRule(l, 1, 652, UNI_L(".test #second-div div span")));
+	verify(VerifyProperty(l, CSS_PROPERTY_color, UNI_L("red"), FALSE, ES_ScopeDebugFrontend::DECLARATIONSTATUS_OVERWRITTEN));
+
+	//  "[[3,3,7,1,651,\".test #second-div span\"],[13],[\"red\"],[0],[0]],"
+	verify(VerifyAuthorRule(l, 1, 651, UNI_L(".test #second-div span")));
+	verify(VerifyProperty(l, CSS_PROPERTY_color, UNI_L("red"), FALSE, ES_ScopeDebugFrontend::DECLARATIONSTATUS_OVERWRITTEN));
+
+	//  "[[3,3,11,1,627,\"#second-div p span\"],[13],[\"red\"],[0],[0]],"
+	verify(VerifyAuthorRule(l, 1, 627, UNI_L("#second-div p span")));
+	verify(VerifyProperty(l, CSS_PROPERTY_color, UNI_L("red"), FALSE, ES_ScopeDebugFrontend::DECLARATIONSTATUS_OVERWRITTEN));
+
+	//  "[[3,3,12,1,627,\"#second-div div span\"],[13],[\"red\"],[0],[0]],"
+	verify(VerifyAuthorRule(l, 1, 627, UNI_L("#second-div div span")));
+	verify(VerifyProperty(l, CSS_PROPERTY_color, UNI_L("red"), FALSE, ES_ScopeDebugFrontend::DECLARATIONSTATUS_OVERWRITTEN));
+
+	//  "[[3,3,10,1,626,\"#second-div span\"],[13],[\"red\"],[0],[0]],"
+	verify(VerifyAuthorRule(l, 1, 626, UNI_L("#second-div span")));
+	verify(VerifyProperty(l, CSS_PROPERTY_color, UNI_L("red"), FALSE, ES_ScopeDebugFrontend::DECLARATIONSTATUS_OVERWRITTEN));
+
+	//  "[[3,3,6,1,28,\".test div div span\"],[13],[\"red\"],[0],[0]],"
+	verify(VerifyAuthorRule(l, 1, 28, UNI_L(".test div div span")));
+	verify(VerifyProperty(l, CSS_PROPERTY_color, UNI_L("red"), FALSE, ES_ScopeDebugFrontend::DECLARATIONSTATUS_OVERWRITTEN));
+
+	//  "[[3,3,4,1,27,\".test p span\"],[13],[\"red\"],[0],[0]],"
+	verify(VerifyAuthorRule(l, 1, 27, UNI_L(".test p span")));
+	verify(VerifyProperty(l, CSS_PROPERTY_color, UNI_L("red"), FALSE, ES_ScopeDebugFrontend::DECLARATIONSTATUS_OVERWRITTEN));
+
+	//  "[[3,3,5,1,27,\".test div span\"],[13],[\"red\"],[0],[0]],"
+	verify(VerifyAuthorRule(l, 1, 27, UNI_L(".test div span")));
+	verify(VerifyProperty(l, CSS_PROPERTY_color, UNI_L("red"), FALSE, ES_ScopeDebugFrontend::DECLARATIONSTATUS_OVERWRITTEN));
+
+	//  "[[3,3,2,1,26,\".test span\"],[13],[\"red\"],[0],[0]],"
+	verify(VerifyAuthorRule(l, 1, 26, UNI_L(".test span")));
+	verify(VerifyProperty(l, CSS_PROPERTY_color, UNI_L("red"), FALSE, ES_ScopeDebugFrontend::DECLARATIONSTATUS_OVERWRITTEN));
+
+	//  "[[3,3,14,1,5,\"pre + div div div span\"],[13],[\"red\"],[0],[0]],"
+	verify(VerifyAuthorRule(l, 1, 5, UNI_L("pre + div div div span")));
+	verify(VerifyProperty(l, CSS_PROPERTY_color, UNI_L("red"), FALSE, ES_ScopeDebugFrontend::DECLARATIONSTATUS_OVERWRITTEN));
+
+	//  "[[3,3,13,1,4,\"div div div span\"],[13],[\"red\"],[0],[0]],"
+	verify(VerifyAuthorRule(l, 1, 4, UNI_L("div div div span")));
+	verify(VerifyProperty(l, CSS_PROPERTY_color, UNI_L("red"), FALSE, ES_ScopeDebugFrontend::DECLARATIONSTATUS_OVERWRITTEN));
+
+	//  "[[3,3,18,1,3,\"div div span\"],[13],[\"red\"],[0],[0]],"
+	verify(VerifyAuthorRule(l, 1, 3, UNI_L("div div span")));
+	verify(VerifyProperty(l, CSS_PROPERTY_color, UNI_L("red"), FALSE, ES_ScopeDebugFrontend::DECLARATIONSTATUS_OVERWRITTEN));
+
+	//  "[[3,3,16,1,2,\"p span\"],[13],[\"red\"],[0],[0]],"
+	verify(VerifyAuthorRule(l, 1, 2, UNI_L("p span")));
+	verify(VerifyProperty(l, CSS_PROPERTY_color, UNI_L("red"), FALSE, ES_ScopeDebugFrontend::DECLARATIONSTATUS_OVERWRITTEN));
+
+	//  "[[3,3,17,1,2,\"div span\"],[13],[\"red\"],[0],[0]],"
+	verify(VerifyAuthorRule(l, 1, 2, UNI_L("div span")));
+	verify(VerifyProperty(l, CSS_PROPERTY_color, UNI_L("red"), FALSE, ES_ScopeDebugFrontend::DECLARATIONSTATUS_OVERWRITTEN));
+
+	//  "[[3,3,15,1,1,\"span\"],[13],[\"red\"],[0],[0]]"
+	verify(VerifyAuthorRule(l, 1, 1, UNI_L("span")));
+	verify(VerifyProperty(l, CSS_PROPERTY_color, UNI_L("red"), FALSE, ES_ScopeDebugFrontend::DECLARATIONSTATUS_OVERWRITTEN));
+
+	verify(VerifyNoMoreMatches(l));
+}
+
+html
+{
+    //! <!doctype html>
+    //! <title> </title>
+    //! <style>
+    //! h1 { box-decoration-break: clone; }
+    //! </style>
+    //! <h1 id="itemtotest">Test</h1>
+}
+
+test("Property box-decoration-break")
+{
+	OtScopeStyleListener l(state.doc);
+	verify(OpStatus::IsSuccess(l.Construct(UNI_L("itemtotest"))));
+
+	verify(VerifyMatch(l, UNI_L("h1")));
+	verify(VerifyAuthorRule(l, 1, 1, UNI_L("h1")));
+	verify(VerifyProperty(l, CSS_PROPERTY_box_decoration_break, UNI_L("clone"), FALSE, ES_ScopeDebugFrontend::DECLARATIONSTATUS_USED));
+	verify(VerifyUserAgentRule(l));
+
+	verify(VerifyNoMoreMatches(l));
+}
+
+html
+{
+	//! <!doctype html>
+	//! <style>
+	//!  div {
+	//!   color: green;
+	//!   z-index: 3;
+	//!   margin-left: 200px !important;
+	//!  }
+	//! </style>
+	//! <div id="fullscreen">Fullscreen</div>
+}
+
+test("Fullscreen styles") require DOM_FULLSCREEN_MODE;
+{
+	FramesDocument *doc = state.doc;
+	verify(doc);
+
+	doc->SetFullscreenElement(find_element("div"));
+	verify(OpStatus::IsSuccess(doc->Reflow(FALSE)));
+
+	OtScopeStyleListener l(state.doc);
+	verify(OpStatus::IsSuccess(l.Construct(UNI_L("fullscreen"))));
+
+	OpScopeNodeMatch *match = l.GetNextMatch();
+	verify(match);
+
+	const OpScopeNodeMatch::Rule *rule = l.GetNextRule();
+	verify(rule);
+	verify(rule->Origin() == ES_ScopeDebugFrontend::RULEORIGIN_AUTHOR);
+
+	OpScopeNodeMatch::Property *prop = rule->FirstProperty();
+	verify(prop);
+	verify(prop->IsImportant() == FALSE);
+	verify(prop->Status() == ES_ScopeDebugFrontend::DECLARATIONSTATUS_USED);
+	verify(prop->IsFullscreen() == FALSE);
+
+	prop = prop->Suc();
+	verify(prop);
+	verify(prop->IsImportant() == FALSE);
+	verify(prop->Status() == ES_ScopeDebugFrontend::DECLARATIONSTATUS_OVERWRITTEN);
+	verify(prop->IsFullscreen() == FALSE);
+
+	prop = prop->Suc();
+	verify(prop);
+	verify(prop->IsImportant() == TRUE);
+	verify(prop->Status() == ES_ScopeDebugFrontend::DECLARATIONSTATUS_USED);
+	verify(prop->IsFullscreen() == FALSE);
+	verify(prop->Suc() == NULL);
+
+	rule = l.GetNextRule();
+	verify(rule);
+	verify(rule->Origin() == ES_ScopeDebugFrontend::RULEORIGIN_USER_AGENT);
+
+	verify(VerifyProperty(l, CSS_PROPERTY_color, UNI_L("rgb(255, 255, 255)"), FALSE, ES_ScopeDebugFrontend::DECLARATIONSTATUS_OVERWRITTEN));
+	verify(VerifyProperty(l, CSS_PROPERTY_z_index, UNI_L("2147483647"), FALSE, ES_ScopeDebugFrontend::DECLARATIONSTATUS_USED));
+	verify(VerifyProperty(l, CSS_PROPERTY_margin_left, UNI_L("0px"), FALSE, ES_ScopeDebugFrontend::DECLARATIONSTATUS_OVERWRITTEN));
+}

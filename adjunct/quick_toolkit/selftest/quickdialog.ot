@@ -1,0 +1,162 @@
+/* -*- Mode: c++; tab-width: 4; indent-tabs-mode: t; c-basic-offset: 4 -*-
+ *
+ * Copyright (C) 1995-2009 Opera Software AS.  All rights reserved.
+ *
+ * This file is part of the Opera web browser.	It may not be distributed
+ * under any circumstances.
+ *
+ * @author Arjan van Leeuwen (arjanl)
+ */
+
+group "quick_toolkit.quickdialog";
+require init;
+
+include "adjunct/quick_toolkit/widgets/QuickDialog.h";
+include "adjunct/quick_toolkit/widgets/QuickWidget.h";
+include "adjunct/desktop_util/selftest_utils/ST_Timer.h";
+include "modules/widgets/OpWidget.h";
+
+global
+{
+	#define VERIFY_SUCCESS(x) do { if (OpStatus::IsError(x)) ST_failed(#x); } while(0)
+
+	class PassOnPaintOpWidget : public OpWidget
+	{
+	public:
+		virtual void OnPaint(OpWidgetPainter* widget_painter, const OpRect &paint_rect) { ST_passed(); }
+	};
+
+	class ParentWindowHelper : public OpWidget
+	{
+	public:
+		virtual void OnPaint(OpWidgetPainter* widget_painter, const OpRect &paint_rect)
+		{
+			if (GetParentOpWindow() && GetParentOpWindow()->GetParentWindow() == m_parent)
+				ST_passed();
+		}
+		OpWindow* m_parent;
+	};
+
+	template<class T>
+	class OpWidgetWrapper : public QuickWidget
+	{
+	public:
+		static const unsigned MIN_SIZE = 50;
+
+		OpWidgetWrapper() : m_op_widget(OP_NEW(T, ())) {}
+		virtual unsigned GetDefaultMinimumWidth() { return MIN_SIZE; }
+		virtual unsigned GetDefaultMinimumHeight(unsigned width) { return MIN_SIZE; }
+		virtual unsigned GetDefaultNominalWidth() { return MIN_SIZE; }
+		virtual unsigned GetDefaultNominalHeight(unsigned width) { return MIN_SIZE; }
+		virtual unsigned GetDefaultPreferredWidth() { return MIN_SIZE; }
+		virtual unsigned GetDefaultPreferredHeight(unsigned width) { return MIN_SIZE; }
+		virtual void GetDefaultMargins(WidgetSizes::Margins& margins) {}
+		virtual void SetParentOpWidget(class OpWidget* parent) { parent->AddChild(m_op_widget); }
+		virtual BOOL HeightDependsOnWidth() { return FALSE; }
+		virtual OP_STATUS Layout(const OpRect& rect) { m_op_widget->SetRect(rect); return OpStatus::OK; }
+		virtual void Show() {}
+		virtual void Hide() {}
+		virtual BOOL IsVisible() { return FALSE; }
+		virtual void SetEnabled(BOOL enabled) { }
+		virtual TypeId GetType() const { return GetTypeId(this); }
+
+	protected:
+		T* m_op_widget;
+	};
+
+	class PassOnCorrectSizeWidget : public OpWidgetWrapper<OpWidget>
+	{
+	public:
+		PassOnCorrectSizeWidget() : m_done(FALSE) {}
+	
+		virtual OP_STATUS Layout(const OpRect& rect)
+		{
+			if (!m_done)
+			{
+				if (rect.width != (int)GetMinimumWidth())
+					ST_failed("initial width should be minimum width of main widget");
+				else if (rect.height != (int)GetMinimumHeight())
+					ST_failed("initial height should be minimum height of main widget");
+				else
+					ST_passed();
+	
+				m_done = TRUE;
+			}
+
+			return OpStatus::OK;
+		}
+
+	private:
+		BOOL m_done;
+	};
+
+	class PassOnCorrectParentWidget : public OpWidgetWrapper<ParentWindowHelper>
+	{
+	public:
+		PassOnCorrectParentWidget(OpWindow* parent) { m_op_widget->m_parent = parent; }
+	};
+
+	void Teardown()
+	{
+		failtimer.Stop();
+		dialog.reset();
+		window.reset();
+	}
+
+
+	ST_Timer failtimer;
+	OpAutoPtr<QuickDialog> dialog;
+	OpAutoPtr<OpWindow> window;
+}
+
+exit
+{
+	Teardown();
+}
+
+test("show a dialog") async; disabled;
+{
+	Teardown();
+
+	dialog = OP_NEW(QuickDialog, ());
+	VERIFY_SUCCESS(dialog->Init());
+
+	dialog->SetContent(OP_NEW(OpWidgetWrapper<PassOnPaintOpWidget>, ()));
+
+	dialog->Show();
+	failtimer.FailAfter(5000);
+}
+
+
+test("set a dialog parent") async; disabled;
+{
+	Teardown();
+
+	OpWindow* window_ptr;
+	VERIFY_SUCCESS(OpWindow::Create(&window_ptr));
+	window = window_ptr;
+	VERIFY_SUCCESS(window->Init(OpWindow::STYLE_DESKTOP, OpTypedObject::WINDOW_TYPE_BROWSER));
+
+	dialog = OP_NEW(QuickDialog, ());
+	VERIFY_SUCCESS(dialog->Init());
+	dialog->SetParentWindow(window.get());
+
+	dialog->SetContent(OP_NEW(PassOnCorrectParentWidget, (window.get())));
+
+	VERIFY_SUCCESS(dialog->Show());
+	failtimer.FailAfter(5000);
+}
+
+
+test("initial size") async; disabled;
+{
+	Teardown();
+
+	dialog = OP_NEW(QuickDialog, ());
+	VERIFY_SUCCESS(dialog->Init());
+
+	dialog->SetContent(OP_NEW(PassOnCorrectSizeWidget, ()));
+
+	dialog->Show();
+	failtimer.FailAfter(5000);
+}

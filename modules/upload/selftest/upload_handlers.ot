@@ -1,0 +1,312 @@
+/* -*- Mode: c++; tab-width: 4; c-basic-offset: 4 -*- 
+ *
+ * Copyright (C) 2009-2011 Opera Software ASA.  All rights reserved.
+ *
+ * This file is part of the Opera web browser.
+ * It may not be distributed under any circumstances.
+ *
+ * Roar Lauritzsen
+ */
+group "upload handlers";
+
+require init;
+
+include "modules/upload/upload.h";
+
+global
+{
+	class Test_Upload_Base : public Upload_Base
+	{
+	public:
+		virtual uint32 GetNextContentBlock(unsigned char *buf, uint32 max_len, BOOL &more) { more=FALSE; return 0; }
+		virtual OpFileLength PayloadLength() { return 0; }
+		virtual void ResetContent() {}
+	};
+
+	class Test_Upload_Handler : public Upload_Handler
+	{
+	public:
+		const char* content;
+		virtual uint32 GetNextContentBlock(unsigned char *buf, uint32 max_len, BOOL &more) {
+			more=FALSE;
+			uint32 content_len = (uint32)op_strlen(content);
+			if (content_len > max_len) // Just in case...
+				return 0;
+			op_memcpy(buf, content, content_len);
+			return content_len;
+		}
+		virtual OpFileLength PayloadLength() { return (OpFileLength)op_strlen(content); }
+#ifdef UPLOAD_PAYLOAD_ACTION_SUPPORT
+		OpString8 processedPayload;
+		void ProcessPayloadActionL() { Upload_Handler::ProcessPayloadActionL(); }
+		virtual void PerformPayloadActionL(unsigned char *src, uint32 src_len) {
+			processedPayload.AppendL((char*)src, src_len);
+			Upload_Handler::PerformPayloadActionL(src, src_len);
+		}
+#endif
+	};
+}
+
+subtest verify_output(Upload_Base* handler, Upload_Transfer_Mode transfer_restriction, const char* expected)
+{
+	unsigned char output[500]; /* ARRAY OK roarl 2012-01-17 */
+	unsigned char *p, *p2;
+	uint32 remaining_len = 500;
+	size_t expected_len = op_strlen(expected);
+	const char* header_end = op_strstr(expected, "\r\n\r\n");
+	size_t header_len = header_end ? header_end - expected + 4 : 0;
+	BOOL done, done2;
+	uint32 len = 0;
+
+	verify_trap(len = handler->PrepareUploadL(transfer_restriction));
+	verify(len < 500);
+	if (header_len)
+		verify(len == header_len+1);
+	len = (uint32)handler->CalculateLength();
+	verify(len < 500);
+	verify(len == op_strlen(expected));
+	verify_trap(handler->ResetL());
+	p = handler->OutputContent(output, remaining_len, done);
+	verify(p == output+expected_len);
+	verify(remaining_len == 500-expected_len);
+	verify(done);
+	// Do it again to make sure we don't get more after we're done
+	p = handler->OutputContent(p, remaining_len, done);
+	verify(p == output+expected_len);
+	verify(remaining_len == 500-expected_len);
+	verify(done);
+	verify(op_strncmp((char*)output, (const char*)expected, expected_len) == 0);
+
+	// Make sure we can split the output at any buffer size
+	for (size_t i=0; i<expected_len+1; i++)
+	{
+		verify_trap(handler->ResetL());
+		remaining_len = (uint32)(expected_len - i);
+		p = handler->OutputContent(output, remaining_len, done);
+		remaining_len = (uint32)(500 - (expected_len - i - remaining_len));
+		p2 = handler->OutputContent(p, remaining_len, done2);
+		verify(p2 == output+expected_len);
+		verify(remaining_len == 500-expected_len);
+		if (p == p2)
+			verify(done); // If nothing is output the second time, we should have been done the first time
+		verify(done2);
+		verify(op_strncmp((char*)output, (const char*)expected, expected_len) == 0);
+	}
+}
+
+test("Upload_Base")
+{
+	Test_Upload_Base handler;
+	Boundary_List boundaries;
+	unsigned char output[200]; /* ARRAY OK roarl 2009-03-06 */
+	unsigned char* p;
+	const char* str;
+	const char *header_names[3];
+	uint32 remaining_len;
+	OP_MEMORY_VAR uint32 len;
+	BOOL done;
+
+	header_names[0] = "first";
+	header_names[1] = "second";
+	header_names[2] = NULL;
+
+	verify_trap(handler.InitL(header_names));
+	verify_trap(handler.AccessHeaders().AddParameterL("second", "ok"));
+	str = "second: ok\r\n\r\n";
+	verify(handler.CalculateHeaderLength() == op_strlen(str));
+
+	verify_output(&handler, UPLOAD_BINARY_NO_CONVERSION, str);
+
+	verify_trap(len = handler.PrepareUploadL(UPLOAD_BINARY_NO_CONVERSION));
+	verify(len == op_strlen(str)+1);
+	remaining_len = 200;
+	verify_trap(handler.ResetL());
+	len = handler.GetOutputData(output, remaining_len, done);
+	verify(len == op_strlen(str));
+	verify(done);
+	// Do it again to make sure we don't get more after we're done
+	len = handler.GetOutputData(output+len, remaining_len-len, done);
+	verify(len == 0);
+	verify(done);
+	verify(op_strncmp((char*)output, (const char*)str, op_strlen(str)) == 0);
+
+	remaining_len = 200;
+	verify_trap(handler.ResetL());
+	p = handler.OutputHeaders(output, remaining_len, done);
+	verify(p == output+op_strlen(str));
+	verify(remaining_len == 200-op_strlen(str));
+	verify(done);
+	// Do it again to make sure we don't get more after we're done
+	p = handler.OutputHeaders(p, remaining_len, done);
+	verify(p == output+op_strlen(str));
+	verify(remaining_len == 200-op_strlen(str));
+	verify(done);
+	verify(op_strncmp((char*)output, (const char*)str, op_strlen(str)) == 0);
+
+	remaining_len = 200;
+	verify_trap(handler.ResetL());
+
+	verify_trap(handler.SetContentTypeL("text/plain; charset=utf-8"));
+	verify_string(handler.GetContentType(), "text/plain");
+	verify_trap(handler.SetContentTypeL("text/html"));
+	verify_string(handler.GetContentType(), "text/plain");
+	verify_trap(handler.SetCharsetL("us-ascii"));
+	verify_string(handler.GetCharset(), "us-ascii");
+	verify_trap(handler.SetCharsetL(""));
+	verify(handler.GetCharset().IsEmpty());
+	verify_trap(handler.SetContentDispositionL("inline"));
+	verify_trap(handler.SetContentDispositionParameterL("attachment"));
+	verify_trap(handler.SetContentDispositionParameterL("filename", "test.txt", TRUE));
+	// ExtractHeadersL modifies the input string!
+	char* s = op_strdup("Content-Id: <1234>\r\n\r\nHello world");
+	verify_trap(len = handler.ExtractHeadersL((const unsigned char*)s, (uint32)op_strlen(s)));
+	verify(len == op_strlen(s)-STRINGLENGTH("Hello world"));
+	op_free(s);
+
+	str = "second: ok\r\n"
+		  "Content-Type: text/plain; charset=utf-8; charset=us-ascii\r\n"
+		  "Content-Disposition: inline; attachment; filename=\"test.txt\"\r\n"
+		  "Content-Id: <1234>\r\n"
+		  "MIME-Version: 1.0\r\n"
+		  "\r\n";
+	verify_output(&handler, UPLOAD_BINARY_TRANSFER, str);
+
+	verify(handler.GetOnlyOutputBody() == FALSE);
+	handler.SetOnlyOutputBody(TRUE);
+	verify(handler.GetOnlyOutputBody() == TRUE);
+	verify_output(&handler, UPLOAD_BINARY_TRANSFER, "");
+
+	verify(handler.FileCount() == 0);
+	verify(handler.UploadedFileCount() == 0);
+#ifdef UPLOAD_NEED_MULTIPART_FLAG
+	verify(handler.IsMultiPart() == FALSE);
+#endif
+	handler.Release();
+}
+
+test("Upload_Handler")
+{
+	Test_Upload_Handler handler;
+	const char* str;
+
+	verify_trap(handler.InitL(ENCODING_AUTODETECT));
+	verify_trap(handler.SetContentTypeL("text/plain"));
+	verify_trap(handler.SetCharsetL("iso-8859-1"));
+	handler.content = "Hello world, \xC6";
+#ifdef UPLOAD_PAYLOAD_ACTION_SUPPORT
+	verify_trap(handler.ProcessPayloadActionL());
+	verify_string(handler.processedPayload, "Hello world, \xC6");
+#endif
+
+	str = "Content-Type: text/plain; charset=iso-8859-1\r\n"
+		  "MIME-Version: 1.0\r\n"
+		  "Content-Transfer-Encoding: Quoted-Printable\r\n"
+		  "\r\n"
+		  "Hello world, =C6";
+	verify_output(&handler, UPLOAD_7BIT_TRANSFER, str);
+
+	handler.Release();
+}
+
+test("Upload_BinaryBuffer")
+{
+	Upload_BinaryBuffer handler;
+	const char* str;
+
+	str = "Hello world, \xC6";
+	verify_trap(handler.InitL((unsigned char*)str, (uint32)op_strlen(str), UPLOAD_REFERENCE_BUFFER, "text/plain", "iso-8859-1"));
+
+	str = "Content-Type: text/plain; charset=iso-8859-1\r\n"
+		  "MIME-Version: 1.0\r\n"
+		  "Content-Transfer-Encoding: Quoted-Printable\r\n"
+		  "\r\n"
+		  "Hello world, =C6";
+	verify_output(&handler, UPLOAD_7BIT_TRANSFER, str);
+
+	handler.Release();
+}
+
+test("Upload_OpString8")
+{
+	Upload_OpString8 handler;
+	const char* str;
+
+	verify_trap(handler.InitL("Hello world, \xC6", "text/plain", "iso-8859-1"));
+
+	str = "Content-Type: text/plain; charset=iso-8859-1\r\n"
+		  "MIME-Version: 1.0\r\n"
+		  "Content-Transfer-Encoding: Quoted-Printable\r\n"
+		  "\r\n"
+		  "Hello world, =C6";
+	verify_output(&handler, UPLOAD_7BIT_TRANSFER, str);
+
+	handler.Release();
+}
+
+test("Upload_Multipart")
+{
+	Upload_Multipart handler0;
+	Upload_Multipart handler;
+	Upload_OpString8 part1;
+	Upload_OpString8 part2;
+	const char* str;
+
+	// Also try multipart with zero parts
+	g_selftest.seed_deterministic_rand(0);
+	verify_trap(handler0.InitL());
+	str = "Content-Type: multipart/mixed; boundary=----------HYzwJ2R4LCjG5YzOVgzYLk\r\n"
+		  "MIME-Version: 1.0\r\n"
+		  "\r\n"
+		  "------------HYzwJ2R4LCjG5YzOVgzYLk--\r\n";
+	verify_output(&handler0, UPLOAD_7BIT_TRANSFER, str);
+
+	g_selftest.seed_deterministic_rand(0);
+
+	verify_trap(handler.InitL());
+	verify_trap(part1.InitL("Part1", "text/plain", "utf-8"));
+	verify_trap(part2.InitL("Part2", "text/plain", "utf-8"));
+	handler.AddElement(&part1);
+	handler.AddElement(&part2);
+
+	str = "Content-Type: multipart/mixed; boundary=----------HYzwJ2R4LCjG5YzOVgzYLk\r\n"
+		  "MIME-Version: 1.0\r\n"
+		  "\r\n"
+		  "------------HYzwJ2R4LCjG5YzOVgzYLk\r\n"
+		  "Content-Type: text/plain; charset=utf-8\r\n"
+		  "Content-Transfer-Encoding: 7bit\r\n"
+		  "\r\n"
+		  "Part1\r\n"
+		  "------------HYzwJ2R4LCjG5YzOVgzYLk\r\n"
+		  "Content-Type: text/plain; charset=utf-8\r\n"
+		  "Content-Transfer-Encoding: 7bit\r\n"
+		  "\r\n"
+		  "Part2\r\n"
+		  "------------HYzwJ2R4LCjG5YzOVgzYLk--\r\n";
+	verify_output(&handler, UPLOAD_7BIT_TRANSFER, str);
+
+	handler.Release();
+}
+
+/* TODO: Complete tests below
+test("Upload_URL")
+{
+	Upload_URL handler;
+}
+
+test("Upload_TemporaryURL")
+{
+	Upload_TemporaryURL handler;
+}
+
+test("Upload_EncapsulatedElement")
+	require UPLOAD2_ENCAPSULATED_SUPPORT;
+{
+	Upload_EncapsulatedElement handler;
+}
+
+test("Upload_External_Body")
+	require UPLOAD_EXTERNAL_BODY_SUPPORT;
+{
+	Upload_External_Body handler;
+}
+*/

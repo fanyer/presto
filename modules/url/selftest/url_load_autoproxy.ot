@@ -1,0 +1,168 @@
+/* -*- Mode: c++; tab-width: 4; indent-tabs-mode: t; c-basic-offset: 4 -*-
+**
+** Copyright (C) 2004-2006 Opera Software ASA.  All rights reserved.
+**
+** This file is part of the Opera web browser.  It may not be distributed
+** under any circumstances.
+**
+** Yngve N. Pettersen
+*/
+
+group "url autoproxy loading";
+
+require init;
+language c++;
+
+include "core/pch.h";
+
+require SUPPORT_AUTO_PROXY_CONFIGURATION;
+require PREFS_WRITE;
+
+include "modules/url/url_man.h";
+include "modules/network_selftest/urldoctestman.h";
+include "modules/prefs/prefsmanager/collections/pc_files.h";
+include "modules/prefs/prefsmanager/collections/pc_network.h";
+include "modules/network_selftest/proxy_replace.h";
+
+global {
+
+	URL_DocSelfTest_Manager *url_tests = NULL;
+	
+	Selftest_ProxyOveride proxy_setting;
+}
+
+table filename_list (const char *) filelist "testfiles/simple";
+
+setup 
+{
+	url_tests = OP_NEW(URL_DocSelfTest_Manager, ());
+	
+	proxy_setting.SetAutoProxy( URLSelftestBase("testproxy.pac"), TRUE);
+}
+
+exit
+{
+	OP_DELETE(url_tests);
+	url_tests = NULL;
+	
+	proxy_setting.ShutDown();
+	
+	// Do a shutdown of the pending connections
+	urlManager->FreeUnusedResources(TRUE);
+}
+
+test("Initialized")
+{
+	verify(url_tests != NULL);
+	verify(proxy_setting.Active());
+}
+
+subtest CheckProxy()
+{
+	verify(proxy_setting.Active());
+}
+
+subtest AddVerySimpleTest(URL_DocSelfTest_Batch *batch, const OpStringC8 &baseurl_format, URL &ref_url, const OpStringC8 &filename)
+{
+	verify(batch != NULL);
+	verify(filename.HasContent());
+
+	OpAutoPtr<URL_DocVerySimpleTest> test(OP_NEW(URL_DocVerySimpleTest, ()));
+	verify(test.get() != NULL);
+
+	verify(OpStatus::IsSuccess(test->Construct(baseurl_format, ref_url, filename)));
+
+	verify(batch->AddTestCase(test.release()));
+}
+
+subtest AddBatch(URL_DocSelfTest_Batch *batch)
+{
+	verify(batch != NULL);
+	verify(url_tests->AddBatch(batch));
+}
+
+subtest StartTestSet()
+{
+	verify(url_tests->SetLastBatch());
+}
+
+subtest Setup_SingleTests(const OpStringC8 &batch_id, const OpStringC8 &baseurl_format, URL &ref_url)
+{
+	verify(CheckProxy());
+	iterate (filename) from filename_list
+	{
+		OpAutoPtr<URL_DocSelfTest_Batch> batch(OP_NEW(URL_DocSelfTest_Batch, ()));
+
+		verify(batch.get() != NULL);
+		
+		batch->SetBatchID(batch_id);
+
+		verify(AddVerySimpleTest(batch.get(), baseurl_format, ref_url, filename));
+
+		verify(!batch->Empty());
+
+		verify(AddBatch(batch.release()));
+	}
+}
+
+subtest Setup_MultipleTests(const OpStringC8 &batch_id, const OpStringC8 &baseurl_format, URL &ref_url, int limit)
+{
+	verify(CheckProxy());
+	OpAutoPtr<URL_DocSelfTest_Batch> batch(NULL);
+
+	iterate (filename) from filename_list
+	{
+		if(batch.get() == NULL)
+			batch.reset(OP_NEW(URL_DocSelfTest_Batch, ()));
+
+		verify(batch.get() != NULL);
+
+		batch->SetBatchID(batch_id);
+
+		verify(AddVerySimpleTest(batch.get(), baseurl_format, ref_url, filename));
+
+
+		if(limit && batch->Cardinal() >= limit)
+			verify(AddBatch(batch.release()));
+	}
+	if(batch.get() != NULL)
+	{
+		verify(!batch->Empty());
+		verify(AddBatch(batch.release()));
+	}
+}
+
+test("URL_LoadingTests") async;
+{
+	URL empty_ref;
+
+	if (!Setup_SingleTests("[Simple_1]", URLSelftestBase("simple/%s"), empty_ref)
+		|| !Setup_MultipleTests("[Simple_2]", URLSelftestBase("simple/%s"), empty_ref, 1)
+		|| !Setup_MultipleTests("[Simple_3]", URLSelftestBase("simple/%s"), empty_ref, 1)
+		|| !Setup_MultipleTests("[Simple_4]", URLSelftestBase("simple/%s"), empty_ref, 2)
+		|| !Setup_MultipleTests("[Simple_5]", URLSelftestBase("simple/%s"), empty_ref, 4)
+		|| !Setup_MultipleTests("[Simple_6]", URLSelftestBase("simple/%s"), empty_ref, 8)
+		|| !Setup_MultipleTests("[Simple_7]", URLSelftestBase("simple/%s"), empty_ref, 0)
+		|| !Setup_SingleTests("[Zipped_1]",URLSelftestBase("zipped/%s"), empty_ref)
+		|| !Setup_MultipleTests("[Zipped_2]",URLSelftestBase("zipped/%s"), empty_ref, 1)
+		|| !Setup_MultipleTests("[Zipped_3]",URLSelftestBase("zipped/%s"), empty_ref, 1)
+		|| !Setup_MultipleTests("[Zipped_4]",URLSelftestBase("zipped/%s"), empty_ref, 2)
+		|| !Setup_MultipleTests("[Zipped_5]",URLSelftestBase("zipped/%s"), empty_ref, 4)
+		|| !Setup_MultipleTests("[Zipped_6]",URLSelftestBase("zipped/%s"), empty_ref, 8)
+		|| !Setup_MultipleTests("[Zipped_7]",URLSelftestBase("zipped/%s"), empty_ref, 0)
+		|| !StartTestSet())
+		ST_failed("Could not start test");
+}
+
+test("URLFTP LoadingTests") async;
+  require undefined NO_FTP_SUPPORT;
+{
+	URL empty_ref;
+
+	if (!Setup_SingleTests("[Simple_8]", FTP_URLSelftestBase("simple/%s"), empty_ref)
+		|| !Setup_MultipleTests("[Simple_9]",FTP_URLSelftestBase("simple/%s"), empty_ref, 1)
+		|| !Setup_MultipleTests("[Simple_10]",FTP_URLSelftestBase("simple/%s"), empty_ref, 1)
+		|| !Setup_MultipleTests("[Simple_11]",FTP_URLSelftestBase("simple/%s"), empty_ref, 2)
+		|| !StartTestSet())
+		ST_failed("Could not start test");
+}

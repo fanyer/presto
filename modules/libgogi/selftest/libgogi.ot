@@ -1,0 +1,343 @@
+/* -*- Mode: c++; tab-width: 4; indent-tabs-mode: t; c-basic-offset: 4 -*- */
+group "libgogi";
+
+require GOGI;
+require undefined VEGA_OPPAINTER_SUPPORT;
+
+include "modules/libgogi/mde.h";
+include "modules/libgogi/pi_impl/mde_widget.h";
+include "modules/img/image.h";
+include "modules/img/decoderfactorypng.h";
+include "platforms/gogi/include/gogi_opera_api.h";
+include "platforms/gogi/src/pi_impl/gogi_opwindow.h";
+include "modules/windowcommander/OpWindowCommander.h";
+include "modules/windowcommander/src/WindowCommander.h";
+include "platforms/gogi/src/gogi_screen.h";
+
+global
+{
+	#define SCREEN_WIDTH 533
+	#define SCREEN_HEIGHT 533
+	#define GENERATE_NEW FALSE
+	#define COMPARE_LINE_COUNT 346 ///< Number of lines that is compared for all formats and BGRA32 format. Lines below, may differ.
+	OpString8 ref_path;
+
+	// Hack to get around selftest parsing bug:
+	OP_STATUS VerifyPng(const char* refFile, unsigned int width, unsigned int height, unsigned int stride, UINT32* pixels, unsigned int linesToTest, unsigned int maxComponentDiff = 1, unsigned int maxPSNR = 0, BOOL regenerate = FALSE)
+	{
+		OpString8 reffilename;
+		reffilename.Set(ref_path);
+		reffilename.Append(refFile);
+		return DecoderFactoryPng::verify(reffilename.CStr(), width, height, stride, pixels, linesToTest, maxComponentDiff, maxPSNR, regenerate);
+	}
+
+	MDE_BUFFER *buf_gradient[3];
+	MDE_BUFFER *buf_8bit;
+}
+
+// Quick ugly hack to get around that current directory is undefined. I wish selftest could do this for us.
+
+table dummy_files(char *) filelist "" name "*.ot";
+
+foreach (FILE) from dummy_files
+{
+	test("getpath_dummy") language C++;
+	{
+		ref_path.Set(FILE);
+		char *buf = ref_path.CStr();
+		for(int i = ref_path.Length() - 1; i > 0; i--)
+			if (buf[i] == '/' || buf[i] == '\\')
+			{
+				buf[i + 1] = 0;
+				break;
+			}
+	}
+}
+
+table SourceFormats(MDE_FORMAT)
+{
+	{ MDE_FORMAT_BGRA32 }
+	{ MDE_FORMAT_BGR24 }
+	{ MDE_FORMAT_RGBA16 }
+	{ MDE_FORMAT_RGB16 }
+	{ MDE_FORMAT_MBGR16 }
+	{ MDE_FORMAT_ARGB32 }
+	{ MDE_FORMAT_RGBA32 }
+	{ MDE_FORMAT_SRGB16 }
+	{ MDE_FORMAT_RGBA24 }
+}
+
+table DestinationFormats(MDE_FORMAT, char *)
+{
+	{ MDE_FORMAT_BGRA32, "dst_BGRA32.png" }
+	{ MDE_FORMAT_BGR24, "dst_BGR24.png" }
+	{ MDE_FORMAT_RGBA16, "dst_RGBA16.png" }
+	{ MDE_FORMAT_RGB16, "dst_RGB16.png" }
+//	{ MDE_FORMAT_MBGR16, "dst_MBGR16.png" }
+//	{ MDE_FORMAT_ARGB32, "dst_ARGB32.png" }
+	{ MDE_FORMAT_RGBA32, "dst_RGBA32.png" }
+	{ MDE_FORMAT_SRGB16, "dst_SRGB16.png" }
+	{ MDE_FORMAT_RGBA24, "dst_RGBA24.png" }
+}
+
+subtest VerifyImage(const char* refimage, MDE_BUFFER *src_buf)
+{
+	MDE_BUFFER *buf_32 = MDE_CreateBuffer(SCREEN_WIDTH, SCREEN_HEIGHT, MDE_FORMAT_BGRA32, 0);
+	verify(buf_32);
+
+	// Set data to random. Will help us find cases when non-alpha formats are blitted to alphaformats and forget to set alpha.
+	int len = SCREEN_WIDTH * SCREEN_HEIGHT * 4;
+	for(int i = 0; i < len; i++)
+		((unsigned char *)buf_32->data)[i] = op_rand()%255;
+
+	MDE_DrawBuffer(src_buf, MDE_MakeRect(0, 0, SCREEN_WIDTH, SCREEN_HEIGHT), 0, 0, buf_32);
+
+	BOOL success1 = OpStatus::IsSuccess(VerifyPng(refimage, SCREEN_WIDTH, SCREEN_HEIGHT, SCREEN_WIDTH * 4,
+													(UINT32 *)buf_32->data, SCREEN_HEIGHT, 1, 0, GENERATE_NEW));
+	BOOL success2 = TRUE;
+
+// doesn't make sense to make this comparison since color spaces may differ
+#if 0
+	if (!GENERATE_NEW || src_buf->format == MDE_FORMAT_BGRA32)
+	{
+		// Compare all tests with the BGRA32 image to see if RGB components are correct.
+		// First remove alpha channel (since some formats we are comparing doesn't have one).
+		for(int i = 0; i < SCREEN_WIDTH * SCREEN_HEIGHT; i++)
+			MDE_COL_A(((UINT32*)buf_32->data)[i]) = 255;
+
+		success2 =  OpStatus::IsSuccess(VerifyPng("dst_BGRA32_no_alpha.png",
+													SCREEN_WIDTH, SCREEN_HEIGHT, SCREEN_WIDTH * 4,
+													(UINT32 *)buf_32->data, COMPARE_LINE_COUNT, 10, 0, GENERATE_NEW));
+	}
+#endif
+
+	if (!success1 || !success2)
+	{
+		OpString8 refimage_failed;
+		refimage_failed.Set(refimage);
+		refimage_failed.Insert(op_strlen(refimage) - 4, "_failed");
+		OpStatus::Ignore(VerifyPng(refimage_failed.CStr(), SCREEN_WIDTH, SCREEN_HEIGHT, SCREEN_WIDTH * 4, (UINT32 *)buf_32->data, SCREEN_HEIGHT, 1, 0, TRUE));
+	}
+
+	verify(success1);
+	verify(success2);
+}
+finally
+{
+	MDE_DeleteBuffer(buf_32);
+}
+
+subtest DrawTests(MDE_BUFFER *dst_buf)
+{
+	int x, i;
+	// Draw background
+	for(x = 0; x < SCREEN_WIDTH; x++)
+	{
+		if (x & 1)
+			MDE_SetColor(MDE_RGBA(32, 32, 32, 255), dst_buf);
+		else
+			MDE_SetColor(MDE_RGBA(72, 72, 72, 255), dst_buf);
+		MDE_DrawLine(x, 0, x, SCREEN_HEIGHT, dst_buf);
+	}
+
+	// Draw R G B color gradient bitmaps
+	for(i = 0; i < 3; i++)
+	{
+		// Copy blit
+		buf_gradient[i]->method = MDE_METHOD_COPY;
+		MDE_DrawBuffer(buf_gradient[i], MDE_MakeRect(10, 10 + i * 20, 512, 10), 0, 0, dst_buf);
+		MDE_DrawBufferStretch(buf_gradient[i], MDE_MakeRect(10, 70 + i * 20, 512, 10), MDE_MakeRect(0, 0, 256, 10), dst_buf);
+
+		// Alpha blit
+		buf_gradient[i]->method = MDE_METHOD_ALPHA;
+		MDE_DrawBuffer(buf_gradient[i], MDE_MakeRect(10, 130 + i * 20, 512, 10), 0, 0, dst_buf);
+		MDE_DrawBufferStretch(buf_gradient[i], MDE_MakeRect(10, 190 + i * 20, 512, 10), MDE_MakeRect(0, 0, 256, 10), dst_buf);
+	}
+
+	// 8 bit blit
+	buf_8bit->method = MDE_METHOD_COPY;
+	MDE_DrawBuffer(buf_8bit, MDE_MakeRect(10, 250, 64, 64), 0, 0, dst_buf);
+	MDE_DrawBufferStretch(buf_8bit, MDE_MakeRect(80, 250, 64, 64), MDE_MakeRect(16, 16, 32, 32), dst_buf);
+
+	// 8 bit blit mask
+	buf_8bit->method = MDE_METHOD_MASK;
+	buf_8bit->mask = 128;
+	MDE_DrawBuffer(buf_8bit, MDE_MakeRect(150, 250, 64, 64), 0, 0, dst_buf);
+	MDE_DrawBufferStretch(buf_8bit, MDE_MakeRect(230, 250, 64, 64), MDE_MakeRect(16, 16, 32, 32), dst_buf);
+
+	// 8 bit blit with color (This is what the fontengines does)
+	buf_8bit->method = MDE_METHOD_COLOR;
+	MDE_SetColor(MDE_RGB(255, 255, 0), buf_8bit);
+	MDE_DrawBuffer(buf_8bit, MDE_MakeRect(310, 250, 32, 32), 16, 16, dst_buf);
+	MDE_SetColor(MDE_RGB(255, 0, 255), buf_8bit);
+	MDE_DrawBuffer(buf_8bit, MDE_MakeRect(350, 250, 32, 32), 16, 16, dst_buf);
+	MDE_SetColor(MDE_RGB(0, 255, 255), buf_8bit);
+	MDE_DrawBuffer(buf_8bit, MDE_MakeRect(390, 250, 32, 32), 16, 16, dst_buf);
+
+	// 8 bit blit mask - The source rectangle needs clipping
+	buf_8bit->method = MDE_METHOD_MASK;
+	buf_8bit->mask = 128;
+	MDE_SetColor(MDE_RGB(255, 255, 255), dst_buf);
+	MDE_DrawRect(MDE_MakeRect(429, 249, 50, 50), dst_buf);
+	MDE_DrawBufferStretch(buf_8bit, MDE_MakeRect(430, 250, 48, 48), MDE_MakeRect(-16, -16, 64 + 32, 64 + 32), dst_buf);
+
+	// Draw functions
+	MDE_RECT r = MDE_MakeRect(10, 330, 10, 10);
+	MDE_SetColor(MDE_RGBA(255, 255, 255, 127), dst_buf);
+	MDE_DrawLine(0, COMPARE_LINE_COUNT-1, SCREEN_WIDTH, COMPARE_LINE_COUNT-1, dst_buf);
+	MDE_SetColor(MDE_RGBA(255, 255, 255, 255), dst_buf);
+	MDE_DrawLineInvert(0, COMPARE_LINE_COUNT, SCREEN_WIDTH, COMPARE_LINE_COUNT, dst_buf);
+	MDE_DrawLine(0, COMPARE_LINE_COUNT+1, SCREEN_WIDTH, COMPARE_LINE_COUNT+1, dst_buf);
+	for(i = 0; i < 4; i++)
+	{
+		MDE_DrawRect(r, dst_buf);				r.x += 15;
+		MDE_DrawRectFill(r, dst_buf);			r.x += 15;
+		MDE_DrawRectInvert(r, dst_buf);			r.x += 15;
+		MDE_DrawEllipse(r, dst_buf);			r.x += 15;
+		MDE_DrawEllipseInvert(r, dst_buf);		r.x += 15;
+		MDE_DrawEllipseFill(r, dst_buf);		r.x += 15;
+		MDE_DrawEllipseInvertFill(r, dst_buf);	r.x += 15;
+		r.w++;
+		r.h++;
+	}
+
+	MDE_BUFFER *buf;
+	r = MDE_MakeRect(10, 350, 15, 15);
+	iterate (src_format) from SourceFormats
+	{
+		if (MDE_GetBlitMethodSupported(MDE_METHOD_COPY, src_format, dst_buf->format))
+		{
+			buf = MDE_CreateBuffer(r.w, r.w, src_format, 0);
+			for(x = 0; x < buf->w; x++)
+			{
+				int k = x * 255 / buf->w;
+				MDE_SetColor(MDE_RGB(k, 0, 255 - k), buf);
+				MDE_DrawRectFill(MDE_MakeRect(x, 0, 1, buf->h), buf);
+			}
+			MDE_DrawBuffer(buf, r, 0, 0, dst_buf);
+			MDE_DrawBufferStretch(buf, MDE_MakeRect(r.x, r.y + buf->h + 5, r.w, r.h), MDE_MakeRect(0, 0, buf->w, buf->h), dst_buf);
+			MDE_DeleteBuffer(buf);
+		}
+		r.x += r.w + 5;
+	}
+}
+
+foreach (format, refimage) from DestinationFormats
+{
+	test("$(format)") language C++;
+	{
+		MDE_BUFFER *buf = 0;
+		BOOL skip = FALSE;
+#ifdef USE_PREMULTIPLIED_ALPHA
+		// doesn't make sense to test these when using premultiplied
+		// alpha, since test triggers paths that copies from premultiplied
+		// to opaque, which intentionally yields wrong results
+		switch (format)
+		{
+		case MDE_FORMAT_SRGB16:
+		case MDE_FORMAT_BGR24:
+		case MDE_FORMAT_RGB16:
+		case MDE_FORMAT_RGBA16:
+			skip = TRUE;
+		}
+#endif // USE_PREMULTIPLIED_ALPHA
+		if (!skip)
+		{
+			buf = MDE_CreateBuffer(SCREEN_WIDTH, SCREEN_HEIGHT, format, 0);
+			verify(DrawTests(buf));
+			verify(VerifyImage(refimage, buf));
+		}
+		else
+			output("skipped\n");
+	}
+	finally
+	{
+		MDE_DeleteBuffer(buf);
+	}
+}
+
+test("RGBA32 to BGR24")
+require success("MDE_FORMAT_BGR24");
+require success("MDE_FORMAT_RGBA32");
+require undefined USE_PREMULTIPLIED_ALPHA;
+{
+	const MDE_FORMAT from = MDE_FORMAT_RGBA32;
+	const MDE_FORMAT to   = MDE_FORMAT_BGR24;
+	const char* refimage = "dst_BGR24.png";
+
+	const int NumGradients = 3;
+	MDE_BUFFER *rgba_gradient[NumGradients];
+	MDE_BUFFER *buf = 0;
+
+	// allocate RGBA32 buffers
+	for (int i = 0; i < NumGradients; ++i)
+		rgba_gradient[i] = MDE_CreateBuffer(buf_gradient[i]->w, buf_gradient[i]->h, from, 0);
+	for (int i = 0; i < NumGradients; ++i)
+		verify (rgba_gradient[i]);
+
+	// create target buffer
+	buf = MDE_CreateBuffer(SCREEN_WIDTH, SCREEN_HEIGHT, to, 0);
+	verify(buf);
+
+	// blit BGRA32 gradients to RGBA32 buffers
+	for (int i = 0; i < NumGradients; ++i)
+	{
+		buf_gradient[i]->method = MDE_METHOD_COPY;
+		MDE_DrawBuffer(buf_gradient[i], MDE_MakeRect(0, 0, buf_gradient[i]->w, buf_gradient[i]->h), 0, 0, rgba_gradient[i]);
+	}
+
+	// HACK: temporarily replace buf gradients - no verifies between here and restoring
+	MDE_BUFFER *tmp_gradient[NumGradients];
+	for (int i = 0; i < NumGradients; ++i)
+	{
+		tmp_gradient[i] = buf_gradient[i];
+		buf_gradient[i] = rgba_gradient[i];
+	}
+	verify(DrawTests(buf));
+	// restore
+	for (int i = 0; i < NumGradients; ++i)
+		buf_gradient[i] = tmp_gradient[i];
+
+	verify(VerifyImage(refimage, buf));
+}
+finally
+{
+	for (int i = 0;i < NumGradients; ++i)
+		MDE_DeleteBuffer(rgba_gradient[i]);
+	MDE_DeleteBuffer(buf);
+}
+
+setup
+{
+	int x, i;
+	buf_gradient[0] = MDE_CreateBuffer(512, 10, MDE_FORMAT_BGRA32, 0);
+	buf_gradient[1] = MDE_CreateBuffer(512, 10, MDE_FORMAT_BGRA32, 0);
+	buf_gradient[2] = MDE_CreateBuffer(512, 10, MDE_FORMAT_BGRA32, 0);
+	for(x = 0; x < 512; x++)
+	{
+		int g1 = MDE_MIN(x, 255);
+		int g2 = x < 256 ? 0 : x - 256;
+		MDE_SetColor(MDE_RGBA(g1, g2, g2, g1), buf_gradient[0]); MDE_DrawRectFill(MDE_MakeRect(x, 0, 1, 10), buf_gradient[0], false);
+		MDE_SetColor(MDE_RGBA(g2, g1, g2, g1), buf_gradient[1]); MDE_DrawRectFill(MDE_MakeRect(x, 0, 1, 10), buf_gradient[1], false);
+		MDE_SetColor(MDE_RGBA(g2, g2, g1, g1), buf_gradient[2]); MDE_DrawRectFill(MDE_MakeRect(x, 0, 1, 10), buf_gradient[2], false);
+	}
+	buf_8bit = MDE_CreateBuffer(64, 64, MDE_FORMAT_INDEX8, 256);
+	for(i = 0; i < 256; i++)
+	{
+		buf_8bit->pal[i * 3] = (unsigned char) i;
+		buf_8bit->pal[i * 3 + 1] = (unsigned char) 0;
+		buf_8bit->pal[i * 3 + 2] = (unsigned char) 255-i;
+	}
+	for(i = 0; i < buf_8bit->w * buf_8bit->h; i++)
+	{
+		((char*)buf_8bit->data)[i] = (unsigned char) (i * 256 / buf_8bit->w);
+	}
+}
+
+exit
+{
+	MDE_DeleteBuffer(buf_gradient[0]);
+	MDE_DeleteBuffer(buf_gradient[1]);
+	MDE_DeleteBuffer(buf_gradient[2]);
+	MDE_DeleteBuffer(buf_8bit);
+}

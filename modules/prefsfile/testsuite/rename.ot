@@ -1,0 +1,147 @@
+/* -*- Mode: c++; tab-width: 4; indent-tabs-mode: t; c-basic-offset: 4 -*-
+**
+** Copyright (C) 2004-2010 Opera Software ASA.  All rights reserved.
+**
+** This file is part of the Opera web browser.  It may not be distributed
+** under any circumstances.
+**
+** Petter Nilsen
+*/
+
+group "prefsfile.ini.rename";
+require PREFS_HAS_PREFSFILE;
+require PREFSFILE_RENAME_SECTION;
+
+include "modules/prefsfile/prefsfile.h";
+include "modules/prefsfile/prefssection.h";
+include "modules/prefsfile/impl/backend/prefsmap.h";
+include "modules/prefsfile/impl/backend/prefssectioninternal.h";
+include "modules/util/opfile/opmemfile.h";
+include "modules/util/opstrlst.h";
+
+// -- Global variables ---------------------------------------------------
+
+global
+{
+	PrefsFile *pfp;
+	OpMemFile *fp;
+}
+
+setup
+{
+	pfp = NULL;
+	fp = NULL;
+
+	/* Create file objects to test prefsfile's rename section functionality */
+	static const unsigned char ini[] =
+		//!Opera Preferences version 2.0
+		//!
+		//![Section1]
+		//!Key1=LocalValue1
+		//!Key2=LocalValue2
+		//!
+		//![Section2]
+		//!Key1=LocalValue1
+		//!Key2=LocalValue2
+		//!
+		//![Section3]
+		//!Key1=LocalValue1
+		//!Key2=LocalValue2
+	;
+	fp = OpMemFile::Create(ini, long(sizeof ini));
+}
+
+// -- Tests --------------------------------------------------------------
+
+test("Setup")
+{
+	pfp = OP_NEW(PrefsFile, (PREFS_INI));
+	TRAPD(rc, pfp->ConstructL());
+	verify(OpStatus::IsSuccess(rc));
+
+	TRAP(rc, pfp->SetFileL(fp));
+	verify(OpStatus::IsSuccess(rc));
+
+	TRAP(rc, pfp->LoadAllL());
+	verify(OpStatus::IsSuccess(rc));
+}
+
+test("Rename section")
+	require success "Setup";
+{
+	OP_STATUS rc;
+
+	verify(pfp->IsSection("Section2"));
+
+	TRAP(rc, pfp->RenameSectionL("Section2", "Section4"));
+
+	verify(!pfp->IsSection("Section2"));
+	verify(pfp->IsSection("Section4"));
+
+	OpString result;
+
+	// read a key from the renamed section
+	TRAP(rc, pfp->ReadStringL("Section4", "Key1", result));
+    verify(OpStatus::IsSuccess(rc));
+    verify(!result.Compare(UNI_L("LocalValue1")));
+}
+
+test("Rename non-existing section")
+	require success "Setup";
+{
+	OP_STATUS rc;
+	BOOL retval = TRUE;
+
+	TRAP(rc, retval = pfp->RenameSectionL("SectionNotThere", "SectionNew1"));
+
+	verify(retval == FALSE);
+	verify(!pfp->IsSection("SectionNew1"));
+}
+
+
+test("Rename section - check hash")
+	require success "Setup";
+	require PREFSMAP_SECTION_HASH;
+{
+	OP_STATUS rc;
+	OpString name;
+	unsigned int i;
+
+	// Create several sections in map one
+    for (i = 0; i<PREFS_SECTIONS_BEFORE_HASH; ++i)
+    {
+        name.Empty();
+        name.AppendFormat(UNI_L("one %d"), i);
+
+		TRAP(rc, pfp->WriteStringL(name, UNI_L("some key"), UNI_L("some value")));
+        verify(OpStatus::IsSuccess(rc));
+    }
+	// the following should hit the hash table
+	name.Empty();
+    name.AppendFormat(UNI_L("one %d"), ++i);
+
+	TRAP(rc, pfp->WriteStringL(name, UNI_L("some key 2"), UNI_L("some value 2")));
+    verify(OpStatus::IsSuccess(rc));
+
+	TRAP(rc, pfp->RenameSectionL(name.CStr(), UNI_L("SectionXX")));
+	verify(!pfp->IsSection(name.CStr()));
+	verify(pfp->IsSection("SectionXX"));
+
+	// read a key from the renamed section
+	OpString result;
+
+	TRAP(rc, pfp->ReadStringL(UNI_L("SectionXX"), UNI_L("some key 2"), result));
+    verify(OpStatus::IsSuccess(rc));
+    verify(!result.Compare(UNI_L("some value 2")));
+}
+
+// -- Global cleanup -----------------------------------------------------
+
+exit
+{
+	pfp->Reset();
+	fp->Close();
+
+	OP_DELETE(pfp);
+	OP_DELETE(fp);
+}

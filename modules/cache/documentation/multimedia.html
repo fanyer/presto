@@ -1,0 +1,142 @@
+
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN"
+          "http://www.w3.org/TR/html4/loose.dtd">
+<html>
+
+<head>
+<link rel=stylesheet href="../../coredoc/coredoc.css" />
+<title>Multimedia Cache</title>
+</head>
+
+<body>
+
+<h1>Multimedia Cache</h1>
+
+<h2>Multimedia Content</h2>
+<p>We wanted to improve as much as possible the experience of the users watching a video (a movie, but also a YouTube-like video) or listening to some audio file. We identified these requirements:
+<ul>
+<li>Support for multiple, out of order, segments (a segment is a part of the file), so the user can move backward and forward in the video without having to download multiple times the same content.</li>
+<li>Persist these segments in the cache, so they can be available even across reboots.</li>
+<li>Support for a size limit.</li>
+<li>Support for a way to identify the "coverage" of the content, to be able to show graphically to the user what parts are still available.</li>
+<li>A crash should have as little as possible impact on the cached content. A corruption is not really acceptable, but the loss of one segment could be tolerated.</li>
+One limitation of the current solution, is that we can only have a finite (and relatively small) number of segments.
+Also, the current solution <b>does not allow override</b> of content already download. This should really not happen. If the file changes, the cache object should be recreated.
+</ul>
+</p>
+
+<h2>How to create a Multimedia Cache Storage</h2>
+<p>It is usually better to have a dedicated context for Multimedia files, to not disrupt the work of the normal disk cache. The suggested method to create the context is using Context_Manager_Multimedia::CreateManager().</p>
+<p>The URLs are managed as multimedia when the Cache Storage back-end is of type Multimedia_Storage. This requires that the URL has the <b>URL::KMultimedia</b> attribute set to TRUE, and it should happen as soon as possible (before the Cache_Storage object has been created).</p>
+
+<h2>How to download part of a file</h2>
+<p>To specify what part of the file to download, the <b>URL::KHTTPRangeStart</b> and <b>URL::KHTTPRangeEnd</b> attributes need to be set. The expectation is that the code using URL will download at least 1 or 2 KB of data at a time. Downloading very small parts can affect performances, as depending on the situation, a disk operation could be required.</p>
+
+
+<h2>How to retrieve the coverage</h2>
+<p>To know if a part of a file is available in the cache, the suggested method is <b>URL::GetPartialCoverage()</b>.<p>
+<p>In some cases, it could be required to <i>fully download</i> the URL, for example to save it on a file. The method to use is <b>URL::GetNextMissingCoverage()</b>.<p>
+<p>The complete situation, with all the segments available, is exposed by <b>URL_DataDescriptor::GetSortedCoverage()</b>, that is the right function to use to provide a UI feedback of what has already been downloaded.</p>
+<p>The internal object that exposes this methods, is Cache_Storage.</p>
+
+<h2>How to retrieve the content</h2>
+<p>Users of URL can use URL_DataDescriptor as usual, but <b>URL_DataDescriptor::SetPosition()</b> has to be called to choose the starting byte. Of course it is important that the range requested is available. </p>
+<p>For the internal objects (not intended for URL users), the method AccessReadOnly() has been added to File_Storage; it returns an OpFileDescriptor object.<br/>For Multimedia content, this object is a logical view, so the content can be accessed in order (or out of order), without worrying about the physical disk position of the requested byte. As usual, the caller must ask only for bytes already present on the cache.</p>
+
+<h2>Some examples</h2>
+<p> The best place to get working examples is probably <b>modules/cache/selftest/cache_download_multimedia.ot</b>.
+In any case, this is a short "not working", incomplete example, with just the critical parts:<br />
+<br />
+<code>
+<style>i {color: rgb(0,128,0); }</style>
+<i>// Create the dedicated context</i><br />
+Context_Manager_Multimedia::CreateManager(ctx, multimedia_folder, multimedia_folder, FALSE, PrefsCollectionNetwork::DiskCacheSize);<br />
+<br />
+<i>// Deal with Multimedia content (it should be set as soon as possible, before the Cache_Storage object has been created)</i><br />
+url.SetAttribute(URL::KMultimedia, TRUE);<br />
+<br />
+<i>// Asks for a partial download, after checking with <b>URL::GetPartialCoverage()</b> if the range is already (even only partially) available</i><br />
+url.SetAttribute(URL::KHTTPRangeStart, &start);<br />
+url.SetAttribute(URL::KHTTPRangeEnd, &end);<br />
+<br />
+<i>// [...] Start downloading the content with URL::LoadDocument()</i><br />
+<br />
+<i>// Retrieve the bytes required (typically in response to a MSG_URL_DATA_LOADED message)</i><br />
+URL_DataDescriptor *dd=rep->GetDescriptor(NULL, URL::KNoRedirect, TRUE);<br />
+<i>...</i>
+<br />
+if(OpStatus::IsSuccess(dd->SetPosition(move_pos))) { ... <i>/* Call <b>RetrieveData()</b> and <b>GetBuffer()</b> */</i> }<br />
+<br />
+<i>// Get the segments available on the cache</i><br />
+OpAutoVector<StorageSegment> sort_seg;<br />
+<br />
+op_err=dd->GetSortedCoverage(sort_seg);<br />
+<br />
+</code>
+</p>
+
+<h2>Streaming</h2>
+On devices that have limited disk capacity, viewing big videos can be problematic.<br /> To solve this problem, the Multimedia Cache provides a streaming mode, meaning that a fixed amount of space is used to cache (in practice, to buffer ahead) part of the content.<br /> Alternatively, the streaming can also be performed in RAM (but DISK_CACHE_SUPPORT is still required, even if the disk cache itself could be disabled via preference).<br />
+<br />
+To activate the streaming directly from a "low level user" perspective:
+<ul>
+<li><b>MultimediaCacheFile::ConstructFile()</b> or <b>MultimediaCacheFile::ConstructMemory()</b> need to be called, specifying a maximum file size</li>
+<li><b>MultimediaCacheFile::ActivateStreaming()</b> has to be called</li>
+</ul>
+<br />
+These details are automatically managed by the cache subsystem (in particular by the class <b>Multimedia_Storage</b>), provided that <b>API_MULTIMEDIA_CACHE_STREAM</b> is imported.
+The following criterias are used:
+<ul>
+<li>If the disk cache is disabled, the streaming is always activated, and it will happen in RAM</li>
+<li>Based on PrefsCollectionNetwork::CacheHTTPS, HTTPS can be streamed in RAM or not</li>
+<li>URLs with KCachePolicy_NoStore set, will be streamed</li>
+<li>If <b>PrefsCollectionNetwork::MultimediaStreamAlways</b> is TRUE, streaming will always be used</li>
+<li>If <b>PrefsCollectionNetwork::MultimediaStreamRAM</b> is TRUE, when the streaming is used, it will happen on RAM</li>
+<li><b>PrefsCollectionNetwork::MultimediaStreamSize</b> provides the size of the file/buffer used to stream</li>
+<li>When streaming, <b>unique URLs</b> should be used. While the cache enforce this by default, the user code should try to create unique URLs as soon as possible. The cache exports the internal logic via the <b>Multimedia_Storage::IsStreamRequired()</b> static method. Please be aware that this information is not 100% correct, as the Cache-Control header (possibly not available when the user calls IsStreamRequired()) can still force streaming at a later stage.</li>
+</ul>
+
+Please note that <i>URLs streamed are meant to be unique</i>.<br/> The cache will not be reused anyway, as for performance reasons the file is not kept in a consistent state.<br />
+<br />
+A new method is exposed by URL, to provide more information on the cache storage:<br />
+<b>void URL::GetCacheInfo(BOOL &streaming, BOOL &ram);</b>
+
+<h3><b>The devil is in the details</b></h3>
+A key concept when streaming is that the cache has a maximum size limit, and when the cache is full no new data can be written.<br />
+So it is vital to have a mechanism to free space, or to "<b>consume</b>" bytes. For performance reasons, consuming bytes does not recover space on disk, and does not move data, but it anyway makes room for new bytes.
+From a user perspective, the cache mainly provides two automatic mechanisms for consuming bytes:
+<ul>
+<li>consume on write (ConsumePolicy::CONSUME_ON_WRITE)</li>
+<li>consume on read (ConsumePolicy::CONSUME_ON_READ)</li>
+</ul>
+<i>The preferred way is "Consume on write"</i>, as it saves as much bandwidth as possible, and it also forces the caller to take full responsibility of the buffering logic.<br />
+This is also the method used automatically by the cache if <i>API_MULTIMEDIA_CACHE_STREAM</i> is imported.<br />
+With "Consume on read", the bandwidth consumption can slightly increase (due to an internal operation that can drop more bytes than really required), but the caller module can somehow try to use the information provided by the cache to manage the buffering.<br />
+So while "Consume on read" can potentially simplify a bit the logic of the caller, it is discouraged.
+<br />ActivateStreaming() enables the streaming and let you choose the logic to use.<br />
+<h3><b>Consume on write</b></h3>
+When "Consume on write" is enabled:
+<ul>
+<li>When the cache is full (which after a while will always be true), a write operation consumes bytes at the beginning of the portion of content in cache, replacing immediately those bytes with the new content.</li>
+<li>The streaming effectively disable the multi segment support, even if internally the classes use it.</li>
+<li>If during a write operation, a seek is performed (maning that the content is not appendend to the end of the stram buffer), <i>the whole content is deleted.</i></li>
+</ul>
+
+<h3><b>Consume on read</b></h3>
+When "Consume on read" is enabled:
+<ul>
+<li>When a read operation is performed, the bytes read are "consumed", so they will no longer be available, freeing space for new content.</li>
+<li>In reality, by default these bytes are still available and the cache will try to reuse them if the caller asks for them again. SetEnableEmptySpaceRecover() can change this behaviour.</li>
+<li>When the file/buffer reach the maximum size, no more writes are allowed, and a read operation is required to free some space. This imply that the user (for example the media module) needs to be aware of the size limit, and limit the read ahead, to avoid downloading bytes that cannot be stored.</li>
+<li>The streaming effectively disable the multi segment support, even if internally the classes use it.</li>
+<li>If during a read operation, a seek is performed (meaning that the content is read not from the beginning of the stream buffered), <i>all the bytes skipped are lost, unless the empty space is recovered (default).</i> Under some conditions, a part of these bytes can be lost anyway.</li>
+<li>If during a write operation, a seek is performed (maning that the content is not appendend to the end of the stram buffer), <i>all the content is deleted.</i></li>
+</ul>
+
+<h3><b>Streaming with multiple segments</b></h3>
+When streaming, if a seek operation outside of the cached content is performed (e.g. the user move to a point of the video that is not in the cache), the cache drops all the bytes.<br />
+It would be nice to keep them around and potentially save some bandwidth. This basically means streaming with multiple segments (even if internally the cache when streaming uses two segments, it's an implementation detail, and from a logic point of view it uses a single segment).<br />
+Streaming with multiple segments is not supported at the moment, but it would be relatively easy to add this functionality. The main problem is deciding which bytes to consume, as there would be multiple segments around, but it is feasible.<br />
+
+</body>
+</html>

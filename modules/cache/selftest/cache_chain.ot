@@ -1,0 +1,328 @@
+/* -*- Mode: c++; tab-width: 4; indent-tabs-mode: t; c-basic-offset: 4 -*-
+**
+** Copyright (C) 2004-2006 Opera Software ASA.  All rights reserved.
+**
+** This file is part of the Opera web browser.  It may not be distributed
+** under any circumstances.
+**
+** This file tests the basic functionalities of the chained cache, to test that Opera can support multiple levels of cache
+**
+** Luca Venturi
+*/
+group "chained cache basic tests";
+require init;
+require DYNAMIC_FOLDER_SUPPORT;
+require DISK_CACHE_SUPPORT;
+require WEBSERVER_SUPPORT;
+include "modules/cache/cache_selftest.h";
+include "modules/cache/cache_ctxman_disk.h";
+
+global
+{
+	UINT32 SIZE_EMBEDDED;
+	UINT32 SIZE_CONTAINERS;
+	UINT32 SIZE_PLAIN;
+	
+	URL_CONTEXT_ID ctx;			// Context used to write on the cache
+	URL_CONTEXT_ID ctx_err;		// Context used to check for errors
+	URL_CONTEXT_ID ctx_err2;	// Context used to check for errors
+	URL_CONTEXT_ID ctx_err3;	// Context used to check for errors
+	OpFileFolder chain_folder;	// Cache folder used to check chained cache functionalities
+	OpFileFolder chain_folder_err;	// Cache folder used to check cache errors
+	OpFileFolder chain_folder_err2;	// Cache folder used to check cache errors
+	OpFileFolder chain_folder_err3;	// Cache folder used to check cache errors
+#if CACHE_SMALL_FILES_LIMIT>0
+	OpString path_embedded;
+	OpFile file_embedded;
+	URL url_embedded;
+	OpFileLength size_embedded;
+#endif
+#if CACHE_CONTAINERS_ENTRIES>0
+	OpString path_cont;
+	OpFile file_cont;
+	URL url_cont;
+	OpFileLength size_cont;
+#endif
+	OpString path_plain;
+	OpFile file_plain;
+	URL url_plain;
+	OpFileLength size_plain;
+	UniteCacheTester uct;
+}
+
+setup 
+{
+#if CACHE_SMALL_FILES_LIMIT>0
+	SIZE_EMBEDDED=CACHE_SMALL_FILES_SIZE-1;
+#else
+	SIZE_EMBEDDED=0;
+#endif
+
+#if CACHE_CONTAINERS_ENTRIES>0
+	SIZE_CONTAINERS=CACHE_CONTAINERS_FILE_LIMIT-1;
+	SIZE_PLAIN=CACHE_CONTAINERS_FILE_LIMIT*2;
+#else
+	SIZE_EMBEDDED=0;
+	SIZE_PLAIN=32768;
+#endif
+
+	uct.SetWindow(state.GetWindow());
+}
+
+exit
+{
+}
+
+test("Start WebServer if required") async;
+{
+	uct.StartWebServer();
+}
+
+test("Check WebServer and create the service")
+async;
+{
+	uct.StartService(UNI_L("cache_chain_selftest"), UNI_L("webserver/cache_chain_selftest_service/"));
+}
+
+test("Create a context and clean it")
+{
+	ctx=urlManager->GetNewContextID();
+	ctx_err=urlManager->GetNewContextID();
+	ctx_err2=urlManager->GetNewContextID();
+	ctx_err3=urlManager->GetNewContextID();
+	
+	verify(OpStatus::IsSuccess(g_folder_manager->AddFolder(OPFILE_CACHE_FOLDER, UNI_L("chain"),&chain_folder)));
+	verify(OpStatus::IsSuccess(g_folder_manager->AddFolder(OPFILE_CACHE_FOLDER, UNI_L("chain_err"),&chain_folder_err)));
+	verify(OpStatus::IsSuccess(g_folder_manager->AddFolder(OPFILE_CACHE_FOLDER, UNI_L("chain_err2"),&chain_folder_err2)));
+	verify(OpStatus::IsSuccess(g_folder_manager->AddFolder(OPFILE_CACHE_FOLDER, UNI_L("chain_err3"),&chain_folder_err3)));
+	
+	verify(OpStatus::IsSuccess(CacheFileTest::DeleteCacheDir(chain_folder)));
+	verify(OpStatus::IsSuccess(CacheFileTest::DeleteCacheDir(chain_folder_err)));
+	verify(OpStatus::IsSuccess(CacheFileTest::DeleteCacheDir(chain_folder_err2)));
+	verify(OpStatus::IsSuccess(CacheFileTest::DeleteCacheDir(chain_folder_err3)));
+	
+	urlManager->AddContextL(ctx, chain_folder, chain_folder, chain_folder, chain_folder, FALSE);
+	urlManager->AddContextL(ctx_err, chain_folder_err, chain_folder_err, chain_folder_err, chain_folder_err, FALSE);
+	urlManager->AddContextL(ctx_err2, chain_folder_err2, chain_folder_err2, chain_folder_err2, chain_folder_err2, FALSE);
+	urlManager->AddContextL(ctx_err3, chain_folder_err3, chain_folder_err3, chain_folder_err3, chain_folder_err3, FALSE);
+}
+
+test("Info")
+{
+	output("\nEmbedded test size: %d\n", SIZE_EMBEDDED);
+	output("Containers test size: %d\n", SIZE_CONTAINERS);
+	output("Plain test size: %d\n", SIZE_PLAIN);
+}
+
+// Used to check the chain cache functionalities, for each size
+table TableSizes(char*, int, OpString&, OpFile&, URL&, char*)
+{
+  { "[embedded]", SIZE_EMBEDDED, path_embedded, file_embedded, url_embedded, "embedded"},
+  { "[container]", SIZE_CONTAINERS, path_cont, file_cont, url_cont, "container" },
+  { "[plain]", SIZE_PLAIN, path_plain, file_plain, url_plain, "plain" }
+}
+
+
+// Create the files
+foreach (descr, file_size, file_path, file, url, vpath) from TableSizes
+{
+	test("Create temporary file " descr)
+	{
+		if(file_size>0)
+		{
+			verify(OpStatus::IsSuccess(CacheFileTest::CreateTempFile(file_size, TRUE, file_path, file)));
+		}
+		else
+			output("DISABLED");
+	}
+	
+	test("Share file " descr)
+	{
+		if(file_size>0)
+		{
+			verify(OpStatus::IsSuccess(uct.Share(file_path.CStr(), vpath, NULL, url, ctx)));
+		}
+		else
+			output("DISABLED");
+	}
+	
+	test("Load file " descr) async;
+	{
+		uct.LoadOK(url, &file);
+	}
+	
+	test("size check" descr)
+	{
+		OpFileLength len=0;
+		url.GetAttribute(URL::KContentSize, &len);
+		
+		verify(len==file_size);
+	}
+	
+	// Unshare, so we are sure that it is taken from the cache
+	test("UnShare file " descr)
+	{
+		if(file_size>0)
+		{
+			verify(OpStatus::IsSuccess(uct.UnShare(vpath)));
+		}
+		else
+			output("DISABLED");
+	}
+}
+
+test("Save files")
+{
+	TRAPD(rc, urlManager->WriteCacheIndexesL(FALSE, FALSE, TRUE));
+}
+
+// Verify the content and that loading from the other context does not work
+foreach (descr, file_size, file_path, file, url, vpath) from TableSizes
+{
+	// Verify the content reading from the cache storage object
+	test("Verify content " descr)
+	{
+		URL_Rep *rep=url.GetRep();
+		Cache_Storage *cs=(rep && rep->GetDataStorage() && rep->GetDataStorage()->GetCacheStorage())?rep->GetDataStorage()->GetCacheStorage():NULL;
+		verify(cs);
+		
+	#ifdef CACHE_FAST_INDEX
+		//// TODO: Implement this function also for containers and plain files
+		SimpleStreamReader *reader=cs->CreateStreamReader();
+		
+		if(reader) // Content in memory
+		{
+			verify(OpStatus::IsSuccess(CacheFileTest::VerifyFileContent(reader, file_path.CStr())));
+			
+			OP_DELETE(reader);
+		}
+	#endif
+	}
+	
+	// Download again
+	test("Load again file "  descr) async;
+	{
+		uct.LoadNoReloadOK(url, &file);
+	}
+	
+	// Verify size
+	test("size check again" descr)
+	{
+		OpFileLength len=0;
+		url.GetAttribute(URL::KContentSize, &len);
+		
+		verify(len==file_size);
+	}
+	
+	// Download again: it must fail, because it has been unshared
+	test("Load (NoReload) file from other context (must fail) "  descr)
+	async;
+	{
+		URL url_err=uct.GetURL(vpath, ctx_err);
+		
+		uct.LoadNoReload404(url_err);
+	}
+	
+	// Download again: it must fail, because it has been unshared
+	test("Load (Reload) file from other context (must fail) "  descr)
+	async;
+	{
+		URL url_err=uct.GetURL(vpath, ctx_err);
+		
+		uct.Load404(url_err);
+	}
+	
+	// Delete URL: Important, or the URL has already been created (with a 404 status)...
+	test("Delete URL "  descr)
+	{
+		URL url_err=uct.GetURL(vpath, ctx_err);
+		
+		url_err.Unload();
+	}
+}
+	
+	
+/// Create 3 new context managers, two bogus and one that read the previous index and chain it to the Context_Manager.
+/// The chain will be:
+/// chain_folder_err (wrong) + chain_folder_err2 (wrong) + chain_folder (right) + chain_folder_err3 (wrong)
+test("Chain new Managers")
+{
+	Context_Manager *man_err = urlManager->FindContextManager(ctx_err);
+	Context_Manager *man_err2 = OP_NEW(Context_Manager_Disk, (ctx_err2, chain_folder_err2, chain_folder_err2));
+	Context_Manager *man_err3 = OP_NEW(Context_Manager_Disk, (ctx_err3, chain_folder_err3, chain_folder_err3));
+	Context_Manager *man_ok=OP_NEW(Context_Manager_Disk, (ctx_err, chain_folder, chain_folder));
+	
+	verify(man_err);
+	verify(man_err2);
+	verify(man_err3);
+	verify(man_ok);
+	
+	man_err2->ConstructSizeL(1024, TRUE);
+	man_err3->ConstructSizeL(1024, TRUE);
+	man_ok->ConstructSizeL(1024, TRUE);
+	
+	man_err->SetNextChainedManager(man_err2);
+	man_err2->SetNextChainedManager(man_ok);
+	man_ok->SetNextChainedManager(man_err3);
+}
+
+/// Verify that iot works with the new chain
+foreach (descr, file_size, file_path, file, url, vpath) from TableSizes	
+{
+	/// check that the file is now available
+	test("Load (NoReload) file from chained cache "  descr)
+	async;
+	{
+		URL url_err=uct.GetURL(vpath, ctx_err);
+		
+		uct.LoadNoReloadOK(url_err, &file);
+	}
+	
+	// Verify size
+	test("size check new context" descr)
+	{
+		URL url_err=uct.GetURL(vpath, ctx_err);
+		OpFileLength len=0;
+		
+		url_err.GetAttribute(URL::KContentSize, &len);
+		
+		verify(len==file_size);
+	}
+	
+	test("Delete temporary file " descr)
+	{
+		if(file_size>0)
+		{
+			file.Delete();
+		}
+		else
+			output("DISABLED");
+	}
+}
+
+test("Remove second Context manager from the chain ")
+{
+	Context_Manager *man_err = urlManager->FindContextManager(ctx_err);
+	
+	verify(man_err);
+	
+	Context_Manager *old=man_err->SetNextChainedManager(NULL);
+	
+	verify(old);
+	OP_DELETE(old);
+}
+
+test("Restore WebServer if required")
+{
+	uct.StopWebServer();
+}
+
+test("Delete context directory")
+{
+	urlManager->RemoveContext(ctx, TRUE);
+	urlManager->RemoveContext(ctx_err, TRUE);
+	
+	verify(OpStatus::IsSuccess(CacheFileTest::DeleteCacheDir(chain_folder)));
+	verify(OpStatus::IsSuccess(CacheFileTest::DeleteCacheDir(chain_folder_err)));
+}
+

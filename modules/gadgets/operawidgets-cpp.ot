@@ -1,0 +1,163 @@
+/* -*- Mode: c++; tab-width: 4; indent-tabs-mode: t; c-basic-offset: 4 -*-
+**
+** Copyright (C) 2006-2011 Opera Software ASA.  All rights reserved.
+**
+** This file is part of the Opera web browser.  It may not be distributed
+** under any circumstances.
+**
+** Peter Krefting
+*/
+
+group "gadgets.generateddocuments.c++";
+require init;
+require OPERA_URL_SUPPORT;
+
+language c++;
+
+include "modules/url/url_api.h";
+include "modules/doc/frm_doc.h";
+include "modules/dochand/docman.h";
+include "modules/logdoc/logdoc.h";
+include "modules/xmlutils/xmlparser.h";
+include "modules/xmlutils/xmltokenhandler.h";
+include "modules/pi/system/OpLowLevelFile.h";
+include "modules/prefs/prefsmanager/collections/pc_network.h";
+
+include "modules/gadgets/operawidgets.h";
+include "modules/gadgets/operaunite.h";
+
+// -- Testing framework --------------------------------------------------
+
+subtest check_document(URL *tmp_url, const uni_char *extratext, bool cachable, bool isxml)
+{
+	// Get the descriptor
+	URL_DataDescriptor * OP_MEMORY_VAR dd = tmp_url->GetDescriptor(NULL, FALSE, TRUE);
+	verify(dd);
+
+	// Extract the text
+	TempBuffer buffer;
+	BOOL more;
+	do
+	{
+		more = FALSE;
+		TRAPD(rc, dd->RetrieveDataL(more));
+		verify_success(rc);
+
+		// Save the actual text in a buffer
+		unsigned long bytesize = dd->GetBufSize();
+		verify_success(buffer.Append(reinterpret_cast<const uni_char *>(dd->GetBuffer()), UNICODE_DOWNSIZE(bytesize)));
+		dd->ConsumeData(bytesize);
+	} while (more);
+	verify_success(buffer.Append(static_cast<uni_char>('\0')));
+
+	// Skip BOM, if any
+	uni_char *p = buffer.GetStorage();
+	if (0xFEFF == *p)
+		++ p;
+	// output("\n======\n%s\n====== ", ST_down(p));
+
+	// Check that we have a DOCTYPE, and HTML, HEAD, TITLE and BODY elements.
+	if (isxml)
+	{
+		verify(uni_strstr(p, UNI_L("<?xml")) == p);
+		verify(uni_strstr(p, UNI_L("<!DOCTYPE")));
+	}
+	else
+	{
+		verify(uni_strstr(p, UNI_L("<!DOCTYPE")) == p);
+	}
+
+	verify(uni_strstr(p, UNI_L("<html dir")));
+	verify(uni_strstr(p, UNI_L("</html>")));
+
+	verify(uni_strstr(p, UNI_L("<head>")));
+	verify(uni_strstr(p, UNI_L("</head>")));
+
+	verify(uni_strstr(p, UNI_L("<title>")));
+	verify(uni_strstr(p, UNI_L("</title>")));
+
+	verify(uni_strstr(p, UNI_L("<body>")) || uni_strstr(p, UNI_L("<body id=")));
+	verify(uni_strstr(p, UNI_L("</body>")));
+
+	// Check for extra text we want to be sure is included
+	if (extratext)
+	{
+		verify(uni_strstr(p, extratext));
+	}
+
+	// Check that document is cachable (or not)
+#ifndef RAMCACHE_ONLY
+	OpString cachefilename;
+	if (cachable)
+		verify(tmp_url->PrepareForViewing(TRUE, TRUE) == 0);
+	TRAPD(rc, tmp_url->GetAttributeL(URL::KFilePathName_L, cachefilename, TRUE));
+	verify_success(rc);
+#endif
+	if (cachable)
+	{
+		verify(!tmp_url->GetAttribute(URL::KCachePolicy_NoStore));
+#ifndef RAMCACHE_ONLY
+		if (g_pcnet->GetIntegerPref(PrefsCollectionNetwork::CacheToDisk))
+			verify(!cachefilename.IsEmpty());
+#endif
+	}
+	else
+	{
+		verify(tmp_url->GetAttribute(URL::KCachePolicy_NoStore));
+#ifndef RAMCACHE_ONLY
+		if (g_pcnet->GetIntegerPref(PrefsCollectionNetwork::CacheToDisk))
+			verify(cachefilename.IsEmpty());
+#endif
+	}
+}
+finally
+{
+	OP_DELETE(dd);
+}
+
+// -- Tests --------------------------------------------------------------
+
+test("OperaWidgets")
+	require OPERAWIDGETS_URL;
+{
+	URL tmp_url = g_url_api->GetNewOperaURL();
+	OperaWidgets *page = OP_NEW(OperaWidgets, (tmp_url));
+	verify(page);
+	verify_success(page->GenerateData());
+	verify(check_document(&tmp_url, UNI_L("opera.widgetManager"), true, false));
+}
+finally
+{
+	OP_DELETE(page);
+	tmp_url.Unload();
+}
+
+test("OperaWidgets - opera:extensions")
+	require OPERAEXTENSIONS_URL;
+{
+	URL tmp_url = g_url_api->GetNewOperaURL();
+	OperaWidgets *page = OP_NEW(OperaWidgets, (tmp_url, OperaWidgets::Extensions));
+	verify(page);
+	verify_success(page->GenerateData());
+	verify(check_document(&tmp_url, UNI_L("opera.extensionManager"), true, false));
+}
+finally
+{
+	OP_DELETE(page);
+	tmp_url.Unload();
+}
+
+test("OperaUnite")
+	require OPERAUNITE_URL;
+{
+	URL tmp_url = g_url_api->GetNewOperaURL();
+	OperaUnite *page = OP_NEW(OperaUnite, (tmp_url));
+	verify(page);
+	verify_success(page->GenerateData());
+	verify(check_document(&tmp_url, UNI_L("opera.uniteApplicationManager"), true, false));
+}
+finally
+{
+	OP_DELETE(page);
+	tmp_url.Unload();
+}

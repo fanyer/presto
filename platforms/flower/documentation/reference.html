@@ -1,0 +1,414 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<title>Flower: Reference Manual</title>
+<link rel="stylesheet" href="doc.css"/>
+</head>
+<body>
+<h1>Flower: Reference Manual</h1>
+<p>This is a reference manual on the user-exposed API of Flower. See <a href="introduction.html">Introduction</a> for a more general discussion of the project's architecture.</p>
+<h2 id="flow-subsystem">Flow subsystem</h2>
+<p>The <a href="introduction.html#flow-subsystem">flow subsystem</a> resides in the <code>flow</code> module. The system automatically makes the names <code><a href="#flow">flow</a></code> (the decorator), <code><a href="#Command">command</a></code> and <code><a href="#goal">goal</a></code> available in the global namespace in the context of which the <a href="introduction.html#flow-file">flow files</a> are interpreted. Flow files do not need to import this module explicitly unless they need to access other names than the ones mentioned above.</p>
+<p>Flower looks for flow files named <code>module.build/flow.py</code> and <code>module.build/*.flow.py</code> in every module listed in a <code>readme.txt</code> file. The order in which flow files are loaded does not matter.</p>
+<h3 id="flow">@flow (decorator)</h3>
+<p>The use of this decorator is mandatory when defining a <a href="introduction.html#flow">flow</a>. The argument list is optional. The decorator can be applied to more than one function with the same name, in which case they are considered <a href="introduction.html#flow-variant">variants</a> of the same flow. Which one is used in each case will be decided through <a href="introduction.html#pattern-matching">pattern matching</a> and priorities. The decorator accepts one optional positional argument, <code>priority</code>, and zero or more keyword arguments declaring the patterns to match against the <a href="introduction.html#node-parameter">node parameters</a> specified when instantiating the node. In case of a tie when two or more flow variants with the same priority match the specified node parameters, <code><a href="#AmbiguousMatch">errors.AmbiguousMatch</a></code> is raised. If no flow variants match, <code><a href="#NoMatch">errors.NoMatch</a></code> is raised.</p>
+<dl>
+  <dt id="flow-priority"><code>priority</code> (integer, default: 0)</dt>
+  <dd>Defines the priority of the flow variant. Signed. Higher values are preferred when looking for a match.</dd>
+</dl>
+<p>Each keyword argument describes a matcher for the node parameter of the same name. All matchers specified as arguments to <code>@flow</code> must match in order for the flow variant to match the instantiation of a node. The possible matcher types are:</p>
+<dl>
+  <dt>Callable</dt>
+  <dd>If a matcher is a callable, it will be called with a single argument containing the value of the node parameter. The match is considered successful if the matcher returns a true value, and unsuccessful otherwise. The <code><a href="#util">util</a></code> module provides several useful matchers of this type.</dd>
+  <dt>Compiled regular expression</dt>
+  <dd>If a matcher is a compiled regular expression object as produced by <code>re.compile</code> from the standard Python library, it is matched against the value of the node parameter, which must be a string, using the <code>search</code> method of the regular expression object. In fact, anything with a <code>search</code> method will be treated this way.</dd>
+  <dt>Constant</dt>
+  <dd>If neither of the above cases apply, the value of the node parameter will be tested for equality to the matcher.</dd>
+</dl>
+<p>The function being decorated (flow function) must declare a first positional argument, by convention called <code>self</code>. When the function gets called by the flow subsystem, this argument receives the current <a href="#Node">node</a> object. The flow function may accept any number of additional keyword arguments, which will receive the values of the node parameters with corresponding names. If an argument does not specify a default value, the node parameter by that name is mandatory when instantiating nodes. Node parameters that are listed neither among the patterns as arguments of the <code>@flow</code> decorator nor among the keyword arguments of the function being decorated must not be specified when instantiating a node. If the flow function uses the <code>**kwargs</code> syntax to accept arbitrary keyword arguments, arbitrary node parameters are allowed.</p>
+<p>If an uncaught exception of any type escapes the function, the flow is considered to have failed, and so are all flows directly or indirectly waiting for the current one to complete. If a node's flow fails, and the node has a <code>target</code> parameter, the file named by the parameter is deleted as a precaution to prevent incompletely generated output files from being considered as valid by the next build. The same happens when a build is interrupted with a signal.</p>
+<p>Any <code>finally</code> blocks in a flow whose corresponding <code>try</code> blocks have been entered are guaranteed to run. However, the order in which such blocks in flows of different nodes will run is undefined.</p>
+<h3 id="yield">yield (statement)</h3>
+<p>When the <code>yield</code> statement is used in a flow, the following expressions can be supplied.</p>
+<dl>
+  <dt><code><a href="#Node">Node</a></code></dt>
+  <dd>If the node's flow has not already been started, it is scheduled to be started. The current flow is suspended until the specified node's flow completes. If the flow of the specified node is already in progress, the current flow joins the set of flows blocked by it. If the flow of the specified node has already completed, the current flow is not suspended. If the flow of the specified node fails, or has already failed, with an exception, or because it yielded on a node or a command that failed, the current flow is considered to have failed as well, and is not resumed. While a flow is suspended, other flows that are not blocked by anything will run. If a flow yielding on a node produces a circular dependency, <code><a href="#CircularDependency">errors.CircularDependency</a></code> is raised.</dd>
+  <dt><code><a href="#Command">Command</a></code></dt>
+  <dd>The command is scheduled to be started. The current flow is suspended until the command completes. By default, if the command fails to start or returns a non-zero exit code, the command is considered to have failed, in which case the current flow fails as well and is not resumed. This behavior can be customized when creating the command object.</dd>
+  <dt>A sequence of <code>Node</code> and/or <code>Command</code> objects</dt>
+  <dd>(A sequence is any container that has a length and is indexable; tuples and lists are typical.) The same as described above happens for each node and command in the sequence, and the current flow is suspended until all listed nodes and commands complete. The flows and commands are not guaranteed to be executed in the specified order; some of the nodes' flows might already be in progress or completed, and some or all of the commands may be run in parallel. If any of the listed flows or commands fails, the current flow is considered to have failed as well and is not resumed.</dd>
+  <dt><code>self</code></dt>
+  <dd>If a flow yields a reference to the current node using the <code>yield self</code> statement, the execution <a href="introduction.html#chaining">chains</a> to a matching flow variant with the next highest priority. The current flow variant is not resumed.</dd>
+</dl>
+<p>User-defined code should not spawn any long-lived child processes by any means other than yielding a <code><a href="#Command">Command</a></code> object. Short-lived processes are allowed, that is, if their lifespan doesn't extend past a yield or a return from a flow, and the user-defined code waits for its completion (<code><a href="#runOnce">util.runOnce</a></code> is an example of how short-lived child processes can be run safely). Also, user-defined code is not allowed to call <code>os.wait</code> (to wait on all child processes) directly or indirectly; doing so will disrupt the scheduler.</p>
+<h3 id="Node">Node (class)</h3>
+<p>Represents a <a href="introduction.html#node">node</a>.</p>
+<p>The constructor is not public. Instances of the class are obtained by invoking flows as functions, specifying zero or more <a href="introduction.html#node-parameter">node parameters</a> as keyword arguments. No positional arguments are allowed. The keyword arguments both are used for pattern matching to decide which flow variant to use, and become the initial set of the node parameters. Parameters from the current context are not inherited. Repeated invocation of the same flow with the same set of keyword arguments produces references to the same node. Each flow function receives a reference to the current node as the first and only positional argument.</p>
+<p>A node object conforms to the dictionary protocol and supports dictionary-like indexing with string keys, membership testing, and iteration. When used as a dictionary, the node represents the set of node parameters. The node parameters are dynamic and can be added, modified or deleted at any time. However, the set of parameters used to instantiate the node is frozen for purposes of obtaining a reference to the same node by invoking the flow with the same set of keyword arguments.</p>
+<p>A node object also supports the context manager protocol and, when used in a <code>with</code> statement, becomes the current <a href="introduction.html#context">context</a> for the duration of the statement's body.</p>
+<p>Other members defined on node instances (all properties described below are read-only):</p>
+<dl>
+  <dt id="Node-state"><code>state (integer)</code></dt>
+  <dd>The state of the node's flow, one of the following:
+    <dl>
+      <dt id="Node-PENDING"><code>Node.PENDING</code></dt>
+      <dd>The node's flow is not currently running, but is scheduled to be run (not blocked on anything).</dd>
+      <dt id="Node-RUNNING"><code>Node.RUNNING</code></dt>
+      <dd>The node's flow is currently running. There is at most one such node at any given time.</dd>
+      <dt id="Node-BLOCKED"><code>Node.BLOCKED</code></dt>
+      <dd>The node's flow is suspended until one or more <code><a href="#Node">Node</a></code> and/or <code><a href="#Command">Command</a></code> objects complete.</dd>
+      <dt id="Node-COMPLETED"><code>Node.COMPLETED</code></dt>
+      <dd>The node's flow has completed successfully. The state never changes after this.</dd>
+      <dt id="Node-FAILED"><code>Node.FAILED</code></dt>
+      <dd>The node's flow has failed. The state never changes after this.</dd>
+    </dl>
+  </dd>
+  <dt id="Node-error"><code>error</code> (tuple)</dt>
+  <dd>A tuple <code>(type, value, traceback)</code> (in the same format as returned by <code>sys.exc_info</code>) with information about the exception that caused the flow to fail, or a tuple of three <code>None</code> values if no exceptions have occurred in the flow. For some internally generated exceptions such as <code><a href="#CommandFailed">errors.CommandFailed</a></code>, <code>traceback</code> will be <code>None</code>.</dd>
+  <dt id="Node-__lt__"><code>&lt;</code> (operator)</dt>
+  <dd>This operator is used to check <a href="introduction.html#needs-update">whether a node needs updating</a>. With the <code>Node</code> on the left-hand side, the operator accepts a string, a <code>Node</code> object, or a sequence of strings and/or <code>Node</code> objects. (A sequence is any container that has a length and is indexable.) The operator returns true if any of the following conditions are true:
+    <ul>
+      <li>The file named by the left-hand operand's <code>target</code> parameter does not exist.</li>
+      <li>Any of the strings specified on the right-hand side names a file that does not exist or is newer than the file named by the left-hand operand's <code>target</code> parameter.</li>
+      <li>The <code>target</code> parameter of any of the nodes specified on the right-hand side names a file that does not exist or is newer than the file named by the left-hand operand's <code>target</code> parameter.</li>
+    </ul>
+    For <code>Node</code> objects appearing on the right-hand side, the optional <code>changed</code> parameter serves as an override. If it's true, the dependency is considered to be newer than the target; if false, it's considered to be older. In either case, the existence and timestamp of the <code>target</code> are not checked. Also note that, as follows from the above, when the right-hand operand is an empty sequence, the operator returns true if and only if the file named by the left-hand operand's <code>target</code> parameter does not exist.</dd>
+</dl>
+<h3 id="Command">Command (class)</h3>
+<p>Represents a <a href="introduction.html#invoking-commands">command</a>.</p>
+<p>Instances are obtained by calling the global <code>command</code> function. Unlike flows, repeated invocations of <code>command</code> with the same arguments produces distinct command objects.</p>
+<p>Arguments of <code>command</code>:</p>
+<dl>
+  <dt><code>args</code> (list or string)</dt>
+  <dd>A sequence of command words (the command and its arguments) if <code>shell</code> is false, or a single command string if <code>shell</code> is true.</dd>
+  <dt><code>message</code> (string, default: <code>None</code>)</dt>
+  <dd>The progress message to display when starting the command. The string is interpreted as a new-style Python format string (as used with <code>str.format</code>) into which the <a href="introduction.html#node-parameter">paremeters</a> of the current node are interpolated as named items. How, when, and whether the progress message actually appears is up to the active <a href="introduction.html#logger">loggers</a>. <code>None</code> means no progress message.</dd>
+  <dt><code>fail</code> (boolean or callable, default: <code>True</code>)</dt>
+  <dd>Specifies whether the command should be considered failed if it fails to start or completes with a non-zero exit code. If a callable, will be called under the described circumstances with the command object as the only argument to obtain a boolean-like value.</dd>
+  <dt><code>shell</code> (boolean, default: <code>False</code>)</dt>
+  <dd>Whether the command should be passed to the shell. If false, the command is invoked directly, and the arguments don't have to be escaped.</dd>
+  <dt><code>cwd</code> (string, default: <code>None</code>)</dt>
+  <dd>If not <code>None</code>, the directory which should be made current before executing the command. Flower always operates with the top-level source directory as current, so <code>None</code> as <code>cwd</code> leaves that unchanged. A <code>cwd</code> value affects only the particular process but not any subsequently spawned child processes or Python code.</dd>
+  <dt><code>env</code> (dictionary, default: <code>None</code>)</dt>
+  <dd>A dictionary of environment variables to pass to the child process. If <code>None</code>, the environment is inherited from the Flower's main process.</dd>
+</dl>
+<p>Members defined on command instances (all properties are read-only):</p>
+<dl>
+  <dt id="Command-state"><code>state</code> (integer)</dt>
+  <dd>The state of the process. Can be one of the following:
+    <dl>
+      <dt id="Command-PENDING"><code>Command.PENDING</code></dt>
+      <dd>The process is not currently running, but is scheduled to be run.</dd>
+      <dt id="Command-RUNNING"><code>Command.RUNNING</code></dt>
+      <dd>The process is currently running.</dd>
+      <dt id="Command-COMPLETED"><code>Command.COMPLETED</code></dt>
+      <dd>The process has completed successfully. The state never changes after this.</dd>
+      <dt id="Command-FAILED"><code>Command.FAILED</code></dt>
+      <dd>The process has failed. The state never changes after this.</dd>
+    </dl>
+  </dd>
+  <dt id="Command-pid"><code>pid</code> (integer)</dt>
+  <dd>The ID of the child process or <code>None</code> if not yet started.</dd>
+  <dt id="Command-returncode"><code>returncode</code> (integer)</dt>
+  <dd>The exit code of the child process or <code>None</code> if still running or not yet started.</dd>
+  <dt id="Command-error"><code>error</code> (tuple)</dt>
+  <dd>A tuple <code>(type, value, traceback)</code> (in the same format as returned by <code>sys.exc_info</code>) with information about the exception that caused the command to fail, or a tuple of three <code>None</code> values if no exceptions have occurred. For some internally generated exceptions such as <code><a href="#CommandFailed">errors.CommandFailed</a></code>, <code>traceback</code> will be <code>None</code>.</dd>
+  <dt id="Command-command"><code>command</code> (string)</dt>
+  <dd>The command string produced from <code>args</code>, with special characters escaped in arguments so that the string is usable as a shell command. If <code>shell</code> is true, the shell command is returned unchanged. In either case, the string includes a <code>cd</code> command (if <code>cwd</code> is not <code>None</code>) and environment assignments (if <code>env</code> is not <code>None</code>).</dd>
+  <dt id="Command-args"><code>args</code> (list)</dt>
+  <dd>The value of <code>args</code> used to create the command.</dd>
+  <dt id="Command-message"><code>message</code> (string)</dt>
+  <dd>The value of <code>message</code> after interpolation, or <code>None</code> if there is no message.</dd>
+  <dt id="Command-shell"><code>shell</code> (boolean)</dt>
+  <dd>The value of <code>shell</code> used to create the command.</dd>
+  <dt id="Command-cwd"><code>cwd</code> (string)</dt>
+  <dd>The value of <code>cwd</code> used to create the command. Can be <code>None</code>.</dd>
+  <dt id="Command-env"><code>env</code> (dictionary)</dt>
+  <dd>The value of <code>env</code> used to create the command. Can be <code>None</code>.</dd>
+  <dt id="Command-output"><code>output</code> (list)</dt>
+  <dd>A list of output lines written by the command so far, in the chronological order. Each line is an object with the following properties:
+    <dl>
+      <dt id="Command-output-text"><code>text</code> (string)</dt>
+      <dd>The content of the line, without the terminating newline character.</dd>
+      <dt id="Command-output-stderr"><code>stderr</code> (boolean)</dt>
+      <dd>True if the line was written to the standard error, false if it was written to the standard output.</dd>
+    </dl>
+  </dd>
+</dl>
+<h3 id="goal">@goal (decorator)</h3>
+<p>Declares a flow as a <a href="introduction.html#goal">goal</a> that can be selected from the command line.</p>
+<p>The decorator should be used above the <a href="#flow">@flow</a> decorator. If the flow has more than one <a href="introduction.html#flow-variant">variant</a>, the decorator should be used on exactly one of them, does not matter which one.</p>
+<p>The decorator takes two mandatory positional arguments:</p>
+<dl>
+  <dt><code>name</code> (string)</dt>
+  <dd>The keyword that identifies this goal on the command line. Must be unique for every goal. Case-sensitive. Stick to printable ASCII.</dd>
+  <dt><code>desc</code> (string)</dt>
+  <dd>A one-line description of the goal that will appear in the help text.</dd>
+</dl>
+<p>In addition, any number of extra positional arguments is accepted, each describing a positional non-option <a href="introduction.html#goal-argument">goal argument</a> that can be specified on the command line and will translate into a <a href="introduction.html#node-parameter">node parameter</a>. Each such argument is a dictionary with the following entries:</p>
+<dl>
+  <dt><code>arg</code> (string)</dt>
+  <dd>The name of the node parameter to which this argument maps. This is the only mandatory entry in the dictionary.</dd>
+  <dt><code>help</code> (string)</dt>
+  <dd>A one-line description of the parameter that will appear in the help text.</dd>
+  <dt><code>default</code> (string or integer)</dt>
+  <dd>The default value to be used in case the argument is omitted from the command line. If <code>None</code> (the default), the argument is mandatory. A mandatory argument cannot follow an optional argument.</dd>
+  <dt><code>type</code> (string, default: <code>'string'</code>)</dt>
+  <dd>The type of the argument, either <code>'string'</code> or <code>'int'</code>.</dd>
+  <dt><code>metavar</code> (string, default: the value of <code>arg</code> in upper case)</dt>
+  <dd>The meta-variable that will be used to refer to the parameter in the help text, such as <code>FILE</code>.</dd>
+  <dt><code>value</code> (any type)</dt>
+  <dd>If this is specified (even if <code>None</code>), the argument merely specifies a hardcoded value for the node parameter to be used when instantiating the goal. Such an argument does not consume anything when parsing the command line, and is not mentioned in the help text.</dd>
+</dl>
+<p>If the goal's flow sets the <code>result</code> node parameter on <code>self</code> to a string, the string will be logged when the goal completes. This should include a one-line explanation of what has been done and where the output file(s) were placed.</p>
+<h2 id="configuration-subsystem">Configuration subsystem</h2>
+<p>The <a href="introduction.html#configuration-subsystem">configuration subsystem</a> resides in the <code>config</code> module. The system automatically makes the name <code><a href="#config">config</a></code> available in the global namespace in the context in which <a href="introduction.html#flow-file">flow files</a> are interpreted, and the names <code><a href="#config">config</a></code>, <code><a href="#default">default</a></code> (if available) and <code><a href="#option">option</a></code> in the global namespace in the context in which <a href="introduction.html#configuration-file">configuration files</a> are interpreted. User-defined code does not need to import this module explicitly.</p>
+<h3 id="configuration-file">Configuration file loading order</h3>
+<p>Loading order matters for configuration files: those loaded later override anything before them. Everything listed below, except for <code>platforms/flower/default.py</code>, is optional.</p>
+<ol>
+  <li><code>platforms/flower/default.py</code>;</li>
+  <li><code>module.build/conf.py</code> and <code>module.build/*.conf.py</code> in every module listed in a <code>readme.txt</code> file (sorted by the filename rather than module name, so a name like <code>00-gcc.conf.py</code> can be used to make sure the file is read before the files overriding its contents in other modules)</li>
+  <li>files listed in <code>config.confFiles</code> by any of the configuration files read so far, and by the configuration files read in this step, repeated until no files are listed that haven't been read before (each particular file is only ever read once); by default, this includes:
+  <ol>
+    <li><code>/etc/opera.conf.py</code>, <code>/usr/local/etc/opera.conf.py</code> (can be used to set options specific to a build server);</li>
+    <li>the file named by the <code>FLOWER_USER_CONF</code> environment variable, or <code>~/.opera.conf.py</code> by default (a user can set their preferred options here);</li>
+    <li><code>*.conf.py</code> at the top level of the source tree (a user can set per-checkout options here; listed in <code>.gitignore</code>);</li>
+  </ol></li>
+  <li>options specified on the command line are treated like a configuration file read at this point;</li>
+  <li>extra configuration files mentioned on the command line, and the files they list in <code>config.confFiles</code>.</li>
+</ol>
+<h3 id="config">config (object)</h3>
+<p>This global object is the primary entry point into the configuration subsystem.</p>
+<p>The object exposes a read-only property for every top-level configuration query defined in any of the configuration files read. Reading the property evaluates the query in the <a href="introduction.html#context">context</a> of the currently running flow. If several configuration files define the property, the most recently read one is selected.</p>
+<p>Evaluation of the property depends on how the configuration file defines it.</p>
+<dl>
+  <dt>Class</dt>
+  <dd>The class is returned after applying the same transformation to all its methods and properties whose names don't start with an underscore as described here for top-level properties.</dd>
+  <dt>Function</dt>
+  <dd>The function (or method of a <a href="introduction.html#configuration-object">configuration object</a>) is invoked. If the function declares keyword arguments, they receive the corresponding <a href="introduction.html#node-parameter">node parameters</a> from the current <a href="introduction.html#context">context</a>. If a keyword argument does not have a default value, the configuration query cannot be evaluated in a context without the corresponding node parameter. If the function uses the <code>**kwargs</code> syntax, all node parameters are passed to it.</dd>
+  <dt>Constant value</dt>
+  <dd>A deep copy of the value is returned. The copying makes sure that a mutable value such as a list is not modified.</dd>
+</dl>
+<p>In addition to the read-only properties for top-level configuration queries, the <code>config</code> object provides the following operators:</p>
+<dl>
+  <dt id="config-__call__"><code>()</code> (operator)</dt>
+  <dd>When invoked as a function with one or more keyword arguments, the <code>config</code> object returns a temporary object with a similar public interface, which answers configuration queries in the context modified by the specified arguments. Node parameters not modified in this way are left unchanged from the current context. This operation can be applied repeatedly. If one of the parameters specified in this way is named <code>softFallback</code>, and it is set to true, the temporary object will apply soft fallback logic when evaluating queries: if an exception is raised during evaluation, instead of failing, the previous overridden configuration function is used, and so on. The soft fallback logic does not apply to configuration class methods.</dd>
+  <dt id="config-__iadd__"><code>+=</code> (operator)</dt>
+  <dd>Add another configuration file, whose settings take precedence over those from any files added so far. The right-hand operand must be a callable or a Python file object. If a callable, it will be called with the dictionary representing the configuration file namespace as the only positional argument; it is expected to insert overrides into the dictionary just as loading a file would.</dd>
+</dl>
+<h3 id="default">default (object)</h3>
+<p>This global object is available to all configuration files except for the first one read. The interface is similar to that of <code><a href="#config">config</a></code>, except that the <code><a href="config-__iadd__">+=</a></code> operator is not available.</p>
+<p>The object answers configuration queries using only the configuration files read before the current one. The only purpose of <code>default</code> is to allow a function overriding a configuration query to access the value it overrides (typically to append items to a list). The <code>default</code> object should only be used to access the value being overridden, not to make any other configuration queries (use <code><a href="#config">config</a></code> for that).</p>
+<h3 id="option">@option (decorator)</h3>
+<p>Declares a configuration function as an <a href="introduction.html#option">option</a> that can be set from the command line.</p>
+<p>The decorator can only be used with a function, not with a class or a constant assignment.</p>
+<p>The decorator takes two mandatory positional arguments, <code>opt</code> and <code>desc</code>, and a number of optional keyword arguments:</p>
+<dl>
+  <dt><code>opt</code> (string or sequence of strings)</dt>
+  <dd>A string or a sequence of strings defining the command-line options. (A sequence is any container that has a length and is indexable.) The options can be short (a dash followed by one letter) or long (two dashes followed by a word). Case sensitive.</dd>
+  <dt><code>desc</code> (string)</dt>
+  <dd>A one-line description of the option that will appear in the help text.</dd>
+  <dt><code>value</code> (boolean, default: <code>None</code>)</dt>
+  <dd>For a boolean option, the value that this option sets when specified. Up to two <code>@option</code> decorators can be put on the same function with with different <code>value</code> arguments. The default behavior for a boolean option when <code>value</code> is not specified is that the option sets a true value, and the opposite option name is generated automatically (<code>--with-</code> is swapped for <code>--without-</code>, <code>--enable-</code> for <code>--disable-</code>, and <code>--no-</code> is added otherwise). Short options are not inverted. The inversion is not performed when <code>value</code> is specified.</dd>
+  <dt><code>default</code> (any type convertible to string, default: <code>None</code>)</dt>
+  <dd>The default value to display in the help text. This is only for documentation purposes and does not affect the actual default used when the option is not specified. The default behavior when <code>default</code> is not specified is to use the actual value obtained from reading the configuration files up to the point of parsing the command line.</dd>
+  <dt><code>metavar</code> (string, default: <code>None</code>)</dt>
+  <dd>The meta-variable that will be used to refer to the option's value in the help text, such as <code>FILE</code>. The default is <code>N</code> for integer options, <code>STRING</code> for strings and lists, and <code>KEY=VALUE</code> for dictionaries.</dd>
+  <dt><code>replace</code> (boolean, default: <code>False</code>)</dt>
+  <dd>Only for list or dictionary options. If true, the first use of the option on the command line clears the list or dictionary; subsequent uses add items to it. If false, every use of the option adds an item.</dd>
+</dl>
+<p>The type of the option is determined by its default value obtained from reading the configuration files up to the point of parsing the command line (soft fallback logic is used to evaluate the configuration queries for the purpose of obtaining defaults). The default should not be <code>None</code>. The allowed types are boolean, integer, string, dictionary mapping strings to strings, and list of strings. In the latter two cases, the option can be repeated on the command line to specify more list items or key-value pairs. If the value of a dictionary option does not contain a <code>=</code> character, the value of the key-value pair is set to <code>None</code>.</p>
+<h2 id="otree">otree (module)</h2>
+<p>The module exposes properties that describe the modules comprising the Opera source tree. The information is obtained by reading the <code>readme.txt</code> files.</p>
+<p>The module is automatically made available as the name <code>otree</code> in the global namespaces in the context of which the <a href="introduction#flow-file">flow files</a> and <a href="introduction.html#configuration-file">configuration files</a> are interpreted.</p>
+<h3 id="modsets">modsets (dictionary)</h3>
+<p>A read-only dictionary mapping the name of each module set (there are currently four: <code>modules</code>, <code>data</code>, <code>adjunct</code> and <code>platforms</code>) to a module set object with the following read-only properties:</p>
+<dl>
+  <dt id="modsets-name"><code>name</code> (string)</dt>
+  <dd>The name of the module set.</dd>
+  <dt id="modsets-modules"><code>modules</code> (dictionary)</dt>
+  <dd>A dictionary mapping the short name of each module in the set to a module object (see below).</dd>
+</dl>
+<h3 id="modules">modules (dictionary)</h3>
+<p>A dictionary mapping the full name of each module to a module object with the following read-only properties:</p>
+<dl>
+  <dt id="modules-name"><code>name</code> (string)</dt>
+  <dd>The short name of the module (not containing a slash).</dd>
+  <dt id="modules-fullname"><code>fullname</code> (string)</dt>
+  <dd>The full name of the module (the module set name, a slash, and the module name).</dd>
+  <dt id="modules-file"><code>file(name)</code></dt>
+  <dd>A method taking a file <code>name</code> relative to the module's directory, opening the file for reading and returning a Python file object or <code>None</code> if the file does not exist. Useful for reading optional files like <code>module.sources</code>.</dd>
+  <dt id="modules-glob"><code>glob(pattern)</code></dt>
+  <dd>A method taking a glob <code>pattern</code> relative to the module's directory and returning a list of files matching the pattern, also relative to the module's directory.</dd>
+</dl>
+<h2 id="util">util (module)</h2>
+<p>An assortment of useful functions and classes.</p>
+<p>The module is automatically made available as the name <code>util</code> in the global namespaces in the context of which the <a href="introduction#flow-file">flow files</a> and <a href="introduction.html#configuration-file">configuration files</a> are interpreted.</p>
+<h3 id="ensureList">ensureList(items)</h3>
+<p>The function checks whether <code>items</code> is a sequence other than a string, and if it isn't, wraps <code>items</code> in a single-element tuple, ensuring that the result is always a sequence. A sequence is any container that has a length and is indexable. If <code>items</code> is <code>None</code>, an empty tuple is returned.</p>
+<h3 id="touch">touch(file)</h3>
+<p>The function creates an empty file with the specified name or updates the last modification time of the existing file, imitating the UNIX <code>touch</code> command. The <code>file</code> argument can be the name of the file or a <code><a href="#Node">Node</a></code> whose <code>target</code> parameter names the file. The latter behavior was introduced especially so that you could write <code>touch(self)</code> in your flow code and maintain an innocent look on your face.</p>
+<h3 id="hasSuffix">hasSuffix(suffix)</h3>
+<p>Returns a matcher usable with the <code><a href="#flow">@flow</a></code> decorator that checks whether the value has the specified suffix.</p>
+<h3 id="hasPrefix">hasPrefix(prefix)</h3>
+<p>Returns a matcher usable with the <code><a href="#flow">@flow</a></code> decorator that checks whether the value has the specified prefix.</p>
+<h3 id="removeSuffix">removeSuffix(s, suffix)</h3>
+<p>Returns <code>s</code> with <code>suffix</code> removed from the end. Note that <code>s</code> must end with <code>suffix</code>, must be at least one character longer, and the character preceding the suffix must not be <code>/</code> (the function contains an assertion, but you should not rely on that check — use <code><a href="#hasSuffix">hasSuffix</a></code> first if you need to).</p>
+<h3 id="makeDirs">makeDirs(item, item, ...)</h3>
+<p>Any number of arguments can be specified. If an <code>item</code> is a string, treat it as a file path and create all its parent directories that do not yet exist, not including the final filename itself. If an <code>item</code> is a <a href="#Node">Node</a> object, it must have a <code>target</code> parameter, and that will be used as the file path.</p>
+<h3 id="readDepFile">readDepFile(filename)</h3>
+<p>Read the makefile snippet in the GNU make format and return a list of all dependencies mentioned there. Only a very limited subset of the makefile language is supported. No commands are allowed. Only one target can have prerequisites. The only supported substitutions are <code>$$</code> and <code>$(wildcard ...)</code>, implemented as in GNU make.</p>
+<p>Parse errors are logged and cause an empty list to be returned. If the file does not exist, or if None is passed instead of the file name, an empty list is returned as well.</p>
+<h3 id="runOnce">runOnce(command, input=None)</h3>
+<p>Runs the <code>command</code> (specified as a list of non-escaped arguments and invoked directly without a shell), optionally feeding the <code>input</code> string to its standard input, waits for its completion, and returns the text the command has written to the standard output. Only very short-lived and lightweight commands, such as <code>--version</code> checks, should be invoked this way. If the command fails to start, the OS exception will escape this function. If the command returns a non-zero exit code, <code><a href="#CommandFailed">errors.CommandFailed</a></code> will be raised.</p>
+<p>The result of successful invocation of a command is cached, and the same command won't be invoked twice with the same value of <code>input</code>.</p>
+<h3 id="readOnce">readOnce(filename)</h3>
+<p>Reads the specified text file and returns the list of lines in it. The contents of the file are cached, and the same file won't be read twice.</p>
+<h3 id="shellEscape">shellEscape(text)</h3>
+<p>Returns <code>text</code> with special characters escaped so that it appears as a single word under the POSIX shell syntax.</p>
+<h3 id="writeIfModified">writeIfModified(filename, text)</h3>
+<p>Write <code>text</code> to <code>file</code> unless the file exists and contains the very same text. An existing file will be overwritten. Directories containing the file will be created if they don't exist.</p>
+<h3 id="Library">Library (class)</h3>
+<p>The base class for <a href="introduction.html#configuration-object">configuration objects</a> representing libraries. All properties are read-only, and the lists and dictionaries they refer to must not be modified, either. This base class provides empty containers as fallback values for all properties.</p>
+<dl>
+  <dt id="Library-defines"><code>defines</code> (dictionary)</dt>
+  <dd>A dictionary that maps preprocessor macro names to the values they should be given when using the library. A name given value <code>None</code> will simply be defined, without specifying a value.</dd>
+  <dt id="Library-includePaths"><code>includePaths</code> (list)</dt>
+  <dd>A list of include paths to specify when using the library.</dd>
+  <dt id="Library-libraryPaths"><code>libraryPaths</code> (list)</dt>
+  <dd>A list of library paths to specify when using the library.</dd>
+  <dt id="Library-libraryNames"><code>libraryNames</code> (list)</dt>
+  <dd>A list of library names (without the <code>lib</code> prefix or any standard suffixes) to link with when using the library.</dd>
+</dl>
+<h3 id="StandardLibrary">StandardLibrary (class)</h3>
+<p>This class extends <a href="#Library">Library</a> and represents a library with a well-known name that does not need special configuration to be linked. An example of such a library is <code>pthread</code>.</p>
+<p>The constructor takes a single argument:</p>
+<dl>
+  <dt><code>name</code> (string)</dt>
+  <dd>The library name. This value ends up the only item in the library object's <code>libraryNames</code> list.</dd>
+</dl>
+<h3 id="PkgConfig">PkgConfig (class)</h3>
+<p>This class extends <a href="#Library">Library</a> and represents a library about which the <code>pkg-config</code> tool provides information.</p>
+<p>The constructor takes one mandatory positional argument, <code>name</code>, and a number of optional keyword arguments.</p>
+<dl>
+  <dt><code>name</code> (string)</dt>
+  <dd>The name of the library package to be passed to <code>pkg-config</code>.</dd>
+  <dt><code>link</code> (boolean, default: <code>True</code>)</dt>
+  <dd>If false, the library won't be linked, however, the include paths and preprocessor macros will be used.</dd>
+  <dt><code>pkgConfig</code> (string, default: <code>'pkg-config'</code>)</dt>
+  <dd>The name of the <code>pkg-config</code> tool to use.</dd>
+</dl>
+<h2 id="errors">errors (module)</h2>
+<p>Custom exception classes.</p>
+<p>The module is automatically made available as the name <code>errors</code> in the global namespaces in the context of which the <a href="introduction#flow-file">flow files</a> and <a href="introduction.html#configuration-file">configuration files</a> are interpreted.</p>
+<h3 id="AmbiguousMatch">AmbiguousMatch (exception)</h3>
+<p>Raised when instantiating a node or <a href="introduction.html#chaining">chaining</a> in case of a tie between two or more matching <a href="introduction.html#flow-variant">flow variants</a> with the highest priority (next highest, in case of chaining).</p>
+<p>Attributes:</p>
+<dl>
+  <dt id="AmbiguousMatch-name"><code>name</code> (string)</dt>
+  <dd>The name of the flow.</dd>
+  <dt id="AmbiguousMatch-attrs"><code>attrs</code> (dictionary)</dt>
+  <dd>The dictionary of <a href="introduction.html#node-parameter">node parameters</a> specified.</dd>
+</dl>
+<h3 id="NoMatch">NoMatch (exception)</h3>
+<p>Raised when instantiating a node or <a href="introduction.html#chaining">chaining</a> in case when no matching <a href="introduction.html#flow-variant">flow variants</a> are found.</p>
+<p>Attributes:</p>
+<dl>
+  <dt id="NoMatch-name"><code>name</code> (string)</dt>
+  <dd>The name of the flow.</dd>
+  <dt id="NoMatch-attrs"><code>attrs</code> (dictionary)</dt>
+  <dd>The dictionary of <a href="introduction.html#node-parameter">node parameters</a> specified.</dd>
+</dl>
+<h3 id="CommandFailed">CommandFailed (exception)</h3>
+<p>Raised when a <a href="#Command">command</a> fails to start or returns a non-zero exit code.</p>
+<dl>
+  <dt id="CommandFailed-command"><code>command</code> (<code><a href="#Command">Command</a></code>)</dt>
+  <dd>The <code><a href="#Command">Command</a></code> that failed.</dd>
+  <dt id="CommandFailed-error"><code>error</code> (object)</dt>
+  <dd>A tuple <code>(type, value, traceback)</code> (in the same format as returned by <code>sys.exc_info</code>) with information about the exception that was raised when the command failed to start, or a tuple of three <code>None</code> values if the command didn't fail to start, but rather returned a non-zero exit code.</dd>
+</dl>
+<h3 id="CircularDependency">CircularDependency (exception)</h3>
+<p>Raised when a node indirectly waits for its own completion.</p>
+<h3 id="BuildInterrupted">BuildInterrupted (exception)</h3>
+<p>Raised when the build is interrupted with a signal.</p>
+<p>Attributes:</p>
+<dl>
+  <dt id="BuildInterrupted-signal"><code>signal</code> (integer)</dt>
+  <dd>The signal with which the build was interrupted.</dd>
+</dl>
+<h3 id="CommandLineError">CommandLineError (exception)</h3>
+<p>Raised when parsing of the command-line arguments fails.</p>
+<h2 id="output">output (module)</h2>
+<p>Logging facilities.</p>
+<p>The module is automatically made available as the name <code>output</code> in the global namespaces in the context of which the <a href="introduction#flow-file">flow files</a> and <a href="introduction.html#configuration-file">configuration files</a> are interpreted.</p>
+<h3 id="Logger">Logger (class)</h3>
+<p>The base class for <a href="introduction.html#logger">loggers</a>. In the base class, all the methods below have dummy implementations that do nothing.</p>
+<dl>
+  <dt id="Logger-systemMessage"><code>systemMessage(text)</code></dt>
+  <dd>A sytem-wide event described by <code>text</code> has occurred. An example is a message about the time elapsed while building, which Flower issues before exiting.</dd>
+  <dt id="Logger-goalStarting"><code>goalStarting(goal)</code></dt>
+  <dd>The <a href="introduction.html#goal">Goal</a> <code>goal</code> (a <a href="#Node">Node</a> object) is starting.</dd>
+  <dt id="Logger-goalCompleted"><code>goalCompleted(goal)</code></dt>
+  <dd>The <a href="introduction.html#goal">Goal</a> <code>goal</code> (a <a href="#Node">Node</a> object) has completed successfully.</dd>
+  <dt id="Logger-goalFailed"><code>goalFailed(goal, errorList)</code></dt>
+  <dd>The <a href="introduction.html#goal">Goal</a> <code>goal</code> (a <a href="#Node">Node</a> object) has failed. <code>errorList</code> is a list of failed nodes, commands, and exceptions that are not related to any particular node or command.</dd>
+  <dt id="Logger-nodeStarting"><code>nodeStarting(node)</code></dt>
+  <dd>The flow of <code>node</code> is starting.</dd>
+  <dt id="Logger-nodeCompleted"><code>nodeCompleted(node)</code></dt>
+  <dd>The flow of <code>node</code> has completed successfully.</dd>
+  <dt id="Logger-nodeFailed"><code>nodeFailed(node)</code></dt>
+  <dd>The flow of <code>node</code> has failed.</dd>
+  <dt id="Logger-processStarting"><code>processStarting(process)</code></dt>
+  <dd>The command <code>process</code> is starting.</dd>
+  <dt id="Logger-processCompleted"><code>processCompleted(process)</code></dt>
+  <dd>The command <code>process</code> has completed successfully.</dd>
+  <dt id="Logger-processFailed"><code>processFailed(process)</code></dt>
+  <dd>The command <code>process</code> has failed.</dd>
+  <dt id="Logger-realtimeStdout"><code>realtimeStdout(process, text)</code></dt>
+  <dd>The command <code>process</code> has written <code>text</code> to its standard output. The text can contain several lines or just a part of a line. No newline characters are stripped from it.</dd>
+  <dt id="Logger-realtimeStderr"><code>realtimeStderr(process, text)</code></dt>
+  <dd>The command <code>process</code> has written <code>text</code> to its standard error. The text can contain several lines or just a part of a line. No newline characters are stripped from it.</dd>
+</dl>
+<h3 id="ConsoleLogger">ConsoleLogger (class)</h3>
+<p>A subclass of <code><a href="#Logger">Logger</a></code> providing real-time logging to the standard output and standard error. The constructor accepts the following arguments:</p>
+<dl>
+  <dt><code>colorize</code> (boolean)</dt>
+  <dd>Whether to colorize the output with ANSI control sequences (this is only performed if the outupt stream is a TTY).</dd>
+  <dt><code>echoMessage</code> (boolean)</dt>
+  <dd>Whether to print the <a href="#Command-message">progress messages</a> of commands that have them.</dd>
+  <dt><code>echoCommands</code> (boolean)</dt>
+  <dd>Whether to print the <a href="#Command-command">commands</a> that are about to be executed.</dd>
+  <dt><code>echoStdout</code> (boolean)</dt>
+  <dd>Whether to display the standard output of the invoked commands.</dd>
+  <dt><code>echoStderr</code> (boolean)</dt>
+  <dd>Whether to display the standard error of the invoked commands.</dd>
+</dl>
+<h3 id="FileLogger">FileLogger (class)</h3>
+<p>A subclass of <code><a href="#Logger">Logger</a></code> and a base class for file-based loggers.</p>
+<p>The constructor accepts two arguments:</p>
+<dl>
+  <dt><code>filename</code> (string)</dt>
+  <dd>The name of the log file to write into.</dd>
+  <dt><code>keep</code> (integer, default: 0)</dt>
+  <dd>The number of old log files to keep. The constructor rotates the existing files so that <code>build.log</code> becomes <code>build.log.1</code>, <code>build.log.1</code> becomes <code>build.log.2</code> and so on. If <code>keep</code> is 0, no old log files are kept, and the log file is truncated every time logging is started.</dd>
+</dl>
+<p>The class defines two internal methods to be used by subclasses:</p>
+<dl>
+  <dt id="FileLogger-_print"><code>_print(text)</code></dt>
+  <dd>Write <code>text</code> into the file.</dd>
+  <dt id="FileLogger-_println"><code>_println(text)</code></dt>
+  <dd>Write <code>text</code> and a newline character into the file.</dd>
+</dl>
+<h3 id="TextFileLogger">TextFileLogger (class)</h3>
+<p>A subclass of <code><a href="#TextFileLogger">TextFileLogger</a></code> providing logging into a text file.</p>
+<p>The standard output and standard error of each command are logged at the moment the command completes rather than in real time. This prevents intermixing of output when several commands run in parallel.</p>
+<h3 id="log">log (object)</h3>
+<p>A global object with a public interface similar to that of <code><a href="#Logger">Logger</a></code>. Invoking <code>Logger</code> methods on <code>output.log</code> makes all active loggers receive the events.</p>
+<p>In addition to the <code>Logger</code> methods, the object provides an operator:</p>
+<dl>
+  <dt id="log-__iadd__"><code>+=</code> (operator)</dt>
+  <dd>Accepts a <code><a href="#Logger">Logger</a></code> object on the right-hand side. Adds a new logger to the list of active loggers.</dd>
+</dl>
+</body>
+</html>

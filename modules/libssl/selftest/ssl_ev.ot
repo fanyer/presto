@@ -1,0 +1,219 @@
+/* -*- Mode: c++; tab-width: 4; indent-tabs-mode: t; c-basic-offset: 4 -*-
+**
+** Copyright (C) 2004-2006 Opera Software ASA.  All rights reserved.
+**
+** This file is part of the Opera web browser.  It may not be distributed
+** under any circumstances.
+**
+** Yngve N. Pettersen
+*/
+
+group "libssl EV load simple";
+
+require init;
+
+require _NATIVE_SSL_SUPPORT_;
+require SSL_CHECK_EXT_VALIDATION_POLICY;
+
+language c++;
+
+include "core/pch.h";
+
+include "modules/dochand/win.h";
+include "modules/dochand/docman.h";
+include "modules/doc/frm_doc.h";
+
+include "modules/url/url_man.h";
+include "modules/libssl/sslbase.h";
+include "modules/libssl/ssl_api.h";
+include "modules/libssl/options/sslopt.h";
+include "modules/network_selftest/urldoctestman.h";
+include "modules/util/opfile/opfile.h";
+include "modules/network_selftest/sslwincom.h";
+include "modules/network_selftest/ssl_waitupdate.h";
+
+global {
+
+#ifdef LIBSSL_AUTO_UPDATE
+	SSL_WaitForAutoUpdate update_waiter;
+#endif
+
+	class SSL_EV_Tester : public URL_DocSimpleTester
+	{
+	private:
+		int security_level_status;
+		
+	public:
+		SSL_EV_Tester(int EV_level) : security_level_status(EV_level){}
+		
+		virtual BOOL Verify_function(URL_DocSelfTest_Event event, Str::LocaleString status_code=Str::NOT_A_STRING)
+		{
+			switch(event)
+			{
+			case URLDocST_Event_Data_Received:
+				{
+					URLStatus status = (URLStatus) url.GetAttribute(URL::KLoadStatus,URL::KFollowRedirect);
+					
+					if(status == URL_LOADED)
+					{
+						int got_level = url.GetAttribute(URL::KSecurityStatus);
+						if(got_level < security_level_status)
+						{
+							ReportFailure("Wrong Security status Expected %d, got %d", security_level_status, got_level);
+							return FALSE;
+						}
+					}
+					else if(status != URL_LOADING)
+					{
+						ReportFailure("Some kind of loading failure %d.", status);
+						return FALSE;
+					}
+				}
+				return TRUE;
+			}
+			return URL_DocSimpleTester::Verify_function(event, status_code);
+		}	
+	
+	};
+
+	URL_DocSelfTest_Manager *libssl_tests = NULL;
+
+	class SimpleClientAuthListener 
+		: public BasicSSLWindowListener
+	{
+	public:
+		SimpleClientAuthListener (URL_DocSelfTest_Manager *manager, OpSSLListener *fallback)
+			: BasicSSLWindowListener(manager, fallback) {}
+
+		virtual ~SimpleClientAuthListener (){}
+		
+		virtual void OnCertificateBrowsingNeeded(OpWindowCommander* wic, SSLCertificateContext* context, SSLCertificateReason reason, SSLCertificateOption options)
+		{
+			if(context)
+			{
+				context->OnCertificateBrowsingDone(TRUE, SSL_CERT_OPTION_ACCEPT);
+				return;
+			}
+		
+			URL empty;
+			ReportFailure(empty,"Certificte dialog called when it should not have been");
+		}
+
+		virtual void OnSecurityPasswordNeeded(OpWindowCommander* wic, SSLSecurityPasswordCallback* callback)
+		{
+			if(callback)
+				callback->OnSecurityPasswordDone(FALSE, NULL, NULL);
+				
+			URL empty;
+			ReportFailure(empty,"Password dialog called when it should not have been");
+		}
+
+	};
+	SimpleClientAuthListener *listener = NULL;
+	WindowCommander *wc=NULL;
+}
+
+table url_list (const char *, int) 
+{
+  {"https://bugs.opera.com/static/100x105.gif", SECURITY_STATE_FULL},
+  {"https://www.dnbnor.no/portalfront/nor/images/gfx/logo.gif", SECURITY_STATE_FULL_EXTENDED},
+  {"https://online.citibank.com/JRS/cm/img/top_nav/logo.gif", SECURITY_STATE_FULL},
+  {"https://www.verisign.com/stellent/groups/public/documents/image/www_vrsn_logo.gif", SECURITY_STATE_FULL_EXTENDED},
+  {"https://www.entrust.net/images/entrust-ssl-certificates.gif",  SECURITY_STATE_FULL_EXTENDED},
+  {"https://t.oslo.opera.com/operalogo.png", SECURITY_STATE_FULL_EXTENDED}
+}
+
+html { "<html><body>Empty document, EV testing going on. A displayed certificate dialog is a failure.</body></html>" };
+
+setup 
+{
+	urlManager->RemoveSensitiveData();
+	if(g_ssl_api->CheckSecurityManager())
+		g_securityManager->Init(SSL_LOAD_ALL_STORES);
+
+	libssl_tests = OP_NEW(URL_DocSelfTest_Manager, ());
+}
+
+exit
+{
+	OP_DELETE(libssl_tests);
+	libssl_tests = NULL;
+
+	if(wc)
+	    wc->SetSSLListener(listener->GetFallback());
+	
+	OP_DELETE(listener);
+	listener = NULL;
+}
+
+test("Initialized")
+{
+	verify(libssl_tests != NULL);
+
+    wc = state.doc->GetWindow()->GetWindowCommander();
+    verify(wc != NULL);
+    listener = OP_NEW(SimpleClientAuthListener, (libssl_tests, wc->GetSSLListener()));
+    verify(listener != NULL);
+    wc->SetSSLListener(listener);
+}
+
+test("Check for updates")
+	require defined LIBSSL_AUTO_UPDATE;
+	require success "Initialized";
+	async;
+{
+	update_waiter.Activate();
+}
+
+subtest AddEVTest(URL_DocSelfTest_Batch *batch, const OpStringC8 &url, URL &ref_url, int security_level)
+{
+	verify(batch != NULL);
+
+	OpAutoPtr<SSL_EV_Tester> test(OP_NEW(SSL_EV_Tester, (security_level)));
+	verify(test.get() != NULL);
+
+	OpStringC8 empty("nop");
+	verify(OpStatus::IsSuccess(test->Construct(url, ref_url, empty)));
+
+	verify(batch->AddTestCase(test.release()));
+}
+
+subtest AddBatch(URL_DocSelfTest_Batch *batch)
+{
+	verify(batch != NULL);
+	verify(libssl_tests->AddBatch(batch));
+}
+
+subtest StartTestSet()
+{
+	verify(libssl_tests->SetLastBatch());
+}
+
+subtest Setup_SingleEVTest(const OpStringC8 &filename, URL &ref_url, int sec_level)
+{
+	OpAutoPtr<URL_DocSelfTest_Batch> batch(OP_NEW(URL_DocSelfTest_Batch, ()));
+
+	verify(batch.get() != NULL);
+	batch->Construct(state.doc->GetMessageHandler());
+
+	verify(AddEVTest(batch.get(), filename, ref_url, sec_level));
+
+	verify(!batch->Empty());
+
+	verify(AddBatch(batch.release()));
+}
+
+test("Load EV SSL URLs") async;
+{
+	URL ref_url;
+	iterate(url, sec_level) from url_list
+	{
+		if (!Setup_SingleEVTest(url, ref_url, sec_level))
+			ST_failed("Could not setup test %s", url);
+	}
+	if (!StartTestSet())
+		ST_failed("Could not start test set");
+}
+
+
+

@@ -1,0 +1,1632 @@
+group "search_engine.diskbtree";
+
+require SEARCH_ENGINE;
+
+include "modules/search_engine/BTree.h";
+include "modules/search_engine/SingleBTree.h";
+include "modules/search_engine/tests/test_util.h";
+include "modules/search_engine/Vector.h";
+include "modules/search_engine/RankIndex.h";
+
+global
+{
+class ShortShortCmp
+{
+public:
+	static BOOL LessThan(const void *l, const void *r)
+	{
+		return ((*(int *)l) & 0xFFFF) < ((*(int *)r) & 0xFFFF);
+	}
+};
+
+typedef UINT32 MessageUid;
+
+struct TImapUidKey
+{
+	int folder;
+	int uid;
+	MessageUid message_id;
+	BOOL operator<(const TImapUidKey& right) const
+	{
+		return (folder < right.folder || (folder == right.folder && uid < right.uid));
+	}
+};
+
+}
+
+test("binary size compatibility")
+{
+	verify(sizeof(RankId) == 8);
+	verify(sizeof(IdTime) == 8);
+}
+
+test("single disk B-Tree") leakcheck;
+	file uni dbtree_bt   "data/dbtree.bt";
+	file uni dbtree_bt_j "data/dbtree.bt-j";
+	file uni dbtree_log  "data/dbtree.log";
+{
+	const int random[8] = {1, 10, 3, 7, 14, 13, 6, 2};
+	const int drandom[8] = {1, 10, 3, 9, 14, 13, 6, 2};
+	TVector<int> input;
+	TPool<int> bp62;
+	TBTree<int> *b62 = NULL;
+	SearchIterator<int> *result62 = NULL;
+	BSCache::Item::DiskId id;
+	int i, j, value, count, max;
+	OP_STATUS status;
+
+	delete_file(dbtree_bt);
+	delete_file(dbtree_bt_j);
+#ifdef _DEBUG
+	delete_file(dbtree_log);
+#endif
+
+	status = bp62.Open(dbtree_bt, BlockStorage::OpenReadWrite);
+	verify_success(status);
+
+	b62 = bp62.CreateTree();
+
+	max = 2048;
+
+	for (i = 0; i < max; ++i)
+	{
+		verify_success(b62->Insert(i * random[i & 7]));
+		bp62.CheckCache();
+		verify_success(input.Add(i * random[i & 7]));
+	}
+
+	verify_success(bp62.Flush());
+	id = b62->GetId();
+
+	verify_success(input.Sort());
+
+	for (i = 0; i < max; ++i)
+	{
+		
+		verify_success(b62->Delete(i * drandom[i & 7]));
+		bp62.CheckCache();
+		j = input.Search(i * drandom[i & 7]);
+		if (input.Get(j) == i * drandom[i & 7])
+			input.Remove(j);
+	}
+
+	OP_DELETE(b62);
+	b62 = NULL;
+
+	bp62.CheckCache();
+
+	verify_success(bp62.Close());
+	verify_success(bp62.Open(dbtree_bt, BlockStorage::OpenRead));
+
+	b62 = bp62.GetTree(id);
+
+	result62 = b62->Search(0, operatorGE);
+
+	verify(result62 != NULL && result62->Count() != 0);
+
+	verify_success(input.Sort());
+
+	count = 1;
+
+	value = result62->Get();
+	while (result62->Next())
+	{
+		if (value >= result62->Get() || value != input.Get(count - 1))
+		{
+			i = input.Get(count - 1);
+		}
+		verify(value < result62->Get());
+		verify(value == input.Get(count - 1));
+		value = result62->Get();
+		++count;
+	}
+
+	verify(count == (int)input.GetCount());
+
+	if (result62 != NULL)
+		OP_DELETE(result62);
+
+	bp62.CheckCache();
+
+	if (b62 != NULL)
+		OP_DELETE(b62);
+
+	verify_success(bp62.Close());
+
+	delete_file(dbtree_bt);
+#ifdef _DEBUG
+	delete_file(dbtree_log);
+#endif
+}
+
+
+test("disk B-Tree delete") leakcheck;
+	file uni dbtreed_bt   "data/dbtreed.bt";
+	file uni dbtreed_bt_j "data/dbtreed.bt-j";
+	file uni dbtreed_log  "data/dbtreed.log";
+{
+#define MAX_NUM 16384
+
+	OpINT32Vector input;
+	TPool<int> bp;
+	TBTree<int> *bt;
+	SearchIterator<int> *result = NULL;
+	int i, count = -1;
+	OP_STATUS status;
+
+	delete_file(dbtreed_bt);
+	delete_file(dbtreed_bt_j);
+#ifdef _DEBUG
+	delete_file(dbtreed_log);
+#endif
+
+	status = bp.Open(dbtreed_bt, BlockStorage::OpenReadWrite, 128);
+	verify_success(status);
+
+	bt = bp.CreateTree();
+
+	for (i = 0; i < MAX_NUM; ++i)
+	{
+		verify_success(bt->Insert(i));
+		bp.CheckCache();
+	}
+
+	verify_success(bp.Flush());
+
+	for (i = 0; i < MAX_NUM; ++i)
+	{
+		verify_success(bt->Delete(i));
+		bp.CheckCache();
+	}
+
+	result = bt->SearchFirst();
+	if (result != NULL)
+		count = result->Count();
+
+	OP_DELETE(result);
+
+	OP_DELETE(bt);
+
+	verify_success(bp.Close());
+
+	delete_file(dbtreed_bt);
+
+	verify(result != NULL && count == 0);
+}
+
+test("disk B-Tree w/FlushJournal") leakcheck;
+	file uni dbtree_bt   "data/dbtree.bt";
+	file uni dbtree_bt_j "data/dbtree.bt-j";
+	file uni dbtree_bt_g "data/dbtree.bt-g";
+{
+	const int random[8] = {1, 10, 3, 7, 14, 13, 6, 2};
+	TPool<int> bp62;
+	TBTree<int> *b62;
+	OpFileLength jsize1, jsize2;
+	OpLowLevelFile *f;
+	int i;
+	OP_STATUS status;
+
+	delete_file(dbtree_bt);
+	delete_file(dbtree_bt_j);
+	delete_file(dbtree_bt_g);
+
+	status = bp62.Open(dbtree_bt, BlockStorage::OpenReadWrite);
+	verify_success(status);
+
+	bp62.SetNURFlush(FALSE);
+
+	b62 = bp62.CreateTree();
+
+	for (i = 0; i < 2048; ++i)
+	{
+		verify_success(b62->Insert(i * random[i & 7]));
+		bp62.CheckCache();
+	}
+
+	verify_success(bp62.Flush(BSCache::JournalAll));
+
+	OpLowLevelFile::Create(&f, dbtree_bt_j);
+	status = f->GetFileLength(&jsize1);
+
+	verify_success(bp62.Flush());
+
+	if (OpStatus::IsSuccess(status))
+		status = f->GetFileLength(&jsize2);
+	else
+		jsize2 = 0;
+
+	OP_DELETE(f);
+	OP_DELETE(b62);
+	b62 = NULL;
+
+	verify_success(bp62.Close());
+
+	delete_file(dbtree_bt);
+
+	verify_success(status);
+	verify(jsize1 == jsize2);
+}
+
+test("insert sorted")
+	file uni dbtree_bt   "data/dbtree.bt";
+	file uni dbtree_bt_j "data/dbtree.bt-j";
+	file uni dbtree_bt_g "data/dbtree.bt-g";
+{
+	TPool<int> pool;
+	TBTree<int> *b1 = NULL, *b2 = NULL;
+	TVector<int> v1, v2;
+	SearchIterator<int> *it1 = NULL, *it2 = NULL;
+	int i;
+	OP_STATUS status;
+
+	delete_file(dbtree_bt);
+	delete_file(dbtree_bt_j);
+	delete_file(dbtree_bt_g);
+
+	status = pool.Open(dbtree_bt, BlockStorage::OpenReadWrite, 256);
+	verify_success(status);
+
+	for (i = 0; i < 256; ++i)
+	{
+		verify_success(v1.Insert(i));
+		verify_success(v2.Insert(i * 2));
+	}
+
+	b1 = pool.CreateTree();
+	b2 = pool.CreateTree();
+
+	for (i = 0; i < 128; ++i)
+	{
+		verify_success(b1->Insert(v1[i]));
+		verify_success(b2->Insert(v2[i]));
+	}
+
+	verify_success(pool.Commit());
+
+	for (i = 128; i < 256; ++i)
+	{
+		verify_success(b1->Insert(v1[i]));
+		verify_success(b2->Insert(v2[i]));
+	}
+
+	it1 = b1->Search(0, operatorGE);
+	it2 = b2->Search(0, operatorGE);
+
+	verify(it1 != NULL && !it1->End());
+	verify(it2 != NULL && !it2->End());
+
+	for (i = 0; i < 255; ++i)
+	{
+		verify(it1->Get() == v1[i]);
+		verify(it2->Get() == v2[i]);
+
+		verify(it1->Next());
+		verify(it2->Next());
+	}
+
+	verify(it1->Get() == v1[i]);
+	verify(it2->Get() == v2[i]);
+
+	verify(!it1->Next());
+	verify(!it2->Next());
+
+	verify(pool.CheckConsistency() == OpBoolean::IS_TRUE);
+
+	if (it1 != NULL)
+		OP_DELETE(it1);
+	if (it2 != NULL)
+		OP_DELETE(it2);
+
+	if (b1 != NULL)
+		OP_DELETE(b1);
+	if (b2 != NULL)
+		OP_DELETE(b2);
+
+	verify_success(pool.Close());
+	delete_file(dbtree_bt);
+}
+
+test("insert backward sorted")
+	file uni dbtree_bt   "data/dbtree.bt";
+	file uni dbtree_bt_j "data/dbtree.bt-j";
+	file uni dbtree_bt_g "data/dbtree.bt-g";
+{
+	TPool<int> pool;
+	TBTree<int> *b1 = NULL, *b2 = NULL;
+	TVector<int> v1, v2;
+	SearchIterator<int> *it1 = NULL, *it2 = NULL;
+	int i;
+	OP_STATUS status;
+
+	delete_file(dbtree_bt);
+	delete_file(dbtree_bt_j);
+	delete_file(dbtree_bt_g);
+
+	status = pool.Open(dbtree_bt, BlockStorage::OpenReadWrite, 256);
+	verify_success(status);
+
+	for (i = 255; i >= 0; --i)
+	{
+		verify_success(v1.Insert(i));
+		verify_success(v2.Insert(i * 2));
+	}
+
+	b1 = pool.CreateTree();
+	b2 = pool.CreateTree();
+
+	for (i = 0; i < 128; ++i)
+	{
+		verify_success(b1->Insert(v1[i]));
+		verify_success(b2->Insert(v2[i]));
+	}
+
+	verify_success(pool.Commit());
+
+	for (i = 128; i < 256; ++i)
+	{
+		verify_success(b1->Insert(v1[i]));
+		verify_success(b2->Insert(v2[i]));
+	}
+
+	it1 = b1->Search(0, operatorGE);
+	it2 = b2->Search(0, operatorGE);
+
+	verify(it1 != NULL && !it1->End());
+	verify(it2 != NULL && !it2->End());
+
+	verify_success(v1.Sort());
+	verify_success(v2.Sort());
+
+	for (i = 0; i < 255; ++i)
+	{
+		verify(it1->Get() == v1[i]);
+		verify(it2->Get() == v2[i]);
+
+		verify(it1->Next());
+		verify(it2->Next());
+	}
+
+	verify(it1->Get() == v1[i]);
+	verify(it2->Get() == v2[i]);
+
+	verify(!it1->Next());
+	verify(!it2->Next());
+
+	verify(pool.CheckConsistency() == OpBoolean::IS_TRUE);
+
+	if (it1 != NULL)
+		OP_DELETE(it1);
+	if (it2 != NULL)
+		OP_DELETE(it2);
+
+	if (b1 != NULL)
+		OP_DELETE(b1);
+	if (b2 != NULL)
+		OP_DELETE(b2);
+
+	verify_success(pool.Close());
+	delete_file(dbtree_bt);
+}
+
+test("insert unsorted paralel")
+	file uni dbtree_bt   "data/dbtree.bt";
+	file uni dbtree_bt_j "data/dbtree.bt-j";
+	file uni dbtree_bt_g "data/dbtree.bt-g";
+{
+	TPool<int> pool;
+	TBTree<int> *b1 = NULL, *b2 = NULL;
+	TVector<int> v1, v2;
+	SearchIterator<int> *it1 = NULL, *it2 = NULL;
+	int i;
+	OP_STATUS status;
+
+	delete_file(dbtree_bt);
+	delete_file(dbtree_bt_j);
+	delete_file(dbtree_bt_g);
+
+	status = pool.Open(dbtree_bt, BlockStorage::OpenReadWrite, 256);
+	verify_success(status);
+
+	for (i = 0; i < 256; ++i)
+	{
+		verify_success(v1.Insert(i ^ 0xAA));
+		verify_success(v2.Insert((i ^ 0xAA) * 2));
+	}
+
+	b1 = pool.CreateTree();
+	b2 = pool.CreateTree();
+
+	for (i = 0; i < 128; ++i)
+	{
+		verify_success(b1->Insert(v1[i]));
+		verify_success(b2->Insert(v2[i]));
+	}
+
+	verify_success(pool.Commit());
+
+	for (i = 128; i < 256; ++i)
+	{
+		verify_success(b1->Insert(v1[i]));
+		verify_success(b2->Insert(v2[i]));
+	}
+
+	it1 = b1->Search(0, operatorGE);
+	it2 = b2->Search(0, operatorGE);
+
+	verify(it1 != NULL && !it1->End());
+	verify(it2 != NULL && !it2->End());
+
+	verify_success(v1.Sort());
+	verify_success(v2.Sort());
+
+	for (i = 0; i < 255; ++i)
+	{
+		verify(it1->Get() == v1[i]);
+		verify(it2->Get() == v2[i]);
+
+		verify(it1->Next());
+		verify(it2->Next());
+	}
+
+	verify(it1->Get() == v1[i]);
+	verify(it2->Get() == v2[i]);
+
+	verify(!it1->Next());
+	verify(!it2->Next());
+
+	verify(pool.CheckConsistency() == OpBoolean::IS_TRUE);
+
+	if (it1 != NULL)
+		OP_DELETE(it1);
+	if (it2 != NULL)
+		OP_DELETE(it2);
+
+	if (b1 != NULL)
+		OP_DELETE(b1);
+	if (b2 != NULL)
+		OP_DELETE(b2);
+
+	verify_success(pool.Close());
+	delete_file(dbtree_bt);
+}
+
+test("insert unsorted serial")
+	file uni dbtree_bt   "data/dbtree.bt";
+	file uni dbtree_bt_j "data/dbtree.bt-j";
+	file uni dbtree_bt_g "data/dbtree.bt-g";
+{
+	TPool<int> pool;
+	TBTree<int> *b1 = NULL, *b2 = NULL;
+	TVector<int> v1, v2;
+	SearchIterator<int> *it1 = NULL, *it2 = NULL;
+	int i;
+	OP_STATUS status;
+
+	delete_file(dbtree_bt);
+	delete_file(dbtree_bt_j);
+	delete_file(dbtree_bt_g);
+
+	status = pool.Open(dbtree_bt, BlockStorage::OpenReadWrite, 256);
+	verify_success(status);
+
+	for (i = 0; i < 256; ++i)
+	{
+		verify_success(v1.Insert(i ^ 0xAA));
+		verify_success(v2.Insert((i ^ 0xAA) * 2));
+	}
+
+	b1 = pool.CreateTree();
+	b2 = pool.CreateTree();
+
+	for (i = 0; i < 128; ++i)
+		verify_success(b1->Insert(v1[i]));
+
+	for (i = 0; i < 128; ++i)
+		verify_success(b2->Insert(v2[i]));
+
+	verify_success(pool.Commit());
+
+	for (i = 128; i < 256; ++i)
+		verify_success(b1->Insert(v1[i]));
+
+	for (i = 128; i < 256; ++i)
+		verify_success(b2->Insert(v2[i]));
+
+	it1 = b1->Search(0, operatorGE);
+	it2 = b2->Search(0, operatorGE);
+
+	verify(it1 != NULL && !it1->End());
+	verify(it2 != NULL && !it2->End());
+
+	verify_success(v1.Sort());
+	verify_success(v2.Sort());
+
+	for (i = 0; i < 255; ++i)
+	{
+		verify(it1->Get() == v1[i]);
+		verify(it2->Get() == v2[i]);
+
+		verify(it1->Next());
+		verify(it2->Next());
+	}
+
+	verify(it1->Get() == v1[i]);
+	verify(it2->Get() == v2[i]);
+
+	verify(!it1->Next());
+	verify(!it2->Next());
+
+	verify(pool.CheckConsistency() == OpBoolean::IS_TRUE);
+
+	if (it1 != NULL)
+		OP_DELETE(it1);
+	if (it2 != NULL)
+		OP_DELETE(it2);
+
+	if (b1 != NULL)
+		OP_DELETE(b1);
+	if (b2 != NULL)
+		OP_DELETE(b2);
+
+	verify_success(pool.Close());
+	delete_file(dbtree_bt);
+}
+
+test("insert duplicates")
+	file uni dbtree_bt   "data/dbtree.bt";
+	file uni dbtree_bt_j "data/dbtree.bt-j";
+	file uni dbtree_bt_g "data/dbtree.bt-g";
+{
+	TPool<int> pool;
+	TBTree<int> *b1 = NULL, *b2 = NULL;
+	TVector<int> v1, v2;
+	SearchIterator<int> *it1 = NULL, *it2 = NULL;
+	int i;
+	OP_STATUS status;
+
+	delete_file(dbtree_bt);
+	delete_file(dbtree_bt_j);
+	delete_file(dbtree_bt_g);
+
+	status = pool.Open(dbtree_bt, BlockStorage::OpenReadWrite, 256);
+	verify_success(status);
+
+	for (i = 0; i < 256; ++i)
+	{
+		verify_success(v1.Insert(i ^ 0xAA));
+		verify_success(v2.Insert((i ^ 0xAA) * 2));
+	}
+
+	b1 = pool.CreateTree();
+	b2 = pool.CreateTree();
+
+	for (i = 0; i < 256; ++i)
+	{
+		verify_success(b1->Insert(v1[i]));
+		verify_success(b2->Insert(v2[i]));
+	}
+
+	for (i = 0; i < 128; ++i)
+	{
+		verify_success(b1->Insert(v1[i]));
+		verify_success(b2->Insert(v2[i]));
+	}
+
+	verify_success(pool.Commit());
+
+	for (i = 0; i < 128; ++i)
+	{
+		verify_success(b1->Insert(v1[i]));
+		verify_success(b2->Insert(v2[i]));
+	}
+
+	verify_success(pool.Commit());
+
+	for (i = 128; i < 256; ++i)
+	{
+		verify_success(b1->Insert(v1[i]));
+		verify_success(b2->Insert(v2[i]));
+	}
+
+	it1 = b1->Search(0, operatorGE);
+	it2 = b2->Search(0, operatorGE);
+
+	verify(it1 != NULL && !it1->End());
+	verify(it2 != NULL && !it2->End());
+
+	verify_success(v1.Sort());
+	verify_success(v2.Sort());
+
+	for (i = 0; i < 255; ++i)
+	{
+		verify(it1->Get() == v1[i]);
+		verify(it2->Get() == v2[i]);
+
+		verify(it1->Next());
+		verify(it2->Next());
+	}
+
+	verify(it1->Get() == v1[i]);
+	verify(it2->Get() == v2[i]);
+
+	verify(!it1->Next());
+	verify(!it2->Next());
+
+	verify(pool.CheckConsistency() == OpBoolean::IS_TRUE);
+
+	if (it1 != NULL)
+		OP_DELETE(it1);
+	if (it2 != NULL)
+		OP_DELETE(it2);
+
+	if (b1 != NULL)
+		OP_DELETE(b1);
+	if (b2 != NULL)
+		OP_DELETE(b2);
+
+	verify_success(pool.Close());
+	delete_file(dbtree_bt);
+}
+
+test("insert and empty on disk")
+	file uni dbtree_bt   "data/dbtree.bt";
+	file uni dbtree_bt_j "data/dbtree.bt-j";
+	file uni dbtree_bt_g "data/dbtree.bt-g";
+{
+	TPool<int> pool;
+	TBTree<int> *b1 = NULL, *b2 = NULL;
+	TVector<int> v1, v2;
+	SearchIterator<int> *it1 = NULL, *it2 = NULL;
+	int i;
+	OP_STATUS status;
+
+	delete_file(dbtree_bt);
+	delete_file(dbtree_bt_j);
+	delete_file(dbtree_bt_g);
+
+	status = pool.Open(dbtree_bt, BlockStorage::OpenReadWrite, 256);
+	verify_success(status);
+
+	for (i = 0; i < 256; ++i)
+	{
+		verify_success(v1.Insert(i ^ 0xAA));
+		verify_success(v2.Insert((i ^ 0xAA) * 2));
+	}
+
+	b1 = pool.CreateTree();
+	b2 = pool.CreateTree();
+
+	for (i = 0; i < 128; ++i)
+	{
+		verify_success(b1->Insert(v1[i]));
+		verify_success(b2->Insert(v2[i]));
+	}
+
+	verify_success(pool.Commit());
+
+	for (i = 128; i < 256; ++i)
+	{
+		verify_success(b1->Insert(v1[i]));
+		verify_success(b2->Insert(v2[i]));
+	}
+
+	verify_success(v1.Sort());
+	verify_success(v2.Sort());
+
+
+	for (i = 0; i < 256; ++i)
+	{
+		verify_success(b1->Delete(v1[i]));
+		verify_success(b2->Delete(v2[i]));
+	}
+
+	it1 = b1->Search(0, operatorGE);
+
+	verify_success(pool.Commit());
+
+	it2 = b2->Search(0, operatorGE);
+
+	verify(it1 != NULL);
+	verify(it2 != NULL);
+
+	verify(it1->End());
+	verify(it2->End());
+
+	verify(pool.CheckConsistency() == OpBoolean::IS_TRUE);
+
+	if (it1 != NULL)
+		OP_DELETE(it1);
+	if (it2 != NULL)
+		OP_DELETE(it2);
+
+	if (b1 != NULL)
+		OP_DELETE(b1);
+	if (b2 != NULL)
+		OP_DELETE(b2);
+
+	verify_success(pool.Close());
+	delete_file(dbtree_bt);
+}
+
+test("insert and empty in cache")
+	file uni dbtree_bt   "data/dbtree.bt";
+	file uni dbtree_bt_j "data/dbtree.bt-j";
+	file uni dbtree_bt_g "data/dbtree.bt-g";
+{
+	TPool<int> pool;
+	TBTree<int> *b1 = NULL, *b2 = NULL;
+	TVector<int> v1, v2;
+	SearchIterator<int> *it1 = NULL, *it2 = NULL;
+	int i;
+	OP_STATUS status;
+
+	delete_file(dbtree_bt);
+	delete_file(dbtree_bt_j);
+	delete_file(dbtree_bt_g);
+
+	status = pool.Open(dbtree_bt, BlockStorage::OpenReadWrite, 256);
+	verify_success(status);
+
+	for (i = 0; i < 256; ++i)
+	{
+		verify_success(v1.Insert(i ^ 0xAA));
+		verify_success(v2.Insert((i ^ 0xAA) * 2));
+	}
+
+	b1 = pool.CreateTree();
+	b2 = pool.CreateTree();
+
+	for (i = 64; i < 192; ++i)
+	{
+		verify_success(b1->Insert(v1[i]));
+		verify_success(b2->Insert(v2[i]));
+	}
+
+	verify_success(v1.Sort());
+	verify_success(v2.Sort());
+
+	for (i = 0; i < 256; ++i)
+	{
+		verify_success(b1->Delete(v1[i]));
+		verify_success(b2->Delete(v2[i]));
+	}
+
+	it1 = b1->Search(0, operatorGE);
+
+	verify_success(pool.Commit());
+
+	it2 = b2->Search(0, operatorGE);
+
+	verify(it1 != NULL);
+	verify(it2 != NULL);
+
+	verify(it1->End());
+	verify(it2->End());
+
+	verify(pool.CheckConsistency() == OpBoolean::IS_TRUE);
+
+	if (it1 != NULL)
+		OP_DELETE(it1);
+	if (it2 != NULL)
+		OP_DELETE(it2);
+
+	if (b1 != NULL)
+		OP_DELETE(b1);
+	if (b2 != NULL)
+		OP_DELETE(b2);
+
+	verify_success(pool.Close());
+	delete_file(dbtree_bt);
+}
+
+test("delete in cache")
+	file uni dbtree_bt   "data/dbtree.bt";
+	file uni dbtree_bt_j "data/dbtree.bt-j";
+	file uni dbtree_bt_g "data/dbtree.bt-g";
+{
+	TPool<int> pool;
+	TBTree<int> *b1 = NULL, *b2 = NULL;
+	TVector<int> v1, v2;
+	SearchIterator<int> *it1 = NULL, *it2 = NULL;
+	int i;
+	OP_STATUS status;
+
+	delete_file(dbtree_bt);
+	delete_file(dbtree_bt_j);
+	delete_file(dbtree_bt_g);
+
+	status = pool.Open(dbtree_bt, BlockStorage::OpenReadWrite, 256);
+	verify_success(status);
+
+	for (i = 0; i < 256; ++i)
+	{
+		verify_success(v1.Insert(i ^ 0xAA));
+		verify_success(v2.Insert((i ^ 0xAA) * 2));
+	}
+
+	b1 = pool.CreateTree();
+	b2 = pool.CreateTree();
+
+	for (i = 0; i < 256; ++i)
+	{
+		verify_success(b1->Insert(v1[i]));
+		verify_success(b2->Insert(v2[i]));
+	}
+
+	for (i = 0; i < 256; ++i)
+		v1[i] = v1[i] ^ 0x55;
+
+	for (i = 127; i >= 64; --i)
+	{
+		verify_success(b1->Delete(v1[i * 2]));
+		verify_success(b2->Delete(v2[i * 2]));
+		v1.Delete(i * 2);
+		v2.Delete(i * 2);
+	}
+
+	for (i = 63; i >= 0; --i)
+	{
+		verify_success(b1->Delete(v1[i * 2]));
+		verify_success(b2->Delete(v2[i * 2]));
+		v1.Delete(i * 2);
+		v2.Delete(i * 2);
+	}
+
+	verify_success(pool.Commit());
+
+	it1 = b1->Search(0, operatorGE);
+	it2 = b2->Search(0, operatorGE);
+
+	verify(it1 != NULL && !it1->End());
+	verify(it2 != NULL && !it2->End());
+
+	verify_success(v1.Sort());
+	verify_success(v2.Sort());
+
+	for (i = 0; i < 127; ++i)
+	{
+		verify(it1->Get() == v1[i]);
+		verify(it2->Get() == v2[i]);
+
+		verify(it1->Next());
+		verify(it2->Next());
+	}
+
+	verify(it1->Get() == v1[i]);
+	verify(it2->Get() == v2[i]);
+
+	verify(!it1->Next());
+	verify(!it2->Next());
+
+	verify(pool.CheckConsistency() == OpBoolean::IS_TRUE);
+
+	if (it1 != NULL)
+		OP_DELETE(it1);
+	if (it2 != NULL)
+		OP_DELETE(it2);
+
+	if (b1 != NULL)
+		OP_DELETE(b1);
+	if (b2 != NULL)
+		OP_DELETE(b2);
+
+	verify_success(pool.Close());
+	delete_file(dbtree_bt);
+}
+
+test("delete on disk and in cache")
+	file uni dbtree_bt   "data/dbtree.bt";
+	file uni dbtree_bt_j "data/dbtree.bt-j";
+	file uni dbtree_bt_g "data/dbtree.bt-g";
+{
+	TPool<int> pool;
+	TBTree<int> *b1 = NULL, *b2 = NULL;
+	TVector<int> v1, v2;
+	SearchIterator<int> *it1 = NULL, *it2 = NULL;
+	int i;
+	OP_STATUS status;
+
+	delete_file(dbtree_bt);
+	delete_file(dbtree_bt_j);
+	delete_file(dbtree_bt_g);
+
+	status = pool.Open(dbtree_bt, BlockStorage::OpenReadWrite, 256);
+	verify_success(status);
+
+	for (i = 0; i < 256; ++i)
+	{
+		verify_success(v1.Insert(i ^ 0xAA));
+		verify_success(v2.Insert((i ^ 0xAA) * 2));
+	}
+
+	b1 = pool.CreateTree();
+	b2 = pool.CreateTree();
+
+	for (i = 0; i < 256; ++i)
+	{
+		verify_success(b1->Insert(v1[i]));
+		verify_success(b2->Insert(v2[i]));
+	}
+
+	verify_success(pool.Commit());
+
+	for (i = 0; i < 256; ++i)
+		v1[i] = v1[i] ^ 0x55;
+
+	for (i = 127; i >= 64; --i)
+	{
+		verify_success(b1->Delete(v1[i * 2]));
+		verify_success(b2->Delete(v2[i * 2]));
+		v1.Delete(i * 2);
+		v2.Delete(i * 2);
+	}
+
+	verify_success(pool.Commit());
+
+	for (i = 63; i >= 0; --i)
+	{
+		verify_success(b1->Delete(v1[i * 2]));
+		verify_success(b2->Delete(v2[i * 2]));
+		v1.Delete(i * 2);
+		v2.Delete(i * 2);
+	}
+
+	it1 = b1->Search(0, operatorGE);
+	it2 = b2->Search(0, operatorGE);
+
+	verify(it1 != NULL && !it1->End());
+	verify(it2 != NULL && !it2->End());
+
+	verify_success(v1.Sort());
+	verify_success(v2.Sort());
+
+	for (i = 0; i < 127; ++i)
+	{
+		verify(it1->Get() == v1[i]);
+		verify(it2->Get() == v2[i]);
+
+		verify(it1->Next());
+		verify(it2->Next());
+	}
+
+	verify(it1->Get() == v1[i]);
+	verify(it2->Get() == v2[i]);
+
+	verify(!it1->Next());
+	verify(!it2->Next());
+
+	verify(pool.CheckConsistency() == OpBoolean::IS_TRUE);
+
+	if (it1 != NULL)
+		OP_DELETE(it1);
+	if (it2 != NULL)
+		OP_DELETE(it2);
+
+	if (b1 != NULL)
+		OP_DELETE(b1);
+	if (b2 != NULL)
+		OP_DELETE(b2);
+
+	verify_success(pool.Close());
+	delete_file(dbtree_bt);
+}
+
+test("update")
+	file uni dbtree_bt   "data/dbtree.bt";
+	file uni dbtree_bt_j "data/dbtree.bt-j";
+	file uni dbtree_bt_g "data/dbtree.bt-g";
+{
+	TPool<int> pool(&ShortShortCmp::LessThan);
+	TBTree<int> *b1 = NULL, *b2 = NULL;
+	TVector<int> v1(&ShortShortCmp::LessThan), v2(&ShortShortCmp::LessThan);
+	SearchIterator<int> *it1 = NULL, *it2 = NULL;
+	int i;
+	OP_STATUS status;
+
+	delete_file(dbtree_bt);
+	delete_file(dbtree_bt_j);
+	delete_file(dbtree_bt_g);
+
+	status = pool.Open(dbtree_bt, BlockStorage::OpenReadWrite, 256);
+	verify_success(status);
+
+	for (i = 0; i < 256; ++i)
+	{
+		verify_success(v1.Insert(i ^ 0xAA));
+		verify_success(v2.Insert((i ^ 0xAA) * 2));
+	}
+
+	b1 = pool.CreateTree();
+	b2 = pool.CreateTree();
+
+	for (i = 0; i < 128; ++i)
+	{
+		verify_success(b1->Insert(v1[i]));
+		verify_success(b2->Insert(v2[i]));
+	}
+
+	verify_success(pool.Commit());
+
+	for (i = 128; i < 256; ++i)
+	{
+		verify_success(b1->Insert(v1[i]));
+		verify_success(b2->Insert(v2[i]));
+	}
+
+	it1 = b1->Search(0, operatorGE);
+	it2 = b2->Search(0, operatorGE);
+
+	verify(it1 != NULL && !it1->End());
+	verify(it2 != NULL && !it2->End());
+
+	verify_success(v1.Sort());
+	verify_success(v2.Sort());
+
+	for (i = 0; i < 128; ++i)
+	{
+		verify_success(b1->Insert(v1[i * 2] | 0x10000, TRUE));
+		verify_success(b2->Insert(v2[i * 2] | 0x10000, TRUE));
+	}
+
+	verify_success(pool.Commit());
+
+	for (i = 0; i < 255; ++i)
+	{
+		verify(it1->Get() == (v1[i] | ((i & 1 ^ 1) << 16)));
+		verify(it2->Get() == (v2[i] | ((i & 1 ^ 1) << 16)));
+
+		verify(it1->Next());
+		verify(it2->Next());
+	}
+
+	verify(it1->Get() == (v1[i] | ((i & 1 ^ 1) << 16)));
+	verify(it2->Get() == (v2[i] | ((i & 1 ^ 1) << 16)));
+
+	verify(!it1->Next());
+	verify(!it2->Next());
+
+	verify(pool.CheckConsistency() == OpBoolean::IS_TRUE);
+
+	if (it1 != NULL)
+		OP_DELETE(it1);
+	if (it2 != NULL)
+		OP_DELETE(it2);
+
+	if (b1 != NULL)
+		OP_DELETE(b1);
+	if (b2 != NULL)
+		OP_DELETE(b2);
+
+	verify_success(pool.Close());
+	delete_file(dbtree_bt);
+}
+
+test("update in cache")
+	file uni dbtree_bt   "data/dbtree.bt";
+	file uni dbtree_bt_j "data/dbtree.bt-j";
+	file uni dbtree_bt_g "data/dbtree.bt-g";
+{
+	TPool<int> pool(&ShortShortCmp::LessThan);
+	TBTree<int> *b1 = NULL, *b2 = NULL;
+	TVector<int> v1(&ShortShortCmp::LessThan), v2(&ShortShortCmp::LessThan);
+	SearchIterator<int> *it1 = NULL, *it2 = NULL;
+	int i;
+	OP_STATUS status;
+
+	delete_file(dbtree_bt);
+	delete_file(dbtree_bt_j);
+	delete_file(dbtree_bt_g);
+
+	status = pool.Open(dbtree_bt, BlockStorage::OpenReadWrite, 256);
+	verify_success(status);
+
+	for (i = 0; i < 256; ++i)
+	{
+		verify_success(v1.Insert(i ^ 0xAA));
+		verify_success(v2.Insert((i ^ 0xAA) * 2));
+	}
+
+	b1 = pool.CreateTree();
+	b2 = pool.CreateTree();
+
+	for (i = 0; i < 128; ++i)
+	{
+		verify_success(b1->Insert(v1[i]));
+		verify_success(b2->Insert(v2[i]));
+	}
+
+	for (i = 128; i < 256; ++i)
+	{
+		verify_success(b1->Insert(v1[i]));
+		verify_success(b2->Insert(v2[i]));
+	}
+
+	verify_success(v1.Sort());
+	verify_success(v2.Sort());
+
+	for (i = 0; i < 128; ++i)
+	{
+		verify_success(b1->Insert(v1[i * 2] | 0x10000, TRUE));
+		verify_success(b2->Insert(v2[i * 2] | 0x10000, TRUE));
+	}
+
+	verify_success(pool.Commit());
+
+	it1 = b1->Search(0, operatorGE);
+	it2 = b2->Search(0, operatorGE);
+
+	verify(it1 != NULL && !it1->End());
+	verify(it2 != NULL && !it2->End());
+
+	for (i = 0; i < 255; ++i)
+	{
+		verify(it1->Get() == (v1[i] | ((i & 1 ^ 1) << 16)));
+		verify(it2->Get() == (v2[i] | ((i & 1 ^ 1) << 16)));
+
+		verify(it1->Next());
+		verify(it2->Next());
+	}
+
+	verify(it1->Get() == (v1[i] | ((i & 1 ^ 1) << 16)));
+	verify(it2->Get() == (v2[i] | ((i & 1 ^ 1) << 16)));
+
+	verify(!it1->Next());
+	verify(!it2->Next());
+
+	verify(pool.CheckConsistency() == OpBoolean::IS_TRUE);
+
+	if (it1 != NULL)
+		OP_DELETE(it1);
+	if (it2 != NULL)
+		OP_DELETE(it2);
+
+	if (b1 != NULL)
+		OP_DELETE(b1);
+	if (b2 != NULL)
+		OP_DELETE(b2);
+
+	verify_success(pool.Close());
+	delete_file(dbtree_bt);
+}
+
+test("update with rollback")
+	file uni dbtree_bt   "data/dbtree.bt";
+	file uni dbtree_bt_j "data/dbtree.bt-j";
+	file uni dbtree_bt_g "data/dbtree.bt-g";
+{
+	TPool<int> pool(&ShortShortCmp::LessThan);
+	TBTree<int> *b1 = NULL, *b2 = NULL;
+	TVector<int> v1(&ShortShortCmp::LessThan), v2(&ShortShortCmp::LessThan);
+	SearchIterator<int> *it1 = NULL, *it2 = NULL;
+	int i;
+	OP_STATUS status;
+
+	delete_file(dbtree_bt);
+	delete_file(dbtree_bt_j);
+	delete_file(dbtree_bt_g);
+
+	status = pool.Open(dbtree_bt, BlockStorage::OpenReadWrite, 256);
+	verify_success(status);
+
+	for (i = 0; i < 256; ++i)
+	{
+		verify_success(v1.Insert(i ^ 0xAA));
+		verify_success(v2.Insert((i ^ 0xAA) * 2));
+	}
+
+	b1 = pool.CreateTree();
+	b2 = pool.CreateTree();
+
+	for (i = 0; i < 256; ++i)
+	{
+		verify_success(b1->Insert(v1[i]));
+		verify_success(b2->Insert(v2[i]));
+	}
+
+	verify_success(pool.Commit());
+
+	for (i = 0; i < 64; ++i)
+	{
+		verify_success(b1->Insert(v1[i * 2] | 0x10000, TRUE));
+		verify_success(b2->Insert(v2[i * 2] | 0x10000, TRUE));
+	}
+
+	verify_success(pool.Commit());
+
+	for (i = 64; i < 128; ++i)
+	{
+		verify_success(b1->Insert(v1[i * 2] | 0x30000, TRUE));
+		verify_success(b2->Insert(v2[i * 2] | 0x30000, TRUE));
+	}
+
+	verify_success(pool.Abort());
+
+	for (i = 64; i < 96; ++i)
+	{
+		verify_success(b1->Insert(v1[i * 2] | 0x20000, TRUE));
+		verify_success(b2->Insert(v2[i * 2] | 0x20000, TRUE));
+	}
+
+	it1 = b1->Search(0, operatorGE);
+	it2 = b2->Search(0, operatorGE);
+
+	verify(it1 != NULL && !it1->End());
+	verify(it2 != NULL && !it2->End());
+
+	verify_success(v1.Sort());
+	verify_success(v2.Sort());
+
+	verify_success(pool.Commit());
+
+	for (i = 0; i < 128; ++i)
+	{
+		verify(it1->Get() == (v1[i] | ((i & 1 ^ 1) << 16)));
+		verify(it2->Get() == (v2[i] | ((i & 1 ^ 1) << 16)));
+
+		verify(it1->Next());
+		verify(it2->Next());
+	}
+
+	for (i = 128; i < 192; ++i)
+	{
+		verify(it1->Get() == (v1[i] | ((i & 1 ^ 1) << 17)));
+		verify(it2->Get() == (v2[i] | ((i & 1 ^ 1) << 17)));
+
+		verify(it1->Next());
+		verify(it2->Next());
+	}
+
+	for (i = 192; i < 255; ++i)
+	{
+		verify(it1->Get() == v1[i]);
+		verify(it2->Get() == v2[i]);
+
+		verify(it1->Next());
+		verify(it2->Next());
+	}
+
+	verify(it1->Get() == v1[i]);
+	verify(it2->Get() == v2[i]);
+
+	verify(!it1->Next());
+	verify(!it2->Next());
+
+	verify(pool.CheckConsistency() == OpBoolean::IS_TRUE);
+
+	if (it1 != NULL)
+		OP_DELETE(it1);
+	if (it2 != NULL)
+		OP_DELETE(it2);
+
+	if (b1 != NULL)
+		OP_DELETE(b1);
+	if (b2 != NULL)
+		OP_DELETE(b2);
+
+	verify_success(pool.Close());
+	delete_file(dbtree_bt);
+}
+
+test("update/delete")
+	file uni dbtree_bt   "data/dbtree.bt";
+	file uni dbtree_bt_j "data/dbtree.bt-j";
+	file uni dbtree_bt_g "data/dbtree.bt-g";
+{
+	TPool<int> pool(&ShortShortCmp::LessThan);
+	TBTree<int> *b1 = NULL, *b2 = NULL;
+	TVector<int> v1(&ShortShortCmp::LessThan), v2(&ShortShortCmp::LessThan);
+	SearchIterator<int> *it1 = NULL, *it2 = NULL;
+	int i;
+	OP_STATUS status;
+
+	delete_file(dbtree_bt);
+	delete_file(dbtree_bt_j);
+	delete_file(dbtree_bt_g);
+
+	status = pool.Open(dbtree_bt, BlockStorage::OpenReadWrite, 256);
+	verify_success(status);
+
+	for (i = 0; i < 256; ++i)
+	{
+		verify_success(v1.Insert(i ^ 0xAA));
+		verify_success(v2.Insert((i ^ 0xAA) * 2));
+	}
+
+	b1 = pool.CreateTree();
+	b2 = pool.CreateTree();
+
+	for (i = 0; i < 192; ++i)
+	{
+		verify_success(b1->Insert(v1[i]));
+		verify_success(b2->Insert(v2[i]));
+	}
+
+	verify_success(pool.Commit());
+
+	for (i = 192; i < 256; ++i)
+	{
+		verify_success(b1->Insert(v1[i]));
+		verify_success(b2->Insert(v2[i]));
+	}
+
+	verify_success(v1.Sort());
+	verify_success(v2.Sort());
+
+	for (i = 0; i < 64; ++i)
+	{
+		verify_success(b1->Insert(v1[i] | 0x10000, TRUE));
+		verify_success(b2->Insert(v2[i] | 0x10000, TRUE));
+	}
+
+	for (i = 0; i < 128; ++i)
+	{
+		verify_success(b1->Delete(v1[i]));
+		verify_success(b2->Delete(v2[i]));
+	}
+
+	for (i = 128; i < 256; ++i)
+	{
+		verify_success(b1->Insert(v1[i] | 0x10000, TRUE));
+		verify_success(b2->Insert(v2[i] | 0x10000, TRUE));
+	}
+
+	for (i = 192; i < 256; ++i)
+	{
+		verify_success(b1->Delete(v1[i]));
+		verify_success(b2->Delete(v2[i]));
+	}
+
+	verify_success(pool.Commit());
+
+	it1 = b1->Search(0, operatorGE);
+	it2 = b2->Search(0, operatorGE);
+
+	verify(it1 != NULL && !it1->End());
+	verify(it2 != NULL && !it2->End());
+
+	verify_success(pool.Commit());
+
+	for (i = 128; i < 191; ++i)
+	{
+		verify(it1->Get() == (v1[i] | 0x10000));
+		verify(it2->Get() == (v2[i] | 0x10000));
+
+		verify(it1->Next());
+		verify(it2->Next());
+	}
+
+	verify(it1->Get() == (v1[i] | 0x10000));
+	verify(it2->Get() == (v2[i] | 0x10000));
+
+	verify(!it1->Next());
+	verify(!it2->Next());
+
+	verify(pool.CheckConsistency() == OpBoolean::IS_TRUE);
+
+	if (it1 != NULL)
+		OP_DELETE(it1);
+	if (it2 != NULL)
+		OP_DELETE(it2);
+
+	if (b1 != NULL)
+		OP_DELETE(b1);
+	if (b2 != NULL)
+		OP_DELETE(b2);
+
+	verify_success(pool.Close());
+	delete_file(dbtree_bt);
+}
+
+test("crash")
+	file uni dbtree_bt   "data/dbtree.bt";
+	file uni dbtree_bt_j "data/dbtree.bt-j";
+	file uni dbtree_bt_g "data/dbtree.bt-g";
+{
+	TPool<int> pool(&ShortShortCmp::LessThan);
+	TBTree<int> *b1 = NULL, *b2 = NULL;
+	TVector<int> v1(&ShortShortCmp::LessThan), v2(&ShortShortCmp::LessThan);
+	SearchIterator<int> *it1 = NULL, *it2 = NULL;
+	int i;
+	OP_STATUS status;
+
+	delete_file(dbtree_bt);
+	delete_file(dbtree_bt_j);
+	delete_file(dbtree_bt_g);
+
+	status = pool.Open(dbtree_bt, BlockStorage::OpenReadWrite, 256);
+	verify_success(status);
+
+	for (i = 0; i < 256; ++i)
+	{
+		verify_success(v1.Insert(i ^ 0xAA));
+		verify_success(v2.Insert((i ^ 0xAA) * 2));
+	}
+
+	b1 = pool.CreateTree();
+	b2 = pool.CreateTree();
+
+	for (i = 0; i < 256; ++i)
+	{
+		verify_success(b1->Insert(v1[i]));
+		verify_success(b2->Insert(v2[i]));
+	}
+
+	verify_success(pool.Commit());
+
+	for (i = 0; i < 64; ++i)
+	{
+		verify_success(b1->Insert(v1[i * 2] | 0x10000, TRUE));
+		verify_success(b2->Insert(v2[i * 2] | 0x10000, TRUE));
+	}
+
+	verify_success(pool.Flush());
+
+	for (i = 64; i < 128; ++i)
+	{
+		verify_success(b1->Insert(v1[i * 2] | 0x30000, TRUE));
+		verify_success(b2->Insert(v2[i * 2] | 0x30000, TRUE));
+	}
+
+	pool.GetStorage()->Crash();
+	verify_success(pool.Abort());
+	verify_success(pool.Close());
+	status = pool.Open(dbtree_bt, BlockStorage::OpenReadWrite, 256);
+	verify_success(status);
+
+	for (i = 32; i < 96; ++i)
+	{
+		verify_success(b1->Insert(v1[i * 2] | 0x20000, TRUE));
+		verify_success(b2->Insert(v2[i * 2] | 0x20000, TRUE));
+	}
+
+	it1 = b1->Search(0, operatorGE);
+	it2 = b2->Search(0, operatorGE);
+
+	verify(it1 != NULL && !it1->End());
+	verify(it2 != NULL && !it2->End());
+
+	verify_success(v1.Sort());
+	verify_success(v2.Sort());
+
+	verify_success(pool.Commit());
+
+	for (i = 0; i < 64; ++i)
+	{
+		verify(it1->Get() == v1[i]);
+		verify(it2->Get() == v2[i]);
+
+		verify(it1->Next());
+		verify(it2->Next());
+	}
+
+	for (i = 64; i < 192; ++i)
+	{
+		verify(it1->Get() == (v1[i] | ((i & 1 ^ 1) << 17)));
+		verify(it2->Get() == (v2[i] | ((i & 1 ^ 1) << 17)));
+
+		verify(it1->Next());
+		verify(it2->Next());
+	}
+
+	for (i = 192; i < 255; ++i)
+	{
+		verify(it1->Get() == v1[i]);
+		verify(it2->Get() == v2[i]);
+
+		verify(it1->Next());
+		verify(it2->Next());
+	}
+
+	verify(it1->Get() == v1[i]);
+	verify(it2->Get() == v2[i]);
+
+	verify(!it1->Next());
+	verify(!it2->Next());
+
+	verify(pool.CheckConsistency() == OpBoolean::IS_TRUE);
+
+	if (it1 != NULL)
+		OP_DELETE(it1);
+	if (it2 != NULL)
+		OP_DELETE(it2);
+
+	if (b1 != NULL)
+		OP_DELETE(b1);
+	if (b2 != NULL)
+		OP_DELETE(b2);
+
+	verify_success(pool.Close());
+	delete_file(dbtree_bt);
+}
+
+test("SingleBTree Insert Delete Insert")
+	file uni dbtree_bt   "data/dbtree.bt";
+	file uni dbtree_bt_j "data/dbtree.bt-j";
+	file uni dbtree_bt_g "data/dbtree.bt-g";
+{
+	SingleBTree<int> bt;
+	int f, l;
+	OP_STATUS status;
+
+	delete_file(dbtree_bt);
+	delete_file(dbtree_bt_j);
+	delete_file(dbtree_bt_g);
+
+	status = bt.Open(dbtree_bt, BlockStorage::OpenReadWrite, 64);
+	verify_success(status);
+
+	verify_success(bt.Insert(2));
+	verify_success(bt.Commit());
+
+	verify_success(bt.Close());
+	status = bt.Open(dbtree_bt, BlockStorage::OpenReadWrite, 64);
+	verify_success(status);
+
+	verify_success(bt.Delete(2));
+
+	verify_success(bt.Insert(4));
+	verify_success(bt.Commit());
+
+	verify_success(bt.Close());
+	status = bt.Open(dbtree_bt, BlockStorage::OpenReadWrite, 64);
+	verify_success(status);
+
+	verify(bt.GetFirst(f) == OpBoolean::IS_TRUE);
+	verify(bt.GetLast(l) == OpBoolean::IS_TRUE);
+
+	verify(f == 4 && l == 4);
+
+	verify_success(bt.Close());
+	delete_file(dbtree_bt);
+}
+
+test("SingleBTree iterator")
+	file uni dbtree_bt   "data/dbtree.bt";
+	file uni dbtree_bt_j "data/dbtree.bt-j";
+	file uni dbtree_bt_g "data/dbtree.bt-g";
+{
+	SingleBTree<TImapUidKey> bt;
+	SearchIterator<TImapUidKey> *it = NULL;
+	OP_STATUS status;
+	TImapUidKey search_key;
+	
+	search_key.folder = 700000005;
+	search_key.uid = 40;
+	search_key.message_id = 0;
+
+	delete_file(dbtree_bt);
+	delete_file(dbtree_bt_j);
+	delete_file(dbtree_bt_g);
+
+	status = bt.Open(dbtree_bt, BlockStorage::OpenRead, 512);
+	verify_success(status);
+
+	verify_success(bt.Insert(search_key));
+
+	it = bt.Search(search_key, operatorGT);
+	
+	verify(it != NULL);
+
+	verify(it->End());  // the greatest item is exactly {700000005, 40}
+	verify(it->Count() == 0);
+	verify(!it->Next());
+	verify(it->Empty());
+
+	search_key.folder = 700000006;
+
+	OP_DELETE(it);
+	it = bt.Search(search_key, operatorGT);
+	
+	verify(it != NULL);
+
+	verify(it->End());  // searching past the end
+	verify(it->Count() == 0);
+	verify(!it->Next());
+	verify(it->Empty());
+
+	OP_DELETE(it);
+	verify_success(bt.Close());
+	delete_file(dbtree_bt);
+}
+

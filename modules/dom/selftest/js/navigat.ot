@@ -1,0 +1,686 @@
+/* -*- Mode: c++; tab-width: 4; indent-tabs-mode: t; c-basic-offset: 4 -*-
+**
+** Copyright (C) 2010 Opera Software ASA.  All rights reserved.
+**
+** This file is part of the Opera web browser.
+** It may not be distributed under any circumstances.
+**
+*/
+
+group "dom.js.navigator";
+
+include "modules/dochand/winman.h";
+include "modules/dochand/win.h";
+include "modules/windowcommander/src/WindowCommander.h";
+include "modules/hardcore/timer/optimer.h";
+include "modules/doc/frm_doc.h";
+include "modules/dochand/docman.h";
+include "modules/prefs/prefsmanager/collections/pc_files.h";
+
+global
+{
+#ifdef WEB_HANDLERS_SUPPORT
+#define HANDLER_TEST_URL UNI_L("about:blank?url=%s")
+#define HANDLER_TEST_URL_CMP UNI_L("about:blank?url=")
+#define HANDLER_TEST_URL_CMP_LEN (static_cast<int>(uni_strlen(HANDLER_TEST_URL_CMP)))
+#define WEB_HANDLERS_TEST_TIMEOUT (15 * 1000)
+
+	enum WebHandlerUsageConfirmationAnswer
+	{
+		OK,
+		OK_DONT_ASK,
+		CANCEL
+	};
+
+	class TestOpDocumentListener : public NullDocumentListener
+	{
+		OpDocumentListener* document_listener;
+		Window* window;
+		WebHandlerUsageConfirmationAnswer type;
+		OpTimer* test_timer;
+		OpTimerListener* timer_listener;
+	public:
+		TestOpDocumentListener(Window *window, WebHandlerUsageConfirmationAnswer test_type, OpTimer* test_timer)
+		: window(window)
+		, type(test_type)
+		, test_timer(test_timer)
+		, timer_listener(NULL)
+		{
+			document_listener = window->GetWindowCommander()->GetDocumentListener();
+			window->GetWindowCommander()->SetDocumentListener(this);
+		}
+
+		virtual ~TestOpDocumentListener()
+		{
+			test_timer->Stop();
+			OP_DELETE(timer_listener);
+			window->GetWindowCommander()->SetDocumentListener(document_listener);
+		}
+
+		void OnWebHandler(OpWindowCommander* commander, OpDocumentListener::WebHandlerCallback* callback)
+		{
+			switch(type)
+			{
+				case OK:
+					callback->OnOK(FALSE, NULL);
+					break;
+
+				case CANCEL:
+					callback->OnCancel();
+					window->GetWindowCommander()->GetLoadingListener()->OnLoadingFinished(commander, OpLoadingListener::LOADING_SUCCESS);
+					break;
+			}
+		}
+
+		void SetTimerListener(OpTimerListener* timer_listener)
+		{
+			this->timer_listener = timer_listener;
+		}
+	};
+
+	class TestOpLoadingListener : public NullLoadingListener
+	{
+		OpLoadingListener* loading_listener;
+		TestOpDocumentListener* test_document_listener;
+		Window* window;
+		WebHandlerUsageConfirmationAnswer ans;
+	public:
+		TestOpLoadingListener(Window *window, TestOpDocumentListener* tst_doc_listener, WebHandlerUsageConfirmationAnswer test_type)
+		: test_document_listener(tst_doc_listener)
+		, window(window)
+		, ans(test_type)
+		{
+			loading_listener = window->GetWindowCommander()->GetLoadingListener();
+			window->GetWindowCommander()->SetLoadingListener(this);
+		}
+
+		virtual ~TestOpLoadingListener()
+		{
+			window->GetWindowCommander()->SetLoadingListener(loading_listener);
+			OP_DELETE(test_document_listener);
+		}
+
+		void OnLoadingFinished(OpWindowCommander* commander, LoadingFinishStatus status)
+		{
+			switch (ans)
+			{
+				case OK:
+				{
+					if (window->GetCurrentURL().GetAttribute(URL::KUniName_With_Fragment_Username_Password_Escaped_NOT_FOR_UI).CompareI(HANDLER_TEST_URL_CMP, HANDLER_TEST_URL_CMP_LEN) == 0)
+					{
+						ST_passed();
+					}
+					else
+					{
+						ST_failed("Wrong URL loaded");
+					}
+				}
+				break;
+
+				case OK_DONT_ASK:
+				{
+					if (window->GetCurrentURL().GetAttribute(URL::KUniName_With_Fragment_Username_Password_Escaped_NOT_FOR_UI).CompareI(HANDLER_TEST_URL_CMP, HANDLER_TEST_URL_CMP_LEN) == 0)
+					{
+						ST_passed();
+					}
+					else
+					{
+						ST_failed("Wrong URL loaded");
+					}
+				}
+				break;
+
+				case CANCEL:
+				{
+					if (window->GetCurrentURL().GetAttribute(URL::KUniName_With_Fragment_Username_Password_Escaped_NOT_FOR_UI).CompareI(HANDLER_TEST_URL_CMP, HANDLER_TEST_URL_CMP_LEN) != 0)
+					{
+						ST_passed();
+					}
+					else
+					{
+						ST_failed("Wrong URL loaded");
+					}
+				}
+				break;
+			}
+			OP_DELETE(this);
+		}
+	};
+
+	enum WebHandlerRegistrationPermissionAnswer
+	{
+		ALLOWED,
+		DISALLOWED,
+	};
+
+	class TestOpPermissionListener : public NullPermissionListener
+	{
+		Window* window;
+		WebHandlerRegistrationPermissionAnswer answer;
+		OpPermissionListener* permission_listener;
+	public:
+		BOOL was_called;
+		TestOpPermissionListener(Window* window, WebHandlerRegistrationPermissionAnswer ans) : window(window), answer(ans), was_called(FALSE)
+		{
+			permission_listener = window->GetWindowCommander()->GetPermissionListener();
+			window->GetWindowCommander()->SetPermissionListener(this);
+		}
+
+		virtual ~TestOpPermissionListener()
+		{
+			window->GetWindowCommander()->SetPermissionListener(permission_listener);
+		}
+
+		void OnAskForPermission(OpWindowCommander *commander, PermissionCallback *callback)
+		{
+			was_called = TRUE;
+			switch (answer)
+			{
+				case ALLOWED:
+					callback->OnAllowed(PermissionCallback::PERSISTENCE_TYPE_ALWAYS);
+					break;
+				case DISALLOWED:
+					callback->OnDisallowed(PermissionCallback::PERSISTENCE_TYPE_NONE);
+					break;
+			}
+		}
+	};
+
+	TestOpPermissionListener* test_permission_listener;
+	TestOpDocumentListener* test_document_listener;
+	TestOpLoadingListener* test_loading_listener;
+	Window* g_window;
+
+	OpFile local_ignore_file;
+	OpFile local_ignore_file_backup;
+
+	OpTimer test_timer;
+	class TestTimerListener : public OpTimerListener
+	{
+	TestOpDocumentListener* test_document_listener;
+	TestOpLoadingListener* test_loading_listener;
+	BOOL timoeout_is_success;
+
+	public:
+		TestTimerListener(TestOpDocumentListener* test_document_listener, TestOpLoadingListener* test_loading_listener, BOOL timoeout_means_success)
+		: test_document_listener(test_document_listener)
+		, test_loading_listener(test_loading_listener)
+		, timoeout_is_success(timoeout_means_success)
+		{}
+
+		void OnTimeOut(OpTimer* timer)
+		{
+			if (!timoeout_is_success)
+				ST_failed("Test timed out\n");
+			else
+				ST_passed();
+			if (test_document_listener && !test_loading_listener)
+				OP_DELETE(test_document_listener);
+			OP_DELETE(test_loading_listener);
+		}
+	};
+#endif // WEB_HANDLERS_SUPPORT
+}
+
+language ecmascript;
+
+test("navigator.userAgent")
+{
+    var useragent = navigator.userAgent;
+    verify(useragent != "");
+    verify(useragent[0] >= 'A' && useragent[0] <= 'Z');
+    verify(useragent.indexOf('(') > 0);
+    verify(useragent.indexOf(')') > useragent.indexOf('('));
+}
+
+test("navigator.appVersion")
+{
+    var appversion = navigator.appVersion;
+    verify(appversion != "");
+    verify(appversion[0] >= '0' && appversion[0] <= '9');
+    verify(appversion.indexOf('(') > 0);
+    verify(appversion.indexOf(')') > appversion.indexOf('('));
+}
+
+test("navigator.register[Content|Protocol]Handler")
+require WEB_HANDLERS_SUPPORT;
+{
+	verify(navigator.registerContentHandler);
+	verify(navigator.unregisterContentHandler);
+	verify(navigator.isContentHandlerRegistered);
+	verify(navigator.registerProtocolHandler);
+	verify(navigator.unregisterProtocolHandler);
+	verify(navigator.isProtocolHandlerRegistered);
+}
+
+table dumm1(char *) filelist "." name "*.ini";
+
+test("navigator.register[Content|Protocol]Handler prepare")
+require WEB_HANDLERS_SUPPORT;
+require success "navigator.register[Content|Protocol]Handler";
+file uni handlers_file "handlers-ignore.ini";
+language c++;
+{
+	OpFileFolder ignore;
+	const uni_char* filename = 0;
+	g_pcfiles->GetDefaultFilePref(PrefsCollectionFiles::HandlersIgnoreFile, &ignore, &filename);
+	verify(filename);
+
+	verify_success(local_ignore_file.Construct(filename, OPFILE_HOME_FOLDER));
+	BOOL exists;
+	verify_success(local_ignore_file.Exists(exists));
+	if (exists)
+	{
+		OpString bak_file_path;
+		verify_success(bak_file_path.Set(local_ignore_file.GetFullPath()));
+		verify_success(bak_file_path.Append(UNI_L(".bak")));
+		verify_success(local_ignore_file_backup.Construct(bak_file_path));
+		verify_success(local_ignore_file_backup.CopyContents(&local_ignore_file, FALSE));
+	}
+
+	OpFile test_list_file;
+	verify_success(test_list_file.Construct(handlers_file));
+	verify_success(local_ignore_file.CopyContents(&test_list_file, FALSE));
+}
+
+test("navigator.register[Content|Protocol]Handler some excepations")
+require WEB_HANDLERS_SUPPORT;
+require success "navigator.register[Content|Protocol]Handler prepare";
+{
+	try
+	{
+		navigator.registerProtocolHandler('domwebhandlertestprotocol1', 'test.html', 'Test handler');
+		verify(!"Was supposed to throw");
+	}
+	catch (e)
+	{
+		verify(e instanceof DOMException);
+		verify(e.code == 12);
+	}
+
+	try
+	{
+		navigator.registerContentHandler('yogibabu/jabadabadu', 'test.html', 'Test handler');
+		verify(!"Was supposed to throw");
+	}
+	catch (e)
+	{
+		verify(e instanceof DOMException);
+		verify(e.code == 12);
+	}
+
+	try
+	{
+		navigator.registerProtocolHandler('domwebhandlertestprotocol1', 'http://example.com?url=%s', 'Test handler');
+		verify(!"Was supposed to throw");
+	}
+	catch (e)
+	{
+		verify(e instanceof DOMException);
+		verify(e.code == 18);
+	}
+
+	try
+	{
+		navigator.registerContentHandler('yogibabu/jabadabadu', 'http://example.com?url=%s', 'Test handler');
+		verify(!"Was supposed to throw");
+	}
+	catch (e)
+	{
+		verify(e instanceof DOMException);
+		verify(e.code == 18);
+	}
+
+
+	try
+	{
+		navigator.registerProtocolHandler('http', location.href + '?url=%s', 'Test handler');
+		verify(e.code == 18);
+	}
+	catch (e)
+	{
+		verify(e instanceof DOMException);
+		verify(e.code == 18);
+	}
+
+	try
+	{
+		navigator.registerContentHandler('text/html', location.href + '?url=%s', 'Test handler');
+		verify(!"Was supposed to throw");
+	}
+	catch (e)
+	{
+		verify(e instanceof DOMException);
+		verify(e.code == 18);
+	}
+
+	try
+	{
+		navigator.registerProtocolHandler('ht.tp', location.href + '?url=%s', 'Test handler');
+		verify(!"Was supposed to throw");
+	}
+	catch (e)
+	{
+		verify(e instanceof DOMException);
+		verify(e.code == 18);
+	}
+
+	try
+	{
+		navigator.registerContentHandler('text\\html', location.href + '?url=%s', 'Test handler');
+		verify(!"Was supposed to throw");
+	}
+	catch (e)
+	{
+		verify(e instanceof DOMException);
+		verify(e.code == 18);
+	}
+}
+
+test("Web handlers registration not permitted prepare")
+language c++;
+require WEB_HANDLERS_SUPPORT;
+require success "navigator.register[Content|Protocol]Handler prepare";
+{
+	test_permission_listener = OP_NEW(TestOpPermissionListener, (state.doc->GetDocManager()->GetWindow(), DISALLOWED));
+	verify(test_permission_listener);
+}
+
+
+test("navigator.register[Content|Protocol]Handler valid registration")
+require WEB_HANDLERS_SUPPORT;
+require success "Web handlers registration not permitted prepare";
+{
+	try
+	{
+		navigator.registerProtocolHandler('domwebhandlertestprotocol1', location.href + '?from=%s', 'Test handler');
+		verify("OK");
+	}
+	catch (e)
+	{
+		verify(!"Was not supposed to throw");
+	}
+
+	try
+	{
+		navigator.registerContentHandler('yogibabu/jabadabadu', location.href + '?from=%s', 'Test handler');
+		verify("OK");
+	}
+	catch (e)
+	{
+		verify(!"Was not supposed to throw");
+	}
+}
+
+test("Web handlers registration not permitted register")
+require WEB_HANDLERS_SUPPORT;
+require success "Web handlers registration not permitted prepare";
+{
+	try
+	{
+		navigator.registerProtocolHandler('domwebhandlertestprotocol2', 'about:blank?url=%s&ts=' + Math.random()+''+(new Date()).getTime(), 'Test');
+		verify(true);
+	}
+	catch (e)
+	{
+		verify(false);
+	}
+}
+
+test("Web handlers registration not permitted verification")
+language c++;
+require WEB_HANDLERS_SUPPORT;
+require success "Web handlers registration not permitted prepare";
+{
+	BOOL called = test_permission_listener->was_called;
+	OP_DELETE(test_permission_listener);
+	verify(called);
+}
+
+test("Web handlers registration not permitted loading")
+language c++;
+require WEB_HANDLERS_SUPPORT;
+require success "Web handlers registration not permitted verification";
+async;
+{
+	g_window = g_windowManager->SignalNewWindow(state.doc->GetDocManager()->GetWindow());
+	if (!g_window)
+	{
+		ST_failed("Could not create a window\n");
+		return -2;
+	}
+
+	// Is not supposed to be called this is why OK_DONT_ASK is used
+	test_document_listener = OP_NEW(TestOpDocumentListener, (g_window, OK_DONT_ASK, &test_timer));
+	if (!test_document_listener)
+	{
+		ST_failed("Could not create TestOpDocumentListener\n");
+		return -2;
+	}
+
+	// Handler was not permitted to be registered this is why CANCEL is used here
+	test_loading_listener = OP_NEW(TestOpLoadingListener, (g_window, test_document_listener, CANCEL));
+	if (!test_loading_listener)
+	{
+		ST_failed("Could not create TestOpLoadingListener\n");
+		return -2;
+	}
+
+
+	TestTimerListener* test_timer_listener = OP_NEW(TestTimerListener, (test_document_listener, test_loading_listener, TRUE));
+	if (!test_timer_listener)
+	{
+		ST_failed("Could not create TestTimerListener\n");
+		return -2;
+	}
+	test_document_listener->SetTimerListener(test_timer_listener);
+	test_timer.SetTimerListener(test_timer_listener);
+	test_timer.Start(WEB_HANDLERS_TEST_TIMEOUT);
+	if (OpStatus::IsError(g_window->OpenURL(UNI_L("domwebhandlertestprotocol2://web.handler.test/"))))
+	{
+		ST_failed("Could not open the url\n");
+		return -2;
+	}
+}
+
+test("Web handlers (protocol) registration permitted prepare")
+language c++;
+require WEB_HANDLERS_SUPPORT;
+require success "navigator.register[Content|Protocol]Handler prepare";
+{
+	test_permission_listener = OP_NEW(TestOpPermissionListener, (state.doc->GetDocManager()->GetWindow(), ALLOWED));
+	verify(test_permission_listener);
+}
+
+
+test("Web handlers (protocol) registration permitted register + check")
+require WEB_HANDLERS_SUPPORT;
+require success "Web handlers (protocol) registration permitted prepare";
+{
+	try
+	{
+		navigator.unregisterProtocolHandler('domwebhandlertestprotocol3', 'about:blank?url=%s');
+		var registered = navigator.isProtocolHandlerRegistered('domwebhandlertestprotocol3', 'about:blank?url=%s');
+		verify(registered == "new");
+		navigator.registerProtocolHandler('domwebhandlertestprotocol3', 'about:blank?url=%s', 'Test');
+		registered = navigator.isProtocolHandlerRegistered('domwebhandlertestprotocol3', 'about:blank?url=%s');
+		verify(registered == "registered");
+	}
+	catch (e)
+	{
+		verify(false);
+	}
+}
+
+test("Web handlers (protocol) registration permitted verification")
+language c++;
+require WEB_HANDLERS_SUPPORT;
+require success "Web handlers (protocol) registration permitted register + check";
+{
+	verify(test_permission_listener->was_called);
+	OP_DELETE(test_permission_listener);
+}
+
+test("Web handlers registration permitted loading cancelled")
+language c++;
+require WEB_HANDLERS_SUPPORT;
+require success "Web handlers (protocol) registration permitted verification";
+async;
+{
+	g_window = g_windowManager->SignalNewWindow(state.doc->GetDocManager()->GetWindow());
+	if (!g_window)
+	{
+		ST_failed("Could not create a window\n");
+		return -2;
+	}
+
+	test_document_listener = OP_NEW(TestOpDocumentListener, (g_window, CANCEL, &test_timer));
+	if (!test_document_listener)
+	{
+		ST_failed("Could not create TestOpDocumentListener\n");
+		return -2;
+	}
+
+	test_loading_listener = OP_NEW(TestOpLoadingListener, (g_window, test_document_listener, CANCEL));
+	if (!test_loading_listener)
+	{
+		ST_failed("Could not create TestOpLoadingListener\n");
+		return -2;
+	}
+
+
+	TestTimerListener* test_timer_listener = OP_NEW(TestTimerListener, (test_document_listener, test_loading_listener, FALSE));
+	if (!test_timer_listener)
+	{
+		ST_failed("Could not create TestTimerListener\n");
+		return -2;
+	}
+	test_document_listener->SetTimerListener(test_timer_listener);
+	test_timer.SetTimerListener(test_timer_listener);
+	test_timer.Start(WEB_HANDLERS_TEST_TIMEOUT);
+	if (OpStatus::IsError(g_window->OpenURL(UNI_L("domwebhandlertestprotocol3://web.handler.test/"))))
+	{
+		ST_failed("Could not open the url\n");
+		return -2;
+	}
+}
+
+test("Web handlers registration permitted loading allowed")
+language c++;
+require WEB_HANDLERS_SUPPORT;
+require success "Web handlers (protocol) registration permitted verification";
+async;
+{
+	g_window = g_windowManager->SignalNewWindow(state.doc->GetDocManager()->GetWindow());
+	if (!g_window)
+	{
+		ST_failed("Could not create a window\n");
+		return -2;
+	}
+
+	test_document_listener = OP_NEW(TestOpDocumentListener, (g_window, OK, &test_timer));
+	if (!test_document_listener)
+	{
+		ST_failed("Could not create TestOpDocumentListener\n");
+		return -2;
+	}
+
+	test_loading_listener = OP_NEW(TestOpLoadingListener, (g_window, test_document_listener, OK));
+	if (!test_loading_listener)
+	{
+		ST_failed("Could not create TestOpLoadingListener\n");
+		return -2;
+	}
+
+
+	TestTimerListener* test_timer_listener = OP_NEW(TestTimerListener, (test_document_listener, test_loading_listener, FALSE));
+	if (!test_timer_listener)
+	{
+		ST_failed("Could not create TestTimerListener\n");
+		return -2;
+	}
+	test_document_listener->SetTimerListener(test_timer_listener);
+	test_timer.SetTimerListener(test_timer_listener);
+	test_timer.Start(WEB_HANDLERS_TEST_TIMEOUT);
+	if (OpStatus::IsError(g_window->OpenURL(UNI_L("domwebhandlertestprotocol3://web.handler.test/"))))
+	{
+		ST_failed("Could not open the url\n");
+		return -2;
+	}
+}
+
+test("Web handlers (protocol) registration permitted unregister + check")
+require WEB_HANDLERS_SUPPORT;
+require success "Web handlers (protocol) registration permitted prepare";
+{
+	try
+	{
+		var registered = navigator.isProtocolHandlerRegistered('domwebhandlertestprotocol3', 'about:blank?url=%s');
+		verify(registered == "registered");
+		navigator.unregisterProtocolHandler('domwebhandlertestprotocol3', 'about:blank?url=%s');
+		registered = navigator.isProtocolHandlerRegistered('domwebhandlertestprotocol3', 'about:blank?url=%s');
+		verify(registered == "new");
+	}
+	catch (e)
+	{
+		verify(false);
+	}
+}
+
+test("Web handlers (content) registration permitted prepare")
+language c++;
+require WEB_HANDLERS_SUPPORT;
+require success "navigator.register[Content|Protocol]Handler prepare";
+{
+	test_permission_listener = OP_NEW(TestOpPermissionListener, (state.doc->GetDocManager()->GetWindow(), ALLOWED));
+	verify(test_permission_listener);
+}
+
+
+test("Web handlers (content) registration permitted register + check")
+require WEB_HANDLERS_SUPPORT;
+require success "Web handlers (content) registration permitted prepare";
+{
+	try
+	{
+		navigator.unregisterContentHandler('yogi/baboo', 'about:blank?url=%s');
+		var registered = navigator.isContentHandlerRegistered('yogi/baboo', 'about:blank?url=%s');
+		verify(registered == "new");
+		navigator.registerContentHandler('yogi/baboo', 'about:blank?url=%s', 'Test');
+		registered = navigator.isContentHandlerRegistered('yogi/baboo', 'about:blank?url=%s');
+		verify(registered == "registered");
+		navigator.unregisterContentHandler('yogi/baboo', 'about:blank?url=%s');
+		registered = navigator.isContentHandlerRegistered('yogi/baboo', 'about:blank?url=%s');
+		verify(registered == "new");
+	}
+	catch (e)
+	{
+		verify(false);
+	}
+}
+
+test("Web handlers (content) registration permitted verification")
+language c++;
+require WEB_HANDLERS_SUPPORT;
+require success "Web handlers (content) registration permitted register + check";
+{
+	verify(test_permission_listener->was_called);
+	OP_DELETE(test_permission_listener);
+}
+
+test("navigator.register[Content|Protocol]Handler cleanup")
+require WEB_HANDLERS_SUPPORT;
+require success "navigator.register[Content|Protocol]Handler prepare";
+language c++;
+{
+	if (local_ignore_file_backup.GetFullPath() != NULL)
+	{
+		verify_success(local_ignore_file.CopyContents(&local_ignore_file_backup, FALSE));
+		verify_success(local_ignore_file_backup.Delete(FALSE));
+	}
+	else
+	{
+		verify_success(local_ignore_file.Delete(FALSE));
+	}
+}
+

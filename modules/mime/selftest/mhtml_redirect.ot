@@ -1,0 +1,193 @@
+/* -*- Mode: c; tab-width: 4; c-basic-offset: 4 -*-
+ *
+ * Copyright (C) 2009-2011 Opera Software ASA.  All rights reserved.
+ *
+ * This file is part of the Opera web browser.
+ * It may only be distributed as agreed with Opera Software.
+ */
+
+group "mime.mhtml_redirect";
+
+require _MIME_SUPPORT_;
+require MHTML_ARCHIVE_REDIRECT_SUPPORT;
+
+include "modules/display/vis_dev.h";
+include "modules/windowcommander/src/WindowCommander.h";
+include "modules/doc/frm_doc.h";
+include "modules/hardcore/timer/optimer.h";
+include "modules/libcrypto/include/CryptoHash.h";
+include "modules/url/url_man.h";
+include "modules/selftest/src/doc_st_utils.h";
+
+global
+{
+#define ORIGINAL_URL UNI_L("https://certo.opera.com:6775/CORE-22213/original/index.html")
+#define ARCHIVE_URL UNI_L("https://certo.opera.com:6775/CORE-22213/click/archive.mht")
+#define ORIGINAL_DOCUMENT_HASH "f4dbeea34a81d1e5f172393b72e2e4ad"
+#define ORIGINAL_INLINE_HASH   "a3cbdefbccebed07a49df22769f5c317"
+#define ARCHIVED_DOCUMENT_HASH "37e5eb16d9849ee186bd72544cfdb8c0"
+#define ARCHIVED_INLINE_HASH   "167e1718e83e0bb0df4090f3e571c660"
+#define NOT_LOADED             ""
+#define DONT_CARE              NULL
+}
+
+subtest verifyMD5(URL url, const char* expectedHash)
+{
+	CryptoHash* md5 = NULL;
+	URL_DataDescriptor *desc = NULL;
+	UINT8 hash[16];
+	char hashStr[32+1];
+
+	if (*expectedHash == 0 /* NOT_LOADED */)
+	{
+		verify((URLStatus)url.GetAttribute(URL::KLoadStatus) != URL_LOADED);
+		return TRUE;
+	}
+
+	verify((URLStatus)url.GetAttribute(URL::KLoadStatus) == URL_LOADED);
+	verify((md5 = CryptoHash::CreateMD5()) != NULL);
+	verify(md5->Size() == 16);
+	verify_success(md5->InitHash());
+	verify((desc = url.GetDescriptor(NULL,URL::KNoRedirect,TRUE)) != NULL);
+
+	BOOL more = TRUE;
+	while (more)
+	{
+		unsigned long len = desc->RetrieveData(more);
+		md5->CalculateHash((const UINT8*)desc->GetBuffer(), (int)len);
+		desc->ConsumeData(len);
+	}
+	md5->ExtractHash(hash);
+	for (int i=0; i<16; i++)
+		op_snprintf(hashStr+i*2,3,"%02x",hash[i]);
+	verify_string(hashStr, expectedHash);
+}
+finally
+{
+	OP_DELETE(md5);
+	OP_DELETE(desc);
+}
+
+subtest checkContents(BOOL secure, const uni_char* expectedUrlname, const char* hash1, const char* hash2, const char *hash3)
+{
+	OpString title;
+	verify_success(state.doc->GetWindow()->GetWindowTitle(title));
+	verify_string(title, "Document");
+	BYTE security_state = state.doc->GetWindow()->GetSecurityState();
+	if (secure)
+		verify(security_state == SECURITY_STATE_FULL);
+	else
+		verify(security_state == SECURITY_STATE_UNKNOWN || security_state == SECURITY_STATE_NONE);
+	URL url = state.doc->GetWindow()->GetCurrentURL();
+	OpString urlname;
+	url.GetAttribute(URL::KUniName, urlname);
+	verify_string(urlname, expectedUrlname);
+
+	URL documentUrl = urlManager->GetURL(url, ORIGINAL_URL);
+	verify(verifyMD5(documentUrl, hash1));
+	URL inlineUrl = urlManager->GetURL(documentUrl, "inline.gif");
+	verify(verifyMD5(inlineUrl, hash2));
+	if (hash3 != DONT_CARE)
+	{
+		URL inline2Url = urlManager->GetURL(documentUrl, "inline2.gif");
+		verify(verifyMD5(inline2Url, hash3));
+	}
+}
+
+// Open a window for test documents
+html
+{
+	//! <body>
+	//! </body>
+}
+
+test("MHTML Redirect stage 1, load original page") async;
+{
+	Window* win = state.GetWindow();
+	if (!win)
+		ST_failed("No window!");
+	else
+		WaitUntilLoadedObj::LoadAndWaitUntilLoaded(win, ORIGINAL_URL);
+}
+
+test("MHTML Redirect stage 2, check contents")
+	require success "MHTML Redirect stage 1, load original page";
+{
+	verify(checkContents(TRUE, ORIGINAL_URL, ORIGINAL_DOCUMENT_HASH, ORIGINAL_INLINE_HASH, ORIGINAL_INLINE_HASH));
+}
+
+test("MHTML Redirect stage 3, load mhtml archive from file://") async;
+	file uni filename "testfiles/mhtml_redirect/archive.mht";
+{
+	OpString urlname;
+	urlname.AppendFormat(UNI_L("file:%s"), filename);
+	Window* win = state.GetWindow();
+	if (!win)
+		ST_failed("No window!");
+	else
+		WaitUntilLoadedObj::LoadAndWaitUntilLoaded(win, urlname.CStr());
+}
+
+test("MHTML Redirect stage 4, check contents")
+	require success "MHTML Redirect stage 3, load mhtml archive from file://";
+{
+	verify(checkContents(FALSE, ORIGINAL_URL, ARCHIVED_DOCUMENT_HASH, ARCHIVED_INLINE_HASH, NOT_LOADED));
+}
+
+test("MHTML Redirect stage 4.1, load mhtml archive again") async;
+	file uni filename "testfiles/mhtml_redirect/archive.mht";
+{
+	OpString urlname;
+	urlname.AppendFormat(UNI_L("file:%s"), filename);
+	state.doc->GetWindow()->GetWindowCommander()->OpenURL(urlname.CStr(), TRUE);
+	Window* win = state.GetWindow();
+	if (!win)
+		ST_failed("No window!");
+	else
+		WaitUntilLoadedObj::LoadAndWaitUntilLoaded(win, urlname.CStr());
+}
+
+test("MHTML Redirect stage 4.2, check contents")
+	require success "MHTML Redirect stage 4.1, load mhtml archive again";
+{
+	verify(checkContents(FALSE, ORIGINAL_URL, ARCHIVED_DOCUMENT_HASH, ARCHIVED_INLINE_HASH, NOT_LOADED));
+}
+
+test("MHTML Redirect stage 5, reload") async;
+	require success "MHTML Redirect stage 4, check contents";
+{
+	WaitUntilLoadedObj::ReloadAndWaitUntilLoaded(state.doc);
+}
+
+test("MHTML Redirect stage 6, check contents")
+	require success "MHTML Redirect stage 5, reload";
+{
+	verify(checkContents(TRUE, ORIGINAL_URL, ORIGINAL_DOCUMENT_HASH, ORIGINAL_INLINE_HASH, DONT_CARE /* For future investigation, why does not this load? */));
+}
+
+test("MHTML Redirect stage 7, load mhtml archive from http://") async;
+{
+	Window* win = state.GetWindow();
+	if (!win)
+		ST_failed("No window!");
+	else
+		WaitUntilLoadedObj::LoadAndWaitUntilLoaded(win, ARCHIVE_URL);
+}
+
+test("MHTML Redirect stage 8, check contents")
+	require success "MHTML Redirect stage 7, load mhtml archive from http://";
+{
+	verify(checkContents(FALSE, ARCHIVE_URL, ARCHIVED_DOCUMENT_HASH, ARCHIVED_INLINE_HASH, NOT_LOADED));
+}
+
+test("MHTML Redirect stage 9, reload") async;
+	require success "MHTML Redirect stage 8, check contents";
+{
+	WaitUntilLoadedObj::ReloadAndWaitUntilLoaded(state.doc);
+}
+
+test("MHTML Redirect stage 10, check contents")
+	require success "MHTML Redirect stage 9, reload";
+{
+	verify(checkContents(FALSE, ARCHIVE_URL, ARCHIVED_DOCUMENT_HASH, ARCHIVED_INLINE_HASH, NOT_LOADED));
+}

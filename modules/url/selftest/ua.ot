@@ -1,0 +1,469 @@
+/* -*- Mode: c++; tab-width: 4; indent-tabs-mode: t; c-basic-offset: 4; -*-
+**
+** Copyright (C) 2004-2011 Opera Software ASA.  All rights reserved.
+**
+** This file is part of the Opera web browser.  It may not be distributed
+** under any circumstances.
+**
+** Peter Krefting
+*/
+
+group "url.ua";
+require initialization;
+
+include "modules/url/uamanager/ua.h";
+include "modules/prefs/prefsmanager/collections/pc_core.h";
+include if UNIX && undefined(CORE_GOGI) "platforms/unix/product/uastring.h";
+
+global
+{
+	UAManager* ua_man;
+	int allow_components_setting;
+}
+
+setup
+{
+	ua_man = NULL;
+
+#if defined COMPONENT_IN_UASTRING_SUPPORT && defined PREFS_WRITE
+	// To test the components stuff we need to have it enabled. We
+	// remember the value so we can restore it afterwards.
+	allow_components_setting = g_pccore->GetIntegerPref(PrefsCollectionCore::AllowComponentsInUAStringComment);
+	if (!allow_components_setting)
+	{
+		TRAPD(rc, g_pccore->WriteIntegerL(PrefsCollectionCore::AllowComponentsInUAStringComment, TRUE));
+	}
+#endif
+}
+
+test("Create UAManager")
+{
+	ua_man = OP_NEW(UAManager, ());
+	verify(ua_man != NULL);
+	TRAPD(status, ua_man->ConstructL());
+	verify_success(status);
+}
+
+test("GetUserAgentStr()")
+	require success "Create UAManager";
+{
+	char ua[256]; /* ARRAY OK 2010-12-28 peter */
+	op_memset(ua, 0, sizeof ua);
+	int len = ua_man->GetUserAgentStr(ua, sizeof ua, NULL);
+	verify(len > 0);
+	verify(ua[0] != 0);
+
+	op_memset(ua, 0, sizeof ua);
+	int version_len = ua_man->GetUserAgentVersionStr(ua, sizeof ua, NULL);
+	verify(version_len > 0);
+	verify(version_len < len);
+	verify(ua[0] != 0);
+}
+
+test("GetUserAgentStr() buffer management")
+	require success "Create UAManager";
+{
+	char ua[256]; /* ARRAY OK 2010-12-28 peter */
+	op_memset(ua, 1, sizeof ua);
+	int len = ua_man->GetUserAgentStr(ua, 5, NULL);
+	verify(len > 0 && len <= 5);
+	verify(ua[5] == 1);
+}
+
+test("GetUserAgentVersionStr() buffer management")
+	require success "Create UAManager";
+{
+	char ua[256]; /* ARRAY OK 2010-12-01 peter */
+	op_memset(ua, 1, sizeof ua);
+	int len = ua_man->GetUserAgentVersionStr(ua, 5, NULL);
+	verify(len > 0 && len <= 5);
+	verify(ua[5] == 1);
+}
+
+test("Adding and removing prefix and suffix")
+	require success "Create UAManager";
+	require TOKEN_IN_UASTRING_SUPPORT;
+{
+	// Add prefix and suffix
+	ua_man->SetPrefix("MobilePhone/420");
+	ua_man->SetSuffix("WeirdFeature");
+
+	// Make sure tokens are included
+	verify(testpresence(UA_Opera, "MobilePhone/420", false));
+	verify(testpresence(UA_Opera, "WeirdFeature", false));
+
+	// Make sure prefix is first and suffix last
+	char ua[256]; /* ARRAY OK 2010-12-28 peter */
+	int len = ua_man->GetUserAgentStr(ua, sizeof ua, NULL);
+	verify(len == int(op_strlen(ua)));
+	verify(op_strncmp(ua, "MobilePhone/420", 15) == 0);
+	verify(op_strcmp(ua + len - 12, "WeirdFeature") == 0);
+
+	// Test buffer handling
+	op_memset(ua, 1, sizeof ua);
+	len = ua_man->GetUserAgentStr(ua, 16, NULL);
+	verify(len == 15);
+	verify(op_strcmp(ua, "MobilePhone/420") == 0);
+	verify(ua[16] == 1);
+
+	// Remove prefix and suffix again
+	ua_man->SetPrefix(NULL);
+	ua_man->SetSuffix(NULL);
+
+	// Make sure tokens are gone
+	verify(testnonpresence(UA_Opera, "MobilePhone/420"));
+	verify(testnonpresence(UA_Opera, "WeirdFeature"));
+}
+
+test("Making sure \"Opera\" occurs in all UA strings")
+	require success "Create UAManager";
+	require undefined SC_UA_EXTERNAL;
+{
+	char ua[256]; /* ARRAY OK 2010-12-28 peter */
+
+	op_memset(ua, 0, sizeof ua);
+	verify(ua_man->GetUserAgentStr(ua, sizeof ua, NULL, NULL, UA_Opera) > 0);
+	verify(op_strstr(ua, "Opera") != NULL);
+
+	op_memset(ua, 0, sizeof ua);
+	verify(ua_man->GetUserAgentStr(ua, sizeof ua, NULL, NULL, UA_Mozilla) > 0);
+	verify(op_strstr(ua, "Opera") != NULL);
+
+	op_memset(ua, 0, sizeof ua);
+	verify(ua_man->GetUserAgentStr(ua, sizeof ua, NULL, NULL, UA_MSIE) > 0);
+	verify(op_strstr(ua, "Opera") != NULL);
+
+#ifdef IMODE_EXTENSIONS
+	op_memset(ua, 0, sizeof ua);
+	verify(ua_man->GetUserAgentStr(ua, sizeof ua, NULL, NULL, UA_IMODE) > 0);
+	verify(op_strstr(ua, "Opera") != NULL);
+#endif
+
+	// Exception: The "Mozilla only" and "MSIE only" overrides (only
+	// available from the hardcoded list)
+	op_memset(ua, 0, sizeof ua);
+	verify(ua_man->GetUserAgentStr(ua, sizeof ua, NULL, NULL, UA_MozillaOnly) > 0);
+	verify(op_strstr(ua, "Opera") == NULL);
+
+	op_memset(ua, 0, sizeof ua);
+	verify(ua_man->GetUserAgentStr(ua, sizeof ua, NULL, NULL, UA_MSIE_Only) > 0);
+	verify(op_strstr(ua, "Opera") == NULL);
+}
+
+test("Making sure U and language does not appear")
+	require success "Create UAManager";
+{
+	for (int i=0; i<2; i++)
+	{
+		// Must enclose properly on both sides, in case "U" appears elsewhere, so testing with both ';' and ')'
+		testnonpresence(UA_Opera, "; U;");
+		testnonpresence(UA_Mozilla, "; U;");
+		testnonpresence(UA_MSIE, "; U;");
+#ifdef IMODE_EXTENSIONS
+		testnonpresence(UA_IMODE, "; U;");
+#endif
+		testnonpresence(UA_MozillaOnly, "; U;");
+		testnonpresence(UA_MSIE_Only, "; U;");
+
+		testnonpresence(UA_Opera, "; U)");
+		testnonpresence(UA_Mozilla, "; U)");
+		testnonpresence(UA_MSIE, "; U)");
+#ifdef IMODE_EXTENSIONS
+		testnonpresence(UA_IMODE, "; U)");
+#endif
+		testnonpresence(UA_MozillaOnly, "; U)");
+		testnonpresence(UA_MSIE_Only, "; U)");
+
+// In case of SC_UA_CONTEXT_COMPONENTS, we can't prevent them from adding language
+#ifndef	SC_UA_CONTEXT_COMPONENTS
+		// For simplicity using language "en" since at least SPARTAN uses that
+		testnonpresence(UA_Opera, "; en;");
+		testnonpresence(UA_Mozilla, "; en;");
+		testnonpresence(UA_MSIE, "; en;");
+#ifdef IMODE_EXTENSIONS
+		testnonpresence(UA_IMODE, "; en;");
+#endif
+		testnonpresence(UA_MozillaOnly, "; en;");
+		testnonpresence(UA_MSIE_Only, "; en;");
+
+		testnonpresence(UA_Opera, "; en)");
+		testnonpresence(UA_Mozilla, "; en)");
+		testnonpresence(UA_MSIE, "; en)");
+#ifdef IMODE_EXTENSIONS
+		testnonpresence(UA_IMODE, "; en)");
+#endif
+		testnonpresence(UA_MozillaOnly, "; en)");
+		testnonpresence(UA_MSIE_Only, "; en)");
+#endif
+
+#ifdef COMPONENT_IN_UASTRING_SUPPORT
+		// Test with component, as UAManager::AssembleComponents() also added language
+		if (i==0)
+			ua_man->AddComponent("Test");
+#endif
+	}
+#ifdef COMPONENT_IN_UASTRING_SUPPORT
+	ua_man->RemoveComponent("Test");
+#endif
+}
+
+test("Testing \"Version\" tag in Opera UA string")
+	require SC_UA_VERSION_TAG;
+	require undefined SC_UA_EXTERNAL;
+{
+	char ua[256]; /* ARRAY OK 2010-12-28 peter */
+
+	op_memset(ua, 0, sizeof ua);
+	verify(ua_man->GetUserAgentStr(ua, sizeof ua, NULL, NULL, UA_Opera) > 0);
+	verify(op_strstr(ua, "Version/" VER_NUM_STR) != NULL);
+}
+
+test("Making sure UA strings are sane")
+	require success "Create UAManager";
+	require undefined SC_UA_EXTERNAL;
+{
+	char ua[256]; /* ARRAY OK 2010-12-01 peter */
+	char version[256]; /* ARRAY OK 2010-12-01 peter */
+	op_memset(ua, 0, sizeof ua);
+	op_memset(version, 0, sizeof version);
+	verify(ua_man->GetUserAgentStr(ua, sizeof ua, NULL, NULL, UA_Opera) > 0);
+	verify(ua_man->GetUserAgentVersionStr(version, sizeof version, NULL, NULL, UA_Opera) > 0);
+	verify(op_strstr(ua, "Mozilla") == NULL);
+	verify(op_strstr(ua, "Gecko") == NULL);
+	verify(op_strstr(ua, "Firefox") == NULL);
+	verify(op_strstr(ua, "MSIE") == NULL);
+	verify(op_strstr(ua, "DoCoMo") == NULL);
+#ifdef VER_NUM_FORCE_STR
+	verify(op_strstr(ua, "Opera/" VER_NUM_FORCE_STR " ") == ua);
+#else
+	verify(op_strstr(ua, "Opera/" VER_NUM_STR " ") == ua);
+#endif
+	verify(op_strstr(ua, "; rv:") == NULL);
+	verify(op_strstr(ua, "Presto/") != NULL); // Must contain core version
+	verify(op_strlen(version) < op_strlen(ua));
+	verify(op_strstr(ua, version) > ua);
+
+	op_memset(ua, 0, sizeof ua);
+	op_memset(version, 0, sizeof version);
+	verify(ua_man->GetUserAgentStr(ua, sizeof ua, NULL, NULL, UA_Mozilla) > 0);
+	verify(ua_man->GetUserAgentVersionStr(version, sizeof version, NULL, NULL, UA_Mozilla) > 0);
+	verify(op_strstr(ua, "Mozilla") == ua);
+	verify(op_strstr(ua, "Gecko") > ua);
+	verify(op_strstr(ua, "Firefox") > ua);
+	verify(op_strstr(ua, "MSIE") == NULL);
+	verify(op_strstr(ua, "DoCoMo") == NULL);
+	verify(op_strstr(ua, "; rv:") > ua);
+	verify(op_strstr(ua, "Presto/") == NULL); // Must not contain core version
+	verify(op_strlen(version) < op_strlen(ua));
+	verify(op_strstr(ua, version) > ua);
+
+	op_memset(ua, 0, sizeof ua);
+	op_memset(version, 0, sizeof version);
+	verify(ua_man->GetUserAgentStr(ua, sizeof ua, NULL, NULL, UA_MSIE) > 0);
+	verify(ua_man->GetUserAgentVersionStr(version, sizeof version, NULL, NULL, UA_MSIE) > 0);
+	verify(op_strstr(ua, "Mozilla") == ua);
+	verify(op_strstr(ua, "Gecko") == NULL);
+	verify(op_strstr(ua, "Firefox") == NULL);
+	verify(op_strstr(ua, "MSIE") > ua);
+	verify(op_strstr(ua, "DoCoMo") == NULL);
+	verify(op_strstr(ua, "; rv:") == NULL);
+	verify(op_strstr(ua, "Presto/") == NULL); // Must not contain core version
+	verify(op_strlen(version) < op_strlen(ua));
+	verify(op_strstr(ua, version) > ua);
+
+#ifdef IMODE_EXTENSIONS
+	op_memset(ua, 0, sizeof ua);
+	op_memset(version, 0, sizeof version);
+	verify(ua_man->GetUserAgentStr(ua, sizeof ua, NULL, NULL, UA_IMODE) > 0);
+	verify(ua_man->GetUserAgentVersionStr(version, sizeof version, NULL, NULL, UA_IMODE) > 0);
+	verify(op_strstr(ua, "Mozilla") == NULL);
+	verify(op_strstr(ua, "Gecko") == NULL);
+	verify(op_strstr(ua, "Firefox") == NULL);
+	verify(op_strstr(ua, "MSIE") == NULL);
+	verify(op_strstr(ua, "DoCoMo") == ua);
+	verify(op_strstr(ua, "; rv:") == NULL);
+	verify(op_strstr(ua, "Presto/") == NULL); // Must not contain core version
+	verify(op_strlen(version) < op_strlen(ua));
+	verify(op_strstr(ua, version) > ua);
+#endif
+
+	op_memset(ua, 0, sizeof ua);
+	op_memset(version, 0, sizeof version);
+	verify(ua_man->GetUserAgentStr(ua, sizeof ua, NULL, NULL, UA_MozillaOnly) > 0);
+	verify(ua_man->GetUserAgentVersionStr(version, sizeof version, NULL, NULL, UA_MozillaOnly) > 0);
+	verify(op_strstr(ua, "Mozilla") == ua);
+	verify(op_strstr(ua, "Gecko") > ua);
+	verify(op_strstr(ua, "Firefox") > ua);
+	verify(op_strstr(ua, "MSIE") == NULL);
+	verify(op_strstr(ua, "DoCoMo") == NULL);
+	verify(op_strstr(ua, "; rv:") > ua);
+	verify(op_strstr(ua, "Presto/") == NULL); // Must not contain core version
+	verify(op_strlen(version) < op_strlen(ua));
+	verify(op_strstr(ua, version) > ua);
+
+	op_memset(ua, 0, sizeof ua);
+	op_memset(version, 0, sizeof version);
+	verify(ua_man->GetUserAgentStr(ua, sizeof ua, NULL, NULL, UA_MSIE_Only) > 0);
+	verify(ua_man->GetUserAgentVersionStr(version, sizeof version, NULL, NULL, UA_MSIE_Only) > 0);
+	verify(op_strstr(ua, "Mozilla") == ua);
+	verify(op_strstr(ua, "Gecko") == NULL);
+	verify(op_strstr(ua, "Firefox") == NULL);
+	verify(op_strstr(ua, "MSIE") > ua);
+	verify(op_strstr(ua, "DoCoMo") == NULL);
+	verify(op_strstr(ua, "; rv:") == NULL);
+	verify(op_strstr(ua, "Presto/") == NULL); // Must not contain core version
+	verify(op_strlen(version) < op_strlen(ua));
+	verify(op_strstr(ua, version) > ua);
+}
+
+subtest testpresence(UA_BaseStringId id, const char *what, bool in_version_string)
+{
+	char ua[256]; /* ARRAY OK 2010-12-28 peter */
+	op_memset(ua, 0, sizeof ua);
+
+	verify(ua_man->GetUserAgentStr(ua, sizeof ua, NULL, NULL, id) > 0);
+	char *found = op_strstr(ua, what);
+	verify(found);
+
+	// Make sure it's not duplicated
+	verify(op_strstr(found + 1, what) == NULL);
+
+	// Check if it is in the version string as well
+	op_memset(ua, 0, sizeof ua);
+
+	verify(ua_man->GetUserAgentVersionStr(ua, sizeof ua, NULL, NULL, id) > 0);
+	char *found_in_version_string = op_strstr(ua, what);
+	if (in_version_string)
+		verify(found_in_version_string);
+	else
+		verify(!found_in_version_string);
+}
+
+subtest testnonpresence(UA_BaseStringId id, const char *what)
+{
+	char ua[256]; /* ARRAY OK 2010-12-28 peter */
+	op_memset(ua, 0, sizeof ua);
+
+	verify(ua_man->GetUserAgentStr(ua, sizeof ua, NULL, NULL, id) > 0);
+	verify(op_strstr(ua, what) == NULL);
+}
+
+test("Adding and removing UA comments")
+	require success "Create UAManager";
+	require COMPONENT_IN_UASTRING_SUPPORT;
+{
+	const char components[3][20] =
+	{
+		"SelfTestVersion",
+		"AnotherCommentToken",
+		"FinalCommentToken"
+	};
+	char semicolon_component[22]; // ARRAY OK roarl 2012-05-23
+
+	// Add components
+	for (int i = 0; i < 3; ++ i)
+	{
+		verify_success(ua_man->AddComponent(components[i]));
+
+		// Check that the tokens we added are present
+		for (int j = 0; j <= i; ++ j)
+		{
+			op_snprintf(semicolon_component, sizeof(semicolon_component), "; %s", components[j]);
+
+			verify(testpresence(UA_Opera, semicolon_component, true));
+#ifndef SC_UA_COMPONENT_FOR_OPERA_ONLY
+			verify(testpresence(UA_Mozilla, semicolon_component, true));
+			verify(testpresence(UA_MSIE, semicolon_component, true));
+#else
+			verify(testnonpresence(UA_Mozilla, semicolon_component));
+			verify(testnonpresence(UA_MSIE, semicolon_component));
+#endif // !SC_UA_COMPONENT_FOR_OPERA_ONLY
+		}
+
+		// And that the ones we didn't aren't
+		for (int k = i + 1; k < 3; ++ k)
+		{
+			verify(testnonpresence(UA_Opera, components[k]));
+			verify(testnonpresence(UA_Mozilla, components[k]));
+			verify(testnonpresence(UA_MSIE, components[k]));
+		}
+	}
+
+	// Remove them again
+	for (int l = 0; l < 3; ++ l)
+	{
+		ua_man->RemoveComponent(components[l]);
+
+		// Check that the tokens we removed aren't present
+		for (int m = 0; m <= l; ++ m)
+		{
+			verify(testnonpresence(UA_Opera, components[m]));
+			verify(testnonpresence(UA_Mozilla, components[m]));
+			verify(testnonpresence(UA_MSIE, components[m]));
+		}
+
+		// And that the ones we haven't removed yet still are there
+		for (int n = l + 1; n < 3; ++ n)
+		{
+			verify(testpresence(UA_Opera, components[n], true));
+#ifndef SC_UA_COMPONENT_FOR_OPERA_ONLY
+			verify(testpresence(UA_Mozilla, components[n], true));
+			verify(testpresence(UA_MSIE, components[n], true));
+#endif // !SC_UA_COMPONENT_FOR_OPERA_ONLY
+		}
+	}
+
+	// Adding duplicates shouldn't do anything
+	for (int o = 0; o < 10; ++ o)
+	{
+		verify_success(ua_man->AddComponent("Duplicate"));
+		verify(testpresence(UA_Opera, "Duplicate", true));
+	}
+	ua_man->RemoveComponent("Duplicate");
+	verify(testnonpresence(UA_Opera, "Duplicate"));
+}
+
+test("GetUserAgentStr() NULL termination and buffer handling")
+	require success "Create UAManager";
+{
+	char buffer[500];
+
+	// Test GetUserAgentStr() with various buffer sizes to test running
+	// out of buffer at every place in the function.
+	for (int i = sizeof(buffer); i >= 0; i--)
+	{
+		op_memset(buffer, 0xcc, sizeof(buffer));
+		int len = ua_man->GetUserAgentStr(buffer, i, NULL, NULL, UA_Opera);
+
+		// Check that the string is null terminated.
+		if (i == 0)
+		{
+			verify(len == 0);
+			verify(static_cast<unsigned char>(buffer[0]) == 0xcc);
+		}
+		else
+		{
+			verify(len < i);
+			verify(buffer[len] == '\0');
+			verify(static_cast<int>(op_strlen(buffer)) == len);
+		}
+
+		// Check that no bytes after the buffer has been touched.
+		for (size_t j = i; j < sizeof(buffer); j++)
+			verify(static_cast<unsigned char>(buffer[j]) == 0xcc);
+	}
+}
+
+exit
+{
+	OP_DELETE(ua_man);
+
+#if defined COMPONENT_IN_UASTRING_SUPPORT && defined PREFS_WRITE
+	// Restore the setting for components in the UA string (but only if
+	// we actually did change it)
+	if (!allow_components_setting)
+	{
+		TRAPD(rc, g_pccore->ResetIntegerL(PrefsCollectionCore::AllowComponentsInUAStringComment));
+	}
+#endif
+}

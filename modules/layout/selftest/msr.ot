@@ -1,0 +1,122 @@
+/* -*- mode: c++; tab-width: 4; c-basic-offset: 4 -*- */
+
+group "layout.msr";
+
+require init;
+
+include "modules/doc/frm_doc.h";
+include "modules/dochand/win.h";
+include "modules/layout/box/box.h";
+include "modules/layout/box/tables.h";
+include "modules/logdoc/htm_elm.h";
+
+language c++;
+
+global
+{
+	LayoutMode old_layout_mode;
+
+	UINT32 orig_width, orig_height;
+
+	// A couple of nasty methods to get and set window size.
+
+	void GetWindowSize(Window* win, UINT32& width, UINT32& height)
+	{
+		win->GetOpWindow()->GetInnerSize(&width, &height);
+	}
+
+	BOOL SetWindowSize(Window* win, UINT32 width, UINT32 height)
+	{
+		/* First increase the window's maximum size, so we don't get
+		   clamped. Note that there's no way to obtain the original maximum
+		   size through the OpWindow API. */
+
+		win->GetOpWindow()->SetMaximumInnerSize(width, height);
+
+		win->GetOpWindow()->SetInnerSize(width, height);
+		win->HandleNewWindowSize(width, height);
+		return OpStatus::IsSuccess(win->GetCurrentDoc()->Reflow(FALSE));
+	}
+}
+
+html
+{
+	//! <!-- see bug CORE-28250 -->
+}
+test("setup")
+{
+	old_layout_mode = state.window->GetLayoutMode();
+	state.doc->GetWindow()->SetLayoutMode(LAYOUT_MSR);
+
+	GetWindowSize(state.doc->GetWindow(), orig_width, orig_height);
+	verify(SetWindowSize(state.doc->GetWindow(), 1000, 2000));
+}
+
+html
+{
+	//! <!DOCTYPE html>
+	//! <html><body style="width:0;">
+	//!  <table id="elm">
+	//!   <tr>
+	//!    <td><div style="width:3000px; min-width:2000px; max-width:2999px;">&nbsp;</div></td>
+	//!    <td><div style="width:3000px; min-width:2000px; max-width:2999px;">&nbsp;</div></td>
+	//!   </tr>
+	//!  </table>
+	//!  <table id="ref">
+	//!   <tr>
+	//!    <td><div>&nbsp;</div></td>
+	//!    <td><div>&nbsp;</div></td>
+	//!   </tr>
+	//!  </table>
+	//! </body></html>
+}
+test("minimum width calculation should ignore width properties") // bug CORE-10437
+{
+	state.doc->Reflow(FALSE);
+
+	HTML_Element* elm = state.doc->GetDocRoot()->GetElmById(UNI_L("elm"));
+	verify(elm);
+	verify(elm->GetLayoutBox());
+
+	TableContent* table = elm->GetLayoutBox()->GetTableContent();
+	verify(table);
+
+	HTML_Element* ref_elm = state.doc->GetDocRoot()->GetElmById(UNI_L("ref"));
+	verify(ref_elm);
+	verify(ref_elm->GetLayoutBox());
+
+	TableContent* ref_table = ref_elm->GetLayoutBox()->GetTableContent();
+	verify(ref_table);
+
+	verify(table->GetWidth() == ref_table->GetWidth());
+}
+
+html
+{
+	//! <!DOCTYPE html>
+	//! <html><body style="width:1000px;">
+	//!  <table id="table" cellspacing="0" cellpadding="0">
+	//!   <tr>
+	//!    <td id="cell1" style="width:300px;"></td>
+	//!    <td id="cell2"><div style="width:400px; height:20px;"></div></td>
+	//!    <td id="cell3">
+	//!     <div style="display:inline-block; width:100px; height:20px;"></div>&#x200b;<div style="display:inline-block; width:100px; height:20px;"></div>
+	//!    </td>
+	//!   </tr>
+	//!  </table>
+	//! </body></html>
+}
+test("maximum table width should be honored when possible") // bug CORE-28257
+language ecmascript;
+{
+	verify(document.getElementById('cell1').offsetWidth == 300);
+	verify(document.getElementById('cell2').offsetWidth == 400);
+	verify(document.getElementById('cell3').offsetWidth == 200);
+	verify(document.getElementById('table').offsetWidth == 900);
+}
+
+exit
+{
+	SetWindowSize(state.doc->GetWindow(), orig_width, orig_height);
+	state.doc->GetWindow()->SetLayoutMode(old_layout_mode);
+}

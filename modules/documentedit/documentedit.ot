@@ -1,0 +1,2174 @@
+/* -*- Mode: c++; tab-width: 4; indent-tabs-mode: t; c-basic-offset: 4 -*- */
+group "DocumentEdit";
+require init;
+require DOCUMENT_EDIT_SUPPORT;
+
+include "modules/documentedit/OpDocumentEdit.h";
+include "modules/documentedit/OpDocumentEditUtils.h";
+include "modules/dochand/fdelm.h";
+include "modules/doc/frm_doc.h";
+include "modules/doc/html_doc.h";
+include "modules/logdoc/selection.h";
+include "modules/logdoc/selectionpoint.h";
+include "modules/doc/caret_painter.h";
+
+global
+{
+	OpDocumentEdit* GetDocumentEdit()
+	{
+		if (FramesDocElm* ifrmroot = state.doc->GetIFrmRoot())
+			if (ifrmroot->FirstChild())
+				return ifrmroot->FirstChild()->GetCurrentDoc()->GetDocumentEdit();
+
+		return NULL;
+	}
+
+	HTML_Element* GetSelectToCaretElement(OpDocumentEdit* edit)
+	{
+		HTML_Element* li_element = edit->FindElementAfterOfType(edit->GetBody(), HE_LI, FALSE);
+		if (!li_element)
+			return NULL;
+
+		HTML_Element* candidate = li_element->FirstChild();
+		if (candidate && candidate->GetIsListMarkerPseudoElement())
+			candidate = candidate->Suc();
+
+		return candidate;
+	}
+}
+
+html
+{
+	//! <script>
+	//! function do_onload()
+	//! {
+	//!   document.getElementById('edit').contentDocument.designMode = 'on';
+	//! }
+	//! </script>
+	//! <body onload="do_onload()">
+	//! <iframe id="edit" width="40" height="40"></iframe>
+	//! </body>
+}
+
+test("ExecuteCommand_EmptyDoc") language ecmascript;
+{
+	verify(document.getElementById('edit').contentDocument.designMode == 'on');
+	verify(document.getElementById('edit').contentDocument.queryCommandEnabled('backcolor'));
+	document.getElementById('edit').contentDocument.execCommand('backcolor', false, '#AA8855');
+}
+
+html
+{
+	//! <script>
+	//! function do_onload()
+	//! {
+	//!   var doc = document.getElementById('edit').contentDocument;
+	//!   doc.open();
+	//!   doc.write("<HTML><BODY>Some <EM>italic</EM> and <B>bold</B> text!</BODY></HTML>");
+	//!   doc.close();
+	//!   doc = document.getElementById('edit').contentDocument;
+	//!   doc.designMode = 'on';
+	//! }
+	//! </script>
+	//! <body onload="do_onload()">
+	//! <iframe id="edit" width="40" height="40"></iframe>
+	//! </body>
+}
+
+test("WriteTemplateDocument") language ecmascript;
+{
+	var doc = document.getElementById('edit').contentDocument;
+	verify(doc.designMode == 'on');
+	verify(doc.body.innerHTML == "Some <em>italic</em> and <b>bold</b> text!");
+}
+
+test("EmptyDocument") language ecmascript;
+{
+	var doc = document.getElementById('edit').contentDocument;
+	doc.body.innerHTML = "";
+	doc.execCommand('bold', false, null);
+	verify(doc.body);
+}
+
+test("EditDocument1") language C++;
+{
+	OpDocumentEdit* edit = GetDocumentEdit();
+	verify(edit);
+	edit->InsertText(UNI_L("test"), 4);
+}
+
+test("EditDocument2") language ecmascript;
+{
+	var doc = document.getElementById('edit').contentDocument;
+	verify(doc.body.innerHTML == "<strong>test</strong>");
+}
+
+subtest VerifyHtml(OpDocumentEdit* edit, const uni_char* text)
+{
+	OpString tmp;
+	edit->GetTextHTML(tmp);
+
+	// Turn unicode nonbreaking space into &nbsp; since we can't (and don't want to) write teststrings with unicode character.
+	while (1)
+	{
+		int pos = tmp.FindI(UNI_L("\xA0"));
+		if (pos == KNotFound)
+			break;
+		tmp.Delete(pos, 1);
+		tmp.Insert(pos, UNI_L("&nbsp;"));
+	}
+
+	if (tmp.CompareI(text))
+	{
+		output("Value: \"%s\" Expected value: \"%s\"\n", ST_down(tmp.CStr() ? tmp.CStr() : UNI_L("")), ST_down(text ? text : UNI_L("")));
+	}
+
+	verify(tmp.CompareI(text) == 0);
+}
+
+test("StyleStartEnd") language C++;
+{
+	OpDocumentEdit* edit = GetDocumentEdit();
+	verify(edit);
+
+	edit->Clear();
+
+	edit->InsertText(UNI_L("x"), 1);
+	verify(VerifyHtml(edit, UNI_L("x")));
+	edit->execCommand(OP_DOCUMENT_EDIT_COMMAND_BOLD);
+	edit->InsertText(UNI_L("x"), 1);
+	verify(VerifyHtml(edit, UNI_L("x<STRONG>x</STRONG>")));
+	edit->execCommand(OP_DOCUMENT_EDIT_COMMAND_BOLD);
+	verify(VerifyHtml(edit, UNI_L("x<STRONG>x</STRONG>")));
+	edit->InsertText(UNI_L("x"), 1);
+
+	verify(VerifyHtml(edit, UNI_L("x<STRONG>x</STRONG>x")));
+
+	edit->Clear();
+
+	edit->InsertText(UNI_L("x"), 1);
+	edit->execCommand(OP_DOCUMENT_EDIT_COMMAND_BOLD);
+	edit->execCommand(OP_DOCUMENT_EDIT_COMMAND_BOLD);
+	edit->execCommand(OP_DOCUMENT_EDIT_COMMAND_ITALIC);
+	edit->InsertText(UNI_L("x"), 1);
+	verify(VerifyHtml(edit, UNI_L("x<EM>x</EM>")));
+
+	edit->execCommand(OP_DOCUMENT_EDIT_COMMAND_BOLD);
+	edit->InsertText(UNI_L("x"), 1);
+	verify(VerifyHtml(edit, UNI_L("x<EM>x<STRONG>x</STRONG></EM>")));
+
+/*	edit->execCommand(OP_DOCUMENT_EDIT_COMMAND_BOLD);
+	edit->InsertText(UNI_L("x"), 1);
+	verify(VerifyHtml(edit, UNI_L("x<EM>x<STRONG>x</STRONG>x</EM>")));
+
+	edit->execCommand(OP_DOCUMENT_EDIT_COMMAND_ITALIC);
+	edit->InsertText(UNI_L("x"), 1);
+	verify(VerifyHtml(edit, UNI_L("x<EM>x<STRONG>x</STRONG>x</EM>x")));*/
+}
+
+test("StyleAndWhitespace") language C++;
+{
+	OpDocumentEdit* edit = GetDocumentEdit();
+	verify(edit);
+
+	edit->SetTextHTML(UNI_L("<STRONG>one two three</STRONG>"));
+
+	// Select "two"
+	HTML_Element* elm = edit->FindEditableElement(edit->GetBody(), TRUE, FALSE, FALSE);
+	verify(elm);
+	edit->m_caret.Place(elm, 4);
+	edit->m_selection.SelectToCaret(edit->m_caret.GetElement(), 7);
+
+	// Remove bold from selection
+	edit->execCommand(OP_DOCUMENT_EDIT_COMMAND_BOLD);
+	verify(VerifyHtml(edit, UNI_L("<STRONG>one </STRONG>two<STRONG> three</STRONG>")));
+
+	edit->execCommand(OP_DOCUMENT_EDIT_COMMAND_SELECTALL);
+	edit->execCommand(OP_DOCUMENT_EDIT_COMMAND_REMOVEFORMAT);
+	verify(VerifyHtml(edit, UNI_L("one two three")));
+
+	// Select "two"
+	elm = edit->FindEditableElement(edit->GetBody(), TRUE, FALSE, FALSE);
+	verify(elm);
+	edit->m_caret.Place(elm, 4, FALSE, FALSE);
+	OpInputAction action(OpInputAction::ACTION_RANGE_NEXT_CHARACTER);
+	edit->EditAction(&action);
+	edit->EditAction(&action);
+	edit->EditAction(&action);
+
+	// Set bold and italic, and remove italic.
+	edit->execCommand(OP_DOCUMENT_EDIT_COMMAND_BOLD);
+	verify(VerifyHtml(edit, UNI_L("one <STRONG>two</STRONG> three")));
+	edit->execCommand(OP_DOCUMENT_EDIT_COMMAND_ITALIC);
+	edit->execCommand(OP_DOCUMENT_EDIT_COMMAND_ITALIC);
+	verify(VerifyHtml(edit, UNI_L("one <STRONG>two</STRONG> three")));
+}
+
+test("WhiteSpaceNBSP1") language C++;
+{
+	OpDocumentEdit* edit = GetDocumentEdit();
+	verify(edit);
+
+	OpInputAction backspace(OpInputAction::ACTION_BACKSPACE);
+
+	edit->SetTextHTML(UNI_L(""));
+		// Adding space/text
+		edit->InsertText(UNI_L(" "), 1);
+		verify(VerifyHtml(edit, UNI_L("&nbsp;")));
+		edit->InsertText(UNI_L("A"), 1);
+		verify(VerifyHtml(edit, UNI_L("&nbsp;A")));
+		edit->InsertText(UNI_L(" "), 1);
+		verify(VerifyHtml(edit, UNI_L("&nbsp;A&nbsp;")));
+		edit->InsertText(UNI_L("B"), 1);
+		verify(VerifyHtml(edit, UNI_L("&nbsp;A B")));
+		// Removing text
+		edit->OnInputAction(&backspace);
+		verify(VerifyHtml(edit, UNI_L("&nbsp;A&nbsp;")));
+}
+
+test("WhiteSpaceNBSP2") language C++;
+{
+	OpDocumentEdit* edit = GetDocumentEdit();
+	verify(edit);
+
+	edit->SetTextHTML(UNI_L(""));
+		// Adding lots of space
+		edit->InsertText(UNI_L(" "), 1);
+		edit->InsertText(UNI_L(" "), 1);
+		verify(VerifyHtml(edit, UNI_L("&nbsp;&nbsp;")));
+		edit->InsertText(UNI_L(" "), 1);
+		verify(VerifyHtml(edit, UNI_L("&nbsp; &nbsp;")));
+}
+
+test("WhiteSpaceNBSP3") language C++;
+{
+	OpDocumentEdit* edit = GetDocumentEdit();
+	verify(edit);
+
+	OpInputAction backspace(OpInputAction::ACTION_BACKSPACE);
+
+	edit->SetTextHTML(UNI_L("AB"));
+	edit->m_caret.Move(FALSE, FALSE);
+		// Adding lots of space
+		edit->InsertText(UNI_L(" "), 1);
+		verify(VerifyHtml(edit, UNI_L("A B")));
+		edit->InsertText(UNI_L(" "), 1);
+		verify(VerifyHtml(edit, UNI_L("A &nbsp;B")));
+		edit->InsertText(UNI_L(" "), 1);
+		verify(VerifyHtml(edit, UNI_L("A &nbsp; B")));
+		// Removing space
+		edit->OnInputAction(&backspace);
+		verify(VerifyHtml(edit, UNI_L("A &nbsp;B")));
+		edit->OnInputAction(&backspace);
+		verify(VerifyHtml(edit, UNI_L("A B")));
+}
+
+test("WhiteSpaceNBSP4") language C++;
+{
+	OpDocumentEdit* edit = GetDocumentEdit();
+	verify(edit);
+
+	edit->SetTextHTML(UNI_L("<DIV>A</DIV>after"));
+		HTML_Element* elm = edit->FindEditableElement(edit->GetBody(), TRUE, FALSE, FALSE);
+		verify(elm);
+		edit->m_caret.Place(elm, 1);
+		edit->InsertText(UNI_L(" "), 1);
+		verify(VerifyHtml(edit, UNI_L("<DIV>A&nbsp;</DIV>after")));
+
+	edit->SetTextHTML(UNI_L("<SPAN>A</SPAN>after"));
+		elm = edit->FindEditableElement(edit->GetBody(), TRUE, FALSE, FALSE);
+		verify(elm);
+		edit->m_caret.Place(elm, 1);
+		edit->InsertText(UNI_L(" "), 1);
+		verify(VerifyHtml(edit, UNI_L("<SPAN>A </SPAN>after")));
+}
+
+test("WhiteSpaceNBSP5") language C++;
+{
+	OpDocumentEdit* edit = GetDocumentEdit();
+	verify(edit);
+
+	OpInputAction backspace(OpInputAction::ACTION_BACKSPACE);
+
+	edit->SetTextHTML(UNI_L("<PRE>A</PRE>"));
+		edit->InsertText(UNI_L(" "), 1);
+		verify(VerifyHtml(edit, UNI_L("<PRE>A </PRE>")));
+		edit->InsertText(UNI_L(" "), 1);
+		verify(VerifyHtml(edit, UNI_L("<PRE>A  </PRE>")));
+		edit->OnInputAction(&backspace);
+		verify(VerifyHtml(edit, UNI_L("<PRE>A </PRE>")));
+}
+
+test("WhiteSpaceNBSP6") language C++;
+{
+	OpDocumentEdit* edit = GetDocumentEdit();
+	verify(edit);
+
+	OpInputAction backspace(OpInputAction::ACTION_BACKSPACE);
+
+	edit->SetTextHTML(UNI_L("<BR>bb<BR>"));
+	edit->m_caret.PlaceFirst();
+	edit->InsertText(UNI_L(" "), 1);
+	edit->InsertText(UNI_L(" "), 1);
+	edit->InsertText(UNI_L(" "), 1);
+	verify(VerifyHtml(edit, UNI_L("&nbsp; &nbsp;<BR>bb<BR>")));
+	edit->OnInputAction(&backspace);
+	verify(VerifyHtml(edit, UNI_L("&nbsp;&nbsp;<BR>bb<BR>")));
+	edit->OnInputAction(&backspace);
+	verify(VerifyHtml(edit, UNI_L("&nbsp;<BR>bb<BR>")));
+	edit->OnInputAction(&backspace);
+	verify(VerifyHtml(edit, UNI_L("<BR>bb<BR>")));
+}
+
+test("StyleWithDummy") language C++;
+{
+	OpDocumentEdit* edit = GetDocumentEdit();
+	verify(edit);
+
+	edit->Clear();
+
+	edit->execCommand(OP_DOCUMENT_EDIT_COMMAND_ITALIC);
+	edit->InsertText(UNI_L("a"), 1);
+	verify(VerifyHtml(edit, UNI_L("<EM>a</EM>")));
+
+	edit->execCommand(OP_DOCUMENT_EDIT_COMMAND_BOLD);
+	edit->InsertText(UNI_L("b"), 1);
+	verify(VerifyHtml(edit, UNI_L("<EM>a<STRONG>b</STRONG></EM>")));
+}
+
+test("InsertFontFaceInFont") language C++;
+{
+	OpDocumentEdit* edit = GetDocumentEdit();
+	verify(edit);
+
+	edit->Clear();
+
+	edit->SetTextHTML(UNI_L("<P><FONT FACE=\"serif\">ABC</FONT></P>"));
+
+	HTML_Element* elm = edit->FindEditableElement(edit->GetBody(), TRUE, FALSE, FALSE);
+	verify(elm);
+	edit->m_caret.Place(elm, 1);
+	edit->m_selection.SelectToCaret(edit->m_caret.GetElement(), 2);
+
+	uni_char font_name[11]; /* ARRAY OK 2011-06-23 stighal */
+	uni_strcpy(font_name, UNI_L("sans-serif"));
+	// This will eventually call GetFirstFontNumber, which requires a non-const string as it changes it temporarily
+	edit->execCommand(OP_DOCUMENT_EDIT_COMMAND_FONTNAME, FALSE, font_name);
+	verify(VerifyHtml(edit, UNI_L("<P><FONT FACE=\"serif\">A</FONT><FONT FACE=\"sans-serif\">B</FONT><FONT FACE=\"serif\">C</FONT></P>")));
+
+	edit->execCommand(OP_DOCUMENT_EDIT_COMMAND_UNDO);
+
+	elm = edit->FindEditableElement(edit->GetBody(), TRUE, FALSE, FALSE);
+	verify(elm);
+	edit->m_caret.Place(elm, 1);
+	edit->m_selection.SelectToCaret(edit->m_caret.GetElement(), 2);
+
+	edit->execCommand(OP_DOCUMENT_EDIT_COMMAND_FONTSIZE, FALSE, UNI_L("5"));
+	verify(VerifyHtml(edit, UNI_L("<P><FONT FACE=\"serif\">A<FONT SIZE=\"5\">B</FONT>C</FONT></P>")));
+}
+
+test("ForegroundColor") language C++;
+{
+	OpDocumentEdit* edit = GetDocumentEdit();
+	verify(edit);
+
+	edit->Clear();
+
+	edit->SetTextHTML(UNI_L("12"));
+
+	edit->execCommand(OP_DOCUMENT_EDIT_COMMAND_FORECOLOR, FALSE, UNI_L("#FF0000"));
+	edit->InsertText(UNI_L("34"), 2);
+	verify(VerifyHtml(edit, UNI_L("12<FONT color=\"#ff0000\">34</FONT>")));
+
+	edit->InsertText(UNI_L("56"), 2);
+	verify(VerifyHtml(edit, UNI_L("12<FONT color=\"#ff0000\">3456</FONT>")));
+
+	edit->execCommand(OP_DOCUMENT_EDIT_COMMAND_FORECOLOR, FALSE, UNI_L("#000000"));
+	edit->InsertText(UNI_L("78"), 2);
+	verify(VerifyHtml(edit, UNI_L("12<FONT color=\"#ff0000\">3456</FONT>78")));
+
+	edit->execCommand(OP_DOCUMENT_EDIT_COMMAND_FORECOLOR, FALSE, UNI_L("#FF0000"));
+	edit->InsertText(UNI_L("90"), 2);
+	verify(VerifyHtml(edit, UNI_L("12<FONT color=\"#ff0000\">3456</FONT>78<FONT color=\"#ff0000\">90</FONT>")));
+}
+
+test("ForegroundColorSelection") language C++;
+{
+	OpDocumentEdit* edit = GetDocumentEdit();
+	verify(edit);
+
+	edit->Clear();
+
+	edit->SetTextHTML(UNI_L("0123"));
+
+	HTML_Element* elm = edit->FindEditableElement(edit->GetBody(), TRUE, FALSE, FALSE);
+	verify(elm);
+	edit->m_caret.Place(elm, 0);
+	edit->m_selection.SelectToCaret(edit->m_caret.GetElement(), 2);
+	edit->execCommand(OP_DOCUMENT_EDIT_COMMAND_FORECOLOR, FALSE, UNI_L("#FF0000"));
+	verify(VerifyHtml(edit, UNI_L("<FONT color=\"#ff0000\">01</FONT>23")));
+
+	elm = edit->FindEditableElement(edit->GetBody(), TRUE, FALSE, FALSE);
+	verify(elm);
+	edit->m_caret.Place(elm, 0);
+	edit->m_selection.SelectToCaret(edit->m_caret.GetElement(), 2);
+	edit->execCommand(OP_DOCUMENT_EDIT_COMMAND_FORECOLOR, FALSE, UNI_L("#000000"));
+	verify(VerifyHtml(edit, UNI_L("0123")));
+}
+
+test("ReplaceInDivAndUndo") language C++;
+{
+	OpDocumentEdit* edit = GetDocumentEdit();
+	verify(edit);
+
+	edit->SetTextHTML(UNI_L("<DIV>inside</DIV>after"));
+
+	// Select "inside"
+	HTML_Element* elm = edit->FindEditableElement(edit->GetBody(), TRUE, FALSE, FALSE);
+	verify(elm);
+	edit->m_caret.Place(elm, 0);
+	edit->m_selection.SelectToCaret(edit->m_caret.GetElement(), 6);
+
+	edit->execCommand(OP_DOCUMENT_EDIT_COMMAND_DELETE);
+	verify(VerifyHtml(edit, UNI_L("<DIV><BR></DIV>after")));
+
+	edit->InsertText(UNI_L("newtextinside"), 13);
+	verify(VerifyHtml(edit, UNI_L("<DIV>newtextinside</DIV>after")));
+
+	edit->execCommand(OP_DOCUMENT_EDIT_COMMAND_UNDO);
+	verify(VerifyHtml(edit, UNI_L("<DIV><BR></DIV>after")));
+
+	edit->InsertTextHTML(UNI_L("<P>newpinside</P>"), 17);
+	verify(VerifyHtml(edit, UNI_L("<DIV><P>newpinside</P></DIV>after")));
+}
+
+test("ReplaceBeforeDivAndUndo") language C++;
+{
+	OpDocumentEdit* edit = GetDocumentEdit();
+	verify(edit);
+
+	edit->SetTextHTML(UNI_L("before<DIV>inside</DIV>"));
+
+	// Select "before"
+	edit->m_caret.PlaceFirst();
+	edit->m_selection.SelectToCaret(edit->m_caret.GetElement(), 6);
+
+	edit->execCommand(OP_DOCUMENT_EDIT_COMMAND_DELETE);
+
+	// Delete empty text at caret - and expect caret to jump inside the content of the now removed DIV
+	edit->execCommand(OP_DOCUMENT_EDIT_COMMAND_DELETE);
+
+	edit->InsertText(UNI_L("newtext"), 7);
+	verify(VerifyHtml(edit, UNI_L("newtextinside")));
+
+	edit->execCommand(OP_DOCUMENT_EDIT_COMMAND_UNDO);
+	edit->execCommand(OP_DOCUMENT_EDIT_COMMAND_UNDO);
+	edit->execCommand(OP_DOCUMENT_EDIT_COMMAND_UNDO);
+	verify(VerifyHtml(edit, UNI_L("before<DIV>inside</DIV>")));
+
+	// Let's try to redo...
+	edit->execCommand(OP_DOCUMENT_EDIT_COMMAND_REDO);
+	edit->execCommand(OP_DOCUMENT_EDIT_COMMAND_REDO);
+	edit->execCommand(OP_DOCUMENT_EDIT_COMMAND_REDO);
+	verify(VerifyHtml(edit, UNI_L("newtextinside")));
+
+	// ...and undo again
+	edit->execCommand(OP_DOCUMENT_EDIT_COMMAND_UNDO);
+	edit->execCommand(OP_DOCUMENT_EDIT_COMMAND_UNDO);
+	edit->execCommand(OP_DOCUMENT_EDIT_COMMAND_UNDO);
+	verify(VerifyHtml(edit, UNI_L("before<DIV>inside</DIV>")));
+
+	edit->m_caret.PlaceFirst();
+	edit->m_selection.SelectToCaret(edit->m_caret.GetElement(), 6);
+
+	edit->InsertText(UNI_L("newtextbefore"), 13);
+	verify(VerifyHtml(edit, UNI_L("newtextbefore<DIV>inside</DIV>")));
+}
+
+test("DeleteIntoContainer") language C++;
+{
+	OpDocumentEdit* edit = GetDocumentEdit();
+	verify(edit);
+
+	edit->SetTextHTML(UNI_L("<DIV>insideX</DIV>Xafter"));
+
+	HTML_Element *helm = edit->FindEditableElement(edit->GetBody(), TRUE, FALSE, FALSE);
+	edit->m_caret.Place(helm, 6);
+	helm = edit->FindEditableElement(helm, TRUE, FALSE, FALSE);
+	verify(helm);
+	edit->m_selection.SelectToCaret(helm, 1);
+
+	edit->execCommand(OP_DOCUMENT_EDIT_COMMAND_DELETE);
+
+	verify(VerifyHtml(edit, UNI_L("<DIV>insideafter</DIV>")));
+}
+
+test("GetTextHTMLFromNamedElement") language C++;
+{
+	OpDocumentEdit* edit = GetDocumentEdit();
+	verify(edit);
+
+	edit->SetTextHTML(UNI_L("<DIV id=a>A</DIV><DIV id=b>B</DIV>after"));
+
+	OpString text;
+
+	edit->GetTextHTMLFromNamedElement(text, UNI_L("a"), FALSE);
+	verify(text.Compare(UNI_L("A")) == 0);
+
+	edit->GetTextHTMLFromNamedElement(text, UNI_L("a"), TRUE);
+	verify(text.Compare(UNI_L("<div id=\"a\">A</div>")) == 0);
+}
+
+test("DeleteNamedElement") language C++;
+{
+	OpDocumentEdit* edit = GetDocumentEdit();
+	verify(edit);
+
+	edit->SetTextHTML(UNI_L("<DIV id=a>A</DIV><DIV id=b>B</DIV>after"));
+
+	edit->DeleteNamedElement(UNI_L("b"));
+	verify(VerifyHtml(edit, UNI_L("<DIV id=\"a\">A</DIV>after")));
+}
+
+test("UndoGrouping") language C++;
+{
+	OpDocumentEdit* edit = GetDocumentEdit();
+	verify(edit);
+
+	edit->Clear();
+	edit->InsertText(UNI_L("a"), 1, TRUE);
+	edit->InsertText(UNI_L("a"), 1, TRUE);
+	edit->execCommand(OP_DOCUMENT_EDIT_COMMAND_UNDO);
+	edit->InsertText(UNI_L("b"), 1, TRUE);
+	verify(VerifyHtml(edit, UNI_L("b")));
+
+	edit->Clear();
+	edit->InsertText(UNI_L("a"), 1, TRUE);
+	edit->InsertText(UNI_L("a"), 1, TRUE);
+	edit->execCommand(OP_DOCUMENT_EDIT_COMMAND_SELECTALL);
+	edit->InsertText(UNI_L("b"), 1, TRUE);
+	verify(VerifyHtml(edit, UNI_L("b")));
+	edit->execCommand(OP_DOCUMENT_EDIT_COMMAND_UNDO);
+	verify(VerifyHtml(edit, UNI_L("aa")));
+}
+
+test("DeleteDiv") language C++;
+{
+	OpDocumentEdit* edit = GetDocumentEdit();
+	verify(edit);
+
+	edit->SetTextHTML(UNI_L("before<DIV>inside</DIV>"));
+
+	// Select "before"
+	HTML_Element* elm = edit->FindEditableElement(edit->GetBody(), TRUE, FALSE, FALSE);
+	verify(elm);
+	edit->m_caret.Place(elm, 6);
+
+	edit->execCommand(OP_DOCUMENT_EDIT_COMMAND_DELETE);
+
+	verify(VerifyHtml(edit, UNI_L("beforeinside")));
+}
+
+test("SplitLineCaretPosition") language C++;
+{
+	OpDocumentEdit* edit = GetDocumentEdit();
+	verify(edit);
+
+	edit->SetTextHTML(UNI_L("<P>first</P><P>second</P><P><BR></P>"));
+
+	// Set caret after "fi"
+	HTML_Element* elm = edit->FindEditableElement(edit->GetBody(), TRUE, FALSE, FALSE);
+	verify(elm);
+	edit->m_caret.Place(elm, 2);
+
+	edit->InsertBreak(TRUE, TRUE);
+
+	verify(VerifyHtml(edit, UNI_L("<P>fi</P><P>rst</P><P>second</P><P><BR></P>")));
+
+	edit->InsertText(UNI_L("thi"), 3, TRUE);
+
+	verify(VerifyHtml(edit, UNI_L("<P>fi</P><P>thirst</P><P>second</P><P><BR></P>")));
+}
+
+test("KeepWhenTidy") language C++;
+{
+	OpDocumentEdit* edit = GetDocumentEdit();
+	verify(edit);
+
+	edit->SetTextHTML(UNI_L("before<TABLE><TR><TD>content</TD></TR></TABLE>after"));
+
+	edit->execCommand(OP_DOCUMENT_EDIT_COMMAND_SELECTALL);
+	edit->execCommand(OP_DOCUMENT_EDIT_COMMAND_DELETE);
+	verify(VerifyHtml(edit, UNI_L("<BR>")));
+
+	edit->SetTextHTML(UNI_L("before<TABLE><TR><TD>content</TD></TR></TABLE>after"));
+	edit->m_caret.PlaceFirst();
+	OpInputAction action(OpInputAction::ACTION_RANGE_NEXT_CHARACTER);
+	for(int i = 0; i < 8; i++)
+		edit->OnInputAction(&action);
+	edit->execCommand(OP_DOCUMENT_EDIT_COMMAND_DELETE);
+	verify(VerifyHtml(edit, UNI_L("<TABLE><TBODY><TR><TD>ontent</TD></TR></TBODY></TABLE>after")));
+}
+
+test("KeepWhenTidyIfEmpty") language C++;
+{
+	OpDocumentEdit* edit = GetDocumentEdit();
+	verify(edit);
+
+	edit->SetTextHTML(UNI_L("before<TEXTAREA>content</TEXTAREA>after"));
+	verify(VerifyHtml(edit, UNI_L("before<TEXTAREA>content</TEXTAREA>after")));
+
+	edit->SetTextHTML(UNI_L("before<TEXTAREA></TEXTAREA>after"));
+	edit->m_caret.PlaceFirst();
+	edit->execCommand(OP_DOCUMENT_EDIT_COMMAND_DELETE);
+	verify(VerifyHtml(edit, UNI_L("efore<TEXTAREA></TEXTAREA>after")));
+
+	edit->execCommand(OP_DOCUMENT_EDIT_COMMAND_SELECTALL);
+	edit->execCommand(OP_DOCUMENT_EDIT_COMMAND_DELETE);
+	verify(VerifyHtml(edit, UNI_L("<BR>")));
+}
+
+test("InsertListItems") language C++;
+{
+	OpDocumentEdit* edit = GetDocumentEdit();
+	verify(edit);
+
+	// New list
+	edit->SetTextHTML(UNI_L("item1"));
+	edit->execCommand(OP_DOCUMENT_EDIT_COMMAND_INSERTORDEREDLIST);
+	verify(VerifyHtml(edit, UNI_L("<OL><LI>item1</LI></OL>")));
+
+	// New listitem
+	edit->InsertBreak();
+	edit->InsertText(UNI_L("item2"), 5, TRUE);
+	verify(VerifyHtml(edit, UNI_L("<OL><LI>item1</LI><LI>item2</LI></OL>")));
+
+	// New listitem that splits current
+	edit->InsertText(UNI_L("item3"), 5, TRUE);
+	for(int i = 0; i < 5; i++)
+		edit->m_caret.Move(FALSE, FALSE);
+	edit->InsertBreak();
+	verify(VerifyHtml(edit, UNI_L("<OL><LI>item1</LI><LI>item2</LI><LI>item3</LI></OL>")));
+
+	// Break 2 times to split the list
+	edit->InsertBreak();
+	edit->InsertBreak();
+	edit->InsertText(UNI_L("noitem"), 6, TRUE);
+	verify(VerifyHtml(edit, UNI_L("<OL><LI>item1</LI><LI>item2</LI></OL><P>noitem</P><OL><LI>item3</LI></OL>")));
+}
+
+test("InsertListMultipleItems") language C++;
+{
+	OpDocumentEdit* edit = GetDocumentEdit();
+	verify(edit);
+
+	edit->SetTextHTML(UNI_L("<P>item1<br></P><P>item2<br></P><P>item3<br></P>"));
+	edit->execCommand(OP_DOCUMENT_EDIT_COMMAND_SELECTALL);
+	edit->execCommand(OP_DOCUMENT_EDIT_COMMAND_INSERTORDEREDLIST);
+
+	verify(VerifyHtml(edit, UNI_L("<OL><LI>item1<BR></LI><LI>item2<BR></LI><LI>item3<BR></LI></OL>")));
+}
+
+test("RemoveList") language C++;
+{
+	OpDocumentEdit* edit = GetDocumentEdit();
+	verify(edit);
+
+	edit->SetTextHTML(UNI_L("<OL><LI>item1</LI><LI>item2</LI><LI>item3</LI></OL>"));
+
+	// Remove item 1
+	edit->m_caret.PlaceFirst();
+	edit->execCommand(OP_DOCUMENT_EDIT_COMMAND_INSERTORDEREDLIST);
+	verify(VerifyHtml(edit, UNI_L("<P>item1</P><OL><LI>item2</LI><LI>item3</LI></OL>")));
+
+	// Reverse and jump to item 2
+	edit->execCommand(OP_DOCUMENT_EDIT_COMMAND_UNDO);
+	verify(VerifyHtml(edit, UNI_L("<OL><LI>item1</LI><LI>item2</LI><LI>item3</LI></OL>")));
+	edit->m_caret.Place(OpWindowCommander::CARET_DOWN);
+
+	// Remove item 2
+	edit->execCommand(OP_DOCUMENT_EDIT_COMMAND_INSERTORDEREDLIST);
+	verify(VerifyHtml(edit, UNI_L("<OL><LI>item1</LI></OL><P>item2</P><OL><LI>item3</LI></OL>")));
+
+	// Reverse and select all
+	edit->execCommand(OP_DOCUMENT_EDIT_COMMAND_UNDO);
+	edit->execCommand(OP_DOCUMENT_EDIT_COMMAND_SELECTALL);
+
+	// Remove entire list
+	edit->execCommand(OP_DOCUMENT_EDIT_COMMAND_INSERTORDEREDLIST);
+	verify(VerifyHtml(edit, UNI_L("<P>item1</P><P>item2</P><P>item3</P>")));
+}
+
+test("ToggleListOrderingInNestledList") language C++;
+{
+	OpDocumentEdit* edit = GetDocumentEdit();
+	verify(edit);
+
+	edit->SetTextHTML(UNI_L("<OL><LI><OL><LI>item1</LI></OL></LI><LI><OL><LI>item2</LI></OL></LI></OL>"));
+
+	// After this should one ordered list contain one un-ordered list with item1 and item2
+	edit->execCommand(OP_DOCUMENT_EDIT_COMMAND_SELECTALL);
+	edit->execCommand(OP_DOCUMENT_EDIT_COMMAND_INSERTUNORDEREDLIST);
+	verify(VerifyHtml(edit, UNI_L("<OL><LI><UL><LI>item1</LI><LI>item2</LI></UL></LI></OL>")));
+
+	// After this should one ordered list contain one ordered list with item1 and item2
+	edit->execCommand(OP_DOCUMENT_EDIT_COMMAND_INSERTORDEREDLIST);
+	verify(VerifyHtml(edit, UNI_L("<OL><LI><OL><LI>item1</LI><LI>item2</LI></OL></LI></OL>")));
+
+	// After this should one ordered list contain item1 and item2
+	edit->execCommand(OP_DOCUMENT_EDIT_COMMAND_INSERTORDEREDLIST);
+	verify(VerifyHtml(edit, UNI_L("<OL><LI>item1</LI><LI>item2</LI></OL>")));
+}
+
+test("IndentAndOutdent") language C++;
+{
+	OpDocumentEdit* edit = GetDocumentEdit();
+	verify(edit);
+
+	edit->SetTextHTML(UNI_L("item1<OL><LI>item2</LI><LI>item3</LI></OL>"));
+
+	edit->m_caret.PlaceFirst();
+	HTML_Element *item2 = GetSelectToCaretElement(edit);
+	verify(item2);
+	edit->m_selection.SelectToCaret(item2, 1);
+
+	edit->execCommand(OP_DOCUMENT_EDIT_COMMAND_INDENT);
+	verify(VerifyHtml(edit, UNI_L("<BLOCKQUOTE>item1</BLOCKQUOTE><OL><OL><LI>item2</LI></OL><LI>item3</LI></OL>")));
+	edit->execCommand(OP_DOCUMENT_EDIT_COMMAND_OUTDENT);
+	verify(VerifyHtml(edit, UNI_L("item1<OL><LI>item2</LI><LI>item3</LI></OL>")));
+}
+
+test("IndentAndOutdentCSS") language C++;
+{
+	OpDocumentEdit* edit = GetDocumentEdit();
+	verify(edit);
+
+	edit->SetTextHTML(UNI_L("item1<OL><LI>item2</LI><LI>item3</LI></OL>"));
+
+	edit->execCommand(OP_DOCUMENT_EDIT_COMMAND_STYLEWITHCSS, FALSE, UNI_L("true"));
+	edit->m_caret.PlaceFirst();
+	HTML_Element *item2 = GetSelectToCaretElement(edit);
+	verify(item2);
+	edit->m_selection.SelectToCaret(item2, 1);
+
+	edit->execCommand(OP_DOCUMENT_EDIT_COMMAND_INDENT);
+	verify(VerifyHtml(edit, UNI_L("<DIV style=\"margin-left: 40px !important;\">item1</DIV><OL><OL><LI>item2</LI></OL><LI>item3</LI></OL>")));
+	edit->execCommand(OP_DOCUMENT_EDIT_COMMAND_OUTDENT);
+	verify(VerifyHtml(edit, UNI_L("<DIV style=\"margin-left: 0px !important;\">item1</DIV><OL><LI>item2</LI><LI>item3</LI></OL>")));
+}
+
+test("RemoveLeadingWhitespace") language C++;
+{
+	OpDocumentEdit* edit = GetDocumentEdit();
+	verify(edit);
+
+	edit->SetTextHTML(UNI_L("<STRONG>A</STRONG> BCD"));
+	edit->m_caret.PlaceFirst();
+	edit->execCommand(OP_DOCUMENT_EDIT_COMMAND_DELETE);
+	edit->execCommand(OP_DOCUMENT_EDIT_COMMAND_DELETE);
+	edit->execCommand(OP_DOCUMENT_EDIT_COMMAND_DELETE);
+	verify(VerifyHtml(edit, UNI_L("CD")));
+}
+
+test("FormatBlock") language C++;
+{
+	OpDocumentEdit* edit = GetDocumentEdit();
+	verify(edit);
+
+	edit->SetTextHTML(UNI_L("Row1 with <B>some</B> <IMG SRC=\"blah\"> inlines.<BR>Row2"));
+	edit->m_caret.PlaceFirst();
+	edit->execCommand(OP_DOCUMENT_EDIT_COMMAND_FORMATBLOCK, FALSE, UNI_L("H1"));
+
+	verify(VerifyHtml(edit, UNI_L("<H1>Row1 with <B>some</B> <IMG SRC=\"blah\"> inlines.<BR></H1>Row2")));
+
+	edit->execCommand(OP_DOCUMENT_EDIT_COMMAND_SELECTALL);
+	edit->execCommand(OP_DOCUMENT_EDIT_COMMAND_FORMATBLOCK, FALSE, UNI_L("H2"));
+
+	verify(VerifyHtml(edit, UNI_L("<H2>Row1 with <B>some</B> <IMG SRC=\"blah\"> inlines.<BR></H2><H2>Row2</H2>")));
+}
+
+test("CreateLink") language C++;
+{
+	OpDocumentEdit* edit = GetDocumentEdit();
+	verify(edit);
+
+	edit->SetTextHTML(UNI_L("link text"));
+	edit->execCommand(OP_DOCUMENT_EDIT_COMMAND_SELECTALL);
+
+	edit->execCommand(OP_DOCUMENT_EDIT_COMMAND_CREATELINK, FALSE, UNI_L("HTTP://aaaa"));
+	verify(VerifyHtml(edit, UNI_L("<A HREF=\"HTTP://aaaa\">link text</A>")));
+
+	edit->execCommand(OP_DOCUMENT_EDIT_COMMAND_CREATELINK, FALSE, UNI_L("HTTP://bbbb"));
+	verify(VerifyHtml(edit, UNI_L("<A HREF=\"HTTP://bbbb\">link text</A>")));
+}
+
+test("MoveCaretOverWhitespace") language C++;
+{
+	OpDocumentEdit* edit = GetDocumentEdit();
+	verify(edit);
+
+	edit->SetTextHTML(UNI_L("Two       words"));
+	HTML_Element* elm = edit->FindEditableElement(edit->GetBody(), TRUE, FALSE, FALSE);
+	verify(elm);
+	edit->m_caret.Place(elm, 0);
+
+	// Forward
+	edit->m_caret.Move(TRUE, FALSE);
+	edit->m_caret.Move(TRUE, FALSE);
+	edit->m_caret.Move(TRUE, FALSE);
+	verify(edit->m_caret.GetOffset() == 3);
+
+	edit->m_caret.Move(TRUE, FALSE);
+	verify(edit->m_caret.GetOffset() == 10);
+	edit->m_caret.Move(TRUE, FALSE);
+	verify(edit->m_caret.GetOffset() == 11);
+
+	// Backward
+	edit->m_caret.Move(FALSE, FALSE);
+	verify(edit->m_caret.GetOffset() == 10);
+	edit->m_caret.Move(FALSE, FALSE);
+	verify(edit->m_caret.GetOffset() == 3);
+}
+
+test("TabInPre") language C++;
+{
+	OpDocumentEdit* edit = GetDocumentEdit();
+	verify(edit);
+
+	edit->SetTextHTML(UNI_L(""));
+
+	edit->execCommand(OP_DOCUMENT_EDIT_COMMAND_FORMATBLOCK, FALSE, UNI_L("PRE"));
+	edit->InsertText(UNI_L("\t"), 1, TRUE);
+	edit->InsertText(UNI_L("\t"), 1, TRUE);
+	verify(VerifyHtml(edit, UNI_L("<pre>\t\t</pre>")));
+
+	edit->m_caret.Move(FALSE, FALSE);
+	edit->InsertText(UNI_L("A"), 1, TRUE);
+	verify(VerifyHtml(edit, UNI_L("<pre>\tA\t</pre>")));
+}
+
+test("TabInP") language C++;
+{
+	OpDocumentEdit* edit = GetDocumentEdit();
+	verify(edit);
+
+	edit->SetTextHTML(UNI_L(""));
+
+	edit->InsertText(UNI_L("\t"), 1, TRUE);
+	verify(VerifyHtml(edit, UNI_L("&nbsp; &nbsp;&nbsp;")));
+
+	edit->InsertText(UNI_L("\t"), 1, TRUE);
+	verify(VerifyHtml(edit, UNI_L("&nbsp; &nbsp; &nbsp; &nbsp;&nbsp;")));
+}
+
+test("TabAndDeletion") language C++;
+{
+	OpDocumentEdit* edit = GetDocumentEdit();
+	verify(edit);
+
+	edit->SetTextHTML(UNI_L(""));
+
+	edit->execCommand(OP_DOCUMENT_EDIT_COMMAND_FORMATBLOCK, FALSE, UNI_L("PRE"));
+	edit->InsertText(UNI_L("\tA\t\t"), 4, TRUE);
+	verify(VerifyHtml(edit, UNI_L("<pre>\tA\t\t</pre>")));
+
+	OpInputAction action(OpInputAction::ACTION_BACKSPACE);
+	edit->OnInputAction(&action);
+	VerifyHtml(edit, UNI_L("<pre>\tA\t</pre>"));
+
+	edit->InsertText(UNI_L("A"), 1, TRUE);
+	verify(VerifyHtml(edit, UNI_L("<pre>\tA\tA</pre>")));
+}
+
+test("GeneratedContent") language C++;
+{
+	OpDocumentEdit* edit = GetDocumentEdit();
+	verify(edit);
+
+	edit->SetTextHTML(UNI_L("<q>Some quoted text</q>"));
+
+	edit->execCommand(OP_DOCUMENT_EDIT_COMMAND_SELECTALL);
+	edit->execCommand(OP_DOCUMENT_EDIT_COMMAND_ITALIC);
+	verify(VerifyHtml(edit, UNI_L("<q><EM>Some quoted text</EM></q>")));
+}
+
+test("InsertBreakBR") language C++;
+{
+	OpDocumentEdit* edit = GetDocumentEdit();
+	verify(edit);
+
+	edit->SetTextHTML(UNI_L(""));
+	edit->InsertBreak(FALSE, FALSE);
+	verify(VerifyHtml(edit, UNI_L("<br><br>")));
+
+	edit->SetTextHTML(UNI_L("text"));
+	edit->m_caret.PlaceFirst();
+	edit->InsertBreak(FALSE, FALSE);
+	verify(VerifyHtml(edit, UNI_L("<br>text")));
+
+	edit->SetTextHTML(UNI_L(""));
+	edit->InsertText(UNI_L("text"), 6, TRUE);
+	edit->InsertBreak(FALSE, FALSE);
+	verify(VerifyHtml(edit, UNI_L("text<br><br>")));
+
+	edit->InsertBreak(FALSE, FALSE);
+	verify(VerifyHtml(edit, UNI_L("text<br><br><br>")));
+
+	edit->InsertBreak(FALSE, FALSE);
+	verify(VerifyHtml(edit, UNI_L("text<br><br><br><br>")));
+}
+
+test("RemoveBreakBR") language C++;
+{
+	OpDocumentEdit* edit = GetDocumentEdit();
+	verify(edit);
+
+	OpInputAction action(OpInputAction::ACTION_BACKSPACE);
+
+	edit->OnInputAction(&action);
+	verify(VerifyHtml(edit, UNI_L("text<br><br><br>")));
+
+	edit->OnInputAction(&action);
+	verify(VerifyHtml(edit, UNI_L("text<br><br>")));
+}
+
+test("InsertBreakBR_first_last") language C++;
+{
+	OpDocumentEdit* edit = GetDocumentEdit();
+	verify(edit);
+
+	// Insert break at end of H1 should insert *after* the H1
+	edit->SetTextHTML(UNI_L("<h1>header</h1>"));
+	edit->InsertBreak(FALSE, FALSE);
+#ifdef DOCUMENT_EDIT_USE_PARAGRAPH_BREAK
+	verify(VerifyHtml(edit, UNI_L("<h1>header<br><br></h1>")));
+#else
+	verify(VerifyHtml(edit, UNI_L("<h1>header</h1><br>")));
+#endif
+
+	// Insert break first in a H1 should insert it *before* the H1
+	edit->m_caret.PlaceFirst();
+	edit->InsertBreak(FALSE, FALSE);
+#ifdef DOCUMENT_EDIT_USE_PARAGRAPH_BREAK
+	verify(VerifyHtml(edit, UNI_L("<h1><br>header<br><br></h1>")));
+#else
+	verify(VerifyHtml(edit, UNI_L("<br><h1>header</h1><br>")));
+#endif
+
+	// Same test for links
+
+	edit->SetTextHTML(UNI_L("<a href=\"#\">header</a>"));
+	edit->InsertBreak(FALSE, FALSE);
+	verify(VerifyHtml(edit, UNI_L("<a href=\"#\">header</a><br><br>")));
+
+	edit->m_caret.PlaceFirst();
+	edit->InsertBreak(FALSE, FALSE);
+	verify(VerifyHtml(edit, UNI_L("<br><a href=\"#\">header</a><br><br>")));
+
+	// FIX: Should we split header/links etc if inserting BR-break inside a header?
+}
+
+test("InsertBreak_first_last_in_block_with_child") language C++;
+{
+	OpDocumentEdit* edit = GetDocumentEdit();
+	verify(edit);
+
+	edit->SetTextHTML(UNI_L("<div>first<div>inner</div></div>"));
+	edit->m_caret.PlaceFirst();
+	edit->m_caret.UpdatePos();
+	edit->m_caret.Place(OpWindowCommander::CARET_LINE_END);
+	edit->InsertBreak(TRUE, TRUE);
+	verify(VerifyHtml(edit, UNI_L("<div>first</div><div><br></div><div><div>inner</div></div>")));
+}
+
+test("InsertBreakP_InPlainText") language C++;
+{
+	OpDocumentEdit* edit = GetDocumentEdit();
+	verify(edit);
+
+#ifdef DOCUMENT_EDIT_USE_PARAGRAPH_BREAK
+	// == Break without any initial P-tag =========
+
+	// empty
+	edit->SetTextHTML(UNI_L(""));
+	edit->InsertBreak(TRUE, TRUE);
+	verify(VerifyHtml(edit, UNI_L("<P><BR></P><P><BR></P>")));
+	edit->InsertText(UNI_L("A"), 1);
+	verify(VerifyHtml(edit, UNI_L("<P><BR></P><P>A</P>")));
+
+	// before
+	edit->SetTextHTML(UNI_L("test"));
+	edit->m_caret.Place(OpWindowCommander::CARET_LINE_HOME);
+	edit->InsertBreak(TRUE, TRUE);
+	verify(VerifyHtml(edit, UNI_L("<P><BR></P><P>test</P>")));
+	edit->InsertText(UNI_L("A"), 1);
+	verify(VerifyHtml(edit, UNI_L("<P><BR></P><P>Atest</P>")));
+
+	// after
+	edit->SetTextHTML(UNI_L("test"));
+	edit->m_caret.Place(OpWindowCommander::CARET_LINE_END);
+	edit->InsertBreak(TRUE, TRUE);
+	verify(VerifyHtml(edit, UNI_L("<P>test</P><P><BR></P>")));
+	edit->InsertText(UNI_L("A"), 1);
+	verify(VerifyHtml(edit, UNI_L("<P>test</P><P>A</P>")));
+
+	// split
+	edit->SetTextHTML(UNI_L("test"));
+	edit->m_caret.Place(OpWindowCommander::CARET_LINE_HOME);
+	edit->m_caret.Move(TRUE, FALSE);
+	edit->InsertBreak(TRUE, TRUE);
+	verify(VerifyHtml(edit, UNI_L("<P>t</P><P>est</P>")));
+	edit->InsertText(UNI_L("A"), 1);
+	verify(VerifyHtml(edit, UNI_L("<P>t</P><P>Aest</P>")));
+#endif
+}
+
+test("InsertBreakP_InP") language C++;
+{
+	OpDocumentEdit* edit = GetDocumentEdit();
+	verify(edit);
+
+#ifdef DOCUMENT_EDIT_USE_PARAGRAPH_BREAK
+	// == Break with a initial P-tag =========
+
+	// before
+	edit->SetTextHTML(UNI_L("<p>test</p>"));
+	edit->m_caret.Place(OpWindowCommander::CARET_LINE_HOME);
+	edit->InsertBreak(TRUE, TRUE);
+	verify(VerifyHtml(edit, UNI_L("<P><BR></P><P>test</P>")));
+	edit->InsertText(UNI_L("A"), 1);
+	verify(VerifyHtml(edit, UNI_L("<P><BR></P><P>Atest</P>")));
+
+	// after
+	edit->SetTextHTML(UNI_L("<p>test</p>"));
+	edit->m_caret.Place(OpWindowCommander::CARET_LINE_END);
+	edit->InsertBreak(TRUE, TRUE);
+	verify(VerifyHtml(edit, UNI_L("<P>test</P><P><BR></P>")));
+	edit->InsertText(UNI_L("A"), 1);
+	verify(VerifyHtml(edit, UNI_L("<P>test</P><P>A</P>")));
+
+	// split
+	edit->SetTextHTML(UNI_L("<p>test</p>"));
+	edit->m_caret.Place(OpWindowCommander::CARET_LINE_HOME);
+	edit->m_caret.Move(TRUE, FALSE);
+	edit->InsertBreak(TRUE, TRUE);
+	verify(VerifyHtml(edit, UNI_L("<P>t</P><P>est</P>")));
+	edit->InsertText(UNI_L("A"), 1);
+	verify(VerifyHtml(edit, UNI_L("<P>t</P><P>Aest</P>")));
+#endif
+}
+
+test("InsertBreakP_InH1") language C++;
+{
+	OpDocumentEdit* edit = GetDocumentEdit();
+	verify(edit);
+
+#ifdef DOCUMENT_EDIT_USE_PARAGRAPH_BREAK
+	// == Break with a initial H1-tag =========
+
+	// before
+	edit->SetTextHTML(UNI_L("<h1>test</h1>"));
+	edit->m_caret.Place(OpWindowCommander::CARET_LINE_HOME);
+	edit->InsertBreak(TRUE, TRUE);
+//	verify(VerifyHtml(edit, UNI_L("<P><BR></P><h1>test</h1>")));
+	verify(VerifyHtml(edit, UNI_L("<h1><BR></h1><h1>test</h1>")));
+	edit->InsertText(UNI_L("A"), 1);
+//	verify(VerifyHtml(edit, UNI_L("<P><BR></P><h1>Atest</h1>")));
+	verify(VerifyHtml(edit, UNI_L("<h1><BR></h1><h1>Atest</h1>")));
+
+	// after - P should follow the h1
+	edit->SetTextHTML(UNI_L("<h1>test</h1>"));
+	edit->m_caret.Place(OpWindowCommander::CARET_LINE_END);
+	edit->InsertBreak(TRUE, TRUE);
+	verify(VerifyHtml(edit, UNI_L("<h1>test</h1><P><BR></P>")));
+	edit->InsertText(UNI_L("A"), 1);
+	verify(VerifyHtml(edit, UNI_L("<h1>test</h1><P>A</P>")));
+
+	// after - P should follow the h1 (with some text after the header already)
+	edit->SetTextHTML(UNI_L("<h1>test</h1>after"));
+	edit->m_caret.Place(OpWindowCommander::CARET_DOCUMENT_HOME);
+	edit->m_caret.Place(OpWindowCommander::CARET_LINE_END);
+	edit->InsertBreak(TRUE, TRUE);
+	verify(VerifyHtml(edit, UNI_L("<h1>test</h1><P><BR></P>after")));
+	edit->InsertText(UNI_L("A"), 1);
+	verify(VerifyHtml(edit, UNI_L("<h1>test</h1><P>A</P>after")));
+
+	// split - new H1 should be created (instead of paragraph)
+	edit->SetTextHTML(UNI_L("<h1>test</h1>"));
+	edit->m_caret.Place(OpWindowCommander::CARET_LINE_HOME);
+	edit->m_caret.Move(TRUE, FALSE);
+	edit->InsertBreak(TRUE, TRUE);
+	verify(VerifyHtml(edit, UNI_L("<h1>t</h1><h1>est</h1>")));
+	edit->InsertText(UNI_L("A"), 1);
+	verify(VerifyHtml(edit, UNI_L("<h1>t</h1><h1>Aest</h1>")));
+#endif
+}
+
+test("InsertBreakP_InPRE") language C++;
+{
+	OpDocumentEdit* edit = GetDocumentEdit();
+	verify(edit);
+
+#ifdef DOCUMENT_EDIT_USE_PARAGRAPH_BREAK
+	// == Break with inside a PRE tag =========
+
+	// before
+	edit->SetTextHTML(UNI_L("<pre>test</pre>"));
+	edit->m_caret.Place(OpWindowCommander::CARET_LINE_HOME);
+	edit->InsertBreak(TRUE, TRUE);
+	edit->InsertText(UNI_L("A"), 1);
+	verify(VerifyHtml(edit, UNI_L("<pre><br>Atest</pre>")));
+
+//	Might want to change to the following behaviour
+//	verify(VerifyHtml(edit, UNI_L("<pre></pre><pre>Atest</pre>")));
+
+	// after
+	edit->SetTextHTML(UNI_L("<pre>test</pre>"));
+	edit->m_caret.Place(OpWindowCommander::CARET_LINE_END);
+	edit->InsertBreak(TRUE, TRUE);
+	edit->InsertText(UNI_L("A"), 1);
+	verify(VerifyHtml(edit, UNI_L("<pre>test<br>A<br></pre>")));
+
+//	Might want to change to the following behaviour
+//	verify(VerifyHtml(edit, UNI_L("<pre>test</pre><pre>A</pre>")));
+
+	// split - new pre should be created (instead of br)
+	edit->SetTextHTML(UNI_L("<pre>test</pre>"));
+	edit->m_caret.Place(OpWindowCommander::CARET_LINE_HOME);
+	edit->m_caret.Move(TRUE, FALSE);
+	edit->InsertBreak(TRUE, TRUE);
+	edit->InsertText(UNI_L("A"), 1);
+	verify(VerifyHtml(edit, UNI_L("<pre>t<br>Aest</pre>")));
+
+//	Might want to change to the following behaviour
+//	verify(VerifyHtml(edit, UNI_L("<pre>t</pre><pre>Aest</pre>")));
+#endif
+}
+
+test("InsertBreakP_KeepStyleButNoId") language C++;
+{
+	OpDocumentEdit* edit = GetDocumentEdit();
+	verify(edit);
+
+#ifdef DOCUMENT_EDIT_USE_PARAGRAPH_BREAK
+	// == Break a P-tag with inline style and id =========
+	// The style should be set on the new P tag, but not the id.
+
+	// after
+	edit->SetTextHTML(UNI_L("<p id=\"unique\" style=\"color: red\">test</p>"));
+	edit->m_caret.Place(OpWindowCommander::CARET_LINE_END);
+	edit->InsertBreak(TRUE, TRUE);
+	edit->InsertText(UNI_L("A"), 1);
+	verify(VerifyHtml(edit, UNI_L("<p id=\"unique\" style=\"color: red\">test</p><p style=\"color: red\">A</p>")));
+#endif
+}
+
+test("RemoveContentNewAutomaticBR") language C++;
+{
+	OpDocumentEdit* edit = GetDocumentEdit();
+	verify(edit);
+
+#ifdef DOCUMENT_EDIT_USE_PARAGRAPH_BREAK
+	edit->SetTextHTML(UNI_L("<p>test</p>"));
+	edit->execCommand(OP_DOCUMENT_EDIT_COMMAND_SELECTALL);
+	edit->execCommand(OP_DOCUMENT_EDIT_COMMAND_DELETE);
+	verify(VerifyHtml(edit, UNI_L("<P><BR></P>")));
+
+	edit->SetTextHTML(UNI_L("<h1>test</h1>"));
+	edit->execCommand(OP_DOCUMENT_EDIT_COMMAND_SELECTALL);
+	edit->execCommand(OP_DOCUMENT_EDIT_COMMAND_DELETE);
+	verify(VerifyHtml(edit, UNI_L("<H1><BR></H1>")));
+
+	edit->SetTextHTML(UNI_L("<p>test</p>"));
+	edit->execCommand(OP_DOCUMENT_EDIT_COMMAND_SELECTALL);
+	edit->InsertText(UNI_L("A"), 1);
+	verify(VerifyHtml(edit, UNI_L("<P>A</P>")));
+
+	edit->SetTextHTML(UNI_L("<STRONG><U>k</U></STRONG>"));
+	edit->execCommand(OP_DOCUMENT_EDIT_COMMAND_SELECTALL);
+	edit->execCommand(OP_DOCUMENT_EDIT_COMMAND_DELETE);
+	verify(VerifyHtml(edit, UNI_L("<STRONG><U><BR></U></STRONG>")));
+	edit->InsertText(UNI_L("A"), 1);
+	verify(VerifyHtml(edit, UNI_L("<STRONG><U>A</U></STRONG>")));
+	edit->execCommand(OP_DOCUMENT_EDIT_COMMAND_SELECTALL);
+	edit->InsertText(UNI_L("B"), 1);
+	verify(VerifyHtml(edit, UNI_L("<STRONG><U>B</U></STRONG>")));
+#endif
+}
+
+//Avoid this test temporary until selections on Containers with no VerticalLayout works (and doesn't cause asserts)
+html
+{
+	//! <script>
+	//! var win;
+	//! var idoc;
+	//! function do_onload()
+	//! {
+	//!   win = document.getElementById('edit').contentWindow;
+	//!   idoc = document.getElementById('edit').contentDocument;
+	//!   idoc.designMode = 'on';
+	//!   idoc.body.innerHTML = '<p></p><p>_delete_this_when_fixed_</p>';
+	//!
+	//!   var r = idoc.createRange();
+	//!   r.setStart(idoc.getElementsByTagName('p')[1], 0 );
+	//!   r.setEnd(idoc.getElementsByTagName('p')[1], 0 );
+	//!   win.getSelection().removeAllRanges();
+	//!   win.getSelection().addRange(r);
+	//!
+	//! }
+	//! </script>
+	//! <body onload="do_onload()">
+	//! <iframe id="edit" width="40" height="40"></iframe>
+	//! </body>
+}
+
+
+test("CaretPositionEmptyElement") language ecmascript;
+{
+	verify(document.getElementById('edit').contentDocument.designMode == 'on');
+
+	idoc.execCommand('inserthtml', false, 'A');
+	verify(idoc.body.innerHTML == "<p></p><p>A_delete_this_when_fixed_</p>");
+}
+
+test("CaretPositionAfterLink") language C++;
+{
+	OpDocumentEdit* edit = GetDocumentEdit();
+	verify(edit);
+
+	// The caret should always insert text right after a link instead of inside it (if the caret is at the last position in the link)
+
+	edit->SetTextHTML(UNI_L("<STRONG><A href=\"http://test\">test</A></STRONG>"));
+	edit->m_caret.Place(OpWindowCommander::CARET_LINE_END);
+
+	edit->InsertText(UNI_L("after"), 5);
+	verify(VerifyHtml(edit, UNI_L("<STRONG><A href=\"http://test\">test</A></STRONG>after")));
+}
+
+test("AlignRightAndLeft") language C++;
+{
+	OpDocumentEdit* edit = GetDocumentEdit();
+	verify(edit);
+
+	edit->SetTextHTML(UNI_L("item1<p>item2</p><p align='left'>item3</p>item4"));
+
+	// Let's make everything right-aligned and verify that
+	edit->execCommand(OP_DOCUMENT_EDIT_COMMAND_SELECTALL);
+	edit->execCommand(OP_DOCUMENT_EDIT_COMMAND_JUSTIFYRIGHT);
+	verify(edit->queryCommandState(OP_DOCUMENT_EDIT_COMMAND_JUSTIFYRIGHT) == TRUE);
+	verify(edit->queryCommandState(OP_DOCUMENT_EDIT_COMMAND_JUSTIFYLEFT) == FALSE); // check so that queryCommandState works...
+
+	// And make it left-aligned and verify...
+	edit->execCommand(OP_DOCUMENT_EDIT_COMMAND_JUSTIFYLEFT);
+	verify(edit->queryCommandState(OP_DOCUMENT_EDIT_COMMAND_JUSTIFYRIGHT) == FALSE);
+	verify(edit->queryCommandState(OP_DOCUMENT_EDIT_COMMAND_JUSTIFYLEFT) == TRUE);
+
+	// Check so that everything really was selected
+	edit->execCommand(OP_DOCUMENT_EDIT_COMMAND_DELETE);
+	verify(VerifyHtml(edit, UNI_L("<DIV align=\"left\"><BR></DIV>")));
+}
+
+test("InsertHrAtTopAndPlaceCaretBefore") language C++;
+{
+	OpDocumentEdit* edit = GetDocumentEdit();
+	verify(edit);
+
+	edit->SetTextHTML(UNI_L(""));
+
+	// Create two HR at the top of the document and step before each of them and type text
+	edit->execCommand(OP_DOCUMENT_EDIT_COMMAND_INSERTHORIZONTALRULE);
+	edit->execCommand(OP_DOCUMENT_EDIT_COMMAND_INSERTHORIZONTALRULE);
+	verify(VerifyHtml(edit, UNI_L("<HR><HR>")));
+	edit->m_caret.Move(FALSE,FALSE);
+	edit->InsertText(UNI_L("b"), 1);
+	edit->m_caret.Move(FALSE,FALSE);
+	edit->m_caret.Move(FALSE,FALSE);
+	edit->InsertText(UNI_L("a"), 1);
+	verify(VerifyHtml(edit, UNI_L("a<HR>b<HR>")));
+}
+
+test("IME_accepted") language C++;
+require WIDGETS_IME_SUPPORT;
+{
+	OpDocumentEdit* edit = GetDocumentEdit();
+	verify(edit);
+
+	edit->SetTextHTML(UNI_L(""));
+
+	OpInputMethodString imstring;
+	imstring.Set(UNI_L("test1"), 5);
+
+	edit->OnStartComposing(&imstring, IM_COMPOSE_NEW);
+	verify(VerifyHtml(edit, UNI_L("<BR>")));
+
+	edit->OnCompose();
+	verify(VerifyHtml(edit, UNI_L("test1")));
+
+	imstring.Set(UNI_L("test2"), 5);
+	edit->OnCompose();
+	verify(VerifyHtml(edit, UNI_L("test2")));
+
+	edit->OnStopComposing(FALSE);
+	verify(VerifyHtml(edit, UNI_L("test2")));
+}
+
+test("IME_canceled") language C++;
+require WIDGETS_IME_SUPPORT;
+{
+	OpDocumentEdit* edit = GetDocumentEdit();
+	verify(edit);
+
+	edit->SetTextHTML(UNI_L(""));
+
+	OpInputMethodString imstring;
+	imstring.Set(UNI_L("test1"), 5);
+
+	edit->OnStartComposing(&imstring, IM_COMPOSE_NEW);
+
+	edit->OnCompose();
+	verify(VerifyHtml(edit, UNI_L("test1")));
+
+	edit->OnStopComposing(TRUE);
+	verify(VerifyHtml(edit, UNI_L("")));
+}
+
+test("IME_pending_styles") language C++;
+require WIDGETS_IME_SUPPORT;
+{
+	OpDocumentEdit* edit = GetDocumentEdit();
+	verify(edit);
+
+	edit->SetTextHTML(UNI_L(""));
+
+	edit->execCommand(OP_DOCUMENT_EDIT_COMMAND_BOLD);
+	edit->execCommand(OP_DOCUMENT_EDIT_COMMAND_ITALIC);
+
+	OpInputMethodString imstring;
+	imstring.Set(UNI_L("test"), 4);
+
+	edit->OnStartComposing(&imstring, IM_COMPOSE_NEW);
+	edit->OnCompose();
+	verify(VerifyHtml(edit, UNI_L("<EM><STRONG>test</STRONG></EM>")));
+	edit->OnCompose();
+	verify(VerifyHtml(edit, UNI_L("<EM><STRONG>test</STRONG></EM>")));
+
+	edit->OnStopComposing(FALSE);
+	verify(VerifyHtml(edit, UNI_L("<EM><STRONG>test</STRONG></EM>")));
+}
+
+test("DefaultBlock div") language C++;
+{
+	OpDocumentEdit* edit = GetDocumentEdit();
+	verify(edit);
+
+	OpInputAction enter(OpInputAction::ACTION_LOWLEVEL_KEY_PRESSED, OP_KEY_ENTER);
+	OpInputAction b(OpInputAction::ACTION_LOWLEVEL_KEY_PRESSED, OP_KEY_B);
+	verify_success(b.SetActionKeyValue("b", 1));
+
+	edit->execCommand(OP_DOCUMENT_EDIT_COMMAND_DEFAULT_BLOCK, FALSE, UNI_L("div"));
+
+	edit->SetTextHTML(UNI_L("a"));
+	edit->m_caret.Place(OpWindowCommander::CARET_DOCUMENT_END);
+
+	edit->EditAction(&enter);
+	verify(VerifyHtml(edit, UNI_L("<div>a</div><div><br></div>")));
+
+	edit->EditAction(&b);
+	verify(VerifyHtml(edit, UNI_L("<div>a</div><div>b</div>")));
+
+	edit->execCommand(OP_DOCUMENT_EDIT_COMMAND_DEFAULT_BLOCK, FALSE, UNI_L("p"));
+}
+
+test("DefaultBlock insert paragraph") language C++;
+{
+	OpDocumentEdit* edit = GetDocumentEdit();
+	verify(edit);
+
+	edit->execCommand(OP_DOCUMENT_EDIT_COMMAND_DEFAULT_BLOCK, FALSE, UNI_L("div"));
+
+	edit->SetTextHTML(UNI_L("a"));
+	edit->m_caret.Place(OpWindowCommander::CARET_DOCUMENT_END);
+
+	edit->execCommand(OP_DOCUMENT_EDIT_COMMAND_INSERTPARAGRAPH);
+	verify(VerifyHtml(edit, UNI_L("<div>a</div><div><br></div>")));
+
+	edit->execCommand(OP_DOCUMENT_EDIT_COMMAND_DEFAULT_BLOCK, FALSE, UNI_L("p"));
+}
+
+test("DefaultBlock div with lists") language C++;
+{
+	OpDocumentEdit* edit = GetDocumentEdit();
+	verify(edit);
+
+	OpInputAction enter(OpInputAction::ACTION_LOWLEVEL_KEY_PRESSED, OP_KEY_ENTER);
+	OpInputAction b(OpInputAction::ACTION_LOWLEVEL_KEY_PRESSED, OP_KEY_B);
+	OpInputAction backspace(OpInputAction::ACTION_BACKSPACE);
+	verify_success(b.SetActionKeyValue("b", 1));
+
+	edit->execCommand(OP_DOCUMENT_EDIT_COMMAND_DEFAULT_BLOCK, FALSE, UNI_L("div"));
+
+	edit->SetTextHTML(UNI_L("a"));
+	edit->m_caret.Place(OpWindowCommander::CARET_DOCUMENT_END);
+
+	edit->EditAction(&enter);
+	verify(VerifyHtml(edit, UNI_L("<div>a</div><div><br></div>")));
+
+	edit->EditAction(&backspace);
+	verify(VerifyHtml(edit, UNI_L("<div>a</div>")));
+
+	edit->execCommand(OP_DOCUMENT_EDIT_COMMAND_INSERTUNORDEREDLIST);
+	verify(VerifyHtml(edit, UNI_L("<ul><li>a</li></ul>")));
+
+	edit->execCommand(OP_DOCUMENT_EDIT_COMMAND_INSERTUNORDEREDLIST);
+	verify(VerifyHtml(edit, UNI_L("<div>a</div>")));
+
+	edit->execCommand(OP_DOCUMENT_EDIT_COMMAND_INSERTUNORDEREDLIST);
+	verify(VerifyHtml(edit, UNI_L("<ul><li>a</li></ul>")));
+
+	edit->EditAction(&enter);
+	verify(VerifyHtml(edit, UNI_L("<ul><li>a</li><li></li></ul>")));
+
+	edit->EditAction(&enter);
+	verify(VerifyHtml(edit, UNI_L("<ul><li>a</li></ul><div></div>")));
+
+	edit->execCommand(OP_DOCUMENT_EDIT_COMMAND_DEFAULT_BLOCK, FALSE, UNI_L("p"));
+}
+
+html
+{
+//! <body onload="document.getElementsByTagName('div')[0].focus();"><ul><li><div contenteditable="true"></div></ul></body>
+}
+
+test("ContentEditable within list item")
+{
+	OpDocumentEdit* edit = state.doc->GetDocumentEdit();
+	verify(edit);
+
+	// Document edit adds the <br> inside the div automatically.
+	// Also, newline is for some reason necessary at the end.
+	VerifyHtml(edit, UNI_L("<ul><li><div contenteditable=\"true\"><br></div></li></ul>\n"));
+
+	edit->InsertBreak();
+	VerifyHtml(edit, UNI_L("<ul><li><div contenteditable=\"true\"><br><br></div></li></ul>\n"));
+}
+
+html
+{
+	//! <body>
+	//! <div contenteditable="TRUE"></div>
+	//! </body>
+}
+
+
+test("ContentEditable_Simple") language C++;
+{
+	if (state.doc)
+		verify(state.doc->GetDocumentEdit());
+}
+
+html
+{
+	//! <body>
+	//! <div id="one" contenteditable="TRUE"></div>
+	//! <script>
+	//!     document.getElementById('one').focus();
+	//!     document.execCommand("insertHTML", false, "PASS");
+	//! </script>
+	//! </body>
+}
+
+test("ContentEditable_ScriptAfter") language ecmascript;
+{
+	/* This is not completely compatible with other browsers
+	   since they seem to require that we wait until the
+	   entire page is loaded before enabling designmode.
+	   not sure how important or good it is to implement this */
+	var one = document.getElementById("one");
+	verify(one.firstChild.data=='PASS');
+}
+
+
+html
+{
+	//! <body>PASS<div id="one" contenteditable="TRUE">PASS<script>
+	//!     document.execCommand("insertHTML", false, "FAIL");
+	//! </script>
+	//! </div>
+	//! </body>
+}
+
+test("ContentEditable_ScriptInside") language ecmascript;
+{
+	/* If we enable designmode as an emergency resort to handle
+	   the execCommand, the added code end up as a child of body
+	   instead of as a child of the documenteditable.
+	   Generally the execCommand should not run at all before
+	   the contenteditable is enabled. Related to DSK-153397. */
+
+	var one = document.getElementById("one");
+	verify(one.firstChild.data=='PASS');
+	var body = document.getElementsByTagName("body")[0];
+	verify(body.firstChild.data == 'PASS');
+}
+
+html
+{
+	//! <body>PASS<div>dummy</div>
+	//! </body>
+}
+
+test("ContentEditable_ExecCommandNoEditable") language ecmascript;
+{
+	/* execCommand on a non-editable document should not
+	throw an exception. And not insert anything. See also DSK-153397. */
+
+	try
+	{
+		document.execCommand("insertHTML", false, "FAIL");
+	}
+	catch (err)
+	{
+		verify(0);
+	}
+	var body = document.getElementsByTagName("body")[0];
+	verify(body.firstChild.data == 'PASS');
+}
+
+html
+{
+	//! <!DOCTYPE html><html><head><title>appending contenteditable element</title>
+	//! </head><body></body></html>
+
+}
+
+test("Inserting contenteditable should only create br if needed")
+language ecmascript;
+{
+	var node1 = document.createElement('div');
+	node1.contentEditable = 'true';
+	node1.innerHTML = 'text';
+
+	node1.style.display = 'none';
+	document.body.appendChild(node1);
+	node1.style.display = 'block';
+
+	verify(node1.innerHTML=='text');
+}
+
+html
+{
+	//! <!DOCTYPE html>
+	//! <title>Missing trailing linebreak</title>
+	//! <body contenteditable>
+	//! <pre>X<br></pre></body>
+}
+
+test("Pasting text with linebreak")
+{
+	HTML_Element* pre = find_element("pre");
+	verify(pre);
+	// Caret between text node and <br>
+	SelectionBoundaryPoint start(pre, 1);
+	SelectionBoundaryPoint end(pre, 1);
+
+	state.doc->GetHtmlDocument()->SetSelection(&start, &end);
+	OpDocumentEdit* edit = state.doc->GetDocumentEdit();
+	verify(edit);
+	const uni_char* clipboard_text = UNI_L("foo\n");
+	verify_success(edit->InsertText(clipboard_text, 4)); // The function used by OpDocumentEdit::OnPaste().
+	verify_success(edit->InsertText(clipboard_text, 4)); // The function used by OpDocumentEdit::OnPaste().
+	HTML_Element* pre_child = pre->FirstChildActual();
+	verify(pre_child && pre_child->Type() == HE_TEXT); // "X"
+	pre_child = pre_child->SucActual();
+	verify(pre_child && pre_child->Type() == HE_TEXT); // "foo"
+	pre_child = pre_child->SucActual();
+	verify(pre_child && pre_child->IsMatchingType(HE_BR, NS_HTML)); // <br>
+	pre_child = pre_child->SucActual();
+	verify(pre_child && pre_child->Type() == HE_TEXT); // "foo"
+	pre_child = pre_child->SucActual();
+	verify(pre_child && pre_child->IsMatchingType(HE_BR, NS_HTML)); // <br>
+	pre_child = pre_child->SucActual();
+	verify(pre_child && pre_child->IsMatchingType(HE_BR, NS_HTML)); // <br>
+	pre_child = pre_child->SucActual();
+	verify(!pre_child);
+}
+
+html
+{
+	"<body><p></p><div contentEditable=true><input></div></body>"
+}
+test("Replace clicked input with text") language C++;
+{
+	// Was a crasher (CORE-24156).
+
+	OpDocumentEdit* edit = state.doc->GetDocumentEdit();
+	verify(edit);
+
+	// simulate a mouse click on the input
+	state.doc->HandleMouseEvent(ONMOUSEDOWN, NULL, find_element("input"), NULL, 127, 8, 138, 19, 0, 98304);
+
+	edit->InsertText(UNI_L("a"), 1); // shouldn't crash here
+
+	verify(VerifyHtml(edit, UNI_L("<P></P><DIV contenteditable=\"true\">a</DIV>")));
+}
+
+html
+{
+	"<body><p></p><div contentEditable=true><input></div></body>"
+}
+test("Remove last input element from contentEditable element") language C++;
+{
+	// When the input is removed the div shouldn't dissapear, a <br> placeholder should be inserted instead.
+
+	OpDocumentEdit* edit = state.doc->GetDocumentEdit();
+	verify(edit);
+
+	// simulate a mouse click on the input
+	state.doc->HandleMouseEvent(ONMOUSEDOWN, NULL, find_element("input"), NULL, 127, 8, 138, 19, 0, 98304);
+
+	OpInputAction backspace(OpInputAction::ACTION_BACKSPACE);
+
+	edit->OnInputAction(&backspace);
+
+	verify(VerifyHtml(edit, UNI_L("<P></P><DIV contenteditable=\"true\"><BR></DIV>")));
+}
+
+setup
+{
+}
+
+exit
+{
+}
+
+// CORE-25307
+html
+{
+//! <!DOCTYPE html>
+//! <html>
+//! <head>
+//!   <title>appendChild, queryCommandState and selection</title>
+//!   <style type="text/css"> body { margin: 0; } </style>
+//!   <script type="text/javascript">
+//!       // Code here comes from TinyMCE 3.
+//!       // (stripped down)
+//!       function getSelectedNode() {
+//!         var s = window.getSelection(), r = null, e = null;
+//!         if (s && s.rangeCount > 0) {
+//!           r = s.getRangeAt(0);
+//!         } else {
+//!           r = s && s.createRange ? s.createRange() : document.createRange();
+//!         }
+//!
+//!         var e = r.commonAncestorContainer;
+//!
+//!         if (!r.collapsed) {
+//!           if (r.startContainer == r.endContainer) {
+//!             if (r.startOffset - r.endOffset < 2) {
+//!               if (r.startContainer.hasChildNodes()) {
+//!                 e = r.startContainer.childNodes[r.startOffset];
+//!               }
+//!             }
+//!           }
+//!         }
+//!
+//!         if (e.nodeType !== Node.ELEMENT_NODE) {
+//!           e = e.parentNode;
+//!         }
+//!
+//!         return e;
+//!       }
+//!
+//!       function handler(ev) {
+//!         var results = document.getElementById('results');
+//!         results.innerHTML = 'IN PROGRESS';
+//!         document.queryCommandState('bold');
+//!         var node = getSelectedNode();
+//!         results.innerHTML = (node instanceof HTMLImageElement ? 'PASS' : 'FAIL');
+//!       }
+//!   </script>
+//! </head>
+//! <body>
+//!   <p contentEditable="true"><img src="http://t/resources/images/100x100-navy.png" id="test" onclick="handler()"></p>
+//!
+//!   <p id="results">NOT TESTED</p>
+//! </body>
+//! </html>
+}
+test("selection after queryCommandState - setup1")
+{
+	HTML_Element* img = find_element("img");
+	verify(img);
+	// simulate a mouse click on the image
+	state.doc->HandleMouseEvent(ONMOUSEDOWN, NULL, img, NULL, 35, 33, 35, 49, 0, 98304);
+	state.doc->HandleMouseEvent(ONMOUSEUP,   NULL, img, NULL, 35, 33, 35, 49, 0, 98304);
+}
+test("selection after queryCommandState - setup2")
+language ecmascript;
+require success "selection after queryCommandState - setup1";
+{
+	// nothing - just to make sure onclick script has run
+}
+test("selection after queryCommandState")
+require success "selection after queryCommandState - setup2";
+{
+	// find output element
+	HTML_Element* p = find_element("p", 2);
+	verify(p && p->Type() == HE_P);
+	// check contents - should be "PASS"
+	const int len = 4;
+	uni_char buf[len+1];					/* ARRAY OK 2010-06-07 markuso */
+	verify(p->GetTextContent(buf, len+1) == len);
+	verify(!uni_strcmp(buf, "PASS"));
+}
+
+html
+{
+	//!<html>
+	//!<head>
+	//!<style>
+	//!body { height: 50px; }
+	//!</style>
+	//!</head>
+	//!<body contenteditable=true>
+	//!<div>a</div>
+	//!</body>
+	//!</html>
+}
+test("Caret place end")
+{
+	verify(state.doc);
+	OpDocumentEdit* edit = state.doc->GetDocumentEdit();
+	verify(edit);
+
+	edit->m_caret.Place(OpWindowCommander::CARET_DOCUMENT_HOME);
+	edit->m_caret.Place(OpWindowCommander::CARET_DOCUMENT_END);
+	edit->InsertText(UNI_L("b"), 1);
+	HTML_Element* div = find_element("div");
+	verify(div && div->Type() == HE_DIV);
+	verify(div->FirstChild() == edit->m_caret.GetElement());
+	verify(div->GetTextContentLength() == 2);
+	uni_char buf[3];						/* ARRAY OK 2010-06-07 markuso */
+	verify(div->GetTextContent(buf, 3));
+	verify(uni_strcmp(buf, UNI_L("ab")) == 0);
+}
+
+html
+{
+	//!<html>
+	//!<head>
+	//!</head>
+	//!<body contenteditable=true>
+	//!</body>
+	//!</html>
+}
+
+test("Catching HTML_Element's Next() - NextActual() usage mismatch in UNDO/REDO stack #1") language C++;
+{
+	OpDocumentEdit* edit = state.doc->GetDocumentEdit();
+	verify(edit);
+
+	edit->SetTextHTML(UNI_L("<DIV STYLE=\"DISPLAY:TABLE-CELL\">DIV DISPLAYED AS TABLE CELL</DIV><P>Some text inside P element</P><DIV STYLE=\"DISPLAY:TABLE-CELL\">DIV DISPLAYED AS TABLE CELL</DIV>"));
+
+	HTML_Element *p = edit->GetBody()->FirstChild()->SucActual();
+	verify(p->Type() == HE_P);
+	HTML_Element* elm = edit->FindEditableElement(p, TRUE, TRUE, FALSE);
+	verify(elm);
+	edit->m_caret.Place(elm, 0);
+	edit->m_selection.SelectToCaret(edit->m_caret.GetElement(), 5);
+
+	edit->execCommand(OP_DOCUMENT_EDIT_COMMAND_DELETE);
+	verify(VerifyHtml(edit, UNI_L("<DIV STYLE=\"DISPLAY:TABLE-CELL\">DIV DISPLAYED AS TABLE CELL</DIV><P>text inside P element</P><DIV STYLE=\"DISPLAY:TABLE-CELL\">DIV DISPLAYED AS TABLE CELL</DIV>")));
+
+	edit->execCommand(OP_DOCUMENT_EDIT_COMMAND_UNDO);
+	verify(VerifyHtml(edit, UNI_L("<DIV STYLE=\"DISPLAY:TABLE-CELL\">DIV DISPLAYED AS TABLE CELL</DIV><P>Some text inside P element</P><DIV STYLE=\"DISPLAY:TABLE-CELL\">DIV DISPLAYED AS TABLE CELL</DIV>")));
+}
+
+test("Catching HTML_Element's Next() - NextActual() usage mismatch in UNDO/REDO stack #2") language C++;
+{
+	OpDocumentEdit* edit = state.doc->GetDocumentEdit();
+	verify(edit);
+
+	edit->SetTextHTML(UNI_L("<div>A<div style=\"display:table-cell\"><div>B</div><div>C</div></div></div><div>D</div>"));
+
+	HTML_Element *div = edit->GetBody()->FirstChildActual();
+	verify(div->Type() == HE_DIV);
+	HTML_Element* elm = edit->FindEditableElement(div, TRUE, TRUE, FALSE);
+	verify(elm);
+	edit->m_caret.Place(elm, 0);
+
+	edit->execCommand(OP_DOCUMENT_EDIT_COMMAND_BACKCOLOR, FALSE, UNI_L("red"));
+	edit->execCommand(OP_DOCUMENT_EDIT_COMMAND_UNDO);
+	verify(VerifyHtml(edit, UNI_L("<div>A<div style=\"display:table-cell\"><div>B</div><div>C</div></div></div><div>D</div>")));
+}
+
+html
+{
+	//!<doctype html>
+	//!<html>
+	//!<head>
+	//!<style>
+	//!* { margin:0; padding:0; line-height:20px; }
+	//!</style>
+	//!</head>
+	//!<body contenteditable=true><b>abc<b><br><br></body>
+	//!</html>
+}
+test("Place caret after text row ending with br") language C++;
+{
+	/* Verify that the caret is placed at the last content of the line when the mouse
+	   is clicked to the right of that line. CORE-30815. */
+
+	OpDocumentEdit* edit = state.doc->GetDocumentEdit();
+	verify(edit);
+
+	/* Simulate a mouse click to the right of the "abc<br>" line. */
+
+	state.doc->HandleMouseEvent(ONMOUSEDOWN, NULL, find_element("body"), NULL, 200, 10, 200, 10, 0, 98304);
+	state.doc->HandleMouseEvent(ONMOUSEUP, NULL, find_element("body"), NULL, 200, 10, 200, 10, 0, 98304);
+
+	HTML_Element* caret_elm = edit->m_caret.GetElement();
+
+	verify(caret_elm);
+
+	verify(caret_elm->IsText());
+
+	const uni_char* text = caret_elm->TextContent();
+
+	verify(uni_strncmp(text, UNI_L("abc"), 3) == 0);
+}
+
+
+html
+{
+	//!<doctype html>
+	//!<html>
+	//!<head>
+	//!<style>
+	//!* { margin:0; padding:0; line-height:20px; }
+	//!</style>
+	//!</head>
+	//!<body contenteditable=true><b>abc<img src="data:image/png;base64,
+	//!iVBORw0KGgoAAAANSUhEUgAAAAoAAAAKCAYAAACNMs+9AAAABGdBTUEAALGP
+	//!C/xhBQAAAAlwSFlzAAALEwAACxMBAJqcGAAAAAd0SU1FB9YGARc5KB0XV+IA
+	//!AAAddEVYdENvbW1lbnQAQ3JlYXRlZCB3aXRoIFRoZSBHSU1Q72QlbgAAAF1J
+	//!REFUGNO9zL0NglAAxPEfdLTs4BZM4DIO4C7OwQg2JoQ9LE1exdlYvBBeZ7jq
+	//!ch9//q1uH4TLzw4d6+ErXMMcXuHWxId3KOETnnXXV6MJpcq2MLaI97CER3N0
+	//!vr4MkhoXe0rZigAAAABJRU5ErkJggg==">
+	//!<img src="data:image/png;base64,
+	//!iVBORw0KGgoAAAANSUhEUgAAAAoAAAAKCAYAAACNMs+9AAAABGdBTUEAALGP
+	//!C/xhBQAAAAlwSFlzAAALEwAACxMBAJqcGAAAAAd0SU1FB9YGARc5KB0XV+IA
+	//!AAAddEVYdENvbW1lbnQAQ3JlYXRlZCB3aXRoIFRoZSBHSU1Q72QlbgAAAF1J
+	//!REFUGNO9zL0NglAAxPEfdLTs4BZM4DIO4C7OwQg2JoQ9LE1exdlYvBBeZ7jq
+	//!ch9//q1uH4TLzw4d6+ErXMMcXuHWxId3KOETnnXXV6MJpcq2MLaI97CER3N0
+	//!vr4MkhoXe0rZigAAAABJRU5ErkJggg=="></b><br><br></body>
+	//!</html>
+}
+test("Place caret after image row ending with br") language C++;
+{
+	/* Verify that the caret is placed at the last content of the line when the mouse
+	   is clicked to the right of that line. CORE-30815. */
+
+	OpDocumentEdit* edit = state.doc->GetDocumentEdit();
+	verify(edit);
+
+	/* Simulate a mouse click to the right of the line with content */
+
+	state.doc->HandleMouseEvent(ONMOUSEDOWN, NULL, find_element("body"), NULL, 200, 10, 200, 10, 0, 98304);
+	state.doc->HandleMouseEvent(ONMOUSEUP, NULL, find_element("body"), NULL, 200, 10, 200, 10, 0, 98304);
+
+	HTML_Element* caret_elm = edit->m_caret.GetElement();
+
+	verify(caret_elm);
+
+	verify(caret_elm->IsMatchingType(HE_IMG, NS_HTML));
+
+	verify(caret_elm->Pred());
+
+	verify(caret_elm->Pred()->IsText());
+}
+
+html
+{
+	//! <html>
+	//! <head contenteditable="true">abc</head>
+	//! <body>
+	//! </body>
+	//! </html>
+}
+test("HEAD should not be editable")
+{
+	OpDocumentEdit* edit = state.doc->GetDocumentEdit();
+	verify(!edit || !edit->m_caret.GetElement());
+
+	state.doc->HandleMouseEvent(ONMOUSEDOWN, NULL, find_element("html"), NULL, 100, 100, 100, 100, 0, 98304);
+	state.doc->HandleMouseEvent(ONMOUSEUP, NULL, find_element("html"), NULL, 100, 100, 100, 100, 0, 98304);
+
+	edit = state.doc->GetDocumentEdit();
+	verify(!edit || !edit->m_caret.GetElement());
+}
+
+html
+{
+	//! <html>
+	//! <body>
+	//! </body>
+	//! </html>
+}
+test("HELPER: set contentEditable on HTML and recreate body")
+	language ecmascript;
+{
+	/* This is not an actual test, just part of a setup that
+	   is easiest to be written in EcmaScript */
+	var html = document.documentElement
+	html.removeChild(document.querySelector('body'))
+
+	html.contentEditable = true
+	html.appendChild(document.createElement('body'))
+}
+
+test("Content editable on HTML element focuses <body>")
+	require success "HELPER: set contentEditable on HTML and recreate body";
+{
+	OpDocumentEdit* edit = state.doc->GetDocumentEdit();
+	verify(edit);
+	verify(!(edit->m_caret.GetElement()));
+
+	state.doc->HandleMouseEvent(ONMOUSEDOWN, NULL, find_element("html"), NULL, 100, 100, 100, 100, 0, 98304);
+	state.doc->HandleMouseEvent(ONMOUSEUP, NULL, find_element("html"), NULL, 100, 100, 100, 100, 0, 98304);
+
+	edit = state.doc->GetDocumentEdit();
+	verify(edit);
+	verify(edit->m_caret.GetElement());
+
+	HTML_Element* caret_element_parent = edit->m_caret.GetElement()->ParentActual();
+	verify(caret_element_parent);
+	verify(caret_element_parent->IsMatchingType(HE_BODY, NS_HTML));
+}
+
+html
+{
+	//! <html>
+	//! <style>div { display: table-cell; }</style>
+	//! <body contentEditable="true"><div></div><p>PASS</p></body>
+	//! </html>
+}
+test("Generated content vs lists")
+{
+	// We need to try and insert a list after some content inserted by layout
+	// The div with display: table-cell ensures layout will insert some table
+	// elements
+	OpDocumentEdit* edit = state.doc->GetDocumentEdit();
+	verify(edit);
+
+	verify(VerifyHtml(edit, UNI_L("<div></div><p>PASS</p>\n\n")));
+	edit->m_caret.Place(edit->FindElementAfterOfType(edit->GetBody(), HE_P, FALSE), 4);
+	edit->execCommand(OP_DOCUMENT_EDIT_COMMAND_INSERTUNORDEREDLIST);
+	verify(VerifyHtml(edit, UNI_L("<div></div><ul><li>PASS</li></ul>\n\n")));
+	edit->execCommand(OP_DOCUMENT_EDIT_COMMAND_INSERTUNORDEREDLIST);
+	// document edit likes to add paragraphs but the important thing is
+	// that the list is created and removed and there is no crash.
+	verify(VerifyHtml(edit, UNI_L("<div></div><p>PASS</p>\n\n")));
+}
+
+html
+{
+	//! <!DOCTYPE html>
+	//! <title>focus not updated when inserting newline</title>
+	//! <body contenteditable>
+	//! <pre>Click after the end of this line and press enter.<br/>A new line should be inserted with caret in that line.
+	//! (If the caret remains at the end of the first line it is a fail). </pre>
+	//! </body>
+}
+
+test("Pressing enter at the end of a line with br")
+{
+	HTML_Element* pre = find_element("pre");
+	verify(pre);
+	// Caret between text node and <br>.
+	SelectionBoundaryPoint start(pre, 1);
+	SelectionBoundaryPoint end(pre, 1);
+	state.doc->GetHtmlDocument()->SetSelection(&start, &end);
+	verify(state.doc->GetCaretPainter());
+	int before_y = state.doc->GetCaretPainter()->GetY();
+	OpDocumentEdit* edit = state.doc->GetDocumentEdit();
+	verify(edit);
+	edit->InsertBreak(TRUE, TRUE);
+	int after_y = state.doc->GetCaretPainter()->GetY();
+	verify(after_y > before_y || !"The caret didn't move to the next line");
+}
+
+html
+{
+	"<html>"
+	"<body contentEditable=\"true\"><p id=\"foo\">FAIL: JavaScript not run</p></body>"
+	"</html>"
+}
+test("Caret moving through non-BMP characters: setup")
+	language ecmascript;
+{
+	// Until html{} learns how to insert non-ASCII characters...
+	var p = document.getElementById("foo");
+	p.innerHTML = "Z\uD800\uDC00Z";
+}
+test("Caret moving through non-BMP characters")
+	require success "Caret moving through non-BMP characters: setup";
+{
+	// We must not have the caret placed inside a surrogate pair
+	// (CORE-20881).
+	OpDocumentEdit* edit = state.doc->GetDocumentEdit();
+	verify(edit);
+	verify(VerifyHtml(edit, UNI_L("<p id=\"foo\">Z\xD800\xDC00Z</p>")));
+
+	edit->m_caret.Place(edit->FindElementAfterOfType(edit->GetBody(), HE_P, FALSE), 0);
+	verify(edit->m_caret.GetOffset() == 0);
+	edit->m_caret.Move(TRUE, FALSE);
+	verify(edit->m_caret.GetOffset() == 1);
+
+	// Next move should skip past the entire non-BMP character
+	edit->m_caret.Move(TRUE, FALSE);
+	verify(edit->m_caret.GetOffset() == 3);
+
+	// Moving back should put us before the non-BMP character again
+	edit->m_caret.Move(FALSE, FALSE);
+	verify(edit->m_caret.GetOffset() == 1);
+}
+
+table converthextounicode
+{
+	{ "BMP",      "20AC",   UNI_L("<p>20AC</p>"),   UNI_L("<p>\x20AC</p>")       },
+	{ "non-BMP",  "1D616",  UNI_L("<p>1D616</p>"),  UNI_L("<p>\xD835\xDE16</p>") },
+	{ "partial",  "XXX58",  UNI_L("<p>XXX58</p>"),  UNI_L("<p>XXXX</p>")         },
+	{ "overlong", "200032", UNI_L("<p>200032</p>"), UNI_L("<p>202</p>")          },
+}
+foreach (name, content, original, converted) from converthextounicode
+{
+	html
+	{
+		"<html>"
+		"<body contentEditable=\"true\"><p>"
+		content
+		"</p></body>"
+		"</html>"
+	}
+	test("Convert hex to Unicode: " name)
+	{
+		OpDocumentEdit* edit = state.doc->GetDocumentEdit();
+		verify(edit);
+		verify(VerifyHtml(edit, original));
+
+		OpInputAction convert(OpInputAction::ACTION_CONVERT_HEX_TO_UNICODE);
+
+		edit->m_caret.Place(edit->FindElementAfterOfType(edit->GetBody(), HE_P, FALSE), op_strlen(content));
+		edit->EditAction(&convert);
+		verify(VerifyHtml(edit, converted));
+
+		edit->execCommand(OP_DOCUMENT_EDIT_COMMAND_UNDO);
+		verify(VerifyHtml(edit, original));
+
+		edit->execCommand(OP_DOCUMENT_EDIT_COMMAND_REDO);
+		verify(VerifyHtml(edit, converted));
+	}
+}
+
+html
+{
+	//! <script>
+	//! var win;
+	//! var idoc;
+	//! function do_onload()
+	//! {
+	//!   win = document.getElementById('edit').contentWindow;
+	//!   idoc = document.getElementById('edit').contentDocument;
+	//!   idoc.designMode = 'on';
+	//!   idoc.body.innerHTML = '<div></div>';
+	//!
+	//!   var r = idoc.createRange();
+	//!   r.setStart(idoc.getElementsByTagName('div')[0], 0 );
+	//!   r.setEnd(idoc.getElementsByTagName('div')[0], 0 );
+	//!   win.getSelection().removeAllRanges();
+	//!   win.getSelection().addRange(r);
+	//!
+	//! }
+	//! </script>
+	//! <body onload="do_onload()">
+	//! <iframe id="edit" width="40" height="40"></iframe>
+	//! </body>
+}
+
+
+test("Caret position set from DOM on non text element in text container") language ecmascript;
+{
+	verify(document.getElementById('edit').contentDocument.designMode == 'on');
+
+	idoc.execCommand('inserthtml', false, 'ABC');
+	verify(idoc.body.innerHTML == "<div>ABC<br></div>");
+}
+
+html
+{
+	//! <script>
+	//! var win;
+	//! var idoc;
+	//! function do_onload()
+	//! {
+	//!   win = document.getElementById('edit').contentWindow;
+	//!   idoc = document.getElementById('edit').contentDocument;
+	//!   idoc.designMode = 'on';
+	//!   idoc.body.innerHTML = '<p>ABC</p>';
+	//!
+	//!   var r = idoc.createRange();
+	//!   r.setStart(idoc.getElementsByTagName('p')[0].firstChild, 3 );
+	//!   r.setEnd(idoc.getElementsByTagName('p')[0].firstChild, 3 );
+	//!   win.getSelection().removeAllRanges();
+	//!   win.getSelection().addRange(r);
+	//!
+	//! }
+	//! </script>
+	//! <body onload="do_onload()">
+	//! <iframe id="edit" width="40" height="40"></iframe>
+	//! </body>
+}
+
+
+test("Caret position set from DOM on text element") language ecmascript;
+{
+	verify(document.getElementById('edit').contentDocument.designMode == 'on');
+
+	idoc.execCommand('inserthtml', false, 'DEF');
+	verify(idoc.body.innerHTML == "<p>ABCDEF</p>");
+}
+
+html
+{
+	//! <script>
+	//! var win;
+	//! var idoc;
+	//! function do_onload()
+	//! {
+	//!   win = document.getElementById('edit').contentWindow;
+	//!   idoc = document.getElementById('edit').contentDocument;
+	//!   idoc.designMode = 'on';
+	//!   idoc.body.innerHTML = '<table><tbody><tr></tr></tbody></table>';
+	//!
+	//!   var r = idoc.createRange();
+	//!   r.setStart(idoc.getElementsByTagName('tr')[0], 0 );
+	//!   r.setEnd(idoc.getElementsByTagName('tr')[0], 0 );
+	//!   win.getSelection().removeAllRanges();
+	//!   win.getSelection().addRange(r);
+	//!
+	//! }
+	//! </script>
+	//! <body onload="do_onload()">
+	//! <iframe id="edit" width="40" height="40"></iframe>
+	//! </body>
+}
+
+
+test("Caret position set from DOM on non text element in no text container") language ecmascript;
+{
+	verify(document.getElementById('edit').contentDocument.designMode == 'on');
+
+	idoc.execCommand('inserthtml', false, 'ABC');
+	verify(idoc.body.innerHTML == "<table><tbody><tr>ABC<br></tr></tbody></table>");
+}

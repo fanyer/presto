@@ -1,0 +1,162 @@
+/* -*- Mode: c++; tab-width: 4; indent-tabs-mode: t; c-basic-offset: 4; -*-
+ *
+ * Copyright (C) 2010-2011 Opera Software AS.  All rights reserved.
+ *
+ * This file is part of the Opera web browser.
+ * It may not be distributed under any circumstances.
+ */
+
+group "opera_auth.oauth";
+
+require OPERA_AUTH_SUPPORT;
+
+include "modules/opera_auth/src/opera_auth_oauth_impl.h";
+
+table test_query_strings(const char* test_name, const char* query_string, int query_length, OP_STATUS expected_status, const char* expected_normalized_request_param)
+{
+	{"null string", 0, 0, OpStatus::OK, ""},
+	{"empty string", "", 0, OpStatus::OK, ""},
+
+	{"name(all)", "name", KAll, OpStatus::OK, "name="},
+	{"name(4)", "name", 4, OpStatus::OK, "name="},
+	{"namecrap(4)", "namecrap", 4, OpStatus::OK, "name="},
+
+	{"name=(all)", "name=", KAll, OpStatus::OK, "name="},
+	{"name=(5)", "name=", 5, OpStatus::OK, "name="},
+	{"name=crap(5)", "name=crap", 5, OpStatus::OK, "name="},
+
+	{"name&(all)", "name&", KAll, OpStatus::OK, "name="},
+	{"name&(5)", "name&", 5, OpStatus::OK, "name="},
+	{"name&crap(5)", "name&crap", 5, OpStatus::OK, "name="},
+
+	{"&=&&name=val&(all)", "&=&&name=val&", KAll, OpStatus::OK, "name=val"},
+	{"&=&&name=val&(13)", "&=&&name=val&", 13, OpStatus::OK, "name=val"},
+	{"&=&&name=val&crap(13)", "&=&&name=val&crap", 13, OpStatus::OK, "name=val"},
+
+	{"name=val&foo=escaped%20value(all)", "name=val&foo=escaped%20value", KAll, OpStatus::OK, "foo=escaped%20value&name=val"},
+	{"name=val&foo=escaped%20value(28)", "name=val&foo=escaped%20value", 28, OpStatus::OK, "foo=escaped%20value&name=val"},
+	{"name=val&foo=escaped%20valuecrap(28)", "name=val&foo=escaped%20valuecrap", 28, OpStatus::OK, "foo=escaped%20value&name=val"},
+}
+
+foreach (test_name, query_string, query_length, expected_status, expected_normalized_request_param) from test_query_strings
+{
+	test("OauthParameterHandler::Parse(" test_name ")")
+	{
+		OauthParameterHandler handler;
+		verify(handler.Parse(query_string, query_length) == expected_status);
+		OpString8 normalized_request_param;
+		verify_success(handler.GetNormalizedRequestParameterString(normalized_request_param));
+		verify_string(normalized_request_param, expected_normalized_request_param);
+	}
+}
+
+test("Oauth test signature base string generation")
+{
+	OauthParameterHandler handler;
+
+	URL url = g_url_api->GetURL("http://example.com/request?b5=%3D%253D&a3=a&c%40=&a2=r%20b");
+
+	handler.CollectAndAddQueryParamentersFromUrl(url);
+
+	verify_success(handler.AddAuthHeaderParameter("realm", "Example"));
+	verify_success(handler.AddAuthHeaderParameter("oauth_consumer_key", "9djdj82h48djs9d2"));
+	verify_success(handler.AddAuthHeaderParameter("oauth_token", "kkk9d7dh3k39sjv7"));
+	verify_success(handler.AddAuthHeaderParameter("oauth_signature_method", "HMAC-SHA1"));
+	verify_success(handler.AddAuthHeaderParameter("oauth_timestamp", "137131201"));
+	verify_success(handler.AddAuthHeaderParameter("oauth_nonce", "7d8f3e4a"));
+
+	/* We also add the body parameters, as we currently not yet parse the post body*/
+
+	verify_success(handler.AddQueryParameter("c2", ""));
+	verify_success(handler.AddQueryParameter("a3", "2 q"));
+
+	OpString8 base_string;
+	handler.GetNormalizedRequestParameterString(base_string);
+	verify_string(base_string,
+				  "a2=r%20b&a3=2%20q&a3=a&b5=%3D%253D&c%40=&c2=&oauth_consumer_key=9djdj82h48djs9d2&oauth_nonce=7d8f3e4a&oauth_signature_method=HMAC-SHA1&oauth_timestamp=137131201&oauth_token=kkk9d7dh3k39sjv7");
+}
+
+test("Oauth test normalized signature base string")
+{
+	OpAutoPtr<OauthSignatureGeneratorImpl> generator(OauthSignatureGeneratorImpl::Create(FALSE, FALSE));
+	if (!generator.get())
+		return OpStatus::ERR_NO_MEMORY;
+
+	URL url = g_url_api->GetURL("http://example.com/request?b5=%3D%253D&a3=a&c%40=&a2=r%20b");
+
+	verify_success(generator->SetToken("kkk9d7dh3k39sjv7"));
+	verify_success(generator->SetTokenSecret("dh893hdasih9"));
+	verify_success(generator->SetClientSecret("j49sk3j29djd"));
+
+	verify_success(generator->AddAuthHeaderParameter("realm", "Example"));
+	verify_success(generator->AddAuthHeaderParameter("oauth_consumer_key", "9djdj82h48djs9d2"));
+	verify_success(generator->AddAuthHeaderParameter("oauth_signature_method", "HMAC-SHA1"));
+	verify_success(generator->AddAuthHeaderParameter("oauth_timestamp", "137131201"));
+	verify_success(generator->AddAuthHeaderParameter("oauth_nonce", "7d8f3e4a"));
+
+	/* We also add the body parameters, as we currently not yet parse the post body*/
+
+	verify_success(generator->AddQueryParameter("c2", ""));
+	verify_success(generator->AddQueryParameter("a3", "2 q"));
+
+	OpString8 signature;
+	generator->CreateOauthSignature(signature, url, HTTP_METHOD_POST);
+	output("\nsignature = %s\n", signature.CStr());
+
+	verify_string(generator->GetNormalizedRequestParameterString(),
+				  "POST&http%3A%2F%2Fexample.com%2Frequest&a2%3Dr%2520b%26a3%3D2%2520q"
+				  "%26a3%3Da%26b5%3D%253D%25253D%26c%2540%3D%26c2%3D%26oauth_consumer_"
+				  "key%3D9djdj82h48djs9d2%26oauth_nonce%3D7d8f3e4a%26oauth_signature_m"
+				  "ethod%3DHMAC-SHA1%26oauth_timestamp%3D137131201%26oauth_token%3Dkkk"
+				  "9d7dh3k39sjv7");
+}
+
+test("Oauth generate signature")
+{
+	// Generated using
+	OpAutoPtr<OauthSignatureGeneratorImpl> generator(OauthSignatureGeneratorImpl::Create(FALSE, FALSE));
+	if (!generator.get())
+		return OpStatus::ERR_NO_MEMORY;
+
+	OpString resolved;
+	RETURN_IF_LEAVE(g_url_api->ResolveUrlNameL(UNI_L("http://host.net/resource/?name=value&name2=value2"), resolved, TRUE));
+	URL url = g_url_api->GetURL(resolved.CStr());
+
+	verify_success(generator->SetToken("ijkl"));
+	verify_success(generator->SetTokenSecret("mnop"));
+	verify_success(generator->SetClientSecret("efgh"));
+
+	verify_success(generator->AddAuthHeaderParameter("realm", ""));
+	verify_success(generator->AddAuthHeaderParameter("oauth_version", "1.0"));
+	verify_success(generator->AddAuthHeaderParameter("oauth_consumer_key", "abcd"));
+	verify_success(generator->AddAuthHeaderParameter("oauth_signature_method", "HMAC-SHA1"));
+	verify_success(generator->AddAuthHeaderParameter("oauth_timestamp", "1294400156"));
+	verify_success(generator->AddAuthHeaderParameter("oauth_nonce", "UTI0mgmO0wX"));
+
+	OpString8 signature;
+	verify_success(generator->CreateOauthSignature(signature, url, HTTP_METHOD_GET));
+	output("\nsignature base string = %s\n", generator->GetNormalizedRequestParameterString());
+	verify_string(signature, "SNwhbw51lPWiGFhb7A3CBh+8dqg=");
+}
+
+table test_request_token_strings(const char* test_name, const uni_char* username, const uni_char* password, const char* expected)
+{
+	{ "foo, bar", UNI_L("foo"), UNI_L("bar"),
+			"x_username=foo&x_password=bar&x_consumer_key=selftest" }
+	{ "unistring", UNI_L("u\x0105_\x0119 "), UNI_L("p\xf3 \x0142_"),
+			"x_username=u%C4%85_%C4%99%20&x_password=p%C3%B3%20%C5%82_&x_consumer_key=selftest" }
+}
+
+foreach (test_name, username, password, expected) from test_request_token_strings
+{
+	test("OperaOauthManagerImpl::GetRequestTokenString(" test_name ")")
+	{
+		OperaOauthManagerImpl* impl = NULL;
+		verify_trap(OperaOauthManagerImpl::CreateL(impl, FALSE));
+		verify_success(impl->SetClientIdentityKey("selftest"));
+		OpString8 post_string_utf8;
+		verify_success(OperaOauthManagerImpl::SelftestHelper(impl).GetRequestTokenString(post_string_utf8, username, password));
+		verify_string(post_string_utf8, expected);
+	}
+	finally { OP_DELETE(impl); }
+}

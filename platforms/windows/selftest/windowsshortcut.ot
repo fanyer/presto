@@ -1,0 +1,165 @@
+/* -*- Mode: c++; tab-width: 4; indent-tabs-mode: t; c-basic-offset: 4 -*-
+ *
+ * Copyright (C) 1995-2010 Opera Software ASA.  All rights reserved.
+ *
+ * This file is part of the Opera web browser.	It may not be distributed
+ * under any circumstances.
+ *
+ * @author Blazej Kazmierczak (bkazmierczak@opera.com)
+ * @author Wojciech Dzierzanowski (wdzierzanowski@opera.com)
+ */
+
+group "windows.shortcut";
+
+require init; 
+require MSWIN; 
+
+include "adjunct/desktop_util/image_utils/fileimagecontentprovider.h";
+include "adjunct/desktop_util/shortcuts/DesktopShortcutInfo.h";
+include "modules/util/path.h";
+include "modules/util/opfile/opfile.h";
+include "platforms/windows/WindowsShortcut.h";
+include "platforms/windows/utils/win_icon.h";
+
+global
+{
+	class TestShortcut : public DesktopShortcutInfo, public WindowsShortcut
+	{
+	public:
+		explicit TestShortcut(const OpStringC& root_path)
+		{
+			m_destination = DesktopShortcutInfo::SC_DEST_NONE;
+			m_file_name.Set(UNI_L("Name"));
+			m_name.Set(UNI_L("Display Name"));
+			m_working_dir_path.Set(root_path);
+			m_icon_name.Set(UNI_L("foo"));
+			m_icon_index = 0;
+			m_comment.Set(UNI_L("bar"));
+			m_command.Set(UNI_L("baz"));
+		}
+
+		OP_STATUS Init(const OpStringC& shortcut_path)
+			{ return WindowsShortcut::Init(*this, shortcut_path); }
+	};
+
+	static void DeleteDirectory(const OpStringC& dir_path)
+	{
+		OpFile dir;
+		OpStatus::Ignore(dir.Construct(dir_path));
+		OpStatus::Ignore(dir.Delete(TRUE));
+	}
+}
+
+ 
+subtest FileExists(const OpStringC& path, BOOL should_exist)
+{
+	BOOL file_exists = FALSE;
+	OpFile file;
+	verify_success(file.Construct(path));
+	verify_success(file.Exists(file_exists));
+	if (file_exists != should_exist)
+	{
+		output("%s %s: ", ST_down(path.CStr()),
+				(file_exists ? "exists" : "doesn't exist"));
+	}
+	verify(file_exists == should_exist);
+}
+
+
+test("By default, shortcut files are not created for SC_DEST_NONE")
+		file uni root_path			"data/tmp";
+{
+	const OpStringC root_dir_path(root_path);
+
+	TestShortcut shortcut(root_path);
+	verify_success(shortcut.WindowsShortcut::Init(shortcut));
+	verify_status(OpStatus::ERR, shortcut.Deploy());
+
+	verify(shortcut.GetShortcutFilePath().IsEmpty()
+			|| FileExists(shortcut.GetShortcutFilePath(), FALSE));
+}
+finally
+{
+	DeleteDirectory(root_dir_path);
+}
+
+
+test("Shortcut files are created in the expected locations")
+		file uni root_path			"data/tmp";
+{
+	OpFile root_dir;
+	verify_success(root_dir.Construct(root_path));
+	verify_success(root_dir.MakeDirectory());
+
+	TestShortcut shortcut(root_path);
+
+	OpString shortcut_path;
+	RETURN_IF_ERROR(OpPathDirFileCombine(shortcut_path,	OpStringC(root_path),
+				OpStringC(UNI_L("Name.lnk"))));
+	RETURN_IF_ERROR(shortcut_path.Append(UNI_L(".lnk")));
+	verify_success(shortcut.Init(shortcut_path));
+
+	verify(shortcut.GetShortcutFilePath().HasContent());
+	verify_string(shortcut.GetShortcutFilePath(), shortcut_path);
+
+	verify_success(shortcut.Deploy());
+	verify(FileExists(shortcut.GetShortcutFilePath(), TRUE));
+}
+finally
+{
+	DeleteDirectory(root_dir.GetFullPath());
+}
+
+
+test("ICO file generation")
+		file uni ref_ico_file_path		"data/icons/icon_1.ico";
+		file uni src_icon_file_path		"data/icons/test_1.png";
+		file uni dest_icon_file_path	"data/tmp/test_1.ico";
+		file uni root_path				"data/tmp";
+{ 
+	OpFile ico_file;
+	OpFile ref_ico_file;
+
+	OpFile root_dir;
+	verify_success(root_dir.Construct(root_path));
+
+	SimpleFileImage src_icon_file(src_icon_file_path);
+	verify_success(IconUtils::WriteIcoFile(src_icon_file.GetImage(),
+				dest_icon_file_path));
+	
+	// Verify that the generated icon file is the same as the reference file.
+	verify_success(ico_file.Construct(dest_icon_file_path));
+	verify_success(ico_file.Open(OPFILE_READ));
+	OpFileLength ico_buffer_size; 
+    verify_success(ico_file.GetFileLength(ico_buffer_size)); 
+	
+	verify_success(ref_ico_file.Construct(ref_ico_file_path));
+	verify_success(ref_ico_file.Open(OPFILE_READ));
+	OpFileLength ref_ico_buffer_size;
+    verify_success(ref_ico_file.GetFileLength(ref_ico_buffer_size));
+	
+	verify(ico_buffer_size == ref_ico_buffer_size);
+	
+    OpByteBuffer ico_buffer;
+    verify_success(ico_buffer.Init(static_cast<UINT>(ico_buffer_size)));
+    OpFileLength bytes_read = 0;
+	verify_success(ico_file.Read(ico_buffer.Buffer(), ico_buffer.BufferSize(), &bytes_read));
+	verify_success(ico_file.Close());
+	
+	OpByteBuffer ref_ico_buffer; 
+    verify_success(ref_ico_buffer.Init(static_cast<UINT>(ref_ico_buffer_size)));
+	verify_success(ref_ico_file.Read(ref_ico_buffer.Buffer(),
+				ref_ico_buffer.BufferSize(), &bytes_read));
+	verify_success(ref_ico_file.Close());
+	
+	for (UINT i = 0; i < ico_buffer.BufferSize(); i++)
+	{
+		verify(ico_buffer.Buffer()[i] == ref_ico_buffer.Buffer()[i]);
+	}	 
+} 
+finally
+{
+	ico_file.Close();
+	ref_ico_file.Close();
+	DeleteDirectory(root_dir.GetFullPath());
+}

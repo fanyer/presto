@@ -1,0 +1,642 @@
+/* -*- Mode: c++; tab-width: 4; indent-tabs-mode: t; c-basic-offset: 4 -*-
+ *
+ * Copyright (C) 1995-2011 Opera Software AS.  All rights reserved.
+ *
+ * This file is part of the Opera web browser.
+ * It may not be distributed under any circumstances.
+ */
+
+group "hardcore.component";
+language c++;
+
+include "modules/hardcore/timer/optimer.h";
+include "modules/hardcore/component/OpComponent.h";
+include "modules/hardcore/component/Messages.h";
+include "modules/hardcore/tests/TestMessageListener.h";
+include "modules/opdata/OpData.h";
+
+global
+{
+	OpChannel* component;
+
+	/** This listener is used to test the successful creation of the
+	 * TestComponent. The test passes when the listener receives an
+	 * OpPeerConnectedMessage:
+	 *
+	 * @msc
+	 * Selftest, OpComponentManager, TestComponent;
+	 * Selftest => OpComponentManager [label="RequestComponent(COMPONENT_TEST)"];
+	 * OpComponentManager => TestComponent [label="Create"];
+	 * TestComponent => Selftest [label="OpPeerConnectedMessage"];
+	 * TestComponent => Selftest [label="OpPeerPendingMessage"];
+	 * @endmsc
+	 *
+	 * The OpPeerPendingMessage may be sent before or after the
+	 * OpPeerConnectedMessage, so we need to ignore this message.
+	 */
+	class TestConnect : public TestMessageListener
+	{
+	public:
+		TestConnect(OpChannel* channel) : TestMessageListener(channel) {}
+		virtual ~TestConnect() {}
+		virtual OP_STATUS OnStartTest()
+		{
+			Succeed();
+			return OpStatus::OK;
+		}
+
+		virtual OP_STATUS OnMessage(const OpTypedMessage* msg)
+		{
+			switch (msg->GetType()) {
+			case OpPeerPendingMessage::Type:
+				/* Ignore any OpPeerPendingMessage. That message may be send
+				 * before or after the OpPeerConnectedMessage. We don't care
+				 * about receiving that message and we don't want to fail on
+				 * receiving it before the OpPeerConnectedMessage. */
+				return OpStatus::OK;
+
+			default:
+				return TestMessageListener::OnMessage(msg);
+			}
+		}
+	};
+
+	/** Base-class for the other tests that get started by sending a
+	 * text-message on the channel. The text to send is specified in the
+	 * constructor. As soon as the listener receives an OpPeerConnectedMessage,
+	 * it sends an OpTextMessage with the specified text to the peer. */
+	class TestSendText : public TestMessageListener
+	{
+	protected:
+		const uni_char* m_message;
+
+		/** Send the specified message on the channel. */
+		OP_STATUS SendTextMessage(OpChannel* channel, const uni_char* message)
+		{
+			UniString msg;
+			if (OpStatus::IsError(msg.SetConstData(message)) ||
+				OpStatus::IsError(channel->SendMessage(OpTextMessage::Create(msg))))
+				Fail("Could not send the message");
+			return OpStatus::OK;
+		}
+
+		OP_STATUS SendTextMessage(const uni_char* message)
+		{
+			return SendTextMessage(m_channel, message);
+		}
+
+	public:
+		TestSendText(OpChannel* channel, const uni_char* message)
+			: TestMessageListener(channel), m_message(message) {}
+		virtual ~TestSendText() {}
+		virtual OP_STATUS OnStartTest() { return SendTextMessage(m_message); }
+	};
+
+	/** This listener is used to test that the TestComponent sends an "echo" on
+	 * receiving the text-message "echo".
+	 *
+	 * The test can be invoked on a channel that is connected to a
+	 * TestComponent.
+	 *
+	 * The test starts with sending a text-message "echo" to the TestComponent
+	 * on the associated channel and passes when it receives the "echo" as
+	 * reply.
+	 *
+	 * @msc
+	 * Selftest, TestComponent;
+	 * Selftest => TestComponent [label="OpTextMessage(echo)"];
+	 * TestComponent => Selftest [label="OpTextMessage(echo)"];
+	 * @endmsc
+	 */
+	class TestEcho : public TestSendText
+	{
+	public:
+		TestEcho(OpChannel* channel)
+			: TestSendText(channel, UNI_L("echo")) {}
+		virtual ~TestEcho() {}
+
+		virtual OP_STATUS OnMessage(const OpTypedMessage* message)
+		{
+			switch (message->GetType()) {
+			case OpTextMessage::Type:
+				return OnTextMessage(OpTextMessage::Cast(message));
+			default:
+				return TestSendText::OnMessage(message);
+			}
+		}
+
+		OP_STATUS OnTextMessage(const OpTextMessage* message)
+		{
+			if (VerifyValidMessage(message))
+			{
+				if (message->GetText() == m_message)
+					Succeed();
+				else
+					Fail("Expected to receive an echo");
+			}
+			return OpStatus::OK;
+		}
+	};
+
+	/** This listener is used to test that the TestComponent sends an error-code
+	 * on receiving a text-message "error".
+	 *
+	 * The test can be invoked on a channel that is connected to a
+	 * TestComponent.
+	 *
+	 * The test starts with sending a text-message "error" to the TestComponent
+	 * on the associated channel and passes when it receives an OpStatusMessage
+	 * with status OpStatus::ERR.
+	 *
+	 * @msc
+	 * Selftest, TestComponent;
+	 * Selftest => TestComponent [label="OpTextMessage(error)"];
+	 * TestComponent => Selftest [label="OpStatusMessage(OpStatus::ERR)"];
+	 * @endmsc
+	 */
+	class TestErrorCode : public TestSendText
+	{
+	public:
+		TestErrorCode(OpChannel* channel)
+			: TestSendText(channel, UNI_L("error")) {}
+		virtual ~TestErrorCode() {}
+
+		virtual OP_STATUS OnMessage(const OpTypedMessage* message)
+		{
+			switch (message->GetType()) {
+			case OpStatusMessage::Type:
+				return OnStatusMessage(OpStatusMessage::Cast(message));
+			default:
+				return TestSendText::OnMessage(message);
+			}
+		}
+
+		OP_STATUS OnStatusMessage(const OpStatusMessage* message)
+		{
+			if (VerifyValidMessage(message))
+			{
+				if (message->GetStatus() == OpStatus::ERR)
+					Succeed();
+				else
+					Fail("Expected to receive an OpStatus::ERR");
+			}
+			return OpStatus::OK;
+		}
+	};
+
+	/** This listener is used to test the creation of a new channel to a
+	 * connected TestComponent.
+	 *
+	 * The test can be invoked on a channel that is connected to a
+	 * TestComponent:
+	 *
+	 *     Selftest <-- connected --> TestComponent
+	 *
+	 * The test starts with creating a new directed channel (A), which is
+	 * directed to the test-component.
+	 *
+	 *     Selftest <-- connected --> TestComponent
+	 *            A  -- directed -->
+	 *
+	 * When the channel is created, the listener starts with sending a
+	 * text-message "test new channel" to the TestComponent.
+	 *
+	 * The TestComponent creates a new channel (B) and connects it with A:
+	 *
+	 *     Selftest <-- connected --> TestComponent
+	 *            A <-- connected --> B
+	 *
+	 * Thus an OpPeerConnectedMessage is sent from B to A. On receiving this
+	 * message, the listener sends a text-message "echo" to B. B's listener
+	 * responds by sending a text-message "mew" back to A. Thus we can verify
+	 * that the channel A is connected to B and no longer directed to the
+	 * TestComponent. On receiving the text-message "mew", the test passes.
+	 *
+	 * @msc
+	 * Selftest, A, B, TestComponent;
+	 * Selftest -> A [label="create, directed to TestComponent"];
+	 * A => TestComponent [label="OpTextMessage(test new channel)"];
+	 * TestComponent -> B [label="create + B->Connect()"];
+	 * B => A [label="OpPeerConnectedMessage"];
+	 * A => B [label="OpTextMessage(echo)"];
+	 * B => A [label="OpTextMessage(mew)"];
+	 * @endmsc
+	 */
+	class TestNewChannel : public TestSendText
+	{
+		enum {
+			STATE_DIRECTED,	///< A is directed to TestComponent.
+			STATE_CONNECTED,///< A is connected to B.
+			STATE_DONE
+		} m_state;
+
+		void Disconnect()
+		{
+			if (m_channel)
+			{
+				m_channel->RemoveMessageListener(this);
+				OP_DELETE(m_channel);
+				m_channel = NULL;
+			}
+		}
+
+	public:
+		TestNewChannel(OpChannel* channel)
+			: TestSendText(channel, UNI_L("test new channel"))
+			, m_state(STATE_DIRECTED) {}
+
+		virtual ~TestNewChannel()
+		{
+			Disconnect();
+		}
+
+		virtual OP_STATUS OnMessage(const OpTypedMessage* message)
+		{
+			switch (message->GetType()) {
+			case OpPeerConnectedMessage::Type:
+				return OnPeerConnected(OpPeerConnectedMessage::Cast(message));
+			case OpTextMessage::Type:
+				return OnTextMessage(OpTextMessage::Cast(message));
+			default:
+				return TestSendText::OnMessage(message);
+			}
+		}
+
+		/** We expect to receive an OpPeerConnectedMessage when the
+		 * TestComponent has created and connected its channel to this one. */
+		OP_STATUS OnPeerConnected(const OpPeerConnectedMessage* message)
+		{
+			if (VerifyValidMessage(message))
+			{
+				if (m_state == STATE_DIRECTED)
+				{
+					m_state = STATE_CONNECTED;
+					if (m_channel->GetDestination() != message->GetSrc())
+						Fail("Expected to be connected to sender of message");
+					else if (OpStatus::IsError(SendTextMessage(UNI_L("echo"))))
+						Fail("Could not send 'echo'");
+				}
+				else
+					Fail("Received PeerConnected when not in initial state");
+			}
+			return OpStatus::OK;
+		}
+
+		/** After sending the text-message "echo" we expect to receive a
+		 * text-message "mew" as reply. */
+		OP_STATUS OnTextMessage(const OpTextMessage* message)
+		{
+			if (VerifyValidMessage(message))
+			{
+				if (m_state == STATE_CONNECTED)
+				{
+					m_state = STATE_DONE;
+					if (message->GetText() != UNI_L("mew"))
+						Fail("Received unexpected text message");
+					else
+					{
+						Disconnect();
+						Succeed();
+					}
+				}
+				else
+					Fail("Received Text when not in connected state");
+			}
+			return OpStatus::OK;
+		}
+	};
+
+	/** This listener is used to test the deletion of a channel from the TestComponent.
+	 *
+	 * The test can be invoked on a channel that is connected to a
+	 * TestComponent:
+	 *
+	 *     Selftest <-- connected --> TestComponent
+	 *
+	 * The test starts with creating a new directed channel (A), which is
+	 * directed to the test-component.
+	 *
+	 *     Selftest <-- connected --> TestComponent
+	 *            A  -- directed -->
+	 *
+	 * When the channel is created, the listener starts with sending a
+	 * text-message "test new channel" to the TestComponent.
+	 *
+	 * The TestComponent creates a new channel (B) and connects it with A:
+	 *
+	 *     Selftest <-- connected --> TestComponent
+	 *            A <-- connected --> B
+	 *
+	 * Thus an OpPeerConnectedMessage is sent from B to A. On receiving this message, 
+	 * the listener sends a text-message "deleteChannel" to B. 
+	 * On handling that message, B is deleted and A is expected to receive an OpPeerDisconnectedMessage. 
+	 * On receiving the OpPeerDisconnectMessage, this listener verifies that A is undirected and no longer connected to B.
+	 *
+	 * @msc
+	 * Selftest, A, B, TestComponent;
+	 * Selftest -> A [label="create, directed to TestComponent"];
+	 * A => TestComponent [label="OpTextMessage(test new channel)"];
+	 * TestComponent -> B [label="create + B->Connect()"];
+	 * B => A [label="OpPeerConnectedMessage"];
+	 * A => B [label="OpTextMessage(deleteChannel)"];
+	 * OP_DELETE(b);
+	 * B => A [label="OpPeerDisconnectedMessage"];
+	 * @endmsc
+	 */
+	class TestDeleteChannel : public TestSendText
+	{
+
+	public:
+		TestDeleteChannel(OpChannel* channel)
+			: TestSendText(channel, UNI_L("test new channel")){}
+
+		virtual OP_STATUS OnMessage(const OpTypedMessage* message)
+		{
+			switch (message->GetType()) {
+			case OpPeerConnectedMessage::Type:
+				return OnPeerConnected(OpPeerConnectedMessage::Cast(message));
+			case OpPeerDisconnectedMessage::Type:
+				return OnPeerDisconnected(OpPeerDisconnectedMessage::Cast(message));
+			default:
+				return TestSendText::OnMessage(message);
+			}
+		}
+
+		/** We expect to receive an OpPeerConnectedMessage when the
+		 * TestComponent has created and connected its channel to this one.
+		 * After sending the text-message "echo" we delete channel B and
+		 * expected OpPeerDisconnectedMessage
+		 */
+		OP_STATUS OnPeerConnected(const OpPeerConnectedMessage* message)
+		{
+			if (VerifyValidMessage(message))
+			{
+				if (m_channel->GetDestination() != message->GetSrc())
+					Fail("Expected to be connected to sender of message");
+				else if (OpStatus::IsError(SendTextMessage(UNI_L("deleteChannel"))))
+					Fail("Could not send 'deleteChannel'");	
+			}
+			return OpStatus::OK;
+		}
+		
+		OP_STATUS OnPeerDisconnected(const OpPeerDisconnectedMessage* message)
+		{
+			if (VerifyValidMessage(message))
+			{
+				if (m_channel->IsDirected())
+					 Fail("On receiving OpPeerDisconnectedMessage, the channel should no longer be directed!");
+				else 
+					 Succeed();	
+			}
+			return OpStatus::OK;
+		}
+	};
+
+	/** This test verifies that deleting the root channel of a component
+	 * disconnects other channels.
+	 *
+	 * The test can be invoked by requesting a new TestComponent and add an
+	 * instance of this listener to the root-channel that was returned by
+	 * RequestComponent().
+	 *
+	 * When the root-channel is connected to the TestComponent:
+	 *
+	 *     Selftest <-- connected --> TestComponent
+	 *
+	 * then the test starts with creating a new directed channel (A), which is
+	 * directed to the test-component.
+	 *
+	 *     Selftest <-- connected --> TestComponent
+	 *            A  -- directed -->
+	 *
+	 * When the channel is created, the listener starts with sending a
+	 * text-message "test new channel" to the TestComponent.
+	 *
+	 * The TestComponent creates a new channel (B) and connects it with A:
+	 *
+	 *     Selftest <-- connected --> TestComponent
+	 *            A <-- connected --> B
+	 *
+	 * Thus an OpPeerConnectedMessage is sent from B to A. On receiving this
+	 * message, the listener deletes the root-channel. Thus the TestComponent is
+	 * expected to be deleted and we expect to receive an
+	 * OpPeerDisconnectedMessage from the channel B.
+	 */
+	class TestDeleteRootChannel : public TestSendText
+	{
+	private:
+		/** The address from which we expect to receive an
+		 * OpPeerDisconnectedMessage. */
+		OpMessageAddress m_expected_disconnect;
+
+		void Disconnect()
+		{
+			if (m_channel)
+			{
+				m_channel->RemoveMessageListener(this);
+				OP_DELETE(m_channel);
+				m_channel = NULL;
+			}
+		}
+
+	public:
+		/**
+		 * @param channel is the root-channel to a TestComponent.
+		 */
+		TestDeleteRootChannel(OpChannel* channel)
+			: TestSendText(channel, NULL) {}
+
+		virtual ~TestDeleteRootChannel()
+		{
+			Disconnect();
+		}
+
+		/** When the TestComponent is connected, we create a new test-channel
+		 * and add this instance as a listener for the new channel. */
+		virtual OP_STATUS OnStartTest()
+		{
+			OpAutoPtr<OpChannel> channel(g_component->CreateChannel(m_channel->GetDestination()));
+			if (channel.get() && OpStatus::IsSuccess(channel->AddMessageListener(this)))
+				return SendTextMessage(channel.release(), UNI_L("test new channel"));
+			else
+				Fail("Could not create additional channel");
+			return OpStatus::OK;
+		}
+
+		virtual OP_STATUS OnMessage(const OpTypedMessage* message)
+		{
+			switch (message->GetType()) {
+			case OpPeerConnectedMessage::Type:
+				return OnPeerConnected(OpPeerConnectedMessage::Cast(message));
+			case OpPeerDisconnectedMessage::Type:
+				return OnPeerDisconnected(OpPeerDisconnectedMessage::Cast(message));
+			default:
+				return TestSendText::OnMessage(message);
+			}
+		}
+
+		/** We expect to receive an OpPeerConnectedMessage when the
+		 * TestComponent has created and connected its channel to this one. */
+		OP_STATUS OnPeerConnected(const OpPeerConnectedMessage* message)
+		{
+			if (VerifyValidMessage(message))
+			{
+				if (message->GetSrc() != m_channel->GetDestination())
+				{
+					/* We expect a disconnect from the same source as we
+					 * received a connect: */
+					m_expected_disconnect = message->GetSrc();
+					/* Delete the root channel: */
+					OP_DELETE(m_channel);
+					m_channel = NULL;
+				}
+			}
+			return OpStatus::OK;
+		}
+
+		/** We expect to receive an OpPeerDisconnectedMessage for the new
+		 * channel after we deleted the root-channel. */
+		OP_STATUS OnPeerDisconnected(const OpPeerDisconnectedMessage* message)
+		{
+			if (VerifyValidMessage(message))
+			{
+				if (message->GetSrc() == m_expected_disconnect)
+					Succeed();
+			}
+			return OpStatus::OK;
+		}
+	};
+	
+	/** This listener is used to test that the TestComponent destroys itself on
+	 * receiving the text-message "die".
+	 *
+	 * The test can be invoked on a channel that is connected to a
+	 * TestComponent.
+	 *
+	 * The test starts with sending a text-message "die" to the TestComponent
+	 * on the associated channel and passes when it receives an
+	 * OpPeerDisconnectedMessage.
+	 * @msc
+	 * Selftest, TestComponent;
+	 * Selftest => TestComponent [label="OpTextMessage(die)"];
+	 * TestComponent => Selftest [label="OpPeerDisconnectedMessage"];
+	 * @endmsc
+	 *
+	 * @note When the test is finished, the TestComponent is no longer running.
+	 */
+	class TestDie : public TestSendText
+	{
+	public:
+		TestDie(OpChannel* channel)
+			: TestSendText(channel, UNI_L("die")) {}
+		virtual ~TestDie() {}
+
+		virtual OP_STATUS OnMessage(const OpTypedMessage* message)
+		{
+			switch (message->GetType()) {
+			case OpPeerDisconnectedMessage::Type:
+				return OnPeerDisconnected(OpPeerDisconnectedMessage::Cast(message));
+			default:
+				return TestSendText::OnMessage(message);
+			}
+		}
+
+		OP_STATUS OnPeerDisconnected(const OpPeerDisconnectedMessage* message)
+		{
+			if (VerifyValidMessage(message))
+				Succeed();
+			return OpStatus::OK;
+		}
+	};
+}
+
+setup
+{
+	component = NULL;
+}
+
+exit
+{
+	OP_DELETE(component);
+}
+
+test("Start component")
+async;
+{
+#define async_verify_success(x) do { if (OpStatus::IsError(x)) ST_failed(#x); } while (0)
+#define async_verify_send(x) do { if (!SendTextMessage(component, x)) ST_failed("Sending text message failed."); } while(0)
+#define async_verify(x) do { if (!(x)) ST_failed(#x); } while (0)
+
+	async_verify_success(g_opera->RequestComponent(&component, COMPONENT_TEST));
+	OpMessageListener* listener = OP_NEW(TestConnect, (component));
+	ST_delete_after_group(listener);
+	async_verify_success(component->AddMessageListener(listener));
+}
+
+test("Communicate with component")
+async;
+require success "Start component";
+{
+	OP_ASSERT(component || !"Test 'Start component' should have passed!");
+	OpMessageListener* listener = OP_NEW(TestEcho, (component));
+	ST_delete_after_group(listener);
+	async_verify_success(component->AddMessageListener(listener));
+}
+
+test("Receive component error codes")
+async;
+require success "Start component";
+{
+	OP_ASSERT(component || !"Test 'Start component' should have passed!");
+	OpMessageListener* listener = OP_NEW(TestErrorCode, (component));
+	ST_delete_after_group(listener);
+	async_verify_success(component->AddMessageListener(listener));
+}
+
+test("New channel")
+async;
+require success "Start component";
+{
+	OP_ASSERT(component || !"Test 'Start component' should have passed!");
+	OpAutoPtr<OpChannel> channel(g_component->CreateChannel(component->GetDestination()));
+	TestNewChannel* listener = OP_NEW(TestNewChannel, (channel.get()));
+	ST_delete_after_group(listener);
+	async_verify_success(channel.release()->AddMessageListener(listener)); 
+	listener->StartTest();
+}
+
+test("Delete channel")
+async;
+require success "Start component";
+{
+	OP_ASSERT(component || !"Test 'Start component' should have passed!");
+	OpAutoPtr<OpChannel> channel(g_component->CreateChannel(component->GetDestination()));
+	TestDeleteChannel* listener = OP_NEW(TestDeleteChannel, (channel.get()));
+	ST_delete_after_group(listener);
+	async_verify_success(channel.release()->AddMessageListener(listener)); 
+	listener->StartTest();
+}
+
+test("Notification of peer's demise")
+async;
+require success "Start component";
+{
+	OP_ASSERT(component || !"Test 'Start component' should have passed!");
+	OpMessageListener* listener = OP_NEW(TestDie, (component));
+	ST_delete_after_group(listener);
+	async_verify_success(component->AddMessageListener(listener)); 
+}
+
+test("Delete a root channel")
+async;
+{
+	OpChannel* root_channel = NULL;
+	async_verify_success(g_opera->RequestComponent(&root_channel, COMPONENT_TEST));
+	OpMessageListener* listener = OP_NEW(TestDeleteRootChannel, (root_channel));
+	ST_delete_after_group(listener);
+	async_verify_success(root_channel->AddMessageListener(listener)); 
+
+#undef async_verify_success
+#undef async_verify_send
+#undef async_verify	
+}

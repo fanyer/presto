@@ -1,0 +1,493 @@
+/* -*- Mode: c++; tab-width: 4; indent-tabs-mode: t; c-basic-offset: 4 -*-
+**
+** Copyright (C) 2004-2006 Opera Software ASA.  All rights reserved.
+**
+** This file is part of the Opera web browser.  It may not be distributed
+** under any circumstances.
+**
+** Yngve N. Pettersen
+*/
+group "cache performance";
+
+disabled;
+
+require init;
+require DYNAMIC_FOLDER_SUPPORT;
+require DISK_CACHE_SUPPORT;
+include "modules/cache/cache_int.h";
+include "modules/cache/simple_stream.h";
+include "modules/cache/cache_common.h";
+include "modules/pi/OpSystemInfo.h";
+
+include "modules/url/url_man.h";
+include "modules/url/url_rep.h";
+include "modules/url/url_ds.h";
+include "modules/cache/url_cs.h";
+include "modules/prefs/prefsmanager/collections/pc_network.h";
+
+include "modules/network_selftest/justload.h";
+include "modules/network_selftest/scanpass.h";
+include "modules/formats/url_dfr.h";
+include "modules/datastream/opdatastreamsafefile.h";
+
+global {
+	URL_DocSelfTest_Manager *url_tests = NULL;
+
+	AutoDeleteHead urls;
+
+	class URL_InUseLink : public URLLink
+	{
+	public:
+		URL_InUse url2;
+
+		URL_InUseLink(URL &a_url) : URLLink(a_url), url2(a_url){}
+	};
+	
+	class WaitURL: public MessageObject
+	{
+	private:
+		OpAutoVector<URL> urls;
+		OpString8 expected;
+		UINT32 loaded;
+		int num_urls;
+		int cur_id;
+		MessageHandler *mh;
+		URL empty_url;
+		URL_LoadPolicy policy;
+		
+		URL CreateURL(UINT32 size)
+		{
+			OpString url_path;
+			
+			url_path.AppendFormat(UNI_L("http://testsuites.oslo.opera.com/core/networking/http/cache/data/cache.php?size=%d&type=text/javascript&id=001-%d"), size, cur_id++);
+			
+			return g_url_api->GetURL (url_path.CStr(), (URL_CONTEXT_ID)0);
+		}
+		
+	public:
+		WaitURL(MessageHandler *mh_obj) { loaded=0; num_urls=0; cur_id=0; mh=mh_obj; }
+		
+		void Reset() { loaded=0; urls.DeleteAll(); }
+		
+		OP_STATUS AddURL(UINT32 size, int num=1, BOOL load=TRUE)
+		{
+			for(int i=0; i<num; i++)
+			{
+				URL u=CreateURL(size);
+				RETURN_IF_ERROR(urls.Add(new URL(u)));
+				
+				if(load && OpStatus::IsError(urls.Get(urls.GetCount()-1)->LoadDocument(mh, empty_url, policy)))
+					ST_failed("Load Url %d failed!", urls.GetCount());
+			}
+			
+			return OpStatus::OK;
+		}
+		
+		OP_STATUS LoadDocuments(UINT16 start=0, UINT16 end=65535)
+		{
+			for(UINT32 i=start; i<end && i<urls.GetCount(); i++)
+				RETURN_IF_ERROR(urls.Get(i)->LoadDocument(mh, empty_url, policy));
+				
+			return OpStatus::OK;
+		}
+		
+		OP_STATUS UpdateFiles(UINT16 start=0, UINT16 end=65535)
+		{
+		
+			for(UINT32 i=start; i<end && i<urls.GetCount(); i++)
+			{
+				if(urls.Get(i)->GetRep() && urls.Get(i)->GetRep()->GetDataStorage())
+				{
+					urls.Get(i)->GetRep()->GetDataStorage()->MoveCacheToOld();
+					RETURN_IF_LEAVE(urls.Get(i)->GetRep()->GetDataStorage()->CreateCacheL());
+				}
+			}
+			
+			return OpStatus::OK;
+		}
+		
+		OP_STATUS SetExpected(char *str) { return expected.Set(str); }
+		virtual void HandleCallback(OpMessage msg, MH_PARAM_1 par1, MH_PARAM_2 par2)
+		{
+			if(msg==MSG_URL_DATA_LOADED)
+			{
+				for(UINT32 i=0; i<urls.GetCount(); i++)
+				{
+					if((UINT32)urls.Get(i)->Id()==(UINT32)par1 && (UINT32)urls.Get(i)->Status(FALSE)==(UINT32)URL_LOADED)
+					{
+						loaded++;
+						break;
+					}
+				}
+				
+				if(loaded>=urls.GetCount())
+					ST_passed();
+				
+				/*BOOL more;
+				OpString str16;
+				OpString8 str8;
+				URL_DataDescriptor *desc=url_load->GetDescriptor(NULL, URL::KFollowRedirect);
+				
+				desc->RetrieveData(more);
+				str16.Set((uni_char *)desc->GetBuffer(), desc->GetBufSize());
+				str8.Set(str16);
+				output("Page string: %s\n", str8.CStr());
+				
+				if(!str8.Compare(expected.CStr()))
+					ST_passed();
+				else
+					ST_failed("Page string wrong!");*/
+			}
+			else if(msg==MSG_URL_LOADING_FAILED)
+			{
+				ST_failed("Failure after %d correct loads.\n", loaded);
+			}
+			else if(msg==MSG_URLMAN_DELETE_SOMEFILES)
+			{
+				FileName_Store files_main(8191);
+		
+				files_main.Construct();
+				
+				Context_Manager::ReadDCacheDir(files_main, OPFILE_CACHE_FOLDER, TRUE, NULL);
+				if(files_main.LinkObjectCount()!=0)
+					ST_failed("Main directory contains %d files instead of %d!", files_main.LinkObjectCount(), 0);
+				
+				ST_passed();
+			}
+		}
+	};
+	
+	#define BENCH_START(NAME)											\
+		double start_time = g_op_time_info->GetWallClockMS(); \
+		int times=0;											\
+		double end_time;										\
+		OpString filename;										\
+		do {													\
+			filename.Empty();									\
+			filename.AppendFormat(UNI_L("%s_%d"), NAME, times++);	\
+
+	#define BENCH_END											\
+			end_time=g_op_time_info->GetWallClockMS();		\
+		}														\
+		while(end_time<start_time+1000 && times<100);							\
+		output("\nNumber of writes: %d - mean time (ms): %d\n", times, (UINT32)((end_time-start_time)/times));
+		
+	WaitURL *wait;
+	MessageHandler *mh;
+	OpFileFolder bench_folder;
+}
+
+setup 
+{
+	url_tests = OP_NEW(URL_DocSelfTest_Manager, ());
+	
+	mh=OP_NEW(MessageHandler, (NULL));
+	wait=OP_NEW(WaitURL, (mh));
+
+	OpMessage messages[]={MSG_URL_DATA_LOADED, MSG_URLMAN_DELETE_SOMEFILES};
+
+	mh->SetCallBackList(wait, 0, messages, 2);
+	g_folder_manager->AddFolder(OPFILE_CACHE_FOLDER, UNI_L("benchmarks"),&bench_folder);
+}
+
+exit
+{
+	OP_DELETE(url_tests);
+	
+	mh->UnsetCallBacks(wait);
+	OP_DELETE(mh);
+	mh=NULL;
+	OP_DELETE(wait);
+	wait=NULL;
+	
+	// Do a shutdown of the pending connections
+	urlManager->FreeUnusedResources(TRUE);
+}
+
+test("Initialized")
+{
+	verify(url_tests != NULL);
+}
+
+subtest AddJustLoadTest(URL_DocSelfTest_Batch *batch, const OpStringC8 &url, URL &ref_url)
+{
+	verify(batch != NULL);
+	verify(url.HasContent());
+
+	OpAutoPtr<JustLoad_Tester> test(OP_NEW(JustLoad_Tester, ()));
+	verify(test.get() != NULL);
+
+	verify(OpStatus::IsSuccess(test->Construct(url, ref_url,FALSE)));
+
+	verify(test->url.GetURL().IsValid());
+
+	URL tmp=test->url.GetURL();
+	URLLink *link_url = OP_NEW(URL_InUseLink, (tmp));
+	verify(link_url != NULL);
+
+	link_url->Into(&urls);
+
+	verify(batch->AddTestCase(test.release()));
+}
+
+subtest AddBatch(URL_DocSelfTest_Batch *batch)
+{
+	verify(batch != NULL);
+	verify(url_tests->AddBatch(batch));
+}
+
+test("Cold index write - datastream 1")
+	require success "Initialized";
+	timer;
+{
+	BENCH_START(UNI_L("index_data_stream_1"))
+		urlManager->TestWriteIndexFileL(filename, bench_folder, FALSE);
+	BENCH_END
+}
+
+test("Cold index write - fast")
+	require success "Initialized";
+	require CACHE_FAST_INDEX;
+	timer;
+{
+	BENCH_START(UNI_L("index_fast_1"))
+		urlManager->TestWriteIndexFileL(filename, bench_folder, TRUE);
+	BENCH_END
+}
+
+test("Cold index write - datastream 2")
+	require success "Initialized";
+	timer;
+{
+	BENCH_START(UNI_L("index_data_stream_2"))
+		urlManager->TestWriteIndexFileL(filename, bench_folder, FALSE);
+	BENCH_END
+}
+
+test("Cold index write - fast 2")
+	require success "Initialized";
+	require CACHE_FAST_INDEX;
+	timer;
+{
+	BENCH_START(UNI_L("index_fast_2"))
+		urlManager->TestWriteIndexFileL(filename, bench_folder, TRUE);
+	BENCH_END
+}
+
+test("Fill the cache - Big Document")
+	require success "Initialized";
+	async;
+{
+	wait->Reset();
+	wait->AddURL(32768, 1000);
+}
+
+test("Corrupted file - cache_entry")
+{
+	OpString filename;
+	OpString last_entry;
+	OpString8 last_entry8;
+	int num_entries;
+	int num_entries_orig;
+	OpFile file;
+	OpFileLength len;
+	
+	filename.Set("corrupted_index");
+	TRAPD(op_err, urlManager->TestWriteIndexFileL(filename, OPFILE_CACHE_FOLDER, TRUE));
+	verify(OpStatus::IsSuccess(op_err));
+	
+	TRAPD(op_err2, urlManager->TestReadIndexFileL(filename, OPFILE_CACHE_FOLDER, num_entries, last_entry));
+	verify(OpStatus::IsSuccess(op_err));
+	verify(OpStatus::IsSuccess(last_entry8.Set(last_entry.CStr())));
+	output("\nLast Entry: %s - num_entries: %d\n", last_entry8.CStr(), num_entries);
+	verify(uni_strcmp(last_entry.CStr(), UNI_L("oprWRONG.tmp")));
+	
+	verify(OpStatus::IsSuccess(file.Construct(filename.CStr(), OPFILE_CACHE_FOLDER)));
+	verify(OpStatus::IsSuccess(file.Open(OPFILE_UPDATE)));
+	verify(OpStatus::IsSuccess(file.GetFileLength(len)));
+	verify(len>8192);
+	verify(num_entries>=1000);
+	
+	num_entries_orig=num_entries;
+	
+	verify(OpStatus::IsSuccess(file.SetFileLength(len-2048)));
+	TRAPD(op_err3, urlManager->TestReadIndexFileL(filename, OPFILE_CACHE_FOLDER, num_entries, last_entry));
+	verify(OpStatus::IsSuccess(op_err));
+	verify(OpStatus::IsSuccess(last_entry8.Set(last_entry.CStr())));
+	output("\nLast Entry: %s - num_entries: %d\n", last_entry8.CStr(), num_entries);
+	verify(num_entries<num_entries_orig && num_entries>0);
+	verify(uni_strcmp(last_entry.CStr(), UNI_L("oprWRONG.tmp")));
+	
+	verify(OpStatus::IsSuccess(file.SetFileLength(len-5432)));
+	TRAPD(op_err4, urlManager->TestReadIndexFileL(filename, OPFILE_CACHE_FOLDER, num_entries, last_entry));
+	verify(OpStatus::IsSuccess(op_err));
+	verify(OpStatus::IsSuccess(last_entry8.Set(last_entry.CStr())));
+	output("\nLast Entry: %s - num_entries: %d\n", last_entry8.CStr(), num_entries);
+	verify(num_entries<num_entries_orig && num_entries>0);
+	verify(uni_strcmp(last_entry.CStr(), UNI_L("oprWRONG.tmp")));
+	
+	verify(OpStatus::IsSuccess(file.SetFileLength(len-8192)));
+	TRAPD(op_err5, urlManager->TestReadIndexFileL(filename, OPFILE_CACHE_FOLDER, num_entries, last_entry));
+	verify(OpStatus::IsSuccess(op_err));
+	verify(OpStatus::IsSuccess(last_entry8.Set(last_entry.CStr())));
+	output("\nLast Entry: %s - num_entries: %d\n", last_entry8.CStr(), num_entries);
+	verify(num_entries<num_entries_orig && num_entries>0);
+	verify(uni_strcmp(last_entry.CStr(), UNI_L("oprWRONG.tmp")));
+}
+
+/*test("Corrupted file - cache_entry")
+{
+	OpString filename_ok;
+	OpString filename_corrupted;
+	OpString last_entry;
+	OpString8 last_entry8;
+	int num_entries;
+	OpFile file_corrupted;
+	OpFile file_ok;
+	
+	filename_ok.Set("not_corrupted_index");
+	filename_corrupted.Set("corrupted_index");
+	TRAPD(op_err, urlManager->TestWriteIndexFileL(filename_ok, OPFILE_CACHE_FOLDER, TRUE));
+	verify(OpStatus::IsSuccess(op_err));
+	
+	TRAPD(op_err2, urlManager->TestReadIndexFileL(filename_ok, OPFILE_CACHE_FOLDER, num_entries, last_entry));
+	verify(OpStatus::IsSuccess(op_err));
+	
+	last_entry8.Set(last_entry);
+	output("\nLast Entry: %s - num_entries: %d", last_entry8.CStr(), num_entries);
+	verify(uni_strcmp(last_entry.CStr(), UNI_L("oprWRONG.tmp")));
+	
+	verify(OpStatus::IsSuccess(file_ok.Construct(filename_ok.CStr(), OPFILE_CACHE_FOLDER)));
+	verify(OpStatus::IsSuccess(file_corrupted.Construct(filename_corrupted.CStr(), OPFILE_CACHE_FOLDER)));
+}*/
+
+test("Big Document index write - datastream big_1")
+	require success "Initialized";
+	timer;
+{
+	BENCH_START(UNI_L("index_data_stream_big_1"))
+		urlManager->TestWriteIndexFileL(filename, bench_folder, FALSE);
+	BENCH_END
+}
+
+test("Big Document index write - fast big_1")
+	require success "Initialized";
+	require CACHE_FAST_INDEX;
+	timer;
+{
+	BENCH_START(UNI_L("index_fast_big_1"))
+		urlManager->TestWriteIndexFileL(filename, bench_folder, TRUE);
+	BENCH_END
+}
+
+test("Big Document index write - datastream big_2")
+	require success "Initialized";
+	timer;
+{
+	BENCH_START(UNI_L("index_data_stream_big_2"))
+		urlManager->TestWriteIndexFileL(filename, bench_folder, FALSE);
+	BENCH_END
+}
+
+test("Big Document index write - fast big_2")
+	require success "Initialized";
+	require CACHE_FAST_INDEX;
+	timer;
+{
+	BENCH_START(UNI_L("index_fast_big_2"))
+		urlManager->TestWriteIndexFileL(filename, bench_folder, TRUE);
+	BENCH_END
+}
+
+test("Fill the cache - Medium Document")
+	require success "Initialized";
+	async;
+{
+	wait->Reset();
+	wait->AddURL(4096, 5000);
+}
+
+test("Medium Document index write - datastream medium_1")
+	require success "Initialized";
+	timer;
+{
+	BENCH_START(UNI_L("index_data_stream_medium_1"))
+		urlManager->TestWriteIndexFileL(filename, bench_folder, FALSE);
+	BENCH_END
+}
+
+test("Medium Document index write - fast medium_1")
+	require success "Initialized";
+	require CACHE_FAST_INDEX;
+	timer;
+{
+	BENCH_START(UNI_L("index_fast_medium_1"))
+		urlManager->TestWriteIndexFileL(filename, bench_folder, TRUE);
+	BENCH_END
+}
+
+test("Medium Document index write - datastream medium_2")
+	require success "Initialized";
+	timer;
+{
+	BENCH_START(UNI_L("index_data_stream_medium_2"))
+		urlManager->TestWriteIndexFileL(filename, bench_folder, FALSE);
+	BENCH_END
+}
+
+test("Medium Document index write - fast medium_2")
+	require success "Initialized";
+	require CACHE_FAST_INDEX;
+	timer;
+{
+	BENCH_START(UNI_L("index_fast_medium_2"))
+		urlManager->TestWriteIndexFileL(filename, bench_folder, TRUE);
+	BENCH_END
+}
+
+
+test("Fill the cache - Small Document")
+	require success "Initialized";
+	async;
+{
+	wait->Reset();
+	wait->AddURL(1024, 5000);
+}
+
+test("Small Document index write - datastream small_1")
+	require success "Initialized";
+	timer;
+{
+	BENCH_START(UNI_L("index_data_stream_small_1"))
+		urlManager->TestWriteIndexFileL(filename, bench_folder, FALSE);
+	BENCH_END
+}
+
+test("Small Document index write - fast small_1")
+	require success "Initialized";
+	require CACHE_FAST_INDEX;
+	timer;
+{
+	BENCH_START(UNI_L("index_fast_small_1"))
+		urlManager->TestWriteIndexFileL(filename, bench_folder, TRUE);
+	BENCH_END
+}
+
+test("Small Document index write - datastream small_2")
+	require success "Initialized";
+	timer;
+{
+	BENCH_START(UNI_L("index_data_stream_small_2"))
+		urlManager->TestWriteIndexFileL(filename, bench_folder, FALSE);
+	BENCH_END
+}
+
+test("Small Document index write - fast small_2")
+	require success "Initialized";
+	require CACHE_FAST_INDEX;
+	timer;
+{
+	BENCH_START(UNI_L("index_fast_small_2"))
+		urlManager->TestWriteIndexFileL(filename, bench_folder, TRUE);
+	BENCH_END
+}

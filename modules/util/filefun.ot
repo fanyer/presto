@@ -1,0 +1,185 @@
+/* -*- Mode: c++; tab-width: 4; indent-tabs-mode: t; c-basic-offset: 4 -*-
+**
+** Copyright (C) 2010 Opera Software AS.  All rights reserved.
+**
+** This file is part of the Opera web browser.  It may not be distributed
+** under any circumstances.
+*/
+
+group "util.filefun";
+require init;
+
+include "modules/util/filefun.h";
+
+global
+{
+	void ConvertPathSeparator(OpString* s)
+	{
+#if PATHSEPCHAR != '/'	// Can't ifdef the whole function - selftest parser limitation
+		for (int i = 0; i < s->Length(); ++i)
+			if ((*s)[i] == '/')
+				(*s)[i] = PATHSEPCHAR;
+#endif
+	}
+}
+
+test("CreateUniqueFilename: filename")
+	file uni test_file_dir "opfile/tests";
+	file uni test_file "opfile/tests/test_file.txt";
+	file uni test_file2 "opfile/tests/test_file2.txt";
+{
+	OpFile temp_file1;
+	verify_success(temp_file1.Construct(test_file));
+	BOOL exists = FALSE;
+	verify_success(temp_file1.Exists(exists));
+	verify(exists);
+
+	OpFile tmp2;
+	verify_success(tmp2.Construct(test_file));
+	verify_success(tmp2.Exists(exists));
+	verify(exists);
+
+	OpString path;
+	verify_success(path.Set(test_file));
+	verify_success(CreateUniqueFilename(path));
+	OpFile tmp3;
+	verify_success(tmp3.Construct(path));
+	verify_success(tmp3.Exists(exists));
+	verify(!exists);
+
+	// Make sure it does not match the names of the original
+	verify(!uni_str_eq(temp_file1.GetName(), tmp3.GetName()));
+	verify(!uni_str_eq(tmp2.GetName(), tmp3.GetName()));
+}
+
+test("CreateUniqueFilename: filename, folder, file_component")
+{
+	OpFile temp_file1;
+	BOOL exists = FALSE;
+
+	// Create a unique name, should not exist, create the file
+	OpString path1;
+	verify_success(CreateUniqueFilename(path1, OPFILE_TEMP_FOLDER, UNI_L("unique.txt")));
+
+	verify_success(temp_file1.Construct(path1));
+	exists = FALSE;
+	verify_success(temp_file1.Exists(exists));
+	verify(!exists);
+	verify_success(temp_file1.Open(OPFILE_WRITE));
+	verify_success(temp_file1.Close());
+
+	// Create a second unique name, should differ from the first
+	OpString path2;
+	verify_success(CreateUniqueFilename(path2, OPFILE_TEMP_FOLDER, UNI_L("unique.txt")));
+
+	OpFile tmp2;
+	verify_success(tmp2.Construct(path2));
+	exists = FALSE;
+	verify_success(tmp2.Exists(exists));
+	verify(!exists);
+
+	verify(!uni_str_eq(temp_file1.GetName(), tmp2.GetName()));
+}
+finally
+{
+	exists = FALSE;
+	RETURN_IF_ERROR(temp_file1.Exists(exists));
+	if (exists)
+		RETURN_IF_ERROR(temp_file1.Delete());
+}
+
+/* Data for GetLastPathSeparator tests, columns:
+   - path string,
+   - length - used to compute the "end" argument as: string + length
+   - expected result position - position of the expected character or -1 for NULL
+   NOTE: for simplicity use '/' in the paths below, they will be converted in the
+   test when necessary.
+   */
+table GetLastPathSeparatorData(const char* , int, int)
+{
+	{ "abc/def",  8,  3 }
+	{ "/abc/def", 9,  4 }
+	{ "/abc/def", 5,  4 }
+	{ "/abc/def", 4,  0 }
+	{ "/abc/",    5,  4 }
+	{ "/abc//",   6,  5 }
+	{ "/",        1,  0 }
+	{ "abc",      3, -1 }
+	{ "",         0, -1 }
+}
+
+foreach (test_path, length, result_position) from GetLastPathSeparatorData
+{
+	test("GetLastPathSeparator: \"" test_path "\"")
+	{
+		const uni_char* path = UNI_L(test_path);
+#if PATHSEPCHAR != '/'
+		OpString converted_path;
+		verify_success(converted_path.Set(path));
+		ConvertPathSeparator(&converted_path);
+		path = converted_path.CStr();
+#endif
+		const uni_char* separator = GetLastPathSeparator(path, path + length);
+		const uni_char* expected_result = (result_position < 0) ? NULL : path + result_position;
+		verify(separator == expected_result);
+	}
+}
+
+
+table touch_files1 filelist "tests/path_tests" recursively;
+
+/* Data for FindRelativPath tests, columns:
+    - full_path
+    - subpath to find
+    - expected result of FindRelativePath(full_path, subpath)
+   NOTE: the files are located in tests/path_tests subfolder of the module,
+   the path is prefixed to the paths in this table.
+   NOTE2: for simplicity use '/' in the paths below, they will be converted in the
+   test when necessary.
+  */
+table FindRelativePathData(const char*, const char*, const char*)
+{
+	{ "/a/file.txt",       "/a/",          "file.txt" }
+	{ "/a/file.txt",       "/b/",          NULL }
+	{ "/a/file.txt",       "/nonexistent", NULL }
+	{ "/a/file.txt",       "/a",           "file.txt" }
+	{ "/a//file.txt",      "/a",           "file.txt" }
+	{ "/a//file.txt",      "/a//",         "file.txt" }
+	{ "/a/../b/file.txt",  "/b",           "file.txt" }
+	{ "/a/file.txt",       "/b/../a",      "file.txt" }
+	{ "/a/file.txt",       "/./a/",        "file.txt" }
+	{ "/a/./file.txt",     "/./a",         "file.txt" }
+	{ "/a/file.txt",       "/",            "a/file.txt" }
+	{ "/a/",               "/a/",          "" }
+	{ "/a/",               "/a",           "" }
+	{ "/a",                "/a/",          "" }
+}
+
+foreach (test_path, test_root, test_expected_result) from FindRelativePathData
+{
+	test("FindRelativePath(\"" test_path "\", \"" test_root "\")")
+		file uni directory "tests/path_tests";
+	{
+		OpString path;
+		OpString root;
+		OpString expected_result;
+		verify_success(path.AppendFormat(UNI_L("%s%s"), directory, UNI_L(test_path)));
+		verify_success(root.AppendFormat(UNI_L("%s%s"), directory, UNI_L(test_root)));
+		verify_success(expected_result.Set((const char*)test_expected_result));
+#if PATHSEPCHAR != '/'
+		ConvertPathSeparator(&path);
+		ConvertPathSeparator(&root);
+		ConvertPathSeparator(&expected_result);
+#endif
+		const uni_char* result = FindRelativePath(path.CStr(), root.CStr());
+
+		if (expected_result.CStr() == NULL)
+			verify(result == NULL);
+		else
+		{
+			verify(result != NULL);
+			verify_string(result, expected_result);
+			verify(result == path.CStr() + (path.Length() - expected_result.Length()));
+		}
+	}
+}

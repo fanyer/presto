@@ -1,0 +1,1 @@
+var result = []; try { var ev = new ProgressEvent("loadend", {cancelable: false, lengthComputable: true, loaded: 3.2, total: 10.7}); result = [ev.type == "loadend", ev.lengthComputable === true, ev.loaded === 3, ev.total === 10, ev.isTrusted === false]; } catch (e) { result = [e.toString()]; } postMessage(result);

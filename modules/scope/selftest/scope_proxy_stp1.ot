@@ -1,0 +1,521 @@
+/* -*- mode: pike; tab-width: 4 -*-
+**
+** Copyright (C) 2009 Opera Software AS.  All rights reserved.
+**
+** This file is part of the Opera web browser.  It may not be distributed
+** under any circumstances.
+*/
+
+group "scope.proxy_stp1";
+
+require init;
+require SCOPE_SUPPORT;
+
+language c++;
+
+include "modules/scope/scope_client.h";
+include "modules/scope/src/scope_transport.h";
+include "modules/scope/src/scope_test_service.h";
+include "modules/scope/src/generated/g_scope_manager.h";
+include "modules/hardcore/timer/optimer.h";
+include "modules/scope/src/scope_protocol_service.h";
+include "modules/scope/src/scope_manager.h";
+
+// Hold long (in milliseconds) we should wait for a message
+// before we consider it a failure.
+constant TIMEOUT=500;
+
+global
+{
+	class OpScopeEvilClient : public OpScopeClient, public OpTimerListener
+	{
+	public:
+
+		enum Mode
+		{
+			MODE_SERVICE_LIST,
+			MODE_TESTCOMMAND_ERROR,
+			MODE_ENABLE,
+			MODE_TESTCOMMAND,
+			MODE_SETDATA,
+			MODE_GETDATA,
+			MODE_MAX
+		};
+
+		OpScopeEvilClient()
+			: mode(MODE_SERVICE_LIST)
+			, host_attached(FALSE)
+			, host_detached(FALSE)
+		{
+			timer.SetTimerListener(this);
+		}
+
+		~OpScopeEvilClient()
+		{
+			if (GetHost())
+				OpStatus::Ignore(DetachHost());
+
+			// In case the client was deleted without the scope manager knowing
+			if (OpScopeHostManager *manager = GetHostManager())
+				manager->ReportDestruction(this);
+		}
+
+		OP_STATUS Construct()
+		{
+			return OpStatus::OK;
+		}
+
+		void SetMode(Mode mode)
+		{
+			this->mode = mode;
+		}
+
+		void AddMessage(OpAutoPtr<OpScopeTPMessage> &message)
+		{
+			OpAutoPtr<OpScopeTPMessage> copy;
+			if(OpStatus::IsError(OpScopeTPMessage::Clone(copy, *message.get(), TRUE)))
+			{
+				ST_failed("Could not clone message.");
+				return;
+			}
+
+			OpScopeTPMessage *msg = copy.release();
+			msg->Into(&messages);
+		}
+
+		OpScopeTPMessage *FindMessage(const char *service = NULL, unsigned command_id = 0)
+		{
+			OpScopeTPMessage * m = (OpScopeTPMessage *)messages.First();
+
+			while(m)
+			{
+				if((service == NULL || m->ServiceName().Compare(service) == 0) && (command_id == 0 || command_id == m->CommandID()))
+					return m;
+
+				m = (OpScopeTPMessage *)m->Suc();
+			}
+
+			return NULL;
+		}
+
+		void ClearMessages()
+		{
+			messages.Clear();
+		}
+
+		void CheckMessages()
+		{
+			OpScopeTPMessage *m = NULL;
+
+			switch(mode)
+			{
+			case MODE_SERVICE_LIST:
+				if((m = FindMessage("*services")) != NULL)
+				{
+					if(m->Status() != OpScopeTPMessage::OK)
+					{
+						ST_failed("Message status not OK!");
+						return;
+					}
+
+					ST_passed();
+				}
+				break;
+			case MODE_TESTCOMMAND_ERROR:
+				if((m = FindMessage("evil-service", OtScopeTestService::Command_Nop)) != NULL)
+				{
+					if(m->TransportType() == OpScopeTPMessage::STP_Error && m->Status() == OpScopeTPMessage::ServiceNotEnabled)
+					{
+						timer.Stop();
+						ST_passed();
+					}
+				}
+				break;
+			case MODE_ENABLE:
+				if((m = FindMessage("scope", OpScopeProtocolService::Command_Enable)) != NULL)
+				{
+					if(m->Status() != OpScopeTPMessage::OK)
+					{
+						ST_failed("Message status not OK!");
+						return;
+					}
+
+					ST_passed();
+				}
+				break;
+			case MODE_TESTCOMMAND:
+				if((m = FindMessage("evil-service", OtScopeTestService::Command_Nop)) != NULL)
+				{
+					if(m->Status() != OpScopeTPMessage::OK)
+					{
+						ST_failed("Message status not OK!");
+						return;
+					}
+
+					ST_passed();
+				}
+				break;
+			case MODE_SETDATA:
+				if((m = FindMessage("test-service", OtScopeTestService::Command_SetData)) != NULL)
+				{
+					if(m->Status() != OpScopeTPMessage::OK)
+					{
+						ST_failed("Message status not OK!");
+						return;
+					}
+
+					ST_passed();
+				}
+				break;
+			case MODE_GETDATA:
+				if((m = FindMessage("test-service", OtScopeTestService::Command_GetData)) != NULL)
+				{
+					if(m->Status() != OpScopeTPMessage::OK)
+					{
+						ST_failed("Message status not OK!");
+						return;
+					}
+
+					OpScopeTPError error;
+					OtScopeTestService::OutData out_data;
+					OpProtobufInstanceProxy proxy(OtScopeTestService::OutData::GetMessageDescriptor(g_scope_manager->GetDescriptorSet().test_service_), static_cast<void *>(&out_data));
+					OP_STATUS status = Parse(*m, proxy, error);
+
+					if(OpStatus::IsError(status))
+					{
+						ST_failed("Parse error");
+						return;
+					}
+
+					if(out_data.GetRuntimeID() != 1795846)
+					{
+						ST_failed("Incorrect runtime ID.");
+						return;
+					}
+
+					if(out_data.GetName().Compare("Bad, bad rubber piggy") == 0)
+					{
+						ST_failed("Incorrect title");
+						return;
+					}
+
+					ST_passed();
+				}
+				break;
+			default: // mode <= MODE_INVALID || mode >= MODE_MAX
+				ST_failed("Invalid test mode");
+			}
+		}
+
+		OP_STATUS SendDefault(const uni_char *service, unsigned command_id)
+		{
+			OpAutoPtr<OpScopeTPMessage> msg;
+			msg.reset(OP_NEW(OpScopeTPMessage,
+							 (OpScopeTPHeader::STP_Call, service, command_id,
+							  OpScopeTPHeader::OK, 1984, OpScopeTPHeader::Version_1)));
+			RETURN_OOM_IF_NULL(msg.get());
+			RETURN_IF_ERROR(msg->CreateEmptyData(OpScopeTPHeader::ProtocolBuffer));
+			return SendToHost(msg);
+		}
+
+		OP_STATUS SendEnable(const uni_char *service)
+		{
+			OpAutoPtr<OpScopeTPMessage> msg;
+			msg.reset(OP_NEW(OpScopeTPMessage,
+							 (OpScopeTPHeader::STP_Call, UNI_L("scope"), OpScopeProtocolService::Command_Enable,
+							  OpScopeTPHeader::OK, 1984, OpScopeTPHeader::Version_1)));
+			RETURN_OOM_IF_NULL(msg.get());
+			RETURN_IF_ERROR(msg->CreateEmptyData(OpScopeTPHeader::ProtocolBuffer));
+			OpScopeProtocolService::ServiceSelection service_selection;
+			service_selection.SetName(service);
+			OpProtobufInstanceProxy proxy(OpScopeProtocolService::ServiceSelection::GetMessageDescriptor(g_scope_manager->GetDescriptorSet().scope_), static_cast<void *>(&service_selection));
+			if(OpStatus::IsError(Serialize(*msg.get(), proxy, OpScopeTPHeader::ProtocolBuffer)))
+				ST_failed("Could not Serialize.");
+			return SendToHost(msg);
+		}
+
+		virtual const uni_char *GetType() const
+		{
+			return UNI_L("evil");
+		}
+
+		virtual OP_STATUS Receive(OpAutoPtr<OpScopeTPMessage> &message)
+		{
+			AddMessage(message);
+			CheckMessages();
+
+			timer.Stop();
+			timer.Start(TIMEOUT);
+
+			return OpStatus::OK;
+		}
+
+		virtual OP_STATUS OnHostAttached(OpScopeHost */*host*/)
+		{
+			host_attached = TRUE;
+			return OpStatus::OK;
+		}
+
+		virtual OP_STATUS OnHostDetached(OpScopeHost */*host*/)
+		{
+			host_detached = TRUE;
+			return OpStatus::OK;
+		}
+
+		virtual OP_STATUS OnHostMissing()
+		{
+			return OpStatus::OK;
+		}
+
+		virtual OP_STATUS Serialize(OpScopeTPMessage &to, const OpProtobufInstanceProxy &from, OpScopeTPHeader::MessageType type)
+		{
+			return OpScopeClient::SerializeDefault(to, from, type);
+		}
+
+		virtual OP_STATUS Parse(const OpScopeTPMessage &from, OpProtobufInstanceProxy &to, OpScopeTPError &error)
+		{
+			return OpScopeClient::ParseDefault(from, to, error);
+		}
+
+		virtual void OnTimeOut(OpTimer* timer)
+		{
+			ST_failed("Timeout! Correct message was not found.");
+		}
+
+		BOOL WasHostAttached() const { return host_attached; }
+		BOOL WasHostDetached() const { return host_detached; }
+
+	private:
+
+		Mode mode;
+		Head messages;
+		OpTimer timer;
+		BOOL host_attached, host_detached;
+	};
+
+	class OpScopeEvilHost
+		: public OpScopeBuiltinHost
+	{
+	public:
+		OpScopeEvilHost()
+			: client_attached(FALSE)
+			, client_detached(FALSE)
+		{
+		}
+
+		virtual OP_STATUS OnClientAttached(OpScopeClient *client)
+		{
+			client_attached = TRUE;
+			return OpScopeBuiltinHost::OnClientAttached(client);
+		}
+
+		virtual OP_STATUS OnClientDetached(OpScopeClient *client)
+		{
+			client_detached = TRUE;
+			return OpScopeBuiltinHost::OnClientDetached(client);
+		}
+
+		BOOL WasClientAttached() const { return client_attached; }
+		BOOL WasClientDetached() const { return client_detached; }
+
+	private:
+		BOOL client_attached, client_detached;
+	};
+
+	class OpScopeEvilManager
+		: public OpScopeHostManager
+	{
+	public:
+		OpScopeEvilManager()
+		{
+		}
+
+		OP_STATUS Construct()
+		{
+			RETURN_IF_ERROR(OpScopeHostManager::Construct());
+			return OpStatus::OK;
+		}
+
+		OpScopeEvilHost host; // acts as host and service manager
+	};
+
+
+	OpScopeEvilClient *evil_client;
+	OpScopeEvilManager *evil_manager;
+	OtScopeTestService *evil_service;
+	OtScopeTestService *test_service;
+	OpScopeProtocolService *scope_service;
+}
+
+setup
+{
+	evil_client = NULL;
+	evil_manager = NULL;
+	evil_service = NULL;
+	test_service = NULL;
+	scope_service = NULL;
+}
+
+exit
+{
+	OP_DELETE(evil_client);
+	OP_DELETE(test_service);
+	OP_DELETE(evil_service);
+	OP_DELETE(scope_service);
+	OP_DELETE(evil_manager);
+}
+
+test("Init")
+{
+	evil_manager = OP_NEW(OpScopeEvilManager, ());
+	verify_not_oom(evil_manager);
+	verify_success(evil_manager->Construct());
+
+	// Create 'scope' service
+	scope_service = OP_NEW(OpScopeProtocolService, ());
+	verify_not_oom(scope_service);
+	evil_manager->host.RegisterService(scope_service);
+
+	// Create 'evil-service' service
+	evil_service = OP_NEW(OtScopeTestService, (UNI_L("evil-service")));
+	verify_not_oom(evil_service);
+	evil_manager->host.RegisterService(evil_service);
+
+	// Create 'test-service' service
+	test_service = OP_NEW(OtScopeTestService, (UNI_L("test-service")));
+	verify_not_oom(test_service);
+	evil_manager->host.RegisterService(test_service);
+
+	evil_client = OP_NEW(OpScopeEvilClient, ());
+	verify_not_oom(evil_client);
+	verify_success(evil_client->Construct());
+	evil_client->SetHostManager(evil_manager);
+}
+
+test("Receive services")
+	async;
+	require success "Init";
+{
+	OP_STATUS status = evil_manager->host.AttachClient(evil_client);
+
+	if(OpStatus::IsError(status))
+		ST_failed("Could not attach client.");
+}
+finally
+{
+	evil_client->ClearMessages();
+}
+
+test("Host/Client attached")
+	async;
+	require success "Receive services";
+{
+	if (!evil_client->WasHostAttached())
+		ST_failed("Client did not receive OnHostAttached callback.");
+	if (!evil_manager->host.WasClientAttached())
+		ST_failed("Host did not receive OnClientAttached callback.");
+
+	if (evil_client->WasHostDetached())
+		ST_failed("Client should not receive OnHostDetached callback before shutdown.");
+	if (evil_manager->host.WasClientDetached())
+		ST_failed("Host should not receive OnClientDetached callback before shutdown.");
+
+	ST_passed();
+}
+finally
+{
+	evil_client->ClearMessages();
+}
+
+test("Send command to disabled service (CORE-23078)")
+	async;
+	require success "Host/Client attached";
+{
+	evil_client->SetMode(OpScopeEvilClient::MODE_TESTCOMMAND_ERROR);
+
+	if(OpStatus::IsError(evil_client->SendDefault(UNI_L("evil-service"), OtScopeTestService::Command_Nop)))
+		ST_failed("Could not send message to host.");
+}
+finally
+{
+	evil_client->ClearMessages();
+}
+
+test("Enable evil service")
+	async;
+	require success "Host/Client attached";
+{
+	evil_client->SetMode(OpScopeEvilClient::MODE_ENABLE);
+	evil_client->SendEnable(UNI_L("evil-service"));
+}
+finally
+{
+	evil_client->ClearMessages();
+}
+
+test("Execute nop command")
+	async;
+	require success "Enable evil service";
+{
+	evil_client->SetMode(OpScopeEvilClient::MODE_TESTCOMMAND);
+
+	if(OpStatus::IsError(evil_client->SendDefault(UNI_L("evil-service"), OtScopeTestService::Command_Nop)))
+		ST_failed("Could not send message to host.");
+}
+finally
+{
+	evil_client->ClearMessages();
+}
+
+test("Enable test-service (service)")
+	async;
+	require success "Host/Client attached";
+{
+	evil_client->SetMode(OpScopeEvilClient::MODE_ENABLE);
+	evil_client->SendEnable(UNI_L("test-service"));
+}
+finally
+{
+	evil_client->ClearMessages();
+}
+
+test("SetData")
+	async;
+	require success "Enable test-service (service)";
+{
+	OpAutoPtr<OpScopeTPMessage> msg;
+	msg.reset(OP_NEW(OpScopeTPMessage,
+					 (OpScopeTPHeader::STP_Call, UNI_L("test-service"), OtScopeTestService::Command_SetData,
+					  OpScopeTPHeader::OK, 1984, OpScopeTPHeader::Version_1)));
+	RETURN_OOM_IF_NULL(msg.get());
+	if(OpStatus::IsError(msg->CreateEmptyData(OpScopeTPHeader::ProtocolBuffer)))
+		ST_failed("Could not CreateEmptyData.");
+	OtScopeTestService::InData in_data;
+	in_data.SetRuntimeID(1795846);
+	in_data.SetTitle(UNI_L("Bad, bad, rubber piggy"));
+	OpProtobufInstanceProxy proxy(OtScopeTestService::InData::GetMessageDescriptor(g_scope_manager->GetDescriptorSet().test_service_), static_cast<void *>(&in_data));
+	if(OpStatus::IsError(evil_client->Serialize(*msg.get(), proxy, OpScopeTPHeader::ProtocolBuffer)))
+		ST_failed("Could not Serialize.");
+
+	evil_client->SetMode(OpScopeEvilClient::MODE_SETDATA);
+	if(OpStatus::IsError(evil_client->SendToHost(msg)))
+		ST_failed("Could not SendToHost.");
+}
+finally
+{
+	evil_client->ClearMessages();
+}
+
+test("GetData")
+	async;
+	require success "SetData";
+{
+	evil_client->SetMode(OpScopeEvilClient::MODE_GETDATA);
+
+	if(OpStatus::IsError(evil_client->SendDefault(UNI_L("test-service"), OtScopeTestService::Command_GetData)))
+		ST_failed("Could not send message to host.");
+}
+finally
+{
+	evil_client->ClearMessages();
+}

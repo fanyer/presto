@@ -1,0 +1,501 @@
+/* -*- Mode: c++; tab-width: 4; indent-tabs-mode: t; c-basic-offset: 4 -*- */
+
+group "webp.decode";
+
+require WEBP_SUPPORT;
+require undefined ASYNC_IMAGE_DECODERS;
+
+include "modules/doc/frm_doc.h";
+include "modules/hardcore/timer/optimer.h";
+include "modules/img/decoderfactorypng.h";
+include "modules/pi/OpBitmap.h";
+include "modules/util/opfile/opfile.h";
+include "modules/webp/webp.h";
+include "modules/windowcommander/src/WindowCommander.h";
+
+global
+{
+	OP_STATUS get_file_data(const UINT8*& data, INT32& len, const char* path)
+	{
+		OpString path_u16;
+		RETURN_IF_ERROR(path_u16.Set(path));
+
+		OpFile file;
+		RETURN_IF_ERROR(file.Construct(path_u16.CStr()));
+
+		OpFileLength length;
+		RETURN_IF_ERROR(file.GetFileLength(length));
+		if (length > INT_MAX)
+			return OpStatus::ERR;
+		OpAutoArray<UINT8> _data(OP_NEWA(UINT8, static_cast<size_t>(length)));
+		if (!_data.get())
+			return OpStatus::ERR_NO_MEMORY;
+
+		RETURN_IF_ERROR(file.Open(OPFILE_READ));
+		OpFileLength read;
+		RETURN_IF_ERROR(file.Read(_data.get(), length, &read));
+		if (read != length)
+			return OpStatus::ERR;
+		data = _data.release();
+		len = static_cast<INT32>(length);
+		return OpStatus::OK;
+	}
+
+	class TestImageDecoderListener : public ImageDecoderListener
+	{
+	public:
+		TestImageDecoderListener() : m_status(OpStatus::OK), m_bitmap(0), m_decoding_finished(FALSE) {}
+		~TestImageDecoderListener() { Reset(); }
+
+		void Reset()
+		{
+			m_status = OpStatus::OK;
+			OP_DELETE(m_bitmap);
+			m_bitmap = 0;
+			m_decoding_finished = FALSE;
+		}
+
+		virtual void OnLineDecoded(void* data, INT32 line, INT32 lineHeight)
+		{
+			RETURN_VOID_IF_ERROR(m_status);
+			m_status = m_bitmap->AddLine(data, line);
+		}
+
+		virtual BOOL OnInitMainFrame(INT32 width, INT32 height)
+		{
+			OP_ASSERT(!m_bitmap);
+			m_status = OpBitmap::Create(&m_bitmap, static_cast<UINT32>(width), static_cast<UINT32>(height));
+			return TRUE;
+		}
+
+		virtual void OnNewFrame(const ImageFrameData& image_frame_data) {}
+		virtual void OnAnimationInfo(INT32 nrOfRepeats) {}
+		virtual void OnDecodingFinished()
+		{
+			if (OpStatus::IsSuccess(m_status))
+				m_decoding_finished = TRUE;
+		}
+
+		virtual void ReportFailure(OP_STATUS reason) { m_status = reason; }
+
+#ifdef IMAGE_METADATA_SUPPORT
+		virtual void OnMetaData(ImageMetaData id, const char* data) {}
+#endif // IMAGE_METADATA_SUPPORT
+#ifdef EMBEDDED_ICC_SUPPORT
+		virtual void OnICCProfileData(const UINT8* data, unsigned datalen) {}
+#endif // EMBEDDED_ICC_SUPPORT
+
+		OP_STATUS m_status;
+		OpBitmap* m_bitmap;
+		BOOL m_decoding_finished;
+	};
+
+	/*
+	  helper class for asynchronous WebP decoding - reports success if decoding
+	  status matches expected_status, failure if not or on timeout.
+	 */
+	class TestWebPDecoderListener : public OpTimerListener
+	{
+	public:
+		TestWebPDecoderListener(TestImageDecoderListener* listener, OP_STATUS expected_status = OpStatus::OK)
+			: m_times(40), m_timeout(250)
+			, m_listener(listener)
+			, m_expected_status(expected_status)
+		{
+			m_timer.SetTimerListener(this);
+		}
+
+		void Load(const UCHAR* data, INT32 len)
+		{
+			// decode file into bitmap
+			int resend = 0;
+			m_decoder.SetImageDecoderListener(m_listener);
+			const OP_STATUS status = m_decoder.Decode(data, len, FALSE, resend);
+
+			// Done decoding?
+			if (m_listener->m_decoding_finished ||
+			    OpStatus::IsError(status))
+			{
+				CompareStatusToExpected(status);
+				OP_DELETE(this);
+				return;
+			}
+
+			if (resend)
+			{
+				ST_failed("resending of data requested");
+				OP_DELETE(this);
+				return;
+			}
+
+			m_timer.Start(m_timeout);
+		}
+
+		void OnTimeOut(OpTimer* timer)
+		{
+			// Done decoding?
+			if (m_listener->m_decoding_finished ||
+			    OpStatus::IsError(m_listener->m_status))
+			{
+				CompareStatusToExpected(m_listener->m_status);
+				OP_DELETE(this);
+				return;
+			}
+
+			if (-- m_times < 0)
+			{
+				OP_DELETE(this);
+				ST_failed("timeout");
+			}
+			else
+			{
+				m_timer.Start(m_timeout);
+			}
+		}
+
+	private:
+
+		void CompareStatusToExpected(OP_STATUS status)
+		{
+			if (status == m_expected_status)
+				ST_passed();
+			else
+				ST_failed("status mismatch");
+		}
+
+		WebPDecoder m_decoder;
+		OpTimer m_timer;
+		int m_times;
+		const int m_timeout;
+		TestImageDecoderListener* m_listener;
+		const OP_STATUS m_expected_status;
+	};
+
+	void WaitForDecoding(TestImageDecoderListener* listener, const UCHAR* data, INT32 len, OP_STATUS expected_status = OpStatus::OK)
+	{
+		TestWebPDecoderListener* l = OP_NEW(TestWebPDecoderListener, (listener, expected_status));
+		if (!l)
+			ST_failed("OOM");
+		l->Load(data, len);
+	}
+
+	/*
+	  these vars are used in the foreach (webp_file) set
+	 */
+	TestImageDecoderListener st_listener;
+	const UCHAR* st_file_data; // handle to WebP data
+	INT32 st_file_len;         // length of WebP data
+	BOOL st_should_fail;       // if TRUE, consecutive tests are expected to fail
+	UINT32 st_peek_width;      // width  from WebPDecoder::Peek
+	UINT32 st_peek_height;     // height from WebPDecoder::Peek
+}
+
+
+subtest Compare(const char* webp_file, TestImageDecoderListener& listener)
+{
+	// create path to reference image
+	OpString8 ref;
+	verify(OpStatus::IsSuccess(ref.Set(webp_file, op_strlen(webp_file) - op_strlen(".webp"))));
+	verify(OpStatus::IsSuccess(ref.Append(".png")));
+
+	// compare to reference image - the png:s are generated from
+	// the webp:s, so they should be identical
+	const unsigned int max_error = 0;
+	const unsigned int max_psnr  = 0;
+	OP_STATUS status = DecoderFactoryPng::selftest_verify(ref.CStr(), listener.m_bitmap, listener.m_bitmap->Height(), max_error, max_psnr);
+
+	// on failure, output actual decoded data as png
+	if (OpStatus::IsError(status))
+	{
+		OpString8 failed;
+		verify(OpStatus::IsSuccess(failed.Set(webp_file, op_strlen(webp_file) - op_strlen(".webp"))));
+		verify(OpStatus::IsSuccess(failed.Append("_failed.png")));
+		DecoderFactoryPng::selftest_verify(failed.CStr(), listener.m_bitmap, listener.m_bitmap->Height(), max_error, max_psnr, TRUE);
+	}
+
+	verify(OpStatus::IsSuccess(status));
+}
+
+
+/**
+   there's a bit of info passed with the file names here. in order to keep all
+   tests passing even when using broken input, differet behavior is triggered
+   if any of the following is part of the name:
+
+   * BogusData - file is successfully decoded, but output bitmap is wrong
+
+   * DecodeFails - WebPDecoder::Decode fails
+
+   * PeekFails - WebPDecoder::Peek fails (which in turn means that
+     WebPDecoder::Decode fails)
+
+   for these images, bitmap comparison is skipped (dimensions are still checked
+   unless peek failed), and the pass condition of relevant tests are changed to
+   reflect the expected failures.
+
+   the rand_*.webp images were constructed by creating a WebP header and
+   putting purely random data in the VP8 chunk.
+
+   the fuzz_*.webp images were fuzzed using zzuf. the number corresponds to the
+   fuzz ratio used. in order to maintain the integrity of the header, the first
+   30 bytes have been left untouched.
+ */
+table webp_files(const char *) filelist "images" name "*.webp";
+table ref_files (const char *) filelist "images" name "*.png";
+
+foreach (webp_file) from webp_files
+{
+	// load webp_file into memory
+	test("$(webp_file) - get_file_data")
+	{
+		st_listener.Reset();
+		st_file_data = 0;
+		st_should_fail = FALSE;
+		st_peek_width = 0;
+		st_peek_height = 0;
+		RETURN_IF_ERROR(get_file_data(st_file_data, st_file_len, webp_file));
+	}
+
+	// test that Check works
+	test("$(webp_file) - Check")
+		require success "$(webp_file) - get_file_data";
+	{
+		// test that Check works
+		verify(WebPDecoder::Check(st_file_data, st_file_len) == YES);
+	}
+
+	// test that Peek works
+	test("$(webp_file) - Peek")
+		require success "$(webp_file) - get_file_data";
+	{
+		st_should_fail = op_strstr(webp_file, "PeekFails") != 0;
+		INT32 width, height;
+		const BOOL3 res = WebPDecoder::Peek(st_file_data, st_file_len, width, height);
+		if (st_should_fail)
+		{
+			verify(res == NO);
+		}
+		else
+		{
+			verify(res == YES);
+			verify(width  > 0);
+			verify(height > 0);
+			st_peek_width  = (UINT32)width;
+			st_peek_height = (UINT32)height;
+		}
+	}
+
+	// asynchronously decode webp_file
+	test("$(webp_file) - decode")
+		require success "$(webp_file) - Peek";
+		async;
+	{
+		OP_STATUS expected = OpStatus::OK;
+		if (!st_should_fail)
+			st_should_fail = op_strstr(webp_file, "DecodeFails") != 0;
+		if (st_should_fail)
+			expected = OpStatus::ERR;
+		WaitForDecoding(&st_listener, st_file_data, st_file_len, expected);
+	}
+
+	// check sanity of decoded file
+	test("$(webp_file) - compare")
+		require success "$(webp_file) - decode";
+	{
+		// if peek fails no bitmap is created (and we don't have
+		// anything to compare to anyways)
+		if (!op_strstr(webp_file, "PeekFails"))
+		{
+			verify(st_peek_width  == st_listener.m_bitmap->Width());
+			verify(st_peek_height == st_listener.m_bitmap->Height());
+		}
+
+		if (!st_should_fail)
+			st_should_fail = op_strstr(webp_file, "BogusData") != 0;
+		if (!st_should_fail)
+		{
+			verify(Compare(webp_file, st_listener));
+		}
+	}
+
+	test("$(webp_file) - cleanup")
+	{
+		OP_DELETEA(st_file_data);
+		st_file_data = 0;
+	}
+}
+
+test("decode while flagging for more data")
+	file		webp_file		"images/cliff.webp";
+{
+	const UCHAR* file_data; // handle to WebP data
+	INT32 file_len;         // length of WebP data
+	verify(OpStatus::IsSuccess(get_file_data(file_data, file_len, webp_file)));
+
+	// decode file into bitmap
+	int resend = 0;
+	WebPDecoder decoder;
+
+	TestImageDecoderListener listener;
+	decoder.SetImageDecoderListener(&listener);
+
+	verify(OpStatus::IsSuccess(decoder.Decode(file_data, file_len, TRUE, resend)));
+	verify(!resend);
+
+	// compare result.
+	verify(Compare(webp_file, listener));
+}
+finally
+{
+	OP_DELETEA(file_data);
+}
+
+table test_headers(const char*, int, BOOL3)
+{
+    { "",                  0, MAYBE }
+
+    { "R",                 1, MAYBE }
+    { "S",                 1, NO    }
+
+    { "RIFF",              4, MAYBE }
+    { "RAFF",              4, NO    }
+
+    { "RIFFxxxxWEBP",     12, MAYBE }
+    { "RIFFxxxxWEPP",     12, NO    }
+    { "RIFFxxxxWEBM",     12, NO    }
+    { "RAFFxxxxWEBP",     12, NO    }
+
+    { "RIFFxxxxWEBPV",    13, MAYBE }
+    { "RIFFxxxxWEBPW",    13, NO    }
+
+    { "RIFFxxxxWEBPVP",   14, YES   }
+    { "RIFFxxxxWEBPVQ",   14, NO    }
+
+    { "RIFFxxxxWEBPVP8",  15, YES   }
+    { "RIFFxxxxWEBPVP9",  15, YES   }
+
+    { "RIFFxxxxWEBPVP8 ", 16, YES   }
+    { "RIFFxxxxWEBMVP8 ", 16, NO    }
+    { "RIFFxxxxWEBPVP8X", 16, YES   }
+    { "RAFFxxxxWEBPVP8 ", 16, NO    }
+}
+test("WebPData '$(header)'")
+multi test_headers(header, length, response);
+{
+    verify(WebPDecoder::Check(reinterpret_cast<const unsigned char*>(header), length) == response);
+}
+test("WebPData NULL")
+{
+    verify(WebPDecoder::Check(0, 0) == MAYBE);
+}
+
+// test that onerror triggers when decoding
+test("onerror - load dummy page")
+file uni empty "empty.html";
+{
+	state.doc->GetWindow()->GetWindowCommander()->OpenURL(empty, TRUE);
+}
+test("onerror - pass filename")
+require success("onerror - load dummy page");
+file uni image "images/huge_DecodeFails.webp";
+{
+	// stupid: communicate actual path to image file
+	HTML_Element* body = find_element("body");
+	verify(body);
+	HLDocProfile* hld = state.doc->GetHLDocProfile();
+	HTML_Element* txt;
+	verify(OpStatus::IsSuccess(hld->InsertText(body, image, uni_strlen(image), FALSE, FALSE, FALSE, txt)));
+}
+test("onerror - with appendChild")
+require success "onerror - pass filename";
+language ecmascript;
+async;
+{
+	function onImgLoaded() {
+		throw "image loading should fail";
+	}
+	function onImgFailed() {
+		ST_passed();
+	}
+	function onTimeout() {
+		throw "timeout";
+	}
+
+	var image = document.getElementsByTagName('body')[0].innerHTML;
+	var i = document.createElement('img');
+	i.src = image;
+	i.onload  = onImgLoaded;
+	i.onerror = onImgFailed;
+	document.body.appendChild(i);
+	setTimeout(onTimeout, 30000);
+}
+test("onerror - without appendChild")
+require success "onerror - pass filename";
+language ecmascript;
+async;
+{
+	function onImgLoaded() {
+		throw "image loading should fail";
+	}
+	function onImgFailed() {
+		ST_passed();
+	}
+	function onTimeout() {
+		throw "timeout";
+	}
+
+	// remove old image
+	var i = document.getElementsByTagName('img')[0];
+	if (i)
+		i.parentNode.removeChild(i);
+
+	var image = document.getElementsByTagName('body')[0].innerHTML;
+	i = document.createElement('img');
+	i.onload  = onImgLoaded;
+	i.onerror = onImgFailed;
+	i.src = image;
+	setTimeout(onTimeout, 30000);
+}
+
+html {
+	//! <!doctype html>
+	//! <img>
+}
+
+test("CORE-49099 leak.html")
+language ecmascript;
+async;
+{
+	var timeout;
+	var img = document.querySelector("img");
+	img.onload = function() {
+		throw "Image loading should fail";
+	};
+	img.onerror = function() {
+		clearTimeout(timeout);
+		ST_passed();
+	};
+	img.src = "data:image/webp;base64,UklGRngAAABXRUJQVlA4WAoAAAAQAAAA8AAAAQAAQUxQSP////8AQUFBAAAAAFZQOCAgAAAAEAIAnQEq8AABAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==";
+	timeout = setTimeout(function() {
+		throw "Test timed out";
+	}, 30000);
+}
+
+test("CORE-49099 loop.html")
+language ecmascript;
+async;
+{
+	var timeout;
+	var img = document.querySelector("img");
+	img.onload = function() {
+		throw "Image loading should fail";
+	};
+	img.onerror = function() {
+		clearTimeout(timeout);
+		ST_passed();
+	};
+	img.src = "data:image/webp;base64,UklGRlgAAABXRUJQVlA4WAoAAAAQAAAAAQAAAQAAQUxQSPf///9WUDggIAAAABACAJ0BKgEAAQAAAAAA";
+	timeout = setTimeout(function() {
+		throw "Test timed out";
+	}, 30000);
+}

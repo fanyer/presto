@@ -1,0 +1,470 @@
+/* -*- mode: pike; tab-width: 4 -*-
+**
+** Copyright (C) 2009-2012 Opera Software AS.  All rights reserved.
+**
+** This file is part of the Opera web browser.  It may not be distributed
+** under any circumstances.
+**
+** Test for json utils.
+**
+** Jan Borsodi
+*/
+
+group "protobuf.json";
+
+require init;
+require PROTOBUF_JSON_SUPPORT;
+
+language c++;
+
+include "modules/protobuf/src/json_tools.h";
+include "modules/util/adt/bytebuffer.h";
+
+global
+{
+	BOOL FloatAlmostEqual(double a, double b, double max_error)
+	{
+		double magnitude = MAX(op_fabs(a), op_fabs(b));
+		double diff = op_fabs(a - b);
+		if (magnitude < 1)
+			return diff < max_error;
+		else
+			return diff / magnitude <= max_error;
+	}
+}
+
+foreach (NAME, TOKEN, INPUT) from
+  {
+	   {True,      TOK_TRUE,     "true"}
+	  ,{False,     TOK_FALSE,    "false"}
+	  ,{Null,      TOK_NULL,     "null"}
+	  ,{Integer,   TOK_INTEGER,  "1234567890"}
+	  ,{Real,      TOK_REAL,     "-9876.543210"}
+	  ,{e,         TOK_REAL,     "0.123456789e-12"}
+	  ,{E,         TOK_REAL,     "1.234567890E+34"}
+	  ,{BigNum,    TOK_REAL,     "23456789012E666"}
+	  ,{Half,      TOK_REAL,     "0.5"}
+	  ,{Minus Zero,TOK_REAL,     "-0"}
+	  ,{Zero,      TOK_INTEGER,  "0"}
+	  ,{One,       TOK_INTEGER,  "1"}
+	  ,{Negative,  TOK_INTEGER,  "-42"}
+	  ,{Empty,     TOK_STRING,   "\"\""}
+	  ,{Space,     TOK_STRING,   "\" \""}
+	  ,{Quote,     TOK_STRING,   "\"\\\"\""}
+	  ,{Backslash, TOK_STRING,   "\"\\\\\""}
+	  ,{Controls,  TOK_STRING,   "\"\\b\\f\\n\\r\\t\""}
+	  ,{Slash,     TOK_STRING,   "\"/ & \\/\""}
+	  ,{Alpha,     TOK_STRING,   "\"abcdefghijklmnopqrstuvwyz\""}
+	  ,{ALPHA,     TOK_STRING,   "\"ABCDEFGHIJKLMNOPQRSTUVWYZ\""}
+	  ,{Digit,     TOK_STRING,   "\"0123456789\""}
+	  ,{Special,   TOK_STRING,   "\"`1~!@#$%^&*()_+-={':[,]}|;.</>?\""}
+	  ,{Hex,       TOK_STRING,   "\"\\u0123\\u4567\\u89AB\\uCDEF\\uabcd\\uef4A\""}
+	  ,{Url,       TOK_STRING,   "\"http://www.JSON.org/\""}
+	  ,{Quotes,    TOK_STRING,   "\"&#34; \\u0022 %22 0x22 034 &#x22;\""}
+	  ,{Array Open,  TOK_BRACKET_START, "["}
+	  ,{Array Close, TOK_BRACKET_END,   "]"}
+	  ,{Object Open,  TOK_CURLY_BRACKET_START, "{"}
+	  ,{Object Close, TOK_CURLY_BRACKET_END,   "}"}
+  }
+{
+test("Tokenize: $(NAME)")
+{
+	const uni_char *data = UNI_L( INPUT );
+	int len = uni_strlen(data);
+	OpScopeJSON::Input input;
+	verify_success(input.Construct(data, len));
+	OpScopeJSON::Lexer lexer;
+	verify_success(lexer.Construct(&input));
+
+	OpScopeJSON::Input::State start = input.GetState();
+
+	OpScopeJSON::Lexer::Token token = OpScopeJSON::Lexer::TOKEN;
+	verify_success(lexer.Match(token));
+
+	OpScopeJSON::Input::State end = input.GetState();
+	verify(*end.cur == '\0');
+	verify( (end.cur - start.cur) == len);
+}
+}
+
+foreach (INPUT, EXPECTED_NUMBER) from
+  {
+	   {"1234567890",  1234567890}
+	  ,{"0",           0}
+	  ,{"1",           1}
+	  ,{"-2147483648", (-2147483647 - 1)}
+  }
+{
+test("Parse integer: " INPUT)
+{
+	const uni_char *data = UNI_L( INPUT );
+	int len = uni_strlen(data);
+	OpScopeJSON::Input input;
+	verify_success(input.Construct(data, len));
+	OpScopeJSON::Lexer lexer;
+	verify_success(lexer.Construct(&input));
+	OpScopeJSON::Parser parser(lexer);
+
+	OpScopeJSON::Input::State start = input.GetState();
+
+	INT32 number;
+	verify_success(parser.ParseSignedInteger(number));
+	INT32 expected = EXPECTED_NUMBER;
+	verify(number == expected);
+
+	OpScopeJSON::Input::State end = input.GetState();
+	verify(*end.cur == '\0');
+	verify( (end.cur - start.cur) == len);
+}
+}
+
+foreach (INPUT, EXPECTED_NUMBER) from
+  {
+	   {"2147483647", ((~0u)>>1)}
+	  ,{"2147483648", 1u<<31}
+	  ,{"4294967295", ~0u}
+	  ,{"0",          0u}
+  }
+{
+test("Parse unsigned integer: " INPUT)
+{
+	const uni_char *data = UNI_L( INPUT );
+	int len = uni_strlen(data);
+	OpScopeJSON::Input input;
+	verify_success(input.Construct(data, len));
+	OpScopeJSON::Lexer lexer;
+	verify_success(lexer.Construct(&input));
+	OpScopeJSON::Parser parser(lexer);
+
+	OpScopeJSON::Input::State start = input.GetState();
+
+	UINT32 number;
+	verify_success(parser.ParseUnsignedInteger(number));
+	UINT32 expected = (UINT32)(EXPECTED_NUMBER);
+	verify(number == expected);
+
+	OpScopeJSON::Input::State end = input.GetState();
+	verify(*end.cur == '\0');
+	verify( (end.cur - start.cur) == len);
+}
+}
+
+foreach (INPUT, EXPECTED_NUMBER) from
+  {
+	   {"1234567890", 1234567890L}
+	  ,{"-9876.543210", -9876.543210L}
+	  ,{"0.123456789e-12", 0.123456789e-12L}
+	  ,{"1.234567890E+34", 1.234567890E+34L}
+	  ,{"0.5", 0.5L}
+	  ,{"0", 0L}
+	  ,{"-0", -0.f}
+	  ,{"1", 1L}
+	  ,{"-42", -42L}
+  }
+{
+test("Parse double: " INPUT)
+{
+	const uni_char *data = UNI_L( INPUT );
+	int len = uni_strlen(data);
+	OpScopeJSON::Input input;
+	verify_success(input.Construct(data, len));
+	OpScopeJSON::Lexer lexer;
+	verify_success(lexer.Construct(&input));
+	OpScopeJSON::Parser parser(lexer);
+
+	OpScopeJSON::Input::State start = input.GetState();
+
+	double number;
+	verify_success(parser.ParseDouble(number));
+	verify(FloatAlmostEqual(number, EXPECTED_NUMBER, 0.0001));
+
+	OpScopeJSON::Input::State end = input.GetState();
+	verify(*end.cur == '\0');
+	verify( (end.cur - start.cur) == len);
+}
+}
+
+foreach (INPUT, EXPECTED) from
+  {
+	   {"\"\"",                                    ""}
+	  ,{"\" \"",                                   " "}
+	  ,{"\"\\\"\"",                                "\""}
+	  ,{"\"\\\\\"" ,                               "\\"}
+	  ,{"\"\\b\\f\\n\\r\\t\"",                     "\b\f\n\r\t"}
+	  ,{"\"/ & \\/\"",                             "/ & /"}
+	  ,{"\"abcdefghijklmnopqrstuvwyz\"",           "abcdefghijklmnopqrstuvwyz"}
+	  ,{"\"ABCDEFGHIJKLMNOPQRSTUVWYZ\"",           "ABCDEFGHIJKLMNOPQRSTUVWYZ"}
+	  ,{"\"0123456789\"",                          "0123456789"}
+	  ,{"\"`1~!@#$%^&*()_+-={':[,]}|;.</>?\"",     "`1~!@#$%^&*()_+-={':[,]}|;.</>?"}
+	  ,{"\"\\u0020\\u0055\\u006E\\u0069\"",        " Uni"}
+	  ,{"\"http://www.JSON.org/\"",                "http://www.JSON.org/"}
+	  ,{"\"&#34; \\u0022 %22 0x22 034 &#x22;\"",   "&#34; \" %22 0x22 034 &#x22;"}
+  }
+{
+test("Parse string: " INPUT)
+{
+	const uni_char *data = UNI_L( INPUT );
+	int len = uni_strlen(data);
+	OpScopeJSON::Input input;
+	verify_success(input.Construct(data, len));
+	OpScopeJSON::Lexer lexer;
+	verify_success(lexer.Construct(&input));
+	OpScopeJSON::Parser parser(lexer);
+
+	OpScopeJSON::Input::State start = input.GetState();
+
+	OpString str;
+	verify_success(parser.ParseString(str));
+	verify_string(str, EXPECTED);
+
+	OpScopeJSON::Input::State end = input.GetState();
+	verify(*end.cur == '\0');
+	verify( (end.cur - start.cur) == len);
+}
+}
+
+foreach (NAME, INPUT, LINE, COL) from
+  {
+	   {Invalid quote,           "\"foo\\:\"",        1, 5}
+	  ,{Invalid unicode digits,  "  \"bar\\uxx\"",    1, 8}
+	  ,{Missing unicode digits,  "\t\"baz\\u00\"",    1, 16}
+	  ,{Missing doublequote,     "\n\"bad",           2, 4}
+	  ,{Premature end,           "\r\n\"\\",          2, 2}
+  }
+{
+test("Invalid string: $(NAME)")
+{
+	const uni_char *data = UNI_L( INPUT );
+	int len = uni_strlen(data);
+	OpScopeJSON::Input input;
+	verify_success(input.Construct(data, len));
+	OpScopeJSON::Lexer lexer;
+	verify_success(lexer.Construct(&input));
+	OpScopeJSON::Parser parser(lexer);
+
+	OpString str;
+	OP_STATUS status = parser.ParseString(str);
+	verify(status == OpStatus::ERR_PARSING_FAILED || status == OpStatus::ERR);
+	const OpScopeJSON::Lexer::Error &error = lexer.GetError();
+	verify(error.token == OpScopeJSON::Lexer::TOK_STRING);
+	verify(error.description.CStr() != NULL);
+	verify(error.line == LINE);
+	verify(error.column == COL);
+}
+}
+
+test("Invalid string: Control character")
+{
+	for (int i = 0; i < 0x20; ++i)
+	{
+		const uni_char data[] = {'"', i, '"', '\0'};
+		int len = 3;
+		OpScopeJSON::Input input;
+		verify_success(input.Construct(data, len));
+		OpScopeJSON::Lexer lexer;
+		verify_success(lexer.Construct(&input));
+		OpScopeJSON::Parser parser(lexer);
+
+		OpString str;
+		OP_STATUS status = parser.ParseString(str);
+		verify(status == OpStatus::ERR_PARSING_FAILED);
+		const OpScopeJSON::Lexer::Error &error = lexer.GetError();
+		verify(error.token == OpScopeJSON::Lexer::TOK_STRING);
+		verify(error.line == 1);
+		verify(error.column == 1);
+	}
+}
+
+foreach (NAME, INPUT, LINE, COL) from
+  {
+	   {Bad fraction,            "2.",        1, 2}
+	  ,{Missing leading zero,    ".1",        1, 0}
+  }
+{
+test("Invalid number: $(NAME)")
+{
+	const uni_char *data = UNI_L( INPUT );
+	int len = uni_strlen(data);
+	OpScopeJSON::Input input;
+	verify_success(input.Construct(data, len));
+	OpScopeJSON::Lexer lexer;
+	verify_success(lexer.Construct(&input));
+	OpScopeJSON::Parser parser(lexer);
+
+	double value;
+	OP_STATUS status = parser.ParseDouble(value);
+	verify(status == OpStatus::ERR_PARSING_FAILED || status == OpStatus::ERR);
+	const OpScopeJSON::Lexer::Error &error = lexer.GetError();
+//	verify(error.token == OpScopeJSON::Lexer::TOK_REAL);
+	verify(error.line == LINE);
+	verify(error.column == COL);
+}
+}
+
+foreach (JSON, CSTR) from
+  {
+	   {"\"\"",                                    ""}
+	  ,{"\" \"",                                   " "}
+	  ,{"\"\\\"\"",                                "\""}
+	  ,{"\"\\\\\"" ,                               "\\"}
+	  ,{"\"\\b\\f\\n\\r\\t\"",                     "\b\f\n\r\t"}
+	  ,{"\"/ & \\/\"",                             "/ & /"}
+	  ,{"\"abcdefghijklmnopqrstuvwyz\"",           "abcdefghijklmnopqrstuvwyz"}
+	  ,{"\"ABCDEFGHIJKLMNOPQRSTUVWYZ\"",           "ABCDEFGHIJKLMNOPQRSTUVWYZ"}
+	  ,{"\"0123456789\"",                          "0123456789"}
+	  ,{"\"`1~!@#$%^&*()_+-={':[,]}|;.</>?\"",     "`1~!@#$%^&*()_+-={':[,]}|;.</>?"}
+	  ,{"\"http://www.JSON.org/\"",                "http://www.JSON.org/"}
+	  ,{"Control Characters",   {' ',  0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f,
+	                             0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f, 0} }
+  }
+{
+test("Generate and parse string: " JSON)
+{
+	ByteBuffer out;
+	char *data = NULL;
+
+	const char cstr [] = CSTR;
+	TempBuffer uni_cstr;
+	verify_trap(uni_cstr.AppendL(cstr));
+	verify_success(OpScopeJSON::DumpUniString(out, uni_cstr.GetStorage(), uni_cstr.Length()));
+
+	data = out.Copy(TRUE);
+	verify(data != NULL);
+	TempBuffer uni_data;
+	uni_data.AppendL(data);
+	int len = uni_data.Length();
+	OpScopeJSON::Input input;
+	verify_success(input.Construct(uni_data.GetStorage(), len));
+	OpScopeJSON::Lexer lexer;
+	verify_success(lexer.Construct(&input));
+	OpScopeJSON::Parser parser(lexer);
+
+	OpScopeJSON::Input::State start = input.GetState();
+
+	OpString str;
+	verify_success(parser.ParseString(str));
+	verify_string(str, cstr);
+
+	OpScopeJSON::Input::State end = input.GetState();
+	verify(*end.cur == '\0');
+	verify( (end.cur - start.cur) == len);
+}
+finally
+{
+	delete []data;
+}
+}
+
+foreach (JSON, CSTR) from
+  {
+	   {"\"\"",                                    ""}
+	  ,{"\" \"",                                   " "}
+	  ,{"\"\\\"\"",                                "\""}
+	  ,{"\"\\\\\"" ,                               "\\"}
+	  ,{"\"\\b\\f\\n\\r\\t\"",                     "\b\f\n\r\t"}
+	  ,{"\"/ & /\"",                               "/ & /"}
+	  ,{"\"abcdefghijklmnopqrstuvwyz\"",           "abcdefghijklmnopqrstuvwyz"}
+	  ,{"\"ABCDEFGHIJKLMNOPQRSTUVWYZ\"",           "ABCDEFGHIJKLMNOPQRSTUVWYZ"}
+	  ,{"\"0123456789\"",                          "0123456789"}
+	  ,{"\"`1~!@#$%^&*()_+-={':[,]}|;.</>?\"",     "`1~!@#$%^&*()_+-={':[,]}|;.</>?"}
+	  ,{"\"http://www.JSON.org/\"",                "http://www.JSON.org/"}
+  }
+{
+test("OpScopeJSON::DumpUniString: " JSON)
+{
+	char *data = NULL;
+
+	const uni_char* expected_result = UNI_L( JSON );
+	const char cstr [] = CSTR;
+	TempBuffer uni_cstr;
+	uni_cstr.AppendL(cstr);
+	ByteBuffer buf;
+	verify(OpStatus::IsSuccess(OpScopeJSON::DumpString(buf, OpProtobufStringChunkRange(uni_cstr.GetStorage(), uni_cstr.Length()))));
+	data = buf.Copy(TRUE);
+	verify_string(data, expected_result);
+}
+finally
+{
+	delete []data;
+}
+}
+
+test("OpScopeJSON::DumpUniString: Control characters 0x01-0x1f")
+{
+	char *data = NULL;
+
+	const char expected_result [] =
+		"\""
+		"\\u0001\\u0002\\u0003\\u0004\\u0005\\u0006\\u0007"
+		"\\u000b\\u000e\\u000f"
+		"\\u0010\\u0011\\u0012\\u0013\\u0014\\u0015\\u0016\\u0017"
+		"\\u0018\\u0019\\u001a\\u001b\\u001c\\u001d\\u001e\\u001f"
+		"\"";
+	TempBuffer uni_expected_result;
+	uni_expected_result.AppendL(expected_result);
+	const uni_char cstr [] = {0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
+		                      0x0b, 0x0e, 0x0f,
+		                      0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17,
+							  0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f,
+						      0};
+	ByteBuffer buf;
+	verify(OpStatus::IsSuccess(OpScopeJSON::DumpString(buf, OpProtobufStringChunkRange(cstr, uni_strlen(cstr)))));
+	data = buf.Copy(TRUE);
+	verify_string(data, uni_expected_result.GetStorage());
+}
+finally
+{
+	delete []data;
+}
+
+test("OpScopeJSON::DumpUniString: Control characters 0x80-0x9f")
+{
+	char *data = NULL;
+
+	const char expected_result [] =
+		"\""
+		"\\u0080\\u0081\\u0082\\u0083\\u0084\\u0085\\u0086\\u0087"
+		"\\u0088\\u0089\\u008a\\u008b\\u008c\\u008d\\u008e\\u008f"
+		"\\u0090\\u0091\\u0092\\u0093\\u0094\\u0095\\u0096\\u0097"
+		"\\u0098\\u0099\\u009a\\u009b\\u009c\\u009d\\u009e\\u009f"
+		"\"";
+	TempBuffer uni_expected_result;
+	uni_expected_result.AppendL(expected_result);
+	const uni_char cstr [] = {0x80, 0x81, 0x82, 0x83, 0x84, 0x85, 0x86, 0x87,
+							  0x88, 0x89, 0x8a, 0x8b, 0x8c, 0x8d, 0x8e, 0x8f,
+							  0x90, 0x91, 0x92, 0x93, 0x94, 0x95, 0x96, 0x97,
+							  0x98, 0x99, 0x9a, 0x9b, 0x9c, 0x9d, 0x9e, 0x9f,
+	                          0};
+	ByteBuffer buf;
+	verify(OpStatus::IsSuccess(OpScopeJSON::DumpString(buf, OpProtobufStringChunkRange(cstr, uni_strlen(cstr)))));
+	data = buf.Copy(TRUE);
+	verify(uni_strcmp(data, uni_expected_result.GetStorage()) == 0);
+}
+finally
+{
+	delete []data;
+}
+
+test("OpScopeJSON::DumpUniString: Surrogates")
+{
+	char *data = NULL;
+
+	const uni_char expected_result [] =
+		{0x22, // "
+		 0xf0, 0x90, 0x80, 0x81,
+		 0x22, // "
+		 0
+		};
+	TempBuffer uni_expected_result;
+	uni_expected_result.AppendL(expected_result);
+	const uni_char cstr [] = {0xd800, 0xdc01,
+	                          0};
+	ByteBuffer buf;
+	verify(OpStatus::IsSuccess(OpScopeJSON::DumpString(buf, OpProtobufStringChunkRange(cstr, uni_strlen(cstr)))));
+	data = buf.Copy(TRUE);
+	verify_string(data, uni_expected_result.GetStorage());
+}
+finally
+{
+	delete []data;
+}

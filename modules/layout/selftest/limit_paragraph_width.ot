@@ -1,0 +1,946 @@
+/* -*- mode: c++; tab-width: 4; c-basic-offset: 4 -*- */
+
+group "layout.limit_paragraph_width";
+
+require init;
+
+include "modules/logdoc/htm_elm.h";
+include "modules/dochand/viewportcontroller.h";
+include "modules/dochand/win.h";
+
+test("AHEM")
+language c++;
+{
+	// Most tests require the AHEM font.
+
+	short font_number = styleManager->GetFontNumber(UNI_L("AHEM"));
+	verify(font_number != -1);
+}
+
+/**
+ * Selftests for LimitParagraphWidth
+ *
+ * Kind of structured after LPW documentation:
+ * [1] https://projects.oslo.osa/Core2profiles/specifications/text_wrap.html
+ *
+ * @todo Fix tests for "Wrapping turned off based on encoding"
+ * @todo Add tests for frames and iframes with specified height < 40px
+ */
+
+global
+{
+    enum Constants
+    {
+        DEFAULT_MAX_PARAGRAPH_WIDTH = 200
+    };
+
+    enum Align
+    {
+        LEFT,
+        RIGHT,
+        TOP,
+        BOTTOM
+    };
+
+    BOOL old_limit_paragraph_width;
+    int  old_max_paragraph_width;
+
+    /**
+     * Helper function to return a value from a rect depending on
+     * alignment.
+     */
+    int GetValFromAlign(RECT rect, Align align)
+    {
+        switch (align)
+        {
+        case LEFT: return rect.left;
+        case RIGHT: return rect.right;
+        case TOP: return rect.top;
+        case BOTTOM: return rect.bottom;
+        }
+        return -1;
+    }
+
+    /**
+     * Get the current rect of an element.
+     * @param id id of element
+     * @param[out] rect will contain rect on success
+     * @return TRUE on success
+     */
+    BOOL GetElmRect(const char* id, RECT& rect)
+    {
+        HTML_Element* elm = find_element_id(id);
+        if (!elm) return FALSE;
+        elm->GetBoxRect(state.doc, CONTENT_BOX, rect);
+        return TRUE;
+    }
+
+    /** @return TRUE if the size of an element with specific id
+     * matches given values, otherwise output message and return
+     * FALSE */
+    BOOL CheckSize(const char* id, int w, int h, const char* msg)
+    {
+        RECT r = {0, 0, 0, 0};
+        if (!GetElmRect(id, r)) return FALSE;
+        if (w != r.right - r.left)
+        {
+            output("Width is %d, should be %d (%s) ", r.right - r.left, w, msg);
+            return FALSE;
+        }
+        if (h != r.bottom - r.top)
+        {
+            output("Height is %d, should be %d (%s) ", r.bottom - r.top, h, msg);
+            return FALSE;
+        }
+        return TRUE;
+    }
+
+    BOOL IsWrapped(const char* id, int w, int h)
+    {
+        return CheckSize(id, w, h, "element should be wrapped");
+    }
+
+    BOOL IsNotWrapped(const char* id, int w, int h)
+    {
+        return CheckSize(id, w, h, "element should not be wrapped");
+    }
+
+    BOOL IsAligned(const char* id_elm1, const char* id_elm2, Align a1, Align a2)
+    {
+        RECT r1, r2;
+        if (!GetElmRect(id_elm1, r1)) return FALSE;
+        if (!GetElmRect(id_elm2, r2)) return FALSE;
+        if (GetValFromAlign(r1, a1) != GetValFromAlign(r2, a2))
+        {
+            output("Alignment is incorrect");
+            return FALSE;
+        }
+        return TRUE;
+    }
+
+    /** @return the height on an element with specific id, or -1 if
+     * element doesn't exist. */
+    int Height(const char* id)
+    {
+        HTML_Element* elm = find_element_id(id);
+        if (!elm) return -1;
+        RECT r;
+        elm->GetBoxRect(state.doc, CONTENT_BOX, r);
+        return r.bottom - r.top;
+    }
+}
+
+setup
+{
+    ViewportController* vc = g_selftest.utils->GetWindow()->GetViewportController();
+    old_limit_paragraph_width = g_selftest.utils->GetWindow()->GetLimitParagraphWidth();
+    old_max_paragraph_width = vc->GetMaxParagraphWidth();
+    vc->SetTextParagraphWidthLimit(DEFAULT_MAX_PARAGRAPH_WIDTH);
+}
+
+exit
+{
+    ViewportController* vc = g_selftest.utils->GetWindow()->GetViewportController();
+    vc->SetTextParagraphWidthLimit(old_max_paragraph_width);
+    g_selftest.utils->GetWindow()->SetLimitParagraphWidth(old_limit_paragraph_width);
+}
+
+// ----------------------------------------------
+// Main tests
+// ----------------------------------------------
+
+// ----------------------------------------------
+// Section 3.3, "Specification"
+// Basic functionality
+// ----------------------------------------------
+
+html
+{
+    //! <html><body style="margin:0px;"><div style="width:600px;font-size:16px;line-height:16px;font-family:'AHEM'">
+    //! <span id="c1">XXXXXX XXXXX XXXXX XXXX XXXX XXX XXX</span></div>
+    //! </body></html>
+}
+
+test("Text inside div")
+require success "AHEM";
+{
+    verify(IsWrapped("c1", 192, 48));
+}
+
+html
+{
+    //! <html><body style="margin:0px;"><div style="width:600px;font-size:16px;line-height:16px;font-family:'AHEM'">
+    //! <div style="float:left;"><span id="c1">XXXXXX XXXXX XXXXX XXXX XXXX XXX XXX</span></div>
+    //! <span id="c2">XXXXXX XXXXX XXXXX XXXX XXXX XXX XXX</span></div>
+    //! </body></html>
+}
+
+test("Text inside float")
+require success "AHEM";
+{
+    verify(IsWrapped("c1", 192, 48));
+    verify(IsWrapped("c2", 192, 48));
+}
+
+html
+{
+    //! <html><body style="margin:0px;"><div id="c2" dir="rtl" style="width:600px;font-size:16px;line-height:16px;font-family:'AHEM'">
+    //! <span id="c1">XXXXXX XXXXX XXXXX XXXX XXXX XXX XXX</span></div>
+    //! </body></html>
+}
+
+test("dir=rtl")
+require success "AHEM";
+{
+    verify(IsWrapped("c1", 192, 48));
+    verify(IsAligned("c1", "c2", RIGHT, RIGHT));
+}
+
+html
+{
+    //! <html><body style="margin:0px;"><div style="width:600px;font-size:16px;line-height:16px;font-family:'AHEM'">
+    //! <div style="position:absolute;top:100px;width:100%;"><span id="c1">XXXXXX XXXXX XXXXX XXXX XXXX XXX XXX</span></div></div>
+    //! </body></html>
+}
+
+test("Inside position: absolute")
+require success "AHEM";
+{
+    verify(IsWrapped("c1", 192, 48));
+}
+
+html
+{
+    //! <html><body style="margin:0px;"><div style="width:600px;font-size:16px;line-height:16px;font-family:'AHEM'">
+    //! <div style="position:fixed;top:100px;width:100%;"><span id="c1">XXXXXX XXXXX XXXXX XXXX XXXX XXX XXX</span></div>
+    //! <div style="position:fixed;top:200px;width:100%;"><span id="c2">XXXXXX XXXXX XXXXX XXXX XXXX XXX XXX</span></div>
+    //! </div></body></html>
+}
+
+test("Inside position: fixed")
+require success "AHEM";
+{
+    verify(IsWrapped("c1", 192, 48));
+    verify(IsWrapped("c2", 192, 48));
+}
+
+html
+{
+    //! <html><body style="margin:0px;"><div style="width:600px;font-size:16px;line-height:16px;">
+    //! <pre style="padding:0px;"><span style="font-family:'AHEM';" id="c1">XXXXXX XXXXX XXXXX XXXX XXXX XXX XXX</span></pre>
+    //! </div></body></html>
+}
+
+test("Inside PRE")
+require success "AHEM";
+{
+    verify(IsNotWrapped("c1", 576, 16));
+}
+
+html
+{
+    //! <html><head><style>.test{font-size:16px;line-height:16px;font-family:'AHEM';}</style></head><body style="margin:0px;"><div style="width:600px;">
+    //! <table><tr><td><dl><dt><span id="c1" class="test">XXXXXX XXXXX XXXXX XXXX XXXX XXX XXX</span></dt>
+    //! <dd><span id="c2" class="test">XXXXXX XXXXX XXXXX XXXX XXXX XXX XXX</span></dd></dl></td></tr></table>
+    //! </div></body></html>
+}
+
+test("table-dl")
+require success "AHEM";
+{
+    verify(IsWrapped("c1", 192, 48));
+    verify(IsWrapped("c2", 192, 48));
+}
+
+html
+{
+    //! <html><head><style>.test{font-size:16px;line-height:16px;font-family:'AHEM';}</style></head><body style="margin:0px;"><div style="width:600px;">
+    //! <table><tr><td><span id="c1" class="test">XXXXXX XXXXX XXXXX XXXX XXXX XXX XXX</span></td>
+    //! <td><span id="c2" class="test">XXXXXX XXXXX XXXXX XXXX XXXX XXX XXX</span></td></tr></table>
+    //! </div></body></html>
+}
+
+test("table")
+require success "AHEM";
+{
+    verify(IsWrapped("c1", 192, 48));
+    verify(IsWrapped("c2", 192, 48));
+}
+
+html
+{
+    //! <html><head><style>.test{font-size:16px;} ol{list-style-position:outside;line-height:16px;font-family:'AHEM';}</style></head>
+    //! <body style="margin:0px;"><div style="width:600px;">
+    //! <table><tr><td><ol dir="rtl"><li dir="rtl"><span id="c1" class="test">XXXXXX XXXXX XXXXX XXXX XXXX XXX XXX</span></li></ol></td>
+    //! <td><ol dir="rtl"><li dir="rtl"><span id="c2" class="test">XXXXXX XXXXX XXXXX XXXX XXXX XXX XXX</span></li></ol></td></tr></table>
+    //! </div></body></html>
+}
+
+test("table-ol-outside-dir")
+require success "AHEM";
+{
+    verify(IsWrapped("c1", 192, 48));
+    verify(IsWrapped("c2", 192, 48));
+}
+
+html
+{
+    //! <html><head><style>.test{font-size:16px;} ol{list-style-position:outside;line-height:16px;font-family:'AHEM';}</style></head>
+    //! <body style="margin:0px;"><div style="width:600px;">
+    //! <table><tr><td><ol start="100000000"><li><span id="c1" class="test">XXXXXX XXXXX XXXXX XXXX XXXX XXX XXX</span></li></ol></td>
+    //! <td><ol start="100000000"><li><span id="c2" class="test">XXXXXX XXXXX XXXXX XXXX XXXX XXX XXX</span></li></ol></td></tr></table>
+    //! </div></body></html>
+}
+
+test("table-ol-outside-start")
+require success "AHEM";
+{
+    verify(IsWrapped("c1", 192, 48));
+    verify(IsWrapped("c2", 192, 48));
+}
+
+html
+{
+    //! <html><head><style>.test{font-size:16px;line-height:16px;font-family:'AHEM';} ul{list-style-position:outside;}</style></head>
+    //! <body style="margin:0px;"><div style="width:600px;">
+    //! <table><tr><td><ul><li><span id="c1" class="test">XXXXXX XXXXX XXXXX XXXX XXXX XXX XXX</span></li></ul></td>
+    //! <td><ul><li><span id="c2" class="test">XXXXXX XXXXX XXXXX XXXX XXXX XXX XXX</span></li></ul></td></tr></table>
+    //! </div></body></html>
+}
+
+test("table-ul-outside")
+require success "AHEM";
+{
+    verify(IsWrapped("c1", 192, 48));
+    verify(IsWrapped("c2", 192, 48));
+}
+
+html
+{
+    //! <html><head><style>.test{font-size:16px;line-height:16px;font-family:'AHEM';} ul{list-style-position:inside;}</style></head>
+    //! <body style="margin:0px;"><div style="width:600px;">
+    //! <ul><li><span id="c1" class="test">XXXXXX XXXXX XXXXX XXXX XXXX XXX XXX</span></li></ul>
+    //! </div></body></html>
+}
+
+test("ul-inside")
+require success "AHEM";
+{
+    verify(IsWrapped("c1", 176, 64));
+}
+
+html
+{
+    //! <html><head><style>.test{font-size:16px;line-height:16px;font-family:'AHEM';} ul{list-style-position:outside;}</style></head>
+    //! <body style="margin:0px;"><div style="width:600px;">
+    //! <ul><li><span id="c1" class="test">XXXXXX XXXXX XXXXX XXXX XXXX XXX XXX</span></li></ul>
+    //! </div></body></html>
+}
+
+test("ul-outside")
+require success "AHEM";
+{
+    verify(IsWrapped("c1", 192, 48));
+}
+
+html
+{
+    //! <html><head><style>.test{font-size:16px;line-height:16px;font-family:'AHEM';} ul{list-style-position:outside;padding-left:30%;}</style></head>
+    //! <body style="margin:0px;"><div style="width:600px;">
+    //! <ul><li><span id="c1" class="test">XXXXXX XXXXX XXXXX XXXX XXXX XXX XXX</span></li></ul>
+    //! </div></body></html>
+}
+
+test("ul-outside-padding")
+require success "AHEM";
+{
+    verify(IsWrapped("c1", 192, 48));
+}
+
+html
+{
+    //! <!doctype html public "-//OMA//DTD XHTML Mobile 1.0//EN" >
+    //! <html><head></head>
+    //! <body style="margin:0px;"><div style="width:600px;font-size:16px;font-family:'AHEM';">
+    //! <span id="c1" class="test">XXXXXX XXXXX XXXXX XXXX XXXX XXX XXX</span>
+    //! </div></body></html>
+}
+
+test("keep original layout")
+require success "AHEM";
+{
+    verify(IsWrapped("c1", 192, 48));
+}
+
+// ----------------------------------------------
+// Section 3.4.1, "height is min height"
+// ----------------------------------------------
+
+html
+{
+    //! <html><body style="margin:0px;"><div style="width:600px;font-size:16px;line-height:16px;font-family:'AHEM'">
+    //! <div id="o1" style="height:40px;width:110%;padding:0px;">
+    //! <span id="c1">XXXXXX XXXXX XXXXX XXXX XXXX XXX XXX</span> XXXXXX XXXXX XXXXX XXXX XXXX XXX XXX XXXXXX XXXXX XXXXX XXXX XXXX XXX XXX
+    //! XXXXXX XXXXX XXXXX XXXX XXXX XXX XXX XXXXXX XXXXX XXXXX XXXX XXXX XXX XXX <span id="c2">XXXXXX XXXXX XXXXX XXXX XXXX XXX XXX</span>
+    //! </div></div></body></html>
+}
+
+test("height is min height -- applied")
+require success "AHEM";
+{
+    verify(IsWrapped("c1", 192, 48));
+    verify(IsWrapped("c2", 192, 48));
+    verify(IsAligned("c1", "o1", TOP, TOP));
+    verify(IsAligned("c2", "o1", BOTTOM, BOTTOM));
+}
+
+html
+{
+    //! <html><body>
+    //! <div id="o1" style="height:40px;width:600px;padding:0px;">
+    //! <div style="width:100%;height:80px;"></div>
+    //! </div></body></html>
+}
+
+test("height is min height -- not applied")
+{
+    verify(Height("o1") == 40, "Container has wrong height, height_is_min_height should not be applied");
+}
+
+// ----------------------------------------------
+// Section 3.4.2, "Paragraphs starting with replaced content"
+// ----------------------------------------------
+
+html
+{
+    //! <html><body style="margin:0px;"><div style="width:600px;font-size:16px;line-height:16px;font-family:'AHEM';">
+    //! X <img src="" style="width:30px;height:16px;"><span id="c1">XXXXXX XXXXX XXXXX XXXX XXXX XXX XXX</span>
+    //! </div></body></html>
+}
+
+test("IMG not first on line: wrap")
+require success "AHEM";
+require LIMIT_PARAGRAPH_WIDTH_AVOID_BREAK_ON_REPLACED_CONTENT;
+{
+    verify(IsWrapped("c1", 176, 64));
+}
+
+html
+{
+    //! <html><body style="margin:0px;"><div style="width:600px;font-size:16px;line-height:16px;font-family:'AHEM';">
+    //! <img src="" style="width:30px;height:16px;"><span id="c1">XXXXXX XXXXX XXXXX XXXX XXXX XXX XXX</span>
+    //! </div></body></html>
+}
+
+test("Only one IMG first on line: wrap")
+require success "AHEM";
+require LIMIT_PARAGRAPH_WIDTH_AVOID_BREAK_ON_REPLACED_CONTENT;
+{
+    verify(IsWrapped("c1", 176, 64));
+}
+
+html
+{
+    //! <html><body style="margin:0px;"><div style="width:800px;font-size:16px;line-height:16px;font-family:'AHEM';">
+    //! <img src="" style="width:30px;height:16px;"><img src="" style="width:30px;height:16px;"><span id="c1">XXXXXX XXXXX XXXXX XXXX XXXX XXX XXX</span>
+    //! </div></body></html>
+}
+
+test("Two IMG first on line: don't wrap")
+require success "AHEM";
+require LIMIT_PARAGRAPH_WIDTH_AVOID_BREAK_ON_REPLACED_CONTENT;
+{
+    verify(IsNotWrapped("c1", 576, 16));
+}
+
+html
+{
+    //! <html><body style="margin:0px;"><div style="width:600px;font-size:16px;line-height:16px;font-family:'AHEM';">
+    //! <img src="" style="width:33%;height:15px;"><img src="" style="width:33%;height:15px;"><img src="" style="width:33%;height:15px;">
+    //! <span id="c1">XXXXXX XXXXX XXXXX XXXX XXXX XXX XXX</span>
+    //! </div></body></html>
+}
+
+test("Three IMGs first on line: don't wrap")
+require success "AHEM";
+require LIMIT_PARAGRAPH_WIDTH_AVOID_BREAK_ON_REPLACED_CONTENT;
+{
+    verify(IsNotWrapped("c1", 576, 16));
+}
+
+html
+{
+//!<!DOCTYPE html>
+//!<html>
+//!<head>
+//!<style>
+//!	*
+//!	{
+//!		margin:0;
+//!		padding:0;
+//!		font-size:16px;
+//!		line-height:16px;
+//!		vertical-align:top;
+//!	}
+//!
+//!	body { width:600px; }
+//!
+//!	#c1 { font-family:'AHEM'; }
+//!
+//!	img.block
+//!	{
+//!		display:block;
+//!		width:20px;
+//!		height:16px;
+//!	}
+//!</style>
+//!</head>
+//!<body>
+//!
+//!	<img src="" />
+//!	<img class="block" src="" />
+//!
+//!	<span id="c1">XXXXXX XXXXX XXXXX XXXX XXXX XXX XXX</span>
+//!
+//!</body>
+//!</html>
+}
+test("One replaced content then replaced block then portion of text")
+	require success "AHEM";
+	require LIMIT_PARAGRAPH_WIDTH_AVOID_BREAK_ON_REPLACED_CONTENT;
+	/* CORE-41254: A block level element (even if with replaced content)
+	   should not influence whether to limit a line. */
+{
+    verify(IsWrapped("c1", 192, 48));
+}
+
+html
+{
+//!<!DOCTYPE html>
+//!<html>
+//!<head>
+//!<style>
+//!	*
+//!	{
+//!		margin:0;
+//!		padding:0;
+//!		font-size:16px;
+//!		line-height:16px;
+//!		vertical-align:top;
+//!	}
+//!
+//!	body { width:600px; }
+//!
+//!	#c1 { font-family:'AHEM'; }
+//!</style>
+//!</head>
+//!<body>
+//!
+//!	<img src="" /><img src="" />
+//!	<div>X</div>
+//!
+//!	<span id="c1">XXXXXX XXXXX XXXXX XXXX XXXX XXX XXX</span>
+//!
+//!</body>
+//!</html>
+}
+test("Two replaced contents then block then portion of text")
+	require success "AHEM";
+	require LIMIT_PARAGRAPH_WIDTH_AVOID_BREAK_ON_REPLACED_CONTENT;
+	/* A block level element should act as a "paragraph" separator
+	   inside its container. */
+{
+    verify(IsWrapped("c1", 192, 48));
+}
+
+html
+{
+//!<!DOCTYPE html>
+//!<html>
+//!<head>
+//!<style>
+//!	*
+//!	{
+//!		margin:0;
+//!		padding:0;
+//!		font-size:16px;
+//!		line-height:16px;
+//!		vertical-align:top;
+//!	}
+//!
+//!	body { width:600px; }
+//!
+//!	#c1 { font-family:'AHEM'; }
+//!</style>
+//!</head>
+//!<body>
+//!
+//!	<img src="" /><img src="" />
+//!	<br /> <br />
+//!
+//!	<span id="c1">XXXXXX XXXXX XXXXX XXXX XXXX XXX XXX</span>
+//!
+//!</body>
+//!</html>
+}
+test("Two replaced contents then double br then portion of text")
+	require success "AHEM";
+	require LIMIT_PARAGRAPH_WIDTH_AVOID_BREAK_ON_REPLACED_CONTENT;
+	/* A layout break because of <br>s should act as a "paragraph" separator
+	   inside its container. */
+{
+    verify(IsWrapped("c1", 192, 48));
+}
+
+// ----------------------------------------------
+// Section 3.4.3, "horizontal marquee"
+// ----------------------------------------------
+
+html
+{
+    //! <html><body style="margin:0px;"><div style="width:600px;font-size:16px;line-height:16px;font-family:'AHEM';">
+    //! <marquee width="200%"><span id="c1">XXXXXX XXXXX XXXXX XXXX XXXX XXX XXX</span></marquee>
+    //! </div></body></html>
+}
+
+test("Horizontal marquee")
+require success "AHEM";
+{
+    verify(IsNotWrapped("c1", 576, 16));
+}
+
+html
+{
+    //! <html><body style="margin:0px;"><div style="width:600px;font-size:16px;line-height:16px;font-family:'AHEM';">
+    //! <marquee width="200%" direction="down"><span id="c1">XXXXXX XXXXX XXXXX XXXX XXXX XXX XXX</span></marquee>
+    //! </div></body></html>
+}
+
+test("Vertical marquee")
+require success "AHEM";
+{
+    verify(IsWrapped("c1", 192, 48));
+}
+
+// ----------------------------------------------
+// Section 3.4.4, "line height > 24px"
+// ----------------------------------------------
+
+html
+{
+    //! <html><body style="margin:0px;"><div style="font-family:'AHEM';">
+    //! <h1><span id="c1">XXXXXX XXXXX XXXXX XXXX XXXX XXX XXX</h1>
+    //! </div></body></html>
+}
+
+test("line height > 24px - h1 element")
+require success "AHEM";
+{
+#if TEXT_WRAP_DONT_WRAP_FONT_SIZE > 0
+#if TEXT_WRAP_DONT_WRAP_FONT_SIZE != 24
+        verify(false, "TEXT_WRAP_DONT_WRAP_FONT_SIZE changed, update test");
+#endif
+        verify(IsNotWrapped("c1", 944, 64));
+#else
+        verify(IsWrapped("c1", 204, 224));
+#endif // TEXT_WRAP_DONT_WRAP_FONT_SIZE > 0
+}
+
+html
+{
+    //! <html><body style="margin:0px;"><div style="width:600px;font-family:'AHEM';">
+    //! <div><span id="c1" style="font-size:23px;">XXXXXX XXXXX XXXXX XXXX XXXX XXX XXX</span></div>
+    //! <div><span id="c2" style="font-size:24px;">XXXXXX XXXXX XXXXX XXXX XXXX XXX XXX</span></div>
+    //! </div></body></html>
+}
+
+test("line height > 24px - font size")
+require success "AHEM";
+{
+    verify(IsWrapped("c1", 184, 138));
+#if TEXT_WRAP_DONT_WRAP_FONT_SIZE > 0
+#if TEXT_WRAP_DONT_WRAP_FONT_SIZE != 24
+        verify(false, "TEXT_WRAP_DONT_WRAP_FONT_SIZE changed, update test");
+#endif
+        verify(IsNotWrapped("c2", 552, 48));
+#else
+        verify(IsWrapped("c2", 192, 144));
+#endif // TEXT_WRAP_DONT_WRAP_FONT_SIZE > 0
+}
+
+// ----------------------------------------------
+// Section 3.4.5, Wrapping turned off based on encoding
+// ----------------------------------------------
+
+// @todo The following three require files encoded in the specific
+// encoding, so they cannot be inserted using html keyword.
+
+// http://t.oslo.osa/platforms/WindowsMobile/KillBill-2/feature/Textwrap/3_4_5_encoding_euc.html
+// http://t.oslo.osa/platforms/WindowsMobile/KillBill-2/feature/Textwrap/3_4_5_encoding_sjis.html
+// http://t.oslo.osa/platforms/WindowsMobile/KillBill-2/feature/Textwrap/3_4_5_encoding_utf8.html
+
+// ----------------------------------------------
+// Section 3.4.6, Paragraphs starting with <li> elements styled as display:inline
+// ----------------------------------------------
+
+html
+{
+    //! <html><head><style>li{display:inline-block;} ul{display:inline-block;}</style></head>
+    //! <body style="margin:0px;"><div style="width:600px;font-size:16px;line-height:16px;font-family:'AHEM';">
+    //! X <ul><li>X</li></ul> <span id="c1">XXXXXX XXXXX XXXXX XXXX XXXX XXX XXX</span>
+    //! </div></body></html>
+}
+
+test("LI not first on line: wrap")
+require success "AHEM";
+{
+    verify(IsWrapped("c1", 200, 80));
+}
+
+html
+{
+    //! <html><head><style>li{display:inline-block;} ul{display:inline-block;}</style></head>
+    //! <body style="margin:0px;"><div style="width:600px;font-size:16px;line-height:16px;font-family:'AHEM';">
+    //! <ul><li>X</li> <li>X</li> <li>X</li></ul> <span id="c1">XXXXXX XXXXX XXXXX XXXX XXXX XXX XXX</span>
+    //! </div></body></html>
+}
+
+test("LI first on line: don't wrap")
+require success "AHEM";
+{
+    verify(IsNotWrapped("c1", 584, 48));
+}
+
+html
+{
+    //! <html><head><style>ul{list-style-position:outside;}</style></head>
+    //! <body style="margin:0px;"><div style="width:600px;font-size:16px;line-height:16px;font-family:'AHEM';">
+    //! <img style="width:100px;height:100px;float:right;">
+    //! <ul><li><span id="c1">XXXXXX XXXXX XXXXX XXXX XXXX XXX XXX</span></li></ul>
+    //! </div></body></html>
+}
+
+test("List with \"list-style-position: outside\"")
+require success "AHEM";
+{
+    verify(IsWrapped("c1", 192, 48));
+}
+
+html
+{
+    //! <html><head><style>ol{list-style-position:outside;padding-left:30%;}</style></head>
+    //! <body style="margin:0px;"><div style="width:600px;font-size:16px;line-height:16px;font-family:'AHEM';">
+    //! <img style="width:100px;height:100px;float:right;">
+    //! <ol><li><span id="c1">XXXXXX XXXXX XXXXX XXXX XXXX XXX XXX</span></li></ol>
+    //! </div></body></html>
+}
+
+test("ol-outside-padding")
+require success "AHEM";
+{
+    verify(IsWrapped("c1", 192, 48));
+}
+
+// ----------------------------------------------
+// Section 3.4.7, Lines with typical menu delimiter characters will not be wrapped
+// ----------------------------------------------
+
+html
+{
+    //! <html><body style="margin:0px;"><div style="width:600px;font-size:16px;line-height:16px;font-family:'AHEM';">
+    //! <div><span id="c1">XXXX | XXX | XXX | XX | XX | XXX XXX</span></div>
+    //! <div><span id="c2">XXX :: XX :: XX :: X :: X :: XXX XXX</span></div>
+    //! <div><span id="c3">XXXX &bull; XXX &bull; XXX &bull; XX &bull; XX &bull; XXX XXX</span></div>
+    //! </div></body></html>
+}
+
+test("Menu delimiters")
+require success "AHEM";
+require LIMIT_PARAGRAPH_WIDTH_SCAN_FOR_DELIMITER_CHARACTERS;
+{
+    verify(IsNotWrapped("c1", 576, 16));
+    verify(IsNotWrapped("c2", 576, 16));
+    verify(IsNotWrapped("c3", 576, 16));
+}
+
+// ----------------------------------------------
+// Section 3.4.8, Blocks and frames or iframes with specified height < 40px inhibits text wrap
+// ----------------------------------------------
+
+html
+{
+    //! <html><body style="margin:0px;"><div style="width:600px;font-size:16px;line-height:16px;font-family:'AHEM';">
+    //! <div style="height:30px;"><span id="c1">XXXXXX XXXXX XXXXX XXXX XXXX XXX XXX</span></div>
+    //! </div></body></html>
+}
+
+test("Blocks with specified height < 40px inhibits text wrap")
+require success "AHEM";
+{
+    verify(IsNotWrapped("c1", 576, 16));
+}
+
+// @todo Add tests for frames and iframes with specified height < 40px
+// (should inhibit text wrap). Such tests currently fail, so there
+// might be a bug in the code.
+
+// ----------------------------------------------
+// Section 3.4.9, Text beside left floats
+// ----------------------------------------------
+
+// The available space beside float is below limit (max paragraph
+// width / 2); wrap, push the text down.
+
+html
+{
+    //! <html><body style="margin:0px;"><div style="width:600px;font-size:16px;line-height:16px;font-family:'AHEM';">
+    //! <div id="float" style="float:left;width:110px;height:200px;"></div>
+    //! <span id="text">XXXXXX XXXXX XXXXX XXXX XXXX XXX XXX</span>
+    //! </div></body></html>
+}
+
+test("Include float")
+require success "AHEM";
+require LIMIT_PARAGRAPH_WIDTH_INCLUDE_FLOAT;
+{
+    verify(IsWrapped("text", 192, 48));
+    verify(IsAligned("text", "float", TOP, BOTTOM));
+}
+
+// The available space beside float is above limit (max paragraph
+// width / 2); wrap, but don't push the text down.
+
+html
+{
+    //! <html><body style="margin:0px;"><div style="width:600px;font-size:16px;line-height:16px;font-family:'AHEM';">
+    //! <div id="float" style="float:left;width:90px;height:200px;"></div>
+    //! <span id="text">XXXXXX XXXXX XXXXX XXXX XXXX XXX XXX</span>
+    //! </div></body></html>
+}
+
+test("Include float - above-limit")
+require success "AHEM";
+require LIMIT_PARAGRAPH_WIDTH_INCLUDE_FLOAT;
+{
+    verify(IsWrapped("text", 96, 112));
+    verify(IsAligned("float", "text", TOP, TOP));
+}
+
+// The available space beside float is below limit (max paragraph
+// width / 2) due to margin; wrap and push the text down.
+
+html
+{
+    //! <html><body style="margin:0px;"><div style="width:600px;font-size:16px;line-height:16px;font-family:'AHEM';">
+    //! <div id="float" style="float:left;width:90px;height:200px;"></div>
+    //! <span id="text" style="margin-left:100px;">XXXXXX XXXXX XXXXX XXXX XXXX XXX XXX</span>
+    //! </div></body></html>
+}
+
+test("Include float - margin-left")
+require success "AHEM";
+require LIMIT_PARAGRAPH_WIDTH_INCLUDE_FLOAT;
+{
+    verify(IsWrapped("text", 196, 64));
+    verify(IsAligned("text", "float", TOP, BOTTOM));
+}
+
+// The available space beside float is below limit (max paragraph
+// width / 2) due to non-breakable text; don't wrap, but push the text
+// down.
+
+html
+{
+    //! <html><body style="margin:0px;"><div style="width:600px;font-size:16px;line-height:16px;font-family:'AHEM';">
+    //! <div id="float" style="float:left;width:90px;height:200px;"></div>
+    //! <span id="text">XXXXXX&nbsp;XXXXX&nbsp;XXXXX&nbsp;XXXX&nbsp;XXXX&nbsp;XXX&nbsp;XXX</span>
+    //! </div></body></html>
+}
+
+test("Include float - min-width")
+require success "AHEM";
+require LIMIT_PARAGRAPH_WIDTH_INCLUDE_FLOAT;
+{
+    verify(IsNotWrapped("text", 576, 16));
+    verify(IsAligned("text", "float", TOP, BOTTOM));
+}
+
+// The available space beside float is above limit (max paragraph
+// width / 2), and text is right-aligned; wrap, don't push the text
+// down.
+
+html
+{
+    //! <html><body style="margin:0px;"><div id="cont" style="width:600px;font-size:16px;line-height:16px;font-family:'AHEM';text-align:right;">
+    //! <div id="float" style="float:left;width:90px;height:200px;"></div>
+    //! <span id="text">XXXXXX XXXXX XXXXX XXXX XXXX XXX XXX</span>
+    //! </div></body></html>
+}
+
+test("Include float - right-align")
+require success "AHEM";
+require LIMIT_PARAGRAPH_WIDTH_INCLUDE_FLOAT;
+{
+    verify(IsWrapped("text", 96, 112));
+    verify(IsAligned("text", "float", TOP, TOP));
+    verify(IsAligned("text", "cont", RIGHT, RIGHT));
+}
+
+// The available space beside float is above limit (max paragraph
+// width / 2); already wrapped due to narrow container, don't push the
+// text down.
+
+html
+{
+    //! <html><body style="margin:0px;"><div style="width:200px;font-size:16px;line-height:16px;font-family:'AHEM';text-align:right;">
+    //! <div id="float" style="float:left;width:90px;height:200px;"></div>
+    //! <span id="text">XXXXXX XXXXX XXXXX XXXX XXXX XXX XXX</span>
+    //! </div></body></html>
+}
+
+test("Include float - smaller")
+require success "AHEM";
+require LIMIT_PARAGRAPH_WIDTH_INCLUDE_FLOAT;
+{
+    verify(IsWrapped("text", 96, 112));
+    verify(IsAligned("text", "float", TOP, TOP));
+}
+
+// The available space beside float is below limit (max paragraph
+// width / 2), the text has indentation; wrap, push the text down.
+
+html
+{
+    //! <html><body style="margin:0px;"><div style="width:200px;font-size:16px;line-height:16px;font-family:'AHEM';text-align:right;">
+    //! <div id="float" style="float:left;width:110px;height:200px;"></div>
+    //! <span id="text" style="text-indent:100px;">XXXXXX XXXXX XXXXX XXXX XXXX XXX XXX</span>
+    //! </div></body></html>
+}
+
+test("Include float - text-indent")
+require success "AHEM";
+require LIMIT_PARAGRAPH_WIDTH_INCLUDE_FLOAT;
+{
+    verify(IsWrapped("text", 192, 48));
+    verify(IsAligned("text", "float", TOP, BOTTOM));
+}
+
+// The available space beside floats is below limit (max paragraph
+// width / 2) due to two floats; wrap, push the text down.
+
+html
+{
+    //! <html><body style="margin:0px;"><div style="width:200px;font-size:16px;line-height:16px;font-family:'AHEM';text-align:right;">
+    //! <div id="float" style="float:left;width:55px;height:200px;"></div>
+    //! <div style="float:left;width:55px;height:200px;"></div>
+    //! <span id="text" style="text-indent:100px;">XXXXXX XXXXX XXXXX XXXX XXXX XXX XXX</span>
+    //! </div></body></html>
+}
+
+test("Include float - two floats")
+require success "AHEM";
+require LIMIT_PARAGRAPH_WIDTH_INCLUDE_FLOAT;
+{
+    verify(IsWrapped("text", 192, 48));
+    verify(IsAligned("text", "float", TOP, BOTTOM));
+}

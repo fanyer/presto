@@ -1,0 +1,206 @@
+/* -*- Mode: c++; tab-width: 4; indent-tabs-mode: t; c-basic-offset: 4 -*-
+ *
+ * Copyright (C) 1995-2010 Opera Software ASA.  All rights reserved.
+ *
+ * This file is part of the Opera web browser.	It may not be distributed
+ * under any circumstances.
+ *
+ * @author Blazej Kazmierczak (bkazmierczak@opera.com)
+ */
+
+group "quick.extensions.extensioninstaller";
+
+require init; 
+
+include "adjunct/quick/extensions/ExtensionInstaller.h";
+include "adjunct/quick/extensions/ExtensionUtils.h";
+include "adjunct/quick/models/ExtensionsModel.h";
+include "adjunct/quick/managers/DesktopExtensionsManager.h";
+
+include "modules/gadgets/OpGadgetManager.h";
+include "modules/util/path.h";
+include "modules/util/opfile/unistream.h";
+include "modules/util/zipload.h";
+
+global 
+{
+	class TestExtensionInstaller : public ExtensionInstaller
+	{
+	public:
+		TestExtensionInstaller(): 
+		extension_gadget(NULL),
+		failed(FALSE){}
+
+		void ShowErrorDialog()
+		{ 
+			failed = TRUE;
+			m_busy = FALSE;
+		}
+
+		void ShowInstallNotificationSuccess(OpGadget*)
+		{
+			failed = FALSE;
+		}
+		
+		OP_STATUS ShowInstallerDialog()
+		{
+			InstallAllowed(TRUE,TRUE);
+			return OpStatus::OK;
+		}
+		
+		OP_STATUS Install(BOOL ssl_access, BOOL private_access,OpGadget** gadget = NULL)
+		{
+			return ExtensionInstaller::Install(ssl_access,private_access,&extension_gadget);
+		}
+
+		
+		OP_STATUS Install(const OpStringC& extension_path)
+		{
+		  return ExtensionInstaller::InstallLocal(extension_path);
+		}
+	
+
+		OpGadgetClass* GetExtensionClass(){return m_gclass; }
+
+		void Restart()
+		{
+			failed = FALSE;
+			extension_gadget = NULL;
+		}
+
+		BOOL HasDifferentAccess(OpGadget* gadget,const OpStringC& file_path)
+		{
+			return ExtensionInstaller::HasDifferentAccess(gadget,file_path);
+		}
+
+		OP_STATUS CheckIfTheSameExist(OpGadgetClass* gclass, VersionType& version)
+		{
+			OpGadget* dummy = NULL;
+			return ExtensionInstaller::CheckIfTheSameExist(gclass, version, &dummy);
+		}
+
+		OpGadget* extension_gadget;
+		BOOL failed;
+	};
+
+	TestExtensionInstaller installer;
+
+} 
+
+
+test("Init installer with corrupted file")
+	file uni invalid_extension "data/invalid_extension.oex";
+{
+	verify(installer.Install(invalid_extension) != OpStatus::OK);
+	verify(installer.failed == TRUE);
+}
+
+test("Install Extension")
+	file uni valid_extension "data/valid_extension.oex";
+{
+	installer.Restart();
+	verify_success(installer.Install(valid_extension));
+
+	verify(installer.GetExtensionClass() != NULL);
+	verify(installer.failed == FALSE);
+	verify(installer.extension_gadget != NULL);
+} 
+finally
+{
+	if (!installer.failed && installer.extension_gadget)
+	{
+		g_desktop_extensions_manager->UninstallExtension(
+			installer.extension_gadget->GetIdentifier());
+	}
+}
+
+test("Install extension from weird path")
+	file uni weird_path_extension "data/config.xml/valid_extension2.oex";
+{
+	installer.Restart();
+	verify_success(installer.Install(weird_path_extension));
+
+	verify(installer.GetExtensionClass() != NULL);
+	verify(installer.failed == FALSE);
+	verify(installer.extension_gadget != NULL);
+	
+	BOOL in_dev_mode = FALSE;
+	verify_success(
+			ExtensionUtils::IsDevModeExtension(*installer.GetExtensionClass(), in_dev_mode));
+	verify(!in_dev_mode);
+}
+finally
+{
+	if (!installer.failed && installer.extension_gadget)
+	{
+		g_desktop_extensions_manager->UninstallExtension(
+			installer.extension_gadget->GetIdentifier());
+	}
+}
+
+test("Check Extension Access")
+	file uni valid_extension 			 "data/valid_extension.oex";
+	file uni valid_extension_same_access "data/valid_extension_same_access.oex";
+	file uni valid_extension_diff_access "data/valid_extension_diff_access.oex";
+{
+	installer.Restart();
+	verify_success(installer.Install(valid_extension));
+	
+	verify(installer.GetExtensionClass() != NULL);
+	verify(installer.failed == FALSE);
+	verify(installer.extension_gadget != NULL);
+	
+	verify(installer.HasDifferentAccess(
+		installer.extension_gadget, valid_extension_same_access) == FALSE);
+		
+	verify(installer.HasDifferentAccess(
+		installer.extension_gadget, valid_extension_diff_access) == TRUE);
+}
+finally
+{
+	if (!installer.failed && installer.extension_gadget)
+	{
+		g_desktop_extensions_manager->UninstallExtension(
+			installer.extension_gadget->GetIdentifier());
+	}
+}
+
+test("Check Extension Duplicate")
+	file uni valid_extension 			 "data/valid_extension.oex";
+	file uni valid_extension2 			 "data/valid_extension2.oex";
+	file uni valid_extension_same_access "data/valid_extension_same_access.oex";
+{
+	installer.Restart();
+	verify_success(installer.Install(valid_extension));
+	
+	verify(installer.GetExtensionClass() != NULL);
+	verify(installer.failed == FALSE);
+	verify(installer.extension_gadget != NULL);
+	
+	OpGadgetClass* new_gclass;
+
+	verify_success(g_gadget_manager->CreateGadgetClass(
+			&new_gclass, valid_extension_same_access, URL_EXTENSION_INSTALL_CONTENT));
+			
+	TestExtensionInstaller::VersionType installed_version;
+	
+	verify_success(installer.CheckIfTheSameExist(new_gclass, installed_version));
+	
+	verify(installed_version == TestExtensionInstaller::SameVersion);
+		
+	verify_success(g_gadget_manager->CreateGadgetClass(
+			&new_gclass, valid_extension2, URL_EXTENSION_INSTALL_CONTENT));
+	
+	verify_success(installer.CheckIfTheSameExist(new_gclass, installed_version));	
+	
+	verify(installed_version == TestExtensionInstaller::NoVersionFound);
+
+}
+finally
+{
+	if (!installer.failed && installer.extension_gadget)
+	{
+		g_desktop_extensions_manager->UninstallExtension(
+			installer.extension_gadget->GetIdentifier());
+	}
+}

@@ -1,0 +1,132 @@
+/* -*- Mode: c++; tab-width: 4; indent-tabs-mode: t; c-basic-offset: 4; c-file-style:"stroustrup" -*-
+**
+** Copyright (C) 1995-2010 Opera Software ASA.  All rights reserved.
+**
+** This file is part of the Opera web browser.
+** It may not be distributed under any circumstances.
+**
+*/
+
+group "pi.oplowlevelfileasync";
+require PI_ASYNC_FILE_OP;
+
+include "modules/pi/system/OpLowLevelFile.h";
+include "modules/util/opfile/opfolder.h";
+
+global
+{
+	// Dynamically create a path for a testing file
+	OP_STATUS SetupPathString(OpString &str, const char* filename) {
+		RETURN_IF_ERROR(g_folder_manager->GetFolderPath(OPFILE_SELFTEST_DATA_FOLDER, str));
+		RETURN_IF_ERROR(str.AppendFormat(UNI_L("modules%cpi%cselftest%cdata%c"), PATHSEPCHAR, PATHSEPCHAR, PATHSEPCHAR, PATHSEPCHAR));
+		RETURN_IF_ERROR(str.Append(filename));
+
+		return OpStatus::OK;
+	}
+
+	OP_STATUS DeleteFile(const uni_char *name)
+	{
+		OpLowLevelFile *d;
+		RETURN_IF_ERROR(OpLowLevelFile::Create(&d, name));
+		OP_STATUS rv = d->Delete();
+		OP_DELETE(d);
+		return rv;
+	}
+
+	class AsyncFileListener : public OpLowLevelFileListener
+	{
+	public:
+		AsyncFileListener() { OpStatus::Ignore(res = OpStatus::ERR); }
+
+		void OnDataRead(OpLowLevelFile* file, OP_STATUS result, OpFileLength len);
+		void OnDataWritten(OpLowLevelFile* file, OP_STATUS result, OpFileLength len);
+		void OnDeleted(OpLowLevelFile* file, OP_STATUS result);
+		void OnFlushed(OpLowLevelFile* file, OP_STATUS result);
+
+		OP_STATUS GetResult();
+
+	private:
+		OP_STATUS res;
+	};
+
+	void AsyncFileListener::OnDataRead(OpLowLevelFile* file, OP_STATUS result, OpFileLength len)
+	{
+		OP_ASSERT(OpStatus::IsSuccess(result));
+		res = result;
+	}
+
+	void AsyncFileListener::OnDataWritten(OpLowLevelFile* file, OP_STATUS result, OpFileLength len)
+	{
+		OP_ASSERT(OpStatus::IsSuccess(result));
+		res = result;
+	}
+
+	void AsyncFileListener::OnDeleted(OpLowLevelFile* file, OP_STATUS result)
+	{
+		OP_ASSERT(OpStatus::IsSuccess(result));
+		res = result;
+	}
+
+	void AsyncFileListener::OnFlushed(OpLowLevelFile* file, OP_STATUS result)
+	{
+		OP_ASSERT(OpStatus::IsSuccess(result));
+		res = result;
+	}
+
+	OP_STATUS AsyncFileListener::GetResult()
+	{
+		OP_STATUS r = res;
+
+		OpStatus::Ignore(res = OpStatus::ERR);
+		return r;
+	}
+}
+
+test("async-read")
+	require PI_ASYNC_FILE_OP;
+{
+	char *buf = OP_NEWA(char, 100);
+	const char data[] = "abcdefghijklmnopqrstuvwxyz";
+	OpLowLevelFile* olf = NULL;
+	OpFileLength pos;
+	OpString path;
+	AsyncFileListener listener;
+
+	verify(OpStatus::IsSuccess(SetupPathString(path, "file.bin")));
+	DeleteFile(path.CStr());
+
+	verify(buf);
+
+	verify(OpStatus::IsSuccess(OpLowLevelFile::Create(&olf, path.CStr())));
+	verify(OpStatus::IsSuccess(olf->Open(OPFILE_OVERWRITE)));
+	verify(OpStatus::IsSuccess(olf->Write(data, sizeof(data))));
+	verify(OpStatus::IsSuccess(olf->SetFilePos(0)));
+
+	olf->SetListener(&listener);
+	olf->ReadAsync(buf, 10);
+	olf->Sync();
+
+	verify(OpStatus::IsSuccess(olf->GetFilePos(&pos)));
+	verify(pos == 10);
+	verify(OpStatus::IsSuccess(listener.GetResult()));
+	verify(!op_strncmp(buf, data, 10));
+
+	olf->ReadAsync(buf, 5, 4);
+	olf->Sync();
+
+	verify(OpStatus::IsSuccess(olf->GetFilePos(&pos)));
+	verify(pos == 10);
+	verify(OpStatus::IsSuccess(listener.GetResult()));
+	verify(!op_strncmp(buf, data+4, 5));
+}
+finally
+{
+	if (olf)
+	{
+		olf->Close();
+		olf->Delete();
+		OP_DELETE(olf);
+	}
+
+	OP_DELETEA(buf);
+}

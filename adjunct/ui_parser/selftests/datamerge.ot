@@ -1,0 +1,126 @@
+/* -*- Mode: c++; tab-width: 4; indent-tabs-mode: t; c-basic-offset: 4 -*-
+ *
+ * Copyright (C) 1995-2010 Opera Software ASA.  All rights reserved.
+ *
+ * This file is part of the Opera web browser.
+ * It may not be distributed under any circumstances.
+ *
+ * @author Arjan van Leeuwen (arjanl)
+ */
+
+group "ui_parser.datamerge";
+
+include "adjunct/ui_parser/yaml/yaml.h";
+include "adjunct/ui_parser/ParserDocument.h";
+include "adjunct/ui_parser/ParserIterators.h";
+include "adjunct/ui_parser/ParserNode.h";
+include "adjunct/ui_parser/selftests/src/ST_YamlDocument.h";
+
+global
+{
+	#define YAML_TOMERGE "tomerge: &tomerge\n" \
+						 "  tomergekey1: tomergevalue1\n" \
+						 "  tomergekey2: tomergevalue2\n"
+
+	#define YAML_MERGED  "merged:\n" \
+						 "  <<: *tomerge\n" \
+						 "  tomergekey2: overridden\n" \
+						 "  anotherkey: anothervalue\n"
+}
+
+test("merge tokens are correctly parsed")
+{
+	ST_YamlDocument document(ST_YamlDocument::FromString(YAML_TOMERGE YAML_MERGED));
+
+	yaml_node_t* root_node = yaml_document_get_root_node(document);
+	verify(root_node && root_node->type == YAML_MAPPING_NODE);
+	verify(root_node->data.mapping.pairs.top - root_node->data.mapping.pairs.start == 2);
+
+	yaml_node_pair_t* elements[2];
+	elements[0] = root_node->data.mapping.pairs.start;
+	elements[1] = root_node->data.mapping.pairs.top - 1;
+
+	yaml_node_t* key = yaml_document_get_node(document, elements[0]->key);
+	verify(key->type == YAML_SCALAR_NODE && op_strncmp(key->data.scalar.value, "tomerge", key->data.scalar.length) == 0);
+	key = yaml_document_get_node(document, elements[1]->key);
+	verify(key->type == YAML_SCALAR_NODE && op_strncmp(key->data.scalar.value, "merged", key->data.scalar.length) == 0);
+
+	yaml_node_t* value = yaml_document_get_node(document, elements[1]->value);
+	verify(value->type == YAML_MAPPING_NODE);
+	verify(value->data.mapping.pairs.top - value->data.mapping.pairs.start == 3);
+
+	yaml_node_pair_t* merged[3];
+	merged[0] = value->data.mapping.pairs.start;
+	merged[1] = merged[0] + 1;
+	merged[2] = merged[1] + 1;
+
+	key = yaml_document_get_node(document, merged[0]->key);
+	verify(key->type == YAML_MERGE_NODE);
+	verify(merged[0]->value == elements[0]->value);
+	value = yaml_document_get_node(document, merged[0]->value);
+	verify(value->type == YAML_MAPPING_NODE);
+	verify(value->data.mapping.pairs.top - value->data.mapping.pairs.start == 2);
+
+	key = yaml_document_get_node(document, merged[1]->key);
+	verify(key->type == YAML_SCALAR_NODE && op_strncmp(key->data.scalar.value, "tomergekey2", key->data.scalar.length) == 0);
+	value = yaml_document_get_node(document, merged[1]->value);
+	verify(value->type == YAML_SCALAR_NODE && op_strncmp(value->data.scalar.value, "overridden", value->data.scalar.length) == 0);
+
+	key = yaml_document_get_node(document, merged[2]->key);
+	verify(key->type == YAML_SCALAR_NODE && op_strncmp(key->data.scalar.value, "anotherkey", key->data.scalar.length) == 0);
+	value = yaml_document_get_node(document, merged[2]->value);
+	verify(value->type == YAML_SCALAR_NODE && op_strncmp(value->data.scalar.value, "anothervalue", value->data.scalar.length) == 0);
+}
+
+test("ParserNodeMapping::FindValueForKey respects merge")
+{
+	ParserDocument document;
+	verify_success(document.Init(ST_YamlDocument::FromString(YAML_TOMERGE YAML_MERGED)));
+
+	ParserNodeMapping rootnode;
+	verify(document.GetRootNode(rootnode));
+
+	ParserNodeMapping merged;
+	verify(document.GetNodeByID(rootnode.FindValueForKey("merged"), merged));
+
+	verify(CheckNode(document, merged, "tomergekey1", "tomergevalue1"));
+	verify(CheckNode(document, merged, "tomergekey2", "overridden"));
+	verify(CheckNode(document, merged, "anotherkey", "anothervalue"));
+}
+
+subtest CheckNode(ParserDocument& document, ParserNodeMapping& map, const OpStringC8& key, const OpStringC8& value)
+{
+	ParserNodeScalar scalar;
+	verify(document.GetNodeByID(map.FindValueForKey(key), scalar));
+	verify(scalar.Equals(value));
+}
+
+test("ParserNodeMapping::GetHashTable respects merge")
+{
+	ParserDocument document;
+	verify_success(document.Init(ST_YamlDocument::FromString(YAML_TOMERGE YAML_MERGED)));
+
+	ParserNodeMapping rootnode;
+	verify(document.GetRootNode(rootnode));
+
+	ParserNodeMapping merged;
+	verify(document.GetNodeByID(rootnode.FindValueForKey("merged"), merged));
+
+	ParserNodeIDTable table;
+	verify_success(merged.GetHashTable(table));
+
+	verify(table.GetCount() == 3);
+	verify(CheckTableNode(document, table, "tomergekey1", "tomergevalue1"));
+	verify(CheckTableNode(document, table, "tomergekey2", "overridden"));
+	verify(CheckTableNode(document, table, "anotherkey", "anothervalue"));
+};
+
+subtest CheckTableNode(ParserDocument& document, ParserNodeIDTable& table, const OpStringC8& key, const OpStringC8& value)
+{
+	ParserNodeIDTableData* data;
+	verify_success(table.GetData(key.CStr(), &data));
+
+	ParserNodeScalar scalar;
+	verify(document.GetNodeByID(data->data_id, scalar));
+	verify(scalar.Equals(value));
+}

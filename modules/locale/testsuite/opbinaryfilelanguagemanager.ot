@@ -1,0 +1,363 @@
+/* -*- Mode: c++; tab-width: 4; indent-tabs-mode: t; c-basic-offset: 4 -*-
+**
+** Copyright (C) 2003-2012 Opera Software ASA.  All rights reserved.
+**
+** This file is part of the Opera web browser.  It may not be distributed
+** under any circumstances.
+**
+** Peter Krefting
+*/
+
+group "locale.languagemanager.binary";
+require LOC_BINFILELANGMAN;
+
+include "modules/locale/oplanguagemanager.h";
+include "modules/locale/src/opbinaryfilelanguagemanager.h";
+include "modules/util/opstring.h";
+include "modules/util/opfile/opfile.h";
+
+// -- Global variables ---------------------------------------------------
+
+global
+{
+	OpLanguageManager *oplanguagemanager_p;
+	OpBinaryFileLanguageManager *languagemanager_p;
+	OpFile *opfile_p;
+#ifdef LOCALE_BINARY_ENDIAN
+	OpBinaryFileLanguageManager *languagemanager_opposite_p;
+	OpFile *opfile_opposite_p;
+#endif
+}
+
+// -- Global setup -------------------------------------------------------
+
+setup
+{
+	languagemanager_p = new OpBinaryFileLanguageManager;
+#ifdef LOCALE_BINARY_ENDIAN
+	languagemanager_opposite_p = new OpBinaryFileLanguageManager;
+#endif
+	oplanguagemanager_p = languagemanager_p;
+
+	/* Create file objects for the testsuite language files */
+	opfile_p = new OpFile;
+	opfile_p->Construct(UNI_L("locale_selftest_created.bin"),
+	                    OPFILE_HOME_FOLDER);
+
+#ifdef LOCALE_BINARY_ENDIAN
+	opfile_opposite_p = new OpFile;
+	opfile_opposite_p->Construct(UNI_L("locale_selftest_created_opposite.bin"),
+	                             OPFILE_HOME_FOLDER);
+#endif
+}
+
+// -- Continued setup ----------------------------------------------------
+
+test("Creating test language file")
+{
+#ifdef OPERA_BIG_ENDIAN
+# define SPLIT32(n) ((n)>>16),((n)&0xFFFF)
+# define SPLIT32FLIP(n) FLIP16(((n)&0xFFFF)),FLIP16(((n)>>16))
+#else
+# define SPLIT32(n) ((n)&0xFFFF),((n)>>16)
+# define SPLIT32FLIP(n) FLIP16(((n)>>16)),FLIP16(((n)&0xFFFF))
+#endif
+#define FLIP16(x) (((((unsigned short) x) & 0xFF) << 8) | ((unsigned short) x) >> 8)
+
+	/* Create the actual language file */
+
+	// Format for the binary language files:
+	//  FormatVersion: INT32 (also serves as byte order marker)
+	//  DBVersion: INT32
+	//  LanguageCodeLength: INT32
+	//  LanguageCode: UTF16CHAR × LanguageCodeLength
+	//  NumberOfEntries: INT32
+	//  {
+	//     StringId: INT32
+	//     StringLength: INT32
+	//     String: UTF16CHAR × StringLength
+	//  } × NumberOfEntries
+	static const uni_char lng[] =
+	{
+		SPLIT32(1),				//  FormatVersion: INT32
+		SPLIT32(666),			//  DBVersion: INT32
+		SPLIT32(4),				//  LanguageCodeLength: INT32
+		't', 'e', 's', 't',		//  LanguageCode: UTF16CHAR × LanguageCodeLength
+		SPLIT32(3),				//  NumberOfEntries: INT32
+								//  {
+		SPLIT32(42),			//     StringId: INT32
+		SPLIT32(8),				//     StringLength: INT32
+		'f','o','r','t','y',	//     String: UTF16CHAR × StringLength
+		't','w','o',			//  }
+								//  {
+		SPLIT32(99),			//     StringId: INT32
+		SPLIT32(2),				//     StringLength: INT32
+		0x4E2D, 0x6587,			//     String: UTF16CHAR × StringLength
+								//  }
+								//  {
+		SPLIT32(4711),			//     StringId: INT32
+		SPLIT32(3),				//     StringLength: INT32
+		0345,0344,0366,			//     String: UTF16CHAR × StringLength
+								//  }
+		// Excess entry (number of entries == 3)
+								//  {
+		SPLIT32(37737),			//     StringId: INT32
+		SPLIT32(3),				//     StringLength: INT32
+		'b', 'o', 'o' 			//     String: UTF16CHAR × StringLength
+								//  }
+	};
+
+	/* Set up the OpFile object */
+	verify_not_oom(opfile_p);
+	verify_success(opfile_p->Open(OPFILE_WRITE));
+	verify_success(opfile_p->Write(lng, sizeof lng));
+	verify_success(opfile_p->Close());
+
+#ifdef LOCALE_BINARY_ENDIAN
+	/* Language file in opposite endian */
+	static const uni_char oppositelng[] =
+	{
+		SPLIT32FLIP(1),
+		SPLIT32FLIP(666),
+		SPLIT32FLIP(4),
+		FLIP16('t'), FLIP16('e'), FLIP16('s'), FLIP16('t'),
+		SPLIT32FLIP(3),
+		SPLIT32FLIP(42),
+		SPLIT32FLIP(8),
+		FLIP16('f'),FLIP16('o'),FLIP16('r'),FLIP16('t'),FLIP16('y'),
+		FLIP16('t'),FLIP16('w'),FLIP16('o'),
+		SPLIT32FLIP(99),
+		SPLIT32FLIP(2),
+		FLIP16(0x4E2D), FLIP16(0x6587),
+		SPLIT32FLIP(4711),
+		SPLIT32FLIP(3),
+		FLIP16(0345),FLIP16(0344),FLIP16(0366)
+	};
+
+	verify_not_oom(opfile_opposite_p);
+	verify_success(opfile_opposite_p->Open(OPFILE_WRITE));
+	verify_success(opfile_opposite_p->Write(oppositelng, sizeof oppositelng));
+	verify_success(opfile_opposite_p->Close());
+#endif
+
+	/* Load the translation */
+	verify_not_oom(languagemanager_p);
+	TRAPD(rc, languagemanager_p->LoadTranslationL(opfile_p));
+	verify_success(rc);
+
+#ifdef LOCALE_BINARY_ENDIAN
+	verify_not_oom(languagemanager_opposite_p);
+	TRAP(rc, languagemanager_opposite_p->LoadTranslationL(opfile_opposite_p));
+	verify_success(rc);
+#endif
+
+	/* Remove the generated file */
+	opfile_p->Delete();
+#ifdef LOCALE_BINARY_ENDIAN
+	opfile_opposite_p->Delete();
+#endif
+}
+
+// -- OpLanguageManager --------------------------------------------------
+
+test("OpLanguageManager::GetLanguage")
+	require success "Creating test language file";
+	leakcheck;
+{
+	OpStringC language = oplanguagemanager_p->GetLanguage();
+	verify_string(language, UNI_L("test"));
+}
+
+test("OpLanguageManager::GetDatabaseVersionFromFileL")
+	require success "Creating test language file";
+	leakcheck;
+{
+	unsigned int dbver = oplanguagemanager_p->GetDatabaseVersionFromFileL();
+	verify(dbver == 666);
+}
+
+test("OpLanguageManager::GetStringL")
+	require success "Creating test language file";
+	leakcheck;
+{
+	OpString d;
+	int len = oplanguagemanager_p->GetStringL(Str::LocaleString(42), d);
+	verify(len == 8);
+	verify_string(d, UNI_L("fortytwo"));
+
+	len = oplanguagemanager_p->GetStringL(Str::LocaleString(4711), d);
+	verify(len == 3);
+	verify_string(d, UNI_L("\345\344\366"));
+
+	len = oplanguagemanager_p->GetStringL(Str::LocaleString(99), d);
+	verify(len == 2);
+	verify_string(d, UNI_L("\x4E2D\x6587"));
+}
+
+test("OpLanguageManager::GetString")
+	require success "Creating test language file";
+	leakcheck;
+{
+	OpString d;
+	OP_STATUS rc = oplanguagemanager_p->GetString(Str::LocaleString(42), d);
+	verify_success(rc);
+	verify_string(d, UNI_L("fortytwo"));
+
+	rc = oplanguagemanager_p->GetString(Str::LocaleString(4711), d);
+	verify_success(rc);
+	verify_string(d, UNI_L("\345\344\366"));
+
+	rc = oplanguagemanager_p->GetString(Str::LocaleString(99), d);
+	verify_string(d, UNI_L("\x4E2D\x6587"));
+}
+
+test("OpLanguageManager::GetString UniString")
+	require success "Creating test language file";
+	leakcheck;
+{
+	UniString d;
+	OP_STATUS rc = oplanguagemanager_p->GetString(Str::LocaleString(42), d);
+	verify_success(rc);
+	verify_string(d, UNI_L("fortytwo"));
+
+	rc = oplanguagemanager_p->GetString(Str::LocaleString(4711), d);
+	verify_success(rc);
+	verify_string(d, UNI_L("\345\344\366"));
+
+	rc = oplanguagemanager_p->GetString(Str::LocaleString(99), d);
+	verify_string(d, UNI_L("\x4E2D\x6587"));
+}
+
+// -- OpBinaryFileLanguageManager ----------------------------------------
+
+test("OpBinaryFileLanguageManager::GetLanguage")
+	require success "Creating test language file";
+	leakcheck;
+{
+	OpStringC language = languagemanager_p->GetLanguage();
+	verify_string(language, UNI_L("test"));
+
+#ifdef LOCALE_BINARY_ENDIAN
+	OpStringC olanguage = languagemanager_opposite_p->GetLanguage();
+	verify_string(olanguage, UNI_L("test"));
+#endif
+}
+
+test("OpBinaryFileLanguageManager::GetDatabaseVersionFromFileL")
+	require success "Creating test language file";
+	leakcheck;
+{
+	verify(languagemanager_p->GetDatabaseVersionFromFileL() == 666);
+#ifdef LOCALE_BINARY_ENDIAN
+	verify(languagemanager_opposite_p->GetDatabaseVersionFromFileL() == 666);
+#endif
+}
+
+test("OpBinaryFileLanguageManager::GetStringL")
+	require success "Creating test language file";
+	leakcheck;
+{
+	OpString d;
+	int len = languagemanager_p->GetStringL(Str::LocaleString(42), d);
+	verify(len == 8);
+	verify_string(d, UNI_L("fortytwo"));
+
+	len = languagemanager_p->GetStringL(Str::LocaleString(4711), d);
+	verify(len == 3);
+	verify_string(d, UNI_L("\345\344\366"));
+
+	len = languagemanager_p->GetStringL(Str::LocaleString(99), d);
+	verify(len == 2);
+	verify_string(d, UNI_L("\x4E2D\x6587"));
+
+#ifdef LOCALE_BINARY_ENDIAN
+	len = languagemanager_opposite_p->GetStringL(Str::LocaleString(42), d);
+	verify(len == 8);
+	verify_string(d, UNI_L("fortytwo"));
+
+	len = languagemanager_opposite_p->GetStringL(Str::LocaleString(4711), d);
+	verify(len == 3);
+	verify_string(d, UNI_L("\345\344\366"));
+
+	len = languagemanager_opposite_p->GetStringL(Str::LocaleString(99), d);
+	verify(len == 2);
+	verify_string(d, UNI_L("\x4E2D\x6587"));
+#endif
+}
+
+test("OpBinaryFileLanguageManager::GetString")
+	require success "Creating test language file";
+	leakcheck;
+{
+	UniString d;
+	OP_STATUS rc = languagemanager_p->GetString(Str::LocaleString(42), d);
+	verify_success(rc);
+	verify_string(d, UNI_L("fortytwo"));
+
+	rc = languagemanager_p->GetString(Str::LocaleString(4711), d);
+	verify_success(rc);
+	verify_string(d, UNI_L("\345\344\366"));
+
+	rc = languagemanager_p->GetString(Str::LocaleString(99), d);
+	verify_string(d, UNI_L("\x4E2D\x6587"));
+
+#ifdef LOCALE_BINARY_ENDIAN
+	rc = languagemanager_opposite_p->GetString(Str::LocaleString(42), d);
+	verify_success(rc);
+	verify_string(d, UNI_L("fortytwo"));
+
+	rc = languagemanager_opposite_p->GetString(Str::LocaleString(4711), d);
+	verify_success(rc);
+	verify_string(d, UNI_L("\345\344\366"));
+
+	rc = languagemanager_opposite_p->GetString(Str::LocaleString(99), d);
+	verify_string(d, UNI_L("\x4E2D\x6587"));
+#endif
+}
+
+test("Checking that excess entry was ignored")
+	require success "Creating test language file";
+	leakcheck;
+{
+	OpString d;
+	int len = languagemanager_p->GetStringL(Str::LocaleString(37737), d);
+	verify(len == 0);
+}
+
+test("String survives destruction of object")
+	require success "Creating test language file";
+{
+	UniString d;
+	OP_STATUS rc = oplanguagemanager_p->GetString(Str::LocaleString(42), d);
+	verify_success(rc);
+	verify_string(d, UNI_L("fortytwo"));
+
+	delete languagemanager_p;
+	oplanguagemanager_p = NULL;
+	languagemanager_p = NULL;
+
+	verify_string(d, UNI_L("fortytwo"));
+}
+
+
+// -- Global cleanup -----------------------------------------------------
+
+exit
+{
+	delete languagemanager_p;
+	oplanguagemanager_p = NULL;
+	languagemanager_p = NULL;
+
+#ifdef LOCALE_BINARY_ENDIAN
+	delete languagemanager_opposite_p;
+	languagemanager_opposite_p = NULL;
+#endif
+
+	delete opfile_p;
+	opfile_p = NULL;
+
+#ifdef LOCALE_BINARY_ENDIAN
+	delete opfile_opposite_p;
+	opfile_p = NULL;
+#endif
+}

@@ -1,0 +1,843 @@
+/* -*- Mode: c++; indent-tabs-mode: nil; c-basic-offset: 2; -*- */;
+
+group "XMLUtils.XMLLanguageParser";
+require init;
+require XMLUTILS_XMLLANGUAGEPARSER_SUPPORT;
+
+include "modules/xmlutils/xmllanguageparser.h";
+include "modules/xmlutils/xmlparser.h";
+include "modules/xmlutils/xmlnames.h";
+include "modules/xmlutils/xmldocumentinfo.h";
+include "modules/xmlutils/xmlserializer.h";
+include "modules/xmlutils/xmlfragment.h";
+include "modules/url/url2.h";
+include "modules/url/url_api.h";
+include "modules/util/opfile/opfile.h";
+
+global
+{
+  class XMLLanguageParserTester
+    : public XMLLanguageParser
+  {
+  public:
+    XMLLanguageParserTester(OpString *result, BOOL block = FALSE)
+      : result(result),
+        block(block)
+    {
+    }
+
+    OpString *result;
+    BOOL block;
+
+    OP_STATUS AppendQName(const XMLCompleteNameN &completename)
+    {
+      if (completename.GetPrefix())
+      {
+        RETURN_IF_ERROR(result->Append(completename.GetPrefix(), completename.GetPrefixLength()));
+        RETURN_IF_ERROR(result->Append(UNI_L(":")));
+      }
+      RETURN_IF_ERROR(result->Append(completename.GetLocalPart(), completename.GetLocalPartLength()));
+      if (completename.GetUri())
+      {
+        OpString uri_string;
+        RETURN_IF_ERROR(uri_string.Set(completename.GetUri(), completename.GetUriLength()));
+        RETURN_IF_ERROR(result->AppendFormat(UNI_L(" (%s)"), uri_string.CStr()));
+      }
+      return OpStatus::OK;
+    }
+
+    OP_STATUS AppendQuotedAndEscaped(const uni_char *string, unsigned string_length)
+    {
+      OpString escaped;
+      if (escaped.Reserve(string_length) == NULL)
+        return OpStatus::ERR_NO_MEMORY;
+      for (unsigned index = 0; index < string_length; ++index)
+        if (string[index] < 32 || string[index] >= 127)
+          RETURN_IF_ERROR(escaped.AppendFormat(UNI_L("U+%04X"), (unsigned) string[index]));
+        else
+          RETURN_IF_ERROR(escaped.Append(string + index, 1));
+      RETURN_IF_ERROR(result->Append(escaped));
+      return OpStatus::OK;
+    }
+
+    void SignalSourceCallbackIfSet()
+    {
+      if (source_callback)
+      {
+        source_callback->Continue(XMLLanguageParser::SourceCallback::STATUS_CONTINUE);
+        source_callback = NULL;
+      }
+    }
+
+    virtual ~XMLLanguageParserTester()
+    {
+      OpStatus::Ignore(result->Append(UNI_L("XMLLanguageParserTester destroyed\n")));
+    }
+
+    virtual OP_STATUS StartEntity(const URL &url, const XMLDocumentInformation &documentinfo, BOOL entity_reference)
+    {
+      OpString url_string, documentinfo_string;
+      if (url.IsEmpty())
+        RETURN_IF_ERROR(url_string.Set(UNI_L("<empty>")));
+      else
+        RETURN_IF_ERROR(url.GetAttribute(URL::KUniName, url_string));
+      if (documentinfo.GetXMLDeclarationPresent())
+        RETURN_IF_ERROR(documentinfo_string.AppendFormat(UNI_L("(XMLDecl:%s/%s/%s)"), documentinfo.GetVersion() == XMLVERSION_1_0 ? UNI_L("1.0") : UNI_L("1.1"), documentinfo.GetEncoding() ? documentinfo.GetEncoding() : UNI_L("<N/A>"), documentinfo.GetStandalone() == XMLSTANDALONE_NONE ? UNI_L("<N/A>") : documentinfo.GetStandalone() == XMLSTANDALONE_YES ? UNI_L("yes") : UNI_L("no")));
+      else
+        RETURN_IF_ERROR(documentinfo_string.AppendFormat(UNI_L("(no XMLDecl)")));
+      if (documentinfo.GetDoctypeDeclarationPresent())
+        RETURN_IF_ERROR(documentinfo_string.AppendFormat(UNI_L("(DoctypeDecl:%s/%s/%s/%s)"), documentinfo.GetDoctypeName(), documentinfo.GetPublicId() ? documentinfo.GetPublicId() : UNI_L("<N/A>"), documentinfo.GetSystemId() ? documentinfo.GetSystemId() : UNI_L("<N/A>"), documentinfo.GetInternalSubset() ? UNI_L("<internal subset>") : UNI_L("<no internal subset>")));
+      else
+        RETURN_IF_ERROR(documentinfo_string.AppendFormat(UNI_L("(no DoctypeDecl)")));
+      RETURN_IF_ERROR(result->AppendFormat(UNI_L("StartEntity:\n  uri=%s\n  documentinfo=%s\n  entity_reference=%s\n"), url_string.CStr(), documentinfo_string.CStr(), entity_reference ? UNI_L("TRUE") : UNI_L("FALSE")));
+
+      RETURN_IF_ERROR(HandleStartEntity(url, documentinfo, entity_reference));
+      OpString baseurl_string;
+      if (GetCurrentBaseUrl().IsEmpty())
+        RETURN_IF_ERROR(baseurl_string.Set(UNI_L("<empty>")));
+      else
+        RETURN_IF_ERROR(GetCurrentBaseUrl().GetAttribute(URL::KUniName, baseurl_string));
+      RETURN_IF_ERROR(result->AppendFormat(UNI_L("Current version: %s\nCurrent base URL: %s\n"), GetCurrentVersion() == XMLVERSION_1_0 ? UNI_L("1.0") : UNI_L("1.1"), baseurl_string.CStr()));
+
+      /* For coverage: */
+      return XMLLanguageParser::StartEntity(url, documentinfo, entity_reference);
+    }
+
+    virtual OP_STATUS StartElement(const XMLCompleteNameN &completename, BOOL fragment_start, BOOL &ignore_element)
+    {
+      RETURN_IF_ERROR(result->Append(UNI_L("StartElement: ")));
+      RETURN_IF_ERROR(AppendQName(completename));
+      RETURN_IF_ERROR(result->AppendFormat(UNI_L(" fragment_start=%s\n"), fragment_start ? UNI_L("TRUE") : UNI_L("FALSE")));
+
+      RETURN_IF_ERROR(HandleStartElement());
+
+      /* For coverage: */
+      return XMLLanguageParser::StartElement(completename, fragment_start, ignore_element);
+    }
+
+    virtual OP_STATUS AddAttribute(const XMLCompleteNameN &completename, const uni_char *value, unsigned value_length, BOOL specified, BOOL id)
+    {
+      RETURN_IF_ERROR(result->Append(UNI_L("AddAttribute: ")));
+      RETURN_IF_ERROR(AppendQName(completename));
+      RETURN_IF_ERROR(result->Append(UNI_L(" '")));
+      RETURN_IF_ERROR(AppendQuotedAndEscaped(value, value_length));
+      RETURN_IF_ERROR(result->AppendFormat(UNI_L("' specified=%s, id=%s\n"), specified ? UNI_L("TRUE") : UNI_L("FALSE"), id ? UNI_L("TRUE") : UNI_L("FALSE")));
+
+      XMLNamespaceDeclaration *declaration_before = GetCurrentNamespaceDeclaration();
+      OpString language_before;
+      if (GetCurrentLanguage())
+        RETURN_IF_ERROR(language_before.Set(GetCurrentLanguage()));
+      URL baseurl_before = GetCurrentBaseUrl();
+
+      RETURN_IF_ERROR(HandleAttribute(completename, value, value_length));
+
+      XMLNamespaceDeclaration *declaration_after = GetCurrentNamespaceDeclaration();
+      while (declaration_after != declaration_before)
+      {
+        RETURN_IF_ERROR(result->AppendFormat(UNI_L("  Declared NS: %s => %s\n"), declaration_after->GetPrefix() ? declaration_after->GetPrefix() : UNI_L("<default>"), declaration_after->GetUri() ? declaration_after->GetUri() : UNI_L("<undeclared>")));
+        declaration_after = declaration_after->GetPrevious();
+      }
+      OpString language_after;
+      if (GetCurrentLanguage())
+        RETURN_IF_ERROR(language_after.Set(GetCurrentLanguage()));
+      if (!language_before.IsEmpty() != !language_after.IsEmpty() || language_before.Compare(language_after) != 0)
+        RETURN_IF_ERROR(result->AppendFormat(UNI_L("  Declared language: %s\n"), language_after.IsEmpty() ? UNI_L("<none>") : language_after.CStr()));
+      URL baseurl_after = GetCurrentBaseUrl();
+      if (!(baseurl_before == baseurl_after))
+      {
+        OpString baseurl_string;
+        if (baseurl_after.IsEmpty())
+          RETURN_IF_ERROR(baseurl_string.Set(UNI_L("<empty>")));
+        else
+          RETURN_IF_ERROR(baseurl_after.GetAttribute(URL::KUniName, baseurl_string));
+        RETURN_IF_ERROR(result->AppendFormat(UNI_L("  Declared base URL: %s\n"), baseurl_string.CStr()));
+      }
+
+      /* For coverage: */
+      return XMLLanguageParser::AddAttribute(completename, value, value_length, specified, id);
+    }
+
+    virtual OP_STATUS StartContent()
+    {
+      RETURN_IF_ERROR(result->Append(UNI_L("StartContent\n")));
+
+      /* For coverage: */
+      return XMLLanguageParser::StartContent();
+    }
+
+    virtual OP_STATUS AddCharacterData(CharacterDataType type, const uni_char *value, unsigned value_length)
+    {
+      RETURN_IF_ERROR(result->Append(UNI_L("AddCharacterData: ")));
+      switch (type)
+      {
+      case XMLLanguageParser::CHARACTERDATA_TEXT:
+        RETURN_IF_ERROR(result->Append(UNI_L("TEXT '")));
+        break;
+      case XMLLanguageParser::CHARACTERDATA_TEXT_WHITESPACE:
+        RETURN_IF_ERROR(result->Append(UNI_L("WS '")));
+        break;
+      case XMLLanguageParser::CHARACTERDATA_CDATA_SECTION:
+        RETURN_IF_ERROR(result->Append(UNI_L("CDATA '")));
+        break;
+      }
+      RETURN_IF_ERROR(AppendQuotedAndEscaped(value, value_length));
+      RETURN_IF_ERROR(result->Append(UNI_L("'\n")));
+
+      /* For coverage: */
+      return XMLLanguageParser::AddCharacterData(type, value, value_length);
+    }
+
+    virtual OP_STATUS AddProcessingInstruction(const uni_char *target, unsigned target_length, const uni_char *data, unsigned data_length)
+    {
+      RETURN_IF_ERROR(result->Append(UNI_L("AddProcessingInstruction: ")));
+      RETURN_IF_ERROR(result->Append(target, target_length));
+      RETURN_IF_ERROR(result->Append(UNI_L(" '")));
+      RETURN_IF_ERROR(AppendQuotedAndEscaped(data, data_length));
+      RETURN_IF_ERROR(result->Append(UNI_L("'\n")));
+
+      /* For coverage: */
+      return XMLLanguageParser::AddProcessingInstruction(target, target_length, data, data_length);
+    }
+
+    virtual OP_STATUS EndElement(BOOL &block_out, BOOL &finished)
+    {
+      RETURN_IF_ERROR(result->Append(UNI_L("EndElement\n")));
+
+      XMLNamespaceDeclaration::Reference declaration_before(GetCurrentNamespaceDeclaration());
+      OpString language_before;
+      if (GetCurrentLanguage())
+        RETURN_IF_ERROR(language_before.Set(GetCurrentLanguage()));
+      URL baseurl_before = GetCurrentBaseUrl();
+
+      RETURN_IF_ERROR(HandleEndElement());
+
+      XMLNamespaceDeclaration *declaration_after = GetCurrentNamespaceDeclaration();
+      while (declaration_after != const_cast<const XMLNamespaceDeclaration::Reference &>(declaration_before))
+      {
+        RETURN_IF_ERROR(result->AppendFormat(UNI_L("  Undeclared NS: %s => %s\n"), declaration_before->GetPrefix() ? declaration_before->GetPrefix() : UNI_L("<default>"), declaration_before->GetUri() ? declaration_before->GetUri() : UNI_L("<undeclared>")));
+        declaration_before = declaration_before->GetPrevious();
+      }
+      OpString language_after;
+      if (GetCurrentLanguage())
+        RETURN_IF_ERROR(language_after.Set(GetCurrentLanguage()));
+      if (!language_before.IsEmpty() != !language_after.IsEmpty() || language_before.Compare(language_after) != 0)
+        RETURN_IF_ERROR(result->AppendFormat(UNI_L("  Undeclared language: %s => %s\n"), language_before.IsEmpty() ? UNI_L("<none>") : language_before.CStr(), language_after.IsEmpty() ? UNI_L("<none>") : language_after.CStr()));
+      URL baseurl_after = GetCurrentBaseUrl();
+      if (!(baseurl_before == baseurl_after))
+      {
+        OpString baseurl_before_string;
+        if (baseurl_before.IsEmpty())
+          RETURN_IF_ERROR(baseurl_before_string.Set(UNI_L("<empty>")));
+        else
+          RETURN_IF_ERROR(baseurl_before.GetAttribute(URL::KUniName, baseurl_before_string));
+        OpString baseurl_after_string;
+        if (baseurl_after.IsEmpty())
+          RETURN_IF_ERROR(baseurl_after_string.Set(UNI_L("<empty>")));
+        else
+          RETURN_IF_ERROR(baseurl_after.GetAttribute(URL::KUniName, baseurl_after_string));
+        RETURN_IF_ERROR(result->AppendFormat(UNI_L("  Undeclared base URL: %s => %s\n"), baseurl_before_string.CStr(), baseurl_after_string.CStr()));
+      }
+
+      /* For coverage: */
+      RETURN_IF_ERROR(XMLLanguageParser::EndElement(block, finished));
+
+      block_out = block;
+      return OpStatus::OK;
+    }
+
+    virtual void SetSourceCallback(SourceCallback *source_callback)
+    {
+      //OpStatus::Ignore(result->Append(UNI_L("SetSourceCallback\n")));
+
+      /* For coverage (and functionality): */
+      XMLLanguageParser::SetSourceCallback(source_callback);
+    }
+
+    virtual OP_STATUS EndEntity()
+    {
+      RETURN_IF_ERROR(result->Append(UNI_L("EndEntity\n")));
+
+      /* For coverage: */
+      return XMLLanguageParser::EndEntity();
+    }
+
+    virtual OP_STATUS XMLError()
+    {
+      RETURN_IF_ERROR(result->Append(UNI_L("XMLError\n")));
+
+      /* For coverage: */
+      return XMLLanguageParser::XMLError();
+    }
+
+#ifdef XML_ERRORS
+    virtual void SetLocation(const XMLRange &location)
+    {
+      OpString start_string, end_string;
+      if (location.start.IsValid())
+        OpStatus::Ignore(start_string.AppendFormat(UNI_L("(%u, %u)"), location.start.line, location.start.column));
+      else
+        OpStatus::Ignore(start_string.Set(UNI_L("<N/A>")));
+      if (location.end.IsValid())
+        OpStatus::Ignore(end_string.AppendFormat(UNI_L("(%u, %u)"), location.end.line, location.end.column));
+      else
+        OpStatus::Ignore(end_string.Set(UNI_L("<N/A>")));
+      OpStatus::Ignore(result->AppendFormat(UNI_L("SetLocation: start=%s, end=%s\n"), start_string.CStr(), end_string.CStr()));
+
+      /* For coverage: */
+      XMLLanguageParser::SetLocation(location);
+    }
+#endif // XML_ERRORS
+  };
+
+  class XMLLanguageParserTester_ParserListener
+    : public XMLParser::Listener
+  {
+  public:
+    XMLLanguageParserTester_ParserListener(OpString *result)
+      : result(result)
+    {
+    }
+
+    OpString *result;
+
+    virtual ~XMLLanguageParserTester_ParserListener()
+    {
+      OpStatus::Ignore(result->Append(UNI_L("XMLLanguageParserTester_ParserListener destroyed\n")));
+    }
+
+    virtual void Continue(XMLParser *parser)
+    {
+      OpStatus::Ignore(result->Append(UNI_L("XMLParser::Listener::Continue\n")));
+    }
+
+    virtual void Stopped(XMLParser *parser)
+    {
+      OpStatus::Ignore(result->Append(UNI_L("XMLParser::Listener::Stopped\n")));
+    }
+  };
+
+#ifdef XMLUTILS_XMLSERIALIZER_SUPPORT
+  class XMLLanguageParserTester_SerializerCallback
+    : public XMLSerializer::Callback
+  {
+  public:
+    XMLLanguageParserTester_SerializerCallback(OpString *result, XMLFragment *fragment = NULL, XMLLanguageParserTester *tester = NULL, XMLSerializer *serializer = NULL, OpFile *output_file = NULL)
+      : result(result),
+        fragment(fragment),
+        tester(tester),
+        serializer(serializer),
+        output_file(output_file)
+    {
+    }
+
+    OpString *result;
+    XMLFragment *fragment;
+    XMLLanguageParserTester *tester;
+    XMLSerializer *serializer;
+    OpFile *output_file;
+
+    virtual void Stopped(XMLSerializer::Callback::Status status)
+    {
+      switch (status)
+      {
+      case XMLSerializer::Callback::STATUS_COMPLETED:
+        OpStatus::Ignore(result->Append(UNI_L("XMLSerializer::Callback::Stopped(STATUS_COMPLETED)\n")));
+        break;
+      case XMLSerializer::Callback::STATUS_FAILED:
+        OpStatus::Ignore(result->Append(UNI_L("XMLSerializer::Callback::Stopped(STATUS_FAILED)\n")));
+        break;
+      case XMLSerializer::Callback::STATUS_OOM:
+        OpStatus::Ignore(result->Append(UNI_L("XMLSerializer::Callback::Stopped(STATUS_OOM)\n")));
+        break;
+      }
+      if (fragment && tester && serializer)
+      {
+        OP_DELETE(fragment);
+        OP_DELETE(serializer);
+        OP_DELETE(tester);
+
+        BOOL passed = TRUE;
+
+        OpString output_line;
+        while (!output_file->Eof() && passed)
+        {
+          passed = passed && output_file->ReadUTF8Line(output_line) == OpStatus::OK;
+          if (output_line.IsEmpty() && output_file->Eof())
+            continue;
+          passed = passed && output_line.Append(UNI_L("\n")) == OpStatus::OK;
+
+          if (passed)
+            {
+              if (output_line.Find(UNI_L("Via ")) == 0)
+                if (output_line.Find(UNI_L("Via XMLFragment/XMLSerializer: ")) != 0)
+                  continue;
+                else
+                  output_line.Delete(0, uni_strlen(UNI_L("Via XMLFragment/XMLSerializer: ")));
+
+              /* No location information is stored in XMLFragment. */
+              if (output_line.Find(UNI_L("SetLocation: ")) == 0)
+                continue;
+
+              passed = passed && result->Find(output_line.CStr()) == 0;
+              result->Delete(0, output_line.Length());
+            }
+        }
+
+        passed = passed && result->Length() == 0;
+        passed = passed && output_file->Close() == OpStatus::OK;
+
+        OP_DELETE(output_file);
+
+        if (passed)
+          ST_passed();
+        else
+          ST_failed("result was not correct");
+      }
+    }
+  };
+#endif // XMLUTILS_XMLSERIALIZER_SUPPORT
+}
+
+table input_files (const char *) filelist "input" name "xmllanguageparser*.input";
+
+// This table is needed for parse_tests.pike to catch the output files as well
+table output_files (const char *) filelist "input" name "xmllanguageparser*.output";
+
+test ("Test (via XMLParser): $(filename8)")
+  multi input_files (filename8);
+{
+  OpString filename_input;
+  verify(filename_input.SetFromUTF8(filename8) == OpStatus::OK);
+
+  OpString filename_output;
+  verify(filename_output.Set(filename_input) == OpStatus::OK);
+  filename_output.Delete(filename_output.Length() - 5);
+  verify(filename_output.Append(UNI_L("output")) == OpStatus::OK);
+
+  OpFile input_file, output_file;
+  BOOL input_exists, output_exists;
+
+  verify(input_file.Construct(filename_input.CStr()) == OpStatus::OK);
+  verify(input_file.Exists(input_exists) == OpStatus::OK);
+  verify(input_exists);
+  verify(input_file.Open(OPFILE_READ) == OpStatus::OK);
+
+  verify(output_file.Construct(filename_output.CStr()) == OpStatus::OK);
+  verify(output_file.Exists(output_exists) == OpStatus::OK);
+  verify(output_exists);
+  verify(output_file.Open(OPFILE_READ) == OpStatus::OK);
+
+  OpString input, input_line, fragment_id, uri;
+  while (!input_file.Eof())
+  {
+    verify(input_file.ReadUTF8Line(input_line) == OpStatus::OK);
+    if (input_line.IsEmpty() && input_file.Eof())
+      continue;
+    if (input_line.Find(UNI_L("fragment: ")) == 0)
+    {
+      verify(fragment_id.Set(input_line.CStr() + op_strlen("fragment: ")) == OpStatus::OK);
+    }
+    else if (input_line.Find(UNI_L("uri: ")) == 0)
+    {
+      verify(uri.Set(input_line.CStr() + op_strlen("uri: ")) == OpStatus::OK);
+    }
+    else
+    {
+      verify(input.AppendFormat(UNI_L("%s\n"), input_line.CStr()) == OpStatus::OK);
+    }
+  }
+
+  verify(input_file.Close() == OpStatus::OK);
+
+  OpString result;
+
+  XMLLanguageParserTester *tester = OP_NEW(XMLLanguageParserTester, (&result));
+  XMLLanguageParserTester_ParserListener *listener = OP_NEW(XMLLanguageParserTester_ParserListener, (&result));
+
+  XMLTokenHandler *tokenhandler;
+  XMLParser *parser;
+  URL url;
+
+  if (!uri.IsEmpty())
+    url = g_url_api->GetURL(uri.CStr());
+
+  verify(XMLLanguageParser::MakeTokenHandler(tokenhandler, tester, fragment_id.IsEmpty() ? NULL : fragment_id.CStr()) == OpStatus::OK);
+  verify(XMLParser::Make(parser, listener, (MessageHandler *) NULL, tokenhandler, url) == OpStatus::OK);
+
+  XMLParser::Configuration configuration;
+  configuration.load_external_entities = XMLParser::LOADEXTERNALENTITIES_YES;
+  configuration.store_internal_subset = TRUE;
+  configuration.max_tokens_per_call = 0;
+  parser->SetConfiguration(configuration);
+
+  parser->SetOwnsListener();
+  parser->SetOwnsTokenHandler();
+
+  while (!parser->IsFinished() && !parser->IsFailed())
+  {
+    tester->SignalSourceCallbackIfSet();
+
+    unsigned consumed;
+    verify(parser->Parse(input.CStr(), input.Length(), FALSE, &consumed) == OpStatus::OK);
+    if (consumed != 0)
+      input.Delete(0, consumed);
+  }
+
+  OP_DELETE(parser);
+  OP_DELETE(tester);
+
+#ifdef XMLUTILS_GENERATE_REFERENCE_OUTPUT
+  OpString filename_reference;
+  verify(filename_reference.Set(filename_input) == OpStatus::OK);
+  filename_reference.Delete(filename_reference.Length() - 5);
+  verify(filename_reference.Append(UNI_L("reference1")) == OpStatus::OK);
+
+  OpFile reference_file;
+  verify(reference_file.Construct(filename_reference.CStr()) == OpStatus::OK);
+  verify(reference_file.Open(OPFILE_WRITE) == OpStatus::OK);
+  OpString8 result8;
+  verify(result8.SetUTF8FromUTF16(result.CStr()) == OpStatus::OK);
+  verify(reference_file.Write(result8.CStr(), result8.Length()) == OpStatus::OK);
+  verify(reference_file.Close() == OpStatus::OK);
+#endif // XMLUTILS_GENERATE_REFERENCE_OUTPUT
+
+  OpString output_line;
+  while (!output_file.Eof())
+  {
+    verify(output_file.ReadUTF8Line(output_line) == OpStatus::OK);
+    if (output_line.IsEmpty() && output_file.Eof())
+      continue; // blank line, happens at Eof().
+    verify(output_line.Append(UNI_L("\n")) == OpStatus::OK);
+
+#ifndef XML_ERRORS
+    if (output_line.Find(UNI_L("SetLocation: ")) == 0)
+      continue;
+#endif // XML_ERRORS
+
+    if (output_line.Find(UNI_L("Via ")) == 0)
+      if (output_line.Find(UNI_L("Via XMLParser: ")) != 0)
+        continue;
+      else
+        output_line.Delete(0, uni_strlen(UNI_L("Via XMLParser: ")));
+
+    verify(result.Find(output_line.CStr()) == 0);
+    result.Delete(0, output_line.Length());
+  }
+
+  verify(result.Length() == 0);
+  verify(output_file.Close() == OpStatus::OK);
+}
+
+test ("Test (via XMLFragment/XMLSerializer): $(filename8)")
+  require XMLUTILS_XMLFRAGMENT_SUPPORT;
+  require XMLUTILS_XMLSERIALIZER_SUPPORT;
+  multi input_files (filename8);
+{
+  OpString filename_input;
+  verify(filename_input.SetFromUTF8(filename8) == OpStatus::OK);
+
+  OpString filename_output;
+  verify(filename_output.Set(filename_input) == OpStatus::OK);
+  filename_output.Delete(filename_output.Length() - 5);
+  verify(filename_output.Append(UNI_L("output")) == OpStatus::OK);
+
+  OpFile input_file, output_file;
+  BOOL input_exists, output_exists;
+
+  verify(input_file.Construct(filename_input.CStr()) == OpStatus::OK);
+  verify(input_file.Exists(input_exists) == OpStatus::OK);
+  verify(input_exists);
+  verify(input_file.Open(OPFILE_READ) == OpStatus::OK);
+
+  verify(output_file.Construct(filename_output.CStr()) == OpStatus::OK);
+  verify(output_file.Exists(output_exists) == OpStatus::OK);
+  verify(output_exists);
+  verify(output_file.Open(OPFILE_READ) == OpStatus::OK);
+
+  OpString input, input_line, fragment_id, uri;
+  while (!input_file.Eof())
+  {
+    verify(input_file.ReadUTF8Line(input_line) == OpStatus::OK);
+    if (input_line.IsEmpty() && input_file.Eof())
+      continue;
+    if (input_line.Find(UNI_L("fragment: ")) == 0)
+    {
+      verify(fragment_id.Set(input_line.CStr() + op_strlen("fragment: ")) == OpStatus::OK);
+    }
+    else if (input_line.Find(UNI_L("uri: ")) == 0)
+    {
+      verify(uri.Set(input_line.CStr() + op_strlen("uri: ")) == OpStatus::OK);
+    }
+    else
+    {
+      verify(input.AppendFormat(UNI_L("%s\n"), input_line.CStr()) == OpStatus::OK);
+    }
+  }
+
+  verify(input_file.Close() == OpStatus::OK);
+
+  XMLFragment fragment;
+
+  fragment.SetDefaultWhitespaceHandling(XMLWHITESPACEHANDLING_PRESERVE);
+
+  verify(fragment.Parse(input.CStr(), input.Length()) == OpStatus::OK);
+
+  OpString result;
+
+  XMLLanguageParserTester *tester = OP_NEW(XMLLanguageParserTester, (&result));
+  XMLLanguageParserTester_SerializerCallback *callback = OP_NEW(XMLLanguageParserTester_SerializerCallback, (&result));
+
+  XMLSerializer *serializer;
+  URL url;
+
+  if (!uri.IsEmpty())
+    url = g_url_api->GetURL(uri.CStr());
+
+  verify(XMLLanguageParser::MakeSerializer(serializer, tester) == OpStatus::OK);
+
+  XMLSerializer::Configuration configuration;
+  configuration.normalize_namespaces = FALSE;
+  configuration.discard_default_content = FALSE;
+  serializer->SetConfiguration(configuration);
+
+  verify(serializer->Serialize(NULL, url, &fragment, callback) == OpStatus::OK);
+
+  OP_DELETE(serializer);
+  OP_DELETE(callback);
+  OP_DELETE(tester);
+
+#ifdef XMLUTILS_GENERATE_REFERENCE_OUTPUT
+  OpString filename_reference;
+  verify(filename_reference.Set(filename_input) == OpStatus::OK);
+  filename_reference.Delete(filename_reference.Length() - 5);
+  verify(filename_reference.Append(UNI_L("reference2")) == OpStatus::OK);
+
+  OpFile reference_file;
+  verify(reference_file.Construct(filename_reference.CStr()) == OpStatus::OK);
+  verify(reference_file.Open(OPFILE_WRITE) == OpStatus::OK);
+  OpString8 result8;
+  verify(result8.SetUTF8FromUTF16(result.CStr()) == OpStatus::OK);
+  verify(reference_file.Write(result8.CStr(), result8.Length()) == OpStatus::OK);
+  verify(reference_file.Close() == OpStatus::OK);
+#endif // XMLUTILS_GENERATE_REFERENCE_OUTPUT
+
+  OpString output_line;
+  while (!output_file.Eof())
+  {
+    verify(output_file.ReadUTF8Line(output_line) == OpStatus::OK);
+    if (output_line.IsEmpty() && output_file.Eof())
+      continue; // blank line, happens at Eof().
+    verify(output_line.Append(UNI_L("\n")) == OpStatus::OK);
+
+    if (output_line.Find(UNI_L("Via ")) == 0)
+      if (output_line.Find(UNI_L("Via XMLFragment/XMLSerializer: ")) != 0)
+        continue;
+      else
+        output_line.Delete(0, uni_strlen(UNI_L("Via XMLFragment/XMLSerializer: ")));
+
+    /* No location information is stored in XMLFragment. */
+    if (output_line.Find(UNI_L("SetLocation: ")) == 0)
+      continue;
+
+    verify(result.Find(output_line.CStr()) == 0);
+    result.Delete(0, output_line.Length());
+  }
+
+  verify(result.Length() == 0);
+  verify(output_file.Close() == OpStatus::OK);
+}
+
+test ("Test (via XMLParser, blocking): $(filename8)")
+  multi input_files (filename8);
+  disabled;
+{
+  OpString filename_input;
+  verify(filename_input.SetFromUTF8(filename8) == OpStatus::OK);
+
+  OpString filename_output;
+  verify(filename_output.Set(filename_input) == OpStatus::OK);
+  filename_output.Delete(filename_output.Length() - 5);
+  verify(filename_output.Append(UNI_L("output")) == OpStatus::OK);
+
+  OpFile input_file, output_file;
+  BOOL input_exists, output_exists;
+
+  verify(input_file.Construct(filename_input.CStr()) == OpStatus::OK);
+  verify(input_file.Exists(input_exists) == OpStatus::OK);
+  verify(input_exists);
+  verify(input_file.Open(OPFILE_READ) == OpStatus::OK);
+
+  verify(output_file.Construct(filename_output.CStr()) == OpStatus::OK);
+  verify(output_file.Exists(output_exists) == OpStatus::OK);
+  verify(output_exists);
+  verify(output_file.Open(OPFILE_READ) == OpStatus::OK);
+
+  OpString input, input_line, fragment_id, uri;
+  while (!input_file.Eof())
+  {
+    verify(input_file.ReadUTF8Line(input_line) == OpStatus::OK);
+    if (input_line.IsEmpty() && input_file->Eof())
+      continue;
+    if (input_line.Find(UNI_L("fragment: ")) == 0)
+    {
+      verify(fragment_id.Set(input_line.CStr() + op_strlen("fragment: ")) == OpStatus::OK);
+    }
+    else if (input_line.Find(UNI_L("uri: ")) == 0)
+    {
+      verify(uri.Set(input_line.CStr() + op_strlen("uri: ")) == OpStatus::OK);
+    }
+    else
+    {
+      verify(input.AppendFormat(UNI_L("%s\n"), input_line.CStr()) == OpStatus::OK);
+    }
+  }
+
+  verify(input_file.Close() == OpStatus::OK);
+
+  OpString result;
+
+  XMLLanguageParserTester *tester = OP_NEW(XMLLanguageParserTester, (&result, TRUE));
+  XMLLanguageParserTester_ParserListener *listener = OP_NEW(XMLLanguageParserTester_ParserListener, (&result));
+
+  XMLTokenHandler *tokenhandler;
+  XMLParser *parser;
+  URL url;
+
+  if (!uri.IsEmpty())
+    url = g_url_api->GetURL(uri.CStr());
+
+  verify(XMLLanguageParser::MakeTokenHandler(tokenhandler, tester, fragment_id.IsEmpty() ? NULL : fragment_id.CStr()) == OpStatus::OK);
+  verify(XMLParser::Make(parser, listener, (MessageHandler *) NULL, tokenhandler, url) == OpStatus::OK);
+
+  XMLParser::Configuration configuration;
+  configuration.load_external_entities = XMLParser::LOADEXTERNALENTITIES_YES;
+  configuration.store_internal_subset = TRUE;
+  configuration.max_tokens_per_call = 0;
+  parser->SetConfiguration(configuration);
+
+  parser->SetOwnsListener();
+  parser->SetOwnsTokenHandler();
+
+  while (!parser->IsFinished() && !parser->IsFailed())
+  {
+    tester->SignalSourceCallbackIfSet();
+
+    unsigned consumed;
+    verify(parser->Parse(input.CStr(), input.Length(), FALSE, &consumed) == OpStatus::OK);
+    if (consumed != 0)
+      input.Delete(0, consumed);
+  }
+
+  OP_DELETE(parser);
+  OP_DELETE(tester);
+
+  OpString output_line;
+  while (!output_file.Eof())
+  {
+    verify(output_file.ReadUTF8Line(output_line) == OpStatus::OK);
+    if (output_line.IsEmpty() && output_file->Eof())
+      continue;
+    verify(output_line.Append(UNI_L("\n")) == OpStatus::OK);
+
+#ifndef XML_ERRORS
+    if (output_line.Find(UNI_L("SetLocation: ")) == 0)
+      continue;
+#endif // XML_ERRORS
+
+    if (output_line.Find(UNI_L("Via ")) == 0)
+      if (output_line.Find(UNI_L("Via XMLParser: ")) != 0)
+        continue;
+      else
+        output_line.Delete(0, uni_strlen(UNI_L("Via XMLParser: ")));
+
+    verify(result.Find(output_line.CStr()) == 0);
+    result.Delete(0, output_line.Length());
+  }
+
+  verify(result.Length() == 0);
+  verify(output_file.Close() == OpStatus::OK);
+}
+
+test ("Test (via XMLFragment/XMLSerializer, blocking): $(filename8)")
+  require XMLUTILS_XMLFRAGMENT_SUPPORT;
+  require XMLUTILS_XMLSERIALIZER_SUPPORT;
+  multi input_files (filename8);
+  async;
+  disabled;
+{
+#define VERIFY(condition) if (!(condition)) ST_failed("VERIFY() failed");
+
+  OpString filename_input;
+  VERIFY(filename_input.SetFromUTF8(filename8) == OpStatus::OK);
+
+  OpString filename_output;
+  VERIFY(filename_output.Set(filename_input) == OpStatus::OK);
+  filename_output.Delete(filename_output.Length() - 5);
+  VERIFY(filename_output.Append(UNI_L("output")) == OpStatus::OK);
+
+  OpFile input_file, *output_file = OP_NEW(OpFile, ());
+  BOOL input_exists, output_exists;
+
+  VERIFY(input_file.Construct(filename_input.CStr()) == OpStatus::OK);
+  VERIFY(input_file.Exists(input_exists) == OpStatus::OK);
+  VERIFY(input_exists);
+  VERIFY(input_file.Open(OPFILE_READ) == OpStatus::OK);
+
+  VERIFY(output_file->Construct(filename_output.CStr()) == OpStatus::OK);
+  VERIFY(output_file->Exists(output_exists) == OpStatus::OK);
+  VERIFY(output_exists);
+  VERIFY(output_file->Open(OPFILE_READ) == OpStatus::OK);
+
+  OpString input, input_line, fragment_id, uri;
+  while (!input_file.Eof())
+  {
+    VERIFY(input_file.ReadUTF8Line(input_line) == OpStatus::OK);
+    if (input_line.IsEmpty() && input_file->Eof())
+      continue;
+    if (input_line.Find(UNI_L("fragment: ")) == 0)
+    {
+      VERIFY(fragment_id.Set(input_line.CStr() + op_strlen("fragment: ")) == OpStatus::OK);
+    }
+    else if (input_line.Find(UNI_L("uri: ")) == 0)
+    {
+      VERIFY(uri.Set(input_line.CStr() + op_strlen("uri: ")) == OpStatus::OK);
+    }
+    else
+    {
+      VERIFY(input.AppendFormat(UNI_L("%s\n"), input_line.CStr()) == OpStatus::OK);
+    }
+  }
+
+  VERIFY(input_file.Close() == OpStatus::OK);
+
+  XMLFragment *fragment = OP_NEW(XMLFragment, ());
+
+  fragment->SetDefaultWhitespaceHandling(XMLWHITESPACEHANDLING_PRESERVE);
+
+  VERIFY(fragment->Parse(input.CStr(), input.Length()) == OpStatus::OK);
+
+  OpString *result = OP_NEW(OpString, ());
+
+  XMLLanguageParserTester *tester = OP_NEW(XMLLanguageParserTester, (result, TRUE));
+  XMLSerializer *serializer;
+
+  VERIFY(XMLLanguageParser::MakeSerializer(serializer, tester) == OpStatus::OK);
+
+  XMLLanguageParserTester_SerializerCallback *callback = OP_NEW(XMLLanguageParserTester_SerializerCallback, (result, fragment, tester, serializer, output_file));
+
+  URL url;
+
+  if (!uri.IsEmpty())
+    url = g_url_api->GetURL(uri.CStr());
+
+  XMLSerializer::Configuration configuration;
+  configuration.normalize_namespaces = FALSE;
+  configuration.discard_default_content = FALSE;
+  serializer->SetConfiguration(configuration);
+
+  VERIFY(serializer->Serialize(g_main_message_handler, url, fragment, callback) == OpStatus::OK);
+
+  OP_DELETE(callback);
+
+#undef VERIFY
+}

@@ -1,0 +1,282 @@
+group "DOM.JIL.Messaging.Attachment";
+
+require GADGET_SUPPORT;
+require DOM_JIL_API_SUPPORT;
+include "modules/security_manager/include/security_manager.h";
+include "modules/gadgets/gadget_selftest_utils.h";
+include "modules/device_api/jil/JILFSMgr.h";
+
+global
+{
+	OpSecurityManager::PrivilegedBlock disable_security;
+	OpAutoVector<OpString> g_current_virt_roots;
+	OpString g_selftest_mount_point;
+
+	GadgetSelftestUtils g_utils;
+}
+
+exit
+{
+	g_utils.UnloadGadget();
+
+	g_DAPI_jil_fs_mgr->RemoveMapping(g_selftest_mount_point, NULL, NULL);
+	for (UINT32 i = 0; i < g_current_virt_roots.GetCount(); ++i)
+		g_DAPI_jil_fs_mgr->SetActive(g_current_virt_roots.Get(i)->CStr(), TRUE);
+}
+
+table dummy1(const char *) filelist "messaging_test_wgt" recursively;
+
+test("Load Messaging test widget")
+	file zip_file "messaging_test_wgt/config.xml";
+	async;
+{
+	OP_GADGET_STATUS status = g_utils.LoadGadgetForSelftest(zip_file, URL_GADGET_INSTALL_CONTENT);
+
+	if (OpStatus::IsError(status))
+		ST_failed("Unable to install test widget, status: %d", status);
+	else if (status != OpGadgetStatus::OK_SIGNATURE_VERIFICATION_IN_PROGRESS)
+		ST_passed();
+}
+
+test("Setup JIL FS mapping configuration")
+	file uni mount_point "messaging_test_wgt";
+{
+	verify_success(g_DAPI_jil_fs_mgr->GetAvailableVirtualDirs(&g_current_virt_roots));
+	for (UINT32 i = 0; i < g_current_virt_roots.GetCount(); ++i)
+	{
+		verify_success(g_DAPI_jil_fs_mgr->SetActive(g_current_virt_roots.Get(i)->CStr(), FALSE));
+	}
+
+	verify_success(g_selftest_mount_point.Set(mount_point));
+
+	verify_success(g_DAPI_jil_fs_mgr->AddMapping(mount_point, UNI_L(PATHSEP), UNI_L("/selftest"), TRUE));
+}
+
+test("Test Messaging existence")
+	language ecmascript;
+	require success "Load Messaging test widget";
+{
+	verify(Widget);
+	verify(Widget.Messaging);
+}
+
+test("Test Messaging.Attachment constructor")
+	language ecmascript;
+{
+	var attachment = new Widget.Messaging.Attachment;
+	verify(attachment);
+	verify(attachment.MIMEType === undefined);
+	verify(attachment.fileName === undefined);
+	verify(attachment.size === undefined);
+	verify(attachment instanceof Widget.Messaging.Attachment);
+}
+
+test("Test Messaging.Attachment null all properties")
+	require success "Test Messaging.Attachment constructor";
+	language ecmascript;
+{
+	var attachment = new Widget.Messaging.Attachment;
+	attachment.fileName = null;
+	attachment.MIMEType = null;
+	attachment.size = null;
+	verify(attachment.MIMEType === null);
+	attachment.MIMEType = undefined;
+	verify(attachment.MIMEType === undefined);
+	verify(attachment.fileName === null);
+	verify(attachment.size === null);
+}
+
+test("Test Messaging.Attachment assign all properties")
+	require success "Test Messaging.Attachment constructor";
+	language ecmascript;
+{
+	var attachment = new Widget.Messaging.Attachment;
+	attachment.fileName = 'a';
+	attachment.MIMEType = 'b';
+	attachment.size = 7;
+	verify(attachment.fileName == 'a');
+	verify(attachment.MIMEType == 'b');
+	verify(attachment.size == 7);
+}
+
+test("Test Message.addAttachment")
+	language ecmascript;
+	require success "Setup JIL FS mapping configuration";
+{
+	var message = Widget.Messaging.createMessage(Widget.Messaging.MessageTypes.EmailMessage);
+	message.addAttachment(fileToAttach);
+	verify(message.attachments);
+	verify(message.attachments);
+	verify(message.attachments.length == 1);
+	verify(message.attachments[0]);
+	verify(message.attachments[0] instanceof Widget.Messaging.Attachment);
+}
+
+test("Test Message.attachments property")
+	language ecmascript;
+	require success "Test Message.addAttachment";
+{
+	var message = Widget.Messaging.createMessage(Widget.Messaging.MessageTypes.EmailMessage);
+	// add attachment
+	message.addAttachment(fileToAttach);
+	verify(message.attachments.length == 1);
+	var attachment = message.attachments[0];
+	verify(attachment.MIMEType == "application/octet-stream");
+	verify(attachment.fileName == "fileToAttach");
+	verify(attachment.size == 7);
+
+	// add second attachment
+	message.addAttachment(secondFileToAttach);
+	verify(message.attachments.length == 2);
+	attachment = message.attachments[0];
+	verify(attachment.MIMEType == "application/octet-stream");
+	verify(attachment.fileName == "fileToAttach");
+	verify(attachment.size == 7);
+	attachment = message.attachments[1];
+	verify(attachment.MIMEType == "application/octet-stream");
+	verify(attachment.fileName == "secondFileToAttach");
+	verify(attachment.size == 14);
+
+	// set one attachment to null
+	message.attachments[1] = null;
+	verify(message.attachments[0] != null);
+	verify(message.attachments[1] == null);
+
+	// nullify reference to attachment
+	var attachment_copy = message.attachments[2];
+	attachment_copy = null;
+	verify(message.attachments[2] == null);
+
+	// null whole collection
+	message.attachments = null;
+	verify(message.attachments == null);
+	message.addAttachment(secondFileToAttach);
+	verify(message.attachments.length == 1);
+	verify(attachment.MIMEType == "application/octet-stream");
+	verify(attachment.fileName == "secondFileToAttach");
+	verify(attachment.size == 14);
+
+	message.attachments[7] = message.attachments[0];
+	verify(message.attachments.length == 8);
+	verify(message.attachments[6] == undefined);
+	verify(message.attachments[7]);
+	verify(attachment.MIMEType == "application/octet-stream");
+	verify(attachment.fileName == "secondFileToAttach");
+	verify(attachment.size == 14);
+}
+
+test("Test Message.attachments property as array")
+	language ecmascript;
+	require success "Test Message.attachments property";
+{
+	var message_first = Widget.Messaging.createMessage(Widget.Messaging.MessageTypes.EmailMessage);
+	var message_second = Widget.Messaging.createMessage(Widget.Messaging.MessageTypes.EmailMessage);
+	var message_third = Widget.Messaging.createMessage(Widget.Messaging.MessageTypes.EmailMessage);
+	message_first.addAttachment(fileToAttach);
+	var attachment_first = message_first.attachments[0];
+
+	message_second.attachments = [attachment_first, attachment_first, attachment_first];
+	verify(message_second.attachments.length == 3);
+	var attachment_second = message_second.attachments[0];
+	verify(attachment_second.MIMEType == "application/octet-stream");
+	verify(attachment_second.fileName == "fileToAttach");
+	verify(attachment_second.size == 7);
+	attachment_second = message_second.attachments[1];
+	verify(attachment_second.MIMEType == "application/octet-stream");
+	verify(attachment_second.fileName == "fileToAttach");
+	verify(attachment_second.size == 7);
+	attachment_second = message_second.attachments[2];
+	verify(attachment_second.MIMEType == "application/octet-stream");
+	verify(attachment_second.fileName == "fileToAttach");
+	verify(attachment_second.size == 7);
+
+	message_third.attachments = message_second.attachments;
+
+	message_second.attachments[0].fileName = "other";
+	verify(message_second.attachments[0].fileName == "other");
+	verify(message_first.attachments[0].fileName == "fileToAttach");
+	verify(message_third.attachments[0].fileName == "fileToAttach");
+}
+
+test("Test Message.deleteAttachment")
+	language ecmascript;
+	require success "Test Message.attachments property";
+{
+	var message = Widget.Messaging.createMessage(Widget.Messaging.MessageTypes.EmailMessage);
+	message.addAttachment(fileToAttach);
+	message.addAttachment(fileToAttach);
+	message.addAttachment(secondFileToAttach);
+	message.addAttachment(fileToAttach);
+	message.deleteAttachment(message.attachments[2]);
+	verify(message.attachments.length == 3);
+
+	message.addAttachment(fileToAttach);
+	message.addAttachment(secondFileToAttach);
+	verify(message.attachments.length == 5);
+	message.deleteAttachment(message.attachments[4]);
+	verify(message.attachments.length == 4);
+}
+
+test("Test Message deleteAttachment which is not in Message.attachments[]")
+	language ecmascript;
+	require success "Test Message.deleteAttachment";
+{
+	var message = Widget.Messaging.createMessage(Widget.Messaging.MessageTypes.EmailMessage);
+	message.addAttachment(fileToAttach);
+	var secondMessage = Widget.Messaging.createMessage(Widget.Messaging.MessageTypes.EmailMessage);
+	secondMessage.addAttachment(secondFileToAttach);
+
+	var catched = false;
+	try
+	{
+		message.deleteAttachment(secondMessage.attachments[0]);
+	} catch(e) {
+		verify(e.type == Widget.ExceptionTypes.INVALID_PARAMETER);
+		catched = true;
+	}
+	verify(catched);
+}
+
+test("Test Message.deleteAttachment in NULL-contaminated array")
+	language ecmascript;
+	require success "Test Message.deleteAttachment";
+{
+	var message = Widget.Messaging.createMessage(Widget.Messaging.MessageTypes.EmailMessage);
+	message.addAttachment(fileToAttach);
+	message.attachments[1] = null;
+	message.addAttachment(secondFileToAttach);
+	verify(message.attachments.length == 3);
+	message.deleteAttachment(message.attachments[2]);
+	verify(message.attachments.length == 2);
+}
+
+test("Test Message.attachments[] operator in")
+	language ecmascript;
+	require success "Test Message.attachments property";
+{
+	var message = Widget.Messaging.createMessage(Widget.Messaging.MessageTypes.EmailMessage);
+	message.addAttachment(fileToAttach);
+	message.addAttachment(fileToAttach);
+	message.addAttachment(fileToAttach);
+	message.addAttachment(secondFileToAttach);
+	message.attachments[32000] = message.attachments[0];
+	message.attachments[32000000] = message.attachments[3];
+
+	var index_sum = 0;
+	for (var i in message.attachments)
+	{
+		verify(typeof(message.attachments[i]) == 'object');
+		index_sum += parseInt(i);
+	}
+	verify(index_sum == 32032006);
+}
+
+test("Test message.saveAttachment")	
+	language ecmascript;	
+	require success "Test Message.addAttachment";	
+{
+	var message = Widget.Messaging.createMessage(Widget.Messaging.MessageTypes.EmailMessage);	
+	message.addAttachment(fileToAttach);	
+	message.saveAttachment(fileToAttach + "-tosave", message.attachments[0]);
+}
+

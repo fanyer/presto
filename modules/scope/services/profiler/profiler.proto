@@ -1,0 +1,758 @@
+syntax = "scope";
+
+/**
+ * This service provides a way to measure the time spent by various `Events`
+ * in a certain window. This information can be used to pinpoint performance
+ * problems in a web page or web application.
+ *
+ * The profiler is started and stopped manually by the client, and `Events` are
+ * recorded for the specified window in that interval. Each such start/stop pair
+ * will produce a `Session`, which is explained in the section that follows.
+ *
+ * `Events` that take place during profiling can currently not be sent in
+ * real-time, and are available only after the fact when profiling is stopped.
+ * This may be supported in a later version of the profiler, though.
+ *
+ * While not required, it is highly recommended to disable other resource
+ * intensive services while profiling, especially:
+ *
+ * - EcmascriptDebugger
+ * - ResourceManager
+ *
+ * Session
+ * -------
+ * Each profiling session produces a `Session`. A `Session` contains one
+ * `Timeline` for each frame that existed (at some point in time) during
+ * profiling.
+ *
+ * A *frame* is a container for *documents*. A frame can contain multiple
+ * documents over time, but does not contain more than one document at once.
+ *
+ * The documents that are loaded in frames during profiling, are also covered
+ * in the report. If multiple documents are loaded in the same frame during
+ * profiling, they will share the same `Timeline`.
+ *
+ * Once a `Session` is created, it will continue to exist until explicitly
+ * removed with `ReleaseSession`, or until the service is disabled.
+ *
+ * Timelines
+ * ---------
+ * A timeline is a collection of `Events`, ordered according to the start of the
+ * `Interval` of each `Event`. The `Events` in the `Timeline` are organized in
+ * a tree, with the `Timeline` itself as the root `Event`. Each `Event` can have
+ * any number of children.
+ *
+ * A child `Event` represents an `Event` which is directly triggered by another
+ * `Event`. The parent `Event` must be on the call stack when this happens for
+ * the parent-child relationship to be established. There will be no
+ * parent-child relationship between `Events` triggered asynchrounsly by another
+ * `Event`, such as a script triggering a CSS reload at a 'later time'.
+ * (This relationship, however, will be obvious to the user if the `Events` are
+ * presented on a `Timeline`).
+ *
+ * Events
+ * ------
+ * An `Event` measures how long a certain operation took in Core. Examples of
+ * `Events` are:
+ *
+ * - Selector matching for a certain selector.
+ * - Imagine decoding for a certain image.
+ * - ECMAScript execution for a certain thread.
+ *
+ * Time Information
+ * ----------------
+ * All time fields in this service are specified in milliseconds, and time is
+ * counted since profiling began (i.e. profiling began at '0' millliseconds).
+ */
+service Profiler
+{
+    option (version) = "1.1";
+
+    /**
+     * Start profiling a window. Currently, only one profiling session is
+     * allowed at the same time. If a profiling session is already in progress,
+     * `BAD_REQUEST` is returned.
+     */
+    command StartProfiler(StartProfilerArg) returns (SessionID) = 1;
+
+    /**
+     * Stop the profiler. `BAD_REQUEST` is returned if we are not profiling.
+     *
+     * When the profiler is stopped, post processing of the `Timelines` takes
+     * place (e.g. aggregation of timing information in the `Event` tree). For
+     * large trees, this process may be split up into multiple time slices, and
+     * may therefore be completed asynchronously. Profiling itself is stopped
+     * immediately when this command is received, however, the response will not
+     * be sent until post processing is done.
+     *
+     * A user-interface should make this information clear to the user, by, for
+     * instance, indicating that the information is "loading" until the response
+     * arrives.
+     */
+    command StopProfiler(StopProfilerArg) returns (Session) = 2;
+
+    /**
+     * Get `Events` from a `Timeline`.
+     *
+     * This command can extract `Events` from the `Timeline`, or a part of the
+     * `Timeline`. It can also process the selected `Events` using certain
+     * built-in operations (e.g. `REDUCE_ALL`) which are
+     */
+    command GetEvents(GetEventsArg) returns (Events) = 3;
+
+    /**
+     * Release a `Session`. The `Session` ID, and `Timelines` contained within
+     * the `Session` are no longer valid after the `Session` has been released.
+     *
+     * Only stopped `Session` can be released.
+     */
+    command ReleaseSession(ReleaseSessionArg) returns (Default) = 4;
+}
+
+message Interval
+{
+    /**
+     * The start of the `Interval`. If not present, this is an left-open
+     * `Interval` ([-inf, N]).
+     */
+    optional double start = 1;
+
+    /**
+     * The end of the `Interval`. If not present, this is an right-open
+     * `Interval` ([N, +inf]).
+     */
+    optional double end = 2;
+}
+
+/**
+ * Defines an `Area` by its top-left corner and width/height.
+ */
+message Area
+{
+    required int32 x = 1;
+    required int32 y = 2;
+    required int32 w = 3;
+    required int32 h = 4;
+
+    /**
+     * The scroll offsets of the view in which area is defined.
+     *
+     * @since 1.1
+     */
+    optional int32 ox = 5;
+    optional int32 oy = 6;
+}
+
+message StartProfilerArg
+{
+    enum StartMode
+    {
+        /**
+         * Start profiling immediately.
+         */
+        IMMEDIATE = 1;
+
+        /**
+         * Start profiling as soon as a URL is about to be opened in the desired
+         * window.
+         */
+        URL = 2;
+    }
+
+    /**
+     * Describes when profiling shall begin.
+     */
+    required StartMode startMode = 1;
+
+    /**
+     * Monitor activity in this window.
+     */
+    required uint32 windowID = 2;
+}
+
+message StopProfilerArg
+{
+    /**
+     * The `Session` to stop.
+     */
+    required uint32 sessionID = 1;
+}
+
+message GetEventsArg
+{
+    /**
+     * Describes different ways `Events` can be returned.
+     */
+    enum Mode
+    {
+        /**
+         * Return each `Event` unprocessed.
+         *
+         * When using this mode, each `Event` in the `Timeline` may contain
+         * type specific data, which provides additional information about the
+         * `Event`, such as the `Area` that was painted for `PAINT` `Events`.
+         */
+        ALL = 1;
+
+        /**
+         * Reduce all `Events` of the same type into the same *virtual* `Event`.
+         * Timing information and number of hits will then be summarized into
+         * that single `Event` (for each type).
+         *
+         * This makes it possible to provide a summary which says how much time
+         * was spent in total on a certain activity, e.g. CSS selector matching.
+         */
+        REDUCE_UNIQUE_TYPES = 2;
+
+        /**
+         * Reduce all equal `Events` into the same *virtual* `Event`. Timing
+         * information and number of hits will then be summarized into a single
+         * *virtual* `Event`.
+         *
+         * An `Event` is equal to another `Event` if they both have the same
+         * type, and both have the same type-specific data. For instance, two
+         * CSS selector matching `Events` are equal if they have the same
+         * selector text.
+         *
+         * This makes it possible to pinpoint specific performance problems in
+         * the profiling session. For instance, an overview of total time spent
+         * matching a single CSS selector can be provided.
+         */
+        REDUCE_UNIQUE_EVENTS = 3;
+
+        /**
+         * Reduce all `Events` (regardless of their types and content) into the
+         * same *virtual* `Event`. This creates a summary of the total time
+         * recording across all `Event` types. The returned `Event` will have
+         * type 'GENERIC', and contain no type-specific data.
+         *
+         * When using this mode, another `Event` *may* be returned which
+         * represents the total execution time for the OS process in the
+         * profiling `Interval`. The execution time includes time spent in user
+         * mode and kernel mode for the current process, and does not include
+         * child processes. The `Event` is only present if the build supports
+         * this feature.
+         */
+        REDUCE_ALL = 4;
+    }
+
+    /**
+     * ID of the `Session` to get `Events` from.
+     */
+    required uint32 sessionID = 1;
+
+    /**
+     * ID of the `Timeline` to get `Events` from.
+     */
+    required uint32 timelineID = 2;
+
+    /**
+     * How `Events` should be processed before they are returned.
+     */
+    optional Mode mode = 3 [default = ALL];
+
+    /**
+     * If present, this `Event` will be used as the root for the iteration
+     * instead of the `Timeline` itself. The `Event` specified here will not be
+     * included in the response. (The highest level `Events` in the response
+     * will be the specified `Event`'s immediate children).
+     *
+     * This can be used with a non-default `Mode` to produce subtree summaries.
+     *
+     * This, combined with the `maxDepth` option is useful for UIs where the
+     * `Timeline` is manually expanded by the user.
+     */
+    optional uint32 eventID = 4;
+
+    /**
+     * If present, return only `Events` down to the specified level. The
+     * smallest allowed vaule is '1', which represents the root `Event`'s
+     * immediate children. (A value of '0' represents the root `Event` itself,
+     * which is either the timeline, or the `Event` specified by `eventID`).
+     * A value of 2 represents the root `Event`'s grandchildren, and so forth.
+     *
+     * A value of '1' will be useful for creating a UI where the user manually
+     * expands an `Event` he or she is interested in.
+     */
+    optional uint32 maxDepth = 5;
+
+    /**
+     * If non-empty, include only the specified types in the result. An empty
+     * list means all `Event` types will be included.
+     */
+    repeated EventType eventTypeList = 6;
+
+    /**
+     * If present, include only `Events` whose `Interval` overlaps this
+     * `Interval`. If the option is not present, the entire `Timeline` may be
+     * included (subject to restrictions set by other options).
+     *
+     * This option can be combined with any `Mode`, to produce a summary of
+     * parts of the `Timeline`.
+     */
+    optional Interval interval = 7;
+}
+
+message ReleaseSessionArg
+{
+    /**
+     * Which `Session` to release. If omitted, *all* `Sessions` are released,
+     * except the in-progress `Session`, if any.
+     */
+    optional uint32 sessionID = 1;
+}
+
+enum EventType
+{
+    /**
+     * Unknown type.
+     */
+    GENERIC = 1;
+
+    /**
+     * Special `Event` type, which represents the total time spent in the
+     * process. This `Event` *may* appear in a response to `GetEvents` command
+     * in `REDUCE_ALL` mode. Not all builds support this `Event`, and it will
+     * only be present if supported.
+     */
+    PROCESS = 2;
+
+    /**
+     * Occurs when the main document (such as HTML, XHTML, etc) is parsed.
+     */
+    DOCUMENT_PARSING = 3;
+
+    /**
+     * Occurs when stylesheets are parsed. This `Event` carries information
+     * about the URL of the stylesheet. If the stylesheet was inline, the parent
+     * document is used for the URL.
+     */
+    CSS_PARSING = 4;
+
+    /**
+     * Occurs when a script is compiled. This `Event` carries the URL of the
+     * script. If the script is inline, the parent document is used for the URL.
+     */
+    SCRIPT_COMPILATION = 5;
+
+    /**
+     * Occurs when a script thread is being evaluated (run). `Events` of this
+     * type carry information about the type of the thread (inline, eval, and so
+     * forth). If the thread is an event handler, the name of the event is also
+     * provided.
+     */
+    SCRIPT_THREAD_EVALUATION = 6;
+
+    /**
+     * Occurs when a reflow is triggered. A reflow is triggered when something
+     * is changed on the document, which *may* require a recalculation of
+     * style and layout.
+     *
+     * A `REFLOW` `Event` does not mean that the whole page will be
+     * recalculated; it is more like a *request* to check whether something
+     * needs to updated. The `REFLOW` is typically a parent of a
+     * `STYLE_RECALCULATION`, and then `LAYOUT`, like this:
+     *
+     * - `REFLOW`
+     *   - `STYLE_RECALCULATION`
+     *     - `CSS_SELECTOR_MATCHING` (#foo)
+     *     - `CSS_SELECTOR_MATCHING` (.bar)
+     *     - ...
+     *     - `CSS_SELECTOR_MATCHING` (#bar .fooz)
+     *   - `LAYOUT`
+     *
+     * Most the time will be spent in `STYLE_RECALCULATION` and `LAYOUT`. The
+     * `REFLOW` itself is not expensive.
+     *
+     * A `REFLOW` may also have no children at all, if no changes were to
+     * layout were necessary.
+     */
+    REFLOW = 7;
+
+    /**
+     * Occurs when a CSS needs to be recalculated for a set of elements in the
+     * document. This `Event` usually contains many `CSS_SELECTOR_MATCHING`
+     * `Events`.
+     *
+     * See `REFLOW` for more information about how this `Event` relates to
+     * `REFLOW`, `CSS_SELECTOR_MATCHING` and `LAYOUT`.
+     */
+    STYLE_RECALCULATION = 8;
+
+    /**
+     * Occurs when we try to match a specific selector. `Events` of this type
+     * carry information about which selector we tried to match.
+     *
+     * See `REFLOW` for more information about how this `Event` relates to
+     * `REFLOW`, `STYLE_RECALCULATION` and `LAYOUT`.
+     */
+    CSS_SELECTOR_MATCHING = 9;
+
+    /**
+     * Occurs when the layout tree is created or changed. Changes to the layout
+     * tree are done based on the caclulated style of elements, so `LAYOUT` will
+     * usually occur after a `STYLE_RECALCULATION`.
+     *
+     * See `REFLOW` for more information about how these `Events` usually relate
+     * to each other.
+     */
+    LAYOUT = 10;
+
+    /**
+     * Occurs when we draw the document (or parts of the document).
+     */
+    PAINT = 11;
+}
+
+message Timeline
+{
+    /**
+     * Non-zero ID for the `Timeline`. This must be used when accessing `Events`
+     * from the `Timeline`.
+     */
+    required uint32 timelineID = 1;
+
+    /**
+     * If the `Timeline` is associated with a frame, the ID of the frame will be
+     * stored here. If the frame was removed during profiling, it will not be
+     * possible to access additional information about the frame from
+     * 'DocumentManager'.
+     *
+     * Also, this field may not be present if the `Timeline` is not associated
+     * with a frame. (Currently not applicable, but field is made optional for
+     * future compatibility).
+     */
+    optional uint32 frameID = 2;
+}
+
+message SessionID
+{
+    /**
+     * The ID of the `Session`.
+     */
+    required uint32 sessionID = 1;
+}
+
+message Session
+{
+    /**
+     * Non-zero ID for the `Session`. This must be used when accessing `Events`
+     * from a `Timeline` within the `Session`, and when releasing the
+     * `Session`.
+     */
+    required uint32 sessionID = 1;
+
+    /**
+     * The ID of the window associated with a `Session`.
+     *
+     * This field may not be present if the `Session` is not associated with a
+     * window. (Currently not applicable, but field is made optional for
+     * future compatibility).
+     */
+    optional uint32 windowID = 2;
+
+    /**
+     * `Timelines` contained within the `Session`. This will typically contain
+     * one `Timeline` for each frame that existed in the window at some point
+     * during profiling.
+     */
+    repeated Timeline timelineList = 3;
+}
+
+message Events
+{
+    /**
+     * Represents the smallest `Interval` which is large enough to cover all the
+     * `Intervals` of each individual `Event` in the list.
+     *
+     * Is not set if `eventList` is empty.
+     */
+    optional Interval interval = 1;
+
+    /**
+     * List of `Events`. The `Events` are ordered according to the start time of
+     * their `Intervals` (increasing order).
+     */
+    repeated Event eventList = 2;
+}
+
+message Event
+{
+    /**
+     * The type of `Event`. Some `Events` carry additional information relevant
+     * to their type.
+     */
+    required EventType type = 1;
+
+    /**
+     * The time spent on this task. (Self-time). This time takes place at some
+     * (unknown) point in the `Interval`.
+     *
+     * Does not include `overhead`.
+     */
+    required double time = 2;
+
+    /**
+     * Profiling overhead. This is the time spent doing things which would
+     * normally not happen if we had not been profiling, e.g. storing the
+     * selector text for CSS selector `Events`.
+     *
+     * The overhead takes place at some (unknown) point in the `Interval`.
+     */
+    required double overhead = 3;
+
+    /**
+     * Number of hits on this `Event`.
+     */
+    required uint32 hits = 4;
+
+    /**
+     * The `Interval` in which the `Event` took place. An `Event` may consume time
+     * across multiple time slices (e.g. thread evaluation) without requiring
+     * *all* the time in that `Interval`.
+     *
+     * The `time` field contains the time actually spent working on the `Event`.
+     * There is no exact start and end time for `Events` which are spread across
+     * time slices, because the self-time spent is fragmented across the
+     * `Interval`.
+     *
+     * We can therefore only know that the `time` spent on this `Event` happened
+     * some time in this `Interval`, but not exactly where. (It would be
+     * possible to expose each fragment of execution, of course, but the amount
+     * of data required to represent this would be to large to handle).
+     *
+     * The start of the `Interval` represents the first time we started working
+     * on this `Event`. The end of the `Interval` represents the last time we
+     * were done working on this `Event`.
+     */
+    optional Interval interval = 5;
+
+    /**
+     * The non-zero ID of this `Event`.
+     */
+    optional uint32 eventID = 6;
+
+    /**
+     * The parent `Event` ID, or not set if this is a top-level `Event`.
+     */
+    optional uint32 parentEventID = 7;
+
+    /**
+     * The number of immediate children (not grandchildren) for this `Event`.
+     */
+    optional uint32 childCount = 8;
+
+    /**
+     * Aggregated `time` for all children, including `time` for this `Event`.
+     */
+    optional double aggregatedTime = 9;
+
+    /**
+     * Aggregated `overhead` for all children, including `overhead` for this
+     * `Event`.
+     */
+    optional double aggregatedOverhead = 10;
+
+    /**
+     * Additional information for `CSS_SELECTOR_MATCHING` `Events`.
+     */
+    optional CssSelectorMatchingEvent cssSelectorMatching = 11;
+
+    /**
+     * Additional information for `SCRIPT_THREAD_EVALUATION` `Events`.
+     */
+    optional ScriptThreadEvaluationEvent scriptThreadEvaluation = 12;
+
+    /**
+     * Additional information for `DOCUMENT_PARSING` `Events`.
+     */
+    optional DocumentParsingEvent documentParsing = 13;
+
+    /**
+     * Additional information for `CSS_PARSING` `Events`.
+     */
+    optional CssParsingEvent cssParsing = 14;
+
+    /**
+     * Additional information for `SCRIPT_COMPILATION` `Events`.
+     */
+    optional ScriptCompilationEvent scriptCompilation = 15;
+
+    /**
+     * Additional information for `PAINT` `Events`.
+     */
+    optional PaintEvent paint = 16;
+}
+
+message CssSelectorMatchingEvent
+{
+    /**
+     * The selector text, e.g. "#foo .bar".
+     */
+    required string selector = 1;
+}
+
+enum ScriptThreadType
+{
+    UNKNOWN = 0;
+
+    /**
+     * A common thread, such as the main thread.
+     */
+    COMMON = 1;
+
+    /**
+     * A timeout or interval thread, i.e. 'window.setTimeout'/'setInterval'.
+     */
+    TIMEOUT = 2;
+
+    /**
+     * An event handler thread. `ScriptThreadEvaluationEvents` of this type also
+     * contain the name of the event that fired.
+     */
+    EVENT = 3;
+
+    /**
+     * A thread which executes inline scripts during loading.
+     */
+    INLINE_SCRIPT = 4;
+
+    /**
+     * A thread which executes a script using the javascript:-URI scheme.
+     */
+    JAVASCRIPT_URL = 5;
+
+    /**
+     * A thread executed when navigating in history (e.g. hash change).
+     */
+    HISTORY_NAVIGATION = 6;
+
+    /**
+     * An eval triggered from Java (LiveConnect).
+     */
+    JAVA_EVAL = 7;
+
+    /**
+     * An eval triggered by the debugger.
+     */
+    DEBUGGER_EVAL = 8;
+}
+
+message ScriptThreadEvaluationEvent
+{
+    /**
+     * What kind of thread the `Event` represents.
+     */
+    required ScriptThreadType scriptThreadType = 1;
+
+    /**
+     * If `scriptThreadType` is `EVENT`, this field will contain the event name,
+     * e.g. 'load'.
+     *
+     * In all other cases, this field is not set.
+     */
+    optional string eventName = 2;
+}
+
+message DocumentParsingEvent
+{
+    /**
+     * The URL of the document that was parsed.
+     */
+    required string url = 1;
+}
+
+message CssParsingEvent
+{
+    /**
+     * The URL of the stylesheet that was parsed. If the stylesheet is inlined
+     * in another document, that document is used as the URL.
+     */
+    required string url = 1;
+}
+
+enum ScriptType
+{
+    /**
+     * The script is of unknown type.
+     */
+    UNKNOWN = 0;
+
+    /**
+     * The script is in an external file, and the document links to it.
+     */
+    LINKED = 1;
+
+    /**
+     * The script is inlined in the document, not via document.write().
+     */
+    INLINE = 2;
+
+    /**
+     * The script is inlined in the documented via document.write().
+     */
+    GENERATED = 3;
+
+    /**
+     * The script comes from a call to `eval`.
+     */
+    EVAL = 4;
+
+    /**
+     * The script comes from a call to `setTimeout` or `setInterval`.
+     */
+    TIMEOUT = 5;
+
+    /**
+     * The script comes from usage of the `javascript:` URI handler.
+     */
+    URI = 6;
+
+    /**
+     * The script is attached as an event handler attribute in the markup.
+     */
+    EVENT_HANDLER = 7;
+
+    /**
+     * The script is injected into the page by the User Javascript feature.
+     */
+    USERJS = 8;
+
+    /**
+     * The script is injected into the page by the Browser Javascript feature.
+     */
+    BROWSERJS = 9;
+
+    /**
+     * The script is injected into the page by an extension.
+     */
+    EXTENSIONJS = 10;
+
+    /**
+     * Scripts compiled by `EcmascriptDebugger`.
+     */
+    DEBUGGER = 11;
+}
+
+message ScriptCompilationEvent
+{
+    /**
+     * Describes the origin of the script.
+     */
+    required ScriptType scriptType = 1;
+
+    /**
+     * The URL of the stylesheet that was parsed. If the stylesheet is inlined
+     * in another document, that document is used as the URL.
+     */
+    optional string url = 2;
+}
+
+message PaintEvent
+{
+    /**
+     * The `Area` that was painted, in document coordinates relative the upper
+     * left corner of the view.
+     */
+    optional Area area = 1;
+}

@@ -1,0 +1,805 @@
+/* -*- Mode: c++; tab-width: 4; indent-tabs-mode: t; c-basic-offset: 4 -*- */
+group "idle.idle_detector";
+require init;
+
+language C++;
+
+include "modules/idle/idle_detector.h";
+include "modules/hardcore/timer/optimer.h";
+
+/**
+ * Idle detector test suite.
+ *
+ * Because of the delayed idle check mechanism, testing of the idle logic
+ * must happen completely asynchronously. Tests are therefore described
+ * here by pre-recording 'Actions' that should happen (possibly based
+ * on the idle state we transitioned to).
+ *
+ * The most basic test could look like this:
+ *
+ *    Actions actions;
+ *    actions.Wait(ACTIVITY_STATE_IDLE);
+ *    actions.Pass();
+ *    TC::Run(actions, detector_ref);
+ *
+ * In the above example, we record an ACTION_WAIT with ACTIVITY_STATE_IDLE,
+ * as a parameter. This will cause the test runner to wait until a
+ * ACTIVITY_STATE_IDLE is recieved. (This is always expected at the beginning
+ * of a test, because ACTIVITY_DISABLED will end when the first listener
+ * attaches itself). Next, we record ACTION_PASS, which will cause the test
+ * to pass when that action is executed.
+ *
+ * @see OpActivity
+ * @see ActionType
+ * @see DetectorRef
+ */
+
+global
+{
+	// How long (in milliseconds) we should wait for
+	// before we consider a single async test a failure.
+	#define TIMEOUT 1000
+
+	/**
+	 * The different actions you can record in an 'Actions' object.
+	 */
+	enum ActionType
+	{
+		/**
+		 * Not really used for much, exception default construction
+		 * of Action objects.
+		 */
+		ACTION_UNKNOWN,
+
+		/**
+		 * Inserted if we run out of memory.
+		 */
+		ACTION_OOM,
+
+		/**
+		 * This action, when executed, will cause the test to pass.
+		 */
+		ACTION_PASS,
+
+		/**
+		 * Wait until a certain activity state is encountered.
+		 */
+		ACTION_WAIT,
+
+		/**
+		 * Create an OpActivity.
+		 */
+		ACTION_CREATE,
+
+		/**
+		 * Destroy an OpActivity.
+		 */
+		ACTION_DESTROY,
+
+		/**
+		 * Call OpActivity::Begin().
+		 */
+		ACTION_BEGIN,
+
+		/**
+		 * Call OpActivity::End().
+		 */
+		ACTION_END,
+
+		/**
+		 * Call OpActivity::Cancel().
+		 */
+		ACTION_CANCEL
+	};
+
+	/**
+	 * Custom OpStatus return value for Action-performing functions.
+	 */
+	class ActionStatus
+		: public OpStatus
+	{
+	public:
+		enum ExtraActionEnum
+		{
+			/**
+			 * Indicate that the Action can not complete until a certain
+			 * OpActivityState is observed.
+			 */
+			WAIT = USER_SUCCESS + 1,
+
+			/**
+			 * The Action caused the test-case to pass.
+			 */
+			PASS = USER_SUCCESS + 2,
+
+			/**
+			 * Indicate the a previously waiting Action completed successfully
+			 * because the correct OpActivityState was observed.
+			 */
+			CONTINUE = USER_SUCCESS + 3,
+		};
+	};
+
+	typedef OP_STATUS ACTION_STATUS;
+
+	/**
+	 * An OpActivity subclass, which also has an ID.
+	 */
+	class Activity
+		: public OpActivity
+	{
+	public:
+		Activity(OpActivityType type, OpIdleDetector *detector, int id)
+			: OpActivity(type, detector)
+			, m_id(id)
+		{
+		}
+
+		int GetId() const { return m_id; }
+
+	private:
+		int m_id;
+	};
+
+	/**
+	 * Keeps track of Activity objects.
+	 */
+	class Activities
+		: public OpAutoVector<Activity>
+	{
+	public:
+
+		Activity *FindActivity(int id)
+		{
+			unsigned count = GetCount();
+
+			for (unsigned i = 0; i < count; ++i)
+				if (Get(i)->GetId() == id)
+					return Get(i);
+
+			return NULL;
+		}
+
+		OP_STATUS FindActivity(int id, Activity *&activity)
+		{
+			activity = FindActivity(id);
+
+			if (!activity)
+				return OpStatus::ERR;
+
+			return OpStatus::OK;
+		}
+
+		OP_STATUS CreateActivity(OpActivityType type, OpIdleDetector *detector, int id)
+		{
+			OpAutoPtr<Activity> activity(OP_NEW(Activity, (type, detector, id)));
+			RETURN_OOM_IF_NULL(activity.get());
+			RETURN_IF_ERROR(Add(activity.get()));
+			activity.release();
+			return OpStatus::OK;
+		}
+
+		OP_STATUS DestroyActivity(int id)
+		{
+			Activity *activity;
+			RETURN_IF_ERROR(FindActivity(id, activity));
+			return Delete(activity);
+		}
+
+		OP_STATUS BeginActivity(int id)
+		{
+			Activity *activity;
+			RETURN_IF_ERROR(FindActivity(id, activity));
+			activity->Begin();
+			return OpStatus::OK;
+		}
+
+		OP_STATUS EndActivity(int id)
+		{
+			Activity *activity;
+			RETURN_IF_ERROR(FindActivity(id, activity));
+			activity->End();
+			return OpStatus::OK;
+		}
+
+		OP_STATUS CancelActivity(int id)
+		{
+			Activity *activity;
+			RETURN_IF_ERROR(FindActivity(id, activity));
+			activity->Cancel();
+			return OpStatus::OK;
+		}
+	};
+
+	class Action
+	{
+	public:
+		Action(ActionType type = ACTION_UNKNOWN)
+			: m_type(type)
+		{
+		}
+
+		Action(ActionType type, OpActivityState activity_state)
+			: m_type(type)
+			, m_activity_state(activity_state)
+		{
+		}
+
+		Action(ActionType type, OpActivityType activity_type, int id)
+			: m_type(type)
+			, m_activity_type(activity_type)
+			, m_id(id)
+		{
+		}
+
+		Action(ActionType type, int id)
+			: m_type(type)
+			, m_id(id)
+		{
+		}
+
+		ACTION_STATUS Perform(Activities &activities, OpIdleDetector *detector, OpActivityState *activity_state)
+		{
+			if (m_type == ACTION_WAIT && activity_state && m_activity_state == *activity_state)
+				return ActionStatus::CONTINUE;
+
+			return Perform(activities, detector);
+		}
+
+	private:
+
+		ACTION_STATUS Perform(Activities &activities, OpIdleDetector *detector)
+		{
+			switch (m_type)
+			{
+			case ACTION_UNKNOWN:
+				return OpStatus::ERR;
+			case ACTION_OOM:
+				return OpStatus::ERR_NO_MEMORY;
+			case ACTION_PASS:
+				return ActionStatus::PASS;
+			case ACTION_WAIT:
+				return ActionStatus::WAIT;
+			case ACTION_CREATE:
+				return activities.CreateActivity(m_activity_type, detector, m_id);
+			case ACTION_DESTROY:
+				return activities.DestroyActivity(m_id);
+			case ACTION_BEGIN:
+				return activities.BeginActivity(m_id);
+			case ACTION_END:
+				return activities.EndActivity(m_id);
+			case ACTION_CANCEL:
+				return activities.CancelActivity(m_id);
+			default:
+				return OpStatus::ERR;
+			};
+		}
+
+		ActionType m_type;
+		OpActivityState m_activity_state;
+		OpActivityType m_activity_type;
+		int m_id;
+	};
+
+	/**
+	 * Creates and keeps track of Action objects. This class can be used to
+	 * build the Action sequence you want to perform asynchronously.
+	 */
+	class Actions
+	{
+	public:
+
+		static const int MAX_ACTIONS = 1024;
+
+		Actions()
+			: m_size(0)
+			, m_next(0)
+		{
+		}
+
+		Actions(const Actions &actions)
+			: m_size(actions.m_size)
+			, m_next(actions.m_next)
+		{
+			for (int i = 0; i < m_size; ++i)
+				m_actions[i] = actions.m_actions[i];
+		}
+
+		/**
+		 * Perform the actions, until we encounter an ACTION_WAIT, ACTION_PASS
+		 * or an error.
+		 */
+		ACTION_STATUS Perform(Activities &activities, OpIdleDetector *detector, OpActivityState activity_state)
+		{
+			OpActivityState *state = &activity_state;
+
+			while (m_next < m_size)
+			{
+				ACTION_STATUS status = PerformNext(activities, detector, state);
+				RETURN_IF_ERROR(status);
+
+				switch (status)
+				{
+				case ActionStatus::PASS:
+				case ActionStatus::WAIT:
+					return status;
+				case ActionStatus::CONTINUE:
+					state = NULL;
+				default:
+					continue;
+				}
+			}
+
+			return OpStatus::ERR;
+		}
+
+		// The functions below may be used to build the Action sequence.
+
+		void Wait(OpActivityState activity_state)
+		{
+			Insert(Action(ACTION_WAIT, activity_state));
+		}
+
+		void Create(OpActivityType activity_type, int id)
+		{
+			Insert(Action(ACTION_CREATE, activity_type, id));
+		}
+
+		void Destroy(int id) { Insert(Action(ACTION_DESTROY, id)); }
+		void Begin(int id) { Insert(Action(ACTION_BEGIN, id)); }
+		void End(int id) { Insert(Action(ACTION_END, id)); }
+		void Cancel(int id) { Insert(Action(ACTION_CANCEL, id)); }
+		void Pass() { Insert(Action(ACTION_PASS)); }
+
+	private:
+
+		ACTION_STATUS PerformNext(Activities &activities, OpIdleDetector *detector, OpActivityState *activity_state)
+		{
+			ACTION_STATUS status = m_actions[m_next].Perform(activities, detector, activity_state);
+
+			if (status != ActionStatus::WAIT)
+				++m_next;
+
+			return status;
+		}
+
+		BOOL IsOOM()
+		{
+			if (m_size >= MAX_ACTIONS)
+			{
+				m_actions[0] = Action(ACTION_OOM);
+				return TRUE;
+			}
+
+			return FALSE;
+		}
+
+		void Insert(const Action &action)
+		{
+			if (IsOOM())
+				return;
+
+			m_actions[m_size++] = action;
+		}
+
+		Action m_actions[MAX_ACTIONS]; // ARRAY OK andersr 2011-11-22
+		int m_size;
+		int m_next;
+	};
+
+	/**
+	 * Subclass of OpIdleDetector with reference counting.
+	 */
+	class Detector
+		: public OpIdleDetector
+	{
+	public:
+
+		/**
+		 * @param ref Initial reference count.
+		 */
+		Detector(int ref = 1)
+			: m_ref(ref)
+		{
+		}
+
+		virtual ~Detector() { }
+
+		Detector *Retain()
+		{
+			++m_ref;
+			return this;
+		}
+
+		void Release()
+		{
+			if (--m_ref == 0)
+				OP_DELETE(this);
+		}
+	private:
+		int m_ref;
+	};
+
+	/**
+	 * This class ensures that the specified detector lives as least as
+	 * long as this object.
+	 *
+	 * This is used globally to keep a Detector alive 'long enough'. The
+	 * Listener needs to keep a reference to its detector, but, since it
+	 * destroys itself in the OnActivityStateChanged callback, the Detector
+	 * would be destroyed with it, unless there is another reference.
+	 *
+	 * Using an object of this class in the 'global' secion provides that
+	 * reference.
+	 */
+	class DetectorRef
+	{
+	public:
+
+		/**
+		 * Create a new reference for the specified Detector. NULL is a valid
+		 * value, because a stack allocated dummy Detector will be used
+		 * instead.
+		 */
+		DetectorRef(Detector *d = NULL)
+			: m_dummy(-1) // Negative, to prevent double free.
+			, m_detector(d ? d->Retain() : &m_dummy) {}
+
+		~DetectorRef(){ m_detector->Release(); }
+		Detector *Get() const { return m_detector; }
+
+		void Reset(Detector *d)
+		{
+			if (m_detector != &m_dummy)
+				m_detector->Release();
+
+			m_detector = (d ? d->Retain() : &m_dummy);
+		}
+
+	private:
+		Detector m_dummy;
+		Detector *m_detector;
+	};
+
+
+	/**
+	 * A dummy listener just to test adding and removing listeners.
+	 */
+	class DummyListener
+		: public OpActivityListener
+	{
+	public:
+		virtual OP_STATUS OnActivityStateChanged(OpActivityState state) { return OpStatus::OK; }
+	};
+
+	/**
+	 * Listens to changes in the activity state, and self-destructs when
+	 * conditions are met, or when we time out.
+	 */
+	class Listener
+		: public OpActivityListener
+		, public OpTimerListener
+	{
+	public:
+
+		// Max numbers of events in an 'EventQueue' instance.
+		static const unsigned MAX_EVENTS = 1024;
+
+		/**
+		 * Event history class.
+		 */
+		class EventQueue
+		{
+		public:
+
+			EventQueue()
+				: m_count(0)
+				, m_head(0)
+			{
+			}
+
+			OP_STATUS Add(OpActivityState state)
+			{
+				if (m_count >= MAX_EVENTS)
+					return OpStatus::ERR_NO_MEMORY;
+
+				m_events[m_count++] = state;
+
+				return OpStatus::OK;
+			}
+
+			BOOL IsEmpty() const { return m_head >= m_count; }
+
+			OpActivityState Next()
+			{
+				OP_ASSERT(!IsEmpty());
+				return m_events[m_head++];
+			}
+
+		private:
+			OpActivityState m_events[MAX_EVENTS];
+			unsigned m_count;
+			unsigned m_head;
+		};
+
+		Listener()
+			: m_detector(NULL)
+			, m_is_processing(FALSE)
+		{
+			m_timer.SetTimerListener(this);
+		}
+
+		~Listener()
+		{
+			m_timer.SetTimerListener(NULL);
+
+			if (m_detector)
+			{
+				m_detector->RemoveListener(this);
+				m_detector->Release();
+			}
+
+			m_activities.DeleteAll();
+		}
+
+		// OpTimerListener
+		void OnTimeOut(OpTimer* timer)
+		{
+			Failed("Timeout");
+		}
+
+		void Attach(Detector *detector)
+		{
+			m_detector = detector->Retain();
+			detector->AddListener(this);
+			m_timer.Start(TIMEOUT);
+		}
+
+		class ProcessingLock
+		{
+		public:
+			ProcessingLock(BOOL &lock) : m_lock(lock) { lock = TRUE; }
+			~ProcessingLock() { m_lock = FALSE; }
+		private:
+			BOOL &m_lock;
+		};
+
+		ACTION_STATUS ProcessQueue()
+		{
+			// If we are already processing, don't recurse. The event we
+			// want to handle here will be handled soon anyway.
+			if (m_is_processing)
+				return OpStatus::OK;
+
+			ProcessingLock lock(m_is_processing);
+
+			while (!m_event_queue.IsEmpty())
+			{
+				OpActivityState state = m_event_queue.Next();
+				ACTION_STATUS status = m_actions.Perform(m_activities, m_detector, state);
+
+				if (status == ActionStatus::WAIT)
+					continue;
+
+				return status;
+			}
+
+			return OpStatus::OK;
+		}
+
+		virtual OP_STATUS OnActivityStateChanged(OpActivityState state)
+		{
+			// Reset timer.
+			m_timer.Stop();
+			m_timer.Start(TIMEOUT);
+
+			RETURN_IF_ERROR(m_event_queue.Add(state));
+
+			ACTION_STATUS status = ProcessQueue();
+
+			switch (status)
+			{
+			case ActionStatus::PASS:
+				return Passed();
+			case OpStatus::OK:
+				return OpStatus::OK;
+			default:
+				return Failed("Test failed");
+			}
+		}
+
+		OP_STATUS Passed()
+		{
+			ST_passed();
+			OP_DELETE(this);
+			return OpStatus::OK;
+		}
+
+		OP_STATUS Failed(const char *fmt)
+		{
+			ST_failed(fmt);
+			OP_DELETE(this);
+			return OpStatus::OK;
+		}
+
+		void SetActions(const Actions &actions) { m_actions = actions; }
+
+	private:
+		Activities m_activities;
+		Actions m_actions;
+		OpTimer m_timer;
+		Detector *m_detector;
+		EventQueue m_event_queue;
+		BOOL m_is_processing;
+	};
+
+	DetectorRef detector_ref;
+
+	// This class exists only to prevent the selftest system from
+	// defining the "global" functions outside the class.
+	class TC
+	{
+	public:
+
+		/**
+		 * Create a testcase where the specified event stream is expected.
+		 * If the specified events are observed on the returned 'Detector',
+		 * the testcase will pass. If they are observered in another order,
+		 * or do not arrive in time (see 'TIMEOUT'), it will fail.
+		 */
+		static void Run(const Actions &actions, DetectorRef &ref)
+		{
+			Detector *detector = NULL;
+
+			if (OpStatus::IsError(TC::AddTestcase(actions, detector)))
+				ST_failed("Could not add testcase");
+
+			ref.Reset(detector);
+		}
+
+		static OP_STATUS AddTestcase(const Actions &actions, Detector *&detector)
+		{
+			OpAutoPtr<Detector> detector_ptr(OP_NEW(Detector, (0)));
+			RETURN_OOM_IF_NULL(detector_ptr.get());
+
+			OpAutoPtr<Listener> listener_ptr(OP_NEW(Listener, ()));
+			RETURN_OOM_IF_NULL(listener_ptr.get());
+
+			listener_ptr->SetActions(actions);
+			listener_ptr->Attach(detector_ptr.get());
+
+			detector = detector_ptr.release();
+
+			// It is now up to the listener to delete itself. Either
+			// through OnActivityStateChanged, or because of timeout.
+			listener_ptr.release();
+
+			return OpStatus::OK;
+		}
+
+	};
+}
+
+test("OpIdleDetector::IsIdle")
+	require init;
+{
+	OpIdleDetector detector;
+
+	// Detector should start in the busy state. (Due to ACTIVITY_DISABLED).
+	verify(!detector.IsIdle());
+}
+
+test("OpIdleDetector::[Add,Remove]Listener")
+{
+	OpIdleDetector detector;
+
+	OpAutoPtr<DummyListener> ptr(OP_NEW(DummyListener, ()));
+
+	// Not much to verify here, except that it doesn't crash.
+	detector.AddListener(ptr.get());
+	detector.RemoveListener(ptr.get());
+}
+
+test("OpActivityListener, basic")
+	async;
+{
+	Actions actions;
+	actions.Wait(ACTIVITY_STATE_IDLE);
+	actions.Create(ACTIVITY_REFLOW, 1);
+	actions.Begin(1);
+	actions.Wait(ACTIVITY_STATE_BUSY);
+	actions.Pass();
+
+	TC::Run(actions, detector_ref);
+}
+
+test("OpActivityListener, one activity")
+	async;
+{
+	Actions actions;
+	actions.Wait(ACTIVITY_STATE_IDLE);
+	actions.Create(ACTIVITY_REFLOW, 1);
+	actions.Begin(1);
+	actions.Wait(ACTIVITY_STATE_BUSY);
+	actions.End(1);
+	actions.Wait(ACTIVITY_STATE_IDLE);
+	actions.Pass();
+
+	TC::Run(actions, detector_ref);
+}
+
+test("OpActivityListener, three activities")
+	async;
+{
+	Actions actions;
+	actions.Wait(ACTIVITY_STATE_IDLE);
+	actions.Create(ACTIVITY_REFLOW, 1);
+	actions.Create(ACTIVITY_DOCMAN, 2);
+	actions.Create(ACTIVITY_PAINT, 3);
+	actions.Begin(1);
+	actions.Wait(ACTIVITY_STATE_BUSY);
+	actions.Begin(2);
+	actions.Begin(3);
+	actions.End(3);
+	actions.End(2);
+	actions.End(1);
+	actions.Wait(ACTIVITY_STATE_IDLE);
+	actions.Pass();
+
+	TC::Run(actions, detector_ref);
+}
+
+test("OpActivityListener, activity with multiple activations")
+	async;
+{
+	Actions actions;
+	actions.Wait(ACTIVITY_STATE_IDLE);
+	actions.Create(ACTIVITY_REFLOW, 1);
+	actions.Begin(1);
+	actions.Wait(ACTIVITY_STATE_BUSY);
+	actions.Begin(1);
+	actions.Begin(1);
+	actions.End(1);
+	actions.End(1);
+	actions.End(1);
+	actions.Wait(ACTIVITY_STATE_IDLE);
+	actions.Pass();
+
+	TC::Run(actions, detector_ref);
+}
+
+test("OpActivityListener, unbalanced activations")
+	async;
+{
+	Actions actions;
+	actions.Wait(ACTIVITY_STATE_IDLE);
+	actions.Create(ACTIVITY_REFLOW, 1);
+	actions.Begin(1);
+	actions.Wait(ACTIVITY_STATE_BUSY);
+	actions.Begin(1);
+	actions.Begin(1);
+	actions.End(1);
+	actions.End(1);
+	actions.Destroy(1);
+	actions.Wait(ACTIVITY_STATE_IDLE);
+	actions.Pass();
+
+	TC::Run(actions, detector_ref);
+}
+
+test("OpActivityListener::Cancel")
+	async;
+{
+	Actions actions;
+	actions.Wait(ACTIVITY_STATE_IDLE);
+	actions.Create(ACTIVITY_REFLOW, 1);
+	actions.Begin(1);
+	actions.Wait(ACTIVITY_STATE_BUSY);
+	actions.Begin(1);
+	actions.Begin(1);
+	actions.Cancel(1);
+	actions.Wait(ACTIVITY_STATE_IDLE);
+	actions.Pass();
+
+	TC::Run(actions, detector_ref);
+}

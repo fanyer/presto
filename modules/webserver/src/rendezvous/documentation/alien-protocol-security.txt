@@ -1,0 +1,217 @@
+ALIEN PROTOCOL: SECURITY PROPOSAL
+
+(Those familiar with the current protocol can skip down to "Proposed
+secure Alien protocol")
+
+The Alien project
+
+Alien is a webserver embedded inside the Opera browser[3]. The webserver
+can serve dynamic content via Server Side Widgets. These 
+are JavaScript applications with a UI similar to normal Opera
+Widgets.  A custom JavaScript API provides the interface between
+Server Side Widgets and the webserver. Static content is served in
+the usual way.
+
+The Alien proxy
+
+The Alien project uses a proxy -- the Alien proxy -- to mediate
+communication between embedded webservers and HTTP clients. In the
+initial release, all traffic is proxied. In a subsequent release, the
+proxy will be used to negotiate NAT traversal between the webserver
+and compatible clients (i.e. those running the corresponding version
+of Opera). Where NAT traversal fails or is not available, traffic will
+be proxied as before. 
+
+The Alien protocol
+
+The embedded webserver and the Alien proxy communicate a very simple
+Alien protocol, aka CCCP (Chris's Connection Control Protocol). 
+We have a prototype implementation of this protocol, which is insecure. 
+This implies, in particular, that I can spoof your embedded webserver[1]. 
+
+We can divide webserver operation conceptually into three phases:
+webserver configuration, connection to proxy, normal operation.
+
+Webserver configuration
+
+When a user starts up her embedded webserver for the first time
+(imagine the excitement!), she will be asked to configure it. The
+details of this are left to your imagination, but we did at one point
+have a prototype which loaded a MyOpera webapp on startup if it
+detected that the webserver was unconfigured. Basically, configuration
+involves naming the webserver and getting some authentication data
+(more about that below) back from MyOpera. Once configuration is
+complete, the webserver is reachable via a hostname like 
+laptop.chrism.alien.opera.com. To see how that is done, keep reading. 
+
+Connection to proxy
+
+Once the webserver is configured, it will connect to the Alien proxy
+on startup. This is a persistent control connection -- it is up as
+long as the webserver is running. 
+
+Normal operation
+
+Suppose a client sends a request for the resource
+http://laptop.chrism.alien.opera.com/
+The name laptop.chrism.alien.opera.com, like all Alien hostnames,
+resolves to the Alien proxy (in a production deployment, one of many Alien
+proxies, but that's a detail). The proxy reads that same hostname from the HTTP
+"Host:" header in the request, and looks up the control connection for
+the corresponding webserver. It sends that webserver an INVITE
+message. The webserver responds by opening a new TCP connection to the
+proxy. This connection is then used to service the request.  
+
+Alien protocol
+
+Here is the existing, unsecure, Alien protocol. "->" indicates messages
+going to from the webserver to the proxy. "<-" indicates messages
+going from the proxy to the webserver. "URI" refers to the string
+obtained by taking the webserver's hostname and replacing the first dot with
+'@': laptop.chrism.alien.opera.com becomes
+laptop@chrism.alien.opera.com. This is used for compatibility with
+STUNT, a NAT traversal protocol. It's a detail. You can pretend the
+URI the same as the hostname if you like. All messages are one line
+terminated by CRLF CRLF. The authoritative reference for this protocol
+is modules/webserver/proxy/com/opera/mole/HTTPProxy.java. What's below
+is only as good as my memory. 
+
+-> REGISTER <URI> <auth-string> [port] CCCP/0.1 
+
+The auth-string can be used by the proxy to authenticate the URI
+against MyOpera. As long as messages are sent in cleartext, this is
+not secure. The optional "port" argument indicates that the webserver
+user has opened up a port on her network, and the proxy should attempt 
+a direct connection to that port when it receives a client request for
+that server. 
+
+<- CCCP/0.1 201 Holepunching Failed CCCP/0.1
+
+This is the standard OK response to a REGISTER message. The
+"Holepunching Failed" dates back from a demo which used STUNT to
+attempt NAT traversal between the webserver and the client. 
+
+<- INVITE <ID> CCCP/0.1
+
+This is the proxy asking the webserver to open a new TCP connection to
+the proxy. This new connection will be used to service an incoming
+request. The ID is echoed back in the next message, which is...
+
+-> CONNECT <ID> CCCP/0.1
+
+The webserver opens a brand new TCP connection to the proxy and sends this 
+in response to an INVITE message. The ID used by the proxy to match up
+this connection with the corresponding INVITE. 
+
+-> CCCP/0.1 503 CCCP/0.1
+
+This is sent on the control connection to deny an INVITE (for example,
+because the number of connections has already been maxed out). 
+
+I think that's about it. Like I said, it's simple. There are also two
+messages that are not sent by the webserver, but can be sent from
+anywhere: SHUTDOWN and DROP.  The exact syntax of these will not be
+revealed here to avoid tempting you to try them. 
+
+Proposed secure Alien protocol
+
+We define "secure" as "makes it nontrivial for you to spoof my
+webserver". In particular, if an attacker is able to sniff my packets
+off the network and replace them with his own packets, all bets are
+off. In other words, we ignore man-in-the-middle attacks. To guard
+against those, services would have to use HTTPS instead of
+HTTP[1], as is the case for any other (i.e. non-Alien) web
+service. Also, client authentication is ignored here; that is a
+subject for another discussion.   
+
+We assume that the Alien instance (the browser running the webserver)
+is able to establish a secure connection to MyOpera. This secure
+channel will be needed at webserver configuration time, and
+subsequently whenever the webserver starts. This assumption has been
+discussed with Information Systems.
+
+Similarly, we assume that the Alien proxy (actually proxies, but no
+matter) has a secure connection to MyOpera or its database. Whether
+this actually needs to be an SSL/TLS connection is debatable. For now
+we can pretend that the MyOpera and the Alien proxy live on the same
+network, and that packets travelling between them will not be seen by
+other networks. 
+
+At webserver configuration time, the webserver uses its secure
+connection to MyOpera to obtain a "key" or "shared secret", call it
+K. This is, for example, a 64 bit random number. 
+
+Consider an encryption function E(k,x), which takes a key k and
+uses it to encrypt the string x into some ASCII
+gibberish. For example, E could be implemented as an MD5 hash of the
+concatenation of k and x. 
+
+At webserver startup, the webserver uses its secure connection to
+MyOpera to obtain a number called a "nonce". This is, for example,
+another 64 bit random number. The function of the nonce is to prevent
+"replay" attacks, where the bad guy sniffs messages from the network
+and simply replays them later on. 
+
+Both the webserver and the proxy also implement a function Incr(n)
+which takes a nonce n and produces a different nonce. Incr() could be
+implemented by adding 1 to the nonce [2]. 
+
+Now, we modify the webserver->proxy Alien protocol messages (above) by
+adding one parameter to each of them. This parameter will take the value 
+E(K, nonce). 
+
+When the webserver connects to the proxy, the proxy requests its key K
+and its nonce from MyOpera. It then runs E(K,nonce) and compares the
+resulting string to the corresponding argument in the REGISTER message. 
+If there is no match, the connection is closed. Otherwise, K and the
+nonce are cached in memory. 
+
+Before sending out each subsequent Alien protocol message, the
+webserver will update its nonce by calling Incr(nonce). Similarly, 
+the proxy will call Incr(nonce) on its cached copy of the nonce, once
+for every message received. This ensures that the nonces stay in
+sync. If for some reason the nonces should go out of sync (for
+example, if the protocol is implemented on top of UDP and a message is
+lost), the proxy will detect the mismatch and drop the control
+connection. The webserver would then need to get a new nonce from
+MyOpera and reopen the control connection. This would not affect
+existing HTTP connections to the webserver. 
+
+Attacks
+
+The proposed protocol is supposed to guard against spoofing
+attacks. I can think of two ways that spoofing can happen with the
+insecure protocol. 
+
+1. The most obvious way is for the attacker to send a
+REGISTER message containing the victim's URI. 
+
+2. The second way is for the attacker to send a CONNECT message
+containing an ID which matches an INVITE message that has just been
+sent to the victim.  
+
+I claim that the proposed protocol prevents both of these attacks,
+since the attacker would have to know the victim's secret key to spoof
+a REGISTER or CONNECT message. 
+
+On the other hand, a man-in-the-middle attack is possible, but recall
+that we do not claim to guard against those: services that rely on
+security should encrypt the data channel via HTTPS[1]. 
+
+Other attacks
+
+Are there other attacks we should (and can reasonably) prevent? 
+Discuss...
+
+------------------------------------------------------------
+
+[1] The Alien project plans to provide HTTPS support
+eventually. Services which rely on security will then be expected to
+use HTTPS. This notwithstanding, the Alien protocol still needs to 
+provide some minimal security. A completely unsecured protocol makes
+it trivial for one miscreant to shut down the entire Alien service just
+by spoofing everybody's webserver. 
+
+[2] Is that secure enough?
+
+[3] This is confidential. 

@@ -1,0 +1,442 @@
+/* -*- Mode: c++; tab-width: 4; indent-tabs-mode: t; c-basic-offset: 4 -*- */
+
+group "spatnav.overflow";
+
+require _SPAT_NAV_SUPPORT_;
+require initialization;
+
+language c++;
+
+include "modules/spatial_navigation/sn_handler.h";
+include "modules/doc/html_doc.h";
+include "modules/doc/frm_doc.h";
+include "modules/logdoc/htm_elm.h";
+include "modules/layout/content/scrollable.h";
+include "modules/layout/box/box.h";
+
+html {
+	//! <html>
+	//! <style type='text/css'>
+	//! div {
+	//!   overflow:auto;
+	//!   height:40px;
+	//!   }
+	//! input {
+	//!   border:none;
+	//!   height:25px;
+	//!   font-size:12px;
+	//!   }
+	//! </style>
+	//! <a href="" id="top-link">link</a>
+	//! <div id="div">
+	//! <input type='button' value='A' id="a"><br>
+	//! <input type='button' value='B' id="b"><br>
+	//! <input type='button' value='C' id="c"><br>
+	//! </div>
+	//! <a href="" id="bottom-link">link</a>
+	//! </html>
+}
+
+table link_elements(const uni_char*)
+{
+	{ UNI_L("a") }
+	{ UNI_L("b") }
+	{ UNI_L("b") }   // we get this twice because the second time we're actually scrolling, not getting a new link
+	{ UNI_L("c") }
+	{ UNI_L("bottom-link") }
+}
+
+test("navigating overflowing div (with scrollbar)")
+{
+#ifdef _SPAT_NAV_SUPPORT_
+	// Init
+	FramesDocument* doc = state.doc;
+	verify(doc != NULL);
+
+	OpAutoPtr<OpSnHandler>handler;
+	handler = OP_NEW(SnHandler, ());
+	verify(handler.get() != NULL);
+
+	Window* window = doc->GetWindow();
+	verify(window != NULL);
+
+	verify(handler->Init(window) == OpStatus::OK);
+	
+	// make our own filter
+	SnConfigurableNavFilter my_filter;
+	SnATagNavFilter link_filter;
+	SnFormNavFilter form_filter;
+	OpSnNavFilter* filter_array[3] = { &link_filter, &form_filter, NULL };
+	my_filter.SetFilterArray(filter_array);
+	handler->SetNavigationFilter(&my_filter, TRUE, TRUE);
+
+	// Get first link
+# ifndef SN_HIGHLIGHT_ON_LOAD
+	verify(handler->MarkNextItemInDirection(DIR_DOWN, NULL));
+# endif // SN_HIGHLIGHT_ON_LOAD
+
+	FramesDocument* frmDoc = (FramesDocument*)handler->GetActiveFrame();
+	verify(frmDoc != NULL);
+
+	HTML_Element* helm = handler->GetActiveLink();
+	verify(helm != NULL && helm->GetId());
+	verify_string(helm->GetId(), "top-link");
+
+	// check that it finds the remaining navigatable elements
+	iterate (link_elem) from link_elements
+	{
+		verify(handler->MarkNextItemInDirection(DIR_DOWN, NULL));
+	
+		helm = handler->GetActiveLink();
+		verify(helm != NULL && helm->GetId());
+		verify_string(helm->GetId(), link_elem);
+	}
+
+	// Make sure it doesn't find anything else
+	verify(handler->MarkNextItemInDirection(DIR_DOWN, NULL) == FALSE);
+#endif // _SPAT_NAV_SUPPORT_	
+}
+
+test("PRECONDITION: AHEM")
+{
+	short font_number = styleManager->GetFontNumber(UNI_L("AHEM"));
+	verify(font_number != -1);
+}
+
+subtest OverflowTest2(BOOL with_scrollbar)
+{
+	OpAutoPtr<SnHandler> handler;
+	Window* window;
+	HTML_Element* helm;
+	ScrollableArea* scrollable;
+
+	handler = OP_NEW(SnHandler, ());
+	verify(handler.get() != NULL);
+
+	window = state.GetWindow();
+	verify(window != NULL);
+
+	verify(handler->Init(window) == OpStatus::OK);
+
+#ifndef SN_HIGHLIGHT_ON_LOAD
+	verify(handler->MarkNextItemInDirection(DIR_DOWN, NULL));
+#endif // SN_HIGHLIGHT_ON_LOAD
+
+	// 1st navigation should result in top anchor highlight
+	helm = handler->GetActiveLink();
+	verify(helm);
+	verify_string(helm->GetId(), "anchor");
+
+	// 2nd navigation should result in scrollable container entering and unhighlighting the previous anchor
+	verify(handler->MarkNextItemInDirection(DIR_DOWN, NULL));
+	verify(handler->activeScrollable);
+	verify(!handler->GetActiveLink());
+
+	// 3rd navigation should scroll the scrollable
+	verify(handler->MarkNextItemInDirection(DIR_RIGHT, NULL));
+	verify(handler->activeScrollable);
+	verify(!handler->GetActiveLink());
+
+	scrollable = handler->activeScrollable->GetLayoutBox() ?  handler->activeScrollable->GetLayoutBox()->GetScrollable() : NULL;
+	verify(scrollable && scrollable->GetViewX() > 0);
+
+	// 4th navigation should highlight the inner link
+	verify(handler->MarkNextItemInDirection(DIR_RIGHT, NULL));
+	verify(handler->activeScrollable);
+	helm = handler->GetActiveLink();
+	verify(helm);
+	verify_string(helm->GetId(), "invisible_anchor");
+
+	// 5th navigation should scroll the scrollable to the end. Nothing should happen on sixth one.
+	for (int i = 0; i < 1; i++)
+	{
+		BOOL result = handler->MarkNextItemInDirection(DIR_RIGHT, NULL);
+		if (i == 0)
+			verify(result);
+		else
+			verify(!result);
+
+		verify(handler->activeScrollable);
+		helm = handler->GetActiveLink();
+		verify(helm);
+		verify_string(helm->GetId(), "invisible_anchor");
+
+		scrollable = handler->activeScrollable->GetLayoutBox() ?  handler->activeScrollable->GetLayoutBox()->GetScrollable() : NULL;
+		verify(scrollable);
+		verify(with_scrollbar ? (scrollable->GetViewX() > 100) : (scrollable->GetViewX() == 100));
+	}
+
+	// 7th navigation should scroll back and unhighlight the link.
+
+	verify(handler->MarkNextItemInDirection(DIR_LEFT, NULL));
+	verify(handler->activeScrollable);
+	verify(!handler->GetActiveLink());
+	scrollable = handler->activeScrollable->GetLayoutBox() ?  handler->activeScrollable->GetLayoutBox()->GetScrollable() : NULL;
+	verify(scrollable && scrollable->GetViewX() < 100 && scrollable->GetViewX() > 0);
+
+	// 8th and 9th navigation. Reaches the left boundary again and does nothing on 9th.
+	for (int i = 0; i < 1; i++)
+	{
+		BOOL result = handler->MarkNextItemInDirection(DIR_LEFT, NULL);
+		if (i == 0)
+			verify(result);
+		else
+			verify(!result);
+
+		verify(handler->activeScrollable);
+		verify(!handler->GetActiveLink());
+		scrollable = handler->activeScrollable->GetLayoutBox() ?  handler->activeScrollable->GetLayoutBox()->GetScrollable() : NULL;
+		verify(scrollable && scrollable->GetViewX() == 0);
+	}
+
+	// 10th - just dummy down to see if nothing happens
+	verify(!handler->MarkNextItemInDirection(DIR_DOWN, NULL));
+	verify(handler->activeScrollable);
+	verify(!handler->GetActiveLink());
+	scrollable = handler->activeScrollable->GetLayoutBox() ?  handler->activeScrollable->GetLayoutBox()->GetScrollable() : NULL;
+	verify(scrollable && scrollable->GetViewX() == 0);
+
+	// 11th - back to the link outside the scrollable
+	verify(handler->MarkNextItemInDirection(DIR_UP, NULL));
+	verify(!handler->activeScrollable);
+	helm = handler->GetActiveLink();
+	verify(helm);
+	verify_string(helm->GetId(), "anchor");
+}
+
+html
+{
+//!<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01//EN">
+//!<html>
+//!<head>
+//!<style type="text/css">
+//!*
+//!{
+//!	margin:0;
+//!	padding:0;
+//!	font-family:'AHEM';
+//!	line-height:20px;
+//!	vertical-align:top;
+//!	font-size:20px;
+//!}
+//!
+//!#scrollable
+//!{
+//!	overflow:scroll;
+//!	height:100px;
+//!	width:100px;
+//!	background-color:yellow;
+//!}
+//!
+//!#invisible_anchor
+//!{
+//!	background-color:green;
+//!}
+//!
+//!</style>
+//!
+//!</head>
+//!<body>
+//!
+//!<a href="#" id="anchor">Link</a>
+//!
+//!<div id="scrollable">
+//!6chars<a href="#" id="invisible_anchor">Link</a>
+//!</div>
+//!
+//!</body>
+//!</html>
+}
+test("navigating overflowing div 2 (scrollbar variant)")
+	require success "PRECONDITION: AHEM";
+	require undefined SN_SCROLL_OVERFLOW_HIDDEN;
+{
+	verify(OverflowTest2(TRUE));
+}
+
+html
+{
+//!<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01//EN">
+//!<html>
+//!<head>
+//!<style type="text/css">
+//!*
+//!{
+//!	margin:0;
+//!	padding:0;
+//!	font-family:'AHEM';
+//!	line-height:20px;
+//!	vertical-align:top;
+//!	font-size:20px;
+//!}
+//!
+//!#scrollable
+//!{
+//!	overflow:hidden;
+//!	height:100px;
+//!	width:100px;
+//!	background-color:yellow;
+//!}
+//!
+//!#invisible_anchor
+//!{
+//!	background-color:green;
+//!}
+//!
+//!</style>
+//!
+//!</head>
+//!<body>
+//!
+//!<a href="#" id="anchor">Link</a>
+//!
+//!<div id="scrollable">
+//!6chars<a href="#" id="invisible_anchor">Link</a>
+//!</div>
+//!
+//!</body>
+//!</html>
+}
+test("navigating overflowing div 2 (overflow hidden variant)")
+	require success "PRECONDITION: AHEM";
+	require SN_SCROLL_OVERFLOW_HIDDEN;
+{
+	verify(OverflowTest2(FALSE));
+}
+
+html
+{
+//!<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01//EN">
+//!<html>
+//!<head>
+//!<style type="text/css">
+//!*
+//!{
+//!	margin:0;
+//!	padding:0;
+//!	font-family:'AHEM';
+//!	font-size:20px;
+//!	line-height:20px;
+//!}
+//!
+//!#outer_scrollable
+//!{
+//!	overflow:scroll;
+//!	height:200px;
+//!	width:200px;
+//!	background-color:yellow;
+//!}
+//!
+//!#inner_scrollable
+//!{
+//!	overflow:scroll;
+//!	height:100px;
+//!	width:100px;
+//!	background-color:lime;
+//!	margin-top:30px;
+//!}
+//!
+//!</style>
+//!
+//!</head>
+//!<body>
+//!
+//!<div id="outer_scrollable">
+//!	<a href="#" id="anchor1">LINK</a>
+//!	
+//!	<div id="inner_scrollable">
+//!		<a href="#" id="anchor2">LINK1</a>
+//!		<br /> <br /><br /> <br /> <br />
+//!		<a href="#" id="anchor3">LINK2</a>
+//!	</div>
+//!
+//!	<a href="#" id="anchor4">LINK</a>
+//!	<br />
+//!	<br />
+//!	<br />
+//!</div>
+//!
+//!<a href="#" id="anchor5">LINK</a>
+//!
+//!</body>
+//!</html>
+}
+test("navigation with nested scrollables")
+	require success "PRECONDITION: AHEM";
+{
+	OpAutoPtr<SnHandler> handler;
+	Window* window;
+	HTML_Element* helm;
+	ScrollableArea* scrollable;
+
+	handler = OP_NEW(SnHandler, ());
+	verify(handler.get() != NULL);
+
+	window = state.GetWindow();
+	verify(window != NULL);
+
+	verify(handler->Init(window) == OpStatus::OK);
+
+#ifndef SN_HIGHLIGHT_ON_LOAD
+	verify(handler->MarkNextItemInDirection(DIR_DOWN, NULL));
+#endif // SN_HIGHLIGHT_ON_LOAD
+
+	/* Navigate down through links in the case with nested scrollables
+	   and links placed in different relation to those scrollables. */
+	helm = handler->GetActiveLink();
+	verify(helm);
+	verify(handler->activeScrollable);
+	verify_string(handler->activeScrollable->GetId(), "outer_scrollable");
+	verify_string(helm->GetId(), "anchor1");
+
+	// 2nd navigation
+	verify(handler->MarkNextItemInDirection(DIR_DOWN, NULL));
+	helm = handler->GetActiveLink();
+	verify(helm);
+	verify(handler->activeScrollable);
+	verify_string(handler->activeScrollable->GetId(), "inner_scrollable");
+	verify_string(helm->GetId(), "anchor2");
+
+	// 3rd navigation should just scroll.
+	verify(handler->MarkNextItemInDirection(DIR_DOWN, NULL));
+	verify(handler->activeScrollable);
+	verify_string(handler->activeScrollable->GetId(), "inner_scrollable");
+	verify(!handler->GetActiveLink());
+
+	scrollable = handler->activeScrollable->GetLayoutBox() ?  handler->activeScrollable->GetLayoutBox()->GetScrollable() : NULL;
+	verify(scrollable && scrollable->GetViewY() > 0);
+
+	// 4th navigation should highlight the lower link in inner scrollable
+	verify(handler->MarkNextItemInDirection(DIR_DOWN, NULL));
+	helm = handler->GetActiveLink();
+	verify(helm);
+	verify(handler->activeScrollable);
+	verify_string(handler->activeScrollable->GetId(), "inner_scrollable");
+	verify_string(helm->GetId(), "anchor3");
+
+	// 5th navigation should leave the inner scrollable and highlight the link below.
+	verify(handler->MarkNextItemInDirection(DIR_DOWN, NULL));
+	helm = handler->GetActiveLink();
+	verify(helm);
+	verify(handler->activeScrollable);
+	verify_string(handler->activeScrollable->GetId(), "outer_scrollable");
+	verify_string(helm->GetId(), "anchor4");
+
+	// 6th navigation should scroll the outer scrollable.
+	verify(handler->MarkNextItemInDirection(DIR_DOWN, NULL));
+	verify(handler->activeScrollable);
+	verify_string(handler->activeScrollable->GetId(), "outer_scrollable");
+	helm = handler->GetActiveLink();
+	verify(helm);
+	verify_string(helm->GetId(), "anchor4");
+
+	scrollable = handler->activeScrollable->GetLayoutBox() ?  handler->activeScrollable->GetLayoutBox()->GetScrollable() : NULL;
+	verify(scrollable && scrollable->GetViewY() > 0);
+
+	// 7th navigation should leave the outer scrollable and highlight the link below.
+	verify(handler->MarkNextItemInDirection(DIR_DOWN, NULL));
+	helm = handler->GetActiveLink();
+	verify(helm);
+	verify_string(helm->GetId(), "anchor5");
+	verify(!handler->activeScrollable);
+}

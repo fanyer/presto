@@ -1,0 +1,631 @@
+/* -*- Mode: c++; tab-width: 4; indent-tabs-mode: t; c-basic-offset: 4; -*-
+**
+** Copyright (C) 2002-2011 Opera Software ASA.  All rights reserved.
+**
+** This file is part of the Opera web browser.  It may not be distributed
+** under any circumstances.
+*/
+
+group "windowcommander.OpViewportController";
+
+require initialization;
+
+include "modules/doc/frm_doc.h";
+include "modules/dochand/win.h";
+include "modules/dochand/winman.h";
+include "modules/util/simset.h";
+include "modules/windowcommander/OpViewportController.h";
+include "modules/windowcommander/OpWindowCommander.h";
+include "modules/windowcommander/OpWindowCommanderManager.h";
+include "modules/windowcommander/src/WindowCommander.h";
+include "modules/style/css_dom.h";
+include "modules/dochand/viewportcontroller.h";
+include "modules/hardcore/timer/optimer.h";
+
+global
+{
+#define ASYNC_VERIFY(expr) do { if (!(expr)) { Failed(#expr, __FILE__, __LINE__); return; } } while (0)
+
+	class Failable // Global "global" functions don't seem to work too well with the selftest system
+	{
+	public:
+		void Failed(const char* expr, const char* file, int line) {
+			char message[1000]; /* ARRAY OK 2009-02-16 mstensho */
+
+			if (op_strlen(expr) + op_strlen(file) + sizeof(line)*3 + 30 > sizeof(message))
+				ST_failed("failed");
+			else
+			{
+				op_sprintf(message, "%s:%d: false expression: %s\n", file, line, expr);
+				ST_failed(message);
+			}
+		}
+	};
+
+	class EmptyViewportInfoListener : public OpViewportInfoListener, public Failable
+	{
+	public:
+		void OnNewPage(OpViewportController* controller, OpViewportChangeReason, int) { }
+		void OnNewPageReady(OpViewportController* controller) {}
+		void OnZoomLevelLimitsChanged(OpViewportController* controller, double min_zoom_level, double max_zoom_level, BOOL user_zoomable) { }
+		void OnLayoutViewportSizeChanged(OpViewportController* controller, unsigned int width, unsigned int height) { }
+		void OnDocumentSizeChanged(OpViewportController* controller, unsigned int width, unsigned int height) { }
+		void OnDocumentContentChanged(OpViewportController* controller, CONTENT_CHANGED_REASON reason) { }
+#ifdef CONTENT_MAGIC
+		void OnContentMagicFound(OpViewportController* controller, const OpRect& content_magic_rect) { }
+#endif // CONTENT_MAGIC
+		void OnReservedRegionChanged(OpViewportController* controller, const OpRect* rect_array, unsigned int num_rects) { }
+#ifdef ADAPTIVE_ZOOM_SUPPORT
+		void OnAreaOfInterestChanged(OpViewportController* controller, const OpRect& primary_rect, const OpRect& secondary_rect) { }
+#endif // ADAPTIVE_ZOOM_SUPPORT
+		void OnTrueZoomBaseScaleChanged(OpViewportController* controller, unsigned int scale_percentage) { }
+#ifdef PAGED_MEDIA_SUPPORT
+		void OnPageChanged(int new_page_number, int new_page_count) { }
+#endif // PAGED_MEDIA_SUPPORT
+	};
+
+	class Test : public Failable
+	{
+	public:
+		virtual ~Test() { }
+		virtual void Check() = 0;
+	};
+
+	class LoadTest : public Test
+	{
+	public:
+		void Check();
+
+		class ViewportInfoListener : public EmptyViewportInfoListener
+		{
+		public:
+			ViewportInfoListener(Test& test) : test(test), called(FALSE) { }
+
+			void OnNewPage(OpViewportController* controller, OpViewportChangeReason, int) { called = TRUE; test.Check(); }
+
+			Test& test;
+			BOOL called;
+		};
+
+		class LoadingListener : public NullLoadingListener, public Failable
+		{
+		public:
+			LoadingListener(Test& test) : test(test), called(FALSE) { }
+
+			void OnLoadingFinished(OpWindowCommander* commander, LoadingFinishStatus status) { ASYNC_VERIFY(status == LOADING_SUCCESS); called = TRUE; test.Check(); }
+
+			Test& test;
+			BOOL called;
+		};
+
+		LoadTest() :
+			viewportinfolistener(*this),
+			loadinglistener(*this) { }
+
+		ViewportInfoListener viewportinfolistener;
+		LoadingListener loadinglistener;
+	};
+
+	void LoadTest::Check()
+	{
+		if (viewportinfolistener.called && loadinglistener.called)
+			ST_passed();
+	}
+
+	Window* win;
+	OpWindowCommander* wic;
+	OpViewportController* controller;
+	OpViewportInfoListener* orig_info_listener;
+	LoadTest loadtest;
+
+#ifdef PAGED_MEDIA_SUPPORT
+	class PageChangeTest : public EmptyViewportInfoListener, public OpTimerListener
+	{
+	private:
+		OpTimer timer;
+		int expected_page_number;
+		int expected_page_count;
+		BOOL expects_callback;
+
+	public:
+		PageChangeTest() { timer.SetTimerListener(this); }
+
+		void Start(int expected_page_number, int expected_page_count)
+		{
+			expects_callback = TRUE;
+			this->expected_page_number = expected_page_number;
+			this->expected_page_count = expected_page_count;
+			timer.Start(1000);
+		}
+
+		void StartNoCallbackExpectation()
+		{
+			expects_callback = FALSE;
+			timer.Start(1000);
+		}
+
+		void OnPageChanged(int new_page_number, int new_page_count)
+		{
+			if (expects_callback)
+				if (new_page_number == expected_page_number)
+					ST_passed();
+				else
+					ST_failed("wrong page");
+			else
+				ST_failed("OnPageChanged() was called unexpectedly");
+		}
+
+		virtual void OnTimeOut(OpTimer* timer)
+		{
+			if (expects_callback)
+				ST_failed("Test timed out.");
+			else
+				ST_passed();
+		}
+	};
+
+	PageChangeTest pagechange_test;
+#endif // PAGED_MEDIA_SUPPORT
+}
+
+setup
+{
+	win = 0;
+	wic = 0;
+	controller = 0;
+	orig_info_listener = 0;
+}
+
+exit
+{
+	if (wic)
+		g_windowCommanderManager->GetUiWindowListener()->CloseUiWindow(wic);
+	if (state.doc && state.doc->GetWindow())
+		state.doc->GetWindow()->GetViewportController()->SetViewportInfoListener(orig_info_listener);
+}
+
+test("init")
+{
+	BOOL3 ignore = MAYBE;
+	win = g_windowManager->GetAWindow(FALSE, ignore, ignore, 100, 200);
+	verify(win);
+	wic = win->GetWindowCommander();
+	wic->SetShowScrollbars(FALSE); // some tests require this (so that visual viewport size equals window size)
+	verify(wic);
+	controller = wic->GetViewportController();
+	verify(controller);
+	orig_info_listener = state.window->GetViewportController()->GetViewportInfoListener();
+}
+
+test("check initial viewports")
+	require success "init";
+{
+	OpRect visual_viewport(controller->GetVisualViewport());
+	OpRect rendering_viewport(controller->GetRenderingViewport());
+	OpRect layout_viewport(controller->GetLayoutViewport());
+
+	// All viewports' position should be 0,0
+
+	verify(visual_viewport.x == 0);
+	verify(visual_viewport.y == 0);
+	verify(rendering_viewport.x == 0);
+	verify(rendering_viewport.y == 0);
+	verify(layout_viewport.x == 0);
+	verify(layout_viewport.y == 0);
+
+	// Rendering and visual viewports' size should be equal to the window size
+
+	UINT32 win_width, win_height;
+	wic->GetOpWindow()->GetInnerSize(&win_width, &win_height);
+
+	verify(visual_viewport.width == (INT32) win_width);
+	verify(visual_viewport.height == (INT32) win_height);
+}
+
+test("load URL")
+	require success "init"; async;
+{
+	wic->SetLoadingListener(&loadtest.loadinglistener);
+	controller->SetViewportInfoListener(&loadtest.viewportinfolistener);
+
+	OpWindowCommander::OpenURLOptions options;
+	wic->OpenURL(UNI_L("http://people.opera.com/mstensho/wic-selftest/"), options);
+}
+
+test("document size")
+	require success "load URL";
+{
+	unsigned int width, height;
+
+	controller->GetDocumentSize(&width, &height);
+
+	verify(width > 0);
+	verify(height > 0);
+
+	/* A better test is needed here, but then we need full control
+	   over the contents of the page that we load first. */
+}
+
+test("get paragraph rects")
+	require success "load URL";
+{
+	AutoDeleteHead paragraphs;
+
+	controller->GetParagraphRects(OpRect(0, 0, 1000, 1000), &paragraphs);
+
+	verify(!paragraphs.Empty());
+
+	/* A better test is needed here, but then we need full control
+	   over the contents of the page that we load first. */
+}
+
+test("size lock")
+	require success "init";
+{
+	controller->LockVisualViewportSize(TRUE);
+
+	OpRect visual_viewport(controller->GetVisualViewport());
+
+	controller->SetVisualViewport(OpRect(visual_viewport.x, visual_viewport.y, 300, 300));
+	verify(visual_viewport.Equals(controller->GetVisualViewport()));
+
+	controller->SetVisualViewport(OpRect(visual_viewport.x, visual_viewport.y, 200, 200));
+	verify(visual_viewport.Equals(controller->GetVisualViewport()));
+}
+
+test("set desktop layout viewport size")
+	require success "init";
+{
+	controller->SetDesktopLayoutViewportSize(1000, 1000);
+
+	OpRect layout_viewport = controller->GetLayoutViewport();
+
+	verify(layout_viewport.width == 1000);
+	verify(layout_viewport.height == 1000);
+}
+finally
+{
+	controller->SetDesktopLayoutViewportSize(0, 0);
+}
+
+test("set visual viewport")
+	require success "init";
+{
+	UINT32 win_width, win_height;
+	wic->GetOpWindow()->GetInnerSize(&win_width, &win_height);
+
+	const OpRect doc_rect(0, 0, win_width, win_height);
+
+	// Keep track of rendering viewport. It should not change at all during this test.
+
+	const OpRect rendering_viewport = controller->GetRenderingViewport();
+
+	/* Throughout this test we will verify that the layout viewport always intersects the visual
+	   viewport, as long as the visual viewport is within the bounds of the document. A stricter
+	   test would be to verify that the layout viewport contains the entire visual viewport, but
+	   for that to be true, the visual viewport needs to be smaller than or equal to the layout
+	   viewport, which is an assumption we currently don't make. */
+
+	// Unlock visual viewport, so that we can resize it independently of the window.
+
+	controller->LockVisualViewportSize(FALSE);
+
+	OpRect visual_viewport(0, 0, 500, 500);
+	controller->SetVisualViewport(visual_viewport);
+	verify(visual_viewport.Equals(controller->GetVisualViewport()));
+
+	verify(rendering_viewport.Equals(controller->GetRenderingViewport()));
+	verify(controller->GetLayoutViewport().Intersecting(controller->GetVisualViewport()));
+
+	// Any insane value should work.
+
+	for (int i=-3000; i<3000; i+= 100)
+	{
+		visual_viewport.x = i;
+		visual_viewport.y = i;
+		controller->SetVisualViewport(visual_viewport);
+		verify(visual_viewport.Equals(controller->GetVisualViewport()));
+
+		verify(rendering_viewport.Equals(controller->GetRenderingViewport()));
+		verify(controller->GetLayoutViewport().Intersecting(controller->GetVisualViewport()) ||
+			   doc_rect.Contains(visual_viewport));
+	}
+
+	controller->SetVisualViewportPos(OpPoint(0, 0));
+	visual_viewport = controller->GetVisualViewport();
+
+	verify(visual_viewport.x == 0);
+	verify(visual_viewport.y == 0);
+	verify(controller->GetLayoutViewport().Intersecting(controller->GetVisualViewport()));
+
+	controller->SetVisualViewportPos(OpPoint(0, 50));
+	visual_viewport = controller->GetVisualViewport();
+
+	verify(visual_viewport.x == 0);
+	verify(visual_viewport.y == 50);
+	verify(controller->GetLayoutViewport().Intersecting(controller->GetVisualViewport()));
+
+	controller->LockVisualViewportSize(TRUE);
+
+	visual_viewport = controller->GetVisualViewport();
+	verify(visual_viewport.x == 0);
+	verify(visual_viewport.y == 50);
+	verify(visual_viewport.width == (INT32) win_width);
+	verify(visual_viewport.height == (INT32) win_height);
+
+	verify(rendering_viewport.Equals(controller->GetRenderingViewport()));
+	verify(controller->GetLayoutViewport().Intersecting(controller->GetVisualViewport()));
+}
+finally
+{
+	controller->LockVisualViewportSize(TRUE);
+}
+
+test("set rendering viewport")
+	require success "init";
+{
+	// Keep track of visual viewport. It should not change at all during this test.
+
+	const OpRect visual_viewport = controller->GetVisualViewport();
+
+	// Keep track of layout viewport. It should not change at all during this test.
+
+	const OpRect layout_viewport = controller->GetLayoutViewport();
+
+	OpRect rendering_viewport = controller->GetRenderingViewport();
+	rendering_viewport.x = 10;
+	rendering_viewport.y = 10;
+	controller->SetRenderingViewportPos(OpPoint(rendering_viewport.x, rendering_viewport.y));
+	verify(rendering_viewport.Equals(controller->GetRenderingViewport()));
+
+	verify(visual_viewport.Equals(controller->GetVisualViewport()));
+	verify(layout_viewport.Equals(controller->GetLayoutViewport()));
+
+	// Any insane value should work.
+
+	for (int i=-3000; i<3000; i+= 100)
+	{
+		rendering_viewport.x = i;
+		rendering_viewport.y = i;
+		controller->SetRenderingViewportPos(OpPoint(rendering_viewport.x, rendering_viewport.y));
+		verify(rendering_viewport.Equals(controller->GetRenderingViewport()));
+
+		verify(visual_viewport.Equals(controller->GetVisualViewport()));
+		verify(layout_viewport.Equals(controller->GetLayoutViewport()));
+	}
+
+	controller->SetRenderingViewportPos(OpPoint(0, 0));
+	rendering_viewport = controller->GetRenderingViewport();
+
+	verify(rendering_viewport.x == 0);
+	verify(rendering_viewport.y == 0);
+
+	verify(visual_viewport.Equals(controller->GetVisualViewport()));
+	verify(layout_viewport.Equals(controller->GetLayoutViewport()));
+}
+
+test("set rendering scale")
+	require success "init";
+{
+	controller->LockVisualViewportSize(FALSE);
+	win->SetFlexRootMaxWidth(0);
+	win->GetCurrentDoc()->Reflow(FALSE);
+
+	OpRect visual_viewport = controller->GetVisualViewport();
+	OpRect rendering_viewport = controller->GetRenderingViewport();
+	OpRect layout_viewport = controller->GetLayoutViewport();
+
+	controller->SetRenderingScale(200);
+
+	win->GetCurrentDoc()->Reflow(FALSE);
+
+	// Changing scaling should not affect the visual and layout viewports.
+
+	verify(visual_viewport.Equals(controller->GetVisualViewport()));
+	verify(layout_viewport.Equals(controller->GetLayoutViewport()));
+
+	// Changing scaling should affect the size of the rendering viewport, but not its position.
+
+	OpRect new_rendering_viewport = controller->GetRenderingViewport();
+	verify(new_rendering_viewport.x == rendering_viewport.x);
+	verify(new_rendering_viewport.y == rendering_viewport.y);
+	verify(new_rendering_viewport.width != rendering_viewport.width);
+	verify(new_rendering_viewport.height != rendering_viewport.height);
+
+	controller->SetRenderingScale(100);
+
+	verify(rendering_viewport.Equals(controller->GetRenderingViewport()));
+}
+finally
+{
+	controller->SetRenderingScale(100);
+	controller->LockVisualViewportSize(TRUE);
+}
+
+test("limit paragraph width")
+	require success "init";
+{
+	win->GetCurrentDoc()->Reflow(FALSE);
+
+	OpRect layout_viewport = controller->GetLayoutViewport();
+
+	unsigned int width, height;
+	controller->GetDocumentSize(&width, &height);
+
+	controller->SetTextParagraphWidthLimit(10);
+	win->GetCurrentDoc()->Reflow(FALSE);
+
+	unsigned int new_width, new_height;
+	controller->GetDocumentSize(&new_width, &new_height);
+
+	verify(layout_viewport.Equals(controller->GetLayoutViewport()));
+
+//	SetTextParagraphWidthLimit() isn't implemented correctly yet. So disable the following verification for now.
+//	verify(new_height > height);
+
+	controller->DisableTextParagraphWidthLimit();
+	win->GetCurrentDoc()->Reflow(FALSE);
+	controller->GetDocumentSize(&new_width, &new_height);
+
+	verify(new_width == width);
+	verify(new_height == height);
+}
+finally
+{
+	controller->DisableTextParagraphWidthLimit();
+}
+
+test("set truezoom base scale")
+	require success "load URL";
+	disabled; // not tested yet
+{
+	unsigned int orig_docwidth, orig_docheight;
+	unsigned int new_docwidth, new_docheight;
+
+	controller->SetTrueZoomBaseScale(100);
+	win->GetCurrentDoc()->Reflow(FALSE);
+	controller->GetDocumentSize(&orig_docwidth, &orig_docheight);
+
+	controller->SetTrueZoomBaseScale(200);
+	win->GetCurrentDoc()->Reflow(FALSE);
+	controller->GetDocumentSize(&new_docwidth, &new_docheight);
+	verify(new_docheight == orig_docheight);
+	verify(new_docwidth == orig_docwidth);
+
+	controller->SetTrueZoomBaseScale(50);
+	win->GetCurrentDoc()->Reflow(FALSE);
+	controller->GetDocumentSize(&new_docwidth, &new_docheight);
+	verify(new_docheight == orig_docheight);
+	verify(new_docwidth == orig_docwidth);
+
+	controller->SetTrueZoomBaseScale(100);
+	win->GetCurrentDoc()->Reflow(FALSE);
+	controller->GetDocumentSize(&new_docwidth, &new_docheight);
+	verify(new_docheight == orig_docheight);
+	verify(new_docwidth == orig_docwidth);
+}
+finally
+{
+	controller->SetTrueZoomBaseScale(100);
+	win->GetCurrentDoc()->Reflow(FALSE);
+}
+
+html
+{
+	//! <!DOCTYPE html>
+	//! <html>
+	//!  <body>
+	//!   <div style="break-after:page;">hest</div>
+	//!   <div style="break-after:page;">hest</div>
+	//!   <div style="break-after:page;">hest</div>
+	//!  </body>
+	//! </html>
+}
+
+test("current page basic")
+require PAGED_MEDIA_SUPPORT;
+{
+	ViewportController* controller = state.window->GetViewportController();
+	verify(controller);
+	verify(controller->GetCurrentPageNumber() == -1);
+	verify(controller->GetTotalPageCount() == -1);
+}
+
+html
+{
+	//! <!DOCTYPE html>
+	//! <html style="overflow:-o-paged-x-controls;">
+	//!  <body>
+	//!   <div style="break-after:page;">hest</div>
+	//!   <div style="break-after:page;">hest</div>
+	//!   <div style="break-after:page;">hest</div>
+	//!  </body>
+	//! </html>
+}
+
+test("current page and count in paged media")
+require PAGED_MEDIA_SUPPORT;
+require success "current page basic";
+{
+	ViewportController* controller = state.window->GetViewportController();
+	verify(controller->GetCurrentPageNumber() == 0);
+	verify(controller->GetTotalPageCount() == 3);
+}
+
+test("change to second page")
+require PAGED_MEDIA_SUPPORT;
+require success "current page and count in paged media";
+async;
+{
+	ViewportController* controller = state.window->GetViewportController();
+	pagechange_test.Start(1, 3);
+	controller->SetViewportInfoListener(&pagechange_test);
+	controller->SetCurrentPageNumber(1);
+	if (controller->GetCurrentPageNumber() != 1)
+		ST_failed("page change failed?");
+}
+
+test("change to first page")
+require PAGED_MEDIA_SUPPORT;
+require success "current page and count in paged media";
+async;
+{
+	ViewportController* controller = state.window->GetViewportController();
+	pagechange_test.Start(0, 3);
+	controller->SetViewportInfoListener(&pagechange_test);
+	controller->SetCurrentPageNumber(0);
+	if (controller->GetCurrentPageNumber() != 0)
+		ST_failed("page change failed?");
+}
+
+test("change to third page")
+require PAGED_MEDIA_SUPPORT;
+require success "current page and count in paged media";
+async;
+{
+	ViewportController* controller = state.window->GetViewportController();
+	pagechange_test.Start(2, 3);
+	controller->SetViewportInfoListener(&pagechange_test);
+	controller->SetCurrentPageNumber(2);
+	if (controller->GetCurrentPageNumber() != 2)
+		ST_failed("page change failed?");
+}
+
+test("change to third page again")
+require PAGED_MEDIA_SUPPORT;
+require success "change to third page";
+async;
+{
+	ViewportController* controller = state.window->GetViewportController();
+	pagechange_test.StartNoCallbackExpectation();
+	controller->SetViewportInfoListener(&pagechange_test);
+	controller->SetCurrentPageNumber(2);
+	if (controller->GetCurrentPageNumber() != 2)
+		ST_failed("page change failed?");
+}
+
+test("change to negative page number")
+require PAGED_MEDIA_SUPPORT;
+require success "current page and count in paged media";
+async;
+{
+	ViewportController* controller = state.window->GetViewportController();
+	pagechange_test.Start(0, 3);
+	controller->SetViewportInfoListener(&pagechange_test);
+	controller->SetCurrentPageNumber(-1);
+	if (controller->GetCurrentPageNumber() != 0)
+		ST_failed("page change failed?");
+}
+
+test("change to fourth page (doesn't exist)")
+require PAGED_MEDIA_SUPPORT;
+require success "current page and count in paged media";
+async;
+{
+	ViewportController* controller = state.window->GetViewportController();
+	pagechange_test.Start(2, 3);
+	controller->SetViewportInfoListener(&pagechange_test);
+	controller->SetCurrentPageNumber(3);
+	if (controller->GetCurrentPageNumber() != 2)
+		ST_failed("page change failed?");
+}

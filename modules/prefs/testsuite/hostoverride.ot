@@ -1,0 +1,888 @@
+/* -*- Mode: c++; tab-width: 4; indent-tabs-mode: t; c-basic-offset: 4 -*-
+**
+** Copyright (C) 2004-2010 Opera Software ASA.  All rights reserved.
+**
+** This file is part of the Opera web browser.  It may not be distributed
+** under any circumstances.
+**
+** Peter Krefting
+*/
+
+group "prefs.hostoverride";
+require init;
+require PREFS_HOSTOVERRIDE;
+require PREFS_WRITE;
+
+include "modules/prefs/prefsmanager/prefsmanager.h";
+include "modules/prefs/prefsmanager/hostoverride.h";
+include "modules/prefs/prefsmanager/collections/pc_display.h";
+include "modules/prefs/prefsmanager/collections/pc_files.h";
+include "modules/prefs/prefsmanager/collections/pc_fontcolor.h";
+include "modules/util/opstrlst.h";
+
+// -- Global variables ---------------------------------------------------
+
+global
+{
+	const uni_char *test_host = UNI_L("www.example.com");
+	const uni_char *test_host2 = UNI_L("www.example.tld");
+	const uni_char *test_domain = UNI_L("example.com");
+	const uni_char *dl_test_host = UNI_L("downloaded.example.com");
+
+	// Status values
+	int new_scale;
+	const uni_char *new_defenc;
+
+	// Define listener classes
+
+	class SelfTestOverrideListener : public OpPrefsListener
+	                               , public PrefsCollectionFilesListener
+	{
+	public:
+		SelfTestOverrideListener()
+			: m_overrideok(FALSE), m_fileoverrideok(FALSE)
+			{}
+
+		/* OpPrefsListener */
+		virtual void HostOverrideChanged(OpPrefsCollection::Collections,
+		                                 const uni_char *hostname)
+		{
+			m_overrideok |= 0 == uni_strcmp(hostname, m_host);
+		}
+
+		/* PrefsCollectionFilesListener */
+		virtual void FileHostOverrideChanged(const uni_char *hostname)
+		{
+			m_fileoverrideok |= 0 == uni_strcmp(hostname, m_host);
+		}
+
+		inline BOOL OverrideValid() { return m_overrideok; }
+		inline BOOL FileOverrideValid() { return m_fileoverrideok; }
+
+		inline void ResetOverrideValid() { m_overrideok = FALSE; }
+
+		void SetExpectedHost(const uni_char *host) { m_host = host; }
+
+	private:
+		BOOL m_overrideok, m_fileoverrideok;
+		const uni_char *m_host;
+	};
+
+	SelfTestOverrideListener *overridelistener = OP_NEW(SelfTestOverrideListener, ());
+}
+
+setup
+{
+	overridelistener->SetExpectedHost(test_host);
+}
+
+// -- Subtests -----------------------------------------------------------
+
+subtest check_string_list(OpString_list *p, const uni_char *s, BOOL wanted)
+	require USE_UTIL_OPSTRING_LIST;
+{
+	unsigned long count = p->Count();
+	BOOL found = FALSE;
+	for (unsigned long i = 0; i < count; ++ i)
+	{
+		if (p->Item(i).CompareI(s) == 0)
+		{
+			// Match found
+			found = TRUE;
+			break;
+		}
+	}
+
+	verify(found == wanted);
+}
+
+// -- Basic OverrideHost test --------------------------------------------
+
+table basic_override_host_match(const char* override_host, const char* match_with, BOOL expected_match)
+{
+	{ "opera.com", "www.opera.com",		TRUE },
+	{ "opera.com", "my.opera.com",		TRUE },
+	{ "opera.com", "opera.com",			TRUE },
+	{ "opera.com", "opera.se",			FALSE },
+	{ "opera.com", "myopera.com",		FALSE },
+	{ "opera.com", "www.abc.se",		FALSE },
+	{ "opera.com", "www.example.com",	FALSE },
+	{ "www.opera.com", "www.opera.com",		TRUE },
+	{ "www.opera.com", "my.opera.com",		FALSE },
+	{ "www.opera.com", "opera.com",			FALSE },
+	{ "www.opera.com", "www.opera.se",		FALSE },
+	{ "www.opera.com", "myopera.com",		FALSE },
+	{ "www.opera.com", "www.abc.se",		FALSE },
+	{ "www.opera.com", "www.example.com",	FALSE },
+	{ "www.example.com", "www.opera.com",	FALSE },
+	{ "www.example.com", "my.opera.com",	FALSE },
+	{ "www.example.com", "opera.com",		FALSE },
+	{ "www.example.com", "www.opera.se",	FALSE },
+	{ "www.example.com", "myopera.com",		FALSE },
+	{ "www.example.com", "www.abc.se",		FALSE },
+	{ "www.example.com", "www.example.com",	TRUE },
+	{ "www.opera.*", "www.opera.com",	TRUE },
+	{ "www.opera.*", "my.opera.com",	FALSE },
+	{ "www.opera.*", "opera.com",		FALSE },
+	{ "www.opera.*", "www.opera.se",	TRUE },
+	{ "www.opera.*", "myopera.com",		FALSE },
+	{ "www.opera.*", "www.abc.se",		FALSE },
+	{ "www.opera.*", "www.example.com",	FALSE },
+}
+
+foreach (override_host, match_with, expected_match) from basic_override_host_match
+{
+	test("OpOverrideHost host " override_host " matching " match_with)
+	{
+		OpString host;
+		verify_success(host.Set(override_host));
+		OpString match;
+		verify_success(match.Set(match_with));
+		OpOverrideHost override;
+		override.ConstructL(host.CStr(), TRUE);
+		verify(override.IsHost(match.CStr(), match.Length(), FALSE, FALSE) == expected_match);
+	}
+}
+
+// -- Register the override listener (compare listener.ot) ---------------
+
+test("Registering override listener")
+{
+	verify_trap(g_pcdisplay->RegisterListenerL(overridelistener));
+	verify_trap(g_pcfiles->RegisterFilesListenerL(overridelistener));
+}
+
+// -- Test simple usage --------------------------------------------------
+
+test("Overriding integer")
+{
+	// Get the standard value
+	int default_scale =
+		g_pcdisplay->GetIntegerPref(PrefsCollectionDisplay::Scale);
+	new_scale =
+		(default_scale == 100) ? 200 : 100;
+
+	// Write an override
+	verify_trap(g_pcdisplay->OverridePrefL(test_host, PrefsCollectionDisplay::Scale, new_scale, TRUE));
+	verify(g_pcdisplay->IsPreferenceOverridden(PrefsCollectionDisplay::Scale, test_host));
+
+	// Read it back
+	int overridden_scale =
+		g_pcdisplay->GetIntegerPref(PrefsCollectionDisplay::Scale,
+		                            test_host);
+	verify(overridden_scale == new_scale);
+
+	// Make sure the normal value did not change
+	int default_scale_2 =
+		g_pcdisplay->GetIntegerPref(PrefsCollectionDisplay::Scale);
+	verify(default_scale_2 == default_scale);
+
+	// Check IsHostOverridden
+	verify(g_pcdisplay->IsHostOverridden(test_host, TRUE) == HostOverrideActive);
+	verify(g_prefsManager->IsHostOverridden(test_host, TRUE) == HostOverrideActive);
+}
+
+test ("Listener feedback for integer override")
+	require success "Overriding integer";
+{
+	verify(overridelistener->OverrideValid());
+	overridelistener->ResetOverrideValid();
+}
+
+test("Reading integer override via string API")
+	require PREFS_HAVE_STRING_API;
+{
+	OpString s;
+	BOOL result = FALSE;
+	verify_trap(result = g_prefsManager->GetPreferenceL("User Prefs", "Scale", s, FALSE, test_host));
+	verify(result);
+	verify_string(s, new_scale == 100 ? UNI_L("100") : UNI_L("200"));
+}
+
+test("Overriding string")
+{
+	// Get the standard value
+	OpString default_defenc;
+	verify_trap(g_pcdisplay->GetStringPrefL(PrefsCollectionDisplay::DefaultEncoding, default_defenc));
+	new_defenc =
+		default_defenc.Compare(UNI_L("windows-1252"))
+			? UNI_L("iso-8859-1")
+			: UNI_L("windows-1252");
+
+	// Write an override
+	verify_trap(g_pcdisplay->OverridePrefL(test_host, PrefsCollectionDisplay::DefaultEncoding, new_defenc, TRUE));
+	verify(g_pcdisplay->IsPreferenceOverridden(PrefsCollectionDisplay::DefaultEncoding, test_host));
+
+	// Read it back
+	OpStringC overridden_defenc =
+		g_pcdisplay->GetStringPref(PrefsCollectionDisplay::DefaultEncoding,
+		                           test_host);
+	verify_string(overridden_defenc, new_defenc);
+
+	// Make sure the normal value did not change
+	OpStringC default_defenc_2 =
+		g_pcdisplay->GetStringPref(PrefsCollectionDisplay::DefaultEncoding);
+	verify_string(default_defenc_2, default_defenc);
+
+	// Check IsHostOverridden
+	verify(g_pcdisplay->IsHostOverridden(test_host, TRUE) == HostOverrideActive);
+	verify(g_prefsManager->IsHostOverridden(test_host, TRUE) == HostOverrideActive);
+}
+
+test ("Listener feedback for string override")
+	require success "Overriding string";
+{
+	verify(overridelistener->OverrideValid());
+}
+
+test("Reading string override via string API")
+	require PREFS_HAVE_STRING_API;
+{
+	OpString s;
+	BOOL result = FALSE;
+	verify_trap(result = g_prefsManager->GetPreferenceL("User Prefs", "Fallback HTML Encoding", s, FALSE, test_host));
+	verify(result);
+	verify_string(s, new_defenc);
+}
+
+test ("Removing overrides")
+	require success "Overriding integer";
+	require success "Overriding string";
+{
+	verify(g_prefsManager->IsHostOverridden(test_host, TRUE) == HostOverrideActive);
+	verify(g_pcdisplay->IsHostOverridden(test_host, TRUE) == HostOverrideActive);
+
+	BOOL result = FALSE;
+	verify_trap(result = g_prefsManager->RemoveOverridesL(test_host, TRUE));
+	verify(result);
+
+	verify(g_prefsManager->IsHostOverridden(test_host, TRUE) == HostNotOverridden);
+	verify(g_pcdisplay->IsHostOverridden(test_host, TRUE) == HostNotOverridden);
+	verify(g_pcdisplay->IsPreferenceOverridden(PrefsCollectionDisplay::Scale, test_host) == HostNotOverridden);
+	verify(g_pcdisplay->IsPreferenceOverridden(PrefsCollectionDisplay::DefaultEncoding, test_host) == HostNotOverridden);
+}
+
+// -- File overrides -----------------------------------------------------
+
+test("Overriding file")
+{
+	// Get the standard value
+	OpFile default_file;
+	verify_trap(g_pcfiles->GetFileL(PrefsCollectionFiles::LocalCSSFile, default_file));
+
+	OpFile new_file;
+	verify_success(new_file.Construct(UNI_L("override.dat"), OPFILE_HOME_FOLDER));
+	if (uni_str_eq(new_file.GetSerializedName(), default_file.GetSerializedName()))
+	{
+		verify_success(new_file.Construct(UNI_L("overrid2.dat"), OPFILE_HOME_FOLDER));
+	}
+
+	// Write the override
+	verify_trap(g_pcfiles->OverridePrefL(test_host, PrefsCollectionFiles::LocalCSSFile, &new_file, TRUE));
+	verify(g_pcfiles->IsPreferenceOverridden(PrefsCollectionFiles::LocalCSSFile, test_host));
+
+	// Read it back
+	OpFile overridden_file;
+	verify_trap(g_pcfiles->GetFileL(PrefsCollectionFiles::LocalCSSFile, overridden_file, test_host));
+	verify_string(overridden_file.GetSerializedName(), new_file.GetSerializedName());
+
+	// Make sure the normal value did not change
+	OpFile default_file_2;
+	verify_trap(g_pcfiles->GetFileL(PrefsCollectionFiles::LocalCSSFile, default_file_2));
+	verify_string(default_file.GetSerializedName(), default_file_2.GetSerializedName());
+
+	// Check IsHostOverridden
+	verify(g_pcfiles->IsHostOverridden(test_host, TRUE) == HostOverrideActive);
+	verify(g_prefsManager->IsHostOverridden(test_host, TRUE) == HostOverrideActive);
+
+#ifdef PREFS_HAVE_STRING_API
+	// Check with the string API
+	OpString s;
+	BOOL result = FALSE;
+	verify_trap(result = g_prefsManager->GetPreferenceL("User Prefs", "Local CSS File", s, FALSE, test_host));
+	verify(result);
+	verify_string(s, new_file.GetFullPath());
+#endif
+}
+finally
+{
+	g_prefsManager->RemoveOverridesL(test_host, TRUE);
+}
+
+test ("Listener feedback for file override")
+	require success "Overriding file";
+{
+	verify(overridelistener->FileOverrideValid());
+}
+
+// -- Color overrides ----------------------------------------------------
+
+test("Overriding color")
+{
+	// Get the standard value
+	COLORREF default_bg =
+		g_pcfontscolors->GetColor(OP_SYSTEM_COLOR_DOCUMENT_BACKGROUND);
+	OP_MEMORY_VAR COLORREF new_bg =
+		(default_bg == 0) ? 0 : OP_RGB(255,255,255);
+
+	// Write an override
+	verify_trap(g_pcfontscolors->OverridePrefL(test_host, OP_SYSTEM_COLOR_DOCUMENT_BACKGROUND, new_bg, TRUE));
+	verify(g_pcfontscolors->IsPreferenceOverridden(OP_SYSTEM_COLOR_DOCUMENT_BACKGROUND, test_host));
+
+	// Read it back
+	COLORREF overridden_bg =
+		g_pcfontscolors->GetColor(OP_SYSTEM_COLOR_DOCUMENT_BACKGROUND,
+		                          test_host);
+	verify(overridden_bg == new_bg);
+
+	// Make sure the normal value did not change
+	COLORREF default_bg_2 =
+		g_pcfontscolors->GetColor(OP_SYSTEM_COLOR_DOCUMENT_BACKGROUND);
+	verify(default_bg == default_bg_2);
+
+	// Check IsHostOverridden
+	verify(g_pcfontscolors->IsHostOverridden(test_host, TRUE) == HostOverrideActive);
+	verify(g_prefsManager->IsHostOverridden(test_host, TRUE) == HostOverrideActive);
+
+#ifdef PREFS_HAVE_STRING_API
+	// Check with the string API
+	OpString s;
+	BOOL result = FALSE;
+	verify_trap(result = g_prefsManager->GetPreferenceL("Colors", "Background", s, FALSE, test_host));
+	verify(result);
+	verify_string(s, new_bg == 0 ? "#000000" : "#ffffff");
+#endif
+}
+finally
+{
+	g_prefsManager->RemoveOverridesL(test_host, TRUE);
+}
+
+test("Overriding custom color")
+{
+	if (PCFONTCOLORS_NUMBEROFCUSTOMCOLORPREFS > 0)
+	{
+		// Get the standard value
+		COLORREF default_val =
+			g_pcfontscolors->GetColor(static_cast<PrefsCollectionFontsAndColors::customcolorpref>(0));
+		OP_MEMORY_VAR COLORREF new_val =
+			(default_val == 0) ? 0 : OP_RGB(255,255,255);
+
+		// Write an override
+		verify_trap(g_pcfontscolors->OverridePrefL(test_host, static_cast<PrefsCollectionFontsAndColors::customcolorpref>(0), new_val, TRUE));
+		verify(g_pcfontscolors->IsPreferenceOverridden(static_cast<PrefsCollectionFontsAndColors::customcolorpref>(0), test_host));
+
+		// Read it back
+		COLORREF overridden_val =
+			g_pcfontscolors->GetColor(static_cast<PrefsCollectionFontsAndColors::customcolorpref>(0),
+			                          test_host);
+		verify(overridden_val == new_val);
+
+		// Make sure the normal value did not change
+		COLORREF default_val_2 =
+			g_pcfontscolors->GetColor(static_cast<PrefsCollectionFontsAndColors::customcolorpref>(0));
+		verify(default_val == default_val_2);
+
+		// Check IsHostOverridden
+		verify(g_pcfontscolors->IsHostOverridden(test_host, TRUE) == HostOverrideActive);
+		verify(g_prefsManager->IsHostOverridden(test_host, TRUE) == HostOverrideActive);
+	}
+	else
+	{
+		output("(untestable) ");
+	}
+}
+finally
+{
+	g_prefsManager->RemoveOverridesL(test_host, TRUE);
+}
+
+// -- Test cascade effect ------------------------------------------------
+
+test ("Testing override cascade effect (domain first)")
+{
+	// Get the standard value
+	int default_scale =
+		g_pcdisplay->GetIntegerPref(PrefsCollectionDisplay::Scale);
+	OP_MEMORY_VAR int domain_scale =
+		(default_scale == 100) ? 200 : 100;
+	int host_scale = domain_scale + 50;
+
+	// Write an override for the domain
+	verify_trap(g_pcdisplay->OverridePrefL(test_domain, PrefsCollectionDisplay::Scale, domain_scale, TRUE));
+
+	// Check IsHostOverridden
+	verify(g_pcdisplay->IsHostOverridden(test_domain, TRUE) == HostOverrideActive);
+	verify(g_pcdisplay->IsHostOverridden(test_host, TRUE) == HostNotOverridden);
+	verify(g_pcdisplay->IsHostOverridden(test_host, FALSE) == HostOverrideActive);
+
+	verify(g_prefsManager->IsHostOverridden(test_domain, TRUE) == HostOverrideActive);
+	verify(g_prefsManager->IsHostOverridden(test_host, TRUE) == HostNotOverridden);
+	verify(g_prefsManager->IsHostOverridden(test_host, FALSE) == HostOverrideActive);
+
+#ifdef PREFS_GETOVERRIDDENHOSTS
+	// Check GetOverriddenHosts
+	OpString_list *hosts1 = g_prefsManager->GetOverriddenHostsL();
+	verify(hosts1);
+	verify(check_string_list(hosts1, test_domain, TRUE));
+	verify(check_string_list(hosts1, test_host, FALSE));
+	OP_DELETE(hosts1);
+#endif
+
+	// Write an override for the host
+	verify_trap(g_pcdisplay->OverridePrefL(test_host, PrefsCollectionDisplay::Scale, host_scale, TRUE));
+
+	// Check IsHostOverridden
+	verify(g_pcdisplay->IsHostOverridden(test_domain, TRUE) == HostOverrideActive);
+	verify(g_pcdisplay->IsHostOverridden(test_host, FALSE) == HostOverrideActive);
+	verify(g_pcdisplay->IsHostOverridden(test_host, TRUE) == HostOverrideActive);
+	verify(g_prefsManager->IsHostOverridden(test_domain, TRUE) == HostOverrideActive);
+	verify(g_prefsManager->IsHostOverridden(test_host, FALSE) == HostOverrideActive);
+	verify(g_prefsManager->IsHostOverridden(test_host, TRUE) == HostOverrideActive);
+
+#ifdef PREFS_GETOVERRIDDENHOSTS
+	// Check GetOverriddenHosts
+	OpString_list *hosts2 = g_prefsManager->GetOverriddenHostsL();
+	verify(hosts2);
+	verify(check_string_list(hosts2, test_domain, TRUE));
+	verify(check_string_list(hosts2, test_host, TRUE));
+	OP_DELETE(hosts2);
+#endif
+
+	// Read the override for the domain
+	int domain_overridden_scale =
+		g_pcdisplay->GetIntegerPref(PrefsCollectionDisplay::Scale,
+		                            test_domain);
+	verify(domain_overridden_scale == domain_scale);
+
+	// Read the override for the host
+	int host_overridden_scale =
+		g_pcdisplay->GetIntegerPref(PrefsCollectionDisplay::Scale,
+		                            test_host);
+	verify(host_overridden_scale == host_scale);
+
+	// Make sure the normal value did not change
+	int default_scale_2 =
+		g_pcdisplay->GetIntegerPref(PrefsCollectionDisplay::Scale);
+	verify(default_scale_2 == default_scale);
+}
+finally
+{
+	// Remove overrides
+	g_prefsManager->RemoveOverridesL(test_host, TRUE);
+	g_prefsManager->RemoveOverridesL(test_domain, TRUE);
+}
+
+test ("Testing override cascade effect (host first)")
+{
+	// This is identical to the above, except that it writes the
+	// host value before the domain value.
+
+	// Get the standard value
+	int default_scale =
+		g_pcdisplay->GetIntegerPref(PrefsCollectionDisplay::Scale);
+	OP_MEMORY_VAR int domain_scale =
+		(default_scale == 100) ? 200 : 100;
+	int host_scale = domain_scale + 50;
+
+	// Write an override for the host
+	verify_trap(g_pcdisplay->OverridePrefL(test_host, PrefsCollectionDisplay::Scale, host_scale, TRUE));
+
+	// Write an override for the domain
+	verify_trap(g_pcdisplay->OverridePrefL(test_domain, PrefsCollectionDisplay::Scale, domain_scale, TRUE));
+
+	// Read the override for the domain
+	int domain_overridden_scale =
+		g_pcdisplay->GetIntegerPref(PrefsCollectionDisplay::Scale,
+		                            test_domain);
+	verify(domain_overridden_scale == domain_scale);
+
+	// Read the override for the host
+	int host_overridden_scale =
+		g_pcdisplay->GetIntegerPref(PrefsCollectionDisplay::Scale,
+		                            test_host);
+	verify(host_overridden_scale == host_scale);
+
+	// Make sure the normal value did not change
+	int default_scale_2 =
+		g_pcdisplay->GetIntegerPref(PrefsCollectionDisplay::Scale);
+	verify(default_scale_2 == default_scale);
+}
+finally
+{
+	// Remove overrides
+	TRAPD(err, g_prefsManager->RemoveOverridesL(test_host, TRUE));
+	TRAP (err, g_prefsManager->RemoveOverridesL(test_domain, TRUE));
+}
+
+// -- Test disabling overrides -------------------------------------------
+
+test("Test disabling override")
+{
+	// Get the standard value
+	int default_scale =
+		g_pcdisplay->GetIntegerPref(PrefsCollectionDisplay::Scale);
+	OP_MEMORY_VAR int new_scale =
+		(default_scale == 100) ? 200 : 100;
+
+	// Write an override
+	verify_trap(g_pcdisplay->OverridePrefL(test_host, PrefsCollectionDisplay::Scale, new_scale, TRUE));
+	verify(g_pcdisplay->IsPreferenceOverridden(PrefsCollectionDisplay::Scale, test_host));
+
+	// Disable it
+	BOOL match = FALSE;
+	verify_trap(match = g_prefsManager->SetHostOverrideActiveL(test_host, FALSE));
+	verify(match);
+	verify(!g_pcdisplay->IsPreferenceOverridden(PrefsCollectionDisplay::Scale, test_host));
+
+	// Read it back and make sure we get the default value
+	int nonoverridden_scale =
+		g_pcdisplay->GetIntegerPref(PrefsCollectionDisplay::Scale,
+		                            test_host);
+	verify(nonoverridden_scale == default_scale);
+
+	// Check IsHostOverridden
+	verify(g_pcdisplay->IsHostOverridden(test_host, TRUE) == HostOverrideDisabled);
+	verify(g_prefsManager->IsHostOverridden(test_host, TRUE) == HostOverrideDisabled);
+
+	// Activate it again
+	match = FALSE;
+	verify_trap(match = g_prefsManager->SetHostOverrideActiveL(test_host));
+	verify(match);
+
+	// Read it back and make sure we get the overridden value now
+	int overridden_scale =
+		g_pcdisplay->GetIntegerPref(PrefsCollectionDisplay::Scale,
+		                            test_host);
+	verify(overridden_scale == new_scale);
+
+	// Make sure the normal value did not change
+	int default_scale_2 =
+		g_pcdisplay->GetIntegerPref(PrefsCollectionDisplay::Scale);
+	verify(default_scale_2 == default_scale);
+
+	// Check IsHostOverridden
+	verify(g_pcdisplay->IsHostOverridden(test_host, TRUE) == HostOverrideActive);
+	verify(g_prefsManager->IsHostOverridden(test_host, TRUE) == HostOverrideActive);
+}
+finally
+{
+	// Remove overrides
+	TRAPD(err, g_prefsManager->RemoveOverridesL(test_host, TRUE));
+}
+
+// -- Test non-user entered overriddes -----------------------------------
+
+test("Test overrides not set by user")
+	require PREFSFILE_WRITE_GLOBAL;
+{
+	// Get the standard value
+	int default_scale =
+		g_pcdisplay->GetIntegerPref(PrefsCollectionDisplay::Scale);
+	OP_MEMORY_VAR int new_scale =
+		(default_scale == 100) ? 200 : 100;
+
+	// Write an override
+	verify_trap(g_pcdisplay->OverridePrefL(dl_test_host, PrefsCollectionDisplay::Scale, new_scale, FALSE));
+	verify(g_pcdisplay->IsPreferenceOverridden(PrefsCollectionDisplay::Scale, dl_test_host));
+
+	// Disable it
+	BOOL match = FALSE;
+	verify_trap(match = g_prefsManager->SetHostOverrideActiveL(dl_test_host, FALSE));
+	verify(match);
+	verify(!g_pcdisplay->IsPreferenceOverridden(PrefsCollectionDisplay::Scale, dl_test_host));
+
+	// Read it back and make sure we get the default value
+	int nonoverridden_scale =
+		g_pcdisplay->GetIntegerPref(PrefsCollectionDisplay::Scale,
+		                            dl_test_host);
+	verify(nonoverridden_scale == default_scale);
+
+	// Check IsHostOverridden
+	verify(g_pcdisplay->IsHostOverridden(dl_test_host, TRUE) == HostOverrideDownloadedDisabled);
+	verify(g_prefsManager->IsHostOverridden(dl_test_host, TRUE) == HostOverrideDownloadedDisabled);
+
+	// Activate it again
+	match = FALSE;
+	verify_trap(match = g_prefsManager->SetHostOverrideActiveL(dl_test_host));
+	verify(match);
+
+	// Read it back and make sure we get the overridden value now
+	int overridden_scale =
+		g_pcdisplay->GetIntegerPref(PrefsCollectionDisplay::Scale,
+		                            dl_test_host);
+	verify(overridden_scale == new_scale);
+
+	// Make sure the normal value did not change
+	int default_scale_2 =
+		g_pcdisplay->GetIntegerPref(PrefsCollectionDisplay::Scale);
+	verify(default_scale_2 == default_scale);
+
+	// Check IsHostOverridden
+	verify(g_pcdisplay->IsHostOverridden(dl_test_host, TRUE) == HostOverrideDownloadedActive);
+	verify(g_prefsManager->IsHostOverridden(dl_test_host, TRUE) == HostOverrideDownloadedActive);
+}
+finally
+{
+	// Remove overrides
+	TRAPD(err, g_prefsManager->RemoveOverridesL(dl_test_host, TRUE));
+}
+
+// -- Test simple usage --------------------------------------------------
+
+test("Overriding integer using string API")
+	require PREFS_HAVE_STRING_API;
+{
+	// Get the standard value
+	int default_scale =
+		g_pcdisplay->GetIntegerPref(PrefsCollectionDisplay::Scale);
+	OP_MEMORY_VAR int new_scale =
+		(default_scale == 100) ? 200 : 100;
+	const uni_char * OP_MEMORY_VAR new_scale_string =
+		(new_scale == 100) ? UNI_L("100") : UNI_L("200");
+
+	// Write an override
+	OP_MEMORY_VAR BOOL ok = FALSE;
+	verify_trap(ok = g_prefsManager->OverridePreferenceL(test_host, "User Prefs", "Scale", new_scale_string, TRUE));
+	verify(ok);
+	verify(g_pcdisplay->IsPreferenceOverridden(PrefsCollectionDisplay::Scale, test_host));
+
+	// Read it back
+	int overridden_scale =
+		g_pcdisplay->GetIntegerPref(PrefsCollectionDisplay::Scale,
+		                            test_host);
+	verify(overridden_scale == new_scale);
+
+	// Make sure the normal value did not change
+	int default_scale_2 =
+		g_pcdisplay->GetIntegerPref(PrefsCollectionDisplay::Scale);
+	verify(default_scale_2 == default_scale);
+
+	// Check IsHostOverridden
+	verify(g_pcdisplay->IsHostOverridden(test_host, TRUE) == HostOverrideActive);
+	verify(g_prefsManager->IsHostOverridden(test_host, TRUE) == HostOverrideActive);
+}
+finally
+{
+	// Remove overrides
+	g_prefsManager->RemoveOverridesL(test_host, TRUE);
+}
+
+test("Overriding string using string API")
+	require PREFS_HAVE_STRING_API;
+{
+	// Get the standard value
+	OpString default_defenc;
+	verify_trap(g_pcdisplay->GetStringPrefL(PrefsCollectionDisplay::DefaultEncoding, default_defenc));
+	const uni_char * OP_MEMORY_VAR new_defenc =
+		default_defenc.Compare(UNI_L("windows-1252"))
+			? UNI_L("iso-8859-1")
+			: UNI_L("windows-1252");
+
+	// Write an override
+	OP_MEMORY_VAR BOOL ok = FALSE;
+	verify_trap(ok = g_prefsManager->OverridePreferenceL(test_host, "User Prefs", "Fallback HTML Encoding", new_defenc, TRUE));
+	verify(ok);
+	verify(g_pcdisplay->IsPreferenceOverridden(PrefsCollectionDisplay::DefaultEncoding, test_host));
+
+	// Read it back
+	OpStringC overridden_defenc =
+		g_pcdisplay->GetStringPref(PrefsCollectionDisplay::DefaultEncoding,
+		                           test_host);
+	verify_string(overridden_defenc, new_defenc);
+
+	// Make sure the normal value did not change
+	OpStringC default_defenc_2 =
+		g_pcdisplay->GetStringPref(PrefsCollectionDisplay::DefaultEncoding);
+	verify_string(default_defenc_2, default_defenc);
+
+	// Check IsHostOverridden
+	verify(g_pcdisplay->IsHostOverridden(test_host, TRUE) == HostOverrideActive);
+	verify(g_prefsManager->IsHostOverridden(test_host, TRUE) == HostOverrideActive);
+}
+finally
+{
+	// Remove overrides
+	TRAPD(err, g_prefsManager->RemoveOverridesL(test_host, TRUE));
+}
+
+test("NULL pointer checking")
+	require PREFS_HAVE_STRING_API;
+{
+	// Write an override
+	TRAPD(rc, g_prefsManager->OverridePreferenceL(NULL, NULL, NULL, NULL, TRUE));
+	verify(OpStatus::IsError(rc));
+
+	TRAP(rc, g_prefsManager->OverridePreferenceL(test_host, NULL, NULL, NULL, TRUE));
+	verify(OpStatus::IsError(rc));
+
+	TRAP(rc, g_prefsManager->OverridePreferenceL(test_host, "User Prefs", NULL, NULL, TRUE));
+	verify(OpStatus::IsError(rc));
+
+	TRAP(rc, g_prefsManager->OverridePreferenceL(test_host, NULL, "Scale", NULL, TRUE));
+	verify(OpStatus::IsError(rc));
+
+	TRAP(rc, g_prefsManager->OverridePreferenceL(NULL, "User Prefs", "Scale", NULL, TRUE));
+	verify(OpStatus::IsError(rc));
+}
+finally
+{
+	// Remove overrides
+	TRAPD(err, g_prefsManager->RemoveOverridesL(test_host, TRUE));
+}
+
+// -- Remove single override --------------------------------------------------
+test("Remove integer host override")
+{
+	// Get the standard value
+	int default_scale =
+		g_pcdisplay->GetIntegerPref(PrefsCollectionDisplay::Scale);
+	new_scale =
+		(default_scale == 100) ? 200 : 100;
+
+	// Write an override
+	verify_trap(g_pcdisplay->OverridePrefL(test_host, PrefsCollectionDisplay::Scale, new_scale, TRUE));
+	verify(g_pcdisplay->IsPreferenceOverridden(PrefsCollectionDisplay::Scale, test_host));
+
+	// Read it back
+	int overridden_scale =
+		g_pcdisplay->GetIntegerPref(PrefsCollectionDisplay::Scale,
+		                            test_host);
+	verify(overridden_scale == new_scale);
+
+	// Remove override
+	TRAPD(ignore, g_pcdisplay->RemoveOverrideL(test_host, PrefsCollectionDisplay::Scale, TRUE));
+
+	// Try reading it again
+	overridden_scale = g_pcdisplay->GetIntegerPref(PrefsCollectionDisplay::Scale, test_host);
+	verify(overridden_scale == default_scale);
+}
+
+test("Remove integer override from multiple hosts")
+{
+	// Get the standard value
+	int default_scale =
+		g_pcdisplay->GetIntegerPref(PrefsCollectionDisplay::Scale);
+	new_scale =
+		(default_scale == 100) ? 200 : 100;
+
+	// Write the overrides
+	verify_trap(g_pcdisplay->OverridePrefL(test_host, PrefsCollectionDisplay::Scale, new_scale, TRUE));
+	verify(g_pcdisplay->IsPreferenceOverridden(PrefsCollectionDisplay::Scale, test_host));
+
+	verify_trap(g_pcdisplay->OverridePrefL(test_host2, PrefsCollectionDisplay::Scale, new_scale, TRUE));
+	verify(g_pcdisplay->IsPreferenceOverridden(PrefsCollectionDisplay::Scale, test_host2));
+
+	TRAPD(ignore, g_opera->prefs_module.PrefsManager()->CommitForceL());
+
+	// Read them back
+	int overridden_scale = g_pcdisplay->GetIntegerPref(PrefsCollectionDisplay::Scale, test_host);
+	verify(overridden_scale == new_scale);
+
+	overridden_scale = g_pcdisplay->GetIntegerPref(PrefsCollectionDisplay::Scale, test_host2);
+	verify(overridden_scale == new_scale);
+
+	// Remove overrides
+	TRAP(ignore, g_pcdisplay->RemoveOverrideL(NULL, PrefsCollectionDisplay::Scale, TRUE));
+
+	// Try reading them again
+	overridden_scale = g_pcdisplay->GetIntegerPref(PrefsCollectionDisplay::Scale, test_host);
+	verify(overridden_scale == default_scale);
+
+	overridden_scale = g_pcdisplay->GetIntegerPref(PrefsCollectionDisplay::Scale, test_host2);
+	verify(overridden_scale == default_scale);
+
+	TRAP(ignore, g_opera->prefs_module.PrefsManager()->CommitForceL());
+}
+
+test("Overriding system color when the host is char")
+{
+	const uni_char* host;
+	URL base_url;
+	
+	base_url=g_url_api->GetURL("http://www.example.com");
+	host=base_url.GetAttribute(URL::KUniHostName).CStr();
+
+	// Get the standard value
+	COLORREF default_bg =
+		g_pcfontscolors->GetColor(OP_SYSTEM_COLOR_BUTTON);
+	OP_MEMORY_VAR COLORREF new_bg =
+		(default_bg == 0) ? 0 : OP_RGB(255,255,255);
+
+	// Write an override
+	verify_trap(g_pcfontscolors->OverridePrefL(host, OP_SYSTEM_COLOR_BUTTON, new_bg, TRUE));
+	verify(g_pcfontscolors->IsPreferenceOverridden(OP_SYSTEM_COLOR_BUTTON, base_url));
+
+	// Read it back
+	COLORREF overridden_bg =
+		g_pcfontscolors->GetColor(OP_SYSTEM_COLOR_BUTTON,
+		                          host);
+	verify(overridden_bg == new_bg);
+
+	// Make sure the normal value did not change
+	COLORREF default_bg_2 =
+		g_pcfontscolors->GetColor(OP_SYSTEM_COLOR_BUTTON);
+	verify(default_bg == default_bg_2);
+
+	// Check IsHostOverridden
+	verify(g_pcfontscolors->IsHostOverridden(host, TRUE) == HostOverrideActive);
+	verify(g_prefsManager->IsHostOverridden(host, TRUE) == HostOverrideActive);
+}
+finally
+{
+	g_prefsManager->RemoveOverridesL(host, TRUE);
+}
+
+test("Overriding custom color when the host is URL object")
+{
+	const uni_char* host;
+	URL base_url;
+	
+	if (PCFONTCOLORS_NUMBEROFCUSTOMCOLORPREFS > 0)
+	{
+		base_url=g_url_api->GetURL("http://www.example.com");
+		host=base_url.GetAttribute(URL::KUniHostName).CStr();
+	
+		// Get the standard value
+		COLORREF default_val =
+			g_pcfontscolors->GetColor(static_cast<PrefsCollectionFontsAndColors::customcolorpref>(0));
+		OP_MEMORY_VAR COLORREF new_val =
+			(default_val == 0) ? 0 : OP_RGB(255,255,255);
+
+		// Write an override
+		verify_trap(g_pcfontscolors->OverridePrefL(host, static_cast<PrefsCollectionFontsAndColors::customcolorpref>(0), new_val, TRUE));
+		verify(g_pcfontscolors->IsPreferenceOverridden(static_cast<PrefsCollectionFontsAndColors::customcolorpref>(0), base_url));
+
+		// Read it back
+		COLORREF overridden_val =
+			g_pcfontscolors->GetColor(static_cast<PrefsCollectionFontsAndColors::customcolorpref>(0),
+			                          host);
+		verify(overridden_val == new_val);
+
+		// Make sure the normal value did not change
+		COLORREF default_val_2 =
+			g_pcfontscolors->GetColor(static_cast<PrefsCollectionFontsAndColors::customcolorpref>(0));
+		verify(default_val == default_val_2);
+
+		// Check IsHostOverridden
+		verify(g_pcfontscolors->IsHostOverridden(host, TRUE) == HostOverrideActive);
+		verify(g_prefsManager->IsHostOverridden(host, TRUE) == HostOverrideActive);
+	}
+	else
+	{
+		output("(untestable) ");
+	}
+}
+finally
+{
+	g_prefsManager->RemoveOverridesL(host, TRUE);
+}
+
+// -- Global cleanup -----------------------------------------------------
+
+exit
+{
+	g_pcdisplay->UnregisterListener(overridelistener);
+	g_pcfiles->UnregisterFilesListener(overridelistener);
+	OP_DELETE(overridelistener);
+}

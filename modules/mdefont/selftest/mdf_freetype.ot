@@ -1,0 +1,140 @@
+/* -*- Mode: c++; tab-width: 4; indent-tabs-mode: t; c-basic-offset: 4 -*- */
+
+group "mdefont.mdf_freetype";
+require MDEFONT_MODULE;
+require MDF_FREETYPE_SUPPORT;
+
+include "modules/mdefont/mdefont.h";
+include "modules/mdefont/mdf_freetype.h";
+
+global
+{
+	// counts number of faces in family
+	unsigned int FaceCount(MDF_FTFontEngine::MDF_FontInformation* family)
+	{
+		unsigned int count = 0;
+		for (MDF_FTFontEngine::MDF_FontFileNameInfo* f = family->file_name_list; f; f = f->next)
+			++ count;
+		return count;
+	}
+}
+
+test("MDF_FTFontEngine - synthesized webfonts")
+file uni vera "Vera.ttf";
+{
+	MDE_FONT* regular = 0;
+	MDE_FONT* bold = 0;
+	MDE_FONT* italic = 0;
+	MDF_WebFontBase* webfont_base = 0;
+
+	const int size = 12;
+
+	MDF_FTFontEngine* engine = (MDF_FTFontEngine*)g_mdf_engine;
+	verify(engine);
+
+	// add webfont
+	verify(OpStatus::IsSuccess(MDF_AddFontFile(vera, webfont_base, engine)));
+	verify(webfont_base);
+
+	MDF_FTFontEngine::MDF_WebFontImpl* webfont = (MDF_FTFontEngine::MDF_WebFontImpl*)webfont_base;
+	MDF_FTFontEngine::MDF_FontInformation* family = webfont->family;
+	const int family_idx = webfont->font_array_index;
+
+	verify(FaceCount(family) == 1); // only one font so far
+
+	// create non-synthesized instance
+	regular = MDF_GetWebFont(webfont, size);
+	verify(regular);
+	verify(FaceCount(family) == 1); // creating regular should not add a new face
+
+	// create boldified instance
+	bold = MDF_GetWebFont(webfont, 7, FALSE, size);
+	verify(bold);
+	verify(FaceCount(family) == 2); // synthesizing bold should have added a new face
+
+	// release non-synthesized instance
+	MDF_ReleaseFont(regular);
+	regular = 0;
+	verify(engine->font_array.Contains(family_idx));
+
+	// create italicized instance
+	italic = MDF_GetWebFont(webfont, 4, TRUE, size);
+	verify(italic);
+	verify(FaceCount(family) == 3); // synthesizing italic should have added yet another face
+
+	// release italicized instance
+	MDF_ReleaseFont(italic);
+	italic = 0;
+	verify(engine->font_array.Contains(family_idx));
+
+	// release boldified instance
+	MDF_ReleaseFont(bold);
+	bold = 0;
+	verify(engine->font_array.Contains(family_idx));
+
+	// remove webfont
+	engine->RemoveFont(webfont_base);
+	webfont_base = 0;
+	verify(!engine->font_array.Contains(family_idx)); // removing webfont should remove family
+	family = 0; // deleted
+}
+finally
+{
+	if (regular)
+		MDF_ReleaseFont(regular);
+	if (bold)
+		MDF_ReleaseFont(bold);
+	if (italic)
+		MDF_ReleaseFont(italic);
+
+	if (webfont_base)
+		engine->RemoveFont(webfont_base);
+}
+
+test("blitting glyph into pre-allocated buffer")
+{
+	const UINT8 bpp =
+#ifdef MDF_FONT_SMOOTHING
+		4;
+#else  // MDF_FONT_SMOOTHING
+		1;
+#endif // MDF_FONT_SMOOTHING
+	const UINT32 size   = 12; // font size, in px
+	const UINT32 slot_w = 3;  // width  of target slot, in px
+	const UINT32 slot_h = 5;  // height of target slot, in px
+	const UINT32 buf_w = 24;  // should be wide enough for 'B' rendered in 12px
+	const UINT32 buf_h = 16;  // should be high enough for 'B' rendered in 12px
+	const UINT32 stride = buf_w*bpp; // buffer stride
+	const size_t buf_size = stride*buf_h;
+	UINT8 buffer[buf_size];
+	op_memset(buffer, 0, buf_size);
+
+	// get the font engine and font to use
+	MDE_FONT* font = 0;
+	MDF_FTFontEngine* engine = (MDF_FTFontEngine*)g_mdf_engine;
+	verify(engine);
+	const int font_index = styleManager->GetFontNumber(UNI_L("Bitstream Vera Sans"));
+	verify(font_index >= 0 && "Bitstream Vera Sans required for this test");
+	font = MDF_GetFont(font_index, size, FALSE, FALSE);
+	verify(font);
+
+	// blit a glyph to buffer
+	MDF_GLYPH_BUFFER gbuf;
+	gbuf.data = buffer;
+	gbuf.w = slot_w;
+	gbuf.h = slot_h;
+	MDF_GLYPH glyph;
+	glyph.buffer_data = &gbuf;
+	BOOL render = TRUE;
+	verify(OpStatus::IsSuccess(engine->LoadFontGlyph(glyph, 'B', font, render, FALSE, stride)));
+
+	// loop over buffer and check that nothing is touched outside the boundaries of width,height
+	for (UINT32 y = 0; y < buf_h; ++y)
+		for (UINT32 x = y < slot_h ? bpp*slot_w : 0; x < buf_w*bpp; ++x)
+			verify(!buffer[y*stride + x]);
+}
+finally
+{
+	if (font)
+		MDF_ReleaseFont(font);
+}

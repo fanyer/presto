@@ -1,0 +1,1 @@
+var expected = []; try { expected = ["WebSocket" in self, WebSocket.prototype != null, "close" in WebSocket.prototype, "send" in WebSocket.prototype, "dispatchEvent" in WebSocket.prototype, "addEventListener" in WebSocket.prototype, "removeEventListener" in WebSocket.prototype]; } catch (e) { expected = [false];}; postMessage(expected);

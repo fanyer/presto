@@ -1,0 +1,906 @@
+/* -*- Mode: c++; tab-width: 4; indent-tabs-mode: t; c-basic-offset: 4 -*-
+**
+** Copyright (C) 2004-2006 Opera Software ASA.  All rights reserved.
+**
+** This file is part of the Opera web browser.  It may not be distributed
+** under any circumstances.
+**
+** Luca Venturi
+*/
+
+group "cache simple";
+require init;
+require DISK_CACHE_SUPPORT;
+require CACHE_FAST_INDEX;
+include "modules/cache/simple_stream.h";
+
+global
+{
+	int STREAM_TEST_SIZE = 1024*(1024+1);
+	
+	OpFileLength GetExpectedReadPhysicalPos(OpFileLength cur)
+	{
+		return ((cur+STREAM_BUF_SIZE-1)/STREAM_BUF_SIZE)*STREAM_BUF_SIZE;
+	}
+
+	enum TestSize { SIZE_8_BITS, SIZE_16_BITS, SIZE_32_BITS, SIZE_64_BITS, SIZE_BIG};
+
+	uni_char multimedia_name[]={'M','u','l','t','i','m','e','d','i','a','.','o','u','t',0};
+}
+
+subtest ReadWriteTest1(uni_char *name)
+{
+	OpAutoPtr<SimpleFileReader>sfr(OP_NEW(SimpleFileReader, ()));
+	OpAutoPtr<SimpleFileWriter>sfw(OP_NEW(SimpleFileWriter, ()));
+
+	verify(sfw.get() && sfr.get());
+	OpAutoArray<UINT8> buf(OP_NEWA(UINT8, STREAM_TEST_SIZE));
+	int cur=0;
+
+	verify(buf.get());
+
+	////// Initialization for Write
+	verify(sfw->Construct(name, OPFILE_ABSOLUTE_FOLDER, FALSE)==OpStatus::OK);
+
+	for(int i=0; i<STREAM_TEST_SIZE; i++)
+		buf[i]=op_rand()&0xFF;
+
+	////// Sequential Write tests
+
+	// 8 bits test
+	for(cur=0; cur<1024; cur++)
+		sfw->Write8((UINT32)buf[cur]);
+
+	// Boundary shift
+	sfw->Write8((UINT32)buf[cur++]);
+
+	// 16 bits test
+	for(; cur<2*1024; cur+=2)
+	{
+	    UINT32 u0=buf[cur];
+	    UINT32 u1=buf[cur+1];
+		UINT32 v=(UINT32)( (u0<<8) | u1 );
+
+		sfw->Write16(v);
+	}
+	// 32 bits test
+	for(; cur<3*1024; cur+=4)
+	{
+		UINT32 u0=buf[cur];
+	    UINT32 u1=buf[cur+1];
+	    UINT32 u2=buf[cur+2];
+	    UINT32 u3=buf[cur+3];
+		UINT32 v=(UINT32)((u0<<24) | (u1<<16) | (u2<<8) | u3);
+
+		sfw->Write32(v);
+	}
+	// 64 bits test
+	for(; cur<4*1024; cur+=8)
+	{
+		UINT64 u0=buf[cur];
+	    UINT64 u1=buf[cur+1];
+	    UINT64 u2=buf[cur+2];
+	    UINT64 u3=buf[cur+3];
+	    UINT64 u4=buf[cur+4];
+	    UINT64 u5=buf[cur+5];
+	    UINT64 u6=buf[cur+6];
+	    UINT64 u7=buf[cur+7];
+		UINT64 v=(	(u0<<56) | (u1<<48) | (u2<<40) | (u3<<32) |
+					(u4<<24) | (u5<<16) | (u6<<8) | u7);
+
+		sfw->Write64(v);
+	}
+
+
+	////// Initialization for Read
+	verify(sfw->Close()==OpStatus::OK);
+	verify(sfr->Construct(name, OPFILE_ABSOLUTE_FOLDER)==OpStatus::OK);
+
+	////// Sequential Read tests
+	cur=0;
+
+	// 8 bits test
+	for(cur=0; cur<1024; cur++)
+		verify(sfr->Read8()==buf[cur]);
+
+	// Boundary shift
+	verify(sfr->Read8()==buf[cur++]);
+
+	// 16 bits test
+	for(; cur<2*1024; cur+=2)
+	{
+		UINT32 u0=buf[cur];
+	    UINT32 u1=buf[cur+1];
+		UINT32 v=(UINT32)((u0<<8) | u1);
+
+		verify(sfr->Read16()==v);
+	}
+	// 32 bits test
+	for(; cur<3*1024; cur+=4)
+	{
+		UINT32 u0=buf[cur];
+	    UINT32 u1=buf[cur+1];
+	    UINT32 u2=buf[cur+2];
+	    UINT32 u3=buf[cur+3];
+		UINT32 v=(UINT32)((u0<<24) | (u1<<16) | (u2<<8) | u3);
+
+		verify(sfr->Read32()==v);
+	}
+	// 64 bits test
+	for(; cur<4*1024; cur+=8)
+	{
+		UINT64 u0=buf[cur];
+	    UINT64 u1=buf[cur+1];
+	    UINT64 u2=buf[cur+2];
+	    UINT64 u3=buf[cur+3];
+	    UINT64 u4=buf[cur+4];
+	    UINT64 u5=buf[cur+5];
+	    UINT64 u6=buf[cur+6];
+	    UINT64 u7=buf[cur+7];
+		UINT64 v=(	(u0<<56) | (u1<<48) | (u2<<40) | (u3<<32) |
+					(u4<<24) | (u5<<16) | (u6<<8) | u7);
+
+		verify(sfr->Read64()==v);
+	}
+
+	sfr->Close();
+}
+
+subtest CheckPositions(SimpleFileReadWrite *sfrw, UINT32 expected_read, UINT32 expected_write, int expected_physical, UINT32 expected_len)
+{
+	verify(sfrw);
+
+	OpFileLength rpos=0;
+	OpFileLength wpos=0;
+	OpFileLength ppos=0;
+	OpFileLength len;
+
+	verify(OpStatus::IsSuccess(sfrw->GetReadFilePos(rpos)));
+	verify(OpStatus::IsSuccess(sfrw->GetWriteFilePos(wpos)));
+	verify(OpStatus::IsSuccess(sfrw->DebugGetPhysicalPos(ppos)));
+
+	verify(OpStatus::IsSuccess(sfrw->GetWriteFilePos(wpos)));
+
+	verify(rpos==expected_read);
+	verify(wpos==expected_write);
+	//if(expected_physical>=0)
+	//	verify(ppos==expected_physical);
+
+	verify(OpStatus::IsSuccess(sfrw->GetFileLength(len)));
+	verify(len==expected_len || len==4097);
+}
+
+subtest WriteTestOutput(SimpleFileReadWrite *sfrw, UINT32 &cur, void *buf, UINT32 num, TestSize size)
+{
+	output("w");
+
+	verify(WriteTest(sfrw, cur, buf, num, size));
+}
+
+// Write at least num bytes of the size requested
+// "cur" is increased by the number of bytes written
+subtest WriteTest(SimpleFileReadWrite *sfrw, UINT32 &cur, void *buf, UINT32 num, TestSize size)
+{
+	OP_ASSERT(buf);
+	UINT8 *buf8=((UINT8 *)buf)+cur;  // Point ot the real beginning of the buffer
+	UINT16 *buf16=(UINT16*)buf8;
+	UINT32 *buf32=(UINT32*)buf8;
+	UINT64 *buf64=(UINT64*)buf8;
+
+	if(size==SIZE_BIG)
+	{
+		verify(OpStatus::IsSuccess(sfrw->WriteBuf(buf8, num)));
+		cur+=num;
+		return 1;
+	}
+
+#ifdef NEEDS_RISC_ALIGNMENT
+	// Align at the largest boundary that is used, ie 64bit
+	OpAutoArray<UINT64> autobuf64(OP_NEWA(UINT64, num/8+1));
+	if(!autobuf64.get())
+		return OpStatus::ERR_NO_MEMORY;
+	op_memcpy(autobuf64.get(), buf8, num);
+	buf16 = (UINT16*)autobuf64.get();
+	buf32 = (UINT32*)autobuf64.get();
+	buf64 = (UINT64*)autobuf64.get();
+#endif // NEEDS_RISC_ALIGNMENT
+
+	UINT32 end=cur+num;
+
+	while(cur<end)
+	{
+		if(size==SIZE_8_BITS)
+		{
+			verify(OpStatus::IsSuccess(sfrw->Write8(*buf8++)));
+			cur++;
+		}
+		else if(size==SIZE_16_BITS)
+		{
+			OP_ASSERT((num%2)==0);
+			verify(OpStatus::IsSuccess(sfrw->Write16(*buf16++)));
+			cur+=2;
+		}
+		else if(size==SIZE_32_BITS)
+		{
+			OP_ASSERT((num%4)==0);
+			verify(OpStatus::IsSuccess(sfrw->Write32(*buf32++)));
+			cur+=4;
+		}
+		else if(size==SIZE_64_BITS)
+		{
+			OP_ASSERT((num%8)==0);
+			verify(OpStatus::IsSuccess(sfrw->Write64(*buf64++)));
+			cur+=8;
+		}
+		else
+		{
+			verify(FALSE);
+		}
+	}
+}
+
+subtest ReadTestOutput(SimpleFileReadWrite *sfrw, UINT32 &cur, void *buf, UINT32 num, TestSize size, BOOL check_not_finished)
+{
+	output("r");
+
+	verify(ReadTest(sfrw, cur, buf, num, size, check_not_finished));
+}
+
+// Read at least num bytes of the size requested
+subtest ReadTest(SimpleFileReadWrite *sfrw, UINT32 &cur, void *buf, UINT32 num, TestSize size, BOOL check_not_finished)
+{
+	OP_ASSERT(buf);
+	UINT8 *buf8=((UINT8 *)buf)+cur;  // Point ot the real beginning of the buffer
+	UINT16 *buf16=(UINT16*)buf8;
+	UINT32 *buf32=(UINT32*)buf8;
+	UINT64 *buf64=(UINT64*)buf8;
+
+	if(size==SIZE_BIG)
+	{
+		OpAutoArray<UINT8> buf2(OP_NEWA(UINT8, num));
+
+		verify(buf2.get());
+
+		verify(OpStatus::IsSuccess(sfrw->ReadBuf(buf2.get(), num)));
+
+		unsigned char *b1=(unsigned char *)(buf8);
+		unsigned char *b2=(unsigned char *)(buf2.get());
+
+		for(UINT32 i=0; i<num; i++)
+		{
+			if(b2[i]!=b1[i])
+				output("** Read error on big size - %d != %d after %d bytes ", (int)b2[i], (int)b2[i], cur+i);
+			verify(b2[i] == b1[i]);
+		}
+
+		cur+=num;
+
+	}
+	else
+	{	
+#ifdef NEEDS_RISC_ALIGNMENT
+		// Align at the largest boundary that is used, ie 64bit
+		OpAutoArray<UINT64> autobuf64(OP_NEWA(UINT64, num/8+1));
+		if(!autobuf64.get())
+			return OpStatus::ERR_NO_MEMORY;
+		op_memcpy(autobuf64.get(), buf8, num);
+		buf16 = (UINT16*)autobuf64.get();
+		buf32 = (UINT32*)autobuf64.get();
+		buf64 = (UINT64*)autobuf64.get();
+#endif // NEEDS_RISC_ALIGNMENT
+
+		UINT32 end=cur+num;
+
+		while(cur<end)
+		{
+			if(size==SIZE_8_BITS)
+			{
+				UINT32 c8=sfrw->Read8();
+				UINT8 v=*buf8++;
+
+				//if(c!=buf[cur] || cur%100==0)
+				//	verify(CheckPositions(sfrw, cur+1, 0, (UINT32)GetExpectedReadPhysicalPos(cur+1), 4097));
+
+				if(check_not_finished)
+					verify(!sfrw->IsFileFinished());
+
+				if(c8!=v)
+					output("** Read error on 8 bits - %d != %d after %d bytes ", (int)c8, (int)v, cur);
+				verify(c8 == v);
+				cur++;
+			}
+			else if(size==SIZE_16_BITS)
+			{
+				OP_ASSERT((num%2)==0);
+
+				UINT16 v=*buf16++;
+				UINT32 c16=sfrw->Read16();
+
+				if(check_not_finished)
+					verify(!sfrw->IsFileFinished());
+
+				if(c16!=v)
+					output("** Read error on 16 bits - %d != %d after %d bytes ", (int)c16, (int)v, cur);
+				verify(c16 == v);
+
+				cur+=2;
+			}
+			else if(size==SIZE_32_BITS)
+			{
+				OP_ASSERT((num%4)==0);
+
+				UINT32 v=*buf32++;
+				UINT32 c32=sfrw->Read32();
+
+				if(check_not_finished)
+					verify(!sfrw->IsFileFinished());
+
+				if(c32!=v)
+					output("** Read error on 32 bits - %d != %d after %d bytes ", (int)c32, (int)v, cur);
+				verify(c32 == v);
+
+				cur+=4;
+			}
+			else if(size==SIZE_64_BITS)
+			{
+				OP_ASSERT((num%8)==0);
+
+				UINT64 v=*buf64++;
+				UINT64 c64=sfrw->Read64();
+
+				if(check_not_finished)
+					verify(cur==4089 || !sfrw->IsFileFinished());
+
+				if(c64!=v)
+					output("** Read error on 64 bits - %d != %d after %d bytes ", (int)c64, (int)v, cur);
+				verify(c64 == v);
+
+				cur+=8;
+			}
+			else
+			{
+				verify(!"unexpected size");
+			}
+		}
+	}
+}
+
+// Sequential Write and Sequential Read
+subtest ReadWriteTest2(uni_char *name, BOOL close, BOOL check)
+{
+	OpAutoPtr<SimpleFileReadWrite>sfrw(OP_NEW(SimpleFileReadWrite, ()));
+	OpFileLength len=0;
+
+	verify(sfrw.get());
+	OpAutoArray<UINT8> buf(OP_NEWA(UINT8, STREAM_TEST_SIZE));
+	UINT32 cur=0;
+
+	verify(buf.get());
+
+	////// Initialization for Write
+	for(int i=0; i<STREAM_TEST_SIZE; i++)
+		buf[i]=op_rand()&0xFF;
+
+	verify(sfrw->ConstructFile(name, OPFILE_ABSOLUTE_FOLDER, FALSE)==OpStatus::OK);
+
+	if(check)
+		verify(CheckPositions(sfrw.get(), 0, 0, 0, 0));
+
+	////// Sequential Write tests
+
+	// 8 bits test with boundary shift (1025 is not a power of 2)
+	verify(WriteTestOutput(sfrw.get(), cur, buf.get(), 1025, SIZE_8_BITS));
+	if(check)
+		verify(CheckPositions(sfrw.get(), 0, 1025, 0, 1025));
+
+	// Test Read Only
+	sfrw->SetReadOnly(TRUE);
+	verify(sfrw->Write64(*buf)==OpStatus::ERR_NOT_SUPPORTED);
+	verify(sfrw->SetWriteFilePos(0)==OpStatus::ERR_NOT_SUPPORTED);
+	sfrw->SetReadOnly(FALSE);
+
+	// 16 bits test
+	verify(WriteTestOutput(sfrw.get(), cur, buf.get(), 1024, SIZE_16_BITS));
+	if(check)
+		verify(CheckPositions(sfrw.get(), 0, 2049, 1025, 2049));
+
+	// 32 bits test
+	verify(WriteTestOutput(sfrw.get(), cur, buf.get(), 1024, SIZE_32_BITS));
+	if(check)
+		verify(CheckPositions(sfrw.get(), 0, 3073, 2049, 3073));
+
+	// 64 bits test
+	verify(WriteTestOutput(sfrw.get(), cur, buf.get(), 1024, SIZE_64_BITS));
+	if(check)
+		verify(CheckPositions(sfrw.get(), 0, 4097, 3073, 4097));
+	if(check)
+		verify(CheckPositions(sfrw.get(), 0, 4097, 0, 4097));
+
+	////// Initialization for Read
+	verify(OpStatus::IsSuccess(sfrw->GetFileLength(len)));
+	verify(len==4097);
+
+	if(close)
+	{
+		verify(sfrw->Close()==OpStatus::OK);
+		verify(sfrw->ConstructFile(name, OPFILE_ABSOLUTE_FOLDER, FALSE)==OpStatus::OK);
+	}
+
+	UINT32 write_pos=close?0:4097;
+
+	if(check)
+		verify(CheckPositions(sfrw.get(), 0, write_pos, 0, 4097));
+
+	////// Sequential Read tests
+	cur=0;
+
+	// 8 bits test
+	verify(ReadTestOutput(sfrw.get(), cur, buf.get(), 1025, SIZE_8_BITS, TRUE));
+	if(check)
+		verify(CheckPositions(sfrw.get(), 1025, write_pos, (UINT32)GetExpectedReadPhysicalPos(1025), 4097));
+
+	// 16 bits test
+	verify(ReadTestOutput(sfrw.get(), cur, buf.get(), 1024, SIZE_16_BITS, TRUE));
+	if(check)
+		verify(CheckPositions(sfrw.get(), 2049, write_pos, (UINT32)GetExpectedReadPhysicalPos(2049)-1, 4097));
+
+	// 32 bits test
+	verify(ReadTestOutput(sfrw.get(), cur, buf.get(), 1024, SIZE_32_BITS, TRUE));
+	if(check)
+		verify(CheckPositions(sfrw.get(), 3073, write_pos, (UINT32)GetExpectedReadPhysicalPos(3073)-1, 4097));
+
+	// 64 bits test
+	verify(ReadTestOutput(sfrw.get(), cur, buf.get(), 1024, SIZE_64_BITS, TRUE));
+	if(check)
+		verify(CheckPositions(sfrw.get(), 4097, write_pos, 4097, 4097));
+}
+
+// Mixed Write and Read operations
+subtest ReadWriteTest3(uni_char *name, BOOL check, BOOL check_not_finished)
+{
+	output("ReadWriteTest3\n");
+	OpAutoPtr<SimpleFileReadWrite>sfrw(OP_NEW(SimpleFileReadWrite, ()));
+	OpFileLength len=0;
+
+	verify(sfrw.get());
+	OpAutoArray<UINT8> buf(OP_NEWA(UINT8, STREAM_TEST_SIZE));
+	UINT32 cur_w=0;
+	UINT32 cur_r=0;
+
+	verify(buf.get());
+
+	////// Initialization for Write
+	for(int i=0; i<STREAM_TEST_SIZE; i++)
+		buf[i]=op_rand()&0xFF;
+
+	verify(sfrw->ConstructFile(name, OPFILE_ABSOLUTE_FOLDER, FALSE)==OpStatus::OK);
+
+	if(check)
+		verify(CheckPositions(sfrw.get(), 0, 0, 0, 0));
+
+	////// READ/Write tests
+
+	// 8 bits test with boundary shift (1025 is not a power of 2)
+	verify(WriteTestOutput(sfrw.get(), cur_w, buf.get(), 1025, SIZE_8_BITS));
+	if(check)
+		verify(CheckPositions(sfrw.get(), 0, 1025, 0, 1025));
+
+	verify(ReadTestOutput(sfrw.get(), cur_r, buf.get(), 1025, SIZE_8_BITS, check_not_finished));
+	if(check)
+		verify(CheckPositions(sfrw.get(), 1025, 1025, -1, (check_not_finished)?4097:1025));
+
+	// 16 bits test
+	verify(WriteTestOutput(sfrw.get(), cur_w, buf.get(), 1024, SIZE_16_BITS)); // Overwrite something buffered for reading.
+	if(check)
+		verify(CheckPositions(sfrw.get(), 1025, 2049, 1025, 2049));
+
+	verify(ReadTestOutput(sfrw.get(), cur_r, buf.get(), 1024, SIZE_16_BITS, check_not_finished));
+	if(check)
+		verify(CheckPositions(sfrw.get(), 2049, 2049, -1, 2049));
+
+	// 32 bits test
+	verify(WriteTestOutput(sfrw.get(), cur_w, buf.get(), 1024, SIZE_32_BITS));
+	if(check)
+		verify(CheckPositions(sfrw.get(), 2049, 3073, 2049, 3073));
+
+	verify(ReadTestOutput(sfrw.get(), cur_r, buf.get(), 1024, SIZE_32_BITS, check_not_finished));
+	if(check)
+		verify(CheckPositions(sfrw.get(), 3073, 3073, -1, 3073));
+
+	// 64 bits test
+	verify(WriteTestOutput(sfrw.get(), cur_w, buf.get(), 1024, SIZE_64_BITS));
+	if(check)
+		verify(CheckPositions(sfrw.get(), 3073, 4097, 3073, 4097));
+	if(check)
+		verify(CheckPositions(sfrw.get(), 3073, 4097, 3073, 4097));
+
+	verify(ReadTestOutput(sfrw.get(), cur_r, buf.get(), 1024, SIZE_64_BITS, check_not_finished));
+	if(check)
+		verify(CheckPositions(sfrw.get(), 4097, 4097, 4097, 4097));
+
+	verify(OpStatus::IsSuccess(sfrw->GetFileLength(len)));
+	verify(len==4097);
+}
+
+// More Mixed Write and Read operations
+subtest ReadWriteTest4(uni_char *name, BOOL check_not_finished)
+{
+	output("* ReadWriteTest4 * ");
+	OpAutoPtr<SimpleFileReadWrite>sfrw(OP_NEW(SimpleFileReadWrite, ()));
+	OpFileLength len=0;
+
+	verify(sfrw.get());
+	OpAutoArray<UINT8> buf(OP_NEWA(UINT8, STREAM_TEST_SIZE));
+	UINT32 cur_w=0;
+	UINT32 cur_r=0;
+
+	verify(buf.get());
+
+	////// Initialization for Write
+	for(int i=0; i<STREAM_TEST_SIZE; i++)
+		buf[i]=op_rand()&0xFF;
+
+	verify(sfrw->ConstructFile(name, OPFILE_ABSOLUTE_FOLDER, FALSE)==OpStatus::OK);
+
+	////// READ/Write tests
+	output("\n     RWT4 - 8 Bits test - ");
+	// 8 bits test with boundary shift (1025 is not a power of 2)
+	verify(WriteTestOutput(sfrw.get(), cur_w, buf.get(), 256, SIZE_8_BITS));
+	verify(ReadTestOutput(sfrw.get(), cur_r, buf.get(), 128, SIZE_8_BITS, check_not_finished));
+	verify(WriteTestOutput(sfrw.get(), cur_w, buf.get(), 256, SIZE_8_BITS));
+	verify(ReadTestOutput(sfrw.get(), cur_r, buf.get(), 128, SIZE_8_BITS, check_not_finished));
+	verify(WriteTestOutput(sfrw.get(), cur_w, buf.get(), 513, SIZE_8_BITS));
+	verify(ReadTestOutput(sfrw.get(), cur_r, buf.get(), 256, SIZE_8_BITS, check_not_finished));
+	verify(ReadTestOutput(sfrw.get(), cur_r, buf.get(), 513, SIZE_8_BITS, check_not_finished));
+
+	// Long Write - Short Read
+	output("\n     RWT4 - Short read - ");
+	OP_ASSERT(131073 > STREAM_BUF_SIZE);
+	verify(WriteTestOutput(sfrw.get(), cur_w, buf.get(), 1024, SIZE_BIG));
+	verify(WriteTestOutput(sfrw.get(), cur_w, buf.get(), 131073, SIZE_BIG));
+	output("[R...]");
+
+	for(int c=0; c<129; c++)
+	{
+		if((c%10)==0)
+			output("[%d]", c);
+
+		verify(ReadTestOutput(sfrw.get(), cur_r, buf.get(), 1024, SIZE_BIG, check_not_finished));
+	}
+	output("[...R]");
+	verify(ReadTestOutput(sfrw.get(), cur_r, buf.get(), 1, SIZE_8_BITS, check_not_finished));
+
+	// Long Write - Long Read
+	output("\n     RWT4 - Long read - ");
+	verify(WriteTestOutput(sfrw.get(), cur_w, buf.get(), 131073, SIZE_BIG));
+	verify(ReadTestOutput(sfrw.get(), cur_r, buf.get(), 131073, SIZE_BIG, check_not_finished));
+	verify(WriteTestOutput(sfrw.get(), cur_w, buf.get(), 131073, SIZE_BIG));
+	verify(ReadTestOutput(sfrw.get(), cur_r, buf.get(), 65536, SIZE_BIG, check_not_finished));
+	verify(ReadTestOutput(sfrw.get(), cur_r, buf.get(), 65537, SIZE_BIG, check_not_finished));
+
+	// 16 bits test
+	output("\n     RWT4 - 16 bites test - ");
+	verify(WriteTestOutput(sfrw.get(), cur_w, buf.get(), 256, SIZE_16_BITS));
+	verify(ReadTestOutput(sfrw.get(), cur_r, buf.get(), 128, SIZE_16_BITS, check_not_finished));
+	verify(WriteTestOutput(sfrw.get(), cur_w, buf.get(), 256, SIZE_16_BITS));
+	verify(ReadTestOutput(sfrw.get(), cur_r, buf.get(), 128, SIZE_16_BITS, check_not_finished));
+	verify(WriteTestOutput(sfrw.get(), cur_w, buf.get(), 512, SIZE_16_BITS));
+	verify(ReadTestOutput(sfrw.get(), cur_r, buf.get(), 256, SIZE_16_BITS, check_not_finished));
+	verify(ReadTestOutput(sfrw.get(), cur_r, buf.get(), 512, SIZE_16_BITS, check_not_finished));
+
+	/// Add random read and write
+	output("\n     RWT4 - Random R/W - ");
+	OpFileLength r_pos;
+	OpFileLength w_pos;
+	UINT32 t_cur=10;
+
+	verify(WriteTestOutput(sfrw.get(), cur_w, buf.get(), 256, SIZE_32_BITS)); // W1
+
+	// Save current position
+	verify(OpStatus::IsSuccess(sfrw.get()->GetWriteFilePos(w_pos)));
+
+	// Reandom write
+	output("\n     RWT4 - Random W - ");
+	verify(OpStatus::IsSuccess(sfrw.get()->SetWriteFilePos(103)));
+
+	verify(WriteTestOutput(sfrw.get(), t_cur, buf.get(), 16, SIZE_8_BITS));  // W2
+	verify(WriteTestOutput(sfrw.get(), t_cur, buf.get(), 16, SIZE_16_BITS));
+	verify(WriteTestOutput(sfrw.get(), t_cur, buf.get(), 16, SIZE_32_BITS));
+	verify(WriteTestOutput(sfrw.get(), t_cur, buf.get(), 16, SIZE_64_BITS));
+
+	// Read from last position
+	output("\n     RWT4 - Last Pos - ");
+	verify(ReadTestOutput(sfrw.get(), cur_r, buf.get(), 256, SIZE_32_BITS, check_not_finished));  // Read W1
+	verify(OpStatus::IsSuccess(sfrw.get()->GetReadFilePos(r_pos)));
+
+	// Random read
+	output("\n     RWT4 - Random R - ");
+	verify(OpStatus::IsSuccess(sfrw.get()->SetReadFilePos(103)));
+	verify(OpStatus::IsSuccess(sfrw.get()->SetReadFilePos(103)));
+	t_cur=10;
+	verify(ReadTestOutput(sfrw.get(), t_cur, buf.get(), 16, SIZE_8_BITS, TRUE));  // Read W2
+	verify(ReadTestOutput(sfrw.get(), t_cur, buf.get(), 16, SIZE_16_BITS, TRUE));
+	verify(ReadTestOutput(sfrw.get(), t_cur, buf.get(), 16, SIZE_32_BITS, TRUE));
+	verify(ReadTestOutput(sfrw.get(), t_cur, buf.get(), 16, SIZE_64_BITS, TRUE));
+
+	// Restore
+	verify(OpStatus::IsSuccess(sfrw.get()->SetReadFilePos(r_pos)));
+	verify(OpStatus::IsSuccess(sfrw.get()->SetWriteFilePos(w_pos)));
+	verify(OpStatus::IsSuccess(sfrw.get()->SetWriteFilePos(w_pos)));
+
+
+	// Add Long writes
+
+	// 32 bits test
+	output("\n     RWT4 - 32 Bits - ");
+	verify(WriteTestOutput(sfrw.get(), cur_w, buf.get(), 256, SIZE_32_BITS));
+	verify(ReadTestOutput(sfrw.get(), cur_r, buf.get(), 128, SIZE_32_BITS, check_not_finished));
+	verify(WriteTestOutput(sfrw.get(), cur_w, buf.get(), 256, SIZE_32_BITS));
+	verify(ReadTestOutput(sfrw.get(), cur_r, buf.get(), 128, SIZE_32_BITS, check_not_finished));
+	verify(WriteTestOutput(sfrw.get(), cur_w, buf.get(), 512, SIZE_32_BITS));
+	verify(ReadTestOutput(sfrw.get(), cur_r, buf.get(), 256, SIZE_32_BITS, check_not_finished));
+	verify(ReadTestOutput(sfrw.get(), cur_r, buf.get(), 512, SIZE_32_BITS, check_not_finished));
+
+	// Read past the end of the file
+	if(!check_not_finished)
+	{
+		verify(0==sfrw->Read8());
+		verify(0==sfrw->Read16());
+		verify(0==sfrw->Read32());
+		verify(0==sfrw->Read64());
+	}
+
+	// 64 bits test
+	output("\n     RWT4 - 64 Bits - ");
+	verify(WriteTestOutput(sfrw.get(), cur_w, buf.get(), 256, SIZE_64_BITS));
+	verify(ReadTestOutput(sfrw.get(), cur_r, buf.get(), 128, SIZE_64_BITS, check_not_finished));
+	verify(WriteTestOutput(sfrw.get(), cur_w, buf.get(), 256, SIZE_64_BITS));
+	verify(ReadTestOutput(sfrw.get(), cur_r, buf.get(), 128, SIZE_64_BITS, check_not_finished));
+	verify(WriteTestOutput(sfrw.get(), cur_w, buf.get(), 512, SIZE_64_BITS));
+	verify(ReadTestOutput(sfrw.get(), cur_r, buf.get(), 256, SIZE_64_BITS, check_not_finished));
+
+	verify(OpStatus::IsSuccess(sfrw.get()->GetFileLength(len)));
+	verify(len==4097+1024+131073*3+256);
+	verify(OpStatus::IsSuccess(sfrw.get()->SetReadFilePos(len)));
+
+	// Read past the end of the file
+	verify(0==sfrw->Read8());
+	verify(0==sfrw->Read16());
+	verify(0==sfrw->Read32());
+	verify(0==sfrw->Read64());
+	output("\n");
+}
+
+// More mixed Write and read operation
+subtest ReadWriteTest5(BOOL check)
+{
+	output("ReadWriteTest5\n");
+	uni_char name[]={'M','u','l','t','i','m','e','d','i','a','4','.','o','u','t',0};
+	//SimpleFileReadWrite *sfrw=OP_NEW(SimpleFileReadWrite, ());
+	//OpFileLength len=0;
+	OpFile f;
+	BOOL exists;
+
+	// Delete the file
+	verify(OpStatus::IsSuccess(f.Construct(name)));
+	verify(OpStatus::IsSuccess(f.Exists(exists)));
+
+	if(exists)
+	{
+		verify(OpStatus::IsSuccess(f.Delete()));
+		f.Close();
+		verify(OpStatus::IsSuccess(f.Construct(name)));
+		verify(OpStatus::IsSuccess(f.Exists(exists)));
+		verify(!exists);
+		output("File 1 deleted\n");
+	}
+	else
+		output("File 1 not existing\n");
+
+
+	// Test empty file
+	verify(ReadWriteTest3(name, TRUE, FALSE));
+	// Test overwrite
+	verify(ReadWriteTest3(name, TRUE, TRUE));
+
+	// Delete the file again
+	verify(OpStatus::IsSuccess(f.Construct(name)));
+	verify(OpStatus::IsSuccess(f.Exists(exists)));
+
+	if(exists)
+	{
+		verify(OpStatus::IsSuccess(f.Delete()));
+		f.Close();
+		verify(OpStatus::IsSuccess(f.Construct(name)));
+		verify(OpStatus::IsSuccess(f.Exists(exists)));
+		verify(!exists);
+		output("File 2 deleted\n");
+	}
+	else
+		output("File 2 not existing\n");
+
+	// Test empty file
+	verify(ReadWriteTest4(name, FALSE));
+	// Test overwrite
+	verify(ReadWriteTest4(name, TRUE));
+}
+
+// This test is important, as some operations in "simple stream" classes assume that is possible to execute shifts of 32 or more bits
+test("Shift test")
+{
+	// Shift compliance test
+	UINT32 i32_0=1;
+	UINT32 i32_31=0x80000000;
+	UINT64 i64_0=1;
+	UINT64 i64_31=0x80000000;
+	UINT64 i64_32=i64_31<<1;
+	UINT64 i64_63=i64_32<<31;
+	
+	// Test UINT32, shifts till 31 bits
+	verify( (i32_0<<31) == i32_31);
+	verify( (i32_31>>31) == i32_0);
+	verify( (i32_31>>31) == 1);
+
+	verify( ((i32_0<<31)>>31) == i32_0);
+	verify( ((i32_31>>31)<<31) == i32_31);
+	
+	// Test 64 bits, shifts till 63 bits
+	verify( (i64_0 << 31) == i64_31);
+	verify( (i64_31 >> 31) == i64_0);
+	verify( (i64_31 >> 31) == 1);
+	verify( (i64_0 << 32) == i64_32);
+	verify( (i64_32 >> 32) == i64_0);
+	verify( (i64_32 >> 32) == 1);
+	
+	verify( (i64_63 >> 31) == i64_32);
+	verify( (i64_63 >> 32) == i64_31);
+	
+	verify( ((i64_0<<31)>>31) == i64_0);
+	verify( ((i64_31>>31)<<31) == i64_31);
+	verify( ((i64_32>>31)<<31) == i64_32);
+	verify( ((i64_63>>31)<<31) == i64_63);
+	
+	verify( (i64_0 << 63) == i64_63);
+	verify( (i64_63 >> 63) == i64_0);
+	verify( (i64_63 >> 63) == 1);
+	
+	verify( ((i64_0<<63)>>63) == i64_0);
+	verify( ((i64_63>>63)<<63) == i64_63);
+}
+
+test("Stream test - Read and Write") require CACHE_FAST_INDEX;
+{
+	OpString filename;
+	
+	verify(OpStatus::IsSuccess(g_folder_manager->GetFolderPath(OPFILE_SELFTEST_DATA_FOLDER, filename)));
+	verify(OpStatus::IsSuccess(filename.Append("modules/cache/selftest/")));
+	verify(OpStatus::IsSuccess(filename.Append("TextTest.txt")));
+	
+	unsigned char c_buf[36]; /* ARRAY OK 2009-04-23 lucav */   //={1,2,3,4,5,6,7,8,9,0xA,0xB,0xC,0xD,0xE,0xFF,1,2,3,4,5,6,7,0,12,'H','e','l','l','o',' ','W','o','r','l','d','!'};
+	SimpleBufferWriter sbw(c_buf, sizeof(c_buf));
+	SimpleBufferReader sbr(c_buf, sizeof(c_buf));
+	SimpleFileReader sfs(NULL);
+	OpString8 str;
+	OpString8 hello;
+	unsigned char temp[1024];   /* ARRAY OK 2009-01-06 lucav */
+	verify(OpStatus::IsSuccess(sbw.Construct()));
+	verify(OpStatus::IsSuccess(sbr.Construct()));
+	verify(OpStatus::IsSuccess(sfs.Construct(filename.CStr(), OPFILE_ABSOLUTE_FOLDER)));
+	
+	hello.Set("Hello World!");
+	
+	// 64 bits contants are not portable...
+	UINT64 temp64=0x01020304;
+	
+	temp64<<=32;
+	temp64|=0x05060708;
+	
+	// verify(OpStatus::IsSuccess(sbw.Write64(0x0102030405060708LL)));
+	verify(OpStatus::IsSuccess(sbw.Write64(temp64)));
+	verify(OpStatus::IsSuccess(sbw.Write32(0x090A0B0C)));
+	verify(OpStatus::IsSuccess(sbw.Write16(0x0D0E)));
+	verify(OpStatus::IsSuccess(sbw.Write8(0xFF)));
+	verify(OpStatus::IsSuccess(sbw.Write8(0x01)));
+	verify(OpStatus::IsSuccess(sbw.Write16(0x0203)));
+	verify(OpStatus::IsSuccess(sbw.Write32(0x04050607)));
+	verify(OpStatus::IsSuccess(sbw.WriteString(&hello, 2)));
+	verify(OpStatus::IsSuccess(sbw.FlushBuffer(TRUE)));
+	verify(sbw.GetBytesWritten()==36);
+	
+	verify(sbr.Read8()==1);
+	verify(sbr.Read16()==0x0203);
+	verify(sbr.Read32()==0x04050607);
+	
+	// 64 bits contants are not portable...
+	temp64=0x08090A0B;
+	
+	temp64<<=32;
+	temp64|=0x0C0D0EFF;
+	
+	verify(sbr.Read64()==temp64);
+	verify(sbr.ReadInt(4)==0x01020304);
+	verify(sbr.ReadInt(2)==0x0506);
+	verify(sbr.ReadInt(1)==0x07);
+	verify(sbr.Read16()==12);
+	verify(sbr.ReadString(&str, 12)==OpStatus::OK);
+	verify(!op_strcmp("Hello World!", str.CStr()));
+	verify(sbr.GetBytesRead()==36);
+	
+	verify(sfs.ReadString(&str, 5)==OpStatus::OK);
+	verify(!op_strcmp("ABCDE", str.CStr()));
+	verify(sfs.Read8()=='-');
+	verify(sfs.ReadString(&str, 32)==OpStatus::OK);
+	verify(!op_strcmp("String Test for SimpleFileStream", str.CStr()));
+	verify(sfs.Read16()==0x0D0A);
+	verify(sfs.GetBytesRead()==40);
+
+	for(int i=0; i<10; i++)
+	{
+		verify(OpStatus::IsSuccess(sfs.ReadBuf(temp, 1000)));
+
+		for(int j=0; j<1000; j++)
+		{
+			if(temp[j]!=0x30 + (j%10))
+			{
+				output("\nMismatch for %d: %d instead of %d\n", 1000*i+j, temp[j], 0x30 + (j%10));
+			}
+			verify(temp[j]==0x30 + (j%10));
+		}
+	}
+	verify(sfs.Read16()==0x0D0A);
+	verify(sfs.GetBytesRead()==10042);
+
+	// Try reading with default values when there's nothing left in the stream.
+	verify(sbr.Read8(0xCA)==0xCA);
+	verify(sbr.Read16(0xCAFE)==0xCAFE);
+	verify(sbr.Read32(0xCAFEBABE)==0xCAFEBABE);
+
+	temp64 = 0xCAFEBABE;
+	temp64 <<= 32;
+	temp64 |= 0xB00BF00D;
+
+	verify(sbr.Read64(temp64)==temp64);
+	verify(sbr.ReadTime(4)==0);
+
+}
+
+
+test("Sequential Read and Write Test 1")
+{
+	verify(ReadWriteTest1(multimedia_name));
+}
+
+test("Sequential Read and Write Test 2 - Close and Check")
+{
+	verify(ReadWriteTest2(multimedia_name, TRUE, TRUE));
+}
+
+test("Sequential Read and Write Test 2 - NO Close and Check")
+{
+	verify(ReadWriteTest2(multimedia_name, FALSE, TRUE));
+}
+
+test("Sequential Read and Write Test 2 - Close and NO Check")
+{
+	verify(ReadWriteTest2(multimedia_name, TRUE, FALSE));
+}
+
+test("Sequential Read and Write Test 2 - NO Close and NO Check")
+{
+	verify(ReadWriteTest2(multimedia_name, FALSE, FALSE));
+}
+
+test("Mixed Read and Write - Check")
+{
+	verify(ReadWriteTest3(multimedia_name, TRUE, TRUE));
+}
+
+test("Mixed Read and Write - NO Check")
+{
+	verify(ReadWriteTest3(multimedia_name, FALSE, TRUE));
+}
+
+test("Heavy Mixed Read and Write - NO Check")
+{
+	verify(ReadWriteTest5(FALSE));
+}

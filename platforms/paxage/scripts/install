@@ -1,0 +1,970 @@
+#!/bin/sh
+
+iterate()
+{
+	"$@" GX - bin/opera@@{SUFFIX}
+	if ! $repackage
+	then
+		"$@" GX - bin/uninstall-opera@@{SUFFIX}
+	fi
+	@@{FILES:iterate}
+}
+
+@@include common.inc
+
+make_tempdir()
+{
+	if [ -z "$tempdir" ]
+	then
+		tempdir=$(mktemp -d -t opera-install.XXXXXXXX)
+		if [ $? != 0 ]
+		then
+			ui_error "Cannot create a temporary directory, please set TMPDIR correctly"
+		fi
+	fi
+}
+
+cleanup()
+{
+	res=$?
+	trap - 0
+	if [ $res -gt 0 ] && $need_rollback
+	then
+		rollback
+	fi
+	if $need_ui_cleanup
+	then
+		ui_cleanup
+	fi
+	if [ -n "$tempdir" ]
+	then
+		rm -rf $tempdir
+	fi
+	exit $res
+}
+
+ui_widget()
+{
+	local width height
+	message=$(
+		echo "$2"
+		if [ -n "$3" ]
+		then
+			echo
+			cat "$3"
+		fi
+		if [ -n "$4" ]
+		then
+			echo
+			echo "$4"
+		fi
+	)
+	case $driver in
+		dialog|whiptail)
+			width=72
+			if available fmt
+			then
+				message=$(echo "$message" | fmt -w $((width - 4)))
+				height=$(($(echo "$message" | wc -l) + 6))
+				if [ $1 = inputbox ]
+				then
+					height=$((height + 2))
+				fi
+			else
+				height=20
+			fi
+			;;
+	esac
+	need_ui_cleanup=true
+	case $driver in
+		dialog|whiptail)
+			exec 4>&1
+			answer=$($driver --title "$windowtitle" --clear --$1 "$message" $height $width 2>&1 1>&4)
+			res=$?
+			exec 4>&-
+			;;
+		plain)
+			echo
+			echo "$message"
+			case $1 in
+				yesno)
+					while true
+					do
+						read -p 'Please enter Y or N: ' answer
+						case "$answer" in
+							y*|Y*)
+								res=0
+								break
+								;;
+							n*|N*)
+								res=1
+								break
+								;;
+						esac
+					done
+					;;
+				inputbox)
+					read -p '>' answer
+					;;
+				msgbox|infobox)
+					res=0
+					;;
+			esac
+			;;
+	esac
+	need_ui_cleanup=false
+	return $res
+}
+
+ui_info()
+{
+	ui_widget infobox "$@"
+}
+
+ui_message()
+{
+	ui_widget msgbox "$@"
+}
+
+ui_warn()
+{
+	ui_widget yesno "$1" "$2" 'Continue?' || exit
+}
+
+ui_error()
+{
+	ui_widget msgbox "$1" "$2" 'Installation aborted.'
+	exit 1
+}
+
+ui_input()
+{
+	ui_widget inputbox "$1" "$2" ''
+}
+
+ui_menu()
+{
+	local text width height
+	case $driver in
+		dialog|whiptail)
+			width=72
+			if available fmt
+			then
+				height=$(($(echo "$text" | fmt -w $((width - 4)) | wc -l) + $# / 2 + 8))
+			else
+				height=20
+			fi
+			;;
+	esac
+	need_ui_cleanup=true
+	case $driver in
+		dialog|whiptail)
+			text=$1
+			shift
+			exec 4>&1
+			answer=$($driver --menu "$text" $height $width $(($# / 2)) "$@" 2>&1 1>&4) || exit
+			res=$?
+			exec 4>&-
+			;;
+		plain)
+			echo
+			echo "$1"
+			shift
+			(
+				n=1
+				while [ -n "$1" ]
+				do
+					echo "[$n] $2"
+					n=$((n + 1))
+					shift 2
+				done
+			)
+			while true
+			do
+				read -p "Your choice: " answer
+				if echo "$answer" | grep -q '^[0-9][0-9]*$' && [ $((answer >= 1)) = 1 ] && [ $((answer <= $# / 2)) = 1 ]
+				then
+					break
+				fi
+				echo "Please enter an integer between 1 and $(($# / 2))."
+			done
+			shift $((answer * 2 - 2))
+			answer="$1"
+			res=0
+			;;
+	esac
+	need_ui_cleanup=false
+	return $res
+}
+
+ui_progress_begin()
+{
+	if ! $talk
+	then
+		return
+	fi
+	if [ -z "$progress_max" ]
+	then
+		progress_max=$(iterate echo | wc -l)
+	fi
+	progress_cur=0
+	need_ui_cleanup=true
+	case $driver in
+		whiptail)
+			make_tempdir
+			mkfifo $tempdir/gauge
+			whiptail --gauge "$1" 0 72 0 <$tempdir/gauge &
+			exec 3>$tempdir/gauge
+			;;
+		*)
+			echo
+			echo -n "$1"
+			;;
+	esac
+}
+
+ui_progress_advance()
+{
+	if ! $talk
+	then
+		return
+	fi
+	progress_cur=$((progress_cur + 1))
+	case $driver in
+		whiptail)
+			echo $((progress_cur * 100 / progress_max)) >&3
+			;;
+		*)
+			echo -n '.'
+			;;
+	esac
+}
+
+ui_progress_end()
+{
+	if ! $talk
+	then
+		return
+	fi
+	case $driver in
+		whiptail)
+			exec 3>&-
+			rm $tempdir/gauge
+			;;
+		*)
+			echo 'done'
+			;;
+	esac
+	need_ui_cleanup=false
+}
+
+ui_cleanup()
+{
+	case $driver in
+		dialog)
+			exec 4>&-
+			dialog --clear
+			stty sane
+			clear
+			;;
+		whiptail)
+			exec 3>&- 4>&-
+			stty sane
+			clear
+			;;
+		plain)
+			echo
+			;;
+	esac
+}
+
+ui_init()
+{
+	if [ -z "$TERM" -o "$TERM" = dumb ]
+	then
+		driver=plain
+	elif available whiptail && [ "$(whiptail --version)" != 'whiptail (newt): 0.52.13' ]
+	then
+		driver=whiptail
+	elif available dialog
+	then
+		driver=dialog
+	else
+		driver=plain
+	fi
+	answer=''
+	progress_max=''
+	windowtitle="$1"
+}
+
+common_init()
+{
+	interactive=true
+	talk=true
+	force=false
+	need_rollback=false
+	need_ui_cleanup=false
+	repackage=false
+	tempdir=''
+
+	trap cleanup 0 INT QUIT TERM
+}
+
+common_opt()
+{
+	case "$1" in
+		--text)
+			driver=plain
+			;;
+		--unattended)
+			interactive=false
+			driver=plain
+			;;
+		--quiet)
+			talk=false
+			interactive=false
+			driver=plain
+			;;
+		--force)
+			force=true
+			;;
+		*)
+			return 1
+	esac
+}
+
+# EOF_COMMON
+
+version()
+{
+	ui_message "@@{S_PRODUCT} - @@{S_ONELINE_DESC}
+
+@@include ../doc/description.inc
+
+This script installs @@{S_PRODUCT} @@{CONF:version} build @@{CONF:build} for @@{CONF:os} on @@{TRADITIONAL_ARCH}.
+
+Copyright (c) @@{S_COPYRIGHT_YEARS} @@{S_VENDOR}. All rights reserved."
+}
+
+usage()
+{
+	version
+	cat <<EOF
+
+Options:
+
+    --text          Select plain-text user interface.
+
+    --unattended    Ask no questions. Implies --text.
+                    The --prefix option becomes mandatory.
+
+    --quiet         Ask no questions and don't show progress.
+                    Implies --text.
+
+    --prefix /P     Specify installation directory. Opera will be
+                    installed into /P/bin, /P/share and /P/lib.
+
+    --user          Install for the current user. Default for non-root.
+                    Alias for --prefix $HOME/.local.
+
+    --system        Install for everybody. Default for root.
+                    Alias for --prefix /usr/local.
+
+    --name N        Use N for package name. Must either be "opera" or
+                    begin with "opera-". Names of installed files and
+                    directories will contain this string in place of
+                    "opera". This allows to install several
+                    versions of Opera side by side. The default is
+                    "@@{CONF:product}".
+
+    --suffix S      Obsolete. Same as --name opera-S.
+
+    --force         Ignore all kinds of errors and try to continue.
+
+    --repackage R   Special mode for package maintainers. Extract files
+                    into the staging directory R as if it were the
+                    installation prefix, but prepare them to be
+                    installed under the actual prefix. In this mode, no
+                    finalizing actions, such as registration of menu
+                    entries, are performed. Sanity checks are disabled.
+                    Implies --unattended.
+
+    --version       Show Opera version.
+
+    --help          Show this message.
+EOF
+}
+
+check_os()
+{
+	local name version arch res msg
+	res=false
+	name=$(uname -s)
+	case "$name" in
+		Linux)
+@@ifdef Linux
+			res=true
+@@endif
+			;;
+		*BSD)
+@@ifdef FreeBSD
+			res=true
+@@endif
+			;;
+	esac
+	arch=$(uname -m)
+	case "$arch" in
+		i?86|i86pc)
+			arch=i386
+			;;
+@@ifdef deb
+		x86_64)
+			arch=amd64
+@@elifdef FreeBSD
+		x86_64)
+			arch=amd64
+@@else
+		amd64)
+			arch=x86_64
+@@endif
+			;;
+	esac
+	if [ "$arch" != @@{TRADITIONAL_ARCH} ]
+	then
+		res=false
+	fi
+	if ! $res
+	then
+		msg="You are running $name on $arch, but this package is intended for @@{CONF:os} on @@{TRADITIONAL_ARCH}. If you choose to install it, the product may not work correctly."
+		if $interactive
+		then
+			ui_warn "$msg"
+		else
+			ui_error "$msg"
+		fi
+	fi
+}
+
+@@ifdef Linux
+ @@define HAVE_PACKAGE_MANAGER
+check_package_manager()
+{
+	if available dpkg
+	then
+		ui_warn "Your system seems to support Debian-style packages. You might want to download and install a Debian package of @@{S_PRODUCT} instead."
+	elif available rpm
+	then
+		ui_warn "Your system seems to support RPM packages. You might want to download and install an RPM package of @@{S_PRODUCT} instead."
+	fi
+}
+@@endif
+
+install_file()
+{
+	local source dest existing tomake
+	if [ -f $tempdir/damaged ] && ! $force
+	then
+		return 1
+	fi
+	source=$(use_suffix '@@{CONF:suffix}' "$3")
+	dest=$INTO/$(use_suffix "$SUFFIX" "$3")
+	existing=$dest
+	tomake=''
+	while [ -n "$existing" -a ! -e "$existing" ]
+	do
+		tomake=$existing
+		existing=${existing%/*}
+	done
+	if [ ! -d "$existing" -o "$dest" = "$existing" ]
+	then
+		if { rm -rf "$existing~" && mv "$existing" "$existing~"; } 2>$tempdir/error || $force
+		then
+			echo "mv '$existing~' '$existing'" >>$tempdir/rollback
+			echo "rm -rf '$existing~'" >>$tempdir/commit
+		else
+			ui_error "Cannot make a backup copy of $existing -- see detailed error message below." $tempdir/error
+			echo "$dest">>$tempdir/damaged
+			return 1
+		fi
+	elif [ -n "$tomake" -a "$tomake" != "$dest" ]
+	then
+		if mkdir -p "${dest%/*}" 2>$tempdir/error || $force
+		then
+			echo "rm -rf '$tomake'" >>$tempdir/rollback
+		else
+			ui_error "Cannot create directory ${dest%/*} -- see detailed error message below." $tempdir/error
+			echo "$dest">>$tempdir/damaged
+			return 1
+		fi
+	fi
+	case "$1" in
+		N?)
+			cp "$source" "$dest"
+			;;
+		L?)
+			source=$(use_suffix "$SUFFIX" "$2")
+			ln -s "$source" "$dest"
+			;;
+		P?)
+			case "$dest" in
+				*.gz)
+					gzip -dc "$source" | process >"${dest%.gz}" && gzip -9 "${dest%.gz}"
+					;;
+				*)
+					process <"$source" >"$dest"
+					;;
+			esac
+			;;
+		G?)
+			generate_file "${source##*/}" | process >"$dest"
+			;;
+	esac 2>$tempdir/error || $force || {
+		ui_error "Cannot install $dest -- see detailed error message below." $tempdir/error
+		echo "$dest">>$tempdir/damaged
+		return 1
+	}
+	case "$1" in
+		?F)
+			chmod 0644 "$dest"
+			;;
+		?X)
+			chmod 0755 "$dest"
+			;;
+	esac 2>$tempdir/error || $force || {
+		ui_error "Cannot install $dest -- see detailed error message below." $tempdir/error
+		echo "$dest">>$tempdir/damaged
+		return 1
+	}
+	ui_progress_advance
+}
+
+generate_file()
+{
+@@define tar-install
+	case "$1" in
+		@@{CONF:product})
+			cat <<'EOF_generate_file'
+@@include opera
+EOF_generate_file
+			;;
+		uninstall-@@{CONF:product})
+			sed -ne '1,/EOF_COMMON/p' "${0##*/}"
+			cat <<EOF
+PREFIX='$PREFIX'
+SUFFIX='$SUFFIX'
+EOF
+			cat <<'EOF_generate_file'
+@@include uninstall.inc
+EOF_generate_file
+			;;
+		*)
+			return 1
+	esac
+@@undef tar-install
+}
+
+rollback()
+{
+	ui_progress_begin "Undoing installation"
+	iterate rollback_file
+	ui_progress_end
+	if [ -f $tempdir/rollback ]
+	then
+		. $tempdir/rollback
+	fi
+}
+
+rollback_file()
+{
+	local dest
+	dest=$INTO/$(use_suffix "$SUFFIX" "$3")
+	rm -f "$dest"
+	while [ -n "$dest" ]
+	do
+		dest=${dest%/*}
+		case "$dest" in
+			$INTO/*/opera*)
+				rmdir "$dest" 2>/dev/null || break
+				;;
+		esac
+	done
+	ui_progress_advance
+}
+
+verify_file()
+{
+	local md5 file
+	md5="$2"
+	file=$(use_suffix '@@{CONF:suffix}' "$3")
+	case "$1" in
+		[GL]?)
+			ui_progress_advance
+			return
+			;;
+	esac
+	if [ ! -f "$file" ]
+	then
+		make_tempdir
+		echo "$file" >>$tempdir/damaged
+	elif [ -n "$md5prog" ]
+	then
+		if [ $(get_md5 "$file") != "$md5" ]
+		then
+			make_tempdir
+			echo "$file" >>$tempdir/damaged
+		fi
+	fi
+	ui_progress_advance
+}
+
+get_md5()
+{
+	if [ "$md5prog" = md5 ]
+	then
+		md5 -q "$1"
+	else
+		md5sum "$1" | { read sum file; echo $sum; }
+	fi
+}
+
+use_suffix()
+{
+	echo "$2" | sed -e "s:@@{SUFFIX}:$1:g"
+}
+
+process()
+{
+	sed -e "s:@@{PREFIX}:$PREFIX:g;s:@@{SUFFIX}:$SUFFIX:g;s:@@{_SUFFIX}:$_SUFFIX:g;s:@@{USUFFIX}:$USUFFIX:g"
+}
+
+PREFIX=''
+INTO=''
+orig_pwd=$PWD
+suffix_set=false
+
+cd "${0%/*}"
+
+common_init
+ui_init 'Installing @@{S_PRODUCT}'
+
+if available md5
+then
+	md5prog=md5
+elif available md5sum
+then
+	md5prog=md5sum
+else
+	md5prog=''
+fi
+
+while [ -n "$1" ]
+do
+	common_opt "$1" || case "$1" in
+		--user)
+			PREFIX=$HOME/.local
+			;;
+		--system)
+			PREFIX=/usr/local
+			;;
+		--prefix)
+			shift
+			PREFIX="$1"
+			;;
+		--name)
+			shift
+			case "$1" in
+				opera|opera-*)
+					SUFFIX=${1#opera}
+					;;
+				*)
+					ui_error '--name string must either be "opera" or begin with "opera-".'
+					;;
+			esac
+			suffix_set=true
+			;;
+		--suffix)
+			shift
+			if [ -n "$1" ]
+			then
+				SUFFIX="-$1"
+			else
+				SUFFIX=''
+			fi
+			suffix_set=true
+			;;
+		--repackage)
+			shift
+			INTO="$1"
+			repackage=true
+			interactive=false
+			driver=plain
+			case "$INTO" in
+				'')
+					ui_error "--repackage needs a non-empty argument."
+					;;
+				/*)
+					;;
+				*)
+					INTO=$orig_pwd/$INTO
+					;;
+			esac
+			;;
+		--version)
+			driver=plain
+			version
+			exit
+			;;
+		*)
+			driver=plain
+			usage
+			exit
+			;;
+	esac
+	shift
+done
+
+if $talk
+then
+	version
+fi
+
+if ! $interactive && [ -z "$PREFIX" ]
+then
+	ui_error "Please specify --prefix, --user or --system for unattended installation."
+fi
+
+if ! $force && ! $repackage
+then
+	check_os
+@@ifdef HAVE_PACKAGE_MANAGER
+	if $interactive
+	then
+		check_package_manager
+	fi
+@@endif
+fi
+
+if [ $(id -u) -eq 0 ]
+then
+	prefix_who="running as root"
+	prefix_for="for all users"
+	prefix_default=/usr/local
+else
+	prefix_who="not running as root"
+	prefix_for="just for yourself"
+	prefix_default=$HOME/.local
+fi
+
+while true
+do
+	if [ -n "$PREFIX" ]
+	then
+		answer=$PREFIX
+		bad_answer=ui_error
+	elif $interactive
+	then
+		ui_input "Please choose an installation directory. @@{S_PRODUCT} will be installed in bin, share and lib directories under the specified location.
+
+Since you are $prefix_who, you probably want to install @@{S_PRODUCT} $prefix_for. The recommended installation prefix in this case is $prefix_default.
+
+Press Enter to accept the recommended location, or specify a different prefix." || exit
+		if [ -z "$answer" ]
+		then
+			answer=$prefix_default
+		fi
+		bad_answer=ui_message
+	else
+		ui_warn "Since you are $prefix_who, assuming you want to install @@{S_PRODUCT} $prefix_for. Using $prefix_default as the installation prefix."
+		answer=$prefix_default
+		bad_answer=ui_error
+	fi
+	case "$answer" in
+		''|[!/]*)
+			$bad_answer "The installation prefix must begin with a slash."
+			continue
+			;;
+		*' '*)
+			$bad_answer "The installation prefix is not allowed to contain whitespace."
+			continue
+			;;
+	esac
+	while [ $answer != / -a "${answer%/}" != $answer ]
+	do
+		answer=${answer%/}
+	done
+	if $repackage
+	then
+		PREFIX=$answer
+		break
+	fi
+	prefix_parent=$answer
+	while [ ! -e "$prefix_parent" ]
+	do
+		prefix_parent=${prefix_parent%/*}
+		if [ -z "$prefix_parent" ]
+		then
+			prefix_parent=/
+		fi
+	done
+	if [ -w $prefix_parent ]
+	then
+		PREFIX=$answer
+		break
+	elif [ -d $prefix_parent ]
+	then
+		$bad_answer "You do not have write permissions for $prefix_parent. Perhaps you should be installing as root?"
+	else
+		$bad_answer "$prefix_parent is not a directory."
+	fi
+done
+
+if [ -z "$INTO" ]
+then
+	INTO=$PREFIX
+fi
+
+while true
+do
+	if $suffix_set
+	then
+		answer=opera$SUFFIX
+		bad_answer=ui_error
+	elif $interactive
+	then
+		ui_input "You can install @@{S_PRODUCT} with an alternative package name, so that the installation does not conflict with other installations of Opera you might have. For example, if you specify opera-@@{CONF:version} as the package name, Opera files will be installed under $PREFIX/share/opera-@@{CONF:version} and $PREFIX/lib/opera-@@{CONF:version}, and you will have to run $PREFIX/bin/opera-@@{CONF:version} to run it. The default location of your profile directory will then be ~/.opera-@@{CONF:version}. If you want that, please enter the desired package name below. The name must be either \"opera\" or begin with \"opera-\". Only Latin letters, digits, periods and dashes are allowed.
+
+Pressing Enter to accept the default and install as \"@@{CONF:product}\" is a safe choice." || exit
+		bad_answer=ui_message
+	else
+		answer=''
+	fi
+	case "$answer" in
+		'')
+			SUFFIX='@@{CONF:suffix}'
+			_SUFFIX='@@{CONF:_suffix}'
+			USUFFIX='@@{CONF:usuffix}'
+			break
+			;;
+		opera-*[!-.A-Za-z0-9]*)
+			$bad_answer "The package name is only allowed to contain Latin letters, digits, periods and dashes."
+			;;
+		opera-*)
+			SUFFIX=${answer#opera}
+			_SUFFIX=' '$(echo ${answer#opera-} | cut -c 1 | tr a-z A-Z)${answer#opera-?}
+			USUFFIX=-$(echo ${answer#opera-} | tr a-z A-Z)
+			break
+			;;
+		opera)
+			SUFFIX=''
+			_SUFFIX=''
+			USUFFIX=''
+			break
+			;;
+		*)
+			$bad_answer "The package name must either be \"opera\" or begin with \"opera-\"."
+			;;
+	esac
+done
+
+if ! $repackage && [ -f "$INTO/share/opera$SUFFIX/package-id.ini" ]
+then
+	upgrade_product=$(sed -ne '/^Product=\(.*\)$/s//\1/p' "$INTO/share/opera$SUFFIX/package-id.ini")
+	upgrade_version=$(sed -ne '/^Version=\(.*\)$/s//\1/p' "$INTO/share/opera$SUFFIX/package-id.ini")
+	upgrade_build=$(sed -ne '/^Build=\(.*\)$/s//\1/p' "$INTO/share/opera$SUFFIX/package-id.ini")
+	if [ -z "$upgrade_product" ]
+	then
+		upgrade_product=opera
+	fi
+	if [ "$upgrade_product" = opera ]
+	then
+		upgrade_title='Opera'
+	else
+		upgrade_title='Opera '$(echo ${upgrade_product#opera-} | cut -c 1 | tr a-z A-Z)${answer#?}
+	fi
+	if [ -n "$upgrade_version" -a -n "$upgrade_build" ]
+	then
+		if [ "$upgrade_product" = @@{CONF:product} -a "$upgrade_version" = @@{CONF:version} -a "$upgrade_build" = @@{CONF:build} ]
+		then
+			msg="The chosen location already contains an installation of $upgrade_title @@{CONF:version} build @@{CONF:build}. The installer will attempt to refresh it."
+		elif [ "$upgrade_product" = @@{CONF:product} ]
+		then
+			msg="The chosen location contains an installation of $upgrade_title $upgrade_version build $upgrade_build. The installer will attempt to upgrade it to version @@{CONF:version} build @@{CONF:build}."
+		else
+			msg="The chosen location contains an installation of $upgrade_title $upgrade_version build $upgrade_build. The installer will attempt to replace it with @@{S_PRODUCT} version @@{CONF:version} build @@{CONF:build}."
+		fi
+		if $interactive
+		then
+			ui_warn "$msg"
+		elif $talk
+		then
+			ui_message "$msg"
+		fi
+	fi
+fi
+
+ui_progress_begin "Verifying package"
+iterate verify_file
+ui_progress_end
+
+if [ -n "$tempdir" -a -f $tempdir/damaged ] && ! $force
+then
+	ui_error "The following files are missing or damaged:" $tempdir/damaged
+fi
+
+if ! $force && ! $repackage
+then
+	need_rollback=true
+fi
+
+make_tempdir
+
+if ! $repackage && [ -x "$PREFIX/bin/uninstall-opera$SUFFIX" ]
+then
+	if $talk
+	then
+		ui_info "Removing old files..."
+	fi
+	"$PREFIX/bin/uninstall-opera$SUFFIX" --upgrade $tempdir
+fi
+
+ui_progress_begin "Installing files"
+iterate install_file
+ui_progress_end
+
+need_rollback=false
+
+if ! $repackage
+then
+	if $talk
+	then
+		ui_info "Finalizing installation..."
+	fi
+	if [ -f $tempdir/commit ]
+	then
+		. $tempdir/commit
+	fi
+	if $talk && [ "$driver" = plain ]
+	then
+		finalize_desktop
+	else
+		finalize_desktop >/dev/null 2>&1
+	fi
+fi
+
+if $talk
+then
+	if [ -n "$upgrade_version" -a -n "$upgrade_build" ]
+	then
+		done='upgraded'
+	else
+		done='installed'
+	fi
+	if $repackage
+	then
+		ui_message "@@{S_PRODUCT} has been installed successfully under $INTO as if it were $PREFIX."
+	else
+		ui_message "@@{S_PRODUCT} has been $done successfully. To start, run $PREFIX/bin/opera$SUFFIX (you might want to add this location to your PATH).
+
+To uninstall @@{S_PRODUCT}, run $PREFIX/bin/uninstall-opera$SUFFIX."
+	fi
+fi

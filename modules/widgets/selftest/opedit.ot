@@ -1,0 +1,206 @@
+/* -*- Mode: c++; tab-width: 4; indent-tabs-mode: t; c-basic-offset: 4 -*- */
+
+group "widgets.opedit";
+require init;
+
+language c++;
+
+include "modules/widgets/OpEdit.h";
+include "modules/inputmanager/inputaction.h";
+include "modules/display/vis_dev.h";
+
+global
+{
+	class OpKeyInputListener : public OpWidgetListener
+	{
+	public:
+		virtual ~OpKeyInputListener() {}
+
+		virtual BOOL OnCharacterEntered(const uni_char *value)
+		{
+			OP_ASSERT(value);
+			return (*value >= 'a' && *value <= 'z');
+		}
+	};
+
+	OpEdit* edit;
+
+	void TypeKey(char key, OpEdit *target = NULL)
+	{
+		OpInputAction keypress(OpInputAction::ACTION_LOWLEVEL_KEY_PRESSED);
+		ShiftKeyState modifiers = SHIFTKEY_NONE;
+		keypress.SetKeyCode(OpKey::FromASCIIToKeyCode(key, modifiers));
+		keypress.SetShiftKeys(modifiers);
+		keypress.SetActionKeyValue(&key, 1);
+		if (!target)
+			target = edit;
+		target->OnInputAction(&keypress);
+	}
+
+	void TypeKeys(const char *keys, OpEdit *target = NULL)
+	{
+		while (*keys != 0)
+		{
+			TypeKey(*keys, target);
+			keys++;
+		}
+	}
+
+	void InvokeAction(OpInputAction::Action action)
+	{
+		OpInputAction a(action);
+		edit->OnInputAction(&a);
+	}
+}
+
+setup
+{
+	edit = NULL;
+}
+
+exit
+{
+	OP_DELETE(edit);
+}
+
+test("Setup")
+{
+	verify(OpStatus::IsSuccess(OpEdit::Construct(&edit)));
+}
+
+test("OpEdit caret position")
+	require success "Setup";
+{
+	int p0 = edit->GetCaretOffset();
+	verify(p0 == 0);
+	TypeKeys("ope");
+	int p1 = edit->GetCaretOffset();
+	verify(p1 == 3);
+	InvokeAction(OpInputAction::ACTION_GO_TO_LINE_START);
+	int p2 = edit->GetCaretOffset();
+	verify(p2 == 0);
+	InvokeAction(OpInputAction::ACTION_GO_TO_LINE_END);
+	int p3 = edit->GetCaretOffset();
+	verify(p3 == 3);
+	TypeKeys("ra");
+	verify(edit->GetCaretOffset() == 5);
+}
+
+table HeuristicTestStrings(WritingSystem::Script, const uni_char*)
+{
+	{ WritingSystem::Japanese, UNI_L(
+			"\x30e9\x30c9\x30af\x30ea\x30d5\x3001\x30de\x30e9\x30bd\x30f3\x4e94\x8f2a\x4ee3\x8868\x306b\x0031\x4e07\x006d\x51fa\x5834\x306b\x3082\x542b\x307f") }
+	{ WritingSystem::Hebrew, UNI_L(
+			"\x05d4\x05d0\x05e7\x05d3\x05de\x05d9\x05d4\x0020\x05dc\x05dc\x05e9\x05d5\x05df\x0020\x05d4\x05e2\x05d1\x05e8\x05d9\x05ea") }
+	{ WritingSystem::ChineseUnknown, UNI_L(
+			"\x807d\x5abd\x5abd\x7684\x8a71\x3000\x5225\x8b93\x5979\x53d7\x50b7\x3000\x60f3\x5feb\x5feb\x9577\x5927\x3000\x624d\x80fd\x4fdd\x8b77\x5979") }
+		// same as previous, but with discerning character U+554F
+	{ WritingSystem::ChineseTraditional, UNI_L(
+			"\x807d\x5abd\x5abd\x7684\x8a71\x3000\x5225\x8b93\x5979\x53d7\x50b7\x3000\x60f3\x5feb\x5feb\x9577\x5927\x3000\x624d\x554f\x80fd\x4fdd\x8b77\x5979") }
+	{ WritingSystem::ChineseSimplified, UNI_L(
+			"\x542c\x5988\x5988\x7684\x8bdd\x3000\x522b\x8ba9\x4ed6\x53d7\x4f24\x3000\x60f3\x5feb\x5feb\x957f\x5927\x3000\x624d\x80fd\x4fdd\x62a4\x4ed6") }
+	{ WritingSystem::Korean, UNI_L("\xc6b8\xb780\xbc14\xb530\xb974") }
+	{ WritingSystem::IndicDevanagari, UNI_L("\x0926\x0947\x0935\x0928\x093e\x0917\x0930\x0940") }
+	{ WritingSystem::IndicKannada, UNI_L("\x0c95\x0ca8\x0ccd\x0ca8\x0ca1\x0cbf\x0c97\x0cb0\x0cc1") }
+	{ WritingSystem::Thai, UNI_L("\x0e20\x0e32\x0e29\x0e32\x0e44\x0e17\x0e22") }
+	{ WritingSystem::LatinWestern, UNI_L("ich habe zwei kokon\x00fcsse") }
+}
+
+foreach(script, string) from HeuristicTestStrings
+{
+	test("TWEAK_WIDGETS_HEURISTIC_LANG_DETECTION - $(script)")
+		require WIDGETS_HEURISTIC_LANG_DETECTION;
+	{
+		OpEdit* edit = 0;
+		verify(OpStatus::IsSuccess(OpEdit::Construct(&edit)));
+		VisualDevice vd;
+		edit->SetVisualDevice(&vd);
+		edit->SetMultilingual(TRUE);
+		verify(edit->IsMultilingual());
+		verify(edit->GetHeuristicScript() == WritingSystem::Unknown);
+		verify(OpStatus::IsSuccess(edit->SetText(string)));
+		edit->MoveCaretToStartOrEnd(FALSE, TRUE); // trigger OpWidgetString::Update
+		verify(edit->GetHeuristicScript() == script);
+	}
+	finally
+	{
+		edit->Delete();
+	}
+}
+
+test("OpEdit listener")
+{
+	OpEdit* edit = 0;
+	OpKeyInputListener listener;
+	verify(OpStatus::IsSuccess(OpEdit::Construct(&edit)));
+	VisualDevice vd;
+	edit->SetVisualDevice(&vd);
+	edit->SetListener(&listener, TRUE);
+	verify(OpStatus::IsSuccess(edit->SetText(UNI_L("op"))));
+	TypeKeys("e1r2aA%", edit);
+	verify(edit->GetTextLength() == 5);
+	uni_char txt[6];
+	edit->GetText(txt, 5, 0);
+	const uni_char *expected = UNI_L("opera");
+	verify_string(txt, expected);
+}
+finally
+{
+	edit->Delete();
+}
+
+test("Clipboard: Cut And Paste")
+require defined USE_OP_CLIPBOARD;
+{
+	OpString s;
+
+	OpEdit* edit = NULL;
+	verify_success(OpEdit::Construct(&edit));
+	verify_success(edit->SetText(UNI_L("i am he as")));
+
+	// cut 'he '
+	edit->SetSelection(5, 8);
+	edit->Cut(); // FIXME:OOM
+	verify_success(edit->GetText(s));
+	verify(s == UNI_L("i am as"));
+
+	edit->Clear();
+	verify_success(edit->SetText(UNI_L("you are as")));
+
+	edit->SetCaretOffset(8);
+	verify_success(edit->SelftestPaste());
+	verify_success(edit->GetText(s));
+	verify(s == UNI_L("you are he as"));
+}
+finally
+{
+	edit->Delete();
+}
+
+test("Clipboard: Copy And Paste")
+require defined USE_OP_CLIPBOARD;
+{
+	OpString s;
+
+	OpEdit* edit = NULL;
+	verify_success(OpEdit::Construct(&edit));
+	verify_success(edit->SetText(UNI_L("you are me")));
+
+	// copy 'are '
+	edit->SetSelection(4, 8);
+	edit->Copy(); // FIXME:OOM
+	verify_success(edit->GetText(s));
+	verify(s == UNI_L("you are me"));
+
+	edit->Clear();
+	verify_success(edit->SetText(UNI_L("and we all together")));
+
+	edit->SetCaretOffset(7);
+	verify_success(edit->SelftestPaste());
+	verify_success(edit->GetText(s));
+	verify(s == UNI_L("and we are all together"));
+}
+finally
+{
+	edit->Delete();
+}

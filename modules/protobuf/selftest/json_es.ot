@@ -1,0 +1,411 @@
+/* -*- mode: c++; tab-width: 4 -*-
+**
+** Copyright (C) 2012 Opera Software AS.  All rights reserved.
+**
+** This file is part of the Opera web browser.  It may not be distributed
+** under any circumstances.
+**
+** Tests JSON -> ES and ES -> JSON converters.
+**
+** Jan Borsodi
+*/
+
+group "protobuf.json_es";
+
+require init;
+require PROTOBUF_JSON_SUPPORT;
+require ESUTILS_ASYNCIF_EVAL_SUPPORT;
+require ECMASCRIPT_DEBUGGER;
+
+language c++;
+
+include "modules/protobuf/src/json_tools.h";
+include "modules/protobuf/src/protobuf_ecmascript.h";
+include "modules/util/adt/bytebuffer.h";
+include "modules/ecmascript_utils/esasyncif.h";
+include "modules/ecmascript_utils/esenvironment.h";
+include "modules/ecmascript_utils/esdebugger.h";
+
+global
+{
+	ES_Environment *es_env;
+	ES_AsyncInterface *es_aif;
+	ES_Runtime *es_rt;
+
+	// class to handle the result from an async eval operation
+	class TestResultHandler
+		: public ES_AsyncCallback
+	{
+	public:
+		virtual OP_STATUS HandleCallback(ES_AsyncOperation operation, ES_AsyncStatus status, const ES_Value &value) = 0;
+		virtual BOOL CompareResult(ES_Object *root, ES_Object *result) { return TRUE; }
+		virtual ES_Object* GetExpected() { return NULL; }
+	};
+
+	// class to handle result of eval called when setting up environment
+	class SetupResultHandler
+		: public TestResultHandler
+	{
+	public:
+		virtual OP_STATUS HandleCallback(ES_AsyncOperation operation, ES_AsyncStatus status, const ES_Value &value)
+		{
+
+			if (status != ES_ASYNC_SUCCESS)
+				ST_failed("Setup Eval failed");
+			else
+				ST_passed();
+
+			OP_DELETE(this);
+			return OpStatus::OK;
+		}
+
+	};
+
+	class BooleanResultHandler
+		: public TestResultHandler
+	{
+		ES_Object *expected;
+		ES_AsyncInterface *es_aif;
+		ES_Runtime *runtime;
+		OpString current_program;
+
+	public:
+
+		BooleanResultHandler() : expected(NULL), es_aif(NULL) { }
+		~BooleanResultHandler()
+		{
+			if (expected)
+				runtime->Unprotect(expected);
+		}
+
+		OP_STATUS Init(ES_Object* p, ES_AsyncInterface *aif, ES_Runtime *es_rt, const uni_char* prog)
+		{
+			runtime=es_rt;
+			RETURN_IF_ERROR(runtime->Protect(p));
+			expected = p;
+			es_aif = aif;
+			return current_program.Set(prog);
+		}
+
+		ES_Object* GetExpected() { return expected; }
+
+		virtual BOOL CompareResult(ES_Object *function, ES_Object *result)
+		{
+			ES_Value arg;
+			arg.type = VALUE_OBJECT;
+			arg.value.object = result;
+
+			return OpStatus::IsSuccess(es_aif->CallFunction(function, result, 1, &arg, this));
+		}
+
+		virtual OP_STATUS HandleCallback(ES_AsyncOperation operation, ES_AsyncStatus status, const ES_Value &value)
+		{
+			bool result = false;
+			if (status != ES_ASYNC_SUCCESS)
+			{
+				ST_failed("Failed to eval or call function");
+				OP_DELETE(this);
+				return OpStatus::OK;
+			}
+
+			if (value.type == VALUE_BOOLEAN)
+				result = value.value.boolean;
+
+			if (result)
+				ST_passed();
+			else
+				ST_failed("Incorrect return value");
+
+			OP_DELETE(this);
+
+			return OpStatus::OK;
+		}
+
+	};
+
+	class ASyncCallback
+		: public ES_AsyncCallback
+	{
+	private:
+		bool result;
+		ES_Object *func;
+		ES_Object *array;
+		ES_Object *root;
+		ES_Runtime *runtime;
+		TestResultHandler* reshandler;
+		OpString8 compare_string;
+	public:
+
+		ASyncCallback()
+			: result(false), func(NULL), array(NULL)
+			, runtime(NULL), reshandler(NULL)
+		{
+		}
+
+		virtual ~ASyncCallback()
+		{
+			if (func)
+				runtime->Unprotect(func);
+			if (array)
+				runtime->Unprotect(array);
+			if (root)
+				runtime->Unprotect(root);
+		}
+
+		void SetResultHandler(TestResultHandler* p) {reshandler = p; }
+		OP_STATUS SetCompareString(const char *p) {return compare_string.Set(p);}
+		virtual OP_STATUS HandleCallback(ES_AsyncOperation operation, ES_AsyncStatus status, const ES_Value &value)
+		{
+			if (status != ES_ASYNC_SUCCESS)
+			{
+				ST_failed("Eval failed");
+				return OpStatus::OK;
+			}
+
+			if (value.type == VALUE_OBJECT)
+			{
+				ES_DebugObjectElement attr;
+				g_ecmaManager->GetObjectAttributes(runtime, value.value.object, &attr);
+
+				ES_Object **target = &array;
+
+				// set up array compare function
+				if (attr.type == OBJTYPE_NATIVE_FUNCTION || attr.type == OBJTYPE_HOST_FUNCTION)
+					target = &func;
+
+				if (*target != NULL)
+				{
+					runtime->Unprotect(*target);
+					*target = NULL;
+				}
+
+				*target = value.value.object;
+				runtime->Protect(*target);
+
+				if (GetArray())
+				{
+					ByteBuffer buffer;
+
+					OpESToJSON converter;
+					char *json_input = &(compare_string[0]);
+					if (OpStatus::IsSuccess(converter.Construct(GetArray(), runtime)) && OpStatus::IsSuccess(converter.Write(buffer)))
+					{
+						unsigned len = buffer.Length();
+						for(unsigned i = 0; i<len; ++i)
+						{
+							if (buffer.Extract1(i) != *(json_input+i))
+							{
+								ST_failed("string compare failed");
+								return OpStatus::OK;
+							}
+						}
+						ST_passed();
+					}
+				}
+
+				if (reshandler)
+					if (!reshandler->CompareResult(GetFunction(), reshandler->GetExpected()))
+						ST_failed("Failed to call comparefunction");
+
+				return OpStatus::OK;
+			}
+			else if (value.type == VALUE_BOOLEAN)
+				result = value.value.boolean;
+			else
+			{
+				// should not happen
+				result = false;
+			}
+
+			if (result)
+				ST_passed();
+			else
+				ST_failed("Result was wrong, or the return type unexpected");
+
+			return OpStatus::OK;
+		}
+
+		void SetRuntime(ES_Runtime *rt)
+		{
+			runtime = rt;
+		}
+
+		BOOL GetResult()
+		{
+			return result;
+		}
+
+		ES_Object *GetFunction()
+		{
+			return func;
+		}
+
+		ES_Object *GetArray()
+		{
+			return array;
+		}
+
+	} *async;
+
+	BOOL Eval(const uni_char *prog, ES_AsyncCallback *callback)
+	{
+		return OpStatus::IsSuccess(es_aif->Eval(prog, callback));
+	}
+
+	BOOL Compare(ES_Object *root, ES_Object *cmp, ES_AsyncCallback *callback)
+	{
+		if (!root || !cmp)
+			return FALSE;
+
+		ES_Value arg;
+		arg.type = VALUE_OBJECT;
+		arg.value.object = root;
+
+		return OpStatus::IsSuccess(es_aif->CallFunction(cmp, root, 1, &arg, callback));
+	}
+
+}
+
+setup
+{
+	es_env = NULL;
+	es_aif = NULL;
+	es_rt = NULL;
+	async = OP_NEW(ASyncCallback, ());
+}
+
+exit
+{
+	if (es_env)
+		ES_Environment::Destroy(es_env);
+	OP_DELETE(async);
+}
+
+test("Setup")
+ async;
+{
+	if (OpStatus::IsError(ES_Environment::Create(es_env)))
+		ST_failed("OOM");
+
+	if (!es_env->Enabled())
+		ST_failed("ES_Environment not enabled");
+
+	es_rt = es_env->GetRuntime();
+	es_aif = es_rt->GetESAsyncInterface();
+	async->SetRuntime(es_rt);
+
+	// Add a compare function to the array prototype.
+	OpString program;
+	if (OpStatus::IsError(program.Set(UNI_L("Array.prototype.compare = function(o){if(this.length != o.length)return false;for(var i = 0; i<this.length; i++){if (this[i].compare !== undefined){ if(!this[i].compare(o[i])) return false;} else if(this[i] !== o[i])return false;}return true;}"))))
+		ST_failed("OOM");
+
+	SetupResultHandler *handler = OP_NEW(SetupResultHandler, ());
+	if (!handler)
+		ST_failed("OOM");
+
+	if (OpStatus::IsError( (Eval(program.CStr(), handler))))
+		ST_failed("Eval failed");
+}
+
+foreach(name, input_data) from
+{
+	{Integer Single, "1337"}
+	{Integer Multiple, "4,286 ,31415 , 42,-200,1"}
+	{Integer Limits, "1984,751,42,-200,2, 2147483647, -2147483648"}
+	{Double Minus Zero, "-0"}
+	{Double Single, "1337.1337"}
+	{Double Multiple, "1337.1337,42.84098234,1.01,42.1298388"}
+	{String Single, "\"doom\""}
+	{String Multiple, "\"Get your ass to Mars\", \"See you at the paaahty, Richter\", \"Open your miiiiind\""}
+	{Boolean Single, "true"}
+	{Boolean Multiple, "true, false, true, false, true, true, true, false, true"}
+	{Sub Array, "[1337,1337.1337,true,false,\"doom\"],[]"}
+}
+{
+	test("JSON -> ES $(name)")
+		async;
+		require success "Setup";
+	{
+		ES_Object *root = NULL;
+		OpJSONToES converter(root, es_rt);
+
+		ByteBuffer buffer;
+		buffer.AppendString("[ " input_data " ]");
+
+		if (OpStatus::IsError(converter.Construct(buffer)) || OpStatus::IsError(converter.Read()))
+			ST_failed("converter failed");
+
+		OpString16 uni_str;
+		if (OpStatus::IsError(uni_str.Set("function(a){ return a.compare([" input_data "]) }")))
+			ST_failed("converter failed");
+
+		BooleanResultHandler *handler = OP_NEW(BooleanResultHandler, ());
+		if (!handler || OpStatus::IsError(handler->Init(root, es_aif, es_rt, uni_str.CStr())))
+			ST_failed("OOM");
+
+		async->SetResultHandler( handler );
+
+		if (OpStatus::IsError( (Eval(uni_str.CStr(), async)) ) )
+			ST_failed("Eval failed");
+
+	}
+}
+
+foreach(name, input_data) from
+{
+	{Integer Single, "1337"}
+	{Integer Multiple, "4,286,31415,42,-200,1"}
+	{Integer Limits, "1984,751,42,-200,2,2147483647,-2147483648"}
+	{Double Minus Zero, "-0"}
+	{Double Single, "1337.1337"}
+	{Double Multiple, "1337.1337,42.84098234,1.01,42.1298388"}
+	{String Single, "\"doom\""}
+	{String Multiple, "\"Get your ass to Mars\",\"See you at the paaahty, Richter\",\"Open your miiiiind\""}
+	{Boolean Single, "true"}
+	{Boolean Multiple, "true,false,true,false,true,true,true,false,true"}
+	{Sub Array, "[1337,1337.1337,true,false,\"doom\"],[]"}
+	{Null entry 1, "null,1"}
+	{Null entry 2, "1,null,2"}
+	{Null entry 3, "null,1,null,2"}
+}
+{
+	test("ES -> JSON $(name)")
+		async;
+		require success "Setup";
+	{
+		const char *json_input = "[" input_data "]";
+
+		OpString16 uni_str;
+		if (OpStatus::IsError(async->SetCompareString(json_input)) || OpStatus::IsError(uni_str.Set(json_input)))
+			ST_failed("OOM");
+
+		async->SetResultHandler( NULL );
+
+		if (OpStatus::IsError( (Eval(uni_str.CStr(), async)) ) )
+			ST_failed("Eval failed");
+	}
+}
+
+foreach(name, input_data, expected) from
+{
+	{Null entry 5, "null", ""}
+	{Null entry 6, "null,null", ""}
+	{Null entry 7, "1,null", "1"}
+}
+{
+	test("ES -> JSON $(name)")
+		async;
+		require success "Setup";
+	{
+		const char *json_input = "[" input_data "]";
+		const char *expected_output = "[" expected "]";
+
+		OpString16 uni_str;
+		if (OpStatus::IsError(uni_str.Set(json_input)) || OpStatus::IsError(async->SetCompareString(expected_output)))
+			ST_failed("OOM");
+
+		if (OpStatus::IsError( (Eval(uni_str.CStr(), async)) ) )
+			ST_failed("Eval failed");
+
+	}
+}

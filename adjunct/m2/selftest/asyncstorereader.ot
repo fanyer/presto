@@ -1,0 +1,90 @@
+/* -*- Mode: c++; tab-width: 4; c-basic-offset: 4 -*-
+ *
+ * Copyright (C) 1995-2009 Opera Software AS.  All rights reserved.
+ *
+ * This file is part of the Opera web browser.
+ * It may not be distributed under any circumstances.
+ *
+ * @author Arjan van Leeuwen (arjanl)
+ */
+
+group "m2.store.asyncstorereader";
+require M2_SUPPORT;
+
+include "adjunct/m2/src/engine/store/asyncstorereader.h";
+include "adjunct/m2/src/MessageDatabase/MessageStore.h";
+
+global
+{
+	struct MockMessageStore : public MessageStore
+	{
+		MockMessageStore() : read_startpos((OpFileLength)-1), read_blockcount(0) {}
+		virtual OP_STATUS AddMessage(message_gid_t& id, StoreMessage& message) { return OpStatus::OK; }
+		virtual OP_STATUS UpdateMessage(StoreMessage& message) { return OpStatus::OK; }
+		virtual OP_STATUS SetRawMessage(StoreMessage& message) { return OpStatus::OK; }
+		virtual OP_STATUS MarkAsRemoved(message_gid_t id) { return OpStatus::OK; }
+		virtual OP_STATUS GetMessage(StoreMessage& message, message_gid_t id) { return OpStatus::OK; }
+		virtual OP_STATUS GetMessageData(StoreMessage& message) { return OpStatus::OK; }
+		virtual OP_STATUS RemoveMessage(message_gid_t id) { return OpStatus::OK; }
+		virtual OP_STATUS CommitData() { return OpStatus::OK; }
+		virtual OpFileLength ReadData(OpFileLength startpos, int blockcount) { read_startpos = startpos; read_blockcount = blockcount; return startpos + blockcount; }
+		virtual BOOL HasFinishedLoading() { return FALSE; }
+		virtual OP_STATUS AddStoreListener(StoreListener* listener) { return OpStatus::OK; }
+		virtual void RemoveStoreListener(StoreListener* listener) {}
+		virtual OP_STATUS SetMessageFlag(message_gid_t id, StoreMessage::Flags flag, BOOL value) { return OpStatus::OK; }
+		virtual BOOL GetMessageFlag(message_gid_t id, StoreMessage::Flags flag) { return FALSE; }
+
+		OpFileLength read_startpos;
+		OpFileLength read_blockcount;
+	};
+
+	struct NoMoreDataMessageStore : public MockMessageStore
+	{
+		virtual OpFileLength ReadData(OpFileLength startpos, int blockcount) { return 0; }
+	};
+
+	struct MockQueue : public AsyncQueue
+	{
+		virtual OP_STATUS AddCommand(AsyncCommand* command) { lastcommand = command; return AsyncQueue::AddCommand(command); }
+		AsyncCommand* lastcommand;
+	};
+};
+
+test("Reads data when executed")
+{
+	MockQueue queue;
+	MockMessageStore store;
+	AsyncStoreReader* reader = OP_NEW(AsyncStoreReader, (store, 0, 2));
+
+	verify(OpStatus::IsSuccess(queue.AddCommand(reader)));
+	reader->Execute();
+
+	verify(store.read_startpos == 0);
+	verify(store.read_blockcount == 2);
+}
+
+test("Adds additional command to read more")
+{
+	MockQueue queue;
+	MockMessageStore store;
+	AsyncStoreReader* reader = OP_NEW(AsyncStoreReader, (store, 0, 2));
+
+	verify(OpStatus::IsSuccess(queue.AddCommand(reader)));
+	reader->Execute();
+	queue.lastcommand->Execute();
+
+	verify(store.read_startpos == 2);
+	verify(store.read_blockcount > 0);
+}
+
+test("Stops reading when there is no more data")
+{
+	MockQueue queue;
+	NoMoreDataMessageStore store;
+	AsyncStoreReader* reader = OP_NEW(AsyncStoreReader, (store, 1, 2));
+
+	verify(OpStatus::IsSuccess(queue.AddCommand(reader)));
+	reader->Execute();
+
+	verify(queue.lastcommand == reader);
+}

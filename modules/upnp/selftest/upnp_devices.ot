@@ -1,0 +1,148 @@
+/* -*- Mode: c++; tab-width: 4; indent-tabs-mode: t; c-basic-offset: 4;  -*-
+**
+** Copyright (C) 2002-2008 Opera Software AS.  All rights reserved.
+**
+** This file is part of the Opera web browser.  It may not be distributed
+** under any circumstances.
+*/
+group "upnp devices";
+require UPNP_SUPPORT;
+require UPNP_SERVICE_DISCOVERY;
+
+include "core/pch.h";
+include "modules/upnp/upnp_upnp.h";
+include "modules/upnp/upnp_port_opening.h";
+include "modules/pi/network/OpSocketAddress.h";
+include "modules/webserver/webserver-api.h";
+include "modules/hardcore/timer/optimer.h";
+
+global
+{
+	class TimeOutObj: public OpTimerListener
+	{
+	private:
+		OpTimer timer;
+		BOOL fail;
+		
+		void OnTimeOut(OpTimer* timer) { fail=TRUE; ST_failed("TimeOut!"); }
+	
+	public:
+		TimeOutObj(UINT ms) { fail=FALSE; timer.SetTimerListener(this); timer.Start(ms); }
+		~TimeOutObj() { timer.Stop(); }
+	};
+	
+	class CPAcceptAll: public UPnPLogic
+	{
+	private:
+		TimeOutObj *timer;
+		
+	public:
+		CPAcceptAll(UPnP *upnp_father): UPnPLogic(upnp_father, "urn:opera-com:device:OperaUnite:1") { timer=new TimeOutObj(3000); }
+		~CPAcceptAll() { OP_DELETE(timer); }
+		virtual OP_STATUS HandlerFailed(UPnPXH_Auto *child, const char *mex) { return OpStatus::OK; }
+		/*virtual BOOL AcceptSearchTarget(const OpStringC8 &search_target) { return TRUE; }*/
+		virtual UPnPXH_Auto *CreateNewDescriptionObject() { return OP_NEW(UPnPXH_DescriptionGeneric, ()); }
+		virtual void OnNewDevice(UPnPDevice *device) {
+			OpString8 dev_desc8;
+		
+			GetDeviceList(g_upnp, dev_desc8, UNI_L("urn:opera-com:device:OperaUnite:1"));
+			output(dev_desc8.CStr());
+			
+			ST_passed();
+		};
+		virtual void OnRemoveDevice(UPnPDevice *device) { };
+		
+		static OP_STATUS GetDeviceList(UPnP *upnp, OpString8 &dev_desc8, const uni_char* type)
+		{
+			OpString dev_desc;
+			dev_desc.AppendFormat(UNI_L("\nDevices detected: %d\n"), upnp->GetNumberOfDevices());
+			int num=0;
+			
+			for(UINT32 i=0; i<upnp->GetNumberOfDevices(); i++)
+			{
+				UPnPDevice *dev=upnp->GetDevice(i);
+				UPnPServicesProvider *prov=dev->GetProvider();
+				
+				if(prov && (!type || (prov->GetDeviceType() && !uni_strcmp(type, prov->GetDeviceType()))))
+				{
+					num++;
+					RETURN_IF_ERROR(dev_desc.AppendFormat(UNI_L("\n*** DEVICE %d) is %s***\n"), num, dev->GetUSN()->CStr()));
+					
+					for(int j=0; j<prov->GetAttributesCount(); j++)
+					{
+						NameValue *nv=prov->GetAttribute(j);
+						
+						if(nv)
+							RETURN_IF_ERROR(dev_desc.AppendFormat(UNI_L("   %s: %s\n"), nv->GetName().CStr(), nv->GetValue().CStr()));
+					}
+					
+					RETURN_IF_ERROR(dev_desc.AppendFormat(UNI_L("   * %d Services:\n"), prov->GetNumberOfServices()));
+					
+					
+					for(UINT32 k=0; k<prov->GetNumberOfServices(); k++)
+					{
+						UPnPService *srv;
+						
+						if(OpStatus::IsSuccess(prov->RetrieveService(k, srv)))
+						{
+							NameValue *nv_type=srv->GetAttribute(UPnPService::SERVICE_TYPE);
+							NameValue *nv_url=srv->GetAttribute(UPnPService::CONTROL_URL);
+							
+							RETURN_IF_ERROR(dev_desc.AppendFormat(UNI_L("      %s:%s\n"), nv_type?nv_type->GetValue().CStr():UNI_L(""), nv_url?nv_url->GetValue().CStr():UNI_L("")));
+						}
+					}
+				}
+			}
+			return dev_desc8.Set(dev_desc.CStr());
+		}
+	};
+	
+	CPAcceptAll * all_cp;
+}
+
+setup
+{
+	all_cp=OP_NEW(CPAcceptAll, (g_upnp));
+	
+	g_upnp->AddLogic(all_cp);
+}
+
+exit
+{
+	OP_DELETE(all_cp);
+}
+
+test("Start UPnP Service discovery  (without webserver)")
+{
+	g_upnp->StartUPnPDiscovery();
+}
+
+test("Device List - Unite Only")
+async;
+{
+	if(!g_upnp)
+		ST_failed("No UPNP object!");
+}
+
+test("Discovered devices")
+language ecmascript;
+require WEBSERVER_SUPPORT;
+{
+	var devices=opera.nearbyDevices;
+	var list="\nDevice List (upnp_devices.ot):\n";
+	
+	for(var i=0; i<devices.length; i++)
+	{
+		var dev=devices[i];
+		
+		list+=i+": " +dev.uniteUser+"."+dev.uniteDeviceName+": " + dev.name + " (" + dev.description + ") - URL: " + dev.url + "\n";
+		list+="      Services: " + dev.services.length + "\n";
+		for(var j=0; j<dev.services.length; j++)
+		{
+			list+="          " + dev.services[j].name + " ==> " + dev.services[j].url + "\n";
+		}
+		
+	}
+	
+	opera.postError(list);
+}

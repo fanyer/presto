@@ -1,0 +1,912 @@
+/* -*- Mode: c++; tab-width: 4; indent-tabs-mode: t; c-basic-offset: 4 -*-
+**
+** Copyright (C) 2004-2007 Opera Software AS.  All rights reserved.
+**
+** This file is part of the Opera web browser.  It may not be distributed
+** under any circumstances.
+**
+** We are going to create fake probes and test their timing!
+**
+** Anders Oredsson, anderso@oera.com
+*/
+
+group "probetools.probes";
+
+require SUPPORT_PROBETOOLS;
+
+include "modules/probetools/src/probe.h";
+include "modules/probetools/src/probehelper.h";
+include "modules/probetools/src/probesnapshot.h";
+
+global
+{
+	//Simple counter for our faked timeline
+	class FakeOpProbeTimeline{
+		private:
+			UINT32 time;
+		public:
+			FakeOpProbeTimeline(){
+				from_start();
+			}
+			void from_start(){time = 0;};
+			UINT32 get_time(){return time;};
+			void spend_time(UINT32 t){time += t;}
+	};
+
+	//A fake OpProbe, lets us test probes with given timestamps
+	class FakeOpProbe : public OpProbe{
+		private:
+			OpProbeThreadLocalStorage* tls;
+			OpProbeGraph* probegraph;
+			
+			UINT32 preamble_overhead;
+			UINT32 postamble_overhead;
+			
+			FakeOpProbeTimeline* timeline;
+			
+		public:
+			//root node setup
+			FakeOpProbe(){}
+		
+			//setup
+			FakeOpProbe(OpProbeIdentifier id, OpProbeThreadLocalStorage* a_tls, OpProbeGraph* a_probegraph, FakeOpProbeTimeline* a_timeline,
+				UINT32 a_preamble_overhead = 0, UINT32 a_postamble_overhead = 0){
+				
+				set_id(id);
+				
+				//stuff
+				tls = a_tls;
+				probegraph = a_probegraph;
+				timeline = a_timeline;
+				
+				//fake times!
+				preamble_overhead = a_preamble_overhead;
+				postamble_overhead = a_postamble_overhead;
+				
+				//start timer
+				preamble_start_ts.set(timeline->get_time());
+				
+				//add overhead
+				timeline->spend_time(preamble_overhead);
+				
+				//call startup probe code
+				startup_probe(tls);
+				
+				//exit timer
+				preamble_stop_ts.set(timeline->get_time());
+			}
+			//teardown
+			~FakeOpProbe(){
+				OpProbeIdentifier nullid = OpProbeIdentifier(0,0);
+			
+				//root probe!
+				if(get_id().get_location()<=1)
+				{
+					//makes probe dead, and OpProbe destructor will exit!
+					
+					set_id(nullid);
+					return;
+				}
+				
+				//start timer
+				postamble_start_ts.set(timeline->get_time());
+				
+				//add overhead
+				timeline->spend_time(postamble_overhead);
+				
+				//call shutdown probe code
+				shutdown_probe(tls, probegraph);
+				
+				//register time at pending destructor
+				OpProbeTimestamp postamble_stop_time_ts;
+				postamble_stop_time_ts.set(timeline->get_time());
+				tls->set_pending_destructor_final_timestamp(postamble_stop_time_ts);
+				
+				//makes probe dead, and OpProbe destructor will exit!
+				set_id(nullid);
+			}
+	};
+}
+
+test("verify probe stacking and fake timeline")
+{
+	//TESTCASE:
+	//
+	//We call some probes, and verify that the stack is correct,
+	//that our FameTimeline is working, and that the pending_destructor is working,
+
+	//-------------------------
+	//SETUP
+		//thread local storage
+		OpProbeThreadLocalStorage tls;
+		tls.init();
+		//graph
+		OpProbeGraph graph;
+		FakeOpProbeTimeline timeline;
+	//SETUP DONE
+	//-------------------------
+	
+	OpProbeIdentifier A_loc = OpProbeIdentifier(2,0);
+	OpProbeIdentifier B_loc = OpProbeIdentifier(3,0);
+	
+	//-----------------------------------------
+	//TEST: stack 1 probe!
+	timeline.from_start();
+	verify(timeline.get_time()==0);
+	
+	verify(tls.verify_probe_stack_pointer_is_root_probe());//verify stack
+	{
+		FakeOpProbe A(A_loc,&tls,&graph,&timeline,1,1);//overhead = 1 sec pre & 1 sec post
+		verify(tls.verify_probe_stack_pointer(&A));//verify stack
+		
+		verify(timeline.get_time()==1);//one sec with overhead
+		timeline.spend_time(1);
+		verify(timeline.get_time()==2);//we used some time
+	}
+	tls.handle_pending_destructor();//don't wait until end!
+	verify(tls.verify_probe_stack_pointer_is_root_probe());//verify stack
+	
+	verify(timeline.get_time()==3);//one more sec with overhead from pending destructor
+	
+	//-----------------------------------------
+	//TEST: stack 2 probes!
+	timeline.from_start();
+	verify(timeline.get_time()==0);
+	
+	verify(tls.verify_probe_stack_pointer_is_root_probe());//verify stack
+	{
+		FakeOpProbe A(A_loc,&tls,&graph,&timeline,1,1);//overhead = 1 sec pre & 1 sec post
+		verify(tls.verify_probe_stack_pointer(&A));//verify stack
+		
+		verify(timeline.get_time()==1);
+		timeline.spend_time(1);
+		verify(timeline.get_time()==2);
+		{
+			FakeOpProbe B(B_loc,&tls,&graph,&timeline,1,1);
+			verify(tls.verify_probe_stack_pointer(&B));//verify stack
+			
+			verify(timeline.get_time()==3);//one sec with overhead
+			timeline.spend_time(1);
+			verify(timeline.get_time()==4);//we used some time
+		}
+		verify(tls.verify_probe_stack_pointer(&A));//verify stack
+	}
+	tls.handle_pending_destructor();//don't wait until end!
+	verify(tls.verify_probe_stack_pointer_is_root_probe());//verify stack
+	
+	verify(timeline.get_time()==6);//two more sec with overhead from pending destructor
+	
+}
+
+test("timing 3 probes in stack A->B->C")
+{
+	//TESTCASE:
+	//
+	//Stack 3 non-recursive probes, and check that numbers adds up.
+	//This cover the most basic stuff of our probes
+
+	//-------------------------
+	//SETUP
+		//thread local storage
+		OpProbeThreadLocalStorage tls;
+		tls.init();
+		OpProbeGraph graph;
+		FakeOpProbeTimeline timeline;
+	//SETUP DONE
+	//-------------------------
+	
+	//-----------------------------------------
+	//Stack 3 probes!
+	
+	OpProbeIdentifier A_loc = OpProbeIdentifier(2,0);
+	OpProbeIdentifier B_loc = OpProbeIdentifier(3,0);
+	OpProbeIdentifier C_loc = OpProbeIdentifier(4,0);
+	
+	timeline.from_start();
+	
+	{
+		FakeOpProbe A(A_loc,&tls,&graph,&timeline);
+		
+		timeline.spend_time(1);
+		{
+			FakeOpProbe B(B_loc,&tls,&graph,&timeline);
+			
+			timeline.spend_time(1);
+			{
+				FakeOpProbe C(C_loc,&tls,&graph,&timeline);
+				
+				timeline.spend_time(1);
+			}
+		}
+	}
+	tls.handle_pending_destructor();//don't wait until end!
+	
+	verify(timeline.get_time() == 3);
+	
+	//-----------------
+	//Get a snapshot and get pointers to edges and probe measurement
+	OpProbeSnapshot* snapshot = OpProbeSnapshotBuilder::build_probetools_snapshot(&graph);
+	OpProbeSnapshotMeasurement* pAm = snapshot->get_probe(A_loc)->get_measurement();
+	OpProbeSnapshotMeasurement* pBm = snapshot->get_probe(B_loc)->get_measurement();
+	OpProbeSnapshotMeasurement* pCm = snapshot->get_probe(C_loc)->get_measurement();
+	OpProbeSnapshotMeasurement* eABm = snapshot->get_edge(A_loc,B_loc)->get_measurement();
+	OpProbeSnapshotMeasurement* eBCm = snapshot->get_edge(B_loc,C_loc)->get_measurement();
+	
+		//Verify 0 sec overhead
+		verify(pAm->get_overhead_time() == 0);
+		verify(pBm->get_overhead_time() == 0);
+		verify(pCm->get_overhead_time() == 0);
+	
+		//Verify 1 sec selftime
+		verify(pAm->get_self_time() == 1);
+		verify(pBm->get_self_time() == 1);
+		verify(pCm->get_self_time() == 1);
+	
+		//Verify childtime
+		verify(pAm->get_children_time() == 2);
+		verify(pBm->get_children_time() == 1);
+		verify(pCm->get_children_time() == 0);
+		
+		//Verify total times (self + children)
+		verify(pAm->get_total_time() == 3);
+		verify(pBm->get_total_time() == 2);
+		verify(pCm->get_total_time() == 1);
+		
+		//Verify that B is the sum of all XB edges (which is only AB)
+		verify(pBm->get_children_time() == eABm->get_children_time());
+		verify(pBm->get_self_time()		== eABm->get_self_time());
+		verify(pBm->get_total_time()	== eABm->get_total_time());
+	
+		//Verify that C is the sum of all XC edges (which is only BC)
+		verify(pCm->get_children_time() == eBCm->get_children_time());
+		verify(pCm->get_self_time()		== eBCm->get_self_time());
+		verify(pCm->get_total_time()	== eBCm->get_total_time());
+		
+		//Verify max total times (only called once, so same as total_time)
+		verify(pAm->get_max_total_time() == 3);
+		verify(pBm->get_max_total_time() == 2);
+		verify(pCm->get_max_total_time() == 1);
+	
+	delete snapshot;
+}
+
+test("timing 3 probes in stack A->B->C (with overhead)")
+{
+	//TESTCASE:
+	//
+	//Same as previous testcase, but with overhead. Results should
+	//be fairly equal
+
+	//-------------------------
+	//SETUP
+		//thread local storage
+		OpProbeThreadLocalStorage tls;
+		tls.init();
+		OpProbeGraph graph;
+		FakeOpProbeTimeline timeline;
+	//SETUP DONE
+	//-------------------------
+	
+	//-----------------------------------------
+	//Stack 3 probes!
+	
+	OpProbeIdentifier A_loc = OpProbeIdentifier(2,0);
+	OpProbeIdentifier B_loc = OpProbeIdentifier(3,0);
+	OpProbeIdentifier C_loc = OpProbeIdentifier(4,0);
+	
+	timeline.from_start();
+	
+	{
+		FakeOpProbe A(A_loc,&tls,&graph,&timeline,1,1);//overhead = 1 sec pre, 1 sec post
+		
+		timeline.spend_time(1);
+		{
+			FakeOpProbe B(B_loc,&tls,&graph,&timeline,1,1);//overhead = 1 sec pre, 1 sec post
+			
+			timeline.spend_time(1);
+			{
+				FakeOpProbe C(C_loc,&tls,&graph,&timeline,1,1);//overhead = 1 sec pre, 1 sec post
+				
+				timeline.spend_time(1);
+			}
+		}
+	}
+	tls.handle_pending_destructor();//don't wait until end!
+	
+	verify(timeline.get_time() == 3 + 6);//overhead should only affect total time passed, nothing else
+	
+	//-----------------
+	//Get a snapshot and get pointers to edges and probe measurement
+	OpProbeSnapshot* snapshot = OpProbeSnapshotBuilder::build_probetools_snapshot(&graph);
+	OpProbeSnapshotMeasurement* pAm = snapshot->get_probe(A_loc)->get_measurement();
+	OpProbeSnapshotMeasurement* pBm = snapshot->get_probe(B_loc)->get_measurement();
+	OpProbeSnapshotMeasurement* pCm = snapshot->get_probe(C_loc)->get_measurement();
+	OpProbeSnapshotMeasurement* eABm = snapshot->get_edge(A_loc,B_loc)->get_measurement();
+	OpProbeSnapshotMeasurement* eBCm = snapshot->get_edge(B_loc,C_loc)->get_measurement();
+	
+		//Verify 2 sec overhead
+		verify(pAm->get_overhead_time() == 2);
+		verify(pBm->get_overhead_time() == 2);
+		verify(pCm->get_overhead_time() == 2);
+	
+		//Verify 1 sec selftime
+		verify(pAm->get_self_time() == 1);
+		verify(pBm->get_self_time() == 1);
+		verify(pCm->get_self_time() == 1);
+	
+		//Verify childtime
+		verify(pAm->get_children_time() == 2);
+		verify(pBm->get_children_time() == 1);
+		verify(pCm->get_children_time() == 0);
+		
+		//Verify total times (self + children)
+		verify(pAm->get_total_time() == 3);
+		verify(pBm->get_total_time() == 2);
+		verify(pCm->get_total_time() == 1);
+		
+		//Verify that B is the sum of all XB edges (which is only AB)
+		verify(pBm->get_children_time() == eABm->get_children_time());
+		verify(pBm->get_self_time()		== eABm->get_self_time());
+		verify(pBm->get_total_time()	== eABm->get_total_time());
+	
+		//Verify that C is the sum of all XC edges (which is only BC)
+		verify(pCm->get_children_time() == eBCm->get_children_time());
+		verify(pCm->get_self_time()		== eBCm->get_self_time());
+		verify(pCm->get_total_time()	== eBCm->get_total_time());
+		
+		//Verify max total times (only called once, so same as total_time)
+		verify(pAm->get_max_total_time() == 3);
+		verify(pBm->get_max_total_time() == 2);
+		verify(pCm->get_max_total_time() == 1);
+	
+	delete snapshot;
+}
+
+test("timing recursive stack A->B->B")
+{
+	//TESTCASE:
+	//
+	//Simples case of recursion.
+
+	//-------------------------
+	//SETUP
+		//thread local storage
+		OpProbeThreadLocalStorage tls;
+		tls.init();
+		OpProbeGraph graph;
+		FakeOpProbeTimeline timeline;
+	//SETUP DONE
+	//-------------------------
+	
+	//-----------------------------------------
+	//Stack 3 probes!
+	
+	OpProbeIdentifier A_loc = OpProbeIdentifier(2,0);
+	OpProbeIdentifier B_loc = OpProbeIdentifier(3,0);
+	
+	timeline.from_start();
+	
+	{
+		FakeOpProbe A(A_loc,&tls,&graph,&timeline);
+		
+		timeline.spend_time(1);
+		{
+			FakeOpProbe B1(B_loc,&tls,&graph,&timeline);
+			
+			timeline.spend_time(1);
+			{
+				FakeOpProbe B2(B_loc,&tls,&graph,&timeline);
+				
+				timeline.spend_time(1);
+			}
+		}
+	}
+	tls.handle_pending_destructor();//don't wait until end!
+	
+	verify(timeline.get_time() == 3);
+	
+	//-----------------
+	//Get a snapshot and get pointers to edges and probe measurement
+	OpProbeSnapshot* snapshot = OpProbeSnapshotBuilder::build_probetools_snapshot(&graph);
+	OpProbeSnapshotMeasurement* pAm = snapshot->get_probe(A_loc)->get_measurement();
+	OpProbeSnapshotMeasurement* pBm = snapshot->get_probe(B_loc)->get_measurement();
+	OpProbeSnapshotMeasurement* eABm = snapshot->get_edge(A_loc,B_loc)->get_measurement();
+	OpProbeSnapshotMeasurement* eBBm = snapshot->get_edge(B_loc,B_loc)->get_measurement();
+	
+		//Verify no overhead
+		verify(pAm->get_overhead_time() == 0);
+		verify(pBm->get_overhead_time() == 0);
+	
+		//Verify 1 sec selftime
+		verify(eABm->get_self_time() == 1);
+		verify(eBBm->get_self_time() == 1);
+		verify( pBm->get_self_time() == 2);
+	
+		//Verify childtime
+		verify(eABm->get_children_time() == 0);
+		verify(eBBm->get_children_time() == 0);
+		verify( pBm->get_children_time() == 0);
+		
+		//Verify total time (self + children)
+		verify(eABm->get_total_time() == 1);
+		verify(eBBm->get_total_time() == 1);
+		verify( pBm->get_total_time() == 2);
+		
+		//Verify count
+		verify(eABm->get_total_count() == 1);
+		verify(eBBm->get_total_count() == 1);
+		verify( pBm->get_total_count() == 2);
+		
+		//Verify recursive count
+		verify(eABm->get_recursive_count() == 0);
+		verify(eBBm->get_recursive_count() == 1);
+		verify( pBm->get_recursive_count() == 1);
+		
+		//Verify recursive self time
+		verify(eABm->get_recursive_self_time() == 0);
+		verify(eBBm->get_recursive_self_time() == 1);
+		verify( pBm->get_recursive_self_time() == 1);
+		
+		//Verify recursion inited time
+		verify(eABm->get_recursion_initiated_time() == 1);
+		verify(eBBm->get_recursion_initiated_time() == 0);
+		verify( pBm->get_recursion_initiated_time() == 1);
+		
+		//Verify that B is the sum of all XB edges (AB & BB)
+		verify(pBm->get_children_time() == eABm->get_children_time() + eBBm->get_children_time());
+		verify(pBm->get_self_time()		== eABm->get_self_time()	 + eBBm->get_self_time());
+		verify(pBm->get_total_time()	== eABm->get_total_time()	 + eBBm->get_total_time());
+	
+	delete snapshot;
+}
+
+test("timing recursive stack A->B->B->C")
+{
+	//TESTCASE:
+	//
+	//Simples case of recursion + children
+
+	//-------------------------
+	//SETUP
+		//thread local storage
+		OpProbeThreadLocalStorage tls;
+		tls.init();
+		OpProbeGraph graph;
+		FakeOpProbeTimeline timeline;
+	//SETUP DONE
+	//-------------------------
+	
+	//-----------------------------------------
+	//Stack 3 probes!
+	
+	OpProbeIdentifier A_loc = OpProbeIdentifier(2,0);
+	OpProbeIdentifier B_loc = OpProbeIdentifier(3,0);
+	OpProbeIdentifier C_loc = OpProbeIdentifier(4,0);
+	
+	timeline.from_start();
+	
+	{
+		FakeOpProbe A(A_loc,&tls,&graph,&timeline);
+		
+		timeline.spend_time(1);
+		{
+			FakeOpProbe B1(B_loc,&tls,&graph,&timeline);
+			
+			timeline.spend_time(1);
+			{
+				FakeOpProbe B2(B_loc,&tls,&graph,&timeline);
+				
+				timeline.spend_time(1);
+				
+				{
+					FakeOpProbe C(C_loc,&tls,&graph,&timeline);
+					
+					timeline.spend_time(1);
+				}
+			}
+		}
+	}
+	tls.handle_pending_destructor();//don't wait until end!
+	
+	verify(timeline.get_time() == 4);
+	
+	//-----------------
+	//Get a snapshot and get pointers to edges and probe measurement
+	OpProbeSnapshot* snapshot = OpProbeSnapshotBuilder::build_probetools_snapshot(&graph);
+	OpProbeSnapshotMeasurement* pAm = snapshot->get_probe(A_loc)->get_measurement();
+	OpProbeSnapshotMeasurement* pBm = snapshot->get_probe(B_loc)->get_measurement();
+	OpProbeSnapshotMeasurement* pCm = snapshot->get_probe(C_loc)->get_measurement();
+	OpProbeSnapshotMeasurement* eABm = snapshot->get_edge(A_loc,B_loc)->get_measurement();
+	OpProbeSnapshotMeasurement* eBBm = snapshot->get_edge(B_loc,B_loc)->get_measurement();
+	OpProbeSnapshotMeasurement* eBCm = snapshot->get_edge(B_loc,C_loc)->get_measurement();
+	
+		//Verify totaltime
+		verify( pAm->get_total_time() == 4);
+	
+		//Verify 1 sec selftime
+		verify(eABm->get_self_time() == 1);
+		verify(eBBm->get_self_time() == 1);
+		verify( pBm->get_self_time() == 2);
+		verify(eBCm->get_self_time() == 1);
+		verify( pCm->get_self_time() == 1);
+	
+		//Verify childtime
+		verify(eABm->get_children_time() == 0);
+		verify(eBBm->get_children_time() == 1);
+		verify( pBm->get_children_time() == 1);
+		verify(eBCm->get_children_time() == 0);
+		verify( pCm->get_children_time() == 0);
+		
+		//Verify count
+		verify(eABm->get_total_count() == 1);
+		verify(eBBm->get_total_count() == 1);
+		verify( pBm->get_total_count() == 2);
+		verify(eBCm->get_total_count() == 1);
+		verify( pCm->get_total_count() == 1);
+		
+		//Verify recursive count
+		verify(eABm->get_recursive_count() == 0);
+		verify(eBBm->get_recursive_count() == 1);
+		verify( pBm->get_recursive_count() == 1);
+		verify(eBCm->get_recursive_count() == 0);
+		verify( pCm->get_recursive_count() == 0);
+		
+		//Verify recursive self time
+		verify(eABm->get_recursive_self_time() == 0);
+		verify(eBBm->get_recursive_self_time() == 1);
+		verify( pBm->get_recursive_self_time() == 1);
+		verify(eBCm->get_recursive_self_time() == 0);
+		verify( pCm->get_recursive_self_time() == 0);
+		
+		//Verify recursion inited time
+		verify(eABm->get_recursion_initiated_time() == 1);
+		verify(eBBm->get_recursion_initiated_time() == 0);
+		verify( pBm->get_recursion_initiated_time() == 1);
+		verify(eBCm->get_recursion_initiated_time() == 0);
+		verify( pCm->get_recursion_initiated_time() == 0);
+	
+	delete snapshot;
+}
+
+test("timing recursive stack A->B->B->B->C")
+{
+	//TESTCASE:
+	//
+	//Simples case of recursion + children (+1 recursion level)
+
+	//-------------------------
+	//SETUP
+		//thread local storage
+		OpProbeThreadLocalStorage tls;
+		tls.init();
+		OpProbeGraph graph;
+		FakeOpProbeTimeline timeline;
+	//SETUP DONE
+	//-------------------------
+	
+	//-----------------------------------------
+	//Stack 3 probes!
+	
+	OpProbeIdentifier A_loc = OpProbeIdentifier(2,0);
+	OpProbeIdentifier B_loc = OpProbeIdentifier(3,0);
+	OpProbeIdentifier C_loc = OpProbeIdentifier(4,0);
+	
+	timeline.from_start();
+	
+	{
+		FakeOpProbe A(A_loc,&tls,&graph,&timeline);
+		
+		timeline.spend_time(1);
+		{
+			FakeOpProbe B1(B_loc,&tls,&graph,&timeline);
+			
+			timeline.spend_time(1);
+			{
+				FakeOpProbe B2(B_loc,&tls,&graph,&timeline);
+				
+				timeline.spend_time(1);
+				
+				{
+					FakeOpProbe B2(B_loc,&tls,&graph,&timeline);
+				
+					timeline.spend_time(1);
+				
+					{
+						FakeOpProbe C(C_loc,&tls,&graph,&timeline);
+					
+						timeline.spend_time(1);
+					}
+				}
+			}
+		}
+	}
+	tls.handle_pending_destructor();//don't wait until end!
+	
+	verify(timeline.get_time() == 5);
+	
+	//-----------------
+	//Get a snapshot and get pointers to edges and probe measurement
+	OpProbeSnapshot* snapshot = OpProbeSnapshotBuilder::build_probetools_snapshot(&graph);
+	OpProbeSnapshotMeasurement* pAm = snapshot->get_probe(A_loc)->get_measurement();
+	OpProbeSnapshotMeasurement* pBm = snapshot->get_probe(B_loc)->get_measurement();
+	OpProbeSnapshotMeasurement* pCm = snapshot->get_probe(C_loc)->get_measurement();
+	OpProbeSnapshotMeasurement* eABm = snapshot->get_edge(A_loc,B_loc)->get_measurement();
+	OpProbeSnapshotMeasurement* eBBm = snapshot->get_edge(B_loc,B_loc)->get_measurement();
+	OpProbeSnapshotMeasurement* eBCm = snapshot->get_edge(B_loc,C_loc)->get_measurement();
+	
+		//Verify totaltime
+		verify( pAm->get_total_time() == 5);
+	
+		//Verify 1 sec selftime
+		verify(eABm->get_self_time() == 1);
+		verify(eBBm->get_self_time() == 2);
+		verify( pBm->get_self_time() == 3);
+		verify(eBCm->get_self_time() == 1);
+		verify( pCm->get_self_time() == 1);
+	
+		//Verify childtime
+		verify(eABm->get_children_time() == 0);
+		verify(eBBm->get_children_time() == 1);
+		verify( pBm->get_children_time() == 1);
+		verify(eBCm->get_children_time() == 0);
+		verify( pCm->get_children_time() == 0);
+		
+		//Verify count
+		verify(eABm->get_total_count() == 1);
+		verify(eBBm->get_total_count() == 2);
+		verify( pBm->get_total_count() == 3);
+		verify(eBCm->get_total_count() == 1);
+		verify( pCm->get_total_count() == 1);
+		
+		//Verify recursive count
+		verify(eABm->get_recursive_count() == 0);
+		verify(eBBm->get_recursive_count() == 2);
+		verify( pBm->get_recursive_count() == 2);
+		verify(eBCm->get_recursive_count() == 0);
+		verify( pCm->get_recursive_count() == 0);
+		
+		//Verify recursive self time
+		verify(eABm->get_recursive_self_time() == 0);
+		verify(eBBm->get_recursive_self_time() == 2);
+		verify( pBm->get_recursive_self_time() == 2);
+		verify(eBCm->get_recursive_self_time() == 0);
+		verify( pCm->get_recursive_self_time() == 0);
+		
+		//Verify recursion inited time
+		verify(eABm->get_recursion_initiated_time() == 2);
+		verify(eBBm->get_recursion_initiated_time() == 0);
+		verify( pBm->get_recursion_initiated_time() == 2);
+		verify(eBCm->get_recursion_initiated_time() == 0);
+		verify( pCm->get_recursion_initiated_time() == 0);
+	
+	delete snapshot;
+}
+
+test("timing recursive stack A->B->B->B->B->C")
+{
+	//TESTCASE:
+	//
+	//Simples case of recursion + children (+2 recursion level)
+
+	//-------------------------
+	//SETUP
+		//thread local storage
+		OpProbeThreadLocalStorage tls;
+		tls.init();
+		OpProbeGraph graph;
+		FakeOpProbeTimeline timeline;
+	//SETUP DONE
+	//-------------------------
+	
+	//-----------------------------------------
+	//Stack 3 probes!
+	
+	OpProbeIdentifier A_loc = OpProbeIdentifier(2,0);
+	OpProbeIdentifier B_loc = OpProbeIdentifier(3,0);
+	OpProbeIdentifier C_loc = OpProbeIdentifier(4,0);
+	
+	timeline.from_start();
+	
+	{
+		FakeOpProbe A(A_loc,&tls,&graph,&timeline);
+		
+		timeline.spend_time(1);
+		{
+			FakeOpProbe B1(B_loc,&tls,&graph,&timeline);
+			
+			timeline.spend_time(1);
+			{
+				FakeOpProbe B2(B_loc,&tls,&graph,&timeline);
+				
+				timeline.spend_time(1);
+				
+				{
+					FakeOpProbe B2(B_loc,&tls,&graph,&timeline);
+				
+					timeline.spend_time(1);
+				
+					{
+						FakeOpProbe B2(B_loc,&tls,&graph,&timeline);
+				
+						timeline.spend_time(1);
+					
+						{
+							FakeOpProbe C(C_loc,&tls,&graph,&timeline);
+						
+							timeline.spend_time(1);
+						}
+					}
+				}
+			}
+		}
+	}
+	tls.handle_pending_destructor();//don't wait until end!
+	
+	verify(timeline.get_time() == 6);
+	
+	//-----------------
+	//Get a snapshot and get pointers to edges and probe measurement
+	OpProbeSnapshot* snapshot = OpProbeSnapshotBuilder::build_probetools_snapshot(&graph);
+	OpProbeSnapshotMeasurement* pAm = snapshot->get_probe(A_loc)->get_measurement();
+	OpProbeSnapshotMeasurement* pBm = snapshot->get_probe(B_loc)->get_measurement();
+	OpProbeSnapshotMeasurement* pCm = snapshot->get_probe(C_loc)->get_measurement();
+	OpProbeSnapshotMeasurement* eABm = snapshot->get_edge(A_loc,B_loc)->get_measurement();
+	OpProbeSnapshotMeasurement* eBBm = snapshot->get_edge(B_loc,B_loc)->get_measurement();
+	OpProbeSnapshotMeasurement* eBCm = snapshot->get_edge(B_loc,C_loc)->get_measurement();
+	
+		//Verify totaltime
+		verify( pAm->get_total_time() == 6);
+	
+		//Verify 1 sec selftime
+		verify(eABm->get_self_time() == 1);
+		verify(eBBm->get_self_time() == 3);
+		verify( pBm->get_self_time() == 4);
+		verify(eBCm->get_self_time() == 1);
+		verify( pCm->get_self_time() == 1);
+	
+		//Verify childtime
+		verify(eABm->get_children_time() == 0);
+		verify(eBBm->get_children_time() == 1);
+		verify( pBm->get_children_time() == 1);
+		verify(eBCm->get_children_time() == 0);
+		verify( pCm->get_children_time() == 0);
+		
+		//Verify count
+		verify(eABm->get_total_count() == 1);
+		verify(eBBm->get_total_count() == 3);
+		verify( pBm->get_total_count() == 4);
+		verify(eBCm->get_total_count() == 1);
+		verify( pCm->get_total_count() == 1);
+		
+		//Verify recursive count
+		verify(eABm->get_recursive_count() == 0);
+		verify(eBBm->get_recursive_count() == 3);
+		verify( pBm->get_recursive_count() == 3);
+		verify(eBCm->get_recursive_count() == 0);
+		verify( pCm->get_recursive_count() == 0);
+		
+		//Verify recursive self time
+		verify(eABm->get_recursive_self_time() == 0);
+		verify(eBBm->get_recursive_self_time() == 3);
+		verify( pBm->get_recursive_self_time() == 3);
+		verify(eBCm->get_recursive_self_time() == 0);
+		verify( pCm->get_recursive_self_time() == 0);
+		
+		//Verify recursion inited time
+		verify(eABm->get_recursion_initiated_time() == 3);
+		verify(eBBm->get_recursion_initiated_time() == 0);
+		verify( pBm->get_recursion_initiated_time() == 3);
+		verify(eBCm->get_recursion_initiated_time() == 0);
+		verify( pCm->get_recursion_initiated_time() == 0);
+	
+	delete snapshot;
+}
+
+
+test("timing recursive stack A->B->B->C with same location but different params")
+{
+	//TESTCASE:
+	//
+	//Simples case of recursion + children where location is equal, but params are different
+
+	//-------------------------
+	//SETUP
+		//thread local storage
+		OpProbeThreadLocalStorage tls;
+		tls.init();
+		OpProbeGraph graph;
+		FakeOpProbeTimeline timeline;
+	//SETUP DONE
+	//-------------------------
+	
+	//-----------------------------------------
+	//Stack 3 probes!
+	
+	OpProbeIdentifier A_loc = OpProbeIdentifier(2,7);
+	OpProbeIdentifier B_loc = OpProbeIdentifier(2,8);
+	OpProbeIdentifier C_loc = OpProbeIdentifier(2,9);
+	
+	timeline.from_start();
+	
+	{
+		FakeOpProbe A(A_loc,&tls,&graph,&timeline);
+		
+		timeline.spend_time(1);
+		{
+			FakeOpProbe B1(B_loc,&tls,&graph,&timeline);
+			
+			timeline.spend_time(1);
+			{
+				FakeOpProbe B2(B_loc,&tls,&graph,&timeline);
+				
+				timeline.spend_time(1);
+				
+				{
+					FakeOpProbe C(C_loc,&tls,&graph,&timeline);
+					
+					timeline.spend_time(1);
+				}
+			}
+		}
+	}
+	tls.handle_pending_destructor();//don't wait until end!
+	
+	verify(timeline.get_time() == 4);
+	
+	//-----------------
+	//Get a snapshot and get pointers to edges and probe measurement
+	OpProbeSnapshot* snapshot = OpProbeSnapshotBuilder::build_probetools_snapshot(&graph);
+	OpProbeSnapshotMeasurement* pAm = snapshot->get_probe(A_loc)->get_measurement();
+	OpProbeSnapshotMeasurement* pBm = snapshot->get_probe(B_loc)->get_measurement();
+	OpProbeSnapshotMeasurement* pCm = snapshot->get_probe(C_loc)->get_measurement();
+	OpProbeSnapshotMeasurement* eABm = snapshot->get_edge(A_loc,B_loc)->get_measurement();
+	OpProbeSnapshotMeasurement* eBBm = snapshot->get_edge(B_loc,B_loc)->get_measurement();
+	OpProbeSnapshotMeasurement* eBCm = snapshot->get_edge(B_loc,C_loc)->get_measurement();
+	
+		//Verify totaltime
+		verify( pAm->get_total_time() == 4);
+	
+		//Verify 1 sec selftime
+		verify(eABm->get_self_time() == 1);
+		verify(eBBm->get_self_time() == 1);
+		verify( pBm->get_self_time() == 2);
+		verify(eBCm->get_self_time() == 1);
+		verify( pCm->get_self_time() == 1);
+	
+		//Verify childtime
+		verify(eABm->get_children_time() == 0);
+		verify(eBBm->get_children_time() == 1);
+		verify( pBm->get_children_time() == 1);
+		verify(eBCm->get_children_time() == 0);
+		verify( pCm->get_children_time() == 0);
+		
+		//Verify count
+		verify(eABm->get_total_count() == 1);
+		verify(eBBm->get_total_count() == 1);
+		verify( pBm->get_total_count() == 2);
+		verify(eBCm->get_total_count() == 1);
+		verify( pCm->get_total_count() == 1);
+		
+		//Verify recursive count
+		verify(eABm->get_recursive_count() == 0);
+		verify(eBBm->get_recursive_count() == 1);
+		verify( pBm->get_recursive_count() == 1);
+		verify(eBCm->get_recursive_count() == 0);
+		verify( pCm->get_recursive_count() == 0);
+		
+		//Verify recursive self time
+		verify(eABm->get_recursive_self_time() == 0);
+		verify(eBBm->get_recursive_self_time() == 1);
+		verify( pBm->get_recursive_self_time() == 1);
+		verify(eBCm->get_recursive_self_time() == 0);
+		verify( pCm->get_recursive_self_time() == 0);
+		
+		//Verify recursion inited time
+		verify(eABm->get_recursion_initiated_time() == 1);
+		verify(eBBm->get_recursion_initiated_time() == 0);
+		verify( pBm->get_recursion_initiated_time() == 1);
+		verify(eBCm->get_recursion_initiated_time() == 0);
+		verify( pCm->get_recursion_initiated_time() == 0);
+	
+	delete snapshot;
+}

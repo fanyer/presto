@@ -1,0 +1,2606 @@
+/* -*- Mode: c++; tab-width: 4; indent-tabs-mode: t; c-basic-offset: 4 -*-
+ *
+ * Copyright (C) 2004-2011 Opera Software ASA.  All rights reserved.
+ *
+ * This file is part of the Opera web browser.
+ * It may not be distributed under any circumstances.
+ *
+ * Luca Venturi
+ */
+group "cache simple multimedia";
+
+require init;
+require DISK_CACHE_SUPPORT;
+require MULTIMEDIA_CACHE_SUPPORT;
+include "modules/cache/simple_stream.h";
+include "modules/cache/multimedia_cache.h";
+include "modules/cache/cache_selftest.h";
+
+global
+{
+	#define BUF_SIZE_VERYSMALL 4
+	#define BUF_SIZE_LIMIT	(1024+BUF_SIZE_VERYSMALL)
+	#define BUF_SIZE_TEST	4096
+	#define BUF_SIZE_TEST_BIG (4096*1024)
+	#define BUF_SIZE_SMALL	(BUF_SIZE_LIMIT/2)
+	#define POSITION_VERYSMALL 10000
+	#define BUF_SIZE_MEDIUM	256*1024
+	//#define BUF_BIGSIZE_LIMIT	((UINT64)(5.0*1024.0*1024.0*1024.0+BUF_SIZE_VERYSMALL))
+	#define BUF_BIGSIZE_LIMIT	((UINT64)(16*1024.0*1024.0+BUF_SIZE_VERYSMALL))
+	#define POSITION_VERYSMALL2 ((UINT64)(10.0*1024.0*1024.0*1024.0+BUF_SIZE_VERYSMALL))
+	#define POSITION_VERYSMALL3 100000
+	#define POSITION_VERYSMALL4 110000
+	#define POSITION_VERYSMALL5 120000
+	#define LINEAR_STREAM_WINDOW 1024*1024
+	#define LINEAR_BUF 128*1024
+	#define LINEAR_FILE_MAX 64*128*1024
+	
+
+	uni_char name[]={'M','u','l','t','i','m','e','d','i','a','S','.','o','u','t',0};
+	uni_char name2[]={'M','u','l','t','i','m','e','d','i','a','S','2','.','o','u','t',0};
+	uni_char name3[]={'M','u','l','t','i','m','e','d','i','a','S','B','i','g','.','o','u','t',0};
+	OpAutoVector<MultimediaSegment> ms_unsorted;
+	OpAutoVector<MultimediaSegment> ms_sorted;
+}
+
+exit
+{
+	ms_unsorted.DeleteAll();
+	ms_sorted.DeleteAll();
+}
+
+test("Ranges check")
+disabled;
+{
+	#ifdef URL_ENABLE_HTTP_RANGE_SPEC
+		ST_passed();
+	#else
+		ST_failed("URL_ENABLE_HTTP_RANGE_SPEC is a requirement!");
+	#endif
+}
+
+/// Test the logic of the segments, above all the coverage
+subtest TestSegmentsLogic(UINT32 num_segments)
+{
+	MultimediaCacheFile cf;
+	OpVector<MultimediaSegment> ms;
+	MultimediaSegment *ms_dirty;  // Dirty test
+
+	ms_dirty=OP_NEW(MultimediaSegment, (num_segments*1000+MMCACHE_HEADER_SIZE, num_segments*1000, 1000, MMCACHE_SEGMENT_DIRTY));
+
+	verify(ms_dirty->IsDirty());
+	ms_dirty->SetDirty(FALSE);
+	verify(!ms_dirty->IsDirty());
+	ms_dirty->SetDirty(TRUE);
+	verify(ms_dirty->IsDirty());
+
+	cf.DebugAddSegment(ms_dirty);  // This should be skipped on coverage
+
+	for(UINT32 i=0; i<num_segments; i++)
+	{
+		verify_success(ms.Add(OP_NEW(MultimediaSegment, (i*1000+MMCACHE_HEADER_SIZE, i*1000, 1000, (i==num_segments-1)?MMCACHE_SEGMENT_NEW:0))));
+
+		MultimediaSegment *tmp_seg=ms.Get(i);
+
+		verify(tmp_seg);
+		verify_success(cf.DebugAddSegment(tmp_seg));
+	}
+
+	// Add some unordered segments
+	verify_success(cf.DebugAddSegment(OP_NEW(MultimediaSegment, (num_segments*1000+MMCACHE_HEADER_SIZE, num_segments*1000+250, 500, 0))));
+	verify_success(cf.DebugAddSegment(OP_NEW(MultimediaSegment, (num_segments*1000+500+MMCACHE_HEADER_SIZE, num_segments*1000, 250, 0))));
+
+	verify_success(cf.DebugAddSegment(OP_NEW(MultimediaSegment, (num_segments*1000+750+MMCACHE_HEADER_SIZE, (num_segments+10)*1000+250, 500, 0))));
+	verify_success(cf.DebugAddSegment(OP_NEW(MultimediaSegment, (num_segments*1000+1250+MMCACHE_HEADER_SIZE, (num_segments+10)*1000, 250, 0))));
+
+	ms_unsorted.DeleteAll();
+
+	// Check unsorted
+	verify_success(cf.GetUnsortedCoverage(ms_unsorted));
+
+	verify(ms.GetCount()==ms_unsorted.GetCount()-4);
+
+	for(UINT32 i=0; i<num_segments; i++)
+	{
+		MultimediaSegment *seg1=ms.Get(i);
+		MultimediaSegment *seg2=ms_unsorted.Get(i);
+
+		verify(seg1 && seg2);
+
+		if(seg1 && seg2)
+		{
+			verify(seg1->GetFileOffset()==seg2->GetFileOffset());
+			verify(seg1->GetContentStart()==seg2->GetContentStart());
+			verify(seg1->GetContentEnd()==seg2->GetContentEnd());
+			verify(seg1->GetContentLength()==seg2->GetContentLength());
+			verify(seg2->GetFlags()==0);
+		}
+	}
+
+
+	// Check sorted
+	ms_sorted.DeleteAll();
+	verify_success(cf.GetSortedCoverage(ms_sorted));
+
+	verify(ms_sorted.GetCount()==2);
+
+	MultimediaSegment *seg_big1=ms_sorted.Get(0);
+	MultimediaSegment *seg_big2=ms_sorted.Get(1);
+
+	verify(seg_big1);
+	verify(seg_big2);
+
+	BOOL coverage_available=FALSE;
+	OpFileLength coverage_length=FILE_LENGTH_NONE;
+	OpFileLength coverage_position=FILE_LENGTH_NONE;
+
+	if(seg_big1)
+	{
+		verify(seg_big1->GetFileOffset()==MMCACHE_HEADER_SIZE);
+		verify(seg_big1->GetContentStart()==0);
+		verify(seg_big1->GetContentEnd()==1000*num_segments+750);
+		verify(seg_big1->GetContentLength()==1000*num_segments+750);
+		verify(seg_big1->GetFlags()==0);
+
+		// Content covered
+		coverage_position=500;
+		cf.GetPartialCoverage(coverage_position, coverage_available, coverage_length, FALSE);
+
+		verify(coverage_available==TRUE);
+		//verify(coverage_length==seg_big1->GetContentEnd()-coverage_position);
+		verify(coverage_length==500);
+	}
+	if(seg_big2)
+	{
+		verify(seg_big2->GetFileOffset()==MMCACHE_HEADER_SIZE+1000*num_segments+750+500);
+		verify(seg_big2->GetContentStart()==(num_segments+10)*1000);
+		verify(seg_big2->GetContentEnd()==(num_segments+10)*1000+750);
+		verify(seg_big2->GetContentLength()==750);
+		verify(seg_big2->GetFlags()==0);
+
+		// Content not covered, in the middle of the file
+		coverage_position=seg_big2->GetContentStart()-2500;
+		cf.GetPartialCoverage(coverage_position, coverage_available, coverage_length, FALSE);
+
+		verify(coverage_available==FALSE);
+		verify(coverage_length==2500);
+
+		// Corner case: segment start
+		coverage_position=seg_big2->GetContentStart();
+		cf.GetPartialCoverage(coverage_position, coverage_available, coverage_length, FALSE);
+
+		verify(coverage_available==TRUE);
+		//verify(coverage_length==seg_big2->GetContentEnd()-seg_big2->GetContentStart());
+		verify(coverage_length==250);
+
+		// Corner case: byte before segment start
+		coverage_position=seg_big2->GetContentStart()-1;
+		cf.GetPartialCoverage(coverage_position, coverage_available, coverage_length, FALSE);
+
+		verify(coverage_available==FALSE);
+		verify(coverage_length==1);
+
+		// Corner case: byte before segment end
+		coverage_position=seg_big2->GetContentEnd()-1;
+		cf.GetPartialCoverage(coverage_position, coverage_available, coverage_length, FALSE);
+
+		verify(coverage_available==TRUE);
+		verify(coverage_length==1);
+
+		// Corner case: segment end
+		coverage_position=seg_big2->GetContentEnd();
+		cf.GetPartialCoverage(coverage_position, coverage_available, coverage_length, FALSE);
+
+		verify(coverage_available==FALSE);
+		verify(coverage_length==0);
+	}
+
+	// Content not covered, after the end of the bytes available
+	coverage_position=(num_segments+10)*1000+750+100;
+	cf.GetPartialCoverage(coverage_position, coverage_available, coverage_length, FALSE);
+
+	verify(coverage_available==FALSE);
+	verify(coverage_length==0);
+
+
+	ms.Remove(0, ms.GetCount());
+	ms_unsorted.DeleteAll();
+	ms_sorted.DeleteAll();
+}
+
+subtest SafeDel(uni_char *name)
+{
+	OpFile file;
+	BOOL exists=TRUE;
+
+	verify_success(file.Construct(name));
+	OpStatus::Ignore(file.Delete());
+	OpStatus::Ignore(file.Close());
+
+	verify_success(file.Construct(name));
+	verify_success(file.Exists(exists));
+	verify(!exists);
+}
+
+subtest SafeInit(MultimediaCacheFile &cf, uni_char *name, OpFileLength suggested_max_file_size, UINT16 suggested_max_segments, BOOL ram_file, BOOL enable_streaming, ConsumePolicy consume_policy)
+{
+	OP_ASSERT(!ram_file || suggested_max_file_size>0);
+	verify(SafeDel(name));
+
+	if(ram_file)
+		verify_success(cf.ConstructMemory(suggested_max_file_size, suggested_max_segments));
+	else
+		verify_success(cf.ConstructFile(name, OPFILE_ABSOLUTE_FOLDER, suggested_max_file_size, suggested_max_segments));
+
+	if(enable_streaming)
+		cf.ActivateStreaming(consume_policy);
+}
+
+// Write num segments of random size, in random order (if requested); no GAP
+subtest TestMultimediaWrite(uni_char *name, UINT32 num_segments, BOOL random, UINT32 max_segment_size, BOOL ram_file)
+{
+	OpVector<MultimediaSegment> ms;
+	MultimediaCacheFile cf;
+	OpFileLength total_len=0;
+	OpAutoArray<UINT8> buf(OP_NEWA(UINT8, max_segment_size));
+	UINT32 written_bytes=0;
+
+	verify(SafeInit(cf, name, 50*1024*1024, 255, ram_file, FALSE, CONSUME_NONE));
+
+	// Create random sized segments
+	for(UINT32 i=0; i<num_segments; i++)
+	{
+		OpFileLength cur_len=op_rand()&max_segment_size;
+
+		if(!cur_len)
+			cur_len=1;
+
+		MultimediaSegment *seg=OP_NEW(MultimediaSegment, (MMCACHE_HEADER_SIZE+total_len, total_len, cur_len, 0));
+		verify(seg);
+		verify_success(ms.Add(seg));
+
+		total_len+=cur_len;
+	}
+
+	// Add them to the file (in reverse order)
+	for(UINT32 j=num_segments; j>0; j--)
+	{
+		UINT32 index=(random)?(op_rand()%ms.GetCount()):j-1;
+
+		OP_ASSERT(index<ms.GetCount());
+
+		MultimediaSegment *seg=ms.Get(index);
+
+		OP_ASSERT(seg);
+
+		if(seg)
+		{
+			OP_ASSERT(seg->GetContentStart()!=FILE_LENGTH_NONE);
+			OP_ASSERT(seg->GetFileOffset()!=FILE_LENGTH_NONE);
+			OP_ASSERT(seg->GetContentLength()!=FILE_LENGTH_NONE);
+
+			OP_ASSERT(seg->GetContentLength()<=max_segment_size);
+
+			for(UINT32 k=0, k_len=(UINT32)seg->GetContentLength(), val=(UINT32)seg->GetContentStart(); k<k_len; k++, val++)
+				buf[k]=(UINT8)val;
+
+			verify_success(cf.WriteContent(seg->GetContentStart(), buf.get(), (UINT32)seg->GetContentLength(), written_bytes));
+
+			OP_ASSERT(written_bytes==seg->GetContentLength());
+		}
+		OP_ASSERT(seg);
+		//verify_success(cf.DebugAddSegment(seg));
+
+		OP_ASSERT(j==ms.GetCount());
+
+		MultimediaSegment *t=ms.Remove(index);
+
+		OP_ASSERT(t==seg);
+		OP_ASSERT(index>=ms.GetCount() || ms.Get(index)!=seg);
+		OP_ASSERT(j==ms.GetCount()+1);
+
+		OP_DELETE(t);
+	}
+
+	// Check segments
+	ms_sorted.DeleteAll();
+	verify_success(cf.GetSortedCoverage(ms_sorted));
+
+	verify(ms_sorted.GetCount()==1);
+
+	MultimediaSegment *seg_big=ms_sorted.Get(0);
+
+	verify(seg_big);
+
+	if(seg_big)
+	{
+		verify(seg_big->GetContentStart()==0);
+		verify(seg_big->GetContentEnd()==total_len);
+		verify(seg_big->GetContentLength()==total_len);
+		verify(seg_big->GetFlags()==0);
+	}
+
+	// Sequential read
+	UINT32 total_read=0;
+	UINT32 read=0;
+
+	while(total_read<seg_big->GetContentLength())
+	{
+		verify_success(cf.ReadContent(total_read, buf.get(), max_segment_size, read));
+
+		for(UINT32 k=0; k<read; k++)
+			verify(buf[k]==(UINT8)(k+total_read));
+
+		total_read+=read;
+	}
+
+	verify(total_read==seg_big->GetContentLength());
+
+	BYTE bytebuf;
+
+	// Randomly read 1 byte in 1024 positions
+	for	(UINT32 read_performed=0; read_performed<1024; read_performed++)
+	{
+		UINT32 pos=op_rand() % ((UINT32)seg_big->GetContentLength());
+
+		verify_success(cf.ReadContent(pos, &bytebuf, 1, read));
+
+		verify(read==1);
+		verify(bytebuf==(UINT8)pos);
+	}
+
+	// Test position 0
+	OP_STATUS ops=cf.ReadContent(0, &bytebuf, 1, read);
+
+	verify(OpStatus::IsSuccess(ops));
+	verify(bytebuf==0);
+
+	// Test an impossible position
+	ops=cf.ReadContent(1024*1024*1024, &bytebuf, 1, read);
+
+	verify(ops==OpStatus::ERR_NO_SUCH_RESOURCE);
+
+	// Close the file
+	cf.CloseAll();
+
+	verify(cf.DebugGetSegmentsCount()==0);
+
+	// Test position 0 (error expected)
+	ops=cf.ReadContent(0, &bytebuf, 1, read);
+
+	verify(ops==OpStatus::ERR_NOT_SUPPORTED);
+
+	// Write (error expected)
+	ops=cf.WriteContent(0, &bytebuf, 1, written_bytes);
+
+	verify(ops==OpStatus::ERR_NOT_SUPPORTED);
+
+	// RAM file for now is not persistent...
+	if(!ram_file)
+	{
+		// Random read after close
+		MultimediaCacheFile cf2;
+
+		verify_success(cf2.ConstructFile(name, OPFILE_ABSOLUTE_FOLDER, 0, 255));
+
+		verify(cf2.GetMaxSize()==50*1024*1024);
+
+		// Randomly read 1 byte in 1024 positions
+		for	(UINT32 read_performed=0; read_performed<1024; read_performed++)
+		{
+			UINT32 pos=op_rand() % ((UINT32)seg_big->GetContentLength());
+
+			verify_success(cf2.ReadContent(pos, &bytebuf, 1, read));
+
+			verify(read==1);
+			verify(bytebuf==(UINT8)pos);
+		}
+
+		// Sequential reading
+		total_read=0;
+
+		while(total_read<seg_big->GetContentLength())
+		{
+			verify_success(cf2.ReadContent(total_read, buf.get(), max_segment_size, read));
+
+			for(UINT32 k=0; k<read; k++)
+				verify(buf[k]==(UINT8)(k+total_read));
+
+			total_read+=read;
+		}
+
+		verify(total_read==seg_big->GetContentLength());
+
+		// Closing
+		verify_success(cf2.CloseAll());
+
+		// Reopening
+		verify_success(cf.ConstructFile(name, OPFILE_ABSOLUTE_FOLDER, 0, 255));
+
+		// Randomly read 1 byte in 1024 positions
+		for	(UINT32 read_performed=0; read_performed<1024; read_performed++)
+		{
+			UINT32 pos=op_rand() % ((UINT32)seg_big->GetContentLength());
+
+			verify_success(cf.ReadContent(pos, &bytebuf, 1, read));
+
+			verify(read==1);
+			verify(bytebuf==(UINT8)pos);
+		}
+
+		// Sequential reading
+		total_read=0;
+
+		while(total_read<seg_big->GetContentLength())
+		{
+			verify_success(cf.ReadContent(total_read, buf.get(), max_segment_size, read));
+
+			for(UINT32 k=0; k<read; k++)
+				verify(buf[k]==(UINT8)(k+total_read));
+
+			total_read+=read;
+		}
+
+		verify(total_read==seg_big->GetContentLength());
+
+		ms_sorted.DeleteAll();
+	}
+}
+
+// Test size limit and overwrite
+subtest TestMultimediaSize(uni_char *name, BOOL ram)
+{
+	MultimediaCacheFile cf;
+	UINT8 buf[BUF_SIZE_TEST];
+
+	verify(SafeInit(cf, name, BUF_SIZE_LIMIT, MMCACHE_DEFAULT_MAX_SEGMENTS, ram, FALSE, CONSUME_NONE));
+
+	for(UINT32 i=0; i<BUF_SIZE_TEST; i++)
+		buf[i]=(UINT8)i;
+
+	UINT32 written=0;
+
+	// Write 4 bytes to create a pending segment of 4 bytes
+	verify_success(cf.WriteContent(POSITION_VERYSMALL, buf, BUF_SIZE_VERYSMALL, written));
+
+	verify(written==BUF_SIZE_VERYSMALL);
+
+	// Write the first part of the big segment
+	verify_success(cf.WriteContent(0, buf, BUF_SIZE_SMALL, written));
+
+	verify(written==BUF_SIZE_SMALL);
+
+	// Test Overwrite last segment
+	verify_status(OpStatus::ERR_NOT_SUPPORTED, cf.WriteContent(0, buf, BUF_SIZE_SMALL, written));
+
+	// Test Overwrite first segment
+	verify_status(OpStatus::ERR_NOT_SUPPORTED, cf.WriteContent(POSITION_VERYSMALL, buf, BUF_SIZE_VERYSMALL, written));
+
+	// Keep writing on the same segment: try to go past the limit
+	verify_success(cf.WriteContent(BUF_SIZE_SMALL, buf+BUF_SIZE_SMALL, BUF_SIZE_TEST-BUF_SIZE_SMALL, written));
+
+	verify(written==BUF_SIZE_LIMIT-BUF_SIZE_SMALL-BUF_SIZE_VERYSMALL);
+
+	verify(cf.DebugGetSegmentsCount()==2);
+
+	verify_status(OpStatus::ERR_OUT_OF_RANGE, cf.WriteContent(BUF_SIZE_LIMIT, buf+BUF_SIZE_LIMIT, BUF_SIZE_TEST-BUF_SIZE_LIMIT, written));
+
+	verify(written==0);
+}
+
+// Test the situation generate by a crash, and some other corner cases
+subtest TestMultimediaCrash(uni_char *name)
+{
+	MultimediaCacheFile cf;
+	MultimediaCacheFile *cf2=NULL;
+	MultimediaCacheFile *cf3=NULL;
+	MultimediaCacheFileDescriptor *cf3d=NULL;
+	OP_STATUS ops=OpStatus::OK;
+	UINT8 buf[BUF_SIZE_TEST];
+	UINT32 written=0;
+	BYTE bytebuf;
+	OpFileLength read64;
+	UINT32 read;
+	UINT32 i=0;
+
+	verify(SafeInit(cf, name, BUF_SIZE_LIMIT+1, MMCACHE_DEFAULT_MAX_SEGMENTS, FALSE, FALSE, CONSUME_NONE));
+
+	// Try to read an empty file
+	ops=cf.ReadContent(0, &bytebuf, 1, read);
+
+	verify(read==0);
+	verify(ops==OpStatus::ERR_NO_SUCH_RESOURCE);
+
+	for(i=0; i<BUF_SIZE_TEST; i++)
+		buf[i]=(UINT8)i;
+
+	// Write 4 bytes to create a pending segment of 4 bytes
+	verify_success(cf.WriteContent(POSITION_VERYSMALL, buf, BUF_SIZE_VERYSMALL, written));
+
+	verify(written==BUF_SIZE_VERYSMALL);
+
+	// Write the the big segment
+	verify_success(cf.WriteContent(0, buf, BUF_SIZE_LIMIT-BUF_SIZE_VERYSMALL, written));
+
+	verify(written==BUF_SIZE_LIMIT-BUF_SIZE_VERYSMALL);
+
+	verify_success(cf.DebugSimulateCrash());
+
+	// Read after crash
+	cf2=OP_NEW(MultimediaCacheFile, ());
+
+	verify_success(cf2->ConstructFile(name, OPFILE_ABSOLUTE_FOLDER, 0, 255));
+
+	verify(cf2->DebugGetSegmentsCount()==2);
+	verify(cf2->GetMaxSize()==BUF_SIZE_LIMIT+1);
+	verify(cf2->DebugGetNewSegments()==1);
+	verify(cf2->DebugGetDirtySegments()==0);
+
+	// Randomly read 1 byte in 1024 positions
+	for	(UINT32 read_performed=0; read_performed<1024; read_performed++)
+	{
+		UINT32 pos=op_rand() % ((UINT32)(BUF_SIZE_LIMIT-BUF_SIZE_VERYSMALL));
+
+		verify_success(cf2->ReadContent(pos, &bytebuf, 1, read));
+
+		verify(read==1);
+		verify(bytebuf==(UINT8)pos);
+	}
+
+	const UINT8 fill_value = (UINT8)(BUF_SIZE_LIMIT & UCHAR_MAX);
+	bytebuf = fill_value;
+
+	verify_success(cf2->WriteContent(BUF_SIZE_LIMIT, &bytebuf, 1, written));
+	verify(OpStatus::IsError(cf2->WriteContent(BUF_SIZE_LIMIT+1, &bytebuf, 1, written)));
+
+	cf2->IncreaseMaxSize(16);
+	verify_success(cf2->WriteContent(BUF_SIZE_LIMIT+1, &bytebuf, 1, written));
+
+	verify(written==1);
+	verify(cf2->DebugGetSegmentsCount()==3);
+	verify(cf2->GetMaxSize()==BUF_SIZE_LIMIT+17);
+	verify(cf2->DebugGetNewSegments()==1);
+	verify(cf2->DebugGetDirtySegments()==0);
+
+	// Delete (close correctly the file)
+	OP_DELETE(cf2);
+
+	// Reopen and check that everything is now fine
+	cf2=OP_NEW(MultimediaCacheFile, ());
+
+	verify_success(cf2->ConstructFile(name, OPFILE_ABSOLUTE_FOLDER, 0, 255));
+
+	bytebuf=0;
+	verify_success(cf2->ReadContent(BUF_SIZE_LIMIT, &bytebuf, 1, read));
+
+	verify(read==1);
+	verify(bytebuf == fill_value);
+
+	verify(cf2->DebugGetSegmentsCount()==3);
+	verify(cf2->GetMaxSize()==BUF_SIZE_LIMIT+17);
+	verify(cf2->DebugGetNewSegments()==1);
+	verify(cf2->DebugGetDirtySegments()==0);
+
+	OP_DELETE(cf2);
+
+	// Testing the File Descriptor
+	cf3=OP_NEW(MultimediaCacheFile, ());
+
+	verify_success(cf3->ConstructFile(name, OPFILE_ABSOLUTE_FOLDER, 0, 255));
+
+	cf3d=cf3->CreateFileDescriptor(OPFILE_READ | OPFILE_WRITE);
+	verify(cf3d);
+	// Verify that the new size is effective
+	verify(cf3->GetMaxSize()==BUF_SIZE_LIMIT+17);
+
+	// Test the sequential read usind ReadContent()
+	for(i=0; i<BUF_SIZE_LIMIT-BUF_SIZE_VERYSMALL; i++)
+	{
+		verify_success(cf3->ReadContent(i, &bytebuf, 1, read));
+
+		verify(read==1);
+		verify(bytebuf==(UINT8)i);
+	}
+
+	// Test the sequential read usind Read()
+	for(i=0; i<BUF_SIZE_LIMIT-BUF_SIZE_VERYSMALL; i++)
+	{
+		verify_success(cf3d->Read(&bytebuf, 1, NULL));
+
+		verify(bytebuf==(UINT8)i);
+	}
+
+	// Test an "append write"
+	cf3d->SetWritePosition(POSITION_VERYSMALL+100);
+
+	for(i=0; i<15;  i++)
+	{
+		bytebuf=(UINT8)i;
+		verify_success(cf3d->Write(&bytebuf, 1));
+	}
+
+	// Verify multiple reads (skip the first byte)
+	cf3d->SetReadPosition(POSITION_VERYSMALL+100+1);
+
+	for(i=1; i<15;  i++)
+	{
+		verify_success(cf3d->Read(&bytebuf, 1, &read64));
+
+		verify(read64==1);
+		verify(bytebuf==(UINT8)i);
+	}
+
+	OP_DELETE(cf3);
+	OP_DELETE(cf3d);
+}
+
+
+// Test a file (and a segment) over 4GBs
+subtest TestMultimediaBig(uni_char *name)
+{
+	MultimediaCacheFile cf;
+	OpAutoArray<UINT8> buf(OP_NEWA(UINT8, BUF_SIZE_TEST_BIG));
+	OpFileLength total_written=0;
+	const OpFileLength MAXED_OUT = BUF_BIGSIZE_LIMIT - BUF_SIZE_VERYSMALL;
+	UINT32 written=0;
+	UINT32 read=0;
+	UINT8 bytebuf;
+
+	verify(buf.get());
+
+	// Set a big limit
+	verify(SafeInit(cf, name, BUF_BIGSIZE_LIMIT, MMCACHE_DEFAULT_MAX_SEGMENTS, FALSE, FALSE, CONSUME_NONE));
+
+	// Write 4 bytes to create a pending segment of 4 bytes
+	buf[0]=101;
+	buf[1]=102;
+	buf[2]=103;
+	buf[3]=104;
+	verify_success(cf.WriteContent(POSITION_VERYSMALL2, buf.get(), BUF_SIZE_VERYSMALL, written));
+
+	verify(written==BUF_SIZE_VERYSMALL);
+
+	// Write the the big segment
+	for(UINT32 i=0; i<BUF_SIZE_TEST_BIG; i++)
+		buf[i]=(UINT8)i;
+	
+	while(total_written < MAXED_OUT)
+	{
+		verify_success(cf.WriteContent(total_written, buf.get(), BUF_SIZE_TEST_BIG, written));
+
+		verify(written>0);
+		total_written+=written;
+	}
+
+	verify(total_written==BUF_BIGSIZE_LIMIT-BUF_SIZE_VERYSMALL);
+
+	// Randomly read 1 byte in 1024 positions
+	for	(UINT32 read_performed=0; read_performed<1024; read_performed++)
+	{
+		OpFileLength pos=op_rand() % total_written;
+
+		verify_success(cf.ReadContent(pos, &bytebuf, 1, read));
+
+		verify(read==1);
+		verify(bytebuf==(UINT8)pos);
+	}
+
+	// Read at high positions
+	buf[0]=buf[1]=buf[2]=buf[3]=0;
+	cf.ReadContent(POSITION_VERYSMALL2, buf.get(), BUF_SIZE_VERYSMALL, read);
+
+	verify(read==BUF_SIZE_VERYSMALL);
+
+	verify(buf[0]==101);
+	verify(buf[1]==102);
+	verify(buf[2]==103);
+	verify(buf[3]==104);
+
+	cf.CloseAll();
+
+	// Delete the big file
+	verify(SafeDel(name));
+}
+
+// Test the Stream Multimedia Cache
+subtest TestStream(MultimediaCacheFile &cf, BOOL ram)
+{
+	OpAutoArray<UINT8> buf(OP_NEWA(UINT8, BUF_SIZE_MEDIUM));
+	OpAutoArray<UINT8> buf2(OP_NEWA(UINT8, BUF_SIZE_MEDIUM));
+	OpFileLength total_written=0;
+	UINT32 written=0;
+	UINT32 written2=0;
+	UINT32 read=0;
+	UINT32 read2=0;
+	UINT8 bytebuf;
+	UINT32 total_read=0;
+
+	verify(buf.get() && buf2.get());
+
+	// Set a limit not enough for all the content
+	verify(SafeInit(cf, name, BUF_SIZE_MEDIUM/4/*+BUF_SIZE_VERYSMALL*/, MMCACHE_DEFAULT_MAX_SEGMENTS, ram, TRUE, CONSUME_ON_READ));
+	cf.SetEnableEmptySpaceRecover(FALSE);
+
+	// Write 4 bytes to create a pending segment of 4 bytes
+	buf[0]=101;
+	buf[1]=102;
+	buf[2]=103;
+	buf[3]=104;
+	verify_success(cf.WriteContent(POSITION_VERYSMALL2, buf.get(), BUF_SIZE_VERYSMALL, written));
+
+	verify(written==BUF_SIZE_VERYSMALL);
+
+	// cf.ActivateStreaming();
+
+	// Write the the big segment
+	for(UINT32 i=0; i<BUF_SIZE_MEDIUM; i++)
+	{
+		buf[i]=(UINT8)(i+3);
+		buf2[i]=0xFA;
+	}
+
+	while(total_written<BUF_SIZE_MEDIUM)
+	{
+		int write_size=(int)((BUF_SIZE_MEDIUM-total_written)>BUF_SIZE_MEDIUM/3 ? BUF_SIZE_MEDIUM/3 : BUF_SIZE_MEDIUM-total_written);
+
+		verify_success(cf.WriteContent(total_written, buf.get()+total_written, write_size, written));
+
+		verify(written>0);
+
+		// Test that the cache is full
+		verify(OpStatus::IsError(cf.WriteContent(total_written+written, "X",1, written2)));
+
+		// Read, freeing resources
+		total_read=0;
+
+		do
+		{
+			// Read just a chunk of a prime number size, just to try more combinations
+			int read_size=(BUF_SIZE_MEDIUM-total_read)>1097 ? 1097 : BUF_SIZE_MEDIUM-total_read;
+
+			// Read and consume the bytes
+			OP_STATUS ops=cf.ReadContent(total_written+total_read, buf2.get()+total_written+total_read, read_size, read);
+			verify_success(ops);
+			verify(read<=1097);
+			// The content is not expected to be available again (because empty space has been disabled)
+			verify(OpStatus::IsError(cf.ReadContent(total_written+total_read, &bytebuf, 1, read2)));
+
+			total_read+=read;
+		}
+		while(total_read<written && read);
+
+		total_written+=written;
+	}
+
+	verify(total_written==BUF_SIZE_MEDIUM);
+
+	// Verify the content
+	for	(UINT32 cur=0; cur<BUF_SIZE_MEDIUM; cur++)
+	{
+		if(buf[cur]!=buf2[cur])
+			output("Buffers diverge on byte %d: %d vs %d", (UINT32) cur, buf[cur], buf2[cur]);
+
+		verify(buf[cur]==buf2[cur]);
+		verify(buf2[cur]==(UINT8)(cur+3));
+	}
+
+	// Read at high positions
+	// Test invalidated by the auto correction of DeleteContent()
+	/*buf[0]=buf[1]=buf[2]=buf[3]=0;
+	cf.ReadContent(POSITION_VERYSMALL2, buf.get(), BUF_SIZE_VERYSMALL, read);
+
+	verify(read==BUF_SIZE_VERYSMALL);
+
+	verify(buf[0]==101);
+	verify(buf[1]==102);
+	verify(buf[2]==103);
+	verify(buf[3]==104);*/
+
+	cf.CloseAll();
+
+	// Delete the big file
+	verify(SafeDel(name));
+}
+
+// More tests for the Stream Multimedia Cache
+subtest TestStream2(MultimediaCacheFile &cf, BOOL ram)
+{
+	OpAutoArray<UINT8> buf(OP_NEWA(UINT8, BUF_SIZE_TEST));
+	OpAutoArray<UINT8> buf2(OP_NEWA(UINT8, BUF_SIZE_TEST));
+	OpFileLength total_written=0;
+	UINT32 written_fixed=0;
+	UINT32 written_stream=0;
+	UINT32 written_small=0;
+	UINT32 written_new=0;
+	UINT32 read=0;
+	UINT32 read2=0;
+	UINT8 bytebuf;
+	UINT32 total_read=0;
+
+	verify(buf.get() && buf2.get());
+
+	// Set a limit not enough for all the full content
+	verify(SafeInit(cf, name, BUF_SIZE_TEST+4, MMCACHE_DEFAULT_MAX_SEGMENTS, ram, FALSE, CONSUME_NONE));
+	cf.DisableStreaming();
+	
+	// Write 4 bytes to create a pending segment of 4 bytes
+	buf[0]=101;
+	buf[1]=102;
+	buf[2]=103;
+	buf[3]=104;
+	verify_success(cf.WriteContent(POSITION_VERYSMALL2, buf.get(), BUF_SIZE_VERYSMALL, written_small));
+
+	verify(written_small==BUF_SIZE_VERYSMALL);
+
+	// Prepare the main content
+	for(UINT32 i=0; i<BUF_SIZE_TEST; i++)
+	{
+		buf[i]=(UINT8)(i+3);
+		buf2[i]=0xFA;
+	}
+
+	// Occupy some space in the "fixed" segment
+	while(total_written<BUF_SIZE_TEST/2)
+	{
+		verify_success(cf.WriteContent(POSITION_VERYSMALL3+total_written, buf.get()+(UINT32)total_written, (UINT32)(BUF_SIZE_TEST/2-total_written), written_fixed));
+
+		verify(written_fixed>0);
+
+		total_written+=written_fixed;
+	}
+
+	verify(total_written==BUF_SIZE_TEST/2);
+
+	total_written=0;
+
+	// Fill the "stream" segment
+	do
+	{
+		verify_success(cf.WriteContent(total_written, buf.get()+(UINT32)total_written, (UINT32)(BUF_SIZE_TEST/2-total_written), written_stream));
+
+		verify_success(cf.ReadContent(total_written, buf2.get()+total_written, written_stream, read));
+		verify(read==written_stream);
+
+		total_written+=written_stream;
+	}
+	while(total_written<BUF_SIZE_TEST/2 && written_fixed);
+
+	verify(total_written==BUF_SIZE_TEST/2);
+
+	verify(OpStatus::IsError(cf.WriteContent(total_written, buf.get()+total_written, 1, written_stream)));
+	verify(0==written_stream);
+
+	// Switch to stream mode
+	cf.ActivateStreaming(CONSUME_ON_READ);
+	
+	// Read, freeing the stream
+	do
+	{
+		verify_success(cf.ReadContent(total_read, buf2.get()+(UINT32)total_read, (UINT32)(total_written-total_read), read));
+
+		total_read+=read;
+	}
+	while(total_read<total_written && read);
+
+	verify(total_read==total_written);
+
+	// Stream more
+	do
+	{
+		verify_success(cf.WriteContent(total_written, buf.get()+(UINT32)total_written, (UINT32)(BUF_SIZE_TEST-total_written), written_stream));
+
+		verify_success(cf.ReadContent(total_written, buf2.get()+total_written, written_stream, read));
+		verify(read==written_stream);
+
+		// The content is not expected to be available again
+		verify(OpStatus::IsError(cf.ReadContent(total_written, &bytebuf, 1, read2)));
+
+		total_written+=written_stream;
+	}
+	while(total_written<BUF_SIZE_TEST && written_fixed);
+
+	verify(total_written==BUF_SIZE_TEST);
+
+	// Verify the content
+	for	(int cur=0; cur<BUF_SIZE_TEST; cur++)
+	{
+		if(buf[cur]!=buf2[cur])
+			output("Buffers diverge on byte %d: %d vs %d", (UINT32) cur, buf[cur], buf2[cur]);
+
+		verify(buf[cur]==buf2[cur]);
+		verify(buf2[cur]==(UINT8)(cur+3));
+	}
+
+	///// Now the "stream" segment has some space left, but the cache itself is full
+	bytebuf=0xAB;
+	// Test invalidated because Auto corrected by DeleteContent()
+	//verify(OpStatus::IsError(cf.WriteContent(POSITION_VERYSMALL4, &bytebuf, 1, written_new)));
+	//verify(0==written_new);
+	verify_success(cf.WriteContent(total_written, &bytebuf, 1, written_stream));
+	verify(1==written_stream);
+
+	/// Increase the size of the cache by 1
+	cf.IncreaseMaxSize(1);
+
+	cf.SetAutoDeleteContentDuringStream(FALSE);
+
+	// Test that 1 byte can be read, but to write another one, a read is required
+	verify_success(cf.WriteContent(POSITION_VERYSMALL4, &bytebuf, 1, written_new));
+	verify(1==written_new);
+	verify(OpStatus::IsError(cf.WriteContent(POSITION_VERYSMALL4+1, &bytebuf, 1, written_new)));
+	verify(0==written_new);
+	bytebuf=0;
+	verify_success(cf.ReadContent(POSITION_VERYSMALL4, &bytebuf, 1, read));
+	verify(1==read);
+	verify(bytebuf==0xab);
+	bytebuf=0xbc;
+	verify_success(cf.WriteContent(POSITION_VERYSMALL4+1, &bytebuf, 1, written_new));
+	verify(1==written_new);
+	verify(OpStatus::IsError(cf.WriteContent(POSITION_VERYSMALL4+2, &bytebuf, 1, written_new)));
+	verify(0==written_new);
+
+	// Do it Again
+	bytebuf=0;
+	verify_success(cf.ReadContent(POSITION_VERYSMALL4+1, &bytebuf, 1, read));
+	verify(1==read);
+	verify(bytebuf==0xbc);
+	bytebuf=0xcd;
+	verify_success(cf.WriteContent(POSITION_VERYSMALL4+2, &bytebuf, 1, written_new));
+	verify(1==written_new);
+	verify(OpStatus::IsError(cf.WriteContent(POSITION_VERYSMALL4+3, &bytebuf, 1, written_new)));
+	verify(0==written_new);
+
+	// And Again
+	bytebuf=0;
+	verify_success(cf.ReadContent(POSITION_VERYSMALL4+2, &bytebuf, 1, read));
+	verify(1==read);
+	verify(bytebuf==0xcd);
+	bytebuf=0xef;
+	verify_success(cf.WriteContent(POSITION_VERYSMALL4+3, &bytebuf, 1, written_new));
+	verify(1==written_new);
+	verify(OpStatus::IsError(cf.WriteContent(POSITION_VERYSMALL4+4, &bytebuf, 1, written_new)));
+	verify(0==written_new);
+
+	// Verify that the previous segment is still available
+	verify_success(cf.WriteContent(total_written+1, &bytebuf, 1, written_stream));
+	verify(1==written_stream);
+	verify_success(cf.WriteContent(total_written+2, &bytebuf, 1, written_stream));
+	verify(1==written_stream);
+
+	// Verify that a new segment cannot be created (total_written+4 cannot be appended without total_written+3)
+	verify(OpStatus::IsError(cf.WriteContent(total_written+4, &bytebuf, 1, written_stream)));
+	verify(0==written_stream);
+	// total_written+4 is successful after adding also total_written+3
+	verify_success(cf.WriteContent(total_written+3, &bytebuf, 1, written_stream));
+	verify(1==written_stream);
+	verify_success(cf.WriteContent(total_written+4, &bytebuf, 1, written_stream));
+	verify(1==written_stream);
+
+	// Read at high positions
+	buf[0]=buf[1]=buf[2]=buf[3]=0;
+	verify_success(cf.ReadContent(POSITION_VERYSMALL2, buf.get(), BUF_SIZE_VERYSMALL, read));
+
+	verify(read==BUF_SIZE_VERYSMALL);
+
+	verify(buf[0]==101);
+	verify(buf[1]==102);
+	verify(buf[2]==103);
+	verify(buf[3]==104);
+
+	// Verify that a new segment cannot be created
+	verify(OpStatus::IsError(cf.WriteContent(POSITION_VERYSMALL5, &bytebuf, 1, written_new)));
+	verify(0==written_new);
+
+	// Delete all the segments
+	verify(cf.DebugGetSegmentsCount()>0);
+	cf.DeleteContent();
+	verify(cf.DebugGetSegmentsCount()==0);
+
+	// Verify that a new segment can now be created
+	verify_success(cf.WriteContent(POSITION_VERYSMALL5, &bytebuf, 1, written_new));
+	verify(1==written_new);
+
+	// Verify that the previous segments are gone
+	verify(OpStatus::IsError(cf.ReadContent(POSITION_VERYSMALL2, buf.get(), BUF_SIZE_VERYSMALL, read)));
+
+	cf.CloseAll();
+
+	// Delete the file
+	verify(SafeDel(name));
+}
+
+// Streamtest that should not trigger an assert
+subtest TestStream3(MultimediaCacheFile &cf, BOOL ram)
+{
+	const int READ_SIZE = 65536;
+	const int WRITE_SIZE = 128*1024;
+	const int BUFFER_SIZE = 1024*1024;
+	const OpFileLength CONTENT_SIZE = 32*1024*1024;
+
+	OpAutoArray<UINT8> read_buf(OP_NEWA(UINT8, READ_SIZE));
+	OpAutoArray<UINT8> write_buf(OP_NEWA(UINT8, WRITE_SIZE));
+	OpFileLength total_written=0;
+	OpFileLength total_read=0;
+	verify(read_buf.get() && write_buf.get());
+
+	verify(SafeInit(cf, name, BUFFER_SIZE, MMCACHE_DEFAULT_MAX_SEGMENTS, ram, TRUE, CONSUME_ON_READ));
+
+	while (total_written < CONTENT_SIZE)
+	{
+		UINT32 written = 0;
+		UINT32 read = 0;
+
+		// Write almost everything 128k-1097 bytes
+		verify_success(cf.WriteContent(total_written, write_buf.get(), WRITE_SIZE-1097, written));
+		verify(written>0);
+		total_written+=written;
+
+		// Read 16k
+		verify_success(cf.ReadContent(total_read, read_buf.get(), READ_SIZE/4, read));
+		total_read+=read;
+
+		// Write the rest 1097 bytes
+		verify_success(cf.WriteContent(total_written, write_buf.get(), 1097, written));
+		verify(written>0);
+		total_written+=written;
+
+		// Read the remaining parts in 16k chunks
+		do
+		{
+			verify_success(cf.ReadContent(total_read, read_buf.get(), READ_SIZE/4, read));
+			total_read+=read;
+		}
+		while(total_read<total_written && read);
+	}
+
+	verify(total_written==CONTENT_SIZE);
+
+	cf.CloseAll();
+
+	// Delete the big file
+	verify(SafeDel(name));
+}
+
+subtest TestStream4(MultimediaCacheFile &cf, BOOL ram)
+{
+	const int READ_SIZE = 65536;
+	const int WRITE_SIZE = 128*1024;
+	const int BUFFER_SIZE = 1024*1024;
+	const OpFileLength CONTENT_SIZE = 32*1024*1024;
+
+	OpAutoArray<UINT8> read_buf(OP_NEWA(UINT8, READ_SIZE));
+	OpAutoArray<UINT8> write_buf(OP_NEWA(UINT8, WRITE_SIZE));
+	OpFileLength total_written=0;
+	OpFileLength total_read=0;
+
+	verify(read_buf.get() && write_buf.get());
+
+	verify(SafeInit(cf, name, BUFFER_SIZE, MMCACHE_DEFAULT_MAX_SEGMENTS, ram, TRUE, CONSUME_ON_READ));
+
+	while (total_written < CONTENT_SIZE)
+	{
+		UINT32 written = 0;
+		UINT32 read = 0;
+
+		// Write almost everything 128k-16746 bytes
+		verify_success(cf.WriteContent(total_written, write_buf.get(), WRITE_SIZE-16746, written));
+		verify(written==WRITE_SIZE-16746);
+		total_written+=written;
+
+		// Read 112k (Which is slighty more than what has been written) 
+		for (int i = 0; i < 7; i++)
+		{
+			// Read 16k
+			verify_success(cf.ReadContent(total_read, read_buf.get(), READ_SIZE/4, read));
+			verify(read>0);
+			total_read+=read;
+		}
+
+		// Write the rest 16746 bytes
+		verify_success(cf.WriteContent(total_written, write_buf.get(), 16746, written));
+		verify(written==16746);
+		total_written+=written;
+
+		// Read the remaining parts in 16k chunks
+		do
+		{
+			verify_success(cf.ReadContent(total_read, read_buf.get(), READ_SIZE/4, read));
+			verify(read>0);
+			total_read+=read;
+		}
+		while(total_read<total_written && read);
+	}
+
+	verify(total_written==CONTENT_SIZE);
+
+	cf.CloseAll();
+
+	// Delete the big file
+	verify(SafeDel(name));
+}
+
+subtest TestStream5(MultimediaCacheFile &cf, BOOL ram)
+{
+	const OpFileLength WRITE_SIZE = 128*1024;
+	const int BUFFER_SIZE = 1024*1024;
+	const OpFileLength READ_CHUNK = 16*1024;
+	OpAutoArray<UINT8> read_buf(OP_NEWA(UINT8, WRITE_SIZE));
+	OpAutoArray<UINT8> write_buf(OP_NEWA(UINT8, WRITE_SIZE));
+
+	verify(read_buf.get() && write_buf.get());
+
+	verify(SafeInit(cf, name, BUFFER_SIZE, MMCACHE_DEFAULT_MAX_SEGMENTS, ram, TRUE, CONSUME_ON_READ));
+
+	UINT32 written = 0;
+	UINT32 read = 0;
+	UINT32 bytes_read = 0;
+	UINT32 bytes_written = 0;
+	OpFileLength total_written=0;
+	OpFileLength total_read=0;
+
+	BOOL available = FALSE;
+	OpFileLength length = 0;
+
+	for	(UINT32 cur=0; cur<WRITE_SIZE; cur++)
+	{
+		write_buf[cur] = (UINT8)(cur%255 + 1);//1-255
+		read_buf[cur] = 0;
+	}
+
+	// Write big chunk
+	verify_success(cf.WriteContent(total_written+bytes_written, write_buf.get(), WRITE_SIZE-16746, written));
+	verify(written==WRITE_SIZE-16746);
+	bytes_written+=written;
+
+	// Write small chunk
+	verify_success(cf.WriteContent(total_written+bytes_written, write_buf.get()+bytes_written, 16746, written));
+	verify(written==16746);
+	bytes_written+=written;
+
+	// Check that the whole buffer is available
+	MMCacheTest::VerifyPartialCoverage(&cf, total_read+bytes_read, TRUE, WRITE_SIZE);
+
+	// Read 65k 
+	for (int i = 0; i < 4; i++)
+	{
+		verify_success(cf.ReadContent(total_read+bytes_read, read_buf.get()+bytes_read, READ_CHUNK, read));
+		verify(read==READ_CHUNK);
+
+		for (UINT32 r = 0; r < read; r++)
+		{
+			if (read_buf[bytes_read+r] != write_buf[bytes_read+r])
+				output("Buffers diverge on byte %d: %d vs %d\n", (UINT32) bytes_read+r, read_buf[bytes_read+r], write_buf[bytes_read+r]);
+
+			verify(read_buf[bytes_read+r] == write_buf[bytes_read+r]);
+		}
+
+		bytes_read+=read;
+	}
+
+	// Check that there is now 65k left
+	MMCacheTest::VerifyPartialCoverage(&cf, total_read+bytes_read, TRUE, WRITE_SIZE-4*READ_CHUNK);
+
+	// Read 65k 
+	for (int i = 0; i < 4; i++)
+	{
+		verify_success(cf.ReadContent(total_read+bytes_read, read_buf.get()+bytes_read, READ_CHUNK, read));
+		verify(read==READ_CHUNK);
+
+		for (UINT32 r = 0; r < read; r++)
+		{
+			if (read_buf[bytes_read+r] != write_buf[bytes_read+r])
+				output("Buffers diverge on byte %d: %d vs %d\n", (UINT32) bytes_read+r, read_buf[bytes_read+r], write_buf[bytes_read+r]);
+
+			verify(read_buf[bytes_read+r] == write_buf[bytes_read+r]);
+		}
+
+		bytes_read+=read;
+	}
+
+	// Reset counters so that we can begin at the beginning of the buffers again
+	total_written+=bytes_written;
+	total_read+=bytes_read;
+	bytes_written=0;
+	bytes_read=0;
+
+	for	(UINT32 cur=0; cur<WRITE_SIZE; cur++)
+	{
+		write_buf[cur] = (UINT8)(cur%255 + 1);//1-255
+		read_buf[cur] = 0;
+	}
+
+	// Write small chunk
+	verify_success(cf.WriteContent(total_written+bytes_written, write_buf.get(), 16746, written));
+	verify(written==16746);
+	bytes_written+=written;
+
+	// Write big chunk
+	verify_success(cf.WriteContent(total_written+bytes_written, write_buf.get()+bytes_written, WRITE_SIZE-bytes_written, written));
+	verify(written==WRITE_SIZE-16746);
+	bytes_written+=written;
+
+	MMCacheTest::VerifyPartialCoverage(&cf, total_read+bytes_read, TRUE, WRITE_SIZE);
+	
+	// Read 65k 
+	for (int i = 0; i < 4; i++)
+	{
+		verify_success(cf.ReadContent(total_read+bytes_read, read_buf.get()+bytes_read, READ_CHUNK, read));
+		verify(read==READ_CHUNK);
+
+		for (UINT32 r = 0; r < read; r++)
+		{
+			if (read_buf[bytes_read+r] != write_buf[bytes_read+r])
+				output("Buffers diverge on byte %d: %d vs %d\n", (UINT32) bytes_read+r, read_buf[bytes_read+r], write_buf[bytes_read+r]);
+
+			verify(read_buf[bytes_read+r] == write_buf[bytes_read+r]);
+		}
+
+		bytes_read+=read;
+	}
+
+	MMCacheTest::VerifyPartialCoverage(&cf, total_read+bytes_read, TRUE, WRITE_SIZE-4*READ_CHUNK);
+
+	// Read 65k 
+	for (int i = 0; i < 4; i++)
+	{
+		verify_success(cf.ReadContent(total_read+bytes_read, read_buf.get()+bytes_read, READ_CHUNK, read));
+		verify(read==READ_CHUNK);
+
+		for (UINT32 r = 0; r < read; r++)
+		{
+			if (read_buf[bytes_read+r] != write_buf[bytes_read+r])
+				output("Buffers diverge on byte %d: %d vs %d\n", (UINT32) bytes_read+r, read_buf[bytes_read+r], write_buf[bytes_read+r]);
+
+			verify(read_buf[bytes_read+r] == write_buf[bytes_read+r]);
+		}
+
+		bytes_read+=read;
+	}
+
+	// Verify that the read buffer contains the same as the write buffer
+	for	(UINT32 cur=0; cur<WRITE_SIZE; cur++)
+		verify(write_buf[cur] == read_buf[cur]);
+
+	// Check GetPartialCoverage again now that the cache should be empty
+	cf.GetPartialCoverage(total_read+bytes_read, available, length, TRUE);
+	verify(!available); // Nothing should be available
+
+	// Try to read once more now that the cache should be empty
+	verify(OpStatus::IsError(cf.ReadContent(total_read+bytes_read, read_buf.get(), READ_CHUNK, read)));
+	verify(read==0);
+	verify(bytes_written==bytes_read);
+	verify(total_written==total_read);
+
+	cf.CloseAll();
+
+	// Delete the big file
+	verify(SafeDel(name));
+}
+
+subtest TestStream6(MultimediaCacheFile &cf, BOOL ram)
+{
+	const int WRITE_SIZE = 128*1024;
+	const int BUFFER_SIZE = 1024*1024;
+	const int READ_CHUNK = 16*1024;
+	OpAutoArray<UINT8> read_buf(OP_NEWA(UINT8, WRITE_SIZE));
+	OpAutoArray<UINT8> write_buf(OP_NEWA(UINT8, WRITE_SIZE));
+	OpFileLength total_written=0;
+	OpFileLength total_read=0;
+
+	verify(read_buf.get() && write_buf.get());
+
+	verify(SafeInit(cf, name, BUFFER_SIZE, MMCACHE_DEFAULT_MAX_SEGMENTS, ram, TRUE, CONSUME_ON_READ));
+
+	UINT32 written = 0;
+	UINT32 read = 0;
+
+	total_read = total_written;
+	verify_success(cf.WriteContent(total_written, write_buf.get(), 4344, written));
+	verify(written==4344);
+	total_written+=written;
+
+	verify_success(cf.ReadContent(total_read, read_buf.get(), READ_CHUNK, read));
+	verify(read==4344);
+	total_read+=read;
+
+	verify_success(cf.WriteContent(total_written, write_buf.get(), 108176, written));
+	verify(written==108176);
+	total_written+=written;
+
+	cf.CloseAll();
+
+	// Delete the big file
+	verify(SafeDel(name));
+}
+
+subtest TestStream7(MultimediaCacheFile &cf, BOOL ram)
+{
+	const int WRITE_SIZE = 128*1024;
+	const int BUFFER_SIZE = 3000*1024;
+	OpAutoArray<UINT8> read_buf(OP_NEWA(UINT8, WRITE_SIZE));
+	OpAutoArray<UINT8> write_buf(OP_NEWA(UINT8, WRITE_SIZE));
+	OpFileLength total_written=0;
+	OpFileLength total_read=0;
+
+	verify(read_buf.get() && write_buf.get());
+
+	verify(SafeInit(cf, name, BUFFER_SIZE, MMCACHE_DEFAULT_MAX_SEGMENTS, ram, TRUE, CONSUME_ON_READ));
+
+	UINT32 written = 0;
+	UINT32 read = 0;
+
+	while (cf.GetAvailableSpace() > 256*1024)
+	{
+	    //output("Space 1: %d\n", (UINT32)cf.GetAvailableSpace());
+		verify_success(cf.WriteContent(total_written, write_buf.get(), WRITE_SIZE, written));
+		total_written+=written;
+	}
+
+	while (cf.GetAvailableSpace() < BUFFER_SIZE-256*1024)
+	{
+		verify_success(cf.ReadContent(total_read, read_buf.get(), WRITE_SIZE, read));
+		total_read+=read;
+	}
+
+	while (cf.GetAvailableSpace() > 256*1024)
+	{
+	    //output("Space 2: %d\n", (UINT32)cf.GetAvailableSpace());
+		verify_success(cf.WriteContent(total_written, write_buf.get(), WRITE_SIZE, written));
+		total_written+=written;
+	}
+
+	while (cf.GetAvailableSpace() > 1024)
+	{
+	    //output("Space 2: %d\n", (UINT32)cf.GetAvailableSpace());
+		verify_success(cf.WriteContent(total_written, write_buf.get(), 1024, written));
+		total_written+=written;
+	}
+
+	cf.CloseAll();
+
+	// Delete the big file
+	verify(SafeDel(name));
+}
+
+// Linear tests for the Stream Multimedia Cache
+subtest TestStreamLinear(MultimediaCacheFile &cf, BOOL ram)
+{
+	OpAutoArray<UINT8> buf(OP_NEWA(UINT8, LINEAR_BUF));
+	OpAutoArray<UINT8> buf2(OP_NEWA(UINT8, LINEAR_BUF));
+	OpFileLength total_written=0;
+	UINT32 written_stream=0;
+	UINT32 written_new=0;
+	UINT32 read_stream=0;
+	UINT32 read_new=0;
+
+	verify(buf.get() && buf2.get());
+
+	// 1 MB content
+	verify(SafeInit(cf, name, LINEAR_STREAM_WINDOW, MMCACHE_DEFAULT_MAX_SEGMENTS, ram, TRUE, CONSUME_ON_READ));
+
+	// Prepare the main content
+	for(UINT32 i=0; i<LINEAR_BUF; i++)
+	{
+		buf[i]=(UINT8)(i+3);
+		buf2[i]=0xFA;
+	}
+
+	verify(cf.DebugGetSegmentsCount()==0);
+
+	// Simulate the streaming
+	do
+	{
+		// Write LINEAR_STREAM_WINDOW bytes at a time
+		written_stream=0;
+
+		do
+		{
+			verify_success(cf.WriteContent(total_written+written_stream, buf.get()+written_stream%LINEAR_BUF, LINEAR_STREAM_WINDOW-written_stream>LINEAR_BUF?LINEAR_BUF:LINEAR_STREAM_WINDOW-written_stream, written_new));
+			written_stream+=written_new;
+		}
+		while(written_stream<LINEAR_STREAM_WINDOW && written_new);
+
+		// Read LINEAR_STREAM_WINDOW bytes at a time
+		read_stream=0;
+
+		do
+		{
+			UINT32 pos=(UINT32)(read_stream%LINEAR_BUF);
+			UINT32 len=(UINT32)(LINEAR_STREAM_WINDOW-read_stream);
+
+			len=len>LINEAR_BUF-pos ? LINEAR_BUF-pos : len;
+
+			verify_success(cf.ReadContent(total_written+read_stream, buf2.get()+pos, len, read_new));
+			read_stream+=read_new;
+		}
+		while(read_stream<LINEAR_STREAM_WINDOW && read_new);
+
+		verify(read_stream==LINEAR_STREAM_WINDOW);
+		verify(written_stream==LINEAR_STREAM_WINDOW);
+
+	    // Compare the contents
+	    for	(UINT32 cur=0; cur<LINEAR_BUF; cur++)
+		{
+			verify(buf[cur]==buf2[cur]);
+			verify(buf2[cur]==(UINT8)(cur+3));
+		}
+
+		total_written+=written_stream;
+	}
+	while(total_written<LINEAR_FILE_MAX && written_stream);
+
+	verify(cf.DebugGetSegmentsCount()==2);
+
+	verify(total_written==LINEAR_FILE_MAX);
+
+	cf.CloseAll();
+
+	// Delete the file
+	verify(SafeDel(name));
+}
+
+// Try to test different situations of mixed reading and writing
+subtest TestStreamMixed(BOOL ram)
+{
+	MultimediaCacheFile cf;
+
+	OpAutoArray<UINT8> buf(OP_NEWA(UINT8, 64));
+	OpAutoArray<UINT8> buf2(OP_NEWA(UINT8, 64));
+	UINT32 written_new=0;
+	UINT32 read_new=0;
+
+	verify(buf.get() && buf2.get());
+
+	// 16 bytes content
+	verify(SafeInit(cf, name, 16, MMCACHE_DEFAULT_MAX_SEGMENTS, ram, TRUE, CONSUME_ON_READ));
+
+	// Prepare the main content
+	for(UINT32 i=0; i<64; i++)
+	{
+		buf[i]=(UINT8)(i+3);
+		buf2[i]=0xFA;
+	}
+
+	verify(cf.DebugGetSegmentsCount()==0);
+
+	// Fill the buffer
+	verify_success(cf.WriteContent(0, buf.get(), 16, written_new));
+	verify(written_new==16);
+	verify(cf.DebugGetSegmentLength(0)==16);
+	verify(cf.DebugGetSegmentEmptySpace(0)==0);
+
+	verify(cf.DebugGetSegmentContentStart(0)==0);
+
+	verify(cf.DebugGetSegmentsCount()==1);
+
+	// Split the segments: 4(R==Reserve) empty + 12 (M==Main) full
+	verify_success(cf.ReadContent(0, buf2.get(), 4, read_new));
+	verify(read_new==4);
+	verify(cf.DebugGetSegmentsCount()==2);
+	verify(buf2[0]==3); verify(buf2[1]==4); verify(buf2[2]==5); verify(buf2[3]==6);
+	verify(cf.DebugGetSegmentLength(1)==12);
+	verify(cf.DebugGetSegmentEmptySpace(1)==0);
+	verify(cf.DebugGetSegmentLength(0)==0);
+	verify(cf.DebugGetSegmentEmptySpace(0)==4);
+	verify(cf.GetAvailableSpace()==4);
+
+	verify(cf.DebugGetSegmentContentStart(1)==4);
+	verify(cf.DebugGetSegmentContentStart(0)==16);
+
+	// 6(R empty) + 10(M full)
+	verify_success(cf.ReadContent(4, buf2.get(), 2, read_new));
+	verify(read_new==2);
+	verify(cf.DebugGetSegmentsCount()==2);
+	verify(buf2[0]==7); verify(buf2[1]==8);
+	verify(cf.DebugGetSegmentLength(1)==10);
+	verify(cf.DebugGetSegmentEmptySpace(1)==0);
+	verify(cf.DebugGetSegmentLength(0)==0);
+	verify(cf.DebugGetSegmentEmptySpace(0)==6);
+	verify(cf.GetAvailableSpace()==6);
+
+	verify(cf.DebugGetSegmentContentStart(1)==6);
+	verify(cf.DebugGetSegmentContentStart(0)==16);
+
+	// Append 1: 6(R 1+5 empty) + 10 (M full)
+	verify_success(cf.WriteContent(16, buf.get(), 1, written_new));
+	verify(written_new==1);
+
+	verify(cf.DebugGetSegmentsCount()==2);
+	verify(cf.DebugGetSegmentLength(1)==10);
+	verify(cf.DebugGetSegmentEmptySpace(1)==0);
+	verify(cf.DebugGetSegmentLength(0)==1);
+	verify(cf.DebugGetSegmentEmptySpace(0)==5);
+	verify(cf.GetAvailableSpace()==5);
+
+	verify(cf.DebugGetSegmentContentStart(1)==6);
+	verify(cf.DebugGetSegmentContentStart(0)==16);
+
+	// Read all: 6(R 1+5 empty) + 10 (M empty) ==> 0(R) + 16(M 1 + 15 empty)
+	verify_success(cf.ReadContent(6, buf2.get(), 16, read_new));
+	verify(read_new==10);
+	verify(cf.DebugGetSegmentsCount()==2);
+	verify(buf2[0]==9); verify(buf2[1]==10); verify(buf2[2]==11); verify(buf2[3]==12); verify(buf2[4]==13); 
+	verify(buf2[5]==14); verify(buf2[6]==15); verify(buf2[7]==16); verify(buf2[8]==17); verify(buf2[9]==18); 
+
+	verify(cf.DebugGetSegmentLength(1)==1);
+	verify(cf.DebugGetSegmentEmptySpace(1)==15);
+	verify(cf.DebugGetSegmentLength(0)==0);
+	verify(cf.DebugGetSegmentEmptySpace(0)==0);
+	verify(cf.GetAvailableSpace()==15);
+
+	verify(cf.DebugGetSegmentContentStart(1)==16);
+	verify(cf.DebugGetSegmentContentStart(0)==32);
+
+	// Append 4: 0(R empty) + 16 (M 5 + 11 empty)
+	verify_success(cf.WriteContent(17, buf.get(), 4, written_new));
+	verify(written_new==4);
+
+	verify(cf.DebugGetSegmentsCount()==2);
+	verify(cf.DebugGetSegmentLength(1)==5);
+	verify(cf.DebugGetSegmentEmptySpace(1)==11);
+	verify(cf.DebugGetSegmentLength(0)==0);
+	verify(cf.DebugGetSegmentEmptySpace(0)==0);
+	verify(cf.GetAvailableSpace()==11);
+
+	verify(cf.DebugGetSegmentContentStart(1)==16);
+	verify(cf.DebugGetSegmentContentStart(0)==32);
+
+	// Read 4: 4(R 4 empty) + 12 (M 1 + 11 empty)
+	verify_success(cf.ReadContent(16, buf2.get(), 4, read_new));
+	verify(read_new==4);
+	verify(cf.DebugGetSegmentsCount()==2);
+	verify(buf2[0]==3); verify(buf2[1]==3); verify(buf2[2]==4); verify(buf2[3]==5);
+
+	verify(cf.DebugGetSegmentsCount()==2);
+	verify(cf.DebugGetSegmentLength(1)==1);
+	verify(cf.DebugGetSegmentEmptySpace(1)==11);
+	verify(cf.DebugGetSegmentLength(0)==0);
+	verify(cf.DebugGetSegmentEmptySpace(0)==4);
+	verify(cf.GetAvailableSpace()==15);
+
+	verify(cf.DebugGetSegmentContentStart(1)==20);
+	verify(cf.DebugGetSegmentContentStart(0)==32);
+
+	// Read 1: 5(R 5 empty) + 11 (M empty) ==> 0(R) + 16(M empty)
+	verify_success(cf.ReadContent(20, buf2.get(), 1, read_new));
+	verify(read_new==1);
+	verify(cf.DebugGetSegmentsCount()==2);
+	verify(buf2[0]==6);
+
+	verify(cf.DebugGetSegmentsCount()==2);
+	verify(cf.DebugGetSegmentLength(1)==0);
+	verify(cf.DebugGetSegmentEmptySpace(1)==16);
+	verify(cf.DebugGetSegmentLength(0)==0);
+	verify(cf.DebugGetSegmentEmptySpace(0)==0);
+	verify(cf.GetAvailableSpace()==16);
+
+	verify(cf.DebugGetSegmentContentStart(1)==21);
+	verify(cf.DebugGetSegmentContentStart(0)==37);
+
+	verify(cf.DebugGetSegmentsCount()==2);
+
+	cf.CloseAll();
+
+	// Delete the file
+	verify(SafeDel(name));
+}
+
+// Try to test different situations of mixed reading and writing
+subtest TestStreamMixed2(BOOL ram)
+{
+	MultimediaCacheFile cf;
+
+	OpAutoArray<UINT8> buf(OP_NEWA(UINT8, 64));
+	OpAutoArray<UINT8> buf2(OP_NEWA(UINT8, 64));
+	UINT32 written_new=0;
+	UINT32 read_new=0;
+
+	verify(buf.get() && buf2.get());
+
+	// 16 bytes content
+	verify(SafeInit(cf, name, 16, MMCACHE_DEFAULT_MAX_SEGMENTS, ram, TRUE, CONSUME_ON_READ));
+
+	// Prepare the main content
+	for(UINT32 i=0; i<64; i++)
+	{
+		buf[i]=(UINT8)(i+3);
+		buf2[i]=0xFA;
+	}
+
+	verify(cf.DebugGetSegmentsCount()==0);
+
+	// Fill part of the buffer
+	verify_success(cf.WriteContent(0, buf.get(), 10, written_new));
+	verify(written_new==10);
+	verify(cf.DebugGetSegmentLength(0)==10);
+	verify(cf.DebugGetSegmentEmptySpace(0)==6);
+	verify(cf.GetAvailableSpace()==6);
+
+	verify(cf.DebugGetSegmentContentStart(0)==0);
+
+	verify(cf.DebugGetSegmentsCount()==1);
+
+	// Split the segments: 4(R==Reserve) empty + 6 (M==Main 6 Full + 6 empty) full
+	verify_success(cf.ReadContent(0, buf2.get(), 4, read_new));
+	verify(read_new==4);
+	verify(cf.DebugGetSegmentsCount()==2);
+	verify(buf2[0]==3); verify(buf2[1]==4); verify(buf2[2]==5); verify(buf2[3]==6);
+	verify(cf.DebugGetSegmentLength(1)==6);
+	verify(cf.DebugGetSegmentEmptySpace(1)==6);
+	verify(cf.DebugGetSegmentLength(0)==0);
+	verify(cf.DebugGetSegmentEmptySpace(0)==4);
+	verify(cf.GetAvailableSpace()==10);
+
+	verify(cf.DebugGetSegmentContentStart(1)==4);
+	verify(cf.DebugGetSegmentContentStart(0)==16);
+
+	// 4(R full) + 12(M full)
+	verify_success(cf.WriteContent(10, buf.get(), 12, written_new));
+	verify(written_new==10);
+	verify(cf.DebugGetSegmentsCount()==2);
+	verify(cf.DebugGetSegmentLength(1)==12);
+	verify(cf.DebugGetSegmentEmptySpace(1)==0);
+	verify(cf.DebugGetSegmentLength(0)==4);
+	verify(cf.DebugGetSegmentEmptySpace(0)==0);
+	verify(cf.GetAvailableSpace()==0);
+
+	verify(cf.DebugGetSegmentContentStart(1)==4);
+	verify(cf.DebugGetSegmentContentStart(0)==16);
+
+	verify(cf.DebugGetSegmentsCount()==2);
+
+	cf.CloseAll();
+
+	// Delete the file
+	verify(SafeDel(name));
+}
+
+
+// Test the limit in the number of segments
+subtest TestMultimediaSegmentLimits(uni_char *name, UINT16 num_segments, BOOL ram)
+{
+	MultimediaCacheFile cf;
+	UINT32 written=0;
+	// UINT32 read=0;
+	UINT8 bytebuf;
+	OP_STATUS ops;
+
+	verify(SafeInit(cf, name, 1024*1024, num_segments, ram, FALSE, CONSUME_NONE));
+
+	// Fill the segments
+	for(int i=0; i<num_segments; i++)
+	{
+		bytebuf=(UINT8)i;
+		ops=cf.WriteContent(i*2, &bytebuf, 1, written);
+
+		verify(OpStatus::IsSuccess(ops));
+		verify(written==1);
+
+		verify(cf.DebugGetSegmentsCount()==i+1);
+	}
+
+	ops=cf.WriteContent(num_segments*2, &bytebuf, 1, written);
+
+	verify(ops==OpStatus::ERR_NOT_SUPPORTED);		
+	verify(written==0);
+
+	verify(cf.DebugGetSegmentsCount()==num_segments);
+}
+
+// Test skipping bytes in the master segment
+subtest TestStreamSkip(MultimediaCacheFile &cf, BOOL ram, BOOL consume_on_write)
+{
+	const int WRITE_SIZE = 128*1024;
+	const int BUFFER_SIZE = 1024*1024;
+	OpAutoArray<UINT8> read_buf(OP_NEWA(UINT8, WRITE_SIZE));
+	OpAutoArray<UINT8> write_buf(OP_NEWA(UINT8, WRITE_SIZE));
+
+	verify(read_buf.get() && write_buf.get());
+
+	verify(SafeInit(cf, name, BUFFER_SIZE, MMCACHE_DEFAULT_MAX_SEGMENTS, ram, TRUE, (consume_on_write) ? CONSUME_ON_WRITE : CONSUME_ON_READ));
+
+	UINT32 written = 0;
+	UINT32 read = 0;
+
+	// Prepare the main content
+	for(UINT32 i=0; i<65536; i++)
+	{
+		write_buf.get()[i]=(UINT8)(i+7);
+	}
+
+	// Write some data to offset=0
+	verify_success(cf.WriteContent(0, write_buf.get(), 65536, written));
+	verify(written==65536);
+
+	MMCacheTest::VerifyPartialCoverage(&cf, 2048, TRUE, 65536-2048);
+	
+	MMCacheTest::VerifyPartialCoverage(&cf, 0, TRUE, 65536);
+
+	// Read data but skip the first 2048 bytes
+	verify_success(cf.ReadContent(2048, read_buf.get(), 16384, read));
+	verify(read==16384);
+
+	MMCacheTest::VerifyPartialCoverage(&cf, 16384+2048, TRUE, 65536-16384-2048);
+	
+	MMCacheTest::VerifyPartialCoverage(&cf, 0, TRUE, 65536);
+	
+	cf.SetEnableEmptySpaceRecover(FALSE);
+	
+	if(consume_on_write)
+		MMCacheTest::VerifyPartialCoverage(&cf, 0, TRUE, 65536);
+	else
+		MMCacheTest::VerifyPartialCoverage(&cf, 0, FALSE, 16384+2048);
+	
+	cf.SetEnableEmptySpaceRecover(TRUE);
+	
+	MMCacheTest::VerifyPartialCoverage(&cf, 0, TRUE, 65536);
+	
+	// Check
+	for(UINT32 i=0; i<16384; i++)
+	{
+		verify(read_buf.get()[i]==(UINT8)(i+7));
+		verify(read_buf.get()[i]==write_buf.get()[i]);
+	}
+
+	cf.CloseAll();
+
+	// Delete the big file
+	verify(SafeDel(name));
+}
+
+// Test skipping bytes in the reserve segment (which needs to consume also the master to avoid problems)
+subtest TestStreamSkipReserve(MultimediaCacheFile &cf, BOOL ram, BOOL consume_on_write)
+{
+	const int WRITE_SIZE = 128*1024;
+	const int BUFFER_SIZE = 64*1024;
+	OpAutoArray<UINT8> read_buf(OP_NEWA(UINT8, WRITE_SIZE));
+	OpAutoArray<UINT8> write_buf(OP_NEWA(UINT8, WRITE_SIZE));
+	ConsumePolicy consume_policy=(consume_on_write) ? CONSUME_ON_WRITE : CONSUME_ON_READ;
+
+	if(!read_buf.get() || !write_buf.get())
+		return OpStatus::ERR_NO_MEMORY;
+
+	SafeInit(cf, name, BUFFER_SIZE, MMCACHE_DEFAULT_MAX_SEGMENTS, ram, TRUE, consume_policy);
+	
+	UINT32 written = 0;
+	UINT32 read = 0;
+	
+	// Prepare the main content
+	for(UINT32 i=0; i<65536; i++)
+		write_buf.get()[i]=(UINT8)(i+7);
+
+	// Fill the buffer
+	verify_success(cf.WriteContent(0, write_buf.get(), 65536, written));
+	verify(written==65536);
+	
+	// Remove auto consume to test that it is really full
+	cf.ActivateStreaming(CONSUME_NONE);
+	
+	verify(OpStatus::IsError(cf.WriteContent(65536, write_buf.get(), 65536, written)));
+	verify(written==0);
+	
+	cf.ActivateStreaming(consume_policy);
+
+	// Read data but skip the first 8192 bytes.
+	// In reality we only want to create space for an additional write, but some additional stress is always good
+	verify_success(cf.ReadContent(8192, read_buf.get(), 8192, read));
+	verify(read==8192);
+	
+	// Verify the situation before writing in the reserve
+	cf.SetEnableEmptySpaceRecover(FALSE);
+	
+	if(consume_on_write)
+		MMCacheTest::VerifyPartialCoverage(&cf, 0, TRUE, 65536);
+	else
+		MMCacheTest::VerifyPartialCoverage(&cf, 0, FALSE, 16384);
+	
+	cf.SetEnableEmptySpaceRecover(TRUE);
+	MMCacheTest::VerifyPartialCoverage(&cf, 0, TRUE, 65536);
+	
+	// Write in the reserve segment
+	verify_success(cf.WriteContent(65536, write_buf.get(), 4096, written));
+	verify(written==4096);
+	
+	// Verify the situation after writing in the reserve
+	MMCacheTest::VerifyPartialCoverage(&cf, 0, FALSE, 4096);
+	
+	cf.SetEnableEmptySpaceRecover(FALSE);
+	
+	if(consume_on_write)
+		MMCacheTest::VerifyPartialCoverage(&cf, 4096, TRUE, 65536);
+	else
+		MMCacheTest::VerifyPartialCoverage(&cf, 4096, FALSE, 16384-4096);
+	
+	cf.SetEnableEmptySpaceRecover(TRUE);
+	MMCacheTest::VerifyPartialCoverage(&cf, 4096, TRUE, 65536);
+	
+	// Read in the reserve segment: on "consume on read", a bug was causing the creation of a third segment, popping asserts everywhere
+	verify_success(cf.ReadContent(65536+16, read_buf.get(), 32, read));
+	verify(read==32);
+	
+	// Verify the situation after the reading
+	if(consume_on_write)
+		MMCacheTest::VerifyPartialCoverage(&cf, 4096, TRUE, 65536);
+	else
+		MMCacheTest::VerifyPartialCoverage(&cf, 0, FALSE, 65536);
+	
+	cf.SetEnableEmptySpaceRecover(FALSE);
+	
+	if(consume_on_write)
+		MMCacheTest::VerifyPartialCoverage(&cf, 4096, TRUE, 65536);
+	else
+		MMCacheTest::VerifyPartialCoverage(&cf, 0, FALSE, 65536+16);
+	
+	cf.SetEnableEmptySpaceRecover(TRUE);
+	
+	if(consume_on_write)
+		MMCacheTest::VerifyPartialCoverage(&cf, 4096, TRUE, 65536);
+	else
+		MMCacheTest::VerifyPartialCoverage(&cf, 0, FALSE, 65536);
+
+	cf.CloseAll();
+	
+	// Delete the big file
+	SafeDel(name);
+	
+	return OpStatus::OK;
+}
+
+// Check that the streaming cache can access older content (when it is still available)
+subtest TestStreamPrefetch(MultimediaCacheFile &cf, BOOL ram, BOOL consume_on_write)
+{
+	const int WRITE_SIZE = 128*1024;
+	const int BUFFER_SIZE = 1024*1024;
+	OpAutoArray<UINT8> read_buf(OP_NEWA(UINT8, WRITE_SIZE));
+	OpAutoArray<UINT8> write_buf(OP_NEWA(UINT8, WRITE_SIZE));
+
+	if(!read_buf.get() || !write_buf.get())
+		return OpStatus::ERR_NO_MEMORY;
+
+	SafeInit(cf, name, BUFFER_SIZE, MMCACHE_DEFAULT_MAX_SEGMENTS, ram, TRUE, (consume_on_write) ? CONSUME_ON_WRITE : CONSUME_ON_READ);
+	
+	UINT32 written = 0;
+	
+	// Check when empty
+	MMCacheTest::VerifyPartialCoverage(&cf, 0, FALSE, 0);
+	MMCacheTest::ReadAndVerifyContent(&cf, 0, 1, FILE_LENGTH_NONE, read_buf.get(), write_buf.get());
+	
+	// Prepare the main content
+	for(UINT32 i=0; i<65536; i++)
+		write_buf.get()[i]=(UINT8)(i+7);
+
+	// Write some data to offset=0
+	verify_success(cf.WriteContent(0, write_buf.get(), 65536, written));
+	verify(written==65536);
+
+	// Verify GetPartialCoverage 
+	MMCacheTest::VerifyPartialCoverage(&cf, 2048, TRUE, 65536-2048);
+
+	// Read 2KB
+	MMCacheTest::ReadAndVerifyContent(&cf, 0, 2048, 2048, read_buf.get(), write_buf.get());
+	
+	MMCacheTest::VerifyPartialCoverage(&cf, 2048, TRUE, 65536-2048);
+	MMCacheTest::VerifyPartialCoverage(&cf, 0, TRUE, 65536);
+	MMCacheTest::VerifyPartialCoverage(&cf, 1024, TRUE, 65536-1024);
+	
+	// Checkt he flag
+	cf.SetEnableEmptySpaceRecover(FALSE);
+	if(consume_on_write)
+		MMCacheTest::VerifyPartialCoverage(&cf, 0, TRUE, 65536);
+	else
+		MMCacheTest::VerifyPartialCoverage(&cf, 0, FALSE, 2048);
+	
+	cf.SetEnableEmptySpaceRecover(TRUE);
+	MMCacheTest::VerifyPartialCoverage(&cf, 0, TRUE, 65536);
+	
+	// Re Read
+	MMCacheTest::ReadAndVerifyContent(&cf, 0, 2048, 2048, read_buf.get(), write_buf.get());
+	
+	// Re Read - check segment border
+	if(consume_on_write)
+		MMCacheTest::ReadAndVerifyContent(&cf, 0, 4096, 4096, read_buf.get(), write_buf.get());
+	else
+		MMCacheTest::ReadAndVerifyContent(&cf, 0, 4096, 2048, read_buf.get(), write_buf.get());
+	
+	// Read across segment border (via File Descriptor), with flag testing
+	MultimediaCacheFileDescriptor *cfd=cf.CreateFileDescriptor(OPFILE_READ);
+	
+	cf.SetEnableEmptySpaceRecover(FALSE);
+	if(consume_on_write)
+		MMCacheTest::ReadFromFileAndVerifyContent(cfd, 0, 4096, 4096, read_buf.get(), write_buf.get());
+	else
+		MMCacheTest::ReadFromFileAndVerifyContent(cfd, 0, 4096, 0, read_buf.get(), write_buf.get());
+		
+	cf.SetEnableEmptySpaceRecover(TRUE);
+	MMCacheTest::ReadFromFileAndVerifyContent(cfd, 0, 4096, 4096, read_buf.get(), write_buf.get());
+
+	OP_DELETE(cfd);
+	
+	MMCacheTest::VerifyPartialCoverage(&cf, 2048, TRUE, 65536-2048);
+	
+	/////////////////////// SEEK TEST ///////////////////////////////////////////
+	// Write some data after a gap, to force data out and test a "seek" operation
+	verify_success(cf.WriteContent(BUFFER_SIZE+65536, write_buf.get(), 1024, written));
+	verify(written==1024);
+	
+	// Check that there are not data available before, but only on the range specified
+	MMCacheTest::VerifyPartialCoverage(&cf, BUFFER_SIZE+65536, TRUE, 1024);
+	MMCacheTest::VerifyPartialCoverage(&cf, BUFFER_SIZE+65535, FALSE, 1);
+	
+	// Read. Warning: reading the whole content, will cause a "blackout"...
+	MMCacheTest::ReadAndVerifyContent(&cf, BUFFER_SIZE+65536, 1023, 1023, read_buf.get(), write_buf.get());
+	
+	MMCacheTest::VerifyPartialCoverage(&cf, BUFFER_SIZE+65536, TRUE, 1024);
+	MMCacheTest::VerifyPartialCoverage(&cf, BUFFER_SIZE+65535, FALSE, 1);
+	
+	cf.SetEnableEmptySpaceRecover(FALSE);
+	if(consume_on_write)
+		MMCacheTest::VerifyPartialCoverage(&cf, BUFFER_SIZE+65535, FALSE, 1);
+	else
+		MMCacheTest::VerifyPartialCoverage(&cf, BUFFER_SIZE+65535, FALSE, 1024);
+	
+	cf.SetEnableEmptySpaceRecover(TRUE);
+	MMCacheTest::VerifyPartialCoverage(&cf, BUFFER_SIZE+65535, FALSE, 1);
+	
+	// Re Read
+	MMCacheTest::ReadAndVerifyContent(&cf, BUFFER_SIZE+65536, 1023, 1023, read_buf.get(), write_buf.get());
+
+	cf.CloseAll();
+	
+	// Delete the big file
+	SafeDel(name);
+	
+	return OpStatus::OK;
+}
+
+// Check that the streaming cache can access older content (when it is still available)
+subtest TestStreamPrefetch2(MultimediaCacheFile &cf, BOOL ram, BOOL consume_on_write)
+{
+	const int WRITE_SIZE = 16;
+	OpAutoArray<UINT8> read_buf(OP_NEWA(UINT8, WRITE_SIZE));
+	OpAutoArray<UINT8> write_buf(OP_NEWA(UINT8, WRITE_SIZE));
+
+	if(!read_buf.get() || !write_buf.get())
+		return OpStatus::ERR_NO_MEMORY;
+
+	SafeInit(cf, name, WRITE_SIZE, MMCACHE_DEFAULT_MAX_SEGMENTS, ram, TRUE, (consume_on_write) ? CONSUME_ON_WRITE : CONSUME_ON_READ);
+	
+	UINT32 written = 0;
+	
+	// Prepare the main content
+	for(UINT32 i=0; i<16; i++)
+		write_buf.get()[i]=(UINT8)(i+7);
+
+	// Write some data to offset=1024
+	verify_success(cf.WriteContent(1024, write_buf.get(), 16, written));
+	verify(written==16);
+
+	// Verify GetPartialCoverage 
+	MMCacheTest::VerifyPartialCoverage(&cf, 1024, TRUE, 16);
+	MMCacheTest::VerifyPartialCoverage(&cf, 1023, FALSE, 1);
+
+	// Read 12 bytes
+	MMCacheTest::ReadAndVerifyContent(&cf, 1024, 12, 12, read_buf.get(), write_buf.get());
+	
+	// Re Read. At this point, the reserve has 12 bytes
+	MMCacheTest::ReadAndVerifyContent(&cf, 1024, 12, 12, read_buf.get(), write_buf.get());
+	
+	// Write 4 bytes
+	verify_success(cf.WriteContent(1024+16, write_buf.get()+16, 4, written));
+	verify(written==4);
+	
+	///// At this point, the reserve segment has 4 bytes occupied and 8 free, with old content
+	// 8 bytes in the reserve
+	MMCacheTest::ReadAndVerifyContent(&cf, 1024+4, 8, 8, read_buf.get(), write_buf.get()+4);
+	// 9 bytes in the reserve: not available
+	MMCacheTest::ReadAndVerifyContent(&cf, 1024+3, 1, FILE_LENGTH_NONE, read_buf.get(), write_buf.get()+3);
+	// 3 bytes in the master segment
+	MMCacheTest::ReadAndVerifyContent(&cf, 1024+12, 3, 3, read_buf.get(), write_buf.get()+12);
+	// 11 bytes in the reserve
+	MMCacheTest::ReadAndVerifyContent(&cf, 1024+4, 11, 11, read_buf.get(), write_buf.get()+4);
+	// last byte in the master segment
+	MMCacheTest::ReadAndVerifyContent(&cf, 1024+15, 1, 1, read_buf.get(), write_buf.get()+15);
+	// 11 bytes in the reserve (does not work for limitations in the algorithm)
+	// MMCacheTest::ReadAndVerifyContent(&cf, 1024+4, 11, 11, read_buf.get(), write_buf.get()+4);
+	// 3 bytes in the reserve segment
+	MMCacheTest::ReadAndVerifyContent(&cf, 1024+16, 3, 3, read_buf.get(), write_buf.get()+16);
+	// last byte in the reserve segment
+	MMCacheTest::ReadAndVerifyContent(&cf, 1024+19, 1, 1, read_buf.get(), write_buf.get()+19);
+	// 15 bytes in the reserve (does not work for limitations in the algorithm)
+	// MMCacheTest::ReadAndVerifyContent(&cf, 1024+4, 15, 15, read_buf.get(), write_buf.get()+4);
+	// 16 bytes in the reserve (does not work for limitations in the algorithm)
+	// MMCacheTest::ReadAndVerifyContent(&cf, 1024+4, 16, 16, read_buf.get(), write_buf.get()+4);
+	
+	// Fill the cache
+	verify_success(cf.WriteContent(2048, write_buf.get(), 16, written));
+	verify(written==16);
+	
+	// Verify that nothing can be read before the segment
+	MMCacheTest::ReadAndVerifyContent(&cf, 2048-1, 1, FILE_LENGTH_NONE, read_buf.get(), write_buf.get());
+	
+	// Check that partial coverage works for bytes not available (no empty space involved)
+	MMCacheTest::VerifyPartialCoverage(&cf, 2048-10, FALSE, 10);
+	cf.SetEnableEmptySpaceRecover(FALSE);
+	MMCacheTest::VerifyPartialCoverage(&cf, 2048-10, FALSE, 10);
+	cf.SetEnableEmptySpaceRecover(TRUE);
+	MMCacheTest::VerifyPartialCoverage(&cf, 2048-10, FALSE, 10);
+	
+	// Read 3 bytes, skipping 5
+	MMCacheTest::ReadAndVerifyContent(&cf, 2048+5, 3, 3, read_buf.get(), write_buf.get()+5);
+
+	cf.SetEnableEmptySpaceRecover(FALSE);
+	if(consume_on_write)
+		MMCacheTest::ReadAndVerifyContent(&cf, 2048, 8, 8, read_buf.get(), write_buf.get());
+	else
+		MMCacheTest::ReadAndVerifyContent(&cf, 2048, 8, FILE_LENGTH_NONE, read_buf.get(), write_buf.get());
+	
+	cf.SetEnableEmptySpaceRecover(TRUE);
+	MMCacheTest::ReadAndVerifyContent(&cf, 2048, 8, 8, read_buf.get(), write_buf.get());
+	
+	// Check that partial coverage works for bytes available but not in empty space
+	MMCacheTest::VerifyPartialCoverage(&cf, 2048+8, TRUE, 8);
+	
+	// Check that partial coverage works for bytes available but in empty space
+	MMCacheTest::VerifyPartialCoverage(&cf, 2048, TRUE, 16);
+
+	// Check that partial coverage works for bytes not available, before empty space
+	MMCacheTest::VerifyPartialCoverage(&cf, 2048-10, FALSE, 10);
+	
+	cf.SetEnableEmptySpaceRecover(FALSE);
+	if(consume_on_write)
+		MMCacheTest::VerifyPartialCoverage(&cf, 2048-10, FALSE, 10);
+	else
+		MMCacheTest::VerifyPartialCoverage(&cf, 2048-10, FALSE, 18);
+	
+	cf.SetEnableEmptySpaceRecover(TRUE);
+	MMCacheTest::VerifyPartialCoverage(&cf, 2048-10, FALSE, 10);
+	
+	cf.CloseAll();
+	
+	// Delete the big file
+	SafeDel(name);
+	
+	return OpStatus::OK;
+}
+
+
+test("Multimedia Cache Stream PreFetch - ConsumeOnRead")
+timer;
+{
+	MultimediaCacheFile cf;
+	
+	TestStreamPrefetch(cf, FALSE, FALSE);
+	
+	verify(cf.IsStreaming());
+	verify(!cf.IsInRAM());
+}
+
+test("Multimedia Cache Stream PreFetch - RAM - ConsumeOnRead")
+timer;
+{
+	MultimediaCacheFile cf;
+	
+	TestStreamPrefetch(cf, TRUE, FALSE);
+	
+	verify(cf.IsStreaming());
+	verify(cf.IsInRAM());
+}
+
+test("Multimedia Cache Stream PreFetch 2 - ConsumeOnRead")
+timer;
+{
+	MultimediaCacheFile cf;
+	
+	TestStreamPrefetch2(cf, FALSE, FALSE);
+	
+	verify(cf.IsStreaming());
+	verify(!cf.IsInRAM());
+}
+
+test("Multimedia Cache Stream PreFetch 2 - RAM - ConsumeOnRead")
+timer;
+{
+	MultimediaCacheFile cf;
+	
+	TestStreamPrefetch2(cf, TRUE, FALSE);
+	
+	verify(cf.IsStreaming());
+	verify(cf.IsInRAM());
+}
+
+test("Stream Skip - ConsumeOnRead")
+timer;
+{
+	MultimediaCacheFile cf;
+
+	TestStreamSkip(cf, FALSE, FALSE);
+}
+
+test("Stream Skip - RAM - ConsumeOnRead")
+timer;
+{
+	MultimediaCacheFile cf;
+
+	TestStreamSkip(cf, TRUE, FALSE);
+}
+
+test("Stream Skip Reserve - ConsumeOnRead")
+timer;
+{
+	MultimediaCacheFile cf;
+
+	TestStreamSkipReserve(cf, FALSE, FALSE);
+}
+
+test("Stream Skip Reserve - RAM - ConsumeOnRead")
+timer;
+{
+	MultimediaCacheFile cf;
+
+	TestStreamSkipReserve(cf, TRUE, FALSE);
+}
+
+test("Multimedia Cache Stream PreFetch - ConsumeOnWrite")
+timer;
+{
+	MultimediaCacheFile cf;
+	
+	TestStreamPrefetch(cf, FALSE, TRUE);
+	
+	verify(cf.IsStreaming());
+	verify(!cf.IsInRAM());
+}
+
+test("Multimedia Cache Stream PreFetch - RAM - ConsumeOnWrite")
+timer;
+{
+	MultimediaCacheFile cf;
+	
+	TestStreamPrefetch(cf, TRUE, TRUE);
+	
+	verify(cf.IsStreaming());
+	verify(cf.IsInRAM());
+}
+
+test("Multimedia Cache Stream PreFetch 2 - ConsumeOnWrite")
+timer;
+{
+	MultimediaCacheFile cf;
+	
+	TestStreamPrefetch2(cf, FALSE, TRUE);
+	
+	verify(cf.IsStreaming());
+	verify(!cf.IsInRAM());
+}
+
+test("Multimedia Cache Stream PreFetch 2 - RAM - ConsumeOnWrite")
+timer;
+{
+	MultimediaCacheFile cf;
+	
+	TestStreamPrefetch2(cf, TRUE, TRUE);
+	
+	verify(cf.IsStreaming());
+	verify(cf.IsInRAM());
+}
+
+test("Stream Skip - ConsumeOnWrite")
+timer;
+{
+	MultimediaCacheFile cf;
+
+	TestStreamSkip(cf, FALSE, TRUE);
+}
+
+test("Stream Skip - RAM - ConsumeOnWrite")
+timer;
+{
+	MultimediaCacheFile cf;
+
+	TestStreamSkip(cf, TRUE, TRUE);
+}
+
+test("Stream Skip Reserve- ConsumeOnWrite")
+timer;
+{
+	MultimediaCacheFile cf;
+
+	TestStreamSkipReserve(cf, FALSE, TRUE);
+}
+
+test("Stream Skip Reserve- RAM - ConsumeOnWrite")
+timer;
+{
+	MultimediaCacheFile cf;
+
+	TestStreamSkipReserve(cf, TRUE, TRUE);
+}
+
+test("segment logic - 3 segments")
+{
+	verify(TestSegmentsLogic(3));
+}
+
+test("segment logic - 64 segments")
+{
+	verify(TestSegmentsLogic(64));
+}
+
+/// Test the logic of the segments, above all the coverage
+test("PartialCoverage Improved")
+{
+	MultimediaCacheFile cf;
+	OpVector<MultimediaSegment> ms;
+	BOOL available;
+	OpFileLength length;
+	OpAutoVector<StorageSegment> segs;
+	
+	cf.GetMissingCoverage(segs, 0, FILE_LENGTH_NONE);
+	verify(segs.GetCount()==0);
+	
+	// Add 3 ordered segments
+	verify_success(cf.DebugAddSegment(OP_NEW(MultimediaSegment, (MMCACHE_HEADER_SIZE, 1000, 100, 0))));
+	verify_success(cf.DebugAddSegment(OP_NEW(MultimediaSegment, (MMCACHE_HEADER_SIZE, 1100, 150, 0))));
+	verify_success(cf.DebugAddSegment(OP_NEW(MultimediaSegment, (MMCACHE_HEADER_SIZE, 1250, 200, 0))));
+	
+	ms_unsorted.DeleteAll();
+	ms_sorted.DeleteAll();
+	
+	// Check unsorted
+	verify_success(cf.GetUnsortedCoverage(ms_unsorted));
+	verify_success(cf.GetSortedCoverage(ms_sorted));
+	
+	verify(ms_unsorted.GetCount()==3);
+	verify(ms_sorted.GetCount()==1);
+	
+	// Check coverage in mutiple segments
+	cf.GetPartialCoverage(1050, available, length, TRUE);
+	
+	verify(length==400);
+	verify(available);
+	// Check coverage of the single segment
+	cf.GetPartialCoverage(1050, available, length, FALSE);
+	
+	verify(length==50);
+	verify(available);
+	
+	// Check missing segments
+	cf.GetMissingCoverage(segs, 1000, 450);
+	verify(segs.GetCount()==0);
+	
+	segs.DeleteAll();
+	cf.GetMissingCoverage(segs, 0, 1500);
+	verify(segs.GetCount()==2);
+	verify(segs.Get(0)->content_start==0);
+	verify(segs.Get(0)->content_length==1000);
+	verify(segs.Get(1)->content_start==1450);
+	verify(segs.Get(1)->content_length==50);
+	
+	// More checks
+	verify_success(cf.DebugAddSegment(OP_NEW(MultimediaSegment, (MMCACHE_HEADER_SIZE, 500, 100, 0))));
+	
+	verify_success(cf.DebugAddSegment(OP_NEW(MultimediaSegment, (MMCACHE_HEADER_SIZE, 1600, 100, 0))));
+	verify_success(cf.DebugAddSegment(OP_NEW(MultimediaSegment, (MMCACHE_HEADER_SIZE, 1500, 100, 0))));
+	
+	segs.DeleteAll();
+	cf.GetMissingCoverage(segs, 0, 1500);
+	verify(segs.GetCount()==3);
+	verify(segs.Get(0)->content_start==0);
+	verify(segs.Get(0)->content_length==500);
+	verify(segs.Get(1)->content_start==600);
+	verify(segs.Get(1)->content_length==400);
+	verify(segs.Get(2)->content_start==1450);
+	verify(segs.Get(2)->content_length==50);
+	
+	segs.DeleteAll();
+	cf.GetMissingCoverage(segs, 0, 20000);
+	
+	verify(segs.GetCount()==4);
+	verify(segs.Get(0)->content_start==0);
+	verify(segs.Get(0)->content_length==500);
+	verify(segs.Get(1)->content_start==600);
+	verify(segs.Get(1)->content_length==400);
+	verify(segs.Get(2)->content_start==1450);
+	verify(segs.Get(2)->content_length==50);
+	verify(segs.Get(3)->content_start==1700);
+	verify(segs.Get(3)->content_length=19300);
+	
+	segs.DeleteAll();
+	cf.GetMissingCoverage(segs, 0);
+	
+	verify(segs.GetCount()==3);
+	verify(segs.Get(0)->content_start==0);
+	verify(segs.Get(0)->content_length==500);
+	verify(segs.Get(1)->content_start==600);
+	verify(segs.Get(1)->content_length==400);
+	verify(segs.Get(2)->content_start==1450);
+	verify(segs.Get(2)->content_length==50);
+	
+	segs.DeleteAll();
+	cf.GetMissingCoverage(segs, 500, 1200);
+	
+	verify(segs.GetCount()==2);
+	verify(segs.Get(0)->content_start==600);
+	verify(segs.Get(0)->content_length==400);
+	verify(segs.Get(1)->content_start==1450);
+	verify(segs.Get(1)->content_length==50);
+	
+	segs.DeleteAll();
+	cf.GetMissingCoverage(segs, 550, 1100);
+	
+	verify(segs.GetCount()==2);
+	verify(segs.Get(0)->content_start==600);
+	verify(segs.Get(0)->content_length==400);
+	verify(segs.Get(1)->content_start==1450);
+	verify(segs.Get(1)->content_length==50);
+	
+	segs.DeleteAll();
+	cf.GetMissingCoverage(segs, 499, 1202);
+	
+	verify(segs.GetCount()==4);
+	verify(segs.Get(0)->content_start==499);
+	verify(segs.Get(0)->content_length==1);
+	verify(segs.Get(1)->content_start==600);
+	verify(segs.Get(1)->content_length==400);
+	verify(segs.Get(2)->content_start==1450);
+	verify(segs.Get(2)->content_length==50);
+	verify(segs.Get(3)->content_start==1700);
+	verify(segs.Get(3)->content_length=1);
+	
+	segs.DeleteAll();
+	cf.GetMissingCoverage(segs, 1500, 200);
+	verify(segs.GetCount()==0);
+	
+	segs.DeleteAll();
+	cf.GetMissingCoverage(segs, 1501, 198);
+	verify(segs.GetCount()==0);
+	
+	segs.DeleteAll();
+	cf.GetMissingCoverage(segs, 1500, 1);
+	verify(segs.GetCount()==0);
+	
+	segs.DeleteAll();
+	cf.GetMissingCoverage(segs, 1501, 1);
+	verify(segs.GetCount()==0);
+	
+	segs.DeleteAll();
+	cf.GetMissingCoverage(segs, 1501);
+	verify(segs.GetCount()==0);
+	
+	segs.DeleteAll();
+	cf.GetMissingCoverage(segs, 700, 1);
+	verify(segs.GetCount()==1);
+	verify(segs.Get(0)->content_start==700);
+	verify(segs.Get(0)->content_length==1);
+	
+	segs.DeleteAll();
+	cf.GetMissingCoverage(segs, 700);
+	verify(segs.GetCount()==2);
+	verify(segs.Get(0)->content_start==700);
+	verify(segs.Get(0)->content_length==300);
+	verify(segs.Get(1)->content_start==1450);
+	verify(segs.Get(1)->content_length==50);
+	
+	segs.DeleteAll();
+	cf.GetMissingCoverage(segs, 3000, 100000);
+	verify(segs.GetCount()==1);
+	verify(segs.Get(0)->content_start==3000);
+	verify(segs.Get(0)->content_length==100000);
+	
+	segs.DeleteAll();
+	cf.GetMissingCoverage(segs, 3000);
+	verify(segs.GetCount()==0);
+}
+
+test("Multimedia write 1 - disk")
+timer;
+{
+	verify(TestMultimediaWrite(name, 1, FALSE, 16384, FALSE));
+}
+
+test("Multimedia write 1 - RAM")
+timer;
+{
+	verify(TestMultimediaWrite(name, 1, FALSE, 16384, TRUE));
+}
+
+test("Multimedia write 2 - disk")
+timer;
+{
+	verify(TestMultimediaWrite(name, 64, FALSE, 5, FALSE));
+}
+
+test("Multimedia write 2 - RAM")
+timer;
+{
+	verify(TestMultimediaWrite(name, 64, FALSE, 5, TRUE));
+}
+
+test("Multimedia write 3 - disk")
+timer;
+{
+	verify(TestMultimediaWrite(name, 64, TRUE, 5, FALSE));
+}
+
+test("Multimedia write 3 - RAM")
+timer;
+{
+	verify(TestMultimediaWrite(name, 64, TRUE, 5, TRUE));
+}
+
+test("Multimedia write 4 - disk")
+timer;
+{
+	verify(TestMultimediaWrite(name, 64, FALSE, 16384, FALSE));
+}
+
+test("Multimedia write 4 - RAM")
+timer;
+{
+	verify(TestMultimediaWrite(name, 64, FALSE, 16384, TRUE));
+}
+
+test("Multimedia write 5 - disk")
+timer;
+{
+	verify(TestMultimediaWrite(name, 64, TRUE, 16384, FALSE));
+}
+
+test("Multimedia write 5 - RAM")
+timer;
+{
+	verify(TestMultimediaWrite(name, 64, TRUE, 16384, TRUE));
+}
+
+test("Multimedia write 6 - disk")
+timer;
+{
+	verify(TestMultimediaWrite(name, 8, FALSE, 1024*1024, FALSE));
+}
+
+test("Multimedia write 6 - RAM")
+timer;
+{
+	verify(TestMultimediaWrite(name, 8, FALSE, 1024*1024, TRUE));
+}
+
+test("Multimedia write 7 - disk")
+timer;
+{
+	verify(TestMultimediaWrite(name, 8, TRUE, 1024*1024, FALSE));
+}
+
+test("Multimedia write 7 - RAM")
+timer;
+{
+	verify(TestMultimediaWrite(name, 8, TRUE, 1024*1024, TRUE));
+}
+	
+test("Size limit check")
+timer;
+{
+	verify(TestMultimediaSize(name2, FALSE));
+}
+
+test("Crash verify")
+timer;
+{
+	verify(TestMultimediaCrash(name2));
+}
+
+test("Big Size check")
+timer;
+{
+	verify(TestMultimediaBig(name3));
+}
+	
+test("Number of segments limit")
+timer;
+{
+	verify(TestMultimediaSegmentLimits(name2, 16, FALSE));
+	verify(TestMultimediaSegmentLimits(name2, 255, FALSE));
+}
+
+test("Multimedia Cache Mixed")
+timer;
+{
+	verify(TestStreamMixed(FALSE));
+}
+
+test("Multimedia Cache Mixed 2")
+timer;
+{
+	verify(TestStreamMixed2(FALSE));
+}
+
+test("Multimedia Cache Mixed")
+timer;
+{
+	verify(TestStreamMixed(FALSE));
+}
+
+test("Multimedia Cache Mixed 2")
+timer;
+{
+	verify(TestStreamMixed2(FALSE));
+}
+
+test("Multimedia Cache Stream Real World")
+timer;
+{
+	MultimediaCacheFile cf;
+
+	verify(TestStream3(cf, FALSE));
+}
+
+test("Multimedia Cache Stream Real World 2")
+timer;
+{
+	MultimediaCacheFile cf;
+
+	verify(TestStream4(cf, FALSE));
+}
+
+test("Multimedia Cache Stream Real World 3")
+timer;
+{
+	MultimediaCacheFile cf;
+
+	verify(TestStream5(cf, FALSE));
+}
+
+test("Multimedia Cache Stream Real World 4")
+timer;
+{
+	MultimediaCacheFile cf;
+
+	verify(TestStream6(cf, FALSE));
+}
+
+test("Multimedia Cache Stream - Test 1")
+timer;
+{
+	MultimediaCacheFile cf;
+
+	cf.DebugDisableDeepStreamCheck();
+	verify(TestStream(cf, FALSE));
+}
+
+test("Multimedia Cache Stream - Test 2")
+timer;
+{
+	MultimediaCacheFile cf;
+
+	cf.DebugDisableDeepStreamCheck();
+	verify(TestStream2(cf, FALSE));
+}
+
+test("Multimedia Cache Stream Linear")
+timer;
+{
+	MultimediaCacheFile cf;
+
+	verify(TestStreamLinear(cf, FALSE));
+}
+
+test("Multimedia Cache Stream Real World 5")
+timer;
+{
+	MultimediaCacheFile cf;
+
+	verify(TestStream7(cf, FALSE));
+
+	verify(cf.IsStreaming());
+	verify(!cf.IsInRAM());
+}
+
+test("Multimedia Cache Stream Real World 5 - RAM")
+timer;
+{
+	MultimediaCacheFile cf;
+
+	verify(TestStream7(cf, TRUE));
+
+	verify(cf.IsStreaming());
+	verify(cf.IsInRAM());
+}

@@ -1,0 +1,224 @@
+/* -*- Mode: c++; tab-width: 4; indent-tabs-mode: t; c-basic-offset: 4 -*- */
+
+group "display.stylemanager";
+
+include "modules/display/styl_man.h";
+
+global
+{
+	StyleManager* tsm;
+	int fontcount;
+}
+
+test("create/destroy") repeat 17; leakcheck;
+{
+	tsm = NULL;
+	tsm = StyleManager::Create();
+	verify(tsm != NULL);
+	OP_DELETE(tsm);
+	tsm = NULL;
+}
+
+test("create")
+{
+	tsm = StyleManager::Create();
+	verify(tsm != NULL);
+}
+
+test("GetFontManager") leakcheck; require success "create";
+{
+	OpFontManager* fm = tsm->GetFontManager();
+	verify(fm != NULL);
+}
+
+test("GetFontFace") leakcheck; require success "create";
+{
+	const uni_char* face = tsm->GetFontFace(0);
+	output("\n");
+	if (face == NULL)
+		output("   font face #0 does not exist. bad.\n");
+	else
+		output("   font face #0: \"%s\"\n", ST_down(face));
+	verify(face != NULL);
+}
+
+test("GetFontFaces") leakcheck; require success "GetFontFace";
+{
+	int i = 0;
+	const uni_char* face;
+	output("\n");
+	do
+	{
+		face = tsm->GetFontFace(i);
+		if (face == NULL)
+			output("   found %d font faces\n", i);
+		else
+			output("   font face #%d: \"%s\"\n", i, ST_down(face));
+		i++;
+	} while (face != NULL);
+	fontcount = i - 1;
+	verify(face == NULL);
+	verify(fontcount != 0);
+}
+
+test("GetFontInfo") leakcheck; require success "GetFontFaces";
+{
+	for (int i = 0; i < fontcount; i++)
+	{
+		OpFontInfo* ofi = tsm->GetFontInfo(i);
+		verify(ofi != NULL);
+	}
+}
+
+test("HasWeight") leakcheck; require success "GetFontFaces";
+{
+	BOOL has_nonbold = FALSE;
+	BOOL has_bold = FALSE;
+	for (int i = 0; i < fontcount; i++)
+	{
+		OpFontInfo* ofi = tsm->GetFontInfo(i);
+		if (ofi->HasWeight(4))
+			has_nonbold = TRUE;
+		if (ofi->HasWeight(7))
+			has_bold = TRUE;
+	}
+	verify(has_bold);
+	verify(has_nonbold);
+}
+
+table GenericNamesTable(const uni_char*)
+{
+	{ UNI_L("monospace") },
+	{ UNI_L("fantasy") },
+	{ UNI_L("serif") },
+	{ UNI_L("sans-serif") },
+	{ UNI_L("cursive") }
+}
+
+test("SetGenericFont") leakcheck; require success "GetFontFaces";
+	require undefined PERSCRIPT_GENERIC_FONT;
+{
+	int i = -1;
+	const uni_char* face;
+
+	iterate (gen) from GenericNamesTable
+	{
+		face = tsm->GetFontFace(i + 1);
+		if (face)
+			i++;
+
+		tsm->SetGenericFont(StyleManager::GetGenericFont(gen), face);
+	}
+}
+
+test("SetGenericFont") leakcheck; require success "GetFontFaces";
+	require PERSCRIPT_GENERIC_FONT;
+{
+	int i = -1;
+	int j = 0;
+	const uni_char* face;
+	const uni_char* faces[5];
+
+
+	iterate (gen) from GenericNamesTable
+	{
+		face = tsm->GetFontFace(i + 1);
+		if (face)
+			i++;
+
+		faces[j++] = face;
+		tsm->SetGenericFont(StyleManager::GetGenericFont(gen), face, WritingSystem::Unknown);
+	}
+}
+
+
+/* fontatt tests */
+
+test("FontAttSerializationTrivial") leakcheck; require success "GetFontFaces";
+	require PREFS_WRITE;
+	require PREFS_READ;
+{
+	/* first an empty one. trivial */
+	FontAtt fa;
+	OpString fontatt_string;
+	OP_STATUS status = fa.Serialize(&fontatt_string);
+	verify(status == OpStatus::OK);
+
+	FontAtt boomerang;
+	BOOL ustatus = boomerang.Unserialize(fontatt_string.CStr());
+	verify(ustatus);
+}
+
+test("FontAttSerializationStress") require success "FontAttSerializationTrivial";
+	require PREFS_WRITE;
+	require PREFS_READ;
+{
+	/* now a more realistic one */
+
+	int overline, weight, underline, fontheight, strikeout, italic, fontnumber;
+	int count = 0;
+	for (fontnumber = 0 ; fontnumber < fontcount ; fontnumber++)
+	{
+		for (overline = 0 ; overline <= 1 ; overline++)
+		{
+			for (weight = 0 ; weight <= 9 ; weight++)
+			{
+				for (underline = 0 ; underline <= 1 ; underline++)
+				{
+					for (fontheight = 0 ; fontheight < 100 ; fontheight++)
+					{
+						if (fontheight > 20)
+							fontheight += 3;
+						if (fontheight > 40)
+							fontheight += 4;
+						if (fontheight > 50)
+							fontheight += 4;
+						for (strikeout = 0 ; strikeout <= 1 ; strikeout++)
+						{
+							for (italic = 0 ; italic <= 1 ; italic++)
+							{
+								FontAtt fa;
+
+								fa.SetOverline(overline != 0);
+								fa.SetWeight(weight);
+								fa.SetUnderline(underline != 0);
+								fa.SetHeight(fontheight);
+								fa.SetStrikeOut(strikeout != 0);
+								fa.SetItalic(italic != 0);
+								fa.SetFontNumber(fontnumber);
+								fa.SetFaceName(tsm->GetFontFace(fontnumber));
+
+								//output("testing fontatt: %s, %d %d %d %d %d %d %d %d\n", ST_down(fa.GetFaceName()), fa.GetOverline(),
+								//	fa.GetWeight(), fa.GetUnderline(), fa.GetHeight(), fa.GetStrikeOut(), fa.GetItalic(), fa.GetFontNumber(), fa.GetChanged());
+								FontAtt fa2;
+								OpString serial;
+								OP_STATUS status = fa.Serialize(&serial);
+								verify(status == OpStatus::OK);
+								BOOL unserial_status = fa2.Unserialize(serial.CStr());
+								verify(unserial_status == TRUE);
+
+								verify(fa.GetOverline() == fa2.GetOverline());
+								verify(fa.GetWeight() == fa2.GetWeight());
+								verify(fa.GetUnderline() == fa2.GetUnderline());
+								verify(fa.GetHeight() == fa2.GetHeight());
+								verify(fa.GetStrikeOut() == fa2.GetStrikeOut());
+								verify(fa.GetItalic() == fa2.GetItalic());
+								verify(fa.GetFontNumber() == fa2.GetFontNumber());
+								verify(0 == uni_strcmp(fa.GetFaceName(), fa2.GetFaceName()));
+								verify(fa.GetChanged() == fa2.GetChanged());
+
+								count++;
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+	output("%d fontatts tested\n", count);
+}
+
+exit
+{
+	OP_DELETE(tsm);
+}

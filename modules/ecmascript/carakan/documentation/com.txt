@@ -1,0 +1,412 @@
+Compact Object Model
+====================
+
+This document aims to describe an alternate, more compact, object model to use
+in the carakan ECMAScript engine.
+
+
+Current
+-------
+
+The current model is something like this:
+
+Each object (ES_Object) has a class which defines a set of named properties
+present on the object (and their order.)  These properties are stored in an
+array of values owned by the object.  Each value is of the type
+ES_Value_Internal, which is 8 bytes large on (most) 32-bit systems (via a hack
+that stores 32-bit objects like integers and pointers as specially crafted NaN
+values in a double) and 16 bytes large on 64-bit systems (and possibly some
+32-bit systems where aforementioned hack doesn't work.)
+
+In addition to this, properties whose names are integer indeces are stored in a
+separate representation owned by the object, which is either a flat array of
+ES_Value_Internal objects or a balanced binary tree, the latter of which can be
+considered an irrelevant special case in the context of object compactness.
+
+Also, objects can store other named properties in a hash table structure
+owned by the object.  This too can be considered an irrelevant special case in
+the context of object compactness.
+
+Ever more irrelevantly, objects can actually store internal "private" properties
+as properties on a secondary ES_Object object owned by the primary object.
+
+Finally, objects acting as prototypes reference a second class which is the root
+of the class tree used by "instances" or "subobjects," that is, objects whose
+[[prototype]] property refer to the this object.
+
+The sum of all this is 6 pointers: class, property value array, indexed property
+representation, other named properties hash table, private properties object,
+and subobject class.  The last three are judged to be NULL so often that they
+have moved into a secondary structured to which the object holds a pointer, so
+there are 7 pointers, but only 4 of them are stored in ES_Object.
+
+I will now discuss a design that reduces these 6/7/4 pointers into, in the best
+case, 1.
+
+
+That Design
+-----------
+
+Each object now holds a pointer to the class.  As before, the class defines a
+set of named properties that the object holds, but it defines more than that
+now.  It defines the layout of the object:
+
+  class ES_Class
+  {
+     ...
+
+     struct LayoutElm
+     {
+       enum Type
+       {
+         BOOLEAN,
+         INT32,
+         DOUBLE,
+         STRING,
+         STRING_OR_NULL,
+         OBJECT,
+         OBJECT_OR_NULL,
+         WHATEVER,
+
+         SPECIAL_INDEXED,
+         SPECIAL_SUBOBJECT_CLASS,
+         SPECIAL_NAMED,
+         SPECIAL_PRIVATE,
+         SPECIAL_SERIAL,
+         SPECIAL_PAYLOAD
+       };
+
+       Type type;
+       unsigned offset:31;
+       unsigned in_payload:1;
+     };
+
+     LayoutElm *layout[];
+
+     ...
+  };
+
+The various types mean:
+
+  BOOLEAN: primitive boolean, stored as a 32-bit integer, 0 or 1 (could of
+           course be stored more compact if we wanted to)
+
+  INT32: primitive number, stored as a 32-bit integer
+
+  DOUBLE: primitive number, stored as a 64-bit double (would be used also for
+          integer values for properties that are sometimes integers and
+          sometimes doubles)
+
+  STRING: primitive string, stored as a pointer to JString (32-bit or 64-bit)
+          that is never NULL
+
+  STRING_OR_NULL: primitive string or null value, stored as a pointer to
+                  JString, where a null value is represented as a NULL pointer
+
+  OBJECT: object, stored as a pointer to ES_Object (32-bit or 64-bit)
+
+  OBJECT_OR_NULL: object or null value, stored as a pointer to ES_Object, where
+                  a null value is represented as a NULL pointer
+
+  WHATEVER: used for properties whose mixture of occuring values doesn't fit any
+            other type, represented as an ES_Value_Internal object (64-bit or
+            128-bit)
+
+  SPECIAL_INDEXED: pointer to ES_Indexed_Properties, used to represent indexed
+                   properties
+
+  SPECIAL_SUBOBJECT_CLASS: pointer to ES_Class, used for subobject class
+
+  SPECIAL_NAMED: pointer to ES_Property_Value_Table, used to represent other
+                 named properties
+
+  SPECIAL_PRIVATE: pointer to ES_Object, used to represent private properties
+
+  SPECIAL_SERIAL: property serial number counter, for assigning serial numbers
+                  to properties with the purpose of keeping track of insertion
+                  order, and thus enumeration order; only needed if object has
+                  indexed or other named properties
+
+  SPECIAL_PAYLOAD: pointer to ES_Boxed, containing the rest of the object
+
+The 'offset' member contains the offset into the ES_Object object, or into the
+extra payload object, at which the property is stored.
+
+The 'in_payload' member is 1 if the property is stored in the extra payload, and
+0 otherwise.
+
+
+Some Examples
+-------------
+
+An object is created via an object literal:
+
+  var obj = { left: {}, right: "foo" };
+
+The class of this object, class "class X", will have a property name table
+mapping names to indeces, as such:
+
+  mappings: { left => 0, right => 1 }
+
+This mapping defines, possibly among other things, the index into the layout
+table of the storage of the property in question.
+
+The layout table will be:
+
+  layout: [ { type=OBJECT, offset=16, in_payload=0 },
+            { type=STRING, offset=20, in_payload=0 } ]
+
+The ES_Object instances created by the object literal will thus be as if a C++
+class
+
+  class ES_MyObject : public ES_Object
+  {
+  public:
+    ES_Object *left;
+    JString *right;
+  };
+
+had been declared, with ES_Object being declared as
+
+  class ES_Boxed
+  {
+  public:
+    unsigned bits; ///< various bits (mostly memory allocator data)
+    unsigned size; ///< size of allocation (memory allocator data)
+  };
+  
+  class ES_Object : ES_Boxed
+  {
+    unsigned object_bits; ///< additional bits describing the object
+    ES_Class *klass; ///< object's class
+  };
+
+
+Suppose one such object is subjected to the following statement:
+
+  obj.middle = 10;
+
+The property access will not have a valid cache record for the class defined
+above, so a property lookup is issued, which fails, since the object has no
+property named 'middle'.  As earlier, a new class will be formed by adding the
+new name to the name->index mapping.  A new property will also be appended to
+the layout.  But, since the existing object has no room for additional
+properties (we're assuming here there was no usable padding introduced by the
+memory allocator -- there may very well be in some cases in practice) adding a
+new property will require us to allocate extra payload for it as well.  The
+pointer to this extra payload will have to replace one of the existing
+properties in the object.  Two new classes are formed:
+
+  Class Y0:
+
+    mappings: { left => 0, right => 1, middle => 2 }
+
+    layout: [ { type=OBJECT, offset=16, in_payload=0 },
+              { type=STRING, offset=20, in_payload=0 },
+              { type=INT32, offset=24, in_payload=0 } ]
+
+  Class Y1:
+
+    mappings: { left => 0, right => 2, middle => 3 }
+
+    layout: [ { type=OBJECT, offset=16, in_payload=0 },
+              { type=SPECIAL_PAYLOAD, offset=20, in_payload=0 },
+              { type=STRING, offset=8, in_payload=1 },
+              { type=INT32, offset=12, in_payload=1 } ]
+
+Class Y0 is the "perfect" class representing an object with this set of
+properties, class Y1 is the "necessary" class used by this particular object.
+Class Y1 will know of class Y0, and whenever class Y1 is extended further, a
+corresponding extension of class Y0 will also be created, known by the extension
+of class Y1.  Cleverness when initially creating future objects by executing the
+initial object literal may cause us to allocate extra space so that this
+property write can use class Y0 instead of class Y1.  This extra space would
+simply be unused "padding" in the allocation, and can be detected by inspecting
+ES_Boxed::size on the object.  Such padding can also be introduced uncalled for
+by the memory allocator, but would be usable the same way all-the-same.
+
+
+Suppose instead that an object created by the initial object literal above was
+subjected to the following statement (without the stuff about 'middle' ever
+taking place) twice:
+
+  obj.right = x;
+
+The first time x is "bar", the second time x is the number 10.
+
+The first time the property access is uncached, and a property lookup is
+performed.  The lookup finds an existing property 'right'.  It also finds that
+the type written is compatible with the type in the layout, so we can go right
+ahead and write a new JString pointer into the designated location in the
+ES_Object.  A property write cache record is created:
+
+  conditions: object class == class X
+              value type == string
+
+  action: write at offset 20
+
+The second time the property access is cached, but the cache fails, since the
+value to be written doesn't meet the requirements of the cache record.
+
+A new property lookup is performed, finding the same existing property, but
+detecting that its stored value is incompatible.  A new class is formed:
+
+  class Z:
+
+    mappings: { left => 0, right => 1 }
+
+    layout: [ { type=OBJECT, offset=16, in_payload=0 },
+              { type=INT32, offset=20, in_payload=0 } ]
+
+This class will be added to the class tree as a sibling to class X, not as its
+child.  Specificly, it will be added as a child of the class whose last property
+is the property before the property whose type was changed.  The object is then
+converted to the new layout (which in this case is a no-op,) and the number 10
+is written at offset 20 as a 32-bit integer.  A second cache record is created:
+
+  conditions: object class == class X
+              value type == int32
+
+  action: change class to class Z
+          write at offset 20
+
+If the property access continues to be called with all combinations of objects
+of class X and class Z, and values of type string and int32, two more cache
+records will eventually be established:
+
+  conditions: object class == class Z
+              value type == string
+
+  action: change class to class X
+          write at offset 20
+
+and
+
+  conditions: object class == class Z
+              value type == int32
+
+  action: write at offset 20
+
+(These cache records all overlap to some degree, so could perhaps be represented
+in a more compact way, and could most likely be transformed to machine code in a
+more elegant manner than just as four separate class checks and actions.)
+
+It can be noted that this type of object might change class a lot, but the only
+things that is actually changed, as in written to memory, are the class pointer
+and the property value.  This is the same number of things as today; but today
+the things that are changed are the property's type and its value.
+
+
+Suppose the same situation as above arises, except that the value written varies
+between string and null (which seems like a more logical thing to happen.)
+There is a property type that is capable of holding both strings and nulls, so
+there is no need to alter the object's class every time the property's type
+changes.  Instead, what happens when a null value is written to a property that
+according to the class can only hold strings, is that the class itself is
+modified.  That is, the original class X becomes
+
+  mappings: { left => 0, right => 1 }
+
+  layout: [ { type=OBJECT, offset=16, in_payload=0 },
+            { type=STRING_OR_NULL, offset=20, in_payload=0 } ]
+
+All instances of class X that exist now become slightly different objects.  But
+because class X up until this point defined the property 'right' to hold only
+strings, all of them will necessarily contain strings, and not null values.
+
+Any existing property caches that were established before the class has changed
+will have to be invalidated, however.  A cache that claims that the property
+'right' for sure has a string value, will no longer be true for the same set of
+objects, because from now on an object could occur that has a property 'right'
+with a null value.  This is simply accomplished by assigning a new class ID to
+class X.  (This same way of invaliding cache records is already being used in
+the current object model in some cases, and will continue to be used that way in
+those cases with this object model as well.)
+
+
+Discussion: what happens when the two cases above are combined, that is, when x
+varies between string, null value and integer?  One of two things, I believe:
+
+1) Objects vary between classes X and Y, only X now being the modified X.
+
+2) Property is converted into the type WHATEVER.
+
+In case of 2, any existing cache records suggesting writes to this property
+would then be purged, leaving a cache record such as
+
+  conditions: object class == class X
+
+  action: change class to class W
+          write at ...
+
+where class W would be a class based on class X's base class (before 'right' was
+added) with the property type of 'right' set to WHATEVER.  The class X might
+even be removed from the class tree, or marked as "don't use" so that new
+objects pick up the class W instead, based on our acquired knowledge that the
+type of the property 'right' varies too much to be recorded.
+
+
+Stack Frames
+------------
+
+Stack frame layout and (our current) object layout shares quite a lot.  The
+ECMAScript language describes the local variables as properties on an object,
+the variables object.  The storage of the stack frame is a simple array of
+ES_Value_Internal objects, same as the current storage of properties on regular
+objects.  And the local variables in a given function do have a lot in common
+with properties on given class of objects: a distinct set of names, and a
+fairly stable type for each named value.
+
+If we extend the object class to record both the types of individual properties
+and the low-level representation of the object, it's not really a big step to
+apply the same to the stack frame.  A function that has ever had its variables
+object created, already has a class defined that describes the set of local
+variables in the function, in the right order.  If classes record types, this
+class could just as well record the types of the values in the local variables,
+and also then define the layout of the stack frame.
+
+There are a few problems.  One is that local variables always start out
+containing the undefined value, whereas properties on objects don't.  For
+properties on objects it's rather rare that the value undefined ever occurs, and
+so it can be treated as a special case, handled perhaps less efficiently by
+defining the storage type as ES_Value_Internal, that is, totally generic.
+Obviously, this won't work well for local variables if they always at some point
+contain the value undefined.  A possible solution to this is to track whether a
+local variable's undefined value is ever read, which it usually isn't, and then
+essentially define that the local variable has no value at all until it is first
+assigned its "real" value of a better type.  We already do this as an
+optimization in machine coded functions, to eliminate an unnecessary write to
+the register's value.
+
+A second problem is the temporary registers.  Currently, they are not as much
+individual registers with a stable type, as they are multiple registers with
+non-overlapping life-times, that share storage but not (necessarily) type.  A
+register/property that often switches between completely different types is a
+bad match for the typed class concept.  A possible solution would be to define
+different classes for the stack frame "object" that apply during different parts
+of the function (essentially defining a code word -> class mapping.)  This will
+probably not be very partical.
+
+Another possible solution would be to have typed temporary registers, so that an
+integer register is only reused for other integer results, and a string result
+would force the allocation of a new register, even if the integer register is
+unused.  This would lead to reduced register reusage and thus more registers and
+a bigger register frame, though the size of course is reduced to begin with by
+having typed registers (an integer register would be only a quarter of the size
+in a 64-bit version.)
+
+Typed registers also give an interesting problem due to the fact that types
+aren't known compile time.  As type information is gathered runtime, we would
+essentially learn how to allocate registers, so the whole allocation of
+temporary registers would need to be revisited whenever type information is
+refined.  Having a system where the register allocation needs to be redone, and
+the stack frame needs to be morphed, whenever a sub-expression turns out to
+yield an unexpected type of value, could be rather slow and heavy until enough
+type information has been gathered, so it is likely we would need to start out
+with a largely untyped function with untyped (and easily shared) registers.
+
+
+What Else?
+----------
+
+There's a lot more to be thought and written on the subject, I am sure...

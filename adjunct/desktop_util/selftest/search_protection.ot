@@ -1,0 +1,941 @@
+/* -*- Mode: c++; tab-width: 4; indent-tabs-mode: t; c-basic-offset: 4 -*- */
+
+group "desktop_util.search_protection";
+
+require init;
+require DESKTOP_UTIL_SEARCH_ENGINES;
+
+include "adjunct/desktop_util/search/search_net.h";
+include "adjunct/desktop_util/search/search_protection.h";
+include "adjunct/quick/dialogs/PreferencesDialog.h";
+include "adjunct/quick/WindowCommanderProxy.h";
+include "adjunct/desktop_util/string/stringutils.h";
+include "modules/util/opfile/opmemfile.h";
+
+global
+{
+    // Loads specified search.ini into HardcodedSearchEngines (instead of search engines
+    // hardcoded inside Opera.dll).
+    class ST_HardcodedSearchEngines : public SearchProtection::HardcodedSearchEngines
+    {
+    public:
+        ST_HardcodedSearchEngines(OpMemFile* search_ini,
+                                  size_t engines_count,
+                                  const SearchProtection::SearchConfiguration* configs,
+                                  size_t configs_count)
+        : m_search_ini(search_ini)
+        , m_engines_count(engines_count)
+        , m_configs(configs)
+        , m_configs_count(configs_count)
+        {}
+
+        OP_STATUS ST_Load()
+        {
+            return HardcodedSearchEngines::LoadSearchEngines(m_search_ini, m_engines_count);
+        }
+
+        OP_STATUS ST_Init(SearchTemplate* package_default_search = NULL,
+                          SearchTemplate* package_speeddial_search = NULL,
+                          size_t global_default_engine_index = 0,
+                          size_t global_speeddial_engine_index = 0,
+                          const char* region = "",
+                          const char* language = "en",
+                          const char* default_language = "")
+        {
+            RETURN_IF_ERROR(m_region.Set(region));
+            RETURN_IF_ERROR(m_language.Set(language));
+            RETURN_IF_ERROR(m_default_language.Set(default_language));
+            return HardcodedSearchEngines::InitSearchEngines(package_default_search,
+                                                             package_speeddial_search,
+                                                             global_default_engine_index,
+                                                             global_speeddial_engine_index,
+                                                             m_configs, m_configs_count);
+        }
+
+        virtual OP_BOOLEAN GetRegionOverride(OpString8& region) const
+        {
+            RETURN_IF_ERROR(region.Set(m_region));
+            return OpBoolean::IS_TRUE;
+        }
+
+        virtual OP_BOOLEAN GetDefaultLanguageOverride(OpString8& language) const
+        {
+            RETURN_IF_ERROR(language.Set(m_default_language));
+            return OpBoolean::IS_TRUE;
+        }
+
+        virtual OP_BOOLEAN GetLanguageOverride(OpString8& language) const 
+        {
+            RETURN_IF_ERROR(language.Set(m_language));
+            return OpBoolean::IS_TRUE;
+        }
+
+
+    private:
+        OpMemFile* m_search_ini;
+        size_t m_engines_count;
+        const SearchProtection::SearchConfiguration* m_configs;
+        size_t m_configs_count;
+        OpString8 m_region;
+        OpString8 m_language;
+        OpString8 m_default_language;
+    };
+
+    OpMemFile* g_search_ini = NULL;       // contents of testfiles/search_protection.ini
+
+    // search configurations from testfiles/search_protection.ini
+    SearchProtection::SearchConfiguration g_search_configs[6] =
+    {
+        { "", "en", 5, 1 },
+        { "", "pl", 3, 4 },
+        { "", "zh-cn", 0, 2 },
+
+        { "cis", "", 0, 0 },
+        { "cis", "ru", 1, 1 },
+        { "gb", "en", 2, 2 }
+    };
+
+    // search engines from g_search_ini with configurations from g_search_configs
+    ST_HardcodedSearchEngines* g_hardcoded_engines = NULL;
+
+    // selected searches read directly from g_search_ini
+    SearchTemplate g_search_2;
+    SearchTemplate g_search_3;
+    SearchTemplate g_search_5;
+    SearchTemplate g_search_fake; // search with fake URL (g_searchEngineManager should not have it)
+
+
+    // Writes/reads search protection data to/from internal strings (instead of operaprefs.ini).
+    class ST_ProtectionDataStore : public SearchProtection::ProtectionDataStore
+    {
+    public:
+        virtual const OpStringC ReadPref(PrefsCollectionUI::stringpref pref)
+        {
+            switch(pref)
+            {
+            case PrefsCollectionUI::HashOfDefaultSearch: return m_default_search_protection_data;
+            case PrefsCollectionUI::HashOfSpeedDialSearch: return m_speeddial_search_protection_data;
+            case PrefsCollectionUI::IdOfHardcodedDefaultSearch: return m_hardcoded_default_search_id;
+            case PrefsCollectionUI::IdOfHardcodedSpeedDialSearch: return m_hardcoded_speeddial_search_id;
+            default: return UNI_L("");
+            }
+        }
+        virtual OP_STATUS WritePref(PrefsCollectionUI::stringpref pref, const OpStringC& value)
+        {
+            switch(pref)
+            {
+            case PrefsCollectionUI::HashOfDefaultSearch: return m_default_search_protection_data.Set(value);
+            case PrefsCollectionUI::HashOfSpeedDialSearch: return m_speeddial_search_protection_data.Set(value);
+            case PrefsCollectionUI::IdOfHardcodedDefaultSearch: return m_hardcoded_default_search_id.Set(value);
+            case PrefsCollectionUI::IdOfHardcodedSpeedDialSearch: return m_hardcoded_speeddial_search_id.Set(value);
+            default: return OpStatus::ERR;
+            }
+        }
+        OP_STATUS WriteHardcodedEngineId(SearchProtection::SearchType type, const OpStringC& value)
+        {
+            if (type == SearchProtection::SPEED_DIAL_SEARCH)
+                return WritePref(PrefsCollectionUI::IdOfHardcodedSpeedDialSearch, value);
+            else
+                return WritePref(PrefsCollectionUI::IdOfHardcodedDefaultSearch, value);
+        }
+        const OpStringC ReadProtectionData(SearchProtection::SearchType type)
+        {
+            if (type == SearchProtection::SPEED_DIAL_SEARCH)
+                return ReadPref(PrefsCollectionUI::HashOfSpeedDialSearch);
+            else
+                return ReadPref(PrefsCollectionUI::HashOfDefaultSearch);
+        }
+        void Reset()
+        {
+            m_default_search_protection_data.Empty();
+            m_speeddial_search_protection_data.Empty();
+            m_hardcoded_default_search_id.Empty();
+            m_hardcoded_speeddial_search_id.Empty();
+        }
+        BOOL IsEmpty()
+        {
+            return m_default_search_protection_data.IsEmpty() && m_speeddial_search_protection_data.IsEmpty() &&
+                m_hardcoded_default_search_id.IsEmpty() && m_hardcoded_speeddial_search_id.IsEmpty();
+        }
+    private:
+        OpString m_default_search_protection_data;
+        OpString m_speeddial_search_protection_data;
+        OpString m_hardcoded_default_search_id;
+        OpString m_hardcoded_speeddial_search_id;
+    };
+
+    ST_ProtectionDataStore g_protection_data_store;
+
+
+    SearchProtection::SearchType OtherType(SearchProtection::SearchType type)
+    {
+        if (type == SearchProtection::DEFAULT_SEARCH)
+            return SearchProtection::SPEED_DIAL_SEARCH;
+        else
+            return SearchProtection::DEFAULT_SEARCH;
+    }
+
+    SearchTemplate* GetDefaultSearch(SearchProtection::SearchType type)
+    {
+        switch (type)
+        {
+            case SearchProtection::DEFAULT_SEARCH: return g_searchEngineManager->GetDefaultSearch();
+            case SearchProtection::SPEED_DIAL_SEARCH: return g_searchEngineManager->GetDefaultSpeedDialSearch();
+            default: return NULL;
+        }
+    }
+
+    void SetDefaultSearch(SearchProtection::SearchType type, const SearchTemplate* search)
+    {
+        OpStringC guid = search ? search->GetUniqueGUID() : UNI_L("");
+        if (type == SearchProtection::DEFAULT_SEARCH)
+            g_searchEngineManager->SetDefaultSearch(guid);
+        else if (type == SearchProtection::SPEED_DIAL_SEARCH)
+            g_searchEngineManager->SetDefaultSpeedDialSearch(guid);
+    }
+
+    OP_STATUS CreateSearchEngineItem(SearchEngineItem*& item,
+                                     const uni_char* name,
+                                     const uni_char* url,
+                                     BOOL set_default,
+                                     SearchProtection::SearchType type)
+    {
+        OpAutoPtr<SearchEngineItem> new_item(OP_NEW(SearchEngineItem, ()));
+        RETURN_OOM_IF_NULL(new_item.get());
+        RETURN_IF_ERROR(new_item->SetName(name));
+        RETURN_IF_ERROR(new_item->SetURL(url));
+        RETURN_IF_ERROR(new_item->SetKey(UNI_L("~")));
+        if (set_default)
+        {
+            if (type == SearchProtection::DEFAULT_SEARCH)
+                new_item->SetIsDefaultEngine(TRUE);
+            else if (type == SearchProtection::SPEED_DIAL_SEARCH)
+                new_item->SetIsSpeeddialEngine(TRUE);
+        }
+        item = new_item.release();
+        return OpStatus::OK;
+    }
+
+    OP_STATUS ReadSearchTemplate(SearchTemplate& search, PrefsFile* prefs, size_t index)
+    {
+        if (prefs)
+        {
+            OpString8 section_name;
+            RETURN_IF_ERROR(section_name.AppendFormat("Search Engine %d", index));
+            RETURN_IF_LEAVE(search.ReadL(section_name, prefs, SearchTemplate::PACKAGE));
+            return OpStatus::OK;
+        }
+        return OpStatus::ERR;
+    }
+
+    // Create PrefsFile backed by empty OpMemFile.
+    PrefsFile* CreateMemPrefs()
+    {
+        OpMemFile* mem = OpMemFile::Create(NULL, 0);
+        RETURN_VALUE_IF_NULL(mem, NULL);
+        OpAutoPtr<OpMemFile> mem_aptr(mem);
+        OpAutoPtr<PrefsFile> prefs(OP_NEW(PrefsFile, (PREFS_STD)));
+        RETURN_VALUE_IF_NULL(prefs.get(), NULL);
+        OP_STATUS status;
+        TRAP_AND_RETURN_VALUE_IF_ERROR(status, prefs->ConstructL(), NULL);
+        TRAP_AND_RETURN_VALUE_IF_ERROR(status, prefs->SetFileL(mem), NULL); // copies mem
+        return prefs.release();
+    }
+
+    // Create copy of search and add it to g_searchEngineManager.
+    // guid gets GUID of created search
+    OP_STATUS AddSearchToManager(const SearchTemplate& search, OpString& guid)
+    {
+        SearchTemplate* new_search = NULL;
+        RETURN_IF_ERROR(search.CreatePackageCopy(new_search));
+        if (new_search->GetUniqueGUID().HasContent() &&
+            OpStatus::IsSuccess(guid.Set(new_search->GetUniqueGUID())) &&
+            g_searchEngineManager->GetByUniqueGUID(guid) == NULL &&
+            OpStatus::IsSuccess(g_searchEngineManager->AddItem(new_search)))
+        {
+            return OpStatus::OK;
+        }
+        OP_DELETE(new_search);
+        guid.Empty();
+        return OpStatus::ERR;
+    }
+
+    void RemoveByGuid(const OpStringC& guid)
+    {
+        if (guid.HasContent())
+        {
+            SearchTemplate* search = g_searchEngineManager->GetByUniqueGUID(guid);
+            if (search)
+            {
+                g_searchEngineManager->RemoveItem(search);
+            }
+        }
+    }
+
+    OP_STATUS pad_with_0s(OpString& str, int required_length)
+    {
+        int str_length = str.Length();
+        if (str_length < required_length)
+        {
+            RETURN_OOM_IF_NULL(str.Reserve(required_length));
+            for (int i = 0; i < required_length - str_length; ++i)
+                RETURN_IF_ERROR(str.Append("0", 1));
+        }
+        return OpStatus::OK;
+    }
+} // global
+
+setup
+{
+    SearchProtection::SetProtectionDataStore(&g_protection_data_store);
+}
+
+exit
+{
+    SearchProtection::SetProtectionDataStore(NULL);
+    OP_DELETE(g_hardcoded_engines);
+    OP_DELETE(g_search_ini);
+}
+
+table signatures1(const char*, const char*, const char*, const char*, OpBoolean)
+{
+    { "empty store 1", NULL, "a/b", "", OpBoolean::IS_FALSE },
+    { "empty store 2", " \r\n", "a/b", "", OpBoolean::IS_FALSE },
+    { "empty store and digest", "", "", "", OpBoolean::IS_FALSE },
+    { "empty digest", "a b", "", "", OpBoolean::IS_FALSE },
+    { "single signature", "a b", "a", "b", OpBoolean::IS_TRUE },
+    { "spaces", "  \n\n\r\ta    \tb", "a", "b" , OpBoolean::IS_TRUE },
+    { "crlf", "a b\r\nc b\nd b\r\ne f\r\n", "e", "f", OpBoolean::IS_TRUE },
+    { "no match", "/a/b c\na/ e\na/b/ d\n", "a/b", "", OpBoolean::IS_FALSE }
+}
+
+foreach(test_name, signatures, key, val, status) from signatures1
+{
+    test("SignatureStore::GetByDigest: " test_name)
+    {
+        OpString8 sig;
+        SearchProtection::SignatureStore sigstore;
+        OpStringC8 signatures_string(signatures);
+        verify_success(sigstore.Init(signatures_string.CStr(), signatures_string.Length()));
+        verify(sigstore.GetByDigest(key, sig) == status);
+        verify(sig == val);
+    }
+}
+
+table signatures2(const char*, const char*, const char*, const char*)
+{
+    { "pathsep", "a\\b/c d\n", "a/b\\c", "d" },
+    { "prefix1", "a\\b c\na/b/c d\n", "a/b", "c" },
+    { "prefix2", "a\\b c\na/b/c d\n", "a\\b\\c", "d" }
+}
+
+foreach(test_name, signatures, key, val) from signatures2
+{
+    test("SignatureStore::GetByPath: " test_name)
+    {
+        OpString8 sig;
+        SearchProtection::SignatureStore sigstore;
+        verify_success(sigstore.Init(signatures, op_strlen(signatures)));
+        verify(sigstore.GetByPath(UNI_L(key), sig) == OpBoolean::IS_TRUE);
+        verify(sig == val);
+    }
+}
+
+table folders(const char*, OpFileFolder, OpFileFolder)
+{
+    { "OPFILE_LANGUAGE_FOLDER", OPFILE_LANGUAGE_FOLDER, OPFILE_RESOURCES_FOLDER },
+    { "OPFILE_INI_FOLDER", OPFILE_INI_FOLDER, OPFILE_RESOURCES_FOLDER }
+}
+
+foreach(test_name, folder, base_folder) from folders
+{
+    test("SignatureChecker::GetRelativePath: " test_name)
+    {
+        OpString rel_path;
+        const uni_char* name = UNI_L("search.ini");
+        verify_success(SearchProtection::SignatureChecker::GetRelativePath(name, folder, base_folder, rel_path));
+        verify(rel_path.HasContent());
+        verify(rel_path[0] != PATHSEPCHAR);
+        verify(rel_path.Find(name) == rel_path.Length() - (int)uni_strlen(name));
+    }
+}
+
+table digest_inputs(const char*)
+{
+    { "a\nb" },
+    { "a\nb\n" },
+    { "\ra\rb" },
+    { "a\r\nb\n\r" }
+}
+
+test("Digest does not depend on eoln convention")
+    file uni path "data/digest_test";
+{
+    OpFile file;
+    verify_success(file.Construct(path));
+    iterate (input) from digest_inputs
+    {
+        verify_success(file.Open(OPFILE_WRITE));
+        verify_success(file.Write(input, op_strlen(input)));
+        verify_success(file.Close());
+        OpString8 digest;
+        verify_success(SearchProtection::ComputeDigest(path, OPFILE_ABSOLUTE_FOLDER, digest));
+        verify(digest == "da23614e02469a0d7c7bd1bdab5c9c474b1904dc");
+    }
+}
+finally
+{
+    file.Delete();
+}
+
+subtest check_hardcoded_engine_hash(ST_HardcodedSearchEngines* hardcoded_engines,
+                                    SearchProtection::SearchType type,
+                                    const uni_char* prefix_of_expected_hash)
+{
+    // check that default search of specified type has expected hash
+    verify(hardcoded_engines);
+    const SearchProtection::SearchEngine* engine = hardcoded_engines->GetSearchEngine(type);
+    verify(engine);
+    OpStringC hash;
+    TRAPD(status, hash = engine->GetHashL());
+    verify_success(status);
+    OpString expected_hash;
+    verify_success(expected_hash.Set(prefix_of_expected_hash));
+    verify_success(pad_with_0s(expected_hash, 32));
+    verify(hash == expected_hash);
+}
+
+test("Load hardcoded search engines")
+	file uni path "testfiles/search_protection.ini";
+{
+    unsigned char* data = NULL;
+    PrefsFile* search_ini_prefs = NULL;
+    OpFile search_ini;
+    verify_success(search_ini.Construct(path));
+    OpFileLength length;
+    verify_success(search_ini.GetFileLength(length));
+    verify(length > 0);
+    data = OP_NEWA(unsigned char, length);
+    verify(data);
+    verify_success(search_ini.Open(OPFILE_READ));
+    OpFileLength bytes_read;
+    verify_success(search_ini.Read(data, length, &bytes_read));
+    verify(bytes_read == length);
+    g_search_ini = OpMemFile::Create(data, length, TRUE); // takes ownership of data
+    verify(g_search_ini);
+    data = NULL;
+
+    // only searches #0 - #5 are loaded into g_hardcoded_engines,
+    // search #6 (g_search_fake) is used only in SearchTemplate::WriteL tests
+    g_hardcoded_engines = OP_NEW(ST_HardcodedSearchEngines, (g_search_ini, 6, g_search_configs, 6));
+    verify(g_hardcoded_engines);
+    verify_success(g_hardcoded_engines->ST_Load());
+    // check that engines #0 - #5 were loaded
+    verify_success(g_hardcoded_engines->ST_Init(NULL, NULL, 5, 5, "", ""));
+    verify(check_hardcoded_engine_hash(g_hardcoded_engines, SearchProtection::DEFAULT_SEARCH, UNI_L("5")));
+    verify(check_hardcoded_engine_hash(g_hardcoded_engines, SearchProtection::SPEED_DIAL_SEARCH, UNI_L("5")));
+
+    // read selected searches directly from g_search_ini
+    search_ini_prefs = OP_NEW(PrefsFile, (PREFS_STD));
+    verify(search_ini_prefs);
+    TRAPD(status, search_ini_prefs->ConstructL());
+    verify_success(status);
+    TRAP(status, search_ini_prefs->SetFileL(g_search_ini)); // copies g_search_ini
+    verify_success(status);
+    TRAP(status, search_ini_prefs->LoadAllL());
+    verify_success(status);
+    verify(search_ini_prefs->IsSection("Search Engine 0"));
+    verify(search_ini_prefs->IsSection("Search Engine 1"));
+    verify(search_ini_prefs->IsSection("Search Engine 2"));
+    verify(search_ini_prefs->IsSection("Search Engine 3"));
+    verify(search_ini_prefs->IsSection("Search Engine 4"));
+    verify(search_ini_prefs->IsSection("Search Engine 5"));
+    verify(search_ini_prefs->IsSection("Search Engine 6"));
+    verify_success(ReadSearchTemplate(g_search_2, search_ini_prefs, 2));
+    verify_success(ReadSearchTemplate(g_search_3, search_ini_prefs, 3));
+    verify_success(ReadSearchTemplate(g_search_5, search_ini_prefs, 5));
+    verify_success(ReadSearchTemplate(g_search_fake, search_ini_prefs, 6));
+}
+finally
+{
+    OP_DELETE(data);
+    OP_DELETE(search_ini_prefs);
+}
+
+
+test("SearchEngine::CreateSearchTemplate")
+    require success "Load hardcoded search engines";
+{
+    // create SearchTemplate from hardcoded search and verify that it has GUID and proper SearchStore
+    SearchTemplate* search = NULL;
+    const SearchProtection::SearchEngine* hardcoded_search = g_hardcoded_engines->GetSearchEngine(SearchProtection::DEFAULT_SEARCH);
+    verify(hardcoded_search);
+    verify_success(hardcoded_search->CreateSearchTemplate(search));
+    verify(search);
+    verify(search->IsFromPackage());
+    verify(search->GetUniqueGUID().HasContent());
+    verify(g_searchEngineManager->GetByUniqueGUID(search->GetUniqueGUID()) == NULL);
+    // SearchStore of modified hardcoded search should be changed to PACKAGE_MODIFIED
+    search->SetIsCustomOrModified();
+    verify(!search->IsFromPackage() && search->IsFromPackageOrModified());
+}
+finally
+{
+    g_protection_data_store.Reset();
+    OP_DELETE(search);
+}
+
+test("SearchProtection::ClearIdsOfHardcodedSearches")
+    require success "Load hardcoded search engines";
+{
+    verify_success(g_hardcoded_engines->ST_Init(NULL, NULL, 0, 1, "", "xx"));
+    verify(check_hardcoded_engine_hash(g_hardcoded_engines, SearchProtection::DEFAULT_SEARCH, UNI_L("0")));
+    verify(check_hardcoded_engine_hash(g_hardcoded_engines, SearchProtection::SPEED_DIAL_SEARCH, UNI_L("1")));
+
+    SearchProtection::ClearIdsOfHardcodedSearches();
+    verify_success(g_hardcoded_engines->ST_Init(&g_search_2, &g_search_3));
+    verify(check_hardcoded_engine_hash(g_hardcoded_engines, SearchProtection::DEFAULT_SEARCH, UNI_L("2")));
+    verify(check_hardcoded_engine_hash(g_hardcoded_engines, SearchProtection::SPEED_DIAL_SEARCH, UNI_L("3")));
+}
+finally
+{
+    g_protection_data_store.Reset();
+}
+
+
+test("HardcodedSearchEngines::InitSearchEngines: ID")
+    require success "Load hardcoded search engines";
+{
+    // HardcodedSearchEngines::InitSearchEngines should fail if there are no stored hashes
+    // and it's not possible to select hardcoded search using arguments passed to that function
+    verify(g_protection_data_store.IsEmpty());
+    verify(g_hardcoded_engines->ST_Init(NULL, NULL, UINT_MAX, UINT_MAX, "", "") == OpStatus::ERR);
+    verify(!g_hardcoded_engines->IsValid());
+
+    // init with global search configuration - should store hashes for 1 and 0
+    verify_success(g_hardcoded_engines->ST_Init(NULL, NULL, 1, 0, "", "xx"));
+    verify(check_hardcoded_engine_hash(g_hardcoded_engines, SearchProtection::DEFAULT_SEARCH, UNI_L("1")));
+    verify(check_hardcoded_engine_hash(g_hardcoded_engines, SearchProtection::SPEED_DIAL_SEARCH, UNI_L("0")));
+
+    // HardcodedSearchEngines::InitSearchEngines should initialize from stored hashes if they are valid
+    verify_success(g_hardcoded_engines->ST_Init(NULL, NULL, 0, 1, "", "xx"));
+    verify(check_hardcoded_engine_hash(g_hardcoded_engines, SearchProtection::DEFAULT_SEARCH, UNI_L("1")));
+    verify(check_hardcoded_engine_hash(g_hardcoded_engines, SearchProtection::SPEED_DIAL_SEARCH, UNI_L("0")));
+
+    // if user changes language stored hashes should become invalid
+    verify_success(g_hardcoded_engines->ST_Init(NULL, NULL, 0, 1, "", "yy"));
+    verify(check_hardcoded_engine_hash(g_hardcoded_engines, SearchProtection::DEFAULT_SEARCH, UNI_L("0")));
+    verify(check_hardcoded_engine_hash(g_hardcoded_engines, SearchProtection::SPEED_DIAL_SEARCH, UNI_L("1")));
+
+    // HardcodedSearchEngines::InitSearchEngines should reject stored hashes if they are invalid
+    OpString fake_hash;
+    // "yy" should match language, but "1100..." should not match any of hardcoded search engines
+    verify_success(fake_hash.Set("yy11"));
+    verify_success(pad_with_0s(fake_hash, 34));
+    verify_success(g_protection_data_store.WriteHardcodedEngineId(SearchProtection::DEFAULT_SEARCH, fake_hash));
+    verify_success(g_protection_data_store.WriteHardcodedEngineId(SearchProtection::SPEED_DIAL_SEARCH, fake_hash));
+    verify_success(g_hardcoded_engines->ST_Init(NULL, NULL, 0, 1, "", "yy"));
+    verify(check_hardcoded_engine_hash(g_hardcoded_engines, SearchProtection::DEFAULT_SEARCH, UNI_L("0")));
+    verify(check_hardcoded_engine_hash(g_hardcoded_engines, SearchProtection::SPEED_DIAL_SEARCH, UNI_L("1")));
+}
+finally
+{
+    g_protection_data_store.Reset();
+}
+
+test("HardcodedSearchEngines::InitSearchEngines: package")
+	require success "HardcodedSearchEngines::InitSearchEngines: ID";
+{
+    // initialization from package searches should be tried first after initialization from stored hashes fails
+    // ("pl" and 0,0 should be ignored by HardcodedSearchEngines::InitSearchEngines)
+    verify(g_protection_data_store.IsEmpty());
+    verify_success(g_hardcoded_engines->ST_Init(&g_search_5, &g_search_2, 0, 0, "", "pl"));
+    verify(check_hardcoded_engine_hash(g_hardcoded_engines, SearchProtection::DEFAULT_SEARCH, UNI_L("5")));
+    verify(check_hardcoded_engine_hash(g_hardcoded_engines, SearchProtection::SPEED_DIAL_SEARCH, UNI_L("2")));
+}
+finally
+{
+    g_protection_data_store.Reset();
+}
+
+
+table hardcoded_configurations(const char*, const char*, size_t, size_t, const char*, const char*)
+{
+    { "cis", "ru", 0, 0, "1", "1" },
+    { "cis", "none", 1, 1, "0", "0" }, // should be matched by {"cis",""} (CIS region, all languages)
+    { "gb", "pl", 0, 0, "3", "4" },    // should be matched by {"", "pl"}, because there is neither {"gb","pl"} nor {"gb",""}
+    { "gb", "none", 0, 0, "0", "0" },  // no match -> global configuration
+    { "", "pl", 0, 0, "3", "4" },
+    { "", "en", 0, 0, "5", "1" },
+    { "", "zh-cn", 1, 1, "0", "2" },
+    { "none", "none", 4, 1, "4", "1" } // no match -> global configuration
+}
+
+foreach (region, locale, global_default, global_speeddial, default_hash, speeddial_hash) from hardcoded_configurations
+{
+    test("HardcodedSearchEngines::InitSearchEngines: region/locale " region "/" locale)
+        require success "HardcodedSearchEngines::InitSearchEngines: ID";
+    {
+        verify_success(g_hardcoded_engines->ST_Init(NULL, NULL, global_default, global_speeddial, region, locale));
+        verify(check_hardcoded_engine_hash(g_hardcoded_engines, SearchProtection::DEFAULT_SEARCH, UNI_L(default_hash)));
+        verify(check_hardcoded_engine_hash(g_hardcoded_engines, SearchProtection::SPEED_DIAL_SEARCH, UNI_L(speeddial_hash)));
+    }
+    finally
+    {
+        g_protection_data_store.Reset();
+    }
+} // foreach
+
+test("HardcodedSearchEngines::InitSearchEngines: default language")
+    require success "HardcodedSearchEngines::InitSearchEngines: ID";
+{
+    // "pl" is default language for region "pl", so even if user sets UI language to "en"
+    // Opera should still load search engines for "pl" (DSK-352090)
+    verify_success(g_hardcoded_engines->ST_Init(NULL, NULL, 0, 0, "pl", "en", "pl"));
+    verify(check_hardcoded_engine_hash(g_hardcoded_engines, SearchProtection::DEFAULT_SEARCH, UNI_L("3")));
+    verify(check_hardcoded_engine_hash(g_hardcoded_engines, SearchProtection::SPEED_DIAL_SEARCH, UNI_L("4")));
+}
+finally
+{
+    g_protection_data_store.Reset();
+}
+
+test("SearchEngine::IsMatch:")
+    require success "Load hardcoded search engines";
+{
+    SearchTemplate default_search;
+    SearchTemplate speeddial_search;
+
+    verify_success(g_hardcoded_engines->ST_Init(NULL, NULL, 3, 5, "", "none"));
+
+    const SearchProtection::SearchEngine* hardcoded_default_search =
+        g_hardcoded_engines->GetSearchEngine(SearchProtection::DEFAULT_SEARCH);
+    verify(hardcoded_default_search);
+    verify_success(hardcoded_default_search->InitSearchTemplate(default_search));
+    // SearchTemplate should match hardcoded search it was created from
+    verify(hardcoded_default_search->IsMatch(&default_search) == OpBoolean::IS_TRUE);
+
+    // g_search_3 is the same search as default_search, but it was read directly from g_serach_ini
+    verify(default_search.IsMatch(&g_search_3, TRUE) == TRUE);
+    verify(hardcoded_default_search->IsMatch(&g_search_3) == OpBoolean::IS_TRUE);
+
+    const SearchProtection::SearchEngine* hardcoded_speeddial_search =
+        g_hardcoded_engines->GetSearchEngine(SearchProtection::SPEED_DIAL_SEARCH);
+    verify(hardcoded_speeddial_search);
+    verify_success(hardcoded_speeddial_search->InitSearchTemplate(speeddial_search));
+    verify(hardcoded_speeddial_search->IsMatch(&speeddial_search) == OpBoolean::IS_TRUE);
+
+    // g_search_5 is the same search as speeddial_search, but it was read directly from g_search_ini
+    verify(speeddial_search.IsMatch(&g_search_5, TRUE) == TRUE);
+    verify(hardcoded_speeddial_search->IsMatch(&g_search_5) == OpBoolean::IS_TRUE);
+
+    // search engines #3 (default) and #5 (speeddial) differ only by suggest urls - SearchTemplate::IsMatch
+    // does not check them, but SearchEngine::IsMatch should
+    verify(default_search.IsMatch(&speeddial_search, TRUE) == TRUE);
+    verify(hardcoded_default_search->IsMatch(&speeddial_search) == OpBoolean::IS_FALSE);
+
+    // SearchTemplate::IsMatch compares PersonalbarPos, but SearchEngine::IsMatch should ignore it
+    speeddial_search.SetPersonalbarPos(speeddial_search.GetPersonalbarPos() + 1);
+    verify(default_search.IsMatch(&speeddial_search, TRUE) == FALSE);
+    verify(hardcoded_speeddial_search->IsMatch(&speeddial_search) == OpBoolean::IS_TRUE);
+
+    // SearchEngine::IsMatch should also ignore search key
+    speeddial_search.SetPersonalbarPos(speeddial_search.GetPersonalbarPos() - 1);
+    verify(default_search.IsMatch(&speeddial_search, TRUE) == TRUE);
+    verify_success(speeddial_search.SetKey(UNI_L("~~")));
+    verify(default_search.IsMatch(&speeddial_search, TRUE) == FALSE);
+    verify(hardcoded_speeddial_search->IsMatch(&speeddial_search) == OpBoolean::IS_TRUE);
+
+    // most important: modified URL -> no match
+    verify(hardcoded_default_search->IsMatch(&default_search) == OpBoolean::IS_TRUE);
+    // URL with removed "&sourceid=opera"
+    verify_success(default_search.SetURL(UNI_L("http://www.google.com/search?q=%s&num=%i&ie=utf-8&oe=utf-8&channel=suggest")));
+    verify(hardcoded_default_search->IsMatch(&default_search) == OpBoolean::IS_FALSE);
+}
+finally
+{
+    g_protection_data_store.Reset();
+}
+
+test("SearchTemplate::CreatePackageCopy")
+    require success "Load hardcoded search engines";
+{
+    SearchTemplate* copy = NULL;
+    verify_success(g_search_3.CreatePackageCopy(copy));
+    verify(copy->IsFromPackage());
+    verify(copy->IsCopyFromPackage());
+    verify(copy->IsMatch(&g_search_3, TRUE));
+    verify(copy->GetUniqueGUID().HasContent());
+    verify(copy->GetUniqueGUID() != g_search_3.GetUniqueGUID());
+    verify(copy->GetUrl() == g_search_3.GetUrl());
+    verify(copy->GetKey() == g_search_3.GetKey());
+    verify(copy->GetEncoding() == g_search_3.GetEncoding());
+    verify(copy->GetName() == g_search_3.GetName());
+    verify(copy->GetSeparatorAfter() == g_search_3.GetSeparatorAfter());
+    verify(copy->GetPersonalbarPos() == g_search_3.GetPersonalbarPos());
+    verify(copy->GetAbsoluteIconAddress() == g_search_3.GetAbsoluteIconAddress());
+    verify(copy->GetIsPost() == g_search_3.GetIsPost());
+    verify(copy->GetUseTLD() == g_search_3.GetUseTLD());
+    verify(copy->GetSuggestProtocol() == g_search_3.GetSuggestProtocol());
+    OpString copy_query;
+    OpString orig_query;
+    verify_success(g_search_3.MakeSuggestQuery(UNI_L("Opera"), orig_query, SearchTemplate::SEARCH_BAR));
+    verify_success(copy->MakeSuggestQuery(UNI_L("Opera"), copy_query, SearchTemplate::SEARCH_BAR));
+    verify(copy_query == orig_query);
+}
+finally
+{
+    OP_DELETE(copy);
+}
+
+test("Don't write fallback search if not modified")
+    require success "Load hardcoded search engines";
+{
+    OpString guid;
+    PrefsFile* prefs = CreateMemPrefs();
+    verify(prefs);
+    verify_success(AddSearchToManager(g_search_fake, guid));
+    SearchTemplate* search = g_searchEngineManager->GetByUniqueGUID(guid);
+    verify(search);
+    verify(search->IsFromPackage());
+
+    BOOL result = FALSE;
+    TRAPD(status, search->WriteL("Search Engine 1", prefs, result));
+    verify_success(status);
+    verify(result == FALSE);
+
+    // removed fallback search should not be written to user's search.ini as Deleted
+    verify_success(g_searchEngineManager->RemoveItem(search));
+    guid.Empty();
+    TRAP(status, search->WriteL("Search Engine 2", prefs, result));
+    verify_success(status);
+    verify(result == FALSE);
+}
+finally
+{
+    if (prefs)
+    {
+        TRAPD(err, prefs->CommitL());
+        OP_DELETE(prefs);
+    }
+    RemoveByGuid(guid);
+    g_protection_data_store.Reset();
+}
+
+test("Write fallback search if set as default from UI")
+    require success "Load hardcoded search engines";
+{
+    SearchTemplate* original_search = NULL;
+    PrefsFile* prefs = NULL;
+    OpString guid;
+
+    original_search = GetDefaultSearch(SearchProtection::DEFAULT_SEARCH);
+    verify(original_search);
+
+    prefs = CreateMemPrefs();
+    verify(prefs);
+
+    verify_success(AddSearchToManager(g_search_fake, guid));
+    verify_success(g_searchEngineManager->SetDefaultSearch(guid));
+
+    SearchTemplate* search = g_searchEngineManager->GetDefaultSearch();
+    verify(search);
+    verify(guid == search->GetUniqueGUID());
+
+    // if user sets fallback search explicitly as default search then
+    // it should be written to user's search.ini (because if it was
+    // loaded from hardcoded searches then it can be removed on upgrade)
+    BOOL result = FALSE;
+    TRAPD(status, search->WriteL("Search Engine 1", prefs, result));
+    verify_success(status);
+    verify(result == TRUE);
+
+    // when deleted it should not be written to user's search.ini
+    // (it should be now CUSTOM)
+    verify_success(g_searchEngineManager->RemoveItem(search));
+    result = FALSE;
+    TRAP(status, search->WriteL("Search Engine 2", prefs, result));
+    verify_success(status);
+    verify(result == FALSE);
+}
+finally
+{
+    if (prefs)
+    {
+        TRAPD(err, prefs->CommitL());
+        OP_DELETE(prefs);
+    }
+    RemoveByGuid(guid);
+    if (original_search)
+    {
+        SetDefaultSearch(SearchProtection::DEFAULT_SEARCH, original_search);
+    }
+    g_protection_data_store.Reset();
+}
+
+test("Write fallback search if modified from UI")
+    require success "Load hardcoded search engines";
+{
+    SearchTemplate* original_search = NULL;
+    PrefsFile* prefs = NULL;
+    OpString guid;
+
+    original_search = GetDefaultSearch(SearchProtection::DEFAULT_SEARCH);
+    verify(original_search);
+
+    prefs = CreateMemPrefs();
+    verify(prefs);
+
+    verify_success(AddSearchToManager(g_search_fake, guid));
+
+    SearchTemplate* search = g_searchEngineManager->GetByUniqueGUID(guid);
+    verify(search);
+    verify(search->IsFromPackage());
+    INT32 pos = g_searchEngineManager->FindItem(search);
+    verify(pos >= 0);
+    g_searchEngineManager->ChangeItem(search, pos, 0);
+
+    // modified fallback serach should be written to user's search.ini
+    BOOL result = FALSE;
+    TRAPD(status, search->WriteL("Search Engine 1", prefs, result));
+    verify_success(status);
+    verify(result == TRUE);
+
+    // when deleted it should not be written to user's search.ini
+    // (it should be now CUSTOM)
+    verify_success(g_searchEngineManager->RemoveItem(search));
+    result = FALSE;
+    TRAP(status, search->WriteL("Search Engine 2", prefs, result));
+    verify_success(status);
+    verify(result == FALSE);
+}
+finally
+{
+    if (prefs)
+    {
+        TRAPD(err, prefs->CommitL());
+        OP_DELETE(prefs);
+    }
+    RemoveByGuid(guid);
+    if (original_search)
+    {
+        SetDefaultSearch(SearchProtection::DEFAULT_SEARCH, original_search);
+    }
+    g_protection_data_store.Reset();
+}
+
+table search_entries(SearchProtection::SearchType, const char*, const uni_char*, const uni_char*)
+{
+    { SearchProtection::DEFAULT_SEARCH, "DEFAULT_SEARCH", UNI_L("Dummy Default Search"), UNI_L("dummy_default_search?q=%s") },
+    { SearchProtection::SPEED_DIAL_SEARCH, "SPEED_DIAL_SEARCH", UNI_L("Dummy SpeedDial Search"), UNI_L("dummy_speeddial_search?q=%s") }
+}
+
+foreach (type, type_str, name, url) from search_entries
+{
+    test("Hash for empty " type_str " is not empty")
+    {
+        SearchTemplate empty_search;
+
+        verify_success(SearchProtection::ProtectSearch(type, NULL));
+        verify(g_protection_data_store.ReadProtectionData(type).HasContent());
+
+        verify_success(SearchProtection::ProtectSearch(type, &empty_search));
+        verify(g_protection_data_store.ReadProtectionData(type).HasContent());
+    }
+    finally
+    {
+        g_protection_data_store.Reset();
+    }
+
+    test(type_str " not set")
+    {
+        // protection should work if user unsets default search from UI (i.e. no search
+        // is set as default)
+        verify_success(SearchProtection::ProtectSearch(type, NULL));
+        verify(SearchProtection::CheckSearch(type, NULL) == OpBoolean::IS_TRUE);
+        // no default search is same as default search with no URL
+        SearchTemplate dummy_search;
+        verify(SearchProtection::CheckSearch(type, &dummy_search) == OpBoolean::IS_TRUE);
+        verify_success(dummy_search.SetURL(url));
+        verify(SearchProtection::CheckSearch(type, &dummy_search) == OpBoolean::IS_FALSE);
+    }
+    finally
+    {
+        g_protection_data_store.Reset();
+    }
+
+    test("Protect " type_str)
+    {
+        SearchTemplate dummy_search;
+        verify_success(dummy_search.SetURL(url));
+        verify(SearchProtection::CheckSearch(type, &dummy_search) == OpBoolean::IS_FALSE);
+        verify_success(SearchProtection::ProtectSearch(type, &dummy_search));
+        // verify that protected search is valid
+        verify(SearchProtection::CheckSearch(type, &dummy_search) == OpBoolean::IS_TRUE);
+        // verify that protection catches deleted searches
+        verify(SearchProtection::CheckSearch(type, NULL) == OpBoolean::IS_FALSE);
+        // verify that ProtectSearch only protects search of requested type
+        verify(SearchProtection::CheckSearch(OtherType(type), &dummy_search) == OpBoolean::IS_FALSE);
+    }
+    finally
+    {
+        g_protection_data_store.Reset();
+    }
+
+    test("Modify " type_str " from UI")
+    {
+        SearchTemplate* original_search = GetDefaultSearch(type);
+        SearchEngineItem* seitem = NULL;
+        SearchTemplate* default_search = NULL;
+        OpString new_search_guid;
+
+        OpStringC charset(UNI_L(""));
+
+        // simulate adding new default search from search preferences dialog
+        verify_success(CreateSearchEngineItem(seitem, name, url, TRUE, type));
+        verify(seitem);
+        verify_success(g_searchEngineManager->AddSearch(seitem, charset)); // deletes seitem
+        seitem = NULL;
+
+        // verify that added search is valid (matches protection data)
+        default_search = GetDefaultSearch(type);
+        verify(default_search);
+        verify_success(new_search_guid.Set(default_search->GetUniqueGUID()));
+        verify(default_search->GetName().Compare(name) == 0);
+        verify(default_search->GetUrl().Compare(url) == 0);
+        verify(SearchProtection::CheckSearch(type, default_search) == OpBoolean::IS_TRUE);
+
+        // simulate changing URL of default search from search preferences dialog
+        OpString modified_url;
+        verify_success(modified_url.Set(UNI_L("modified-")));
+        verify_success(modified_url.Append(url));
+        verify_success(CreateSearchEngineItem(seitem, name, modified_url, FALSE, type));
+        verify(seitem);
+        verify_success(g_searchEngineManager->EditSearch(seitem, charset, default_search, FALSE, FALSE)); // deletes seitem
+        seitem = NULL;
+
+        // verify that search with modified URL is still valid
+        default_search = GetDefaultSearch(type);
+        verify(default_search);
+        verify(default_search->GetName().Compare(name) == 0);
+        verify(default_search->GetUrl().Compare(modified_url) == 0);
+        verify(default_search->GetUniqueGUID().Compare(new_search_guid) == 0);
+        verify(SearchProtection::CheckSearch(type, default_search) == OpBoolean::IS_TRUE);
+
+        // remove default search
+        verify_success(g_searchEngineManager->RemoveItem(default_search));
+        verify(g_searchEngineManager->GetByUniqueGUID(new_search_guid) == NULL);
+        // RemoveItem should automatically set new default search - check that it was protected
+        default_search = GetDefaultSearch(type);
+        verify(default_search);
+        verify(SearchProtection::CheckSearch(type, default_search) == OpBoolean::IS_TRUE);
+    }
+    finally
+    {
+        SetDefaultSearch(type, original_search);
+        // AddSearch and EditSearch call Write, but RemoveItem does not
+        g_searchEngineManager->Write();
+        OP_DELETE(seitem);
+        g_protection_data_store.Reset();
+    }
+} // foreach

@@ -1,0 +1,220 @@
+/* -*- Mode: c++; tab-width: 4; indent-tabs-mode: t; c-basic-offset: 4; -*-
+**
+** Copyright (C) 2007 Opera Software ASA.  All rights reserved.
+**
+** This file is part of the Opera web browser.  It may not be distributed
+** under any circumstances.
+**
+** Frode Gill
+*/
+
+group "searchmanager.opensearch";
+require initialization;
+require OPENSEARCH_SUPPORT;
+require undefined HAVE_NO_OPMEMFILE;
+
+include "modules/searchmanager/src/searchmanager_opensearch.h";
+
+include "modules/hardcore/timer/optimer.h";
+include "modules/searchmanager/searchmanager.h";
+include "modules/url/url2.h";
+include "modules/util/opfile/opmemfile.h";
+
+global
+{
+	class OpenSearchAsyncHelper : public OpTimerListener, public MessageObject
+	{
+	public:
+		OpenSearchAsyncHelper()
+		: OpTimerListener(),
+		  MessageObject(),
+		  m_search_manager(NULL),
+		  m_opensearch_template(NULL),
+		  m_timer(NULL),
+		  m_added_notification(FALSE),
+		  m_cleanup_notification(FALSE),
+		  m_search_id(0)
+		{
+			//Create a new manager
+			m_search_manager = OP_NEW(SearchManager, ());
+			if (!m_search_manager)
+			{
+				ST_failed("SearchManager is NULL\n");
+				return;
+			}
+
+			OP_STATUS ret;
+			//Initialize an empty search manager
+			OpMemFile* search_ini_memfile = OpMemFile::Create(NULL, 0);
+			OpMemFile* usersearch_ini_memfile = OpMemFile::Create(NULL, 0);
+			TRAP(ret, m_search_manager->LoadL(search_ini_memfile, usersearch_ini_memfile));
+			if (ret != OpStatus::OK)
+			{
+				ST_failed("SearchManager LoadL failed\n");
+				return;
+			}
+
+			//Verify that it is empty
+			if (m_search_manager->GetSearchEnginesCount(TRUE, TRUE) != 0)
+			{
+				ST_failed("SearchManager LoadL found searches\n");
+				return;
+			}
+
+			/* OpenSearch XML file (taken from <URL:http://www.live.com/live/search/search.xml>)*/
+			m_opensearch_template =
+				"data:application/opensearchdescription+xml,"
+				"<?xml version=\"1.0\" encoding=\"UTF-8\" ?>"
+				"<OpenSearchDescription xmlns=\"http://a9.com/-/spec/opensearch/1.1/\">"
+				"<ShortName>Live Search</ShortName>"
+				"<Description>Use Live Search to search the web.</Description>"
+				"<Tags>Live Search</Tags>"
+				"<Contact></Contact>"
+				"<Image width=\"16\" height=\"16\" type=\"image/png\">http://www.live.com/live/search/flag.png</Image>"
+				"<Url type=\"text/html\" template=\"http://search.live.com/results.aspx?q={searchTerms}&amp;FORM=ADDLVD&amp;src={referrer:source?}\"/>"
+				"</OpenSearchDescription>";
+		
+			m_url = g_url_api->GetURL(m_opensearch_template);
+			if (m_url.IsEmpty())
+			{
+				ST_failed("Failed setting up data URL\n");
+				return;
+			}
+
+			//Register callbacks
+			if (OpStatus::IsError(g_main_message_handler->SetCallBack(this, MSG_SEARCHMANAGER_DELETE_OPENSEARCH, 0)) ||
+				OpStatus::IsError(g_main_message_handler->SetCallBack(this, MSG_SEARCHMANAGER_OPENSEARCH_ADDED, 0)))
+			{
+				ST_failed("Could not register with message handler");
+				return;
+			}
+
+			//Set up 3 second timeout (to make sure selftest finishes)
+			m_timer = OP_NEW(OpTimer, ());
+			if (!m_timer)
+			{
+				ST_failed("Failed to create timer\n");
+				return;
+			}
+			m_timer->SetTimerListener(this);
+			m_timer->Start(3000);
+
+			// Feed the data URL to the loader
+			m_search_manager->AddOpenSearch(m_url);
+		}
+
+		virtual ~OpenSearchAsyncHelper()
+		{
+			OP_DELETE(m_timer);
+			OP_DELETE(m_search_manager);
+			g_main_message_handler->UnsetCallBacks(this);
+		}
+
+		virtual void HandleCallback(OpMessage msg, MH_PARAM_1 param1, MH_PARAM_2)
+		{
+			switch (msg)
+			{
+			case MSG_SEARCHMANAGER_DELETE_OPENSEARCH:
+				m_cleanup_notification = TRUE;
+				break;
+
+			case MSG_SEARCHMANAGER_OPENSEARCH_ADDED:
+				m_added_notification = TRUE;
+				m_search_id = param1;
+				break;
+			}
+		}
+
+		/* OpTimerListener */
+		virtual void OnTimeOut(OpTimer *)
+		{
+			if (m_added_notification && m_cleanup_notification)
+			{
+				if (m_search_manager->GetSearchEnginesCount(TRUE, TRUE) != 1)
+				{
+					ST_failed("Unexpected search engine count\n");
+					return;
+				}
+
+				OpString result;
+				SearchElement* element = m_search_manager->GetSearchById(m_search_id);
+				if (!element)
+					ST_failed("Couldn't find search by ID\n");
+				else if (element->GetId() != m_search_id)
+					ST_failed("ID mismatch\n");
+				else if (element->GetLinkGUID(result)!=OpStatus::OK || result.HasContent())
+					ST_failed("Invalid GUID\n");
+				else if (element->GetName(result)!=OpStatus::OK || result.Compare(UNI_L("Live Search"))!=0)
+					ST_failed("Invalid name\n");
+				else if (element->GetDescription(result)!=OpStatus::OK || result.HasContent())
+					ST_failed("Invalid description\n");
+				else if (element->GetURL(result)!=OpStatus::OK || result.Compare(UNI_L("http://search.live.com/results.aspx?q=%s&FORM=ADDLVD&src=opera"))!=0)
+					ST_failed("Invalid url\n");
+				else if (element->GetKey(result)!=OpStatus::OK || result.HasContent())
+					ST_failed("Invalid key\n");
+				else if (element->IsPost())
+					ST_failed("Invalid post status\n");
+				else if (element->GetPostQuery(result)!=OpStatus::OK || result.HasContent())
+					ST_failed("Invalid post query\n");
+				else if (element->GetCharset(result)!=OpStatus::OK || result.CompareI(UNI_L("UTF-8"))!=0)
+					ST_failed("Invalid charset\n");
+				else if (element->GetType() != SEARCH_TYPE_SEARCH)
+					ST_failed("Invalid type\n");
+				else if (element->GetIconURL(result)!=OpStatus::OK || result.Compare(UNI_L("http://www.live.com/live/search/flag.png"))!=0)
+					ST_failed("Invalid icon url\n");
+				else if (element->GetOpenSearchXMLURL(result)!=OpStatus::OK || result.Compare(m_opensearch_template)!=0)
+					ST_failed("Invalid icon url\n");
+				else if (element->IsSeparator())
+					ST_failed("Invalid separator status\n");
+				else if (element->IsDeleted())
+					ST_failed("Invalid deleted status\n");
+				else if (element->GetVersion() != 0)
+					ST_failed("Invalid version\n");
+				else if (!element->BelongsInUserfile())
+					ST_failed("Invalid userfile status\n");
+				else if (!element->IsChangedThisSession())
+					ST_failed("Invalid changed status\n");
+				else
+					ST_passed();
+			}
+			else
+			{
+				if (!m_added_notification)
+				{
+					ST_failed("Not added within in 3s\n");
+				}
+				if (!m_cleanup_notification)
+				{
+					ST_failed("No cleanup requested within in 3s\n");
+				}
+			}
+		}
+
+	private:
+		SearchManager* m_search_manager;
+		const char* m_opensearch_template;
+		URL m_url;
+		OpTimer* m_timer;
+		BOOL m_added_notification;
+		BOOL m_cleanup_notification;
+		int m_search_id;
+	};
+
+	OpenSearchAsyncHelper* g_async_helper = NULL;
+}
+
+test("Testing async OpenSearch import") async;
+{
+	//Start the async selftest
+	g_async_helper = OP_NEW(OpenSearchAsyncHelper, ());
+	if (!g_async_helper)
+	{
+		ST_failed("Failed allocating listener\n");
+	}
+}
+
+// -- Global cleanup -----------------------------------------------------
+exit
+{
+	OP_DELETE(g_async_helper);
+}

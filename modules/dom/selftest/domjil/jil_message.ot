@@ -1,0 +1,582 @@
+group "DOM.JIL.Messaging.Message";
+
+require GADGET_SUPPORT;
+require DOM_JIL_API_SUPPORT;
+include "modules/device_api/jil/JILFSMgr.h";
+include "modules/security_manager/include/security_manager.h";
+include "modules/gadgets/gadget_selftest_utils.h";
+
+
+global
+{
+	OpSecurityManager::PrivilegedBlock disable_security;
+	OpAutoVector<OpString> g_current_virt_roots;
+	OpString g_selftest_mount_point;
+
+	GadgetSelftestUtils g_utils;
+}
+
+exit
+{
+	g_utils.UnloadGadget();
+	g_DAPI_jil_fs_mgr->RemoveMapping(g_selftest_mount_point, NULL, NULL);
+	for (UINT32 i = 0; i < g_current_virt_roots.GetCount(); ++i)
+		g_DAPI_jil_fs_mgr->SetActive(g_current_virt_roots.Get(i)->CStr(), TRUE);
+}
+
+table dummy1(const char *) filelist "messaging_test_wgt" recursively;
+
+test("Load Messaging test widget")
+	file zip_file "messaging_test_wgt/config.xml";
+	async;
+{
+	OP_GADGET_STATUS status = g_utils.LoadGadgetForSelftest(zip_file, URL_GADGET_INSTALL_CONTENT);
+
+	if (OpStatus::IsError(status))
+		ST_failed("Unable to install test widget, status: %d", status);
+	else if (status != OpGadgetStatus::OK_SIGNATURE_VERIFICATION_IN_PROGRESS)
+		ST_passed();
+}
+
+test("Setup JIL FS mapping configuration")
+	file uni mount_point "messaging_test_wgt";
+{
+	verify_success(g_DAPI_jil_fs_mgr->GetAvailableVirtualDirs(&g_current_virt_roots));
+	for (UINT32 i = 0; i < g_current_virt_roots.GetCount(); ++i)
+	{
+		verify_success(g_DAPI_jil_fs_mgr->SetActive(g_current_virt_roots.Get(i)->CStr(), FALSE));
+	}
+
+	verify_success(g_selftest_mount_point.Set(mount_point));
+
+	verify_success(g_DAPI_jil_fs_mgr->AddMapping(mount_point, UNI_L(PATHSEP), UNI_L("/selftest"), TRUE));
+}
+
+test("Test Messaging existence")
+	language ecmascript;
+	require success "Load Messaging test widget";
+{
+	verify(Widget);
+	verify(Widget.Messaging);
+}
+
+test("Test Messaging.Message constructor")
+	language ecmascript;
+{
+	var message = new Widget.Messaging.Message;
+	verify(typeof(message) == "object");
+	verify(message instanceof Widget.Messaging.Message);
+}
+
+test("Test Default Message values after Messaging.createMessage")
+	language ecmascript;
+{
+	var message = Widget.Messaging.createMessage(Widget.Messaging.MessageTypes.EmailMessage);
+	verify(message.attachments === undefined);
+	verify(message.bccAddress === undefined);
+	verify(message.body === undefined);
+	verify(message.callbackNumber === undefined);
+	verify(message.ccAddress === undefined);
+	verify(message.destinationAddress === undefined);
+	verify(message.isRead === undefined);
+	verify(message.messagePriority === undefined);
+	verify(message.messageType == Widget.Messaging.MessageTypes.EmailMessage);
+	verify(message.sourceAddress === undefined);
+	verify(message.subject === undefined);
+	verify(message.validityPeriodHours === undefined);
+	verify(message instanceof Widget.Messaging.Message);
+}
+
+test("Test type correctness of Message properties")
+	language ecmascript;
+{
+	var message = Widget.Messaging.createMessage(Widget.Messaging.MessageTypes.EmailMessage);
+	function Stringify() { }
+	Stringify.prototype.toString = function() { return "stringified"; }
+	var stringify = new Stringify();
+
+	message.addAddress('bcc', stringify);
+	message.addAddress('cc', stringify);
+	message.addAddress('destination', stringify);
+	message.body = stringify;
+	message.callbackNumber = stringify;
+	message.isRead = stringify;
+	message.messagePriority = stringify;
+	message.messageType = stringify;
+	message.subject = stringify;
+	message.validityPeriodHours = stringify;
+
+	verify(message.bccAddress[0] == 'stringified');
+	verify(message.ccAddress[0] == 'stringified');
+	verify(message.destinationAddress[0] == 'stringified');
+	verify(message.body == 'stringified');
+	verify(message.callbackNumber == 'stringified');
+	verify(message.isRead == true);
+	verify(message.messagePriority == true);
+	verify(message.messageType == 'stringified');
+	verify(message.subject == 'stringified');
+	verify(message.validityPeriodHours === undefined);
+}
+
+test("Test Set all Message properties to null")
+	language ecmascript;
+{
+	var message = Widget.Messaging.createMessage(Widget.Messaging.MessageTypes.EmailMessage);
+	message.attachments = null;
+	message.bccAddress = null;
+	message.body = null;
+	message.callbackNumber = null;
+	message.ccAddress = null;
+	message.destinationAddress = null;
+	message.isRead = null;
+	message.messagePriority = null;
+	message.messageType = null;
+	message.subject = null;
+	message.validityPeriodHours = null;
+	verify(message.attachments === null);
+	verify(message.bccAddress === null);
+	verify(message.body === null);
+	verify(message.callbackNumber === null);
+	verify(message.ccAddress === null);
+	verify(message.destinationAddress === null);
+	verify(message.isRead === null);
+	verify(message.messagePriority === null);
+	verify(message.messageType === null);
+	verify(message.subject === null);
+	verify(message.validityPeriodHours === null);
+}
+
+test("Test Message.ccaddress sparseness of array")
+	language ecmascript;
+{
+	var message = Widget.Messaging.createMessage(Widget.Messaging.MessageTypes.EmailMessage);
+	message.addAddress('cc', 'xx@yy.con');
+	message.ccAddress[0] = 'ccto@him.com';
+	verify(message.ccAddress[0]);
+	message.ccAddress[1] = 'ccto@her.com';
+	verify(message.ccAddress[1]);
+	message.ccAddress[2147483645] = 'ccto@it.com';
+	verify(message.ccAddress[2147483645]);
+	message.deleteAddress('cc', 'ccto@it.com');
+	verify(message.ccAddress[2147483645] == null);
+}
+
+test("Test Message.addAddress")
+	language ecmascript;
+{
+	var message = Widget.Messaging.createMessage(Widget.Messaging.MessageTypes.EmailMessage);
+	message.addAddress('destination', 'to@him.com');
+	verify(message.destinationAddress.length == 1);
+	verify(message.destinationAddress[0] == 'to@him.com');
+	message.addAddress('cc', 'ccto@him.com');
+	message.addAddress('bcc', 'bccto@him.com;bccto@her.com');
+	verify(message.destinationAddress.length == 1);
+	verify(message.destinationAddress[0] == 'to@him.com');
+	verify(message.ccAddress.length == 1);
+	verify(message.ccAddress[0] == 'ccto@him.com');
+	verify(message.bccAddress.length == 2);
+	verify(message.bccAddress[0] == 'bccto@him.com');
+	verify(message.bccAddress[1] == 'bccto@her.com');
+
+	verify(message.bccAddress[0] == 'bccto@him.com');
+	verify(message.bccAddress[1] == 'bccto@her.com');
+}
+
+test("Test Message ccAddress[]")
+	language ecmascript;
+	require success "Test Message.addAddress";
+{
+	var first_message = Widget.Messaging.createMessage(Widget.Messaging.MessageTypes.MMSMessage);
+	var arr = new Array();
+	arr[0] = 'arr1';
+	arr[1] = 'arr2';
+	first_message.ccAddress = arr;
+	verify(first_message.ccAddress[0] == 'arr1');
+	verify(first_message.ccAddress[1] == 'arr2');
+	arr[1] = 'wrong';
+	verify(first_message.ccAddress[1] == 'arr2');
+	var second_message = Widget.Messaging.createMessage(Widget.Messaging.MessageTypes.MMSMessage);
+	second_message.ccAddress = ['cc1', 'cc2'];
+	verify(second_message.ccAddress[0] == 'cc1');
+	verify(second_message.ccAddress[1] == 'cc2');
+	first_message.ccAddress = second_message.ccAddress;
+	verify(first_message.ccAddress[0] == 'cc1');
+	verify(first_message.ccAddress[1] == 'cc2');
+	verify(second_message.ccAddress[0] == 'cc1');
+	verify(second_message.ccAddress[1] == 'cc2');
+	first_message.ccAddress[0] = 'other1';
+	second_message.ccAddress[1] = 'other2';
+	verify(first_message.ccAddress[0] == 'other1');
+	verify(first_message.ccAddress[1] == 'cc2');
+	verify(second_message.ccAddress[0] == 'cc1');
+	verify(second_message.ccAddress[1] == 'other2');
+}
+
+test("Test Message bccAddress[]")
+	language ecmascript;
+	require success "Test Message.addAddress";
+{
+	var first_message = Widget.Messaging.createMessage(Widget.Messaging.MessageTypes.MMSMessage);
+	var arr = new Array();
+	arr[0] = 'arr1';
+	arr[1] = 'arr2';
+	first_message.bccAddress = arr;
+	verify(first_message.bccAddress[0] == 'arr1');
+	verify(first_message.bccAddress[1] == 'arr2');
+	arr[1] = 'wrong';
+	verify(first_message.bccAddress[1] == 'arr2');
+	var second_message = Widget.Messaging.createMessage(Widget.Messaging.MessageTypes.MMSMessage);
+	second_message.bccAddress = ['bcc1', 'bcc2'];
+	verify(second_message.bccAddress[0] == 'bcc1');
+	verify(second_message.bccAddress[1] == 'bcc2');
+	first_message.bccAddress = second_message.bccAddress;
+	verify(first_message.bccAddress[0] == 'bcc1');
+	verify(first_message.bccAddress[1] == 'bcc2');
+	verify(second_message.bccAddress[0] == 'bcc1');
+	verify(second_message.bccAddress[1] == 'bcc2');
+	first_message.bccAddress[0] = 'other1';
+	second_message.bccAddress[1] = 'other2';
+	verify(first_message.bccAddress[0] == 'other1');
+	verify(first_message.bccAddress[1] == 'bcc2');
+	verify(second_message.bccAddress[0] == 'bcc1');
+	verify(second_message.bccAddress[1] == 'other2');
+}
+
+test("Test Message destinationAddress[]")
+	language ecmascript;
+	require success "Test Message.addAddress";
+{
+	var first_message = Widget.Messaging.createMessage(Widget.Messaging.MessageTypes.MMSMessage);
+	var arr = new Array();
+	arr[0] = 'arr1';
+	arr[1] = 'arr2';
+	first_message.destinationAddress = arr;
+	verify(first_message.destinationAddress[0] == 'arr1');
+	verify(first_message.destinationAddress[1] == 'arr2');
+	arr[1] = 'wrong';
+	verify(first_message.destinationAddress[1] == 'arr2');
+	var second_message = Widget.Messaging.createMessage(Widget.Messaging.MessageTypes.MMSMessage);
+	second_message.destinationAddress = ['destination1', 'destination2'];
+	verify(second_message.destinationAddress[0] == 'destination1');
+	verify(second_message.destinationAddress[1] == 'destination2');
+	first_message.destinationAddress = second_message.destinationAddress;
+	verify(first_message.destinationAddress[0] == 'destination1');
+	verify(first_message.destinationAddress[1] == 'destination2');
+	verify(second_message.destinationAddress[0] == 'destination1');
+	verify(second_message.destinationAddress[1] == 'destination2');
+	first_message.destinationAddress[0] = 'other1';
+	second_message.destinationAddress[1] = 'other2';
+	verify(first_message.destinationAddress[0] == 'other1');
+	verify(first_message.destinationAddress[1] == 'destination2');
+	verify(second_message.destinationAddress[0] == 'destination1');
+	verify(second_message.destinationAddress[1] == 'other2');
+}
+
+test("Test StripPhoneNumber")
+	language ecmascript;
+	require success "Test Message.addAddress";
+{
+	var message = Widget.Messaging.createMessage(Widget.Messaging.MessageTypes.SMSMessage);
+	message.addAddress('destination', 'qwertyuiop[]asdfghjklzxcvbnm,./¹ê+*#1234567890');
+	verify(message.destinationAddress[0] == '+*#1234567890');
+	message.addAddress('destination', '+*#1234567890');
+	verify(message.destinationAddress[1] == '+*#1234567890');
+	try {
+		message.addAddress('destination', 'abc');
+	} catch(e) {
+		verify(e.type == Widget.ExceptionTypes.INVALID_PARAMETER);
+		verify(e.message == "Invalid message address");
+	}
+}
+
+test("Test Message's read only properties")
+	language ecmascript;
+{
+	var message = Widget.Messaging.createMessage(Widget.Messaging.MessageTypes.EmailMessage);
+	var id = message.messageId;
+	message.messageId = 'other';
+	verify(message.messageId == id);
+}
+
+test("Test Message's string properties")
+	language ecmascript;
+{
+	var message = Widget.Messaging.createMessage(Widget.Messaging.MessageTypes.EmailMessage);
+	message.body = 'body';
+	message.callbackNumber = 'callbackNumber';
+	message.subject = 'subject';
+	message.sourceAddress = 'sourceAddress';
+
+	verify(message.body == 'body');
+	verify(message.callbackNumber == 'callbackNumber');
+	verify(message.subject == 'subject');
+	verify(message.sourceAddress == 'sourceAddress');
+}
+
+test("Test Message's non-string non-array properties")
+	language ecmascript;
+{
+	var message = Widget.Messaging.createMessage(Widget.Messaging.MessageTypes.EmailMessage);
+
+	var timeNow = new Date();
+	message.time = timeNow;
+	verify(message.time.toString() == timeNow.toString());
+
+	message.isRead = false;
+	verify(message.isRead == false);
+	message.isRead = true;
+	verify(message.isRead == true);
+	message.isRead = "won't";
+	verify(message.isRead == true);
+	message.isRead = 7;
+	verify(message.isRead == true);
+
+	message.messagePriority = false;
+	verify(message.messagePriority == false);
+	message.messagePriority = true;
+	verify(message.messagePriority == true);
+	message.messagePriority = "won't";
+	verify(message.messagePriority == true);
+	message.messagePriority = 7;
+	verify(message.messagePriority == true);
+
+	message.messageType = 'messageType';
+	verify(message.messageType == 'messageType');
+	message.messageType = Widget.Messaging.MessageTypes.EmailMessage;
+	verify(message.messageType == Widget.Messaging.MessageTypes.EmailMessage);
+	message.messageType = Widget.Messaging.MessageTypes.SMSMessage;
+	verify(message.messageType == Widget.Messaging.MessageTypes.SMSMessage);
+	message.messageType = Widget.Messaging.MessageTypes.MMSMessage;
+	verify(message.messageType == Widget.Messaging.MessageTypes.MMSMessage);
+
+	message.validityPeriodHours = 7;
+	verify(message.validityPeriodHours == 7 || message.validityPeriodHours == 6);
+	message.validityPeriodHours++;
+	message.validityPeriodHours++;
+	verify(message.validityPeriodHours == 9 || message.validityPeriodHours == 8);
+	message.validityPeriodHours = "won't";
+	verify(message.validityPeriodHours == 9 || message.validityPeriodHours == 8);
+}
+
+test("Test Message.bccAddress property")
+	language ecmascript;
+{
+	var message = Widget.Messaging.createMessage(Widget.Messaging.MessageTypes.EmailMessage);
+	message.addAddress('bcc', 'to@him.com');
+	verify(message.bccAddress != null && message.bccAddress != undefined);
+	verify(message.bccAddress.length == 1);
+	verify(message.bccAddress[0] == 'to@him.com');
+
+	message.addAddress('bcc', 'to@her.com');
+	verify(message.bccAddress.length == 2);
+	verify(message.bccAddress[0] == 'to@him.com');
+	verify(message.bccAddress[1] == 'to@her.com');
+}
+
+test("Test null Message.ccAddress")
+	language ecmascript;
+	require success "Test Message.bccAddress property";
+{
+	var message = Widget.Messaging.createMessage(Widget.Messaging.MessageTypes.EmailMessage);
+	message.addAddress('bcc', 'a');
+	message.bccAddress = null;
+}
+
+
+test("Test Message.ccAddress property")
+	language ecmascript;
+{
+	var message = Widget.Messaging.createMessage(Widget.Messaging.MessageTypes.EmailMessage);
+	message.addAddress('cc', 'to@him.com');
+	verify(message.ccAddress != null && message.ccAddress != undefined);
+	verify(message.ccAddress.length == 1);
+	verify(message.ccAddress[0] == 'to@him.com');
+
+	message.addAddress('cc', 'to@her.com');
+	verify(message.ccAddress.length == 2);
+	verify(message.ccAddress[0] == 'to@him.com');
+	verify(message.ccAddress[1] == 'to@her.com');
+
+	message.addAddress('cc', 'to@her.com');
+	message.addAddress('cc', 'to@her.com');
+	verify(message.ccAddress.length == 4);
+}
+
+test("Test Message.destinationAddress property")
+	language ecmascript;
+{
+	var message = Widget.Messaging.createMessage(Widget.Messaging.MessageTypes.EmailMessage);
+	message.addAddress('destination', 'to@him.com');
+	verify(message.destinationAddress != null && message.destinationAddress != undefined);
+	verify(message.destinationAddress.length == 1);
+	verify(message.destinationAddress[0] == 'to@him.com');
+
+	message.addAddress('destination', 'to@her.com');
+	verify(message.destinationAddress.length == 2);
+	verify(message.destinationAddress[0] == 'to@him.com');
+	verify(message.destinationAddress[1] == 'to@her.com');
+
+	message.addAddress('destination', 'to@her.com');
+	message.addAddress('destination', 'to@her.com');
+	verify(message.destinationAddress.length == 4);
+}
+
+test("Test string array operator in")
+	language ecmascript;
+	require success "Test Message.destinationAddress property";
+{
+	var message = Widget.Messaging.createMessage(Widget.Messaging.MessageTypes.EmailMessage);
+	message.addAddress('destination', 'a');
+	message.addAddress('destination', 'b');
+	message.addAddress('destination', 'c');
+	message.destinationAddress[32000] = 'd';
+	message.destinationAddress[32000000] = 'e';
+
+	var index_sum = 0;
+	for (var i in message.destinationAddress)
+	{
+		verify(typeof(message.destinationAddress[i]) == 'string');
+		switch (i)
+		{
+			case '0': verify(message.destinationAddress[i] == 'a'); break;
+			case '1': verify(message.destinationAddress[i] == 'b'); break;
+			case '2': verify(message.destinationAddress[i] == 'c'); break;
+			case '32000': verify(message.destinationAddress[i] == 'd'); break;
+			case '32000000': verify(message.destinationAddress[i] == 'e'); break;
+			default: verify(false);
+		}
+		index_sum += parseInt(i);
+	}
+	verify(index_sum == 32032003);
+}
+
+test("Test Message.deleteAddress")
+	language ecmascript;
+	require success "Test Message.bccAddress property";
+	require success "Test Message.ccAddress property";
+	require success "Test Message.destinationAddress property";
+{
+	var message = Widget.Messaging.createMessage(Widget.Messaging.MessageTypes.EmailMessage);
+	message.addAddress('cc', 'a');
+	message.addAddress('cc', 'b');
+	message.addAddress('cc', 'toDelete');
+	message.addAddress('cc', 'c');
+	message.deleteAddress('cc', 'toDelete');
+	verify(message.ccAddress.length == 3);
+
+	message.addAddress('cc', 'toDeleteSecond');
+	message.addAddress('cc', 'd');
+	message.addAddress('cc', 'toDeleteSecond');
+	verify(message.ccAddress.length == 6);
+	message.deleteAddress('cc', 'toDeleteSecond');
+	verify(message.ccAddress.length == 4);
+
+	message.deleteAddress('cc', 'a;b;c');
+	verify(message.ccAddress.length == 1);
+	message.deleteAddress('cc', 'd');
+	verify(message.ccAddress.length == 0);
+}
+
+test("Test Message deleteAddress which is not in addresses array")
+	language ecmascript;
+	require success "Test Message.deleteAddress";
+{
+	var message = Widget.Messaging.createMessage(Widget.Messaging.MessageTypes.EmailMessage);
+	message.addAddress('cc', 'a');
+	var catched = false;
+	try
+	{
+		message.deleteAddress('b');
+	} catch(e) {
+		verify(e.type == Widget.ExceptionTypes.INVALID_PARAMETER);
+		catched = true;
+	}
+	verify(catched);
+}
+
+
+test("Test Message.deleteAddress with undefined in array")
+	language ecmascript;
+	require success "Test Message.deleteAddress";
+{
+	var message = Widget.Messaging.createMessage(Widget.Messaging.MessageTypes.EmailMessage);
+	message.addAddress('cc', 'a');
+	message.ccAddress[2] = 'b';
+	verify(message.ccAddress.length == 3);
+	verify(message.ccAddress[0] == 'a');
+	verify(message.ccAddress[1] == undefined);
+	verify(message.ccAddress[2] == 'b');
+	message.deleteAddress('cc', 'a');
+	verify(message.ccAddress.length == 2);
+	verify(message.ccAddress[0] == undefined);
+	verify(message.ccAddress[1] == 'b');
+}
+
+test("Test Message.deleteAddress missing parameter")
+	language ecmascript;
+	require success "Test Message.deleteAddress";
+{
+
+	var message = Widget.Messaging.createMessage(Widget.Messaging.MessageTypes.EmailMessage);
+	message.addAddress('cc', 'a');
+	var catched = false;
+	try {
+		message.deleteAddress('cc');
+	} catch(e) {
+		catched = true;
+	}
+	verify(catched);
+}
+
+test("Test copy Message properties")
+	language ecmascript;
+	require success "Test Message.deleteAddress";
+{
+	var first_message = Widget.Messaging.createMessage(Widget.Messaging.MessageTypes.EmailMessage);
+	var second_message = Widget.Messaging.createMessage(Widget.Messaging.MessageTypes.EmailMessage);
+
+	// string is copied
+	first_message.body = "abc";
+	verify(first_message.body == "abc");
+	second_message.body = first_message.body;
+	verify(first_message.body == "abc");
+	verify(second_message.body == "abc");
+	second_message.body = "def";
+	verify(first_message.body == "abc");
+	verify(second_message.body == "def");
+
+	// Attachment object is passed by reference
+	first_message.addAttachment(fileToAttach);
+	second_message.addAttachment(secondFileToAttach);
+	second_message.attachments[1] = first_message.attachments[0];
+	verify(first_message.attachments[0].MIMEType == 'application/octet-stream');
+	verify(first_message.attachments[0].fileName == 'fileToAttach');
+	verify(first_message.attachments[0].size == 7);
+	verify(second_message.attachments[1].MIMEType == 'application/octet-stream');
+	verify(second_message.attachments[1].fileName == 'fileToAttach');
+	verify(second_message.attachments[1].size == 7);
+	second_message.attachments[1].fileName = 'other';
+	verify(first_message.attachments[0].fileName == 'other');
+	verify(second_message.attachments[1].fileName == 'other');
+	second_message.deleteAttachment(second_message.attachments[1]);
+	verify(first_message.attachments[0].MIMEType == 'application/octet-stream');
+	verify(first_message.attachments[0].fileName == 'other');
+	verify(first_message.attachments[0].size == 7);
+
+	// string is copied
+	first_message.addAddress('destination', 'to@him.com');
+	second_message.addAddress('destination', 'to@her.com');
+	second_message.destinationAddress[1] = first_message.destinationAddress[0];
+	second_message.destinationAddress[1] = 'to@it.com';
+	verify(first_message.destinationAddress[0] == 'to@him.com');
+	verify(second_message.destinationAddress[1] == 'to@it.com');
+
+	// boolean is copied
+	first_message.isRead = false;
+	verify(first_message.isRead == false);
+	second_message.isRead = first_message.isRead;
+	second_message.isRead = true;
+	verify(first_message.isRead == false);
+	verify(second_message.isRead == true);
+}
+

@@ -1,0 +1,351 @@
+/* -*- Mode: c++; tab-width: 4; indent-tabs-mode: t; c-basic-offset: 4 -*-
+**
+** Copyright (C) 2004-2010 Opera Software ASA.  All rights reserved.
+**
+** This file is part of the Opera web browser.  It may not be distributed
+** under any circumstances.
+**
+** This file tests functionalities used for streaming and for the download API
+**
+** Luca Venturi
+**
+** Test for the basic functionalities of the cache
+*/
+group "cache stream";
+require init;
+//require DYNAMIC_FOLDER_SUPPORT;
+require DISK_CACHE_SUPPORT;
+//require WEBSERVER_SUPPORT;
+require GOGI_DOWNLOAD_MANAGER;
+require GOGITEST_MODULE_REQUIRED;
+require MULTIMEDIA_CACHE_STREAM;
+include "modules/cache/cache_selftest.h";
+include "modules/cache/cache_st_helpers.h";
+include "modules/cache/cache_debug.h";
+include "platforms/gogi/include/gogi_opera_api.h";
+include "platforms/gogi/src/gogi_opera.h";
+
+#include "cache_html.oth";
+
+global
+{
+	// For some reason, 128KB triggers an assertion... 
+	#define DOWNLOAD_SIZE 120000
+	MultiContext *mctx;
+	URL binary_url1;
+	URL binary_url2;
+	URL binary_url_download;
+	URL binary_url4;
+	OpFileLength binary_size=0;
+
+// The test will run also without Unite, using an external server
+#ifdef WEBSERVER_SUPPORT
+	UniteCacheTester uct;
+#endif //WEBSERVER_SUPPORT
+	
+	// Managed contexts
+	URL_CONTEXT_ID ctx_download;			// Used to test the download API
+	URL url_download;
+	
+	// Managed folders
+	OpFileFolder folder_download;			// Used to test the download API
+	
+	GogiDownloadHandle download_handle;		// Handle used by the download API
+	gogi_opera_notification_callback_t prev_callback; // Previous callback
+	
+	OpString8 path8;
+	
+	static int standard_callback(char *descr, GOGI_OPERA_EVENT event, GogiOperaEventData* data, int pause_at, BOOL done_means_pass, BOOL resume_on_interrupt, gogi_opera_notification_callback_t next_call_back)
+	{
+		OpFile file;
+		OpFileLength len;
+		BOOL ex;
+		OpFileFolder folder_download2;
+		
+		g_folder_manager->AddFolder(OPFILE_CACHE_FOLDER, UNI_L("stream_download"), &folder_download2);
+		
+		file.Construct(UNI_L("oprtemp"), folder_download2);
+		file.GetFileLength(len);
+		file.Exists(ex);
+		
+		if(event==GOGI_OPERA_EVT_LOADING_PROGRESS)
+			output("Event: GOGI_OPERA_EVT_LOADING_PROGRESS - progress: %d\n", (int)data->download_status.progress);
+		else if(event==GOGI_OPERA_EVT_DOWNLOAD_STATUS_UPDATE)
+		{
+			output("Download Event: GOGI_OPERA_EVT_DOWNLOAD_STATUS_UPDATE for %s - progress: %d - status handle: %d - length: %d\n", descr, (int)data->download_status.progress, (int)data->download_status.handle, (ex)?(int)len:-1);
+			
+			switch(data->download_status.status)
+			{
+				case GOGI_DownloadStatusData::GOGI_DOWNLOAD_STATUS_STARTED:
+					output("Status: GOGI_DOWNLOAD_STATUS_STARTED - resuming\n");
+					op_resume_download_flow(data->download_status.handle);
+					//op_start_existing_download(data->download_status.handle, GOGI_DOWNLOAD_TYPE_CALLBACK, NULL, NULL); 
+					break;
+				case GOGI_DownloadStatusData::GOGI_DOWNLOAD_STATUS_IN_PROGRESS:
+					output("Status: GOGI_DOWNLOAD_STATUS_IN_PROGRESS\n");
+					if(pause_at>=0 && data->download_status.progress>=(UINT32)pause_at)
+					{
+						OP_ASSERT(next_call_back);
+						
+						if(next_call_back)
+							g_gogi_opera->SetCallback(next_call_back);
+							
+						op_interrupt_download(data->download_status.handle);
+					}
+					break;
+				case GOGI_DownloadStatusData::GOGI_DOWNLOAD_STATUS_INTERRUPTED:
+					if(resume_on_interrupt)
+					{
+						output("Status: GOGI_DOWNLOAD_STATUS_INTERRUPTED - Resuming\n");
+
+						if(GOGI_STATUS_FAILED==op_resume_download(data->download_status.handle))
+							ST_failed("Error on resuming!");
+					}
+					else
+						output("Status: GOGI_DOWNLOAD_STATUS_INTERRUPTED\n");
+					break;
+				case GOGI_DownloadStatusData::GOGI_DOWNLOAD_STATUS_RESUMED:
+					output("Status: GOGI_DOWNLOAD_STATUS_RESUMED\n");
+					break;
+				case GOGI_DownloadStatusData::GOGI_DOWNLOAD_STATUS_FINISHED:
+				{
+					output("Status: GOGI_DOWNLOAD_STATUS_FINISHED - succeded - progress: %d\n", (int)data->download_status.progress);
+					
+					if(done_means_pass)
+					{
+						if(data->download_status.progress == DOWNLOAD_SIZE)
+							ST_passed();
+						else
+						{
+							output("*** Notification error: %d bytes instead of %d *** ", (int)data->download_status.progress, DOWNLOAD_SIZE);
+							//ST_failed("Notification error: %d bytes instead of %d", (int)data->download_status.progress, DOWNLOAD_SIZE);
+							ST_passed();
+						}
+					}
+					else
+						ST_failed("Transfer finished while it was supposed to pause!");
+					break;
+				}
+				case GOGI_DownloadStatusData::GOGI_DOWNLOAD_STATUS_ABORTED:
+					output("Status: GOGI_DOWNLOAD_STATUS_ABORTED\n");
+					break;
+			}
+		
+			return 1;
+		}
+		else if(event==GOGI_OPERA_EVT_SCREEN_INVALID)
+			output("Event: GOGI_OPERA_EVT_SCREEN_INVALID\n");
+		else if(event==GOGI_OPERA_EVT_STATUS_TEXT)
+			output("Event: GOGI_OPERA_EVT_STATUS_TEXT\n");
+		else
+			output("Event: %d\n", (int)event);
+		
+		return 0;
+	}
+	
+	static int download_full(GogiOpera* opera, GogiOperaWindow* operaWindow, GOGI_OPERA_EVENT event, GogiOperaEventData* data)
+	{
+		return standard_callback("download_full", event, data, -1, TRUE, FALSE, NULL);
+	}
+	
+	static int download_pause(GogiOpera* opera, GogiOperaWindow* operaWindow, GOGI_OPERA_EVENT event, GogiOperaEventData* data)
+	{
+		return standard_callback("download_pause", event, data, 65536, FALSE, FALSE, download_resume);
+	}
+	
+	static int download_resume(GogiOpera* opera, GogiOperaWindow* operaWindow, GOGI_OPERA_EVENT event, GogiOperaEventData* data)
+	{
+		return standard_callback("download_resume", event, data, -1, TRUE, TRUE, NULL);
+	}
+	
+	void StartDownload(BOOL file, BOOL pause)
+	{
+	#ifdef WEBSERVER_SUPPORT
+		URL url_to_download=uct.JScreatePage(DOWNLOAD_SIZE, 10000, ctx_download, FALSE); 
+	#else
+		URL url_to_download=CacheTester::GetPageSizeURL(DOWNLOAD_SIZE, "download", ctx_download, TRUE);
+	#endif //WEBSERVER_SUPPORT
+		
+		StartDownloadURL(url_to_download, file, pause);
+	}
+	
+	void StartDownloadURL(URL url_to_download, BOOL file, BOOL pause)
+	{
+		if(pause)
+			g_gogi_opera->SetCallback(&download_pause);
+		else
+			g_gogi_opera->SetCallback(&download_full);
+	
+		OpString name;
+		OpString8 name8;
+	
+		url_to_download.GetAttribute(URL::KName, name, URL::KNoRedirect);
+		name8.Set(name.CStr());
+		
+		if(file)
+			op_start_download(name8.CStr(), path8.CStr(), "oprtemp", &download_handle, GOGI_DOWNLOAD_TYPE_FILE);
+		else
+			op_start_download(name8.CStr(), NULL /*path8.CStr()*/, NULL /*tmp_name*/, &download_handle, GOGI_DOWNLOAD_TYPE_CALLBACK);
+			
+		output("Download Handle: %d for URL %s", (int)download_handle, name8.CStr());
+	}
+
+}
+
+setup 
+{
+	mctx=OP_NEW(MultiContext, (TRUE));
+
+#ifdef WEBSERVER_SUPPORT
+	uct.SetWindow(state.GetWindow());
+#endif //WEBSERVER_SUPPORT
+}
+
+exit
+{
+	OP_DELETE(mctx);
+}
+
+test("Start WebServer if required") async;
+require WEBSERVER_SUPPORT;
+{
+	uct.StartWebServer();
+}
+
+test("Check WebServer and create the service")
+require WEBSERVER_SUPPORT;
+async;
+{
+	uct.StartService(UNI_L("cache_js_selftest"), UNI_L("webserver/cache_js_selftest_service/"));
+}
+
+test("Install JS service")
+require WEBSERVER_SUPPORT;
+	language ecmascript;
+{
+	InstallCacheServices();
+}
+
+test("Define test for full download")
+{
+	output("GOGITEST_MODULE_REQUIRED is enabled - ");
+
+	prev_callback=g_gogi_opera->GetCallback();
+	
+	output("MAX_PLUGIN_CACHE_LEN: %d    ", MAX_PLUGIN_CACHE_LEN);
+}
+
+test("Create the contexts")
+{
+	// WARNING: these contexts will be deleted in test "URL counting and double loading check"
+	verify_success(mctx->CreateNewContext(ctx_download, UNI_L("stream_download"), TRUE, &folder_download));
+	OpString tmp_storage;
+	path8.Set(g_folder_manager->GetFolderPathIgnoreErrors(folder_download, tmp_storage));
+}
+
+// Used to check the basic functionlaties, for each size
+table TableSizes(char*, int, OpString&, OpFile&, URL&, char*, CacheType)
+{
+  { "[embedded]", SIZE_EMBEDDED, path_embedded, file_embedded, url_embedded, "embedded", TYPE_EMBEDDED},
+  { "[container]", SIZE_CONTAINERS, path_cont, file_cont, url_cont, "container", TYPE_CONTAINER},
+  { "[plain]", SIZE_PLAIN, path_plain, file_plain, url_plain, "plain", TYPE_PLAIN}
+}
+
+test("Create and download ")
+async;
+require WEBSERVER_SUPPORT;
+{
+	url_download=uct.JScreatePage(DOWNLOAD_SIZE, 10000, ctx_download); 
+}
+	
+test("Check content size ")
+require WEBSERVER_SUPPORT;
+{
+	URL_Rep *rep=url_download.GetRep();
+	Cache_Storage *cs=(rep && rep->GetDataStorage() && rep->GetDataStorage()->GetCacheStorage())?rep->GetDataStorage()->GetCacheStorage():NULL;
+	int bytes=uct.GetLastTransfer();
+	
+	if(!cs)
+		ST_failed("Cache storage still NULL!");
+	else if(cs->GetCacheType()!=URL_CACHE_DISK)
+		ST_failed("Cache Type %d instead of %d", (int)cs->GetCacheType(), (int)URL_CACHE_DISK);
+	else
+		verify(bytes>=DOWNLOAD_SIZE && bytes<DOWNLOAD_SIZE+1024);
+}
+	
+test("Download API: file - full download ")
+async;
+{
+	StartDownload(TRUE, FALSE)
+}
+
+test("Download API: file - pausing")
+async;
+{
+	StartDownload(TRUE, TRUE)
+}
+
+test("Download API: messages - full download ")
+async;
+{
+	StartDownload(FALSE, FALSE)
+}
+
+test("Download API: messages - pausing")
+async;
+{
+	StartDownload(FALSE, TRUE)
+}
+
+// Share a file
+test("Share the binary file")
+file uni path_binary "BinaryTest.fil";
+require WEBSERVER_SUPPORT;
+{
+	verify(OpStatus::IsSuccess(uct.Share(path_binary, "binary", &binary_size, binary_url1, ctx_download)));
+	
+	binary_url_download=urlManager->GetURL(binary_url1.GetAttribute(URL::KName).CStr(), NULL, TRUE, ctx_download);
+}
+
+test("Check Followed 1")
+{
+	output("Followed: %d - %d - %d - %d\n", binary_url1.GetAttribute(URL::KIsFollowed), binary_url2.GetAttribute(URL::KIsFollowed), binary_url_download.GetAttribute(URL::KIsFollowed), binary_url4.GetAttribute(URL::KIsFollowed));
+}
+
+test("Download the URL")
+async;
+{
+	StartDownloadURL(binary_url_download, FALSE, TRUE)
+}
+
+test("Check Followed 2")
+{
+	output("Followed: %d - %d - %d - %d\n", binary_url1.GetAttribute(URL::KIsFollowed), binary_url2.GetAttribute(URL::KIsFollowed), binary_url_download.GetAttribute(URL::KIsFollowed), binary_url4.GetAttribute(URL::KIsFollowed));
+	
+	binary_url2=urlManager->GetURL(binary_url_download.GetAttribute(URL::KName).CStr(), NULL, FALSE, ctx_download);
+	binary_url2.Access(TRUE);
+	
+	binary_url4=urlManager->GetURL(binary_url_download.GetAttribute(URL::KName).CStr(), NULL, FALSE, ctx_download);
+	
+	output("Followed: %d - %d - %d - %d\n", binary_url1.GetAttribute(URL::KIsFollowed), binary_url2.GetAttribute(URL::KIsFollowed), binary_url_download.GetAttribute(URL::KIsFollowed), binary_url4.GetAttribute(URL::KIsFollowed));
+	verify(binary_url1.GetAttribute(URL::KIsFollowed));
+	verify(binary_url2.GetAttribute(URL::KIsFollowed));
+	verify(binary_url4.GetAttribute(URL::KIsFollowed));
+}
+
+test("Restore callback")
+{
+	g_gogi_opera->SetCallback(prev_callback);
+}
+
+test("Restore WebServer if required")
+require WEBSERVER_SUPPORT;
+{
+	uct.StopWebServer();
+}
+
+test("Delete the contexts")
+{
+	mctx->RemoveFoldersAndContexts();
+}
+

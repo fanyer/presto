@@ -1,0 +1,318 @@
+/* -*- Mode: c++; tab-width: 4; indent-tabs-mode: t; c-basic-offset: 4 -*-
+**
+** Copyright (C) 2004-2010 Opera Software ASA.  All rights reserved.
+**
+** This file is part of the Opera web browser.  It may not be distributed
+** under any circumstances.
+**
+** Yngve N. Pettersen
+*/
+
+group "url download loading";
+
+require init;
+language c++;
+
+include "core/pch.h";
+
+require undefined NO_EXTERNAL_APPLICATIONS;
+
+
+include "modules/url/url_man.h";
+include "modules/network_selftest/urldoctestman.h";
+include "modules/prefs/prefsmanager/collections/pc_files.h";
+include "modules/util/filefun.h";
+include "modules/locale/locale-enum.h";
+
+global {
+
+	URL_DocSelfTest_Manager *url_tests = NULL;
+	OpString8 ex_file;
+
+	class Download_SimpleTest : public URL_DocVerySimpleTest
+	{
+	private:
+		int mode; // 0 at load, 1 at header loaded, 2 at first data, 3 at finished.
+		OpString targetname;
+
+	public:
+		Download_SimpleTest(int md) : mode(md){};
+	
+		virtual BOOL Verify_function(URL_DocSelfTest_Event event, Str::LocaleString status_code=Str::NOT_A_STRING){
+			switch(event){
+			case URLDocST_Event_Header_Loaded:
+				{
+					BOOL ret = URL_DocVerySimpleTest::Verify_function(event, status_code);
+					if(ret && mode == 1)
+						ret = OpStatus::IsSuccess(SetFileName());
+					return ret;
+				}
+			case URLDocST_Event_Data_Received:
+				{
+					URLStatus status = (URLStatus) url.GetAttribute(URL::KLoadStatus, TRUE);
+					
+					if((status == URL_LOADED || mode == 2) && targetname.IsEmpty()) 
+						RETURN_VALUE_IF_ERROR(SetFileName(), FALSE);
+					
+					BOOL ret = URL_DocVerySimpleTest::Verify_function(event, status_code);
+					
+					if(ret && status == URL_LOADED)
+					{
+						OpString tempname;
+						RETURN_VALUE_IF_ERROR(url.GetAttribute(URL::KFilePathName_L, tempname, URL::KFollowRedirect), FALSE);
+						if(!targetname.Compare(tempname) == 0)
+							return FALSE;
+						if(!CompareFileAndURL(this, url, targetname))
+							return FALSE;
+						ret = TRUE;
+					}
+					return ret;
+				}
+			default:
+				return URL_DocVerySimpleTest::Verify_function(event, status_code);
+			}
+		}
+		
+		virtual BOOL OnURLLoadingStarted(URL &){
+			if(mode == 0)
+				return OpStatus::IsSuccess(SetFileName());
+				
+			return TRUE;
+		}
+
+	private:
+		OP_STATUS SetFileName(){
+			OpString filename;
+			TRAPD(err, url.GetAttributeL(URL::KSuggestedFileName_L, filename, TRUE));
+			RETURN_IF_ERROR(err);
+
+			/* This code is fundamentally broken if OPFILE_TEMPDOWNLOAD_FOLDER doesn't
+			   exist.  It should exist anyway, I think, or at least with a different
+			   condition.  This function is called from non-NO_EXTERNAL_APPLICATIONS
+			   code.  Or maybe that code is broken; I don't know. */
+
+			RETURN_IF_ERROR(g_folder_manager->GetFolderPath(OPFILE_TEMPDOWNLOAD_FOLDER, targetname));
+
+			if( targetname.Length() > 0 && targetname[targetname.Length()-1] != PATHSEPCHAR )
+			{
+				RETURN_IF_ERROR(targetname.Append(PATHSEP));
+			}
+			RETURN_IF_ERROR(targetname.Append(filename));
+
+			err = CreateUniqueFilename(targetname);
+			RETURN_IF_ERROR(err);
+			if (targetname.HasContent())
+				RETURN_IF_ERROR(url.LoadToFile(targetname.CStr()));
+			else 
+				return OpStatus::ERR;
+
+			return OpStatus::OK;
+		}
+	};
+}
+
+table filename_list (const char *) filelist "testfiles/simple";
+
+table excluded_file (const char *) filelist "testfiles/simple/" name "EmptyDocument.txt";
+
+setup 
+{
+	url_tests = OP_NEW(URL_DocSelfTest_Manager, ());
+}
+
+exit
+{
+	OP_DELETE(url_tests);
+	url_tests = NULL;
+	
+	// Do a shutdown of the pending connections
+	urlManager->FreeUnusedResources(TRUE);
+}
+
+test("Initialized")
+{
+	verify(url_tests != NULL);
+	iterate (exlude_file) from excluded_file
+	{
+		verify(ex_file.IsEmpty());
+		verify(OpStatus::IsSuccess(ex_file.Set(exlude_file)));
+	}
+}
+
+
+subtest AddDownLoadTest(URL_DocSelfTest_Batch *batch, int category, const OpStringC8 &baseurl_format, URL &ref_url, const OpStringC8 &filename)
+{
+	verify(batch != NULL);
+	verify(filename.HasContent());
+
+	OpAutoPtr<Download_SimpleTest> test(OP_NEW(Download_SimpleTest, (category)));
+	verify(test.get() != NULL);
+
+	verify(OpStatus::IsSuccess(test->Construct(baseurl_format, ref_url, filename)));
+
+	verify(batch->AddTestCase(test.release()));
+}
+
+subtest AddBatch(URL_DocSelfTest_Batch *batch)
+{
+	verify(batch != NULL);
+	verify(url_tests->AddBatch(batch));
+}
+
+subtest StartTestSet()
+{
+	verify(url_tests->SetLastBatch());
+}
+
+subtest ConfigureSingleTest(const OpStringC8 &batch_id, int category, const OpStringC8 &baseurl_format, URL &ref_url, const OpStringC8 &filename)
+{
+	BOOL match = FALSE;
+	
+	if(ex_file.Compare(filename) == 0) // Can't handle empty files at the moment
+	{
+		match = TRUE;
+	}
+	
+	if(!match)
+	{
+		OpAutoPtr<URL_DocSelfTest_Batch> batch(OP_NEW(URL_DocSelfTest_Batch, ()));
+
+		verify(batch.get() != NULL);
+		
+		batch->SetBatchID(batch_id);
+
+		verify(AddDownLoadTest(batch.get(), category, baseurl_format, ref_url, filename));
+
+		verify(!batch->Empty());
+
+		verify(AddBatch(batch.release()));
+	}
+}
+
+subtest Setup_SingleTests(const OpStringC8 &batch_id, int category, const OpStringC8 &baseurl_format, URL &ref_url)
+{
+	OpString8 actual_batch_id;
+	actual_batch_id.AppendFormat("[%s:%d]", batch_id.CStr(), category);
+
+	iterate (filename) from filename_list
+	{
+		verify(ConfigureSingleTest(actual_batch_id, category, baseurl_format, ref_url, filename));
+	}
+}
+
+/*
+subtest Setup_MultipleTests(const OpStringC8 &batch_id, int category, const OpStringC8 &baseurl_format, URL &ref_url, int limit)
+{
+	OpAutoPtr<URL_DocSelfTest_Batch> batch(NULL);
+
+	OpString8 actual_batch_id;
+	actual_batch_id.AppendFormat("[%s:%d]", batch_id.CStr(), category);
+
+	iterate (filename) from filename_list
+	{
+		BOOL match = FALSE;
+		
+		iterate (ex_file) from excluded_file
+		{
+			if(op_stricmp(filename, ex_file) == 0) // Can't handle empty files at the moment
+			{
+				match = TRUE;
+			}
+		}
+		
+		if(!match)
+		{
+			if(batch.get() == NULL)
+				batch.reset(OP_NEW(URL_DocSelfTest_Batch, ()));
+
+			verify(batch.get() != NULL);
+
+			batch->SetBatchID(actual_batch_id);
+
+			verify(AddDownLoadTest(batch.get(), category,  baseurl_format, ref_url, filename));
+
+
+			if(limit && batch->Cardinal() >= limit)
+				verify(AddBatch(batch.release()));
+		}
+	}
+	if(batch.get() != NULL)
+	{
+		verify(!batch->Empty());
+		verify(AddBatch(batch.release()));
+	}
+}
+*/
+
+test("URL DownLoad Tests")
+	require success "Initialized";
+	async;
+{
+	URL empty_ref;
+	int i;
+
+	for (i=0;i<=3; i++)
+	{
+		if (!Setup_SingleTests("[Simple_1]", i, URLSelftestBase("simple/%s"), empty_ref)
+/*			|| !Setup_MultipleTests("[Simple_2]", i, URLSelftestBase("simple/%s"), empty_ref, 1)
+			|| !Setup_MultipleTests("[Simple_3]", i, URLSelftestBase("simple/%s"), empty_ref, 1)
+			|| !Setup_MultipleTests("[Simple_4]", i, URLSelftestBase("simple/%s"), empty_ref, 2)
+			|| !Setup_MultipleTests("[Simple_5]", i, URLSelftestBase("simple/%s"), empty_ref, 4)
+			|| !Setup_MultipleTests("[Simple_6]", i, URLSelftestBase("simple/%s"), empty_ref, 8)
+			|| !Setup_MultipleTests("[Simple_7]", i, URLSelftestBase("simple/%s"), empty_ref, 0)*/
+			|| !Setup_SingleTests("[Zipped_1]",i, URLSelftestBase("zipped/%s"), empty_ref)
+/*			|| !Setup_MultipleTests("[Zipped_2]",i, URLSelftestBase("zipped/%s"), empty_ref, 1)
+			|| !Setup_MultipleTests("[Zipped_3]",i, URLSelftestBase("zipped/%s"), empty_ref, 1)
+			|| !Setup_MultipleTests("[Zipped_4]",i, URLSelftestBase("zipped/%s"), empty_ref, 2)
+			|| !Setup_MultipleTests("[Zipped_5]",i, URLSelftestBase("zipped/%s"), empty_ref, 4)
+			|| !Setup_MultipleTests("[Zipped_6]",i, URLSelftestBase("zipped/%s"), empty_ref, 8)
+			|| !Setup_MultipleTests("[Zipped_7]",i, URLSelftestBase("zipped/%s"), empty_ref, 0)*/
+#ifdef URLSelftestBaseIP
+/*
+			|| !Setup_SingleTests("[Simple_1]", i, URLSelftestBaseIP("simple/%s"), empty_ref)
+			|| !Setup_MultipleTests("[Simple_2]", i, URLSelftestBaseIP("simple/%s"), empty_ref, 1)
+			|| !Setup_MultipleTests("[Simple_3]", i, URLSelftestBaseIP("simple/%s"), empty_ref, 1)
+			|| !Setup_MultipleTests("[Simple_4]", i, URLSelftestBaseIP("simple/%s"), empty_ref, 2)
+			|| !Setup_MultipleTests("[Simple_5]", i, URLSelftestBaseIP("simple/%s"), empty_ref, 4)
+			|| !Setup_MultipleTests("[Simple_6]", i, URLSelftestBaseIP("simple/%s"), empty_ref, 8)
+			|| !Setup_MultipleTests("[Simple_7]", i, URLSelftestBaseIP("simple/%s"), empty_ref, 0)
+			|| !Setup_SingleTests("[Zipped_1]",i, URLSelftestBaseIP("zipped/%s"), empty_ref)
+			|| !Setup_MultipleTests("[Zipped_2]",i, URLSelftestBaseIP("zipped/%s"), empty_ref, 1)
+			|| !Setup_MultipleTests("[Zipped_3]",i, URLSelftestBaseIP("zipped/%s"), empty_ref, 1)
+			|| !Setup_MultipleTests("[Zipped_4]",i, URLSelftestBaseIP("zipped/%s"), empty_ref, 2)
+			|| !Setup_MultipleTests("[Zipped_5]",i, URLSelftestBaseIP("zipped/%s"), empty_ref, 4)
+			|| !Setup_MultipleTests("[Zipped_6]",i, URLSelftestBaseIP("zipped/%s"), empty_ref, 8)
+			|| !Setup_MultipleTests("[Zipped_7]",i, URLSelftestBaseIP("zipped/%s"), empty_ref, 0)
+		*/
+#endif
+			)
+			ST_failed("Could not setup test");
+	}
+	if (!StartTestSet())
+		ST_failed("Could not start test set");
+}
+
+test("URLFTP Download Tests") async;
+  require undefined NO_FTP_SUPPORT;
+{
+	URL empty_ref;
+	int i;
+
+	for (i=0;i<=3; i++)
+	{
+		if (!Setup_SingleTests("[Simple_8]", i, FTP_URLSelftestBase("simple/%s"), empty_ref)
+		/*	|| !Setup_MultipleTests("[Simple_9]",i, FTP_URLSelftestBase("simple/%s"), empty_ref, 1)
+			|| !Setup_MultipleTests("[Simple_10]",i, FTP_URLSelftestBase("simple/%s"), empty_ref, 1)
+			|| !Setup_MultipleTests("[Simple_11]",i, FTP_URLSelftestBase("simple/%s"), empty_ref, 2)*/
+#ifdef FTP_URLSelftestBaseIP
+		/*	|| !Setup_SingleTests("[Simple_8]", i, FTP_URLSelftestBaseIP("simple/%s"), empty_ref)
+			|| !Setup_MultipleTests("[Simple_9]",i, FTP_URLSelftestBaseIP("simple/%s"), empty_ref, 1)
+			|| !Setup_MultipleTests("[Simple_10]",i, FTP_URLSelftestBaseIP("simple/%s"), empty_ref, 1)
+			|| !Setup_MultipleTests("[Simple_11]",i, FTP_URLSelftestBaseIP("simple/%s"), empty_ref, 2)*/
+#endif
+			)
+			ST_failed("Could not setup test");
+	}
+	if (!StartTestSet())
+		ST_failed("Could not start test set");
+}

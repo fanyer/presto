@@ -1,0 +1,604 @@
+/* -*- Mode: c++; tab-width: 4; indent-tabs-mode: t; c-basic-offset: 4 -*-
+ *
+ * Copyright (C) 1995-2009 Opera Software AS.  All rights reserved.
+ *
+ * This file is part of the Opera web browser.	It may not be distributed
+ * under any circumstances.
+ *
+ * @author emil
+ */
+
+group "quick.address_dropdown_autocompletion";
+require init;
+require DIRECT_HISTORY_SUPPORT;
+
+include "modules/history/direct_history.h";
+include "adjunct/quick/widgets/OpAddressDropDown.h";
+include "adjunct/quick/models/HistoryAutocompleteModel.h";
+include "adjunct/quick/models/DesktopHistoryModel.h";
+include "modules/widgets/OpEdit.h";
+include "adjunct/quick/managers/DesktopBookmarkManager.h";
+
+global
+{
+	OpAddressDropDown* ad;
+
+	void TypeKey(char key)
+	{
+		OpInputAction keypress(OpInputAction::ACTION_LOWLEVEL_KEY_PRESSED);
+		keypress.SetActionData(key);
+		ad->edit->OnInputAction(&keypress);
+	}
+	void TypeKeys(const char *keys)
+	{
+		while (*keys != 0)
+		{
+			TypeKey(*keys);
+			keys++;
+		}
+	}
+	void InvokeAction(OpInputAction::Action action)
+	{
+		OpInputAction a(action);
+		g_input_manager->InvokeAction(&a);
+	}
+	INT32 GetSelectedItem()
+	{
+		int position = -1;
+		ad->GetSelectedItem(&position);
+		return position;
+	}
+	BOOL DeleteBookmarkByURL(const uni_char *url)
+	{
+		OpVector<Bookmark> items;
+		BookmarkModel* model = g_hotlist_manager->GetBookmarksModel();
+		model->GetBookmarkItemList(items);
+		for(UINT32 i = 0; i < items.GetCount(); i++)
+		{
+			OpString address;
+			if (items.Get(i)->GetHistoryItem())
+				items.Get(i)->GetHistoryItem()->GetAddress(address);
+			if (address.Compare(url) == 0)
+			{
+				if (!model->DeleteItem(items.Get(i), TRUE))
+					return FALSE;
+			}
+		}
+		return TRUE;
+	}
+	class WaitUntilBookmarksReadyObj : public OpTimerListener
+	{
+	public:
+		OpTimer m_timer;
+		WaitUntilBookmarksReadyObj()
+		{
+			m_timer.SetTimerListener(this);
+			m_timer.Start(10);
+		}
+		virtual void OnTimeOut(OpTimer* timer)
+		{
+			if (!g_bookmark_manager->IsBusy())
+			{
+				OP_DELETE(this);
+				ST_passed();
+			}
+			else
+				m_timer.Start(10);
+		}
+	};
+};
+
+test("Waiting for bookmarks to get ready") async;
+{
+	if (!(OP_NEW(WaitUntilBookmarksReadyObj, ())))
+		ST_failed("Out of memory");
+}
+
+test("Autocompletion popup")
+{
+	// Delete all typed history to get consistent test results
+	InvokeAction(OpInputAction::ACTION_CLEAR_TYPED_IN_HISTORY);
+	InvokeAction(OpInputAction::ACTION_CLEAR_VISITED_HISTORY);
+
+	// Clear previous test bookmarks.
+	verify(DeleteBookmarkByURL(UNI_L("http://d u m m y 1")));
+	verify(DeleteBookmarkByURL(UNI_L("http://d u m m y 2")));
+	verify(DeleteBookmarkByURL(UNI_L("http://d u m m y 3")));
+
+	g_application->GoToPage(UNI_L("opera:blanker"), TRUE);
+
+	DocumentDesktopWindow *win = g_application->GetActiveDocumentDesktopWindow();
+	verify(win);
+
+	ad = win->GetAddressDropdown();
+	verify(ad);
+	verify(ad->edit);
+
+	// Focus address field
+	ad->edit->SetFocus(FOCUS_REASON_ACTION);
+	verify(ad->edit->IsFocused());
+	ad->edit->Clear();
+
+	TypeKey('3');
+
+	verify(ad->DropdownIsOpen());
+	verify(ad->GetModel()->GetCount() > 0);
+}
+
+test("Autocompletion dial number")
+  require success "Autocompletion popup";
+{
+	OpString address;
+
+	// Speed dial item
+	ad->GetModel()->GetItemByIndex(0)->GetAddress(address);
+	verify(address.Compare("3") == 0);
+	verify(GetSelectedItem() == 0);
+
+	if (g_pcui->GetIntegerPref(PrefsCollectionUI::AddressDropdownMixSuggestions) == 0)
+	{
+		// Web search item
+		ad->GetModel()->GetItemByIndex(1)->GetAddress(address);
+		verify(address.Compare("? 3") == 0);
+	}
+}
+
+test("Autocompletion url")
+  require success "Autocompletion popup";
+{
+	if (g_pcui->GetIntegerPref(PrefsCollectionUI::AddressDropdownMixSuggestions) == 0)
+	{
+
+		OpString address;
+		ad->edit->Clear();
+
+		TypeKey('o');
+
+		// Web search should be selected
+		ad->GetModel()->GetItemByIndex(0)->GetAddress(address);
+		verify(address.Compare("? o") == 0);
+		verify(GetSelectedItem() == 0);
+
+		TypeKeys(".com");
+
+		// Web search should NOT be selected as it is a url
+		ad->GetModel()->GetItemByIndex(0)->GetAddress(address);
+		verify(address.Compare("? o.com") == 0);
+		verify(GetSelectedItem() == -1);
+
+		ad->edit->Clear();
+		TypeKeys("o/");
+
+		// Web search should NOT be selected as it is a intranet
+		ad->GetModel()->GetItemByIndex(0)->GetAddress(address);
+		verify(address.Compare("? o/") == 0);
+		verify(GetSelectedItem() == -1);
+	}
+}
+
+test("Autocompletion quick completion")
+  require success "Autocompletion popup";
+{
+	OpString address;
+	ad->edit->Clear();
+
+	g_directHistory->Add(UNI_L("opera.com"), DirectHistory::TEXT_TYPE, 1173106132);
+	TypeKey('o');
+
+	// Text should quick complete
+	ad->edit->GetText(address);
+	verify(address.Compare("opera.com") == 0);
+
+	if (g_pcui->GetIntegerPref(PrefsCollectionUI::AddressDropdownMixSuggestions) == 0)
+	{
+
+		// Web search item
+		ad->GetModel()->GetItemByIndex(0)->GetAddress(address);
+		verify(address.Compare("? o") == 0);
+		verify(GetSelectedItem() == -1);
+
+		InvokeAction(OpInputAction::ACTION_BACKSPACE);
+
+		// Text should have quick completion removed
+		ad->edit->GetText(address);
+		verify(address.Compare("o") == 0);
+
+		// Web search item
+		ad->GetModel()->GetItemByIndex(0)->GetAddress(address);
+		verify(address.Compare("? o") == 0);
+		verify(GetSelectedItem() == 0);
+	}
+}
+
+test("Autocompletion quick completion editing end")
+  require success "Autocompletion popup";
+{
+	OpString address;
+	ad->edit->Clear();
+
+	TypeKeys("opera.coM");
+
+	// Text should NOT quick complete
+	ad->edit->GetText(address);
+	verify(address.Compare("opera.coM") == 0);
+}
+
+test("Autocompletion quick completion editing start")
+  require success "Autocompletion popup";
+{
+	OpString address;
+	ad->edit->Clear();
+
+	TypeKeys("pera.com");
+
+	InvokeAction(OpInputAction::ACTION_GO_TO_LINE_START);
+
+	TypeKeys("o");
+
+	// Text should NOT quick complete, so the caret should stay where it is.
+
+	ad->edit->GetText(address);
+	verify(address.Compare("opera.com") == 0);
+
+	// Test caret position by typing another letter
+	TypeKeys("o");
+
+	ad->edit->GetText(address);
+	verify(address.Compare("oopera.com") == 0);
+}
+
+test("Autocompletion address should not search")
+  require success "Autocompletion popup";
+{
+	if (g_pcui->GetIntegerPref(PrefsCollectionUI::AddressDropdownMixSuggestions) == 0)
+	{
+		OpString address;
+		ad->edit->Clear();
+
+		TypeKeys("http://www.opera.com");
+
+		ad->GetModel()->GetItemByIndex(0)->GetAddress(address);
+		verify(address.Compare("? http://www.opera.com") == 0);
+		verify(GetSelectedItem() == -1);
+	}
+}
+
+test("Autocompletion inline completion shortest match")
+  require success "Autocompletion popup";
+{
+	OpString address;
+	ad->edit->Clear();
+
+	g_directHistory->Add(UNI_L("ope.com"), DirectHistory::TEXT_TYPE,   1173106232);
+	g_directHistory->Add(UNI_L("opera.com/foobar"), DirectHistory::TEXT_TYPE, 1173106233);
+	g_directHistory->Add(UNI_L("opera.com/foo"), DirectHistory::TEXT_TYPE, 1173106234);
+	TypeKeys("ope");
+
+	ad->edit->GetText(address);
+	verify(address.Compare("ope.com") == 0);
+}
+
+test("Autocompletion inline completion case insensitivity")
+  require success "Autocompletion popup";
+{
+	OpString address;
+	ad->edit->Clear();
+
+	TypeKeys("OPE");
+
+	ad->edit->GetText(address);
+	verify(address.Compare("OPE") == 0);
+}
+
+test("Autocompletion inline completion match ignore prefix")
+  require success "Autocompletion popup";
+{
+	OpString address;
+	ad->edit->Clear();
+
+	g_directHistory->Add(UNI_L("Url1.com"), DirectHistory::TEXT_TYPE,   1173206232);
+	g_directHistory->Add(UNI_L("http://www.Url2.com"), DirectHistory::TEXT_TYPE, 1173206233);
+	g_directHistory->Add(UNI_L("www.U.com"), DirectHistory::TEXT_TYPE, 1173206234);
+
+	TypeKeys("U");
+
+	// Should match the third url
+	ad->edit->GetText(address);
+	verify(address.Compare("U.com") == 0);
+
+	TypeKeys("rl");
+
+	// Should match the second url
+	ad->edit->GetText(address);
+	verify(address.Compare("Url2.com") == 0);
+
+	TypeKeys("1");
+
+	// Should match the first url
+	ad->edit->GetText(address);
+	verify(address.Compare("Url1.com") == 0);
+
+	ad->edit->Clear();
+	TypeKeys("www");
+
+	ad->edit->GetText(address);
+	verify(address.Compare("www.U.com") == 0);
+
+	TypeKeys(".");
+
+	ad->edit->GetText(address);
+	verify(address.Compare("www.U.com") == 0);
+
+	TypeKeys("U");
+
+	ad->edit->GetText(address);
+	verify(address.Compare("www.U.com") == 0);
+
+	TypeKeys("r");
+
+	ad->edit->GetText(address);
+	verify(address.Compare("www.Url2.com") == 0);
+
+	ad->edit->Clear();
+	TypeKeys("http:");
+
+	ad->edit->GetText(address);
+	verify(address.Compare("http://www.Url2.com") == 0);
+
+	TypeKeys("//");
+
+	ad->edit->GetText(address);
+	verify(address.Compare("http://www.Url2.com") == 0);
+
+	TypeKeys("w");
+
+	ad->edit->GetText(address);
+	verify(address.Compare("http://www.Url2.com") == 0);
+
+	TypeKeys("ww.");
+
+	ad->edit->GetText(address);
+	verify(address.Compare("http://www.Url2.com") == 0);
+}
+
+test("Autocompletion keyword search")
+  require success "Autocompletion popup";
+{
+	if (g_pcui->GetIntegerPref(PrefsCollectionUI::AddressDropdownMixSuggestions) == 0)
+	{
+		OpString address;
+		ad->edit->Clear();
+
+		g_directHistory->Add(UNI_L("? test1"), DirectHistory::SEARCH_TYPE, 1173106132);
+		g_directHistory->Add(UNI_L("? test2"), DirectHistory::SEARCH_TYPE, 1173106133);
+		g_directHistory->Add(UNI_L("? test3"), DirectHistory::SEARCH_TYPE, 1173106134);
+
+		TypeKeys("? t");
+
+		ad->GetModel()->GetItemByIndex(0)->GetAddress(address);
+		verify(address.Compare("? t") == 0);
+
+		ad->GetModel()->GetItemByIndex(1)->GetAddress(address);
+		verify(address.Compare("") == 0); // Section item
+
+		ad->GetModel()->GetItemByIndex(2)->GetAddress(address);
+		verify(address.Compare("? test3") == 0);
+
+		ad->GetModel()->GetItemByIndex(3)->GetAddress(address);
+		verify(address.Compare("? test2") == 0);
+
+		ad->GetModel()->GetItemByIndex(4)->GetAddress(address);
+		verify(address.Compare("? test1") == 0);
+	}
+}
+
+test("Autocompletion nickname")
+  require success "Autocompletion popup";
+{
+	if (g_pcui->GetIntegerPref(PrefsCollectionUI::AddressDropdownMixSuggestions) == 0)
+	{
+		OpString address;
+		ad->edit->Clear();
+
+		BookmarkItemData item_data;
+		item_data.name.Set(UNI_L("Selftest nick 1"));
+		item_data.url.Set(UNI_L("http://d u m m y 1"));
+		item_data.shortname.Set(UNI_L("sn1"));
+		g_desktop_bookmark_manager->NewBookmark(item_data, 0);
+
+		TypeKeys("sn");
+	
+		verify(GetSelectedItem() == 0);
+
+		ad->GetModel()->GetItemByIndex(0)->GetAddress(address);
+		verify(address.Compare("? sn") == 0);
+
+		ad->GetModel()->GetItemByIndex(1)->GetAddress(address);
+		verify(address.Compare("sn1") == 0);
+
+		TypeKey('1');
+
+		verify(GetSelectedItem() == 0);
+
+		ad->GetModel()->GetItemByIndex(0)->GetAddress(address);
+		verify(address.Compare("sn1") == 0);
+
+		ad->GetModel()->GetItemByIndex(1)->GetAddress(address);
+		verify(address.Compare("? sn1") == 0);
+	}
+}
+
+test("Autocompletion multiword nickname")
+  require success "Autocompletion nickname";
+{
+	if (g_pcui->GetIntegerPref(PrefsCollectionUI::AddressDropdownMixSuggestions) == 0)
+	{
+		OpString address;
+		ad->ShowDropdown(FALSE);
+
+		BookmarkItemData item_data;
+		item_data.name.Set(UNI_L("Selftest nick 2"));
+		item_data.url.Set(UNI_L("http://d u m m y 2"));
+		item_data.shortname.Set(UNI_L("sn1 b"));
+		g_desktop_bookmark_manager->NewBookmark(item_data, 0);
+
+		InvokeAction(OpInputAction::ACTION_BACKSPACE);
+
+		ad->GetModel()->GetItemByIndex(0)->GetAddress(address);
+		verify(address.Compare("? sn") == 0);
+
+		ad->GetModel()->GetItemByIndex(1)->GetAddress(address);
+		verify(address.Compare("sn1 b") == 0);
+
+		ad->GetModel()->GetItemByIndex(2)->GetAddress(address);
+		verify(address.Compare("sn1") == 0);
+
+		TypeKey('1');
+
+		ad->GetModel()->GetItemByIndex(0)->GetAddress(address);
+		verify(address.Compare("sn1") == 0);
+
+		ad->GetModel()->GetItemByIndex(1)->GetAddress(address);
+		verify(address.Compare("? sn1") == 0);
+
+		ad->GetModel()->GetItemByIndex(2)->GetAddress(address);
+		verify(address.Compare("sn1 b") == 0);
+
+		TypeKeys(" b");
+
+		ad->GetModel()->GetItemByIndex(0)->GetAddress(address);
+		verify(address.Compare("sn1 b") == 0);
+	}
+}
+
+test("Autocompletion nickname overrides quickcompletion")
+  require success "Autocompletion nickname";
+{
+	OpString address;
+	ad->edit->Clear();
+	ad->ShowDropdown(FALSE);
+
+	BookmarkItemData item_data;
+	item_data.name.Set(UNI_L("Selftest nick 3"));
+	item_data.url.Set(UNI_L("http://d u m m y 3"));
+	item_data.shortname.Set(UNI_L("selftestnick"));
+	g_desktop_bookmark_manager->NewBookmark(item_data, 0);
+
+	g_directHistory->Add(UNI_L("selftestnick.com"), DirectHistory::TEXT_TYPE, 1173116132);
+
+	TypeKeys("selftestnic");
+
+	ad->edit->GetText(address);
+	verify(address.Compare("selftestnick.com") == 0);
+
+	TypeKeys("k");
+
+	ad->edit->GetText(address);
+	verify(address.Compare("selftestnick") == 0);
+
+	TypeKeys(".");
+
+	ad->edit->GetText(address);
+	verify(address.Compare("selftestnick.com") == 0);
+}
+
+test("Autocompletion remove duplicates")
+  require success "Autocompletion popup";
+{
+	OpString address;
+	ad->edit->Clear();
+	ad->ShowDropdown(FALSE);
+
+	DesktopHistoryModel* history_model = DesktopHistoryModel::GetInstance();
+	history_model->AddPage(UNI_L("http://selftesthistoryitem.com"), UNI_L("selftest dummy"), 1173116132);
+	history_model->AddPage(UNI_L("http://www.selftesthistoryitem.com"), UNI_L("selftest dummy"), 1173116133);
+
+	TypeKeys("selftesthistoryitem");
+
+	int index1 = -1;
+	int index2 = -1;
+	for(int i = 0; i < ad->GetModel()->GetCount(); i++)
+	{
+		ad->GetModel()->GetItemByIndex(i)->GetAddress(address);
+		if (address.Compare("http://www.selftesthistoryitem.com") == 0)
+			index1 = i;
+		if (address.Compare("http://selftesthistoryitem.com") == 0)
+			index2 = i;
+	}
+	verify(index1 != -1);
+	verify(index2 == -1); // The duplicate item should not be in the list.
+
+	// Navigate to the item at index1
+	for(int j = 0; j < ad->GetModel()->GetCount(); j++)
+	{
+		InvokeAction(OpInputAction::ACTION_NEXT_ITEM);
+		if (GetSelectedItem() == index1)
+			break;
+	}
+	verify(GetSelectedItem() == index1);
+}
+
+test("Autocompletion delete item in history")
+  require success "Autocompletion remove duplicates";
+{
+	// Verify that we delete it from UI
+
+	int item_count = ad->GetModel()->GetCount();
+	InvokeAction(OpInputAction::ACTION_DELETE_SELECTED_ITEM);
+	verify(ad->GetModel()->GetCount() == item_count - 1);
+
+	// Clear and type it again to verify that we really deleted it from history,
+	// and also deleted the duplicate item.
+
+	ad->edit->Clear();
+	TypeKeys("selftesthistoryitem");
+
+	int index = -1;
+	for(int i = 0; i < ad->GetModel()->GetCount(); i++)
+	{
+		OpString address;
+		ad->GetModel()->GetItemByIndex(i)->GetAddress(address);
+		if (address.Find("http://www.selftesthistoryitem.com") != -1 ||
+			address.Find("http://selftesthistoryitem.com") != -1)
+		{
+			index = i;
+			output("The item is still not removed!");
+		}
+	}
+	verify(index == -1);
+}
+
+test("Autocompletion delete item in previosly typed history")
+  require success "Autocompletion popup";
+{
+	OpString address;
+	ad->edit->Clear();
+	ad->ShowDropdown(FALSE);
+
+	g_directHistory->Add(UNI_L("selftest delete item 1"), DirectHistory::TEXT_TYPE, 1173316132);
+	g_directHistory->Add(UNI_L("selftest delete item 2"), DirectHistory::TEXT_TYPE, 1173316133);
+
+	ad->ShowMenu();
+	
+	verify(ad->DropdownIsOpen());
+	int item_count = ad->GetModel()->GetCount();
+	verify(item_count >= 2);
+
+	ad->GetModel()->GetItemByIndex(0)->GetAddress(address);
+	verify(address.Compare("selftest delete item 2") == 0);
+
+	InvokeAction(OpInputAction::ACTION_NEXT_ITEM);
+	InvokeAction(OpInputAction::ACTION_DELETE_SELECTED_ITEM);
+
+	ad->GetModel()->GetItemByIndex(0)->GetAddress(address);
+	verify(address.Compare("selftest delete item 1") == 0);
+	verify(ad->GetModel()->GetCount() == item_count - 1);
+
+	InvokeAction(OpInputAction::ACTION_DELETE_SELECTED_ITEM);
+	verify(ad->GetModel()->GetCount() == item_count - 2);
+
+	ad->ShowDropdown(FALSE);
+
+	ad->ShowMenu();
+	verify(ad->GetModel()->GetCount() == item_count - 2);
+}

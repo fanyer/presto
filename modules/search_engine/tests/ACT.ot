@@ -1,0 +1,1519 @@
+group "search_engine.ACT";
+
+require SEARCH_ENGINE;
+
+include "modules/search_engine/ACT.h";
+include "modules/search_engine/ACTUtil.h";
+include "modules/search_engine/tests/test_util.h";
+include "modules/util/opfile/opfile.h";
+
+global
+{
+class TailCompressCallback
+{
+public:
+	OpINT32Vector ids;
+	OpVector<char> words;
+
+	static OP_STATUS Callback(char **str, ACT::WordID id, void *self_ptr)
+	{
+		int pos;
+		const char *s;
+
+		pos = ((TailCompressCallback *)self_ptr)->ids.Search(id);
+		if (((TailCompressCallback *)self_ptr)->ids.Get(pos) != (int)id)
+			return OpStatus::ERR;
+
+		s = ((TailCompressCallback *)self_ptr)->words.Get(pos);
+
+		if ((*str = OP_NEWA(char, op_strlen(s) + 1)) == NULL)
+			return OpStatus::ERR_NO_MEMORY;
+		op_strcpy(*str, s);
+
+		return OpStatus::OK;
+	}
+};
+
+class WordParser
+{
+	OpFile *f;
+	OpString8 buf;
+	unsigned char *ptr, *end;
+public:
+	WordParser(void) {f = NULL; ptr = NULL; end = NULL;}
+	void Construct(const uni_char *fname);
+	void Close(void);
+	char *ReadWord(void);
+};
+
+void WordParser::Construct(const uni_char *fname)
+{
+	f = OP_NEW(OpFile, ());
+	f->Construct(fname);
+	if (f->Open(OPFILE_READ | OPFILE_TEXT) != OpStatus::OK)
+	{
+		OP_DELETE(f);
+		f = NULL;
+	}
+}
+
+char *WordParser::ReadWord(void)
+{
+	unsigned char *start;
+
+	if (f == NULL)
+		return NULL;
+
+	do {
+		while (buf.IsEmpty() || ptr >= end)
+		{
+			f->ReadLine(buf);
+			if (f->Eof())
+			{
+				f->Close();
+				OP_DELETE(f);
+				f = NULL;
+				return NULL;
+			}
+			ptr = (unsigned char *)buf.CStr();
+			end = ptr + op_strlen((char *)ptr);
+		}
+
+		while (*ptr < 0x80 && !op_isalnum(*ptr) && ptr < end)
+			++ptr;
+	} while (ptr >= end);
+
+	start = ptr;
+	while (*ptr >= 0x80 || op_isalnum(*ptr))
+		++ptr;
+
+	*ptr = 0;
+
+	return (char *)start;
+}
+
+void WordParser::Close(void)
+{
+	if (f != NULL)
+	{
+		f->Close();
+		OP_DELETE(f);
+	}
+
+	buf.Empty();
+}
+
+}
+
+test("ACT analysis") disabled;
+	file uni jlexicon_ax "data/jlexicon.axx";
+{
+	ACT act;
+	OP_STATUS status;
+	SearchIterator<ACT::PrefixResult> *res;
+	OpString word;
+	int len;
+	unsigned numbers = 0, words = 0, other = 0,
+		nlen5 = 0, nlen10 = 0, nlen20 = 0, nlen30 = 0, nlen_more = 0,
+		len5 = 0, len10 = 0, len20 = 0, len30 = 0, len_more = 0,
+		count = 0;
+
+	status = act.Open(jlexicon_ax, BlockStorage::OpenRead);
+	verify_success(status);
+
+	res = act.PrefixCaseSearch("");
+	verify(res != NULL && !res->End());
+
+
+	do {
+		word.SetFromUTF8(res->Get().utf8_word);
+		++count;
+
+		len = word.Length();
+
+		if (uni_isdigit(*word.CStr()))
+		{
+			++numbers;
+
+			if (len <= 5)
+				++nlen5;
+			else if (len <= 10)
+				++nlen10;
+			else if (len <= 20)
+				++nlen20;
+			else if (len <= 30)
+				++nlen30;
+			else
+				++nlen_more;
+		}
+		else {
+			if (uni_isalpha(*word.CStr()))
+				++words;
+			else
+				++other;
+
+			if (len <= 5)
+				++len5;
+			else if (len <= 10)
+				++len10;
+			else if (len <= 20)
+				++len20;
+			else if (len <= 30)
+				++len30;
+			else
+				++len_more;
+		}
+	} while (res->Next());
+
+	output("\nnumbers: %i\nalpha: %i\nother: %i\n", numbers, words, other);
+	output("\nnumbers:");
+	output("\n 5: %i\n10: %i\n20: %i\n30: %i\n >: %i\n", nlen5, nlen10, nlen20, nlen30, nlen_more);
+	output("\nwords:");
+	output("\n 5: %i\n10: %i\n20: %i\n30: %i\n >: %i\n", len5, len10, len20, len30, len_more);
+	output("\ntotal: %i\n", count);
+
+	OP_DELETE(res);
+
+	act.Close();
+}
+
+
+test("ACT fill") disabled;
+	file uni actf_wr   "data/actf.wr";
+	file uni actf_wr_j "data/actf.wr-j";
+{
+// this test works only for branch size of 818 (ACTUtil.h:#define TRIE_SIZE)
+
+	ACT act;
+	OpFileLength file_size1, file_size2, block_size;
+	OpLowLevelFile *f;
+	OP_STATUS status;
+	char *word817 =
+"QWERTYUIOPASDFGHJKLZXCVBNM1234567890QWERTYUIOPASDFGHJKLZXCVBNM1234567890QWERTYUIOPASDFGHJKLZXCVBNM1234567890QWERTYUIOPASDFGHJKLM"
+"QWERTYUIOPASDFGHJKLZXCVBNM1234567890QWERTYUIOPASDFGHJKLZXCVBNM1234567890QWERTYUIOPASDFGHJKLZXCVBNM1234567890QWERTYUIOPASDFGHJKLM"
+"QWERTYUIOPASDFGHJKLZXCVBNM1234567890QWERTYUIOPASDFGHJKLZXCVBNM1234567890QWERTYUIOPASDFGHJKLZXCVBNM1234567890QWERTYUIOPASDFGHJKLM"
+"QWERTYUIOPASDFGHJKLZXCVBNM1234567890QWERTYUIOPASDFGHJKLZXCVBNM1234567890QWERTYUIOPASDFGHJKLZXCVBNM1234567890QWERTYUIOPASDFGHJKLM"
+"QWERTYUIOPASDFGHJKLZXCVBNM1234567890QWERTYUIOPASDFGHJKLZXCVBNM1234567890QWERTYUIOPASDFGHJKLZXCVBNM1234567890QWERTYUIOPASDFGHJKLM"
+"QWERTYUIOPASDFGHJKLZXCVBNM1234567890QWERTYUIOPASDFGHJKLZXCVBNM1234567890QWERTYUIOPASDFGHJKLZXCVBNM1234567890QWERTYUIOPASDFGHJKLM"
+//"QWERTYUIOPASDFGHJK";
+"QWERTYUIOPASDFGHJKLZXCVBNM1234567890QWERTYUIOPASD";
+	char *word817_2 =
+"QWERTYUIOPASDFGHJKLZXCVBNM1234567890QWERTYUIOPASDFGHJKLZXCVBNM1234567890QWERTYUIOPASDFGHJKLZXCVBNM1234567890QWERTYUIOPASDFGHJKLM"
+"QWERTYUIOPASDFGHJKLZXCVBNM1234567890QWERTYUIOPASDFGHJKLZXCVBNM1234567890QWERTYUIOPASDFGHJKLZXCVBNM1234567890QWERTYUIOPASDFGHJKLM"
+"QWERTYUIOPASDFGHJKLZXCVBNM1234567890QWERTYUIOPASDFGHJKLZXCVBNM1234567890QWERTYUIOPASDFGHJKLZXCVBNM1234567890QWERTYUIOPASDFGHJKLM"
+"QWERTYUIOPASDFGHJKLZXCVBNM1234567890QWERTYUIOPASDFGHJKLZXCVBNM1234567890QWERTYUIOPASDFGHJKLZXCVBNM1234567890QWERTYUIOPASDFGHJKLM"
+"QWERTYUIOPASDFGHJKLZXCVBNM1234567890QWERTYUIOPASDFGHJKLZXCVBNM1234567890QWERTYUIOPASDFGHJKLZXCVBNM1234567890QWERTYUIOPASDFGHJKLM"
+"QWERTYUIOPASDFGHJKLZXCVBNM1234567890QWERTYUIOPASDFGHJKLZXCVBNM1234567890QWERTYUIOPASDFGHJKLZXCVBNM1234567890QWERTYUIOPASDFGHJKLM"
+"QWERTYUIOPASDFGHJKLZXCVBNM1234567890QWERTYUIOPASC";
+
+//	verify(op_strlen(word817) == 817);
+
+	delete_file(actf_wr);
+	delete_file(actf_wr_j);
+	act.Open(actf_wr, BlockStorage::OpenReadWrite);
+	act.Close();
+
+	verify_success(OpLowLevelFile::Create(&f, actf_wr));
+	
+	status = f->GetFileLength(&block_size);
+	verify_success(status);
+	verify(block_size != 0); // or we crash further down
+
+	block_size /= 2;
+	f->Close();
+	OP_DELETE(f);
+
+	act.Open(actf_wr, BlockStorage::OpenReadWrite);
+
+	act.AddWord(word817, 1);
+	act.Close();
+
+	verify_success(OpLowLevelFile::Create(&f, actf_wr));
+
+	status = f->GetFileLength(&file_size1);
+	verify_success(status);
+
+	file_size1 = file_size1 / block_size - 1;
+	f->Close();
+	OP_DELETE(f);
+
+	act.Open(actf_wr, BlockStorage::OpenReadWrite);
+	act.AddWord(word817_2, 2);
+	act.Close();
+
+	verify_success(OpLowLevelFile::Create(&f, actf_wr));
+
+	status = f->GetFileLength(&file_size2);
+	verify_success(status);
+
+	file_size2 = file_size2 / block_size - 1;
+	f->Close();
+	OP_DELETE(f);
+
+	delete_file(actf_wr);
+
+	verify(file_size1 == 1);
+	verify(file_size2 == 2);
+}
+
+test("ACT leaks") leakcheck;
+	file uni actl_wr     "data/actl.wr";
+	file uni actl_wr_j   "data/actl.wr-j";
+	file uni english_txt "data/english.txt";
+{
+	ACT act;
+	ACT::WordID w1, w2, w3;
+	WordParser wp;
+	char *word;
+	char prev_word[16] = "not_found";
+	char old_word[32] = "not_found_too";
+	int i;
+	int errors;
+	BOOL word_created;
+	OP_STATUS status;
+
+	delete_file(actl_wr);
+	delete_file(actl_wr_j);
+
+	if (BlockStorage::FileExists(english_txt) != OpBoolean::IS_TRUE)
+	{
+		output("\ndata/english.txt not found, aborting ...");
+		errors = 0;
+	}
+	else {
+		status = act.Open(actl_wr, BlockStorage::OpenReadWrite);
+		verify_success(status);
+
+		wp.Construct(english_txt);
+
+		errors = 0;
+		i = 0;
+		w2 = 0;
+		w3 = 0;
+
+		while (i < 100 && (word = wp.ReadWord()) != NULL)
+		{
+			w1 = i;
+
+			word_created = act.AddWord(word, w1, FALSE) == OpBoolean::IS_TRUE;
+
+			if (word_created)
+				if (act.Search(word) != w1)
+					++errors;
+
+
+			if (act.Search(prev_word) != w2)
+				++errors;
+
+
+			if (act.Search(old_word) != w3)
+				++errors;
+
+
+			if (word_created && op_strlen(word) < sizeof(prev_word) && (*word & 1) != 0)  // some randomness
+			{
+				op_strcpy(prev_word, word);
+				w2 = w1;
+			}
+
+			if (word_created && i % 100 == 5 && op_strlen(word) < sizeof(old_word))
+			{
+				op_strcpy(old_word, word);
+				w3 = w1;
+			}
+
+			++i;
+		}
+
+		wp.Close();
+
+		verify_success(act.Flush());
+
+		if (act.CheckConsistency() != OpBoolean::IS_TRUE)
+			++errors;
+
+		verify_success(act.Close());
+
+		delete_file(actl_wr);
+	}
+
+	verify(errors == 0);
+}
+
+test("ACT IDs")
+	file uni act_wr   "data/act.wr";
+	file uni act_wr_j "data/act.wr-j";
+{
+	ACT act;
+	ACT::WordID sresult1[8], sresult2[8];
+	ACT::WordID id;
+	char *wresult = NULL;
+	char *allwords[8];
+	int prefix_match;
+	int count1, count2;
+	OP_BOOLEAN consistent;
+	char word[8];  /* ARRAY OK 2010-09-24 roarl */
+	int i;
+	OP_STATUS status;
+
+	delete_file(act_wr);
+	delete_file(act_wr_j);
+	status = act.Open(act_wr, BlockStorage::OpenReadWrite);
+	verify_success(status);
+
+	word[0] = FIRST_CHAR;  // this should be ignored during indexing and searching
+	word[1] = FIRST_CHAR + 1;  // the first really valid character
+	word[2] = '\xff';  // the last valid character; the utf8 combination is probably invalid, but it doesn't matter
+	word[3] = 'a';
+	word[4] = 0;
+	verify_success(act.AddCaseWord(word, 1));
+
+	id = act.CaseSearch(word);
+	act.PrefixCaseWords(&wresult, "", 1);
+	if (wresult != NULL)
+	{
+		prefix_match = ACT::WordsEqual(wresult, word);
+		OP_DELETEA(wresult);
+	}
+	else
+		prefix_match = 0;
+
+	word[3] = FIRST_CHAR + 1;
+	verify_success(act.AddCaseWord(word, 2));
+
+	word[3] = 0;
+	count1 = act.PrefixCaseSearch(sresult1, word, 8);
+
+	word[3] = FIRST_CHAR + 1;
+	verify_success(act.DeleteCaseWord(word));
+
+	word[3] = 0;
+	count2 = act.PrefixCaseSearch(sresult2, word, 8);
+
+	verify_success(act.Flush());
+
+	consistent = act.CheckConsistency();
+
+	verify_success(act.Close());
+	delete_file(act_wr);
+
+	verify(id == 1);
+	verify(prefix_match == -1);
+	verify(count1 == 2 && ((sresult1[0] == 1 && sresult1[1] == 2) || (sresult1[0] == 2 && sresult1[1] == 1)));
+	verify(count2 == 1 && sresult2[0] == 1);
+	verify(consistent == OpBoolean::IS_TRUE);
+
+	verify_success(act.Open(act_wr, BlockStorage::OpenReadWrite));
+
+	verify_success(act.AddWord("prefixpostfix", 1));
+	verify_success(act.AddWord("prefix", 2));
+	verify_success(act.AddWord("pre", 3));
+	verify_success(act.AddWord("pr", 4));
+
+	verify_success(act.DeleteWord("prefix"));
+
+	count1 = act.PrefixWords(allwords, "pr", 8);
+	for (i = 0; i < count1; ++i)
+		OP_DELETEA(allwords[i]);
+
+	count2 = act.PrefixSearch(sresult2, "pr", 8);
+
+	if (count2 == 3)
+	{
+		if (sresult2[0] > sresult2[1])
+		{
+			i = sresult2[0];
+			sresult2[0] = sresult2[1];
+			sresult2[1] = i;
+		}
+		if (sresult2[0] > sresult2[2])
+		{
+			i = sresult2[0];
+			sresult2[0] = sresult2[2];
+			sresult2[2] = i;
+		}
+		if (sresult2[1] > sresult2[2])
+		{
+			i = sresult2[1];
+			sresult2[1] = sresult2[2];
+			sresult2[2] = i;
+		}
+	}
+
+	verify_success(act.Flush());
+
+	consistent = act.CheckConsistency();
+
+	verify_success(act.Close());
+	delete_file(act_wr);
+
+	verify(count1 == 3);
+	verify(count2 == 3 && sresult2[0] == 1 && sresult2[1] == 3 && sresult2[2] == 4);
+	verify(consistent == OpBoolean::IS_TRUE);
+}
+
+test("ACT insert")
+	file uni act_wr        "data/act.wr";
+	file uni act_wr_j      "data/act.wr-j";
+	file uni icelandic_txt "data/icelandic.txt";
+{
+	ACT act;
+	ACT::WordID w1, w2, w3;
+	WordParser wp;
+	char *word;
+	char prev_word[16] = "not_found";
+	char old_word[32] = "not_found_too";
+	int i;
+	int errors;
+	BOOL word_created;
+#ifdef _DEBUG
+	time_t test_start;
+	int favg, fmin, fmax;
+	int distributions[10];
+#endif
+	OpFileLength file_size, block_size;
+	OpLowLevelFile *f;
+	OP_STATUS status;
+
+	delete_file(act_wr);
+	delete_file(act_wr_j);
+
+	if (BlockStorage::FileExists(icelandic_txt) != OpBoolean::IS_TRUE)
+	{
+		output("\ndata/icelandic.txt not found, aborting ...");
+		errors = 0;
+	}
+	else {
+
+		verify_success(act.Open(act_wr, BlockStorage::OpenReadWrite));
+		verify_success(act.Close());
+
+		status = OpLowLevelFile::Create(&f, act_wr);
+		verify_success(status);
+
+		status = f->GetFileLength(&block_size);
+		verify_success(status);
+		verify(block_size != 0);
+
+		block_size /= 2;
+		f->Close();
+		OP_DELETE(f);
+
+		verify_success(act.Open(act_wr, BlockStorage::OpenReadWrite));
+
+		wp.Construct(icelandic_txt);
+
+#ifdef _DEBUG
+		test_start = op_time(NULL);
+#endif
+
+		errors = 0;
+		i = 0;
+		w2 = 0;
+		w3 = 0;
+
+		while ((word = wp.ReadWord()) != NULL)
+		{
+			w1 = i;
+
+			word_created = act.AddWord(word, w1, FALSE) == OpBoolean::IS_TRUE;
+
+			if (word_created)
+				if (act.Search(word) != w1)
+					++errors;
+
+
+			if (act.Search(prev_word) != w2)
+				++errors;
+
+
+			if (act.Search(old_word) != w3)
+				++errors;
+
+
+			if (word_created && op_strlen(word) < sizeof(prev_word) && (*word & 1) != 0)  // some randomness
+			{
+				op_strcpy(prev_word, word);
+				w2 = w1;
+			}
+
+			if (word_created && i % 100 == 5 && op_strlen(word) < sizeof(old_word))
+			{
+				op_strcpy(old_word, word);
+				w3 = w1;
+			}
+
+			++i;
+		}
+
+		wp.Close();
+
+		verify_success(act.Flush());
+
+#ifdef _DEBUG
+		output("\ninsertion of %i words and search of %i words took %i seconds\n", i, i * 3, op_time(NULL) - test_start);
+		output("disk reads:                %i\n", act.branches_read);
+		output("disk writes:               %i\n", act.branches_written);
+		output("cache accessed:            %i\n", act.branches_cached);
+		output("branches created:          %i\n", act.branches_created);
+		output("modified branches flushed: %i\n", act.flush_count);
+		output("collisions resolved:       %i\n", act.collision_count);
+
+		act.GetFillFactor(&favg, &fmin, &fmax, 0);
+		output("Total fill factor (%% of space used): %i%%, minimum: %i%%, maximum: %i%%\n", favg, fmin, fmax); 
+
+		act.GetFillFactor(&favg, &fmin, &fmax, 1);
+		output("Parent fill factor (%% of space used): %i%%, minimum: %i%%, maximum: %i%%\n", favg, fmin, fmax); 
+
+		act.GetFillFactor(&favg, &fmin, &fmax, 2);
+		output("Children fill factor (%% of space used): %i%%, minimum: %i%%, maximum: %i%%\n", favg, fmin, fmax); 
+
+		act.GetFillDistribution(distributions, sizeof(distributions) / sizeof(int));
+		for (i = 0; i < (int)(sizeof(distributions) / sizeof(int)); ++i)
+		{
+			output("Fill at level %i: %i%%\n", i, distributions[i]);
+		}
+#endif  // _DEBUG
+
+		if (act.Search("Proofreading") == 0)
+			++errors;
+
+		if (act.Search("Proofr") != 0)
+			++errors;
+
+		if (act.Search("neexistujicihodnedlouhyslovoslovokterybynemelobejtvact") != 0)
+			++errors;
+
+		if (act.Search("neex") != 0)
+			++errors;
+
+		if (act.PrefixSearch(&w1, "blessa", 1) <= 0)
+			++errors;
+
+		if (act.CheckConsistency() != OpBoolean::IS_TRUE)
+			++errors;
+
+		verify_success(act.Close());
+
+		status = OpLowLevelFile::Create(&f, act_wr);
+		verify_success(status);
+
+		status = f->GetFileLength(&file_size);
+		verify_success(status);
+
+		file_size = file_size / block_size - 1;
+		OP_DELETE(f);
+
+		output("Branch count: %i\n", file_size);
+
+		delete_file(act_wr);
+	}
+
+	verify(errors == 0);
+}
+
+test("ACT delete")
+	file uni actd_wr       "data/actd.wr";
+	file uni actd_wr_j     "data/actd.wr-j";
+	file uni icelandic_txt "data/icelandic.txt";
+{
+	ACT act;
+	WordParser wp;
+	char *word;
+	OpFileLength block_size, block_count, size3;
+	OpLowLevelFile *f;
+	int efound, enotfound;
+	int i;
+	BOOL word_added[250];
+	BOOL consistent;
+#ifdef _DEBUG
+	int favg, fmax, fmin;
+#endif
+	OP_STATUS status;
+
+	delete_file(actd_wr);
+	delete_file(actd_wr_j);
+
+	if (BlockStorage::FileExists(icelandic_txt) != OpBoolean::IS_TRUE)
+	{
+		output("\ndata/icelandic.txt not found, aborting ...");
+		verify(1);
+	}
+	else {
+
+		verify_success(act.Open(actd_wr, BlockStorage::OpenRead));
+		verify_success(act.Close());
+
+
+		efound = 3;
+		size3 = 4;
+
+		status = OpLowLevelFile::Create(&f, actd_wr);
+		verify_success(status);
+
+		status = f->GetFileLength(&block_size);
+		verify_success(status);
+		verify(block_size != 0);
+
+		block_size /= 2;
+		f->Close();
+		OP_DELETE(f);
+
+		wp.Construct(icelandic_txt);
+
+		while ((word = wp.ReadWord()) != NULL)
+		{
+			verify_success(act.Open(actd_wr, BlockStorage::OpenReadWrite));
+			verify_success(act.AddWord(word, 1));  // all words will have id 1, doesn't matter
+			verify_success(act.Close());
+
+			status = OpLowLevelFile::Create(&f, actd_wr);
+			verify_success(status);
+		
+			status = f->GetFileLength(&block_count);
+			verify_success(status);
+
+			f->GetFileLength(&block_count);
+			block_count /= block_size;
+			f->Close();
+			OP_DELETE(f);
+
+			if (block_count > 2)
+			{
+				verify_success(act.Open(actd_wr, BlockStorage::OpenReadWrite));
+				verify_success(act.DeleteWord(word));
+
+				efound = act.Search(word) != 0 ? 1 : 0;
+				verify_success(act.Close());
+				break;
+			}
+		}
+
+		delete_file(actd_wr);
+
+		wp.Close();
+
+		verify(efound == 0);
+
+		wp.Construct(icelandic_txt);
+		verify_success(act.Open(actd_wr, BlockStorage::OpenReadWrite));
+
+		i = 1;
+
+		while ((word = wp.ReadWord()) != NULL && i < 250)
+		{
+			if (i == 100)
+				verify_success(act.AddWord("test_word1", 300, FALSE));
+			word_added[i] = act.AddWord(word, i, FALSE) == OpBoolean::IS_TRUE;
+
+			if (i == 200)
+				verify_success(act.DeleteWord("test_word1"));
+			++i;
+		}
+
+		verify_success(act.Close());
+		wp.Close();
+
+		wp.Construct(icelandic_txt);
+		verify_success(act.Open(actd_wr, BlockStorage::OpenReadWrite));
+
+		i = 1;
+		efound = 0;
+		enotfound = 0;
+
+		while ((word = wp.ReadWord()) != NULL && i < 250)
+		{
+			if (act.Search(word) == 0)
+				++enotfound;
+			++i;
+		}
+
+		wp.Close();
+
+		wp.Construct(icelandic_txt);
+
+		i = 1;
+
+		while ((word = wp.ReadWord()) != NULL && i < 250)
+		{
+			if (word_added[i])
+			{
+				if (act.Search(word) == 0)
+					++enotfound;
+				verify_success(act.DeleteWord(word));
+				if (act.Search(word) != 0)
+					++efound;
+			}
+			++i;
+		}
+
+		verify_success(act.Flush());
+
+#ifdef _DEBUG
+		// just to verify integrity
+		act.GetFillFactor(&favg, &fmin, &fmax, 0);
+#endif
+
+		consistent = (act.CheckConsistency() == OpBoolean::IS_TRUE);
+
+		verify_success(act.Close());
+		wp.Close();
+
+		OpLowLevelFile::Create(&f, actd_wr);
+		f->GetFileLength(&size3);
+		size3 /= block_size;
+		f->Close();
+		OP_DELETE(f);
+
+		delete_file(actd_wr);
+
+		verify(enotfound == 0);
+		verify(efound == 0);
+		verify(size3 == 2);
+		verify(consistent);
+	}
+}
+
+test("ACT search")
+	file uni acts_wr   "data/acts.wr";
+	file uni acts_wr_j "data/acts.wr-j";
+{
+	ACT act;
+	ACT::WordID w1[4], w2[8];
+	int c1, c2;
+	OP_STATUS status;
+
+	delete_file(acts_wr);
+	delete_file(acts_wr_j);
+	status = act.Open(acts_wr, BlockStorage::OpenReadWrite);
+	verify_success(status);
+
+	verify_success(act.AddWord("aaa", 1));
+	verify_success(act.AddWord("aaaa", 2));
+	verify_success(act.AddWord("aaab", 3));
+	verify_success(act.AddWord("ab", 4));
+	verify_success(act.AddWord("aba", 5));
+	verify_success(act.AddWord("baa", 6));
+
+	c1 = act.PrefixSearch(w1, "a", 4);
+	c2 = act.PrefixSearch(w2, "a", 8);
+
+	verify_success(act.Close());
+
+	delete_file(acts_wr);
+
+	verify(c1 == 4 && c2 == 5);
+}
+
+test("ACT word search")
+	file uni actws_wr   "data/actws.wr";
+	file uni actws_wr_j "data/actws.wr-j";
+{
+	ACT act;
+	char *words[8];
+	uni_char *uwords[8];
+	int c1 = 0, cl, cu = 0, i;
+	OP_STATUS status;
+
+	delete_file(actws_wr);
+	delete_file(actws_wr_j);
+	status = act.Open(actws_wr, BlockStorage::OpenReadWrite);
+	verify_success(status);
+
+	verify_success(act.AddWord("aaab", 1));
+	verify_success(act.AddWord("aaac", 2));
+	verify_success(act.AddWord("aab", 3));
+	verify_success(act.AddWord("abb", 4));
+	verify_success(act.AddWord("bba", 5));
+	verify_success(act.AddWord("aaaad123456789012345678901234567890", 6));
+
+	cl = act.PrefixWords(uwords, UNI_L("Aa"), 2);
+
+	for (i = 0; i < cl; ++i)
+		OP_DELETEA(uwords[i]);
+
+	cu = act.PrefixCaseWords(uwords, UNI_L(""), 5);
+
+	c1 = act.PrefixWords(words, "Aa", 8);
+
+	verify_success(act.Close());
+
+	delete_file(actws_wr);
+
+	verify(c1 == 4 && cl == 2 && cu == 5);
+}
+finally
+{
+	while (--c1 >= 0)
+		OP_DELETEA(words[c1]);
+	while (--cu >= 0)
+		OP_DELETEA(uwords[cu]);
+}
+
+test("Invalid input")
+	file uni actii_wr   "data/actii.wr";
+	file uni actii_wr_j "data/actii.wr-j";
+{
+	ACT act;
+	ACT::WordID w1[4];
+	char *w2[4];
+	OP_STATUS status;
+
+	delete_file(actii_wr);
+	delete_file(actii_wr_j);
+	status = act.Open(actii_wr, BlockStorage::OpenReadWrite);
+	verify_success(status);
+
+	verify(act.AddWord("t\tn\nr\r", 2) == OpBoolean::IS_TRUE);
+	verify(act.AddWord("tnr", 3, FALSE) == OpBoolean::IS_FALSE);
+
+	verify(act.PrefixSearch(w1, "tn", 4) == 1);
+	verify(w1[0] == 2);
+
+	verify(act.PrefixSearch(w1, "t\tn\t", 4) == 1);
+	verify(w1[0] == 2);
+
+	verify(act.Search("tnr") == 2);
+	verify(act.Search("T\tN\nr\r") == 2);
+
+	verify(act.PrefixWords(w2, "tN", 4) == 1);
+	verify(op_stricmp(w2[0], "TNR") == 0);
+	OP_DELETEA(w2[0]);
+
+	verify(act.PrefixWords(w2, "t\tN\nr\r", 4) == 1);
+	verify_string(w2[0], "t\tN\nr\r");
+	OP_DELETEA(w2[0]);
+
+	verify(act.DeleteWord("T\tn\nr\r") == OpStatus::OK);
+	verify(act.Search("tnr") == 0);
+
+	verify_success(act.Close());
+	delete_file(actii_wr);
+}
+
+test("ACT performance") disabled;
+	file uni actp_wr   "data/actp.wr";
+	file uni actp_wr_j "data/actp.wr-j";
+	file uni bible_txt "data/bible.txt";
+{
+	ACT act;
+	WordParser wp;
+	char *word;
+	OpLowLevelFile *f;
+	OpFileLength input_size, output_size;
+	int i;
+	time_t i_start, i_end, s_start, s_end;
+	OP_STATUS status;
+
+	delete_file(actp_wr);
+	delete_file(actp_wr_j);
+	if (BlockStorage::FileExists(bible_txt) != OpBoolean::IS_TRUE)
+	{
+		output("\ndata/bible.txt not found, aborting ...");
+		verify(1);
+		return 0;
+	}
+
+	act.Open(actp_wr, BlockStorage::OpenReadWrite);
+	wp.Construct(bible_txt);
+
+	i_start = op_time(NULL);
+
+	i = 0;
+
+	while ((word = wp.ReadWord()) != NULL)
+	{
+		act.AddWord(word, 1, FALSE);
+		++i;
+	}
+
+	i_end = op_time(NULL);
+
+	wp.Close();
+	act.Close();
+
+
+	act.Open(actp_wr, BlockStorage::OpenRead);
+	wp.Construct(bible_txt);
+
+	s_start = op_time(NULL);
+
+	while ((word = wp.ReadWord()) != NULL)
+	{
+		act.Search(word);
+		++i;
+	}
+
+	s_end = op_time(NULL);
+
+	wp.Close();
+	act.Close();
+
+
+	status = OpLowLevelFile::Create(&f, bible_txt);
+	verify_success(status);
+
+	f->GetFileLength(&input_size);
+	f->Close();
+	OP_DELETE(f);
+
+	status = OpLowLevelFile::Create(&f, actp_wr);
+	verify_success(status);
+
+	f->GetFileLength(&output_size);
+	f->Close();
+	OP_DELETE(f);
+
+	output("\nInput size:  %u, %i words\nOutput size: %u\n", (unsigned)input_size, i, (unsigned)output_size);
+	output("Index time:  %i\n", i_end - i_start);
+	output("Search time: %i\n", s_end - s_start);
+	 
+	delete_file(actp_wr);
+
+	verify(1);
+}
+
+test("ACT tail compression")
+	file uni acttc_wr   "data/acttc.wr";
+	file uni acttc_wr_j "data/acttc.wr-j";
+{
+	ACT act;
+	TailCompressCallback cb;
+	int i;
+	int c1, pc1, pp1, ppc1;
+	char *wr[8];
+	ACT::WordID ir[8];
+	BOOL consistent;
+	OP_STATUS status;
+
+	delete_file(acttc_wr);
+	delete_file(acttc_wr_j);
+	status = act.Open(acttc_wr, BlockStorage::OpenReadWrite, &cb.Callback, &cb);
+	verify_success(status);
+
+	verify_success(cb.ids.Add(1));
+	verify_success(cb.words.Add((char *)"simple_word_1"));
+
+	verify_success(cb.ids.Add(2));
+	verify_success(cb.words.Add((char *)"end"));
+
+	verify_success(cb.ids.Add(3));
+	verify_success(cb.words.Add((char *)"echt"));
+
+	verify_success(cb.ids.Add(4));
+	verify_success(cb.words.Add((char *)"\n\rsome\tinvalid chars"));
+
+	verify_success(cb.ids.Add(5));
+	verify_success(cb.words.Add((char *)"someinvalid chars_2"));
+
+	verify_success(cb.ids.Add(6));
+	verify_success(cb.words.Add((char *)"\tsome"));
+
+	for (i = 0; i < (int)cb.ids.GetCount(); ++i)
+		verify_success(act.AddCaseWord(cb.words.Get(i), cb.ids.Get(i)));
+
+	verify_success(act.DeleteCaseWord(cb.words.Get(2)));
+
+	c1 = 0;
+
+	for (i = 0; i < (int)cb.ids.GetCount(); ++i)
+		c1 += act.CaseSearch(cb.words.Get(i));
+
+	pc1 = act.PrefixCaseWords(wr, "some\b", 8);
+	for (i = 0; i < pc1; ++i)
+		OP_DELETEA(wr[i]);
+
+	pp1 = act.PrefixCaseSearch(ir, "some\b", 8);
+	ppc1 = 0;
+	for (i = 0; i < pp1; ++i)
+		ppc1 += ir[i];
+
+	verify_success(act.Flush());
+	consistent = (act.CheckConsistency() == OpBoolean::IS_TRUE);
+
+	verify_success(act.Close());
+
+	delete_file(acttc_wr);
+
+	verify(c1 == 18);
+	verify(pc1 == 3);
+	verify(ppc1 == 15);
+	verify(consistent);
+}
+
+test("url tail compression")
+	file uni acttc_wr   "data/acttc.wr";
+	file uni acttc_wr_j "data/acttc.wr-j";
+{
+	ACT act;
+	TailCompressCallback cb;
+	int i;
+	BOOL consistent;
+	OP_STATUS status;
+	const char *url[3];
+
+	url[0] = "h/0/";
+	url[1] = "h/";
+	url[2] = "h/0";
+
+	delete_file(acttc_wr);
+	delete_file(acttc_wr_j);
+	status = act.Open(acttc_wr, BlockStorage::OpenReadWrite, &cb.Callback, &cb);
+	verify_success(status);
+
+	for (i = 0; i < (int)(sizeof(url) / sizeof(url[0])); ++i)
+	{
+		verify_success(cb.ids.Add(i + 1));
+		verify_success(cb.words.Add((char *)(url[i])));
+	}
+
+	for (i = 0; i < (int)cb.ids.GetCount(); ++i)
+		verify_success(act.AddCaseWord(cb.words.Get(i), cb.ids.Get(i)));
+
+	i = act.CaseSearch("h/0/");
+
+	verify_success(act.Flush());
+
+	consistent = (act.CheckConsistency() == OpBoolean::IS_TRUE);
+
+	verify_success(act.Close());
+
+	delete_file(acttc_wr);
+
+	verify(i != 0);
+	verify(consistent);
+}
+
+test("tail compression conflict")
+	file uni acttc_wr   "data/acttc.wr";
+	file uni acttc_wr_j "data/acttc.wr-j";
+{
+	ACT act;
+	TailCompressCallback cb;
+	int i;
+	BOOL consistent;
+	OP_STATUS status;
+
+	const char *url[66];
+	url[ 0] = "http://g.idnes.cz:80/o/xhp/ico_jobdnes.gif";
+	url[ 1] = "http://g.idnes.cz:80/o/xhp/xxx_set_hp.gif";
+	url[ 2] = "http://g.idnes.cz:80/js/ad/vylohy.js";
+	url[ 3] = "http://imgs.idnes.cz:80/_sph/80x60_16_FDV_HPE36-210_H.JPG";
+	url[ 4] = "http://g.idnes.cz:80/js/uni/uni.js?rr=4";
+	url[ 5] = "http://bonusweb.idnes.cz:80/obrazek/sims2podnik_idnes";
+	url[ 6] = "http://g.idnes.cz:80/r/predplatne/predpl_0306.gif";
+	url[ 7] = "http://g.idnes.cz:80/o/xhp/text_a.gif";
+	url[ 8] = "http://g.idnes.cz:80/o/xhp/logo_idnes.gif";
+	url[ 9] = "http://i.idnes.cz:80/06/032/mini/KOT119c75_11.jpg";
+	url[10] = "http://g.idnes.cz:80/u/24_email.gif";
+	url[11] = "http://g.idnes.cz:80/o/xhp/klikni_logo_box.gif";
+	url[12] = "http://g.idnes.cz:80/o/xhp/ico_slovnik.gif";
+	url[13] = "http://imgs.idnes.cz:80/igcechy/A060316_TOM_BILKA_80X60_1N_N.JPG";
+	url[14] = "http://g.idnes.cz:80/u/favicon.ico";
+	url[15] = "http://g.idnes.cz:80/o/xhp/coop.gif";
+	url[16] = "http://imgs.idnes.cz:80/_sph/80x60_16_PET_BYT_H_H.JPG";
+	url[17] = "http://g.idnes.cz:80/o/zam/b_hledej.gif";
+	url[18] = "http://adidnes2.bbmedia.cz:80/logos/b15481.gif";
+	url[19] = "http://adidnes2.bbmedia.cz:80/logos/b15223/korunka.gif";
+	url[20] = "http://adidnes2.bbmedia.cz:80/logos/b15363/logo.gif";
+	url[21] = "http://data.idnes.cz:80/vylohy/sph4_123shop/6.htm?vyloha_sph4";
+	url[22] = "http://i.idnes.cz:80/06/032/sph/VEN11b94b_2BCEC602_0.jpg";
+	url[23] = "http://www.idnes.cz:80/";
+	url[24] = "http://g.idnes.cz:80/o/xhp/dot.gif";
+	url[25] = "http://spir.hit.gemius.pl:80/_1142610339093/reppdot.js?l=12&id=ogTqljMrYxhE2MzBMWyBZaRuzUTGf4LUWB7fdZ0a_3b.I7;ref=;href=http%3A//www.idnes.cz/;&tz=-60&screen=1024x768&col=32";
+	url[26] = "http://spir.hit.gemius.pl:80/_1142610339093/reppdot.js?l=12&id=ogTqljMrYxhE2MzBMWyBZaRuzUTGf4LUWB7fdZ0a_3b.I7;ref=;href=http%3A//www.idnes.cz/;&tz=-60&screen=1024x768&col=32";
+	url[27] = "http://g.idnes.cz:80/o/xhp/sb.gif";
+	url[28] = "http://i.idnes.cz:80/06/032/mini/KOT11a776_skinner_1.JPG";
+	url[29] = "http://adidnes2.bbmedia.cz:80/logos/b15371/korunka.gif";
+	url[30] = "http://imgs.idnes.cz:80/_sph/80x60_16_BRZ_TITANIC_HP_H.JPG";
+	url[31] = "http://imgs.idnes.cz:80/_sph/80x60_16_BRZ_JABLO_HP_H.JPG";
+	url[32] = "http://i.idnes.cz:80/05/111/mini/MIZebcf9_bush.JPG";
+	url[33] = "http://adidnes2.bbmedia.cz:80/bb/bb_codesnif.js";
+	url[34] = "http://g.idnes.cz:80/css/sph_2005.css?r=x4";
+	url[35] = "http://g.idnes.cz:80/o/zam/r_sph.gif";
+	url[36] = "http://g.idnes.cz:80/o/zam/l_sph.gif";
+	url[37] = "http://i.idnes.cz:80/06/032/midi/ECK11b369_africke_vzory.jpg";
+	url[38] = "http://g.idnes.cz:80/o/xhp/mfdnes_divider.gif";
+	url[39] = "http://adidnes2.bbmedia.cz:80/logos/b15418/horoskopy_44x35.jpg";
+	url[40] = "http://g.idnes.cz:80/o/xhp/bg_must.gif";
+	url[41] = "http://i.idnes.cz:80/06/032/midi/ADL11aa7b_DSC_5094.JPG";
+	url[42] = "http://adidnes2.bbmedia.cz:80/logos/b14154_1.gif";
+	url[43] = "http://g.idnes.cz:80/b/vsh/logo_123shop.gif";
+	url[44] = "http://g.idnes.cz:80/o/xhp/b.gif";
+	url[45] = "http://i.idnes.cz:80/05/111/mini/NELee86f_volby02.jpg";
+	url[46] = "http://imgs.idnes.cz:80/_sph/80x60_19_VRA_STOP-HPAAA_H.JPG";
+	url[47] = "http://adidnes2.bbmedia.cz:80/logos/b15379/korunka.gif";
+	url[48] = "http://g.idnes.cz:80/o/xhp/klikni_logo.gif";
+	url[49] = "http://i.idnes.cz:80/06/021/midi/DK10e7e4_Madonna_Sorry.jpg";
+	url[50] = "http://i.idnes.cz:80/06/032/midi/ADL11ad8c_DSC_3474.JPG";
+	url[51] = "http://g.idnes.cz:80/o/xhp/bg-tv.gif";
+	url[52] = "http://adidnes2.bbmedia.cz:80/logos/b15369_1.gif";
+	url[53] = "http://g.idnes.cz:80/js/klikni/searchhelper.js?rr=4";
+	url[54] = "http://i.idnes.cz:80/06/032/mini/TON1190c5_televize.jpg";
+	url[55] = "http://start1.idnes.cz:80/?856545rdsph";
+	url[56] = "http://g.idnes.cz:80/o/xhp/ct24.gif";
+	url[57] = "http://g.idnes.cz:80/u/24_ikona.gif";
+	url[58] = "http://i.idnes.cz:80/06/032/mini/VOT11b921_Paroubek_Zavadil.jpg";
+	url[59] = "http://adidnes2.bbmedia.cz:80/logos/b14710/vodafone129x40_idnes.gif";
+	url[60] = "http://g.idnes.cz:80/o/zam/bg.gif";
+	url[61] = "http://adidnes2.bbmedia.cz:80/logos/b11944_1.gif";
+	url[62] = "http://g.idnes.cz:80/o/sph/reality_dum.gif";
+	url[63] = "http://g.idnes.cz:80/o/zam/lupa.gif";
+	url[64] = "http://data.idnes.cz:80/mfdnes/imgpdf/20060317p.gif";
+	url[65] = "http://adidnes2.bbmedia.cz:80/logos/b14205_1.gif";
+	/*"http://g.idnes.cz:80/o/xhp/text_b.gif",
+	"http://g.idnes.cz:80/o/xhp/xe_li_dot_notie.gif",
+	"http://g.idnes.cz:80/o/xhp/zs_logo.gif",
+	"http://g.idnes.cz:80/u/24_mobil.gif",
+	"http://imgs.idnes.cz:80/iweb16.gif",
+	"http://start1.idnes.cz:80/?506355sph",
+	"http://i.idnes.cz:80/05/101/mini/KOTe1e48_100stupnu.jpg",
+	"http://g.idnes.cz:80/o/xhp/ico_live.gif",
+	"http://g.idnes.cz:80/o/xhp/bg_shp.gif",
+	"http://i.idnes.cz:80/06/032/mini/KLU11a2ae_vzd_JStrouhal.JPG",
+	"http://g.idnes.cz:80/o/xhp/ico_pocasi2.gif",
+	"http://spir.hit.gemius.pl:80/gemiusaudience.html",
+	"http://i.idnes.cz:80/06/032/mini/MIA11b892_CMB_ILC_PolMap300.jpg",
+	"http://i.idnes.cz:80/06/013/mini/VOT10a46e_Dane_form.jpg",
+	"http://adidnes2.bbmedia.cz:80/bb/bb_one2n.js",
+	"http://i.idnes.cz:80/06/032/midi/VAC11b972_IPB_2.jpg",
+	"http://imgs.idnes.cz:80/_sph/80x60_10_MIN_ZLIN_H_H.JPG"*/
+
+	delete_file(acttc_wr);
+	delete_file(acttc_wr_j);
+	status = act.Open(acttc_wr, BlockStorage::OpenReadWrite, &cb.Callback, &cb);
+	verify_success(status);
+
+	for (i = 0; i < (int)(sizeof(url) / sizeof(url[0])); ++i)
+	{
+		verify_success(cb.ids.Add(i + 1));
+		verify_success(cb.words.Add((char *)(url[i])));
+	}
+
+	for (i = 0; i < (int)cb.ids.GetCount(); ++i)
+		verify_success(act.AddCaseWord(cb.words.Get(i), cb.ids.Get(i)));
+
+	verify_success(act.Flush());
+
+	consistent = (act.CheckConsistency() == OpBoolean::IS_TRUE);
+
+	verify_success(act.Close());
+
+	delete_file(acttc_wr);
+
+	verify(consistent);
+}
+
+test("ACT w/FlushJournal")
+	file uni act_wr        "data/act.wr";
+	file uni act_wr_j      "data/act.wr-j";
+	file uni act_wr_g      "data/act.wr-g";
+	file uni icelandic_txt "data/icelandic.txt";
+{
+	ACT act;
+	ACT::WordID w1, w2, w3;
+	WordParser wp;
+	char *word;
+	char prev_word[16] = "not_found";
+	char old_word[32] = "not_found_too";
+	int i;
+	int errors;
+	BOOL word_created;
+	OpFileLength jsize1, jsize2;
+	OpLowLevelFile *f;
+	OP_STATUS status;
+
+	delete_file(act_wr);
+	delete_file(act_wr_j);
+	delete_file(act_wr_g);
+
+	if (BlockStorage::FileExists(icelandic_txt) != OpBoolean::IS_TRUE)
+	{
+		output("\ndata/icelandic.txt not found, aborting ...");
+		errors = 0;
+		jsize1 = jsize2 = 0;
+	}
+	else {
+		status = act.Open(act_wr, BlockStorage::OpenReadWrite);
+		verify_success(status);
+
+		act.SetNURFlush(FALSE);
+
+		wp.Construct(icelandic_txt);
+
+		errors = 0;
+		i = 0;
+		w2 = 0;
+		w3 = 0;
+
+		while ((word = wp.ReadWord()) != NULL)
+		{
+			w1 = i;
+
+			word_created = act.AddWord(word, w1, FALSE) == OpBoolean::IS_TRUE;
+
+			if (word_created)
+				if (act.Search(word) != w1)
+					++errors;
+
+
+			if (act.Search(prev_word) != w2)
+				++errors;
+
+
+			if (act.Search(old_word) != w3)
+				++errors;
+
+
+			if (word_created && op_strlen(word) < sizeof(prev_word) && (*word & 1) != 0)  // some randomness
+			{
+				op_strcpy(prev_word, word);
+				w2 = w1;
+			}
+
+			if (word_created && i % 100 == 5 && op_strlen(word) < sizeof(old_word))
+			{
+				op_strcpy(old_word, word);
+				w3 = w1;
+			}
+
+			++i;
+		}
+
+		verify_success(act.Flush(BSCache::JournalAll));
+
+		status = OpLowLevelFile::Create(&f, act_wr_j);
+		verify_success(status);
+
+		f->GetFileLength(&jsize1);
+
+		wp.Close();
+
+		verify_success(act.Flush());
+
+		if (act.CheckConsistency() != OpBoolean::IS_TRUE)
+			++errors;
+
+		f->GetFileLength(&jsize2);
+
+		f->Close();
+		OP_DELETE(f);
+
+		if (act.Search("Proofreading") == 0)
+			++errors;
+
+		if (act.Search("Proofr") != 0)
+			++errors;
+
+		if (act.Search("neexistujicihodnedlouhyslovoslovokterybynemelobejtvact") != 0)
+			++errors;
+
+		if (act.Search("neex") != 0)
+			++errors;
+
+		if (act.PrefixSearch(&w1, "blessa", 1) <= 0)
+			++errors;
+
+		verify_success(act.Close());
+
+		delete_file(act_wr);
+	}
+
+	verify(errors == 0);
+	verify(jsize1 == jsize2);
+}
+
+test("FindFirst/FindNext")
+	file uni actws_wr   "data/actws.wr";
+	file uni actws_wr_j "data/actws.wr-j";
+{
+	ACT act;
+	int c1, c2, c3, c4;
+	ACT::PrefixResult res;
+	OP_STATUS status;
+
+	delete_file(actws_wr);
+	delete_file(actws_wr_j);
+	status = act.Open(actws_wr, BlockStorage::OpenReadWrite);
+	verify_success(status);
+
+	verify_success(act.AddCaseWord("aaab", 1));
+	verify_success(act.AddCaseWord("aaad", 3));
+	verify_success(act.AddCaseWord("aab", 4));
+	verify_success(act.AddCaseWord("abb", 5));
+	verify_success(act.AddCaseWord("bba", 6));
+	verify_success(act.AddCaseWord("aaacd67890abcdefghijABCDEFGHIJ1234", 2));
+	verify_success(act.AddCaseWord("c", 7));
+	verify_success(act.AddCaseWord("ca", 8));
+	verify_success(act.AddCaseWord("caa", 9));
+
+	c1 = 0;
+	if (act.FindFirst(res, "a") == OpBoolean::IS_TRUE)
+	do {
+		++c1;
+	} while (act.FindNext(res, "a") == OpBoolean::IS_TRUE);
+
+	c2 = 0;
+	if (act.FindFirst(res, "c") == OpBoolean::IS_TRUE)
+	do {
+		++c2;
+	} while (act.FindNext(res, "c") == OpBoolean::IS_TRUE);
+
+	c3 = 0;
+	if (act.FindFirst(res, "axf") == OpBoolean::IS_TRUE)
+	do {
+		++c3;
+	} while (act.FindNext(res, "axf") == OpBoolean::IS_TRUE);
+
+	c4 = 0;
+	if (act.FindFirst(res, "") == OpBoolean::IS_TRUE)
+	do {
+		++c4;
+		if (res.id != (unsigned)c4)
+			break;
+	} while (act.FindNext(res, "") == OpBoolean::IS_TRUE);
+
+	verify_success(act.Close());
+
+	delete_file(actws_wr);
+
+	verify(c1 == 5);
+	verify(c2 == 3);
+	verify(c3 == 0);
+	verify(c4 == 9);
+}
+
+test("ACT iterator")
+	file uni actws_wr   "data/actws.wr";
+	file uni actws_wr_j "data/actws.wr-j";
+{
+	ACT act;
+	int c1, c2, c3, c4;
+	SearchIterator<ACT::PrefixResult> *it = NULL;
+	OP_STATUS status;
+
+	delete_file(actws_wr);
+	delete_file(actws_wr_j);
+	status = act.Open(actws_wr, BlockStorage::OpenReadWrite);
+	verify_success(status);
+
+	verify_success(act.AddWord("aaab", 1));
+	verify_success(act.AddWord("aaad", 3));
+	verify_success(act.AddWord("aab", 4));
+	verify_success(act.AddWord("abb", 5));
+	verify_success(act.AddWord("bba", 6));
+	verify_success(act.AddWord("aaacd67890abcdefghijABCDEFGHIJ1234", 2));
+	verify_success(act.AddWord("c", 7));
+	verify_success(act.AddWord("ca", 8));
+	verify_success(act.AddWord("caa", 9));
+
+	verify_success(act.Commit());
+
+	c1 = 0;
+	it = act.PrefixSearch(UNI_L("a"));
+	verify(it != NULL && it->Error() == OpStatus::OK);
+	while (!it->End())
+	{
+		++c1;
+		it->Next();
+	}
+	verify(it->Error() == OpStatus::OK);
+	OP_DELETE(it);
+
+	c2 = 0;
+	it = act.PrefixSearch(UNI_L("c"));
+	verify(it != NULL && it->Error() == OpStatus::OK);
+	while (!it->End())
+	{
+		++c2;
+		it->Next();
+	}
+	verify(it->Error() == OpStatus::OK);
+	OP_DELETE(it);
+
+	c3 = 0;
+	it = act.PrefixSearch(UNI_L("axf"));
+	verify(it != NULL && it->Error() == OpStatus::OK);
+	while (!it->End())
+	{
+		++c3;
+		it->Next();
+	}
+	verify(it->Error() == OpStatus::OK);
+	OP_DELETE(it);
+
+	c4 = 0;
+	it = act.PrefixCaseSearch(UNI_L(""));
+	verify(it != NULL && it->Error() == OpStatus::OK);
+	while (!it->End())
+	{
+		++c4;
+		it->Next();
+	}
+	verify(it->Error() == OpStatus::OK);
+	OP_DELETE(it);
+	it = NULL;
+
+	verify(c1 == 5);
+	verify(c2 == 3);
+	verify(c3 == 0);
+	verify(c4 == 9);
+
+	OP_DELETE(it);
+	verify_success(act.Close());
+	delete_file(actws_wr);
+}
+
+test("ACT random number generator")
+	file uni actws_wr   "data/actws.wr";
+	file uni actws_wr_j "data/actws.wr-j";
+{
+	OpAutoPtr<ACT> act(OP_NEW(ACT, ()));
+	OP_STATUS status;
+	int i;
+
+	delete_file(actws_wr);
+	delete_file(actws_wr_j);
+	status = act->Open(actws_wr, BlockStorage::OpenReadWrite);
+	verify_success(status);
+
+	op_srand((unsigned int)op_time(0));
+
+	for (i=0; i<10000; i++)
+	{
+		act->Random();
+		if (op_rand() % 1000 == 0)
+		{
+			verify_success(act->SaveStatus());
+			verify_success(act->Close());
+			act.reset(OP_NEW(ACT, ()));
+			status = act->Open(actws_wr, BlockStorage::OpenReadWrite);
+		}
+	}
+	verify(act->Random() == 0x04705318); // ACT::Random must be deterministic
+
+	verify_success(act->Close());
+	delete_file(actws_wr);
+}
+
+test("ACT random number generator index crasher, DSK-291499")
+	file uni actrng_wr "data/actrng.wr";
+{
+	OpAutoPtr<ACT> act(OP_NEW(ACT, ()));
+	OpAutoPtr<OpFile> file(OP_NEW(OpFile, ()));
+	int data = 0x7f7f7f7f;
+
+	verify_success(act->Open(actrng_wr, BlockStorage::OpenReadWrite));
+	verify_success(act->SaveStatus());
+	verify_success(act->Close());
+
+	verify_success(file->Construct(actrng_wr));
+	verify_success(file->Open(OPFILE_UPDATE));
+	verify_success(file->SetFilePos(16+17*4));
+	verify_success(file->Write(&data, 4)); // Bogus index
+	verify_success(file->Close());
+
+	verify_success(act->Open(actrng_wr, BlockStorage::OpenReadWrite));
+	verify_success(act->Close());
+	delete_file(actrng_wr);
+}

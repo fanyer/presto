@@ -1,0 +1,2427 @@
+/* -*- mode: c++; tab-width: 4; c-basic-offset: 4 -*- */
+
+group "layout.traverse";
+
+require init;
+
+include "modules/layout/box/box.h";
+include "modules/layout/box/inline.h";
+include "modules/layout/traverse/traverse.h";
+include "modules/layout/content/scrollable.h";
+include "modules/layout/box/box.h";
+include "modules/layout/layout_workplace.h";
+include "modules/display/styl_man.h";
+include "modules/util/adt/opvector.h";
+include "modules/display/coreview/coreview.h";
+
+global
+{
+	class BoxList : public OpVector<Box> {};
+
+	class ST_OnePassTraversalObject : public TraversalObject
+	{
+	private:
+		BoxList box_list;
+		OpString8 text;
+
+		BOOL AddBox(Box* box)
+		{
+			if (!GetTarget())
+				if (OpStatus::IsMemoryError(box_list.Add(box)))
+				{
+					SetOutOfMemory();
+					return FALSE;
+				}
+
+			return TRUE;
+		}
+
+	public:
+		ST_OnePassTraversalObject(FramesDocument* doc) : TraversalObject(doc)
+		{
+			SetTraverseType(TRAVERSE_ONE_PASS);
+		}
+
+		virtual BOOL EnterVerticalBox(LayoutProperties* parent_lprops, LayoutProperties*& layout_props, VerticalBox* box, TraverseInfo& traverse_info)
+		{
+			return (traverse_info.dry_run || AddBox(box)) &&
+				TraversalObject::EnterVerticalBox(parent_lprops, layout_props, box, traverse_info);
+		}
+
+		virtual BOOL EnterInlineBox(LayoutProperties* layout_props, InlineBox* box, const RECT& box_area, LineSegment& segment, BOOL start_of_box, BOOL end_of_box, LayoutCoord baseline, TraverseInfo& traverse_info)
+		{
+			return AddBox(box) &&
+				TraversalObject::EnterInlineBox(layout_props, box, box_area, segment, start_of_box, end_of_box, baseline, traverse_info);
+		}
+
+		virtual BOOL EnterLayoutBreak(HTML_Element* break_element)
+		{
+			AddBox(break_element->GetLayoutBox());
+
+			return FALSE;
+		}
+
+		virtual void HandleLineBreak(LayoutProperties* layout_props, BOOL is_layout_break)
+		{
+			if (AddBox(layout_props->html_element->GetLayoutBox()))
+				TraversalObject::HandleLineBreak(layout_props, is_layout_break);
+		}
+
+		virtual void HandleTextContent(LayoutProperties* layout_props,
+									   Text_Box* box,
+									   const uni_char* word,
+									   int word_length,
+									   LayoutCoord word_width,
+									   LayoutCoord space_width,
+									   LayoutCoord justified_space_extra,
+									   const WordInfo& word_info,
+									   LayoutCoord x,
+									   LayoutCoord virtual_pos,
+									   LayoutCoord baseline,
+									   LineSegment& segment,
+									   LayoutCoord line_height)
+		{
+			OpString8 str8;
+
+			if (!OpStatus::IsMemoryError(str8.Set(word, word_length)))
+				if (!OpStatus::IsMemoryError(text.Append(str8)))
+					return;
+
+			SetOutOfMemory();
+		}
+
+		const char* GetText() const { return text.CStr(); }
+		const BoxList& GetBoxList() const { return box_list; }
+	};
+
+	class ST_MultiPassTraversalObject : public ST_OnePassTraversalObject
+	{
+	public:
+		ST_MultiPassTraversalObject(FramesDocument* doc) : ST_OnePassTraversalObject(doc)
+		{
+			SetTraverseType(TRAVERSE_BACKGROUND);
+		}
+	};
+
+	class ST_LogicalTraversalObject : public ST_OnePassTraversalObject
+	{
+	public:
+		ST_LogicalTraversalObject(FramesDocument* doc) : ST_OnePassTraversalObject(doc) {}
+
+		virtual BOOL TraverseInLogicalOrder() const { return TRUE; }
+	};
+
+	BOOL IsSaneLayout(const BoxList& box_list, UINT32& index)
+	{
+		Box* box;
+
+		box = box_list.Get(index++);
+		if (!box || box->GetHtmlElement()->Type() != Markup::HTE_DOC_ROOT)
+			return FALSE;
+
+		box = box_list.Get(index++);
+		if (!box || box->GetHtmlElement()->Type() != Markup::HTE_HTML)
+			return FALSE;
+
+		box = box_list.Get(index++);
+		if (!box || box->GetHtmlElement()->Type() != Markup::HTE_BODY)
+			return FALSE;
+
+		return TRUE;
+	}
+}
+
+html
+{
+//! <!DOCTYPE html>
+//! <html><body>
+//!   <span>A B</span>
+//!   <div style="float:left;">float</div>
+//! </body></html>
+}
+test("text + float on line (one-pass)")
+{
+	FramesDocument* doc = state.doc;
+	ST_OnePassTraversalObject traversal_object(doc);
+
+	traversal_object.Traverse(doc->GetDocRoot());
+	verify(!traversal_object.IsOutOfMemory());
+
+	const BoxList &box_list = traversal_object.GetBoxList();
+	UINT32 index = 0;
+	Box* box;
+
+	verify(IsSaneLayout(box_list, index));
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement()->Type() == Markup::HTE_DIV);
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement()->Type() == Markup::HTE_SPAN);
+	verify(!box_list.Get(index++));
+
+	verify(!op_strcmp(traversal_object.GetText(), "floatAB"));
+}
+test("text + float on line (multi-pass)")
+{
+	FramesDocument* doc = state.doc;
+	ST_MultiPassTraversalObject traversal_object(doc);
+
+	traversal_object.Traverse(doc->GetDocRoot());
+	verify(!traversal_object.IsOutOfMemory());
+
+	const BoxList &box_list = traversal_object.GetBoxList();
+	UINT32 index = 0;
+	Box* box;
+
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement()->Type() == Markup::HTE_DOC_ROOT);
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement()->Type() == Markup::HTE_HTML);
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement()->Type() == Markup::HTE_BODY);
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement()->Type() == Markup::HTE_DIV);
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement()->Type() == Markup::HTE_HTML);
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement()->Type() == Markup::HTE_BODY);
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement()->Type() == Markup::HTE_SPAN);
+	verify(!box_list.Get(index++));
+
+	verify(!op_strcmp(traversal_object.GetText(), "floatAB"));
+}
+test("text + float on line (logical)")
+{
+	FramesDocument* doc = state.doc;
+	ST_LogicalTraversalObject traversal_object(doc);
+
+	traversal_object.Traverse(doc->GetDocRoot());
+	verify(!traversal_object.IsOutOfMemory());
+
+	const BoxList &box_list = traversal_object.GetBoxList();
+	UINT32 index = 0;
+	Box* box;
+
+	verify(IsSaneLayout(box_list, index));
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement()->Type() == Markup::HTE_SPAN);
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement()->Type() == Markup::HTE_DIV);
+	verify(!box_list.Get(index++));
+
+	verify(!op_strcmp(traversal_object.GetText(), "ABfloat"));
+}
+
+html
+{
+//! <!DOCTYPE html>
+//! <html><body>
+//!   <span>A B</span><br>
+//!   <div style="float:left;">float</div>
+//! </body></html>
+}
+test("text + break + float (one-pass)")
+{
+	FramesDocument* doc = state.doc;
+	ST_OnePassTraversalObject traversal_object(doc);
+
+	traversal_object.Traverse(doc->GetDocRoot());
+	verify(!traversal_object.IsOutOfMemory());
+
+	const BoxList &box_list = traversal_object.GetBoxList();
+	UINT32 index = 0;
+	Box* box;
+
+	verify(IsSaneLayout(box_list, index));
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement()->Type() == Markup::HTE_SPAN);
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement()->Type() == Markup::HTE_BR);
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement()->Type() == Markup::HTE_DIV);
+	verify(!box_list.Get(index++));
+
+	verify(!op_strcmp(traversal_object.GetText(), "ABfloat"));
+}
+test("text + break + float (multi-pass)")
+{
+	FramesDocument* doc = state.doc;
+	ST_MultiPassTraversalObject traversal_object(doc);
+
+	traversal_object.Traverse(doc->GetDocRoot());
+	verify(!traversal_object.IsOutOfMemory());
+
+	const BoxList &box_list = traversal_object.GetBoxList();
+	UINT32 index = 0;
+	Box* box;
+
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement()->Type() == Markup::HTE_DOC_ROOT);
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement()->Type() == Markup::HTE_HTML);
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement()->Type() == Markup::HTE_BODY);
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement()->Type() == Markup::HTE_DIV);
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement()->Type() == Markup::HTE_HTML);
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement()->Type() == Markup::HTE_BODY);
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement()->Type() == Markup::HTE_SPAN);
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement()->Type() == Markup::HTE_BR);
+	verify(!box_list.Get(index++));
+
+	verify(!op_strcmp(traversal_object.GetText(), "floatAB"));
+}
+test("text + break + float (logical)")
+{
+	FramesDocument* doc = state.doc;
+	ST_LogicalTraversalObject traversal_object(doc);
+
+	traversal_object.Traverse(doc->GetDocRoot());
+	verify(!traversal_object.IsOutOfMemory());
+
+	const BoxList &box_list = traversal_object.GetBoxList();
+	UINT32 index = 0;
+	Box* box;
+
+	verify(IsSaneLayout(box_list, index));
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement()->Type() == Markup::HTE_SPAN);
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement()->Type() == Markup::HTE_BR);
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement()->Type() == Markup::HTE_DIV);
+	verify(!box_list.Get(index++));
+
+	verify(!op_strcmp(traversal_object.GetText(), "ABfloat"));
+}
+
+html
+{
+//! <!DOCTYPE html>
+//! <html><body>
+//!   <span>
+//!    A B
+//!    <div style="float:left;">float</div>
+//!    C D
+//!   </span>
+//! </body></html>
+}
+test("text + float on line + text (one-pass)")
+{
+	FramesDocument* doc = state.doc;
+	ST_OnePassTraversalObject traversal_object(doc);
+
+	traversal_object.Traverse(doc->GetDocRoot());
+	verify(!traversal_object.IsOutOfMemory());
+
+	const BoxList &box_list = traversal_object.GetBoxList();
+	UINT32 index = 0;
+	Box* box;
+
+	verify(IsSaneLayout(box_list, index));
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement()->Type() == Markup::HTE_DIV);
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement()->Type() == Markup::HTE_SPAN);
+	verify(!box_list.Get(index++));
+
+	verify(!op_strcmp(traversal_object.GetText(), "floatABCD"));
+}
+test("text + float on line + text (multi-pass)")
+{
+	FramesDocument* doc = state.doc;
+	ST_MultiPassTraversalObject traversal_object(doc);
+
+	traversal_object.Traverse(doc->GetDocRoot());
+	verify(!traversal_object.IsOutOfMemory());
+
+	const BoxList &box_list = traversal_object.GetBoxList();
+	UINT32 index = 0;
+	Box* box;
+
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement()->Type() == Markup::HTE_DOC_ROOT);
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement()->Type() == Markup::HTE_HTML);
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement()->Type() == Markup::HTE_BODY);
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement()->Type() == Markup::HTE_DIV);
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement()->Type() == Markup::HTE_HTML);
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement()->Type() == Markup::HTE_BODY);
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement()->Type() == Markup::HTE_SPAN);
+	verify(!box_list.Get(index++));
+
+	verify(!op_strcmp(traversal_object.GetText(), "floatABCD"));
+}
+test("text + float on line + text (logical)")
+{
+	FramesDocument* doc = state.doc;
+	ST_LogicalTraversalObject traversal_object(doc);
+
+	traversal_object.Traverse(doc->GetDocRoot());
+	verify(!traversal_object.IsOutOfMemory());
+
+	const BoxList &box_list = traversal_object.GetBoxList();
+	UINT32 index = 0;
+	Box* box;
+
+	verify(IsSaneLayout(box_list, index));
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement()->Type() == Markup::HTE_SPAN);
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement()->Type() == Markup::HTE_DIV);
+	verify(!box_list.Get(index++));
+
+	verify(!op_strcmp(traversal_object.GetText(), "ABfloatCD"));
+}
+
+html
+{
+//! <!DOCTYPE html>
+//! <html><body>
+//!   <div style="float:left;">float</div>
+//!   A B
+//! </body></html>
+}
+test("float + text (one-pass)")
+{
+	FramesDocument* doc = state.doc;
+	ST_OnePassTraversalObject traversal_object(doc);
+
+	traversal_object.Traverse(doc->GetDocRoot());
+	verify(!traversal_object.IsOutOfMemory());
+
+	const BoxList &box_list = traversal_object.GetBoxList();
+	UINT32 index = 0;
+	Box* box;
+
+	verify(IsSaneLayout(box_list, index));
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement()->Type() == Markup::HTE_DIV);
+	verify(!box_list.Get(index++));
+
+	verify(!op_strcmp(traversal_object.GetText(), "floatAB"));
+}
+test("float + text (multi-pass)")
+{
+	FramesDocument* doc = state.doc;
+	ST_MultiPassTraversalObject traversal_object(doc);
+
+	traversal_object.Traverse(doc->GetDocRoot());
+	verify(!traversal_object.IsOutOfMemory());
+
+	const BoxList &box_list = traversal_object.GetBoxList();
+	UINT32 index = 0;
+	Box* box;
+
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement()->Type() == Markup::HTE_DOC_ROOT);
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement()->Type() == Markup::HTE_HTML);
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement()->Type() == Markup::HTE_BODY);
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement()->Type() == Markup::HTE_DIV);
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement()->Type() == Markup::HTE_HTML);
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement()->Type() == Markup::HTE_BODY);
+	verify(!box_list.Get(index++));
+
+	verify(!op_strcmp(traversal_object.GetText(), "floatAB"));
+}
+test("float + text (logical)")
+{
+	FramesDocument* doc = state.doc;
+	ST_LogicalTraversalObject traversal_object(doc);
+
+	traversal_object.Traverse(doc->GetDocRoot());
+	verify(!traversal_object.IsOutOfMemory());
+
+	const BoxList &box_list = traversal_object.GetBoxList();
+	UINT32 index = 0;
+	Box* box;
+
+	verify(IsSaneLayout(box_list, index));
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement()->Type() == Markup::HTE_DIV);
+	verify(!box_list.Get(index++));
+
+	verify(!op_strcmp(traversal_object.GetText(), "floatAB"));
+}
+
+html
+{
+//! <!DOCTYPE html>
+//! <html><body>
+//!   <div id="fl1" style="float:right;">fl1</div>
+//!   <span>A B</span>
+//!   <div id="fl2" style="float:left;">fl2</div>
+//!   <br>
+//!   <div id="fl3" style="float:left;">fl3</div>
+//! </body></html>
+}
+test("float + text + line-fl + break + fl (one-pass)")
+{
+	FramesDocument* doc = state.doc;
+	HTML_Element* root = doc->GetDocRoot();
+	ST_OnePassTraversalObject traversal_object(doc);
+
+	traversal_object.Traverse(root);
+	verify(!traversal_object.IsOutOfMemory());
+
+	const BoxList &box_list = traversal_object.GetBoxList();
+	UINT32 index = 0;
+	Box* box;
+
+	verify(IsSaneLayout(box_list, index));
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement() == root->GetElmById(UNI_L("fl1")));
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement() == root->GetElmById(UNI_L("fl2")));
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement()->Type() == Markup::HTE_SPAN);
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement()->Type() == Markup::HTE_BR);
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement() == root->GetElmById(UNI_L("fl3")));
+	verify(!box_list.Get(index++));
+
+	verify(!op_strcmp(traversal_object.GetText(), "fl1fl2ABfl3"));
+}
+test("float + text + line-fl + break + fl (multi-pass)")
+{
+	FramesDocument* doc = state.doc;
+	HTML_Element* root = doc->GetDocRoot();
+	ST_MultiPassTraversalObject traversal_object(doc);
+
+	traversal_object.Traverse(root);
+	verify(!traversal_object.IsOutOfMemory());
+
+	const BoxList &box_list = traversal_object.GetBoxList();
+	UINT32 index = 0;
+	Box* box;
+
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement()->Type() == Markup::HTE_DOC_ROOT);
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement()->Type() == Markup::HTE_HTML);
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement()->Type() == Markup::HTE_BODY);
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement() == root->GetElmById(UNI_L("fl1")));
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement() == root->GetElmById(UNI_L("fl2")));
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement() == root->GetElmById(UNI_L("fl3")));
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement()->Type() == Markup::HTE_HTML);
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement()->Type() == Markup::HTE_BODY);
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement()->Type() == Markup::HTE_SPAN);
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement()->Type() == Markup::HTE_BR);
+	verify(!box_list.Get(index++));
+
+	verify(!op_strcmp(traversal_object.GetText(), "fl1fl2fl3AB"));
+}
+test("float + text + line-fl + break + fl (logical)")
+{
+	FramesDocument* doc = state.doc;
+	HTML_Element* root = doc->GetDocRoot();
+	ST_LogicalTraversalObject traversal_object(doc);
+
+	traversal_object.Traverse(root);
+	verify(!traversal_object.IsOutOfMemory());
+
+	const BoxList &box_list = traversal_object.GetBoxList();
+	UINT32 index = 0;
+	Box* box;
+
+	verify(IsSaneLayout(box_list, index));
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement() == root->GetElmById(UNI_L("fl1")));
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement()->Type() == Markup::HTE_SPAN);
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement() == root->GetElmById(UNI_L("fl2")));
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement()->Type() == Markup::HTE_BR);
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement() == root->GetElmById(UNI_L("fl3")));
+	verify(!box_list.Get(index++));
+
+	verify(!op_strcmp(traversal_object.GetText(), "fl1ABfl2fl3"));
+}
+
+html
+{
+//! <!DOCTYPE html>
+//! <html><body>
+//!   <span>A<br>B</span>
+//! </body></html>
+}
+test("text + break + text (one-pass)")
+{
+	FramesDocument* doc = state.doc;
+	HTML_Element* root = doc->GetDocRoot();
+	ST_LogicalTraversalObject traversal_object(doc);
+
+	traversal_object.Traverse(root);
+	verify(!traversal_object.IsOutOfMemory());
+
+	const BoxList &box_list = traversal_object.GetBoxList();
+	UINT32 index = 0;
+	Box* box;
+
+	verify(IsSaneLayout(box_list, index));
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement()->Type() == Markup::HTE_SPAN);
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement()->Type() == Markup::HTE_BR);
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement()->Type() == Markup::HTE_SPAN);
+	verify(!box_list.Get(index++));
+
+	verify(!op_strcmp(traversal_object.GetText(), "AB"));
+}
+test("text + break + text (multi-pass)")
+{
+	FramesDocument* doc = state.doc;
+	HTML_Element* root = doc->GetDocRoot();
+	ST_MultiPassTraversalObject traversal_object(doc);
+
+	traversal_object.Traverse(root);
+	verify(!traversal_object.IsOutOfMemory());
+
+	const BoxList &box_list = traversal_object.GetBoxList();
+	UINT32 index = 0;
+	Box* box;
+
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement()->Type() == Markup::HTE_DOC_ROOT);
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement()->Type() == Markup::HTE_HTML);
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement()->Type() == Markup::HTE_BODY);
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement()->Type() == Markup::HTE_HTML);
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement()->Type() == Markup::HTE_BODY);
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement()->Type() == Markup::HTE_SPAN);
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement()->Type() == Markup::HTE_BR);
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement()->Type() == Markup::HTE_SPAN);
+	verify(!box_list.Get(index++));
+
+	verify(!op_strcmp(traversal_object.GetText(), "AB"));
+}
+test("text + break + text (logical)")
+{
+	FramesDocument* doc = state.doc;
+	HTML_Element* root = doc->GetDocRoot();
+	ST_LogicalTraversalObject traversal_object(doc);
+
+	traversal_object.Traverse(root);
+	verify(!traversal_object.IsOutOfMemory());
+
+	const BoxList &box_list = traversal_object.GetBoxList();
+	UINT32 index = 0;
+	Box* box;
+
+	verify(IsSaneLayout(box_list, index));
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement()->Type() == Markup::HTE_SPAN);
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement()->Type() == Markup::HTE_BR);
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement()->Type() == Markup::HTE_SPAN);
+	verify(!box_list.Get(index++));
+
+	verify(!op_strcmp(traversal_object.GetText(), "AB"));
+}
+
+html
+{
+//! <!DOCTYPE html>
+//! <html><body>
+//!   <span>
+//!    A
+//!    <div id="fl1" style="float:left;">fl1</div>
+//!    B
+//!    <br>
+//!    C D
+//!    <div id="fl2" style="float:left;">fl2</div>
+//!   </span>
+//! </body></html>
+}
+test("txt + fl + txt + br + txt + fl (one-pass)")
+{
+	FramesDocument* doc = state.doc;
+	HTML_Element* root = doc->GetDocRoot();
+	ST_OnePassTraversalObject traversal_object(doc);
+
+	traversal_object.Traverse(root);
+	verify(!traversal_object.IsOutOfMemory());
+
+	const BoxList &box_list = traversal_object.GetBoxList();
+	UINT32 index = 0;
+	Box* box;
+
+	verify(IsSaneLayout(box_list, index));
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement() == root->GetElmById(UNI_L("fl1")));
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement()->Type() == Markup::HTE_SPAN);
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement()->Type() == Markup::HTE_BR);
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement() == root->GetElmById(UNI_L("fl2")));
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement()->Type() == Markup::HTE_SPAN);
+	verify(!box_list.Get(index++));
+
+	verify(!op_strcmp(traversal_object.GetText(), "fl1ABfl2CD"));
+}
+test("txt + fl + txt + br + txt + fl (multi-pass)")
+{
+	FramesDocument* doc = state.doc;
+	HTML_Element* root = doc->GetDocRoot();
+	ST_MultiPassTraversalObject traversal_object(doc);
+
+	traversal_object.Traverse(root);
+	verify(!traversal_object.IsOutOfMemory());
+
+	const BoxList &box_list = traversal_object.GetBoxList();
+	UINT32 index = 0;
+	Box* box;
+
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement()->Type() == Markup::HTE_DOC_ROOT);
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement()->Type() == Markup::HTE_HTML);
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement()->Type() == Markup::HTE_BODY);
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement() == root->GetElmById(UNI_L("fl1")));
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement() == root->GetElmById(UNI_L("fl2")));
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement()->Type() == Markup::HTE_HTML);
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement()->Type() == Markup::HTE_BODY);
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement()->Type() == Markup::HTE_SPAN);
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement()->Type() == Markup::HTE_BR);
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement()->Type() == Markup::HTE_SPAN);
+	verify(!box_list.Get(index++));
+
+	verify(!op_strcmp(traversal_object.GetText(), "fl1fl2ABCD"));
+}
+test("txt + fl + txt + br + txt + fl (logical)")
+{
+	FramesDocument* doc = state.doc;
+	HTML_Element* root = doc->GetDocRoot();
+	ST_LogicalTraversalObject traversal_object(doc);
+
+	traversal_object.Traverse(root);
+	verify(!traversal_object.IsOutOfMemory());
+
+	const BoxList &box_list = traversal_object.GetBoxList();
+	UINT32 index = 0;
+	Box* box;
+
+	verify(IsSaneLayout(box_list, index));
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement()->Type() == Markup::HTE_SPAN);
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement() == root->GetElmById(UNI_L("fl1")));
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement()->Type() == Markup::HTE_BR);
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement()->Type() == Markup::HTE_SPAN);
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement() == root->GetElmById(UNI_L("fl2")));
+	verify(!box_list.Get(index++));
+
+	verify(!op_strcmp(traversal_object.GetText(), "Afl1BCDfl2"));
+}
+
+html
+{
+//! <!DOCTYPE html>
+//! <html><body>
+//!   <div id="fl1" style="float:right;">fl1</div>
+//!   A
+//!   <div id="fl2" style="float:left; position:relative;">fl2</div>
+//!   B
+//!   <div id="fl3" style="float:right;">fl3</div>
+//!   C
+//!   <div id="fl4" style="float:left; position:relative; z-index:-1;">fl4</div>
+//!   D
+//! </body></html>
+}
+test("fl + pos inline fl + inline fl + pos inline fl (one-pass)")
+{
+	FramesDocument* doc = state.doc;
+	HTML_Element* root = doc->GetDocRoot();
+	ST_OnePassTraversalObject traversal_object(doc);
+
+	traversal_object.Traverse(root);
+	verify(!traversal_object.IsOutOfMemory());
+
+	const BoxList &box_list = traversal_object.GetBoxList();
+	UINT32 index = 0;
+	Box* box;
+
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement()->Type() == Markup::HTE_DOC_ROOT);
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement() == root->GetElmById(UNI_L("fl4")));
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement()->Type() == Markup::HTE_HTML);
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement()->Type() == Markup::HTE_BODY);
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement() == root->GetElmById(UNI_L("fl1")));
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement() == root->GetElmById(UNI_L("fl3")));
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement() == root->GetElmById(UNI_L("fl2")));
+	verify(!box_list.Get(index++));
+
+	verify(!op_strcmp(traversal_object.GetText(), "fl4fl1fl3ABCDfl2"));
+}
+test("fl + pos inline fl + inline fl + pos inline fl (multi-pass)")
+{
+	FramesDocument* doc = state.doc;
+	HTML_Element* root = doc->GetDocRoot();
+	ST_MultiPassTraversalObject traversal_object(doc);
+
+	traversal_object.Traverse(root);
+	verify(!traversal_object.IsOutOfMemory());
+
+	const BoxList &box_list = traversal_object.GetBoxList();
+	UINT32 index = 0;
+	Box* box;
+
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement()->Type() == Markup::HTE_DOC_ROOT);
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement() == root->GetElmById(UNI_L("fl4")));
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement()->Type() == Markup::HTE_HTML);
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement()->Type() == Markup::HTE_BODY);
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement() == root->GetElmById(UNI_L("fl1")));
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement() == root->GetElmById(UNI_L("fl3")));
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement()->Type() == Markup::HTE_HTML);
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement()->Type() == Markup::HTE_BODY);
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement() == root->GetElmById(UNI_L("fl2")));
+	verify(!box_list.Get(index++));
+
+	verify(!op_strcmp(traversal_object.GetText(), "fl4fl1fl3ABCDfl2"));
+}
+test("fl + pos inline fl + inline fl + pos inline fl (logical)")
+{
+	FramesDocument* doc = state.doc;
+	HTML_Element* root = doc->GetDocRoot();
+	ST_LogicalTraversalObject traversal_object(doc);
+
+	traversal_object.Traverse(root);
+	verify(!traversal_object.IsOutOfMemory());
+
+	const BoxList &box_list = traversal_object.GetBoxList();
+	UINT32 index = 0;
+	Box* box;
+
+	verify(IsSaneLayout(box_list, index));
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement() == root->GetElmById(UNI_L("fl1")));
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement() == root->GetElmById(UNI_L("fl2")));
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement() == root->GetElmById(UNI_L("fl3")));
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement() == root->GetElmById(UNI_L("fl4")));
+	verify(!box_list.Get(index++));
+
+	verify(!op_strcmp(traversal_object.GetText(), "fl1Afl2Bfl3Cfl4D"));
+}
+
+html
+{
+//! <!DOCTYPE html>
+//! <html><body>
+//!   <span style="position:relative; z-index:0;">
+//!    <div style="float:left; position:relative;">fl</div>
+//!   </span>
+//! </body></html>
+}
+test("sole positioned float in inline zroot (one-pass)")
+{
+	FramesDocument* doc = state.doc;
+	HTML_Element* root = doc->GetDocRoot();
+	ST_OnePassTraversalObject traversal_object(doc);
+
+	traversal_object.Traverse(root);
+	verify(!traversal_object.IsOutOfMemory());
+
+	const BoxList &box_list = traversal_object.GetBoxList();
+	UINT32 index = 0;
+	Box* box;
+
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement()->Type() == Markup::HTE_DOC_ROOT);
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement()->Type() == Markup::HTE_HTML);
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement()->Type() == Markup::HTE_BODY);
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement()->Type() == Markup::HTE_SPAN);
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement()->Type() == Markup::HTE_DIV);
+	verify(!box_list.Get(index++));
+
+	verify(!op_strcmp(traversal_object.GetText(), "fl"));
+}
+test("sole positioned float in inline zroot (multi-pass)")
+{
+	FramesDocument* doc = state.doc;
+	HTML_Element* root = doc->GetDocRoot();
+	ST_MultiPassTraversalObject traversal_object(doc);
+
+	traversal_object.Traverse(root);
+	verify(!traversal_object.IsOutOfMemory());
+
+	const BoxList &box_list = traversal_object.GetBoxList();
+	UINT32 index = 0;
+	Box* box;
+
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement()->Type() == Markup::HTE_DOC_ROOT);
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement()->Type() == Markup::HTE_HTML);
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement()->Type() == Markup::HTE_BODY);
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement()->Type() == Markup::HTE_HTML);
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement()->Type() == Markup::HTE_BODY);
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement()->Type() == Markup::HTE_SPAN);
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement()->Type() == Markup::HTE_DIV);
+	verify(!box_list.Get(index++));
+
+	verify(!op_strcmp(traversal_object.GetText(), "fl"));
+}
+test("sole positioned float in inline zroot (logical)")
+{
+	FramesDocument* doc = state.doc;
+	HTML_Element* root = doc->GetDocRoot();
+	ST_LogicalTraversalObject traversal_object(doc);
+
+	traversal_object.Traverse(root);
+	verify(!traversal_object.IsOutOfMemory());
+
+	const BoxList &box_list = traversal_object.GetBoxList();
+	UINT32 index = 0;
+	Box* box;
+
+	verify(IsSaneLayout(box_list, index));
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement()->Type() == Markup::HTE_SPAN);
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement()->Type() == Markup::HTE_DIV);
+	verify(!box_list.Get(index++));
+
+	verify(!op_strcmp(traversal_object.GetText(), "fl"));
+}
+
+html
+{
+//! <!DOCTYPE html>
+//! <html><body>
+//!   <span style="position:relative; z-index:0;">
+//!    <div id="bl1">A</div>
+//!    <div id="bl2">B</div>
+//!    <div id="bl3">C</div>
+//!   </span>
+//! </body></html>
+}
+test("blocks in inline zroot (one-pass)")
+{
+	FramesDocument* doc = state.doc;
+	HTML_Element* root = doc->GetDocRoot();
+	ST_OnePassTraversalObject traversal_object(doc);
+
+	traversal_object.Traverse(root);
+	verify(!traversal_object.IsOutOfMemory());
+
+	const BoxList &box_list = traversal_object.GetBoxList();
+	UINT32 index = 0;
+	Box* box;
+
+	/* We're buggy here. The blocks are not traversed as part of the inline
+	   zroot. See CORE-43742. Let's verify that everything else is okay,
+	   anyway. */
+
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement()->Type() == Markup::HTE_DOC_ROOT);
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement()->Type() == Markup::HTE_HTML);
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement()->Type() == Markup::HTE_BODY);
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement() == root->GetElmById(UNI_L("bl1")));
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement() == root->GetElmById(UNI_L("bl2")));
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement() == root->GetElmById(UNI_L("bl3")));
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement()->Type() == Markup::HTE_SPAN);
+	verify(!box_list.Get(index++));
+
+	verify(!op_strcmp(traversal_object.GetText(), "ABC"));
+}
+test("blocks in inline zroot (multi-pass)")
+{
+	FramesDocument* doc = state.doc;
+	HTML_Element* root = doc->GetDocRoot();
+	ST_MultiPassTraversalObject traversal_object(doc);
+
+	traversal_object.Traverse(root);
+	verify(!traversal_object.IsOutOfMemory());
+
+	const BoxList &box_list = traversal_object.GetBoxList();
+	UINT32 index = 0;
+	Box* box;
+
+	/* We're buggy here. The blocks are not traversed as part of the inline
+	   zroot. See CORE-43742. Let's verify that everything else is okay,
+	   anyway. */
+
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement()->Type() == Markup::HTE_DOC_ROOT);
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement()->Type() == Markup::HTE_HTML);
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement()->Type() == Markup::HTE_BODY);
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement() == root->GetElmById(UNI_L("bl1")));
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement() == root->GetElmById(UNI_L("bl2")));
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement() == root->GetElmById(UNI_L("bl3")));
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement()->Type() == Markup::HTE_HTML);
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement()->Type() == Markup::HTE_BODY);
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement() == root->GetElmById(UNI_L("bl1")));
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement() == root->GetElmById(UNI_L("bl2")));
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement() == root->GetElmById(UNI_L("bl3")));
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement()->Type() == Markup::HTE_SPAN);
+	verify(!box_list.Get(index++));
+
+	verify(!op_strcmp(traversal_object.GetText(), "ABC"));
+}
+test("blocks in inline zroot (logical)")
+{
+	FramesDocument* doc = state.doc;
+	HTML_Element* root = doc->GetDocRoot();
+	ST_LogicalTraversalObject traversal_object(doc);
+
+	traversal_object.Traverse(root);
+	verify(!traversal_object.IsOutOfMemory());
+
+	const BoxList &box_list = traversal_object.GetBoxList();
+	UINT32 index = 0;
+	Box* box;
+
+	verify(IsSaneLayout(box_list, index));
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement()->Type() == Markup::HTE_SPAN);
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement() == root->GetElmById(UNI_L("bl1")));
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement() == root->GetElmById(UNI_L("bl2")));
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement() == root->GetElmById(UNI_L("bl3")));
+	verify(!box_list.Get(index++));
+
+	verify(!op_strcmp(traversal_object.GetText(), "ABC"));
+}
+
+html
+{
+//! <!DOCTYPE html>
+//! <html><body>
+//!   <span style="position:relative; z-index:0;">
+//!    <div id="bl1" style="position:relative;">A</div>
+//!    <div id="bl2" style="position:relative;">B</div>
+//!    <div id="bl3" style="position:relative; z-index:-1;">C</div>
+//!   </span>
+//! </body></html>
+}
+test("positioned blocks in inline zroot (one-pass)")
+{
+	FramesDocument* doc = state.doc;
+	HTML_Element* root = doc->GetDocRoot();
+	ST_OnePassTraversalObject traversal_object(doc);
+
+	traversal_object.Traverse(root);
+	verify(!traversal_object.IsOutOfMemory());
+
+	const BoxList &box_list = traversal_object.GetBoxList();
+	UINT32 index = 0;
+	Box* box;
+
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement()->Type() == Markup::HTE_DOC_ROOT);
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement()->Type() == Markup::HTE_HTML);
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement()->Type() == Markup::HTE_BODY);
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement()->Type() == Markup::HTE_SPAN);
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement() == root->GetElmById(UNI_L("bl3")));
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement() == root->GetElmById(UNI_L("bl1")));
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement() == root->GetElmById(UNI_L("bl2")));
+	verify(!box_list.Get(index++));
+
+	verify(!op_strcmp(traversal_object.GetText(), "CAB"));
+}
+test("positioned blocks in inline zroot (multi-pass)")
+{
+	FramesDocument* doc = state.doc;
+	HTML_Element* root = doc->GetDocRoot();
+	ST_MultiPassTraversalObject traversal_object(doc);
+
+	traversal_object.Traverse(root);
+	verify(!traversal_object.IsOutOfMemory());
+
+	const BoxList &box_list = traversal_object.GetBoxList();
+	UINT32 index = 0;
+	Box* box;
+
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement()->Type() == Markup::HTE_DOC_ROOT);
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement()->Type() == Markup::HTE_HTML);
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement()->Type() == Markup::HTE_BODY);
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement()->Type() == Markup::HTE_HTML);
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement()->Type() == Markup::HTE_BODY);
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement()->Type() == Markup::HTE_SPAN);
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement() == root->GetElmById(UNI_L("bl3")));
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement() == root->GetElmById(UNI_L("bl1")));
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement() == root->GetElmById(UNI_L("bl2")));
+	verify(!box_list.Get(index++));
+
+	verify(!op_strcmp(traversal_object.GetText(), "CAB"));
+}
+test("positioned blocks in inline zroot (logical)")
+{
+	FramesDocument* doc = state.doc;
+	HTML_Element* root = doc->GetDocRoot();
+	ST_LogicalTraversalObject traversal_object(doc);
+
+	traversal_object.Traverse(root);
+	verify(!traversal_object.IsOutOfMemory());
+
+	const BoxList &box_list = traversal_object.GetBoxList();
+	UINT32 index = 0;
+	Box* box;
+
+	verify(IsSaneLayout(box_list, index));
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement()->Type() == Markup::HTE_SPAN);
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement() == root->GetElmById(UNI_L("bl1")));
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement() == root->GetElmById(UNI_L("bl2")));
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement() == root->GetElmById(UNI_L("bl3")));
+	verify(!box_list.Get(index++));
+
+	verify(!op_strcmp(traversal_object.GetText(), "ABC"));
+}
+
+html
+{
+//! <!DOCTYPE html>
+//! <html><body>
+//!   <span>
+//!    A
+//!    <div>block</div>
+//!    B
+//!   </span>
+//! </body></html>
+}
+test("block in inline (one-pass)")
+{
+	FramesDocument* doc = state.doc;
+	HTML_Element* root = doc->GetDocRoot();
+	ST_OnePassTraversalObject traversal_object(doc);
+
+	traversal_object.Traverse(root);
+	verify(!traversal_object.IsOutOfMemory());
+
+	const BoxList &box_list = traversal_object.GetBoxList();
+	UINT32 index = 0;
+	Box* box;
+
+	verify(IsSaneLayout(box_list, index));
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement()->Type() == Markup::HTE_SPAN);
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement()->Type() == Markup::HTE_DIV);
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement()->Type() == Markup::HTE_SPAN);
+	verify(!box_list.Get(index++));
+
+	verify(!op_strcmp(traversal_object.GetText(), "AblockB"));
+}
+test("block in inline (multi-pass)")
+{
+	FramesDocument* doc = state.doc;
+	HTML_Element* root = doc->GetDocRoot();
+	ST_MultiPassTraversalObject traversal_object(doc);
+
+	traversal_object.Traverse(root);
+	verify(!traversal_object.IsOutOfMemory());
+
+	const BoxList &box_list = traversal_object.GetBoxList();
+	UINT32 index = 0;
+	Box* box;
+
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement()->Type() == Markup::HTE_DOC_ROOT);
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement()->Type() == Markup::HTE_HTML);
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement()->Type() == Markup::HTE_BODY);
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement()->Type() == Markup::HTE_DIV);
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement()->Type() == Markup::HTE_HTML);
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement()->Type() == Markup::HTE_BODY);
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement()->Type() == Markup::HTE_SPAN);
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement()->Type() == Markup::HTE_DIV);
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement()->Type() == Markup::HTE_SPAN);
+	verify(!box_list.Get(index++));
+
+	verify(!op_strcmp(traversal_object.GetText(), "AblockB"));
+}
+test("block in inline (logical)")
+{
+	FramesDocument* doc = state.doc;
+	HTML_Element* root = doc->GetDocRoot();
+	ST_LogicalTraversalObject traversal_object(doc);
+
+	traversal_object.Traverse(root);
+	verify(!traversal_object.IsOutOfMemory());
+
+	const BoxList &box_list = traversal_object.GetBoxList();
+	UINT32 index = 0;
+	Box* box;
+
+	verify(IsSaneLayout(box_list, index));
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement()->Type() == Markup::HTE_SPAN);
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement()->Type() == Markup::HTE_DIV);
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement()->Type() == Markup::HTE_SPAN);
+	verify(!box_list.Get(index++));
+
+	verify(!op_strcmp(traversal_object.GetText(), "AblockB"));
+}
+
+html
+{
+//! <!DOCTYPE html>
+//! <html><body>
+//!  <span id="outerspan">
+//!   {
+//!   <div id="block">
+//!    <span id="sp1">
+//!     <div id="fl" style="float:left;">float</div>
+//!     blBEFORE
+//!     <div id="abspos" style="position:absolute;">
+//!      <span id="sp2">
+//!       apBEFORE
+//!       <div id="fixedzroot1" style="position:fixed; z-index:2;">+</div>
+//!       <div id="fixedzroot2" style="position:fixed; z-index:-2;">-</div>
+//!       apAFTER
+//!      </span>
+//!     </div>
+//!     blAFTER
+//!    </span>
+//!   </div>
+//!   }
+//!  </span>
+//! </body></html>
+}
+test("fixedpos zroot in abspos in block w/ float (one-pass)")
+{
+	FramesDocument* doc = state.doc;
+	HTML_Element* root = doc->GetDocRoot();
+	ST_OnePassTraversalObject traversal_object(doc);
+
+	traversal_object.Traverse(root);
+	verify(!traversal_object.IsOutOfMemory());
+
+	const BoxList &box_list = traversal_object.GetBoxList();
+	UINT32 index = 0;
+	Box* box;
+
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement()->Type() == Markup::HTE_DOC_ROOT);
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement() == root->GetElmById(UNI_L("fixedzroot2")));
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement()->Type() == Markup::HTE_HTML);
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement()->Type() == Markup::HTE_BODY);
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement() == root->GetElmById(UNI_L("outerspan")));
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement() == root->GetElmById(UNI_L("block")));
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement() == root->GetElmById(UNI_L("fl")));
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement() == root->GetElmById(UNI_L("sp1")));
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement() == root->GetElmById(UNI_L("outerspan")));
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement() == root->GetElmById(UNI_L("abspos")));
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement() == root->GetElmById(UNI_L("sp2")));
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement() == root->GetElmById(UNI_L("fixedzroot1")));
+	verify(!box_list.Get(index++));
+
+	verify(!op_strcmp(traversal_object.GetText(), "-{floatblBEFOREblAFTER}apBEFOREapAFTER+"));
+}
+test("fixedpos zroot in abspos in block w/ float (multi-pass)")
+{
+	FramesDocument* doc = state.doc;
+	HTML_Element* root = doc->GetDocRoot();
+	ST_MultiPassTraversalObject traversal_object(doc);
+
+	traversal_object.Traverse(root);
+	verify(!traversal_object.IsOutOfMemory());
+
+	const BoxList &box_list = traversal_object.GetBoxList();
+	UINT32 index = 0;
+	Box* box;
+
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement()->Type() == Markup::HTE_DOC_ROOT);
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement() == root->GetElmById(UNI_L("fixedzroot2")));
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement()->Type() == Markup::HTE_HTML);
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement()->Type() == Markup::HTE_BODY);
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement() == root->GetElmById(UNI_L("block")));
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement() == root->GetElmById(UNI_L("fl")));
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement()->Type() == Markup::HTE_HTML);
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement()->Type() == Markup::HTE_BODY);
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement() == root->GetElmById(UNI_L("outerspan")));
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement() == root->GetElmById(UNI_L("block")));
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement() == root->GetElmById(UNI_L("sp1")));
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement() == root->GetElmById(UNI_L("outerspan")));
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement() == root->GetElmById(UNI_L("abspos")));
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement() == root->GetElmById(UNI_L("sp2")));
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement() == root->GetElmById(UNI_L("fixedzroot1")));
+	verify(!box_list.Get(index++));
+
+	verify(!op_strcmp(traversal_object.GetText(), "-float{blBEFOREblAFTER}apBEFOREapAFTER+"));
+}
+test("fixedpos zroot in abspos in block w/ float (logical)")
+{
+	FramesDocument* doc = state.doc;
+	HTML_Element* root = doc->GetDocRoot();
+	ST_LogicalTraversalObject traversal_object(doc);
+
+	traversal_object.Traverse(root);
+	verify(!traversal_object.IsOutOfMemory());
+
+	const BoxList &box_list = traversal_object.GetBoxList();
+	UINT32 index = 0;
+	Box* box;
+
+	verify(IsSaneLayout(box_list, index));
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement() == root->GetElmById(UNI_L("outerspan")));
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement() == root->GetElmById(UNI_L("block")));
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement() == root->GetElmById(UNI_L("sp1")));
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement() == root->GetElmById(UNI_L("fl")));
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement() == root->GetElmById(UNI_L("abspos")));
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement() == root->GetElmById(UNI_L("sp2")));
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement() == root->GetElmById(UNI_L("fixedzroot1")));
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement() == root->GetElmById(UNI_L("fixedzroot2")));
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement() == root->GetElmById(UNI_L("outerspan")));
+	verify(!box_list.Get(index++));
+
+	verify(!op_strcmp(traversal_object.GetText(), "{floatblBEFOREapBEFORE+-apAFTERblAFTER}"));
+}
+
+html
+{
+//! <!DOCTYPE html>
+//! <html><body>
+//!   <div id="zeroA" style="position:absolute;">0A</div>
+//!   <div id="zeroB" style="position:relative;">0B</div>
+//!   <div id="negA" style="z-index:-1; position:fixed;">-A</div>
+//!   <div id="negB" style="z-index:-1; position:absolute;">-B</div>
+//!   <div id="posA" style="z-index:1; position:relative;">+A</div>
+//!   <div id="posB" style="z-index:1; position:fixed;">+B</div>
+//!   <div id="negC" style="z-index:-1; position:absolute;">-C</div>
+//!   <div id="posC" style="z-index:1; position:relative;">+C</div>
+//!   <div id="zeroC" style="position:fixed;">0C</div>
+//!   <div id="zeroD" style="opacity:0.9;">0D</div>
+//! </body></html>
+}
+test("fixedpos zroot in abspos in block w/ float (one-pass)")
+{
+	FramesDocument* doc = state.doc;
+	HTML_Element* root = doc->GetDocRoot();
+	ST_OnePassTraversalObject traversal_object(doc);
+
+	traversal_object.Traverse(root);
+	verify(!traversal_object.IsOutOfMemory());
+
+	const BoxList &box_list = traversal_object.GetBoxList();
+	UINT32 index = 0;
+	Box* box;
+
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement()->Type() == Markup::HTE_DOC_ROOT);
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement() == root->GetElmById(UNI_L("negA")));
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement() == root->GetElmById(UNI_L("negB")));
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement() == root->GetElmById(UNI_L("negC")));
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement()->Type() == Markup::HTE_HTML);
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement()->Type() == Markup::HTE_BODY);
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement() == root->GetElmById(UNI_L("zeroA")));
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement() == root->GetElmById(UNI_L("zeroB")));
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement() == root->GetElmById(UNI_L("zeroC")));
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement() == root->GetElmById(UNI_L("zeroD")));
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement() == root->GetElmById(UNI_L("posA")));
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement() == root->GetElmById(UNI_L("posB")));
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement() == root->GetElmById(UNI_L("posC")));
+	verify(!box_list.Get(index++));
+
+	verify(!op_strcmp(traversal_object.GetText(), "-A-B-C0A0B0C0D+A+B+C"));
+}
+test("fixedpos zroot in abspos in block w/ float (multi-pass)")
+{
+	FramesDocument* doc = state.doc;
+	HTML_Element* root = doc->GetDocRoot();
+	ST_MultiPassTraversalObject traversal_object(doc);
+
+	traversal_object.Traverse(root);
+	verify(!traversal_object.IsOutOfMemory());
+
+	const BoxList &box_list = traversal_object.GetBoxList();
+	UINT32 index = 0;
+	Box* box;
+
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement()->Type() == Markup::HTE_DOC_ROOT);
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement() == root->GetElmById(UNI_L("negA")));
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement() == root->GetElmById(UNI_L("negB")));
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement() == root->GetElmById(UNI_L("negC")));
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement()->Type() == Markup::HTE_HTML);
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement()->Type() == Markup::HTE_BODY);
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement()->Type() == Markup::HTE_HTML);
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement()->Type() == Markup::HTE_BODY);
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement() == root->GetElmById(UNI_L("zeroA")));
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement() == root->GetElmById(UNI_L("zeroB")));
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement() == root->GetElmById(UNI_L("zeroC")));
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement() == root->GetElmById(UNI_L("zeroD")));
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement() == root->GetElmById(UNI_L("posA")));
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement() == root->GetElmById(UNI_L("posB")));
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement() == root->GetElmById(UNI_L("posC")));
+	verify(!box_list.Get(index++));
+
+	verify(!op_strcmp(traversal_object.GetText(), "-A-B-C0A0B0C0D+A+B+C"));
+}
+test("fixedpos zroot in abspos in block w/ float (logical)")
+{
+	FramesDocument* doc = state.doc;
+	HTML_Element* root = doc->GetDocRoot();
+	ST_LogicalTraversalObject traversal_object(doc);
+
+	traversal_object.Traverse(root);
+	verify(!traversal_object.IsOutOfMemory());
+
+	const BoxList &box_list = traversal_object.GetBoxList();
+	UINT32 index = 0;
+	Box* box;
+
+	verify(IsSaneLayout(box_list, index));
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement() == root->GetElmById(UNI_L("zeroA")));
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement() == root->GetElmById(UNI_L("zeroB")));
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement() == root->GetElmById(UNI_L("negA")));
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement() == root->GetElmById(UNI_L("negB")));
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement() == root->GetElmById(UNI_L("posA")));
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement() == root->GetElmById(UNI_L("posB")));
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement() == root->GetElmById(UNI_L("negC")));
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement() == root->GetElmById(UNI_L("posC")));
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement() == root->GetElmById(UNI_L("zeroC")));
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement() == root->GetElmById(UNI_L("zeroD")));
+	verify(!box_list.Get(index++));
+
+	verify(!op_strcmp(traversal_object.GetText(), "0A0B-A-B+A+B-C+C0C0D"));
+}
+
+html
+{
+//! <!DOCTYPE html>
+//! <html><body>
+//!   <span id="outer">
+//!    {
+//!    <span id="pos1" style="position:relative;">p1</span>
+//!    <br id="br1">
+//!    <span id="pos2" style="position:relative;">
+//!     p2A
+//!     <span id="pos3" style="position:relative; z-index:1;">
+//!      p3A
+//!      <span id="pos4" style="position:relative; z-index:-1;">p4</span>
+//!      <br id="br3">p3B
+//!     </span>
+//!     <span id="pos5" style="position:relative;">p5A<br id="br2">p5B</span>
+//!     p2B
+//!     <span id="pos6" style="position:relative;">p6A<br id="br4">p6B</span>
+//!     p2C
+//!    </span>
+//!    }
+//!   </span>
+//! </body></html>
+}
+test("zroot inlines (one-pass)")
+{
+	FramesDocument* doc = state.doc;
+	HTML_Element* root = doc->GetDocRoot();
+	ST_OnePassTraversalObject traversal_object(doc);
+
+	traversal_object.Traverse(root);
+	verify(!traversal_object.IsOutOfMemory());
+
+	const BoxList &box_list = traversal_object.GetBoxList();
+	UINT32 index = 0;
+	Box* box;
+
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement()->Type() == Markup::HTE_DOC_ROOT);
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement()->Type() == Markup::HTE_HTML);
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement()->Type() == Markup::HTE_BODY);
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement() == root->GetElmById(UNI_L("outer")));
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement() == root->GetElmById(UNI_L("br1")));
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement() == root->GetElmById(UNI_L("outer")));
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement() == root->GetElmById(UNI_L("outer")));
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement() == root->GetElmById(UNI_L("outer")));
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement() == root->GetElmById(UNI_L("outer")));
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement() == root->GetElmById(UNI_L("pos1")));
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement() == root->GetElmById(UNI_L("pos2")));
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement() == root->GetElmById(UNI_L("pos2")));
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement() == root->GetElmById(UNI_L("pos2")));
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement() == root->GetElmById(UNI_L("pos2")));
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement() == root->GetElmById(UNI_L("pos5")));
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement() == root->GetElmById(UNI_L("br2")));
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement() == root->GetElmById(UNI_L("pos5")));
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement() == root->GetElmById(UNI_L("pos6")));
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement() == root->GetElmById(UNI_L("br4")));
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement() == root->GetElmById(UNI_L("pos6")));
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement() == root->GetElmById(UNI_L("pos3")));
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement() == root->GetElmById(UNI_L("pos4")));
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement() == root->GetElmById(UNI_L("br3")));
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement() == root->GetElmById(UNI_L("pos3")));
+	verify(!box_list.Get(index++));
+
+	verify(!op_strcmp(traversal_object.GetText(), "{}p1p2Ap2Bp2Cp5Ap5Bp6Ap6Bp4p3Ap3B"));
+}
+test("zroot inlines (multi-pass)")
+{
+	FramesDocument* doc = state.doc;
+	HTML_Element* root = doc->GetDocRoot();
+	ST_MultiPassTraversalObject traversal_object(doc);
+
+	traversal_object.Traverse(root);
+	verify(!traversal_object.IsOutOfMemory());
+
+	const BoxList &box_list = traversal_object.GetBoxList();
+	UINT32 index = 0;
+	Box* box;
+
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement()->Type() == Markup::HTE_DOC_ROOT);
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement()->Type() == Markup::HTE_HTML);
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement()->Type() == Markup::HTE_BODY);
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement()->Type() == Markup::HTE_HTML);
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement()->Type() == Markup::HTE_BODY);
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement() == root->GetElmById(UNI_L("outer")));
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement() == root->GetElmById(UNI_L("br1")));
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement() == root->GetElmById(UNI_L("outer")));
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement() == root->GetElmById(UNI_L("outer")));
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement() == root->GetElmById(UNI_L("outer")));
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement() == root->GetElmById(UNI_L("outer")));
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement() == root->GetElmById(UNI_L("pos1")));
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement() == root->GetElmById(UNI_L("pos2")));
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement() == root->GetElmById(UNI_L("pos2")));
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement() == root->GetElmById(UNI_L("pos2")));
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement() == root->GetElmById(UNI_L("pos2")));
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement() == root->GetElmById(UNI_L("pos5")));
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement() == root->GetElmById(UNI_L("br2")));
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement() == root->GetElmById(UNI_L("pos5")));
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement() == root->GetElmById(UNI_L("pos6")));
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement() == root->GetElmById(UNI_L("br4")));
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement() == root->GetElmById(UNI_L("pos6")));
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement() == root->GetElmById(UNI_L("pos3")));
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement() == root->GetElmById(UNI_L("pos4")));
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement() == root->GetElmById(UNI_L("br3")));
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement() == root->GetElmById(UNI_L("pos3")));
+	verify(!box_list.Get(index++));
+
+	verify(!op_strcmp(traversal_object.GetText(), "{}p1p2Ap2Bp2Cp5Ap5Bp6Ap6Bp4p3Ap3B"));
+}
+test("zroot inlines (logical)")
+{
+	FramesDocument* doc = state.doc;
+	HTML_Element* root = doc->GetDocRoot();
+	ST_LogicalTraversalObject traversal_object(doc);
+
+	traversal_object.Traverse(root);
+	verify(!traversal_object.IsOutOfMemory());
+
+	const BoxList &box_list = traversal_object.GetBoxList();
+	UINT32 index = 0;
+	Box* box;
+
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement()->Type() == Markup::HTE_DOC_ROOT);
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement()->Type() == Markup::HTE_HTML);
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement()->Type() == Markup::HTE_BODY);
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement() == root->GetElmById(UNI_L("outer")));
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement() == root->GetElmById(UNI_L("pos1")));
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement() == root->GetElmById(UNI_L("br1")));
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement() == root->GetElmById(UNI_L("outer")));
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement() == root->GetElmById(UNI_L("pos2")));
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement() == root->GetElmById(UNI_L("pos3")));
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement() == root->GetElmById(UNI_L("pos4")));
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement() == root->GetElmById(UNI_L("br3")));
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement() == root->GetElmById(UNI_L("outer")));
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement() == root->GetElmById(UNI_L("pos2")));
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement() == root->GetElmById(UNI_L("pos3")));
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement() == root->GetElmById(UNI_L("pos5")));
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement() == root->GetElmById(UNI_L("br2")));
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement() == root->GetElmById(UNI_L("outer")));
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement() == root->GetElmById(UNI_L("pos2")));
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement() == root->GetElmById(UNI_L("pos5")));
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement() == root->GetElmById(UNI_L("pos6")));
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement() == root->GetElmById(UNI_L("br4")));
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement() == root->GetElmById(UNI_L("outer")));
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement() == root->GetElmById(UNI_L("pos2")));
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement() == root->GetElmById(UNI_L("pos6")));
+	verify(!box_list.Get(index++));
+
+	verify(!op_strcmp(traversal_object.GetText(), "{p1p2Ap3Ap4p3Bp5Ap5Bp2Bp6Ap6Bp2C}"));
+}
+
+html
+{
+//! <!DOCTYPE html>
+//! <html>
+//!  <head>
+//!   <style>
+//!    .rel, .relpositive, .relnegative { position:relative; }
+//!    .relpositive { z-index:1; }
+//!    .relnegative { z-index:-1; }
+//!   </style>
+//!  </head>
+//!  <body style="width:0;">
+//!   <span id="outer" style="position:relative; z-index:1;">
+//!    A
+//!    <span id="p1" class="relnegative">B<span id="p2" class="relpositive">b</span></span>
+//!    <span id="p3" class="relpositive">C<span id="p4" class="rel">c</span></span>
+//!    <span id="p5" class="rel">D<span id="p6" class="relnegative">d</span></span>
+//!    Z
+//!   </span>
+//!  </body>
+//! </html>
+}
+test("CORE-41860 zroot inlines (one-pass)")
+{
+	FramesDocument* doc = state.doc;
+	HTML_Element* root = doc->GetDocRoot();
+	ST_OnePassTraversalObject traversal_object(doc);
+
+	traversal_object.Traverse(root);
+	verify(!traversal_object.IsOutOfMemory());
+
+	const BoxList &box_list = traversal_object.GetBoxList();
+	UINT32 index = 0;
+	Box* box;
+
+	/* Note: we're traversing this in incorrect order. For the outer inline Z
+	   root, we traverse in correct order on a line basis, not on element
+	   basis. Bug reported as CORE-43885. But anyway, let's at least verify
+	   that we don't do anything else fishy, such as traversing content twice
+	   or missing it. */
+
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement()->Type() == Markup::HTE_DOC_ROOT);
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement()->Type() == Markup::HTE_HTML);
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement()->Type() == Markup::HTE_BODY);
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement() == root->GetElmById(UNI_L("outer")));
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement() == root->GetElmById(UNI_L("p1")));
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement() == root->GetElmById(UNI_L("outer")));
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement() == root->GetElmById(UNI_L("p1")));
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement() == root->GetElmById(UNI_L("p2")));
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement() == root->GetElmById(UNI_L("p3")));
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement() == root->GetElmById(UNI_L("outer")));
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement() == root->GetElmById(UNI_L("p5")));
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement() == root->GetElmById(UNI_L("p3")));
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement() == root->GetElmById(UNI_L("p4")));
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement() == root->GetElmById(UNI_L("outer")));
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement() == root->GetElmById(UNI_L("p6")));
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement() == root->GetElmById(UNI_L("p5")));
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement() == root->GetElmById(UNI_L("outer")));
+	verify(!box_list.Get(index++));
+
+	verify(!op_strcmp(traversal_object.GetText(), "ABbCcdDZ"));
+}
+test("CORE-41860 zroot inlines (multi-pass)")
+{
+	FramesDocument* doc = state.doc;
+	HTML_Element* root = doc->GetDocRoot();
+	ST_MultiPassTraversalObject traversal_object(doc);
+
+	traversal_object.Traverse(root);
+	verify(!traversal_object.IsOutOfMemory());
+
+	const BoxList &box_list = traversal_object.GetBoxList();
+	UINT32 index = 0;
+	Box* box;
+
+	/* Note: we're traversing this in incorrect order. For the outer inline Z
+	   root, we traverse in correct order on a line basis, not on element
+	   basis. Bug reported as CORE-43885. But anyway, let's at least verify
+	   that we don't do anything else fishy, such as traversing content twice
+	   or missing it. */
+
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement()->Type() == Markup::HTE_DOC_ROOT);
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement()->Type() == Markup::HTE_HTML);
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement()->Type() == Markup::HTE_BODY);
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement()->Type() == Markup::HTE_HTML);
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement()->Type() == Markup::HTE_BODY);
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement() == root->GetElmById(UNI_L("outer")));
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement() == root->GetElmById(UNI_L("p1")));
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement() == root->GetElmById(UNI_L("outer")));
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement() == root->GetElmById(UNI_L("p1")));
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement() == root->GetElmById(UNI_L("p2")));
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement() == root->GetElmById(UNI_L("p3")));
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement() == root->GetElmById(UNI_L("outer")));
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement() == root->GetElmById(UNI_L("p5")));
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement() == root->GetElmById(UNI_L("p3")));
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement() == root->GetElmById(UNI_L("p4")));
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement() == root->GetElmById(UNI_L("outer")));
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement() == root->GetElmById(UNI_L("p6")));
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement() == root->GetElmById(UNI_L("p5")));
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement() == root->GetElmById(UNI_L("outer")));
+	verify(!box_list.Get(index++));
+
+	verify(!op_strcmp(traversal_object.GetText(), "ABbCcdDZ"));
+}
+test("CORE-41860 zroot inlines (logical)")
+{
+	FramesDocument* doc = state.doc;
+	HTML_Element* root = doc->GetDocRoot();
+	ST_LogicalTraversalObject traversal_object(doc);
+
+	traversal_object.Traverse(root);
+	verify(!traversal_object.IsOutOfMemory());
+
+	const BoxList &box_list = traversal_object.GetBoxList();
+	UINT32 index = 0;
+	Box* box;
+
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement()->Type() == Markup::HTE_DOC_ROOT);
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement()->Type() == Markup::HTE_HTML);
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement()->Type() == Markup::HTE_BODY);
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement() == root->GetElmById(UNI_L("outer")));
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement() == root->GetElmById(UNI_L("p1")));
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement() == root->GetElmById(UNI_L("outer")));
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement() == root->GetElmById(UNI_L("p1")));
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement() == root->GetElmById(UNI_L("p2")));
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement() == root->GetElmById(UNI_L("p3")));
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement() == root->GetElmById(UNI_L("outer")));
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement() == root->GetElmById(UNI_L("p3")));
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement() == root->GetElmById(UNI_L("p4")));
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement() == root->GetElmById(UNI_L("p5")));
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement() == root->GetElmById(UNI_L("outer")));
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement() == root->GetElmById(UNI_L("p5")));
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement() == root->GetElmById(UNI_L("p6")));
+
+	verify(!op_strcmp(traversal_object.GetText(), "ABbCcDdZ"));
+}
+
+html
+{
+//! <!DOCTYPE html>
+//! <html><body style="margin:0;">
+//!   <div id="elm" style="width:100px; height:100px; margin:1px; border:2px solid; padding:3px;">
+//!    <div style="width:200px; height:200px;"></div>
+//!   </div>
+//!  </body>
+//! </html>
+}
+test("BoxEdgesObject - block - OFFSET_AREA")
+{
+	HTML_Element* root = state.doc->GetLogicalDocument()->GetRoot();
+	verify(root);
+
+	HTML_Element* elm = state.doc->GetDocRoot()->GetElmById(UNI_L("elm"));
+	verify(elm);
+
+	BoxEdgesObject beo(state.doc, elm, root, BoxEdgesObject::OFFSET_AREA);
+	beo.Traverse(root);
+
+	verify(beo.GetBoxFound());
+	const RECT& rect = beo.GetBoxEdges();
+
+	verify(rect.left == 1);
+	verify(rect.top == 1);
+	verify(rect.right == 111);
+	verify(rect.bottom == 111);
+}
+
+html
+{
+//! <!DOCTYPE html>
+//! <html><body style="margin:0;">
+//!   <div id="elm" style="display:inline-block; width:100px; height:100px; margin:1px; border:2px solid; padding:3px;">
+//!    <div style="width:200px; height:200px;"></div>
+//!   </div>
+//!  </body>
+//! </html>
+}
+test("BoxEdgesObject - inline-block - OFFSET_AREA")
+{
+	HTML_Element* root = state.doc->GetLogicalDocument()->GetRoot();
+	verify(root);
+
+	HTML_Element* elm = state.doc->GetDocRoot()->GetElmById(UNI_L("elm"));
+	verify(elm);
+
+	BoxEdgesObject beo(state.doc, elm, root, BoxEdgesObject::OFFSET_AREA);
+	beo.Traverse(root);
+
+	verify(beo.GetBoxFound());
+	const RECT& rect = beo.GetBoxEdges();
+
+	verify(rect.left == 1);
+	verify(rect.top == 1);
+	verify(rect.right == 111);
+	verify(rect.bottom == 111);
+}
+
+html
+{
+//! <!DOCTYPE html>
+//! <html><body style="margin:0; line-height:100px;">
+//!   <span id="elm">
+//!	   line
+//!    <div style="width:500px; height:200px;">
+//!     <div style="width:10000px; height:10000px;"></div>
+//!    </div>
+//!   </span>
+//!  </body>
+//! </html>
+}
+test("BoxEdgesObject - inline with block - OFFSET_AREA")
+{
+	HTML_Element* root = state.doc->GetLogicalDocument()->GetRoot();
+	verify(root);
+
+	HTML_Element* elm = state.doc->GetDocRoot()->GetElmById(UNI_L("elm"));
+	verify(elm);
+
+	BoxEdgesObject beo(state.doc, elm, root, BoxEdgesObject::OFFSET_AREA);
+	beo.Traverse(root);
+
+	verify(beo.GetBoxFound());
+	const RECT& rect = beo.GetBoxEdges();
+
+	verify(rect.left == 0);
+	verify(rect.right == 500);
+	verify(rect.bottom == 300);
+}
+
+html
+{
+//! <!DOCTYPE html>
+//! <html><body style="margin:0; line-height:100px;">
+//!   <span id="elm">
+//!    <span>
+//!	    line
+//!     <div style="width:500px; height:200px;">
+//!      <div style="width:10000px; height:10000px;"></div>
+//!     </div>
+//!    </span>
+//!   </span>
+//!  </body>
+//! </html>
+}
+test("BoxEdgesObject - inline in inline with block - OFFSET_AREA")
+{
+	HTML_Element* root = state.doc->GetLogicalDocument()->GetRoot();
+	verify(root);
+
+	HTML_Element* elm = state.doc->GetDocRoot()->GetElmById(UNI_L("elm"));
+	verify(elm);
+
+	BoxEdgesObject beo(state.doc, elm, root, BoxEdgesObject::OFFSET_AREA);
+	beo.Traverse(root);
+
+	verify(beo.GetBoxFound());
+	const RECT& rect = beo.GetBoxEdges();
+
+	verify(rect.left == 0);
+	verify(rect.right == 500);
+	verify(rect.bottom == 300);
+}
+
+html
+{
+//! <!DOCTYPE html>
+//! <html><body style="margin:0; line-height:100px;">
+//!   <span id="elm">
+//!	   line
+//!    <div style="position:absolute; width:10px; height:10px;"></div>
+//!    <div style="float:left; width:10px; height:10px;"></div>
+//!    <div style="width:200px; height:100px;"></div>
+//!    <div style="position:relative; width:300px; height:100px;"></div>
+//!    <div style="position:absolute; width:400px; height:10px;"></div>
+//!    <div style="float:left; width:10px; height:10px;"></div>
+//!    <div style="clear:both; width:100px; height:100px;"></div>
+//!   </span>
+//!   <div style="width:100px; height:100px;"></div>
+//!  </body>
+//! </html>
+}
+test("BoxEdgesObject - inline with misc. blocks - OFFSET_AREA")
+{
+	FramesDocument* doc = state.doc;
+	HTML_Element* root = doc->GetLogicalDocument()->GetRoot();
+	verify(root);
+
+	HTML_Element* elm = root->GetElmById(UNI_L("elm"));
+	verify(elm);
+
+	BoxEdgesObject beo(doc, elm, root, BoxEdgesObject::OFFSET_AREA);
+	beo.Traverse(root);
+
+	verify(beo.GetBoxFound());
+	const RECT& rect = beo.GetBoxEdges();
+
+	verify(rect.left == 0);
+	verify(rect.right == 400);
+	verify(rect.bottom == 410);
+}
+test("GetRectList - inline with misc. blocks")
+{
+	RectList rect_list;
+	FramesDocument* doc = state.doc;
+	HTML_Element* root = doc->GetLogicalDocument()->GetRoot();
+	verify(root);
+
+	HTML_Element* elm = root->GetElmById(UNI_L("elm"));
+	verify(elm);
+	verify(elm->GetLayoutBox());
+
+	verify(elm->GetLayoutBox()->GetRectList(doc, BORDER_BOX, rect_list));
+	verify(rect_list.Cardinal() == 8);
+}
+finally
+{
+	rect_list.Clear();
+}
+
+test("PRECONDITION: AHEM")
+{
+	short font_number = styleManager->GetFontNumber(UNI_L("AHEM"));
+	verify(font_number != -1);
+}
+
+language ecmascript;
+
+html
+{
+//!<!DOCTYPE html>
+//!<html>
+//!<head>
+//!
+//!<style>
+//!*
+//!{
+//!	margin:0;padding:0;
+//!	font-size:20px;
+//!	font-family:'AHEM';
+//!}
+//!
+//!div
+//!{
+//!	width:40px;
+//!	height:40px;
+//!	margin-left:40px;
+//!}
+//!
+//!#test
+//!{
+//!	margin-left:-20px;
+//!}
+//!
+//!</style>
+//!
+//!</head>
+//!
+//!<body>
+//!<div><span id="test">X</span></div>
+//!</body>
+//!
+//!</html>
+}
+test("GetRect of an inline element with negative margin")
+	require success "PRECONDITION: AHEM";
+	/* Tests whether the rect of the test span has correct
+	   horizontal position. The line has zero used space, because
+	   the element has negative margin that is as big as its width. */
+{
+	element = document.getElementById("test");
+	verify(element.offsetLeft == 20);
+	verify(element.offsetWidth == 20);
+}
+
+language C++;
+
+subtest CoreViewFinderFixedPositionedElementTest(FramesDocument* doc, const OpRect& area, BOOL should_hit, const char* fixed_elm_id)
+{
+	OpPointerHashTable<HTML_Element, CoreView> core_views;
+	OpPointerSet<HTML_Element> fixed_position_subtrees;
+	HTML_Element* core_view_elm = find_element_id("fixed_scr");
+	verify(core_view_elm);
+	ScrollableArea* cv = core_view_elm->GetLayoutBox() ? core_view_elm->GetLayoutBox()->GetScrollable() : NULL;
+	verify(cv);
+
+	verify_success(core_views.Add(core_view_elm, cv));
+
+	if (fixed_elm_id)
+	{
+		HTML_Element* fixed_elm = find_element_id(fixed_elm_id);
+		verify(fixed_elm);
+		verify_success(fixed_position_subtrees.Add(fixed_elm));
+	}
+	else
+		verify_success(fixed_position_subtrees.Add(core_view_elm));
+
+	verify_success(CoreViewFinder::TraverseWithFixedPositioned(doc, area, core_views, fixed_position_subtrees));
+
+	// CoreViewFinder::TraverseWithFixedPositioned assumption (on success).
+	verify(fixed_position_subtrees.GetCount() == 0);
+
+	/* Depending on the param, we should or shouldn't hit the CoreView.
+	   Hitting means intersecting the searched area. */
+	verify(core_views.GetCount() == (should_hit ? 0 : 1));
+}
+finally
+{
+	core_views.RemoveAll();
+	fixed_position_subtrees.RemoveAll();
+}
+
+html
+{
+//!<!DOCTYPE html>
+//!<html>
+//!<head>
+//!<style>
+//!*
+//!{
+//!	margin:0;
+//!	padding:0;
+//!}
+//!
+//!#fixed_scr
+//!{
+//!	overflow:hidden;
+//!	position:fixed;
+//!	height:50px;
+//!	width:50px;
+//!	left:20px;
+//!	top:20px;
+//!	background-color:green;
+//!}
+//!
+//!</style>
+//!</head>
+//!<body>
+//!    <div id="fixed_scr">
+//!    </div>
+//!</body>
+//!</html>
+}
+test("CoreViewFinder vs. fixed positioned test 1")
+	/* Fixed positioned div with overflow hidden with specified offsets.
+	   These tests ("CoreViewFinder vs. fixed positioned...") test the special
+	   type of traverse of CoreViewFinder. We check whether we reach the CoreView,
+	   which the ScrollableContainer of an element with overflow:hidden is
+	   a subclass of. Depending on the area, that CoreView does or doesn't
+	   intersect it. The rectangles are chosen in a way, so the correct result
+	   is fragile (the rects intersect by e.g. just one pixel or are just one
+	   pixel away. */
+{
+	FramesDocument* doc = state.doc;
+	BOOL need_reset_layout_view = FALSE;
+	LayoutWorkplace* lwp = doc->GetLogicalDocument() ? doc->GetLogicalDocument()->GetLayoutWorkplace() : NULL;
+	verify(lwp);
+
+	verify(CoreViewFinderFixedPositionedElementTest(doc, OpRect(20, 20, 10, 10), TRUE, NULL));
+	verify(CoreViewFinderFixedPositionedElementTest(doc, OpRect(10, 10, 10, 10), FALSE, NULL));
+
+	// This will affect the fixed positioned elements.
+	lwp->SetLayoutViewPos(LayoutCoord(10), LayoutCoord(10));
+	need_reset_layout_view = TRUE;
+
+	verify(CoreViewFinderFixedPositionedElementTest(doc, OpRect(79, 79, 10, 10), TRUE, NULL));
+	verify(CoreViewFinderFixedPositionedElementTest(doc, OpRect(20, 20, 10, 10), FALSE, NULL));
+}
+finally
+{
+	if (need_reset_layout_view)
+		lwp->SetLayoutViewPos(LayoutCoord(0), LayoutCoord(0));
+}
+
+html
+{
+//!<!DOCTYPE html>
+//!<html>
+//!<head>
+//!<style>
+//!*
+//!{
+//!	margin:0;
+//!	padding:0;
+//!}
+//!
+//!#fixed_elm
+//!{
+//!	line-height:20px;
+//!	position:fixed;
+//!	height:50px;
+//!	width:50px;
+//!	left:20px;
+//!	top:20px;
+//!	background-color:yellow;
+//!}
+//!
+//!#fixed_scr
+//!{
+//!	display:inline-block;
+//!	height:30px;
+//!	width:30px;
+//!	overflow:hidden;
+//!	margin-left:20px;
+//!	background-color:green;
+//!}
+//!
+//!</style>
+//!</head>
+//!<body>
+//!    <div id="fixed_elm">
+//!	Text.
+//!		<div id="fixed_scr">
+//!		</div>
+//!	</div>
+//!</body>
+//!</html>
+}
+test("CoreViewFinder vs. fixed positioned test 2")
+	/* Fixed positioned div with specified offsets having a div with overflow
+	   hidden as a child, which is inline placed and has some translation to its
+	   fixed positioned parent. */
+{
+	verify(CoreViewFinderFixedPositionedElementTest(state.doc, OpRect(40, 40, 10, 10), TRUE, "fixed_elm"));
+	verify(CoreViewFinderFixedPositionedElementTest(state.doc, OpRect(30, 40, 10, 10), FALSE, "fixed_elm"));
+}
+
+html
+{
+//!<!DOCTYPE html>
+//!<html>
+//!<head>
+//!<style>
+//!*
+//!{
+//!	margin:0;
+//!	padding:0;
+//!	line-height:20px;
+//!}
+//!
+//!#fixed_scr
+//!{
+//!	overflow:hidden;
+//!	position:fixed;
+//!	height:50px;
+//!	width:50px;
+//!	background-color:green;
+//!}
+//!
+//!</style>
+//!</head>
+//!<body>
+//!	Text.
+//!	<div id="fixed_scr">
+//!	</div>
+//!</body>
+//!</html>
+}
+test("CoreViewFinder vs. fixed positioned test 3")
+	// Fixed positioned div with overflow hidden and auto offsets.
+{
+	FramesDocument* doc = state.doc;
+	BOOL need_reset_layout_view = FALSE;
+	LayoutWorkplace* lwp = doc->GetLogicalDocument() ? doc->GetLogicalDocument()->GetLayoutWorkplace() : NULL;
+	verify(lwp);
+
+	verify(CoreViewFinderFixedPositionedElementTest(doc, OpRect(0, 20, 10, 10), TRUE, NULL));
+	verify(CoreViewFinderFixedPositionedElementTest(doc, OpRect(0, 10, 10, 10), FALSE, NULL));
+
+	// This will affect the fixed positioned elements.
+	lwp->SetLayoutViewPos(LayoutCoord(10), LayoutCoord(10));
+	need_reset_layout_view = TRUE;
+
+	verify(CoreViewFinderFixedPositionedElementTest(doc, OpRect(1, 79, 10, 10), TRUE, NULL));
+	verify(CoreViewFinderFixedPositionedElementTest(doc, OpRect(10, 20, 10, 10), FALSE, NULL));
+}
+finally
+{
+	if (need_reset_layout_view)
+		lwp->SetLayoutViewPos(LayoutCoord(0), LayoutCoord(0));
+}

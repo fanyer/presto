@@ -1,0 +1,87 @@
+/* -*- Mode: c++; tab-width: 4; indent-tabs-mode: t; c-basic-offset: 4 -*- */
+group "dochand.lockdisplay";
+require init;
+
+include "modules/display/vis_dev.h";
+include "modules/dochand/viewportcontroller.h";
+include "modules/dochand/viewportlisteners.h";
+include "modules/dochand/win.h";
+include "modules/windowcommander/OpWindowCommander.h";
+include "modules/windowcommander/src/WindowCommander.h";
+
+global
+{
+	/** Helper class to manage testing locked status.  Fails or passes
+	 * depending on if lock is held or not at various events. */
+	class LockTester : public NullLoadingListener, NullViewportInfoListener
+	{
+		OpLoadingListener* m_old_loading_listener;
+		OpViewportInfoListener* m_old_info_listener;
+		Window* m_window;
+		BOOL m_failed_start_loading, m_failed_new_page;
+	protected:
+		BOOL IsLocked()
+		{
+			return m_window->VisualDev()->IsLocked();
+		}
+	public:
+		LockTester(Window* window)
+			: m_window(window), m_failed_start_loading(FALSE), m_failed_new_page(FALSE)
+
+		{
+			WindowCommander::SelftestHelper helper(m_window->GetWindowCommander());
+			helper.OverrideLoadingListenerProxy(this);
+			m_old_info_listener = m_window->GetViewportController()->GetViewportInfoListener();
+			m_window->GetViewportController()->SetViewportInfoListener(this);
+		}
+		virtual ~LockTester()
+		{
+			WindowCommander::SelftestHelper helper(m_window->GetWindowCommander());
+			helper.OverrideLoadingListenerProxy(NULL);
+			m_window->GetViewportController()->SetViewportInfoListener(m_old_info_listener);
+		}
+		virtual void Reset()
+		{
+			m_failed_start_loading = m_failed_new_page = FALSE;
+		}
+		virtual void OnStartLoading(OpWindowCommander* commander)
+		{
+			m_failed_start_loading = IsLocked();
+		}
+		virtual void OnNewPage(OpViewportController* controller, OpViewportChangeReason reason, int id)
+		{
+			m_failed_new_page = !IsLocked();
+		}
+		virtual void OnLoadingFinished(OpWindowCommander* commander, LoadingFinishStatus status)
+		{
+			if (m_failed_start_loading)
+				ST_failed("VisualDevice should not be locked in OnStartLoading");
+			if (m_failed_new_page)
+				ST_failed("VisualDevice should be locked in OnNewPage");
+			if (!m_failed_start_loading && !m_failed_new_page)
+				ST_passed();
+		}
+	};
+
+	Window* g_window = 0;
+	LockTester* g_tester = 0;
+}
+setup
+{
+	g_window = g_selftest.utils->GetWindow();
+	g_tester = OP_NEW(LockTester, (g_window));
+}
+exit
+{
+	OP_DELETE(g_tester);
+}
+
+test("Lock on simple page")
+async;
+{
+	g_tester->Reset();
+	if (OpStatus::IsError(g_window->OpenURL(UNI_L("data:text/html,<p>Test"))))
+	{
+		ST_failed("Could not open the url\n");
+	}
+}

@@ -1,0 +1,394 @@
+/* -*- Mode: c++; tab-width: 4; indent-tabs-mode: t; c-basic-offset: 4 -*-
+**
+** Copyright (C) 2004-2010 Opera Software ASA.  All rights reserved.
+**
+** This file is part of the Opera web browser.  It may not be distributed
+** under any circumstances.
+**
+** This file tests the basic functionalities of the cache from an higher level:
+** load a document and test if it is really accessed from the cache
+**
+** Luca Venturi
+**
+** Tests especially meant for containers.
+** These tests are also meant to test how the cache works with Turbo.
+** Part of them are a modified subsets of the tests present in cache_basic.ot
+*/
+group "cache.containers";
+require init;
+require DISK_CACHE_SUPPORT;
+include "modules/cache/cache_selftest.h";
+include "modules/cache/cache_st_helpers.h";
+include "modules/cache/cache_debug.h";
+include "modules/cache/cache_ctxman_disk.h";
+include "modules/url/url2.h";
+include "modules/prefs/prefsmanager/collections/pc_network.h";
+include "modules/prefs/prefsmanager/collections/pc_js.h";
+
+#include "cache_html.oth";
+
+global
+{
+	MultiContext mctx;
+	
+	// Managed contexts
+	URL_CONTEXT_ID ctx_containers;			// Tests for Operator Cache (also for Dragonfly)
+	URL_CONTEXT_ID ctx_turbo;				// Context of Turbo
+	
+	CacheHelpers ch;
+	OpAutoVector<URL> del_urls_http;		// HTTP URLs for delete test
+	CS_MessageHandler *mh;
+	WaitSingleURL *wait_ok;
+	URL url_install;
+	
+	void deleteURLHTTP(int num)
+	{
+		OP_ASSERT(del_urls_http.Get(num));
+		CacheTester::BrutalDelete(del_urls_http.Get(num), TRUE, state.GetWindow());
+		del_urls_http.Replace(num, NULL);
+	}
+}
+
+setup
+{
+#ifdef WEBSERVER_SUPPORT
+    wait_ok=OP_NEW(WaitSingleURL, (NULL));
+#else
+    wait_ok=OP_NEW(WaitSingleURL, ());
+#endif
+    if(wait_ok)
+    {
+		wait_ok->SetAutoDelete(FALSE);
+		wait_ok->SetNumberOfLoading(-1);
+	}
+    CacheTester::BlockPeriodicFreeUnusedResources();
+    mh=OP_NEW(CS_MessageHandler, (state.GetWindow()));
+}
+
+exit
+{
+	CacheTester::RestorePeriodicFreeUnusedResources();
+	if(mh && wait_ok)
+		mh->UnsetCallBacks(wait_ok);
+	OP_DELETE(mh);
+	OP_DELETE(wait_ok);
+	state.GetWindow()->SetTurboMode(FALSE);
+			
+}
+
+test("Create the contexts")
+{
+	verify_success(mctx.CreateNewContext(ctx_containers, UNI_L("cont"), TRUE, NULL));
+	
+	// Never checks HTML expiry; the PHP page in "t" does not generate the proper headers,
+	// so URLs are forbidden to join a container
+	g_pcnet->WriteIntegerL(PrefsCollectionNetwork::CheckDocModification, NEVER);
+	// Cache HTTPS, so that they can join containers and be embedded
+	g_pcnet->WriteIntegerL(PrefsCollectionNetwork::CacheHTTPS, 1);
+	
+	
+	Context_Manager *man=urlManager->FindContextManager(ctx_containers);
+	
+	verify(man);
+	// man->ExpireOnlyOnUserSettings(TRUE); // Proxied Unite URLs can now join a container
+	man->SetEmbedAllCacheTypes(TRUE); // HTTPS can now be embedded and join a container
+	
+#ifdef WEB_TURBO_MODE
+	verify_success(g_windowManager->CheckTuboModeContext());
+	
+	ctx_turbo = g_windowManager->GetTurboModeContextId();
+	
+	output("Turbo Context: %d", ctx_turbo);
+	man=urlManager->FindContextManager(ctx_turbo);
+	
+	verify(man);
+	mctx.AddContext(man, NULL, state.GetWindow());
+	
+	//man->ExpireOnlyOnUserSettings(TRUE); // Proxied Unite URLs can now join a container
+	man->SetEmbedAllCacheTypes(TRUE); // HTTPS can now be embedded and join a container
+#endif
+}
+
+test("Empty turbo")
+async;
+{
+#ifdef WEB_TURBO_MODE
+	mctx.EmptyDCache(ctx_turbo);
+#else
+	ST_passed();
+#endif
+}
+
+test("Enable deep debug in Turbo")
+{
+#ifdef WEB_TURBO_MODE
+	CacheTester::SetDeepDebug(ctx_turbo, TRUE);
+#endif
+}
+
+
+// Just used because repeat seems not to work with async tests...
+table TableNum(int)
+{
+  { 0 },  { 1 },  { 2 },  { 3 },  { 4 },  { 5 },  { 6 },  { 7 },  { 8 },  { 9 },
+  { 10 }, { 11 }, { 12 }, { 13 }, { 14 }, { 15 }, { 16 }, { 17 }, { 18 }, { 19 },
+  { 20 }, { 21 }, { 22 }, { 23 }, { 24 }, { 25 }, { 26 }, { 27 }, { 28 }, { 29 },
+  { 30 }, { 31 }
+}
+
+table TableSizesTurbo(char*, int, CacheType, char*, URL_CONTEXT_ID, BOOL)
+{
+  { "[embedded]", SIZE_EMBEDDED, TYPE_EMBEDDED, "emb", ctx_containers, FALSE},
+  { "[container]", SIZE_CONTAINERS, TYPE_CONTAINER, "cnt", ctx_containers, FALSE },
+  { "[plain]", SIZE_PLAIN, TYPE_PLAIN, "pln", ctx_containers, FALSE } 
+#ifdef WEB_TURBO_MODE
+ ,{ "[Turbo embedded]", SIZE_EMBEDDED, TYPE_EMBEDDED, "t_emb", ctx_turbo, TRUE},
+  { "[Turbo container]", SIZE_CONTAINERS, TYPE_CONTAINER, "t_cnt", ctx_turbo, TRUE },
+  { "[Turbo plain]", SIZE_PLAIN, TYPE_PLAIN, "t_pln", ctx_turbo, TRUE }
+#endif
+}
+
+foreach (descr, file_size, cache_type, prefix, ctx, turbo) from TableSizesTurbo
+{
+	test("Turbo Init")
+	{
+		state.GetWindow()->SetTurboMode(turbo);
+		g_pcnet->WriteIntegerL(PrefsCollectionNetwork::UseWebTurbo, turbo);
+#ifdef DELAYED_SCRIPT_EXECUTION
+	    g_pcjs->WriteIntegerL(PrefsCollectionJS::DelayedScriptExecution, turbo);
+#endif // DELAYED_SCRIPT_EXECUTION
+	}
+	// Tests that OEM files are saved as plain texts
+	test("Init var for " descr)
+	{
+		del_urls_http.DeleteAll();
+	}
+
+	foreach (num) from TableNum
+	{
+		test("Load more HTTP urls for delete test " descr)
+		async;
+		{
+			OpString8 id;
+			
+			id.AppendFormat("%s_%d", prefix, num);
+			URL url=CacheTester::GetURLExternalTestServerSize(ctx, file_size, id.CStr(), "application/octet-stream");
+			//URL url=uct.JScreateExternalPage(file_size, 500, ctx);
+
+			output("\nLoading %s\n", url.GetAttribute(URL::KName).CStr());
+			del_urls_http.Add(OP_NEW(URL, (url)));
+			mh->LoadNormal(url, 200, wait_ok, NULL);
+		}
+	}
+	
+	test("Save files " descr)
+	{
+		verify_success(CacheTester::SaveFiles(ctx, TRUE, TRUE));	
+	}
+	
+	foreach (num) from TableNum
+	{
+		test("Test size " descr)
+		{
+			URL *url=del_urls_http.Get(num);
+
+			CacheTester::VerifyType(*url, cache_type, file_size);
+		}
+	}
+	
+	test("Check some files 1 " descr)
+	async;
+	{
+		mh->LoadNormal(*del_urls_http.Get(1), 200, wait_ok, NULL);
+	}
+	
+	test("Check some files 2 " descr)
+	async;
+	{
+		mh->LoadNormal(*del_urls_http.Get(9), 200, wait_ok, NULL);
+	}
+	
+	test("Save files again " descr)
+	{
+		verify_success(CacheTester::SaveFiles(ctx, TRUE, TRUE));	
+	}
+	
+	test("Test size again " descr)
+	{
+		CacheTester::VerifyType(*del_urls_http.Get(1), cache_type, file_size);
+		CacheTester::VerifyType(*del_urls_http.Get(9), cache_type, file_size);
+	}
+	
+	test("HTTP URLs Delete " descr)
+	{
+		// Force URLs to become containers (if they qualify for it)
+		Context_Manager *man=urlManager->FindContextManager(ctx);
+
+		verify(man);
+
+		if(man)
+		{
+			TRAPD(rc, man->WriteCacheIndexesL(FALSE, FALSE));
+		}
+		verify_success(CacheTester::SaveFiles(ctx, TRUE, TRUE));
+
+#if CACHE_CONTAINERS_ENTRIES>0
+		output("HTTP URLs to delete: %d\r\n", CacheTester::CheckMarked(ctx));
+#endif// CACHE_CONTAINERS_ENTRIES>0
+
+		deleteURLHTTP(0);
+
+		deleteURLHTTP(15);
+		deleteURLHTTP(8);
+		deleteURLHTTP(12);
+
+		deleteURLHTTP(16);
+		deleteURLHTTP(17);
+		deleteURLHTTP(21);
+		deleteURLHTTP(19);
+
+		deleteURLHTTP(24);
+		deleteURLHTTP(31);
+		deleteURLHTTP(25);
+		deleteURLHTTP(30);
+		deleteURLHTTP(29);
+		deleteURLHTTP(26);
+		deleteURLHTTP(28);
+		deleteURLHTTP(27);
+		
+		if(man)
+		{
+			OP_ASSERT(man->IsDebugDeepEnabled());
+
+	#if CACHE_CONTAINERS_ENTRIES>0
+			output("HTTP URLs to delete - Start: %d\r\n", CacheTester::CheckMarked(ctx));
+	#endif// CACHE_CONTAINERS_ENTRIES>0
+			TRAPD(rc, man->WriteCacheIndexesL(FALSE, FALSE));
+			
+			man->CheckInvariants();
+			
+			// No delete of the URLs, to test for update
+		}
+
+	}
+	
+	// Download expected (on Desktop, with default settings), as all the containers have been deleted
+	foreach (num) from TableNum
+	{
+		test("Update HTTP URLs " descr)
+		async;
+		{
+			URL *url=del_urls_http.Get(num);
+
+			if(url)
+			{
+				mh->LoadNormal(*url, 200, wait_ok, NULL);
+			}
+			else
+			{
+				if (num==0 ||
+					num==15 || num==8  || num==12 ||
+					num==16 || num==17 || num==21 || num==19 ||
+					num>=24)
+					ST_passed();
+				else
+					ST_failed("URL %d not supposed to be NULL!", num);
+			}
+		}
+	}
+	
+	test("HTTP Post update " descr)
+	{
+		verify_success(CacheTester::SaveFiles(ctx, TRUE, TRUE));
+		
+		Context_Manager *man=urlManager->FindContextManager(ctx);
+
+		verify(man);
+
+		if(man)
+		{
+			OP_ASSERT(man->IsDebugDeepEnabled());
+			man->CheckInvariants();
+
+	#if CACHE_CONTAINERS_ENTRIES>0
+			output("HTTP URLs to delete - Start: %d\r\n", CacheTester::CheckMarked(ctx));
+	#endif// CACHE_CONTAINERS_ENTRIES>0
+			TRAPD(rc, man->WriteCacheIndexesL(FALSE, FALSE));
+	#if CACHE_CONTAINERS_ENTRIES>0
+			output("HTTP URLs to delete - FALSE FALSE: %d\r\n", CacheTester::CheckMarked(ctx));
+	#endif// CACHE_CONTAINERS_ENTRIES>0
+			TRAP(rc, man->WriteCacheIndexesL(TRUE, FALSE));
+	#if CACHE_CONTAINERS_ENTRIES>0
+			output("HTTP URLs to delete - TRUE FALSE: %d\r\n", CacheTester::CheckMarked(ctx));
+	#endif// CACHE_CONTAINERS_ENTRIES>0
+		}
+	}
+	
+	// Recheck size
+	foreach (num) from TableNum
+	{
+		test("Test size after update " descr)
+		{
+			URL *url=del_urls_http.Get(num);
+
+			if(url)
+				CacheTester::VerifyType(*url, cache_type, file_size);
+		}
+	}
+	
+	test("ReCheck some files 1 " descr)
+	async;
+	{
+		mh->LoadNormal(*del_urls_http.Get(1), 200, wait_ok, NULL);
+	}
+	
+	test("ReCheck some files 2 " descr)
+	async;
+	{
+		mh->LoadNormal(*del_urls_http.Get(9), 200, wait_ok, NULL);
+	}
+	
+	test("ReCheck some files 3 " descr)
+	async;
+	{
+		mh->LoadNormal(*del_urls_http.Get(18), 200, wait_ok, NULL);
+	}
+	
+	test("ReCheck some files 4 " descr)
+	async;
+	{
+		mh->LoadNormal(*del_urls_http.Get(20), 200, wait_ok, NULL);
+	}
+	
+	test("ReCheck some files 5 " descr)
+	async;
+	{
+		mh->LoadNormal(*del_urls_http.Get(22), 200, wait_ok, NULL);
+	}
+	
+	test("ReCheck some files 6 " descr)
+	async;
+	{
+		mh->LoadNormal(*del_urls_http.Get(22), 200, wait_ok, NULL);
+	}
+	
+	test("Save files again 2 " descr)
+	{
+		verify_success(CacheTester::SaveFiles(ctx, TRUE, TRUE));	
+	}
+	
+	test("Test size again " descr)
+	{
+		CacheTester::VerifyType(*del_urls_http.Get(1), cache_type, file_size);
+		CacheTester::VerifyType(*del_urls_http.Get(9), cache_type, file_size);
+		CacheTester::VerifyType(*del_urls_http.Get(18), cache_type, file_size);
+		CacheTester::VerifyType(*del_urls_http.Get(20), cache_type, file_size);
+		CacheTester::VerifyType(*del_urls_http.Get(22), cache_type, file_size);
+	}
+	
+	test("Empty context " descr)
+	async;
+	{
+		mctx.EmptyDCache(ctx);	
+	}
+}

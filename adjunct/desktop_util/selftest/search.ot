@@ -1,0 +1,381 @@
+/* -*- Mode: c++; tab-width: 4; indent-tabs-mode: t; c-basic-offset: 4 -*- */
+
+group "desktop_util.search";
+require init;
+require DESKTOP_UTIL_SEARCH_ENGINES;
+
+include "adjunct/desktop_util/search/search_types.h";
+include "adjunct/desktop_util/selftest/src/ST_search_net.h";
+include "adjunct/desktop_util/search/searchenginemanager.h";
+include "adjunct/quick/widgets/OpSearchEdit.h";
+include "modules/prefsfile/prefsfile.h";
+include "modules/prefs/prefsmanager/collections/pc_doc.h";
+include "modules/prefs/prefsmanager/collections/pc_ui.h";
+
+global
+{
+	// key returned by SearchEngineManager::FindFreeKey should start
+	// with lower-case latin letter and can only contain lower-case
+	// latin letters and numbers
+	BOOL CheckGeneratedKey(OpStringC key)
+	{
+		if (key.IsEmpty())
+			return FALSE;
+		if (key[0] > 127 || !op_isalpha(key[0]) || op_isupper(key[0]))
+			return FALSE;
+		for (const uni_char* p = key.CStr() + 1; *p; ++p)
+		{
+			if (*p > 127 || !op_isalnum(*p) || op_isupper(key[0]))
+				return FALSE;
+		}
+		return TRUE;
+	}
+}
+
+table search_entries(const char*, const uni_char*, const uni_char*)
+{
+	{ "Entry 1", UNI_L("opera:%s"), UNI_L("o") },
+	{ "Entry 2", UNI_L("db.no"), UNI_L("x") },
+	{ "Entry 3", UNI_L("http://www.webmonkey.com/"), UNI_L("a")},
+	{ "Entry 4", UNI_L("http://www.whatismyip.com/"), UNI_L("b")},
+}
+
+foreach (name, data2, data3) from search_entries
+{
+	test("Add and get search: " name)
+	{
+		SearchTemplate* new_item = OP_NEW(SearchTemplate, ());
+		
+		new_item->SetURL(data2);
+		new_item->SetKey(data3);
+
+		// Note: AddItem will give item without guid a guid
+		verify_success(g_searchEngineManager->AddItem(new_item));
+		verify(new_item->GetUniqueGUID().HasContent());
+		verify(g_searchEngineManager->GetSearchModel()->GetItemByID(new_item->GetID()));
+
+		// This should work (magic search from end of list currently) even if there is already an entry
+		// with the given key
+		verify(g_searchEngineManager->GetSearchEngineByKey(new_item->GetKey()));
+		verify(g_searchEngineManager->KeyInUse(new_item->GetKey(), 0));
+
+		// Id and index crap
+		verify(g_searchEngineManager->GetSearchEngine(g_searchEngineManager->SearchIDToIndex(new_item->GetID())) == new_item);
+		verify(g_searchEngineManager->SearchFromID(new_item->GetID()) == new_item);
+		verify(g_searchEngineManager->GetByUniqueGUID(new_item->GetUniqueGUID()) == new_item);
+
+		// Test GetDefaultSearch
+		// OpString guid;
+		// guid.Set(g_pcdoc->GetStringPref(PrefsCollectionDoc::DefaultSearchType));
+		// g_pcdoc->WriteIntegerL(PrefsCollectionDoc::DefaultSearchType, new_item->GetUniqueGUID());
+		// verify(g_searchEngineManager->GetDefaultSearch() == new_item);
+		// g_pcdoc->WriteStringL(PrefsCollectionDoc::DefaultSearchType, guid);
+
+		// default searches are the ones in the package file
+		verify(!new_item->IsFromPackageOrModified());
+		verify(new_item->IsCustomOrModified());
+
+		// Key
+		verify(g_searchEngineManager->GetSearchEngineByKey(data3));
+		verify(g_searchEngineManager->KeyInUse(data3, 0));
+	}
+	finally
+	{
+		g_searchEngineManager->RemoveItem(new_item);
+	}
+}
+
+test("search ui")
+{
+	OpSearchEdit *edit = NULL;
+	OpSearchEdit *fip_edit = NULL;
+
+	int idx = 0;
+	edit = OP_NEW(OpSearchEdit, (idx));
+	verify(edit);
+	verify(edit->GetSearchEditIdentifier() == idx);
+	verify(edit->GetSearchIndex() == edit->GetSearchEditIdentifier());
+
+	// create edit from index for find in page search
+	int fip_index = g_searchEngineManager->SearchTypeToIndex(SEARCH_TYPE_INPAGE);
+	SearchTemplate* search = g_searchEngineManager->GetSearchEngine(fip_index);
+	verify(search);
+	verify(search->GetSearchType() == SEARCH_TYPE_INPAGE);
+
+	// create edit from find in page search type
+	fip_edit = OP_NEW(OpSearchEdit, (-((int)SEARCH_TYPE_INPAGE)));
+	verify(fip_edit);
+
+	verify(fip_edit->GetSearchEditIdentifier() == (-(int)SEARCH_TYPE_INPAGE));
+	verify(fip_edit->GetSearchIndex() == g_searchEngineManager->SearchTypeToIndex(SEARCH_TYPE_INPAGE));
+}
+finally
+{
+	// OpSearchEdit reimplements OpWidget::OnDelete() which is activated by Delete() 
+	if (edit)
+		edit->Delete();
+	if (fip_edit)
+		fip_edit->Delete();
+}
+
+// Delete custom search -> it should be set to hidden, but then not written to file
+test("Delete custom search ") disabled;
+{
+
+}
+
+foreach (name, data2, data3) from search_entries
+{
+	test("DefaultSearchType: " name)
+	{
+		// Store away the old default
+		OpStringC guid = g_pcdoc->GetStringPref(PrefsCollectionDoc::DefaultSearchType);
+
+		SearchTemplate *new_item = OP_NEW_L(SearchTemplate, ());
+		
+		new_item->SetURL(data2);
+		new_item->SetKey(data3);
+
+		// Note: AddItem will give item without guid a guid
+		verify_success(g_searchEngineManager->AddItem(new_item));
+		verify(new_item->GetUniqueGUID().HasContent());
+		verify(g_searchEngineManager->GetSearchModel()->GetItemByID(new_item->GetID()));
+
+		// Default Search Type
+
+		verify_success(g_searchEngineManager->SetDefaultSearch(new_item->GetUniqueGUID()));
+		verify(g_searchEngineManager->GetDefaultSearch() == new_item);
+
+		// Check resetting to item 0 when deleting the search that is default
+		g_searchEngineManager->RemoveItem(new_item);
+
+		verify(g_searchEngineManager->GetDefaultSearch() == g_searchEngineManager->GetSearchEngine(0));
+
+		// Unset that this item is the default
+		g_searchEngineManager->SetDefaultSearch(NULL);
+
+		// Check that value of pref is now first item in list, and GetDefaultSearch != 0
+		verify(g_searchEngineManager->GetDefaultSearch() == g_searchEngineManager->GetSearchEngine(0));
+	}
+	finally
+	{
+		// reset default
+		g_pcdoc->WriteStringL(PrefsCollectionDoc::DefaultSearchType, guid);
+
+		g_searchEngineManager->RemoveItem(new_item);
+	}
+}
+/*
+test("DefaultSpeeddialSearchType")
+{
+	iterate(data1, data2, data3) from search_entries
+	{
+		SearchTemplate *new_item = OP_NEW_L(SearchTemplate, ());
+		
+		new_item->SetURL(data2);
+		new_item->SetKey(data3);
+
+		// Note: AddItem will give item without guid a guid
+		verify(OpStatus::IsSuccess(g_searchEngineManager->AddItem(new_item)));
+		verify(new_item->GetUniqueGUID().HasContent());
+		verify(g_searchEngineManager->GetSearchModel()->GetItemByID(new_item->GetID()));
+
+		// Default speeddial search type ---------------------------------------------------
+
+		// Store away the old default
+		SearchTemplate *tmp = g_searchEngineManager->GetDefaultSpeedDialSearch();
+		verify(tmp != NULL);
+		OpString guid2;
+		
+		guid2.Set(tmp->GetUniqueGUID());
+
+		// Set this item to be default
+		g_searchEngineManager->SetDefaultSpeedDialSearch(new_item->GetUniqueGUID());
+		
+		g_pcui->WriteStringL(PrefsCollectionUI::DefaultSpeeddialSearchType, new_item->GetUniqueGUID());
+		verify(g_searchEngineManager->GetDefaultSpeedDialSearch() == new_item);
+
+		OpStringC default_sd_search = g_pcui->GetStringPref(PrefsCollectionUI::DefaultSpeeddialSearchType);
+		verify(default_sd_search.Compare(new_item->GetUniqueGUID())==0);
+
+		g_searchEngineManager->RemoveItem(new_item);
+
+		// Check resetting to item 0 when deleting the default sd search
+		verify(g_searchEngineManager->GetDefaultSpeedDialSearch() == g_searchEngineManager->GetSearchEngine(0));
+
+		// Unset that this item is the default
+		g_searchEngineManager->SetDefaultSpeedDialSearch(0);
+
+		// Check that value of pref is now "", and GetDefaultSpeedDialSearch returns 0
+		verify(g_searchEngineManager->GetDefaultSpeedDialSearch() == 0);
+		verify(g_pcui->GetStringPref(PrefsCollectionUI::DefaultSpeeddialSearchType).Compare(UNI_L("")) == 0);
+
+		// -----------------------------------------------------------------------------------
+
+		// reset default
+		g_pcui->WriteStringL(PrefsCollectionUI::DefaultSpeeddialSearchType, guid2);
+
+		g_searchEngineManager->RemoveItem(new_item);
+
+	}
+}
+*/
+test("Write search")
+		file uni path "data/test_search.ini";
+{
+	PrefsFile* search_file = 0;
+	OpStackAutoPtr<PrefsFile> additional(OP_NEW_L(PrefsFile, (PREFS_STD)));
+	additional->ConstructL();
+	search_file = additional.release();
+
+	OpFile searchuserfile;
+
+	// Now we need the name of the user search.ini, which is only in one location
+	// This will work by accident since on Mac OPFILE_HOME_FOLDER and
+	// OPFILE_USERPREFS_FOLDER are in the same location but I don't think that
+	// this is right - adamm 27-02-2007
+	verify(OpStatus::IsSuccess(searchuserfile.Construct(path)));
+	search_file->SetFileL(&searchuserfile);
+	
+	// 1. Add custom search, delete it, and check that it is not written to user search.ini (Bug 353204)
+	ST_SearchTemplate *new_item = OP_NEW_L(ST_SearchTemplate, ());
+		
+	new_item->SetName(UNI_L("user_search"));
+	new_item->SetURL(UNI_L("user_search_url"));
+	new_item->SetKey(UNI_L("user_key"));
+
+	// Note: AddItem will give item without guid a guid
+	verify(OpStatus::IsSuccess(g_searchEngineManager->AddItem(new_item)));
+	verify(new_item->GetUniqueGUID().HasContent());
+	verify(g_searchEngineManager->GetSearchModel()->GetItemByID(new_item->GetID()));
+
+	// default searches are the ones in the package file
+	verify(!new_item->IsFromPackageOrModified());
+	verify(new_item->IsCustomOrModified());
+
+	OpString guid;
+	guid.Set(new_item->GetUniqueGUID());
+	g_searchEngineManager->RemoveItem(new_item);
+	verify(g_searchEngineManager->GetByUniqueGUID(guid) == 0);
+
+	char currsection[64]; /* ARRAY OK 2004-02-02 rikard */
+	INT32 section_num = 1;
+	op_snprintf(currsection, 64, "Search Engine %d", section_num);
+	currsection[63] = 0;
+
+	BOOL result = TRUE;
+	new_item->WriteL(currsection, search_file, result);
+	verify(!result);
+
+	// 2. Add user search, and check that it is written
+	new_item = OP_NEW_L(ST_SearchTemplate, ());
+		
+	new_item->SetName(UNI_L("user_search"));
+	new_item->SetURL(UNI_L("user_search_url"));
+	new_item->SetKey(UNI_L("user_key"));
+	verify(OpStatus::IsSuccess(g_searchEngineManager->AddItem(new_item)));
+	new_item->WriteL(currsection, search_file, result);
+	verify(result);
+	g_searchEngineManager->RemoveItem(new_item); // remove so it is not written to user search.ini (e.g. from another selftest)
+	if(result)section_num++;
+	op_snprintf(currsection, 64, "Search Engine %d", section_num);
+
+	// 3. Add default search, remove it, and check that it is written with deleted=1
+	// test default search that is deleted, and should be written
+	new_item = OP_NEW_L(ST_SearchTemplate, ());
+	new_item->SetName(UNI_L("default_search"));
+	new_item->SetURL(UNI_L("default_search_url"));
+	new_item->SetKey(UNI_L("default_key"));
+	new_item->SetIsPackageSearch();
+	new_item->SetIsCustomOrModified();
+	verify(new_item->IsFromPackageOrModified() && new_item->IsCustomOrModified()); // ie. is PACKAGE_MODIFIED
+	verify(OpStatus::IsSuccess(g_searchEngineManager->AddItem(new_item)));
+	g_searchEngineManager->RemoveItem(new_item);
+	new_item->WriteL(currsection, search_file, result);
+	verify(result);
+	new_item->SetIsCustomSearch(); // back to custom so it is not written to user search.ini (e.g. from another selftest)
+ 
+	search_file->CommitL();
+}
+finally
+{
+	searchuserfile.Delete();
+}
+
+test("SearchEngineManager::IsUrl")
+{
+	verify(g_searchEngineManager->IsUrl(UNI_L("127.0.0.1")) == TRUE);
+	verify(g_searchEngineManager->IsUrl(UNI_L("127.0.0.10")) == TRUE);
+	verify(g_searchEngineManager->IsUrl(UNI_L("127.0.0.100")) == TRUE);
+	verify(g_searchEngineManager->IsUrl(UNI_L("127.0.0.1/")) == TRUE);
+	verify(g_searchEngineManager->IsUrl(UNI_L("127.0.0.1:1200")) == TRUE);
+	verify(g_searchEngineManager->IsUrl(UNI_L("http://127.0.0.1")) == TRUE);
+	verify(g_searchEngineManager->IsUrl(UNI_L("http://127.0.0.1/")) == TRUE);
+	verify(g_searchEngineManager->IsUrl(UNI_L("intranet/")) == TRUE);
+	verify(g_searchEngineManager->IsUrl(UNI_L("intranet/ test")) == TRUE);
+	verify(g_searchEngineManager->IsUrl(UNI_L("a/s netcom")) == TRUE);
+	verify(g_searchEngineManager->IsUrl(UNI_L("opera.com")) == TRUE);
+	verify(g_searchEngineManager->IsUrl(UNI_L("opera.pl")) == TRUE);
+	verify(g_searchEngineManager->IsUrl(UNI_L("opera.com/ test")) == TRUE);
+	verify(g_searchEngineManager->IsUrl(UNI_L("www.opera.com")) == TRUE);
+	verify(g_searchEngineManager->IsUrl(UNI_L(" www.opera.com ")) == TRUE);
+	verify(g_searchEngineManager->IsUrl(UNI_L("bbc.co.uk")) == TRUE);
+	verify(g_searchEngineManager->IsUrl(UNI_L("info.info")) == TRUE);
+	verify(g_searchEngineManager->IsUrl(UNI_L("www.info.info")) == TRUE);
+	verify(g_searchEngineManager->IsUrl(UNI_L("opera:config")) == TRUE);
+	verify(g_searchEngineManager->IsUrl(UNI_L("javascript:(function() { alert('test'); })();")) == TRUE);
+	verify(g_searchEngineManager->IsUrl(UNI_L("ask.com/search?q=your base are belongs to us")) == TRUE);
+	verify(g_searchEngineManager->IsUrl(UNI_L("foo\x3002tar")) == TRUE);
+	verify(g_searchEngineManager->IsUrl(UNI_L("foo\xFF0Etar")) == TRUE);
+	verify(g_searchEngineManager->IsUrl(UNI_L("foo\xFF61tar")) == TRUE);
+
+	verify(g_searchEngineManager->IsUrl(UNI_L("search")) == FALSE);
+	verify(g_searchEngineManager->IsUrl(UNI_L("search.")) == FALSE);
+	verify(g_searchEngineManager->IsUrl(UNI_L("searc.h")) == FALSE);
+	verify(g_searchEngineManager->IsUrl(UNI_L("127.")) == FALSE);
+	verify(g_searchEngineManager->IsUrl(UNI_L("127.0")) == FALSE);
+	verify(g_searchEngineManager->IsUrl(UNI_L("127.0.0.")) == FALSE);
+	verify(g_searchEngineManager->IsUrl(UNI_L("12700/2")) == FALSE);
+	verify(g_searchEngineManager->IsUrl(UNI_L("12700/")) == FALSE);
+	verify(g_searchEngineManager->IsUrl(UNI_L("www opera com")) == FALSE);
+	verify(g_searchEngineManager->IsUrl(UNI_L("6/9")) == FALSE);
+	verify(g_searchEngineManager->IsUrl(UNI_L("7/2+6")) == FALSE);
+
+}
+
+test("SearchEngineManager::FindFreeKey")
+{
+	OpString key;
+	verify_success(g_searchEngineManager->FindFreeKey(UNI_L(""), UNI_L(""), key));
+	verify(g_searchEngineManager->KeyInUse(key, NULL) == FALSE);
+	verify(CheckGeneratedKey(key));
+
+	verify_success(g_searchEngineManager->FindFreeKey(UNI_L("abcd"), UNI_L("efgh"), key));
+	verify(g_searchEngineManager->KeyInUse(key, NULL) == FALSE);
+	verify(CheckGeneratedKey(key));
+
+	SearchTemplate* default_search = g_searchEngineManager->GetDefaultSearch();
+	verify(default_search);
+	verify(default_search->GetKey().HasContent());
+	verify_success(g_searchEngineManager->FindFreeKey(default_search->GetKey(), default_search->GetName(), key));
+	verify(g_searchEngineManager->KeyInUse(key, NULL) == FALSE);
+	verify(CheckGeneratedKey(key));
+}
+
+test ("SearchEngineManager::IsDetectedIntranetHost - host not found")
+{
+	g_searchEngineManager->AddDetectedIntranetHost(UNI_L("t"));
+	g_searchEngineManager->AddDetectedIntranetHost(UNI_L("thisIsIntranetHost"));
+
+	verify(!g_searchEngineManager->IsDetectedIntranetHost(UNI_L("thisIsIntranetLost")));
+}
+
+test ("SearchEngineManager::IsDetectedIntranetHost - host found")
+{
+	g_searchEngineManager->AddDetectedIntranetHost(UNI_L("intranetHost"));
+	verify(g_searchEngineManager->IsDetectedIntranetHost(UNI_L("intranetHost")));
+}
+
+// Guids
+// Icons
+// 

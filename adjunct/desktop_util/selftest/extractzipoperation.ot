@@ -1,0 +1,166 @@
+/* -*- Mode: c++; tab-width: 4; indent-tabs-mode: t; c-basic-offset: 4 -*-
+ *
+ * Copyright (C) 1995-2010 Opera Software AS.  All rights reserved.
+ *
+ * This file is part of the Opera web browser.	It may not be distributed
+ * under any circumstances.
+ *
+ * @author Wojciech Dzierzanowski (wdzierzanowski)
+ */
+
+group "desktop_util.extractzipoperation";
+
+include "adjunct/desktop_util/transactions/ExtractZipOperation.h";
+include "modules/util/path.h";
+include "modules/util/zipload.h";
+
+global
+{
+	static BOOL FileExists(const OpStringC& path)
+	{
+		OpFile file;
+		RETURN_VALUE_IF_ERROR(file.Construct(path), FALSE);
+		BOOL file_exists = FALSE;
+		RETURN_VALUE_IF_ERROR(file.Exists(file_exists), FALSE);
+		return file_exists;
+	}
+
+	static OP_STATUS Touch(const OpStringC& path)
+	{
+		OpFile file;
+		RETURN_IF_ERROR(file.Construct(path));
+		RETURN_IF_ERROR(file.Open(OPFILE_WRITE));
+		return OpStatus::OK;
+	}
+
+	static void DeleteDir(OpFile& dir)
+	{
+		const BOOL deleted = OpStatus::IsSuccess(dir.Delete(TRUE));
+		OP_ASSERT(deleted || !"Failed to delete temporary test directory");
+	}
+}
+
+
+subtest NewOperation(const OpStringC& archive_path,
+		const OpStringC& extract_to_path,
+		OpAutoPtr<OpUndoableOperation>& operation, OP_STATUS exp_status)
+{
+	OpString archive_path_copy;
+	verify_success(archive_path_copy.Set(archive_path));
+	OpZip archive;
+	verify_success(archive.Open(&archive_path_copy, FALSE));
+
+	operation.reset(OP_NEW(ExtractZipOperation, (archive, extract_to_path)));
+	verify_not_oom(operation.get());
+	verify_status(exp_status, operation->Do());
+}
+
+
+test("With no foreign files, undo deletes everything")
+		file uni archive_path		"testfiles/archive.zip";
+		file uni temp_path			"testfiles/tmp";
+		file uni extract_to_path	"testfiles/tmp/extracted/";
+{
+	OpFile temp_dir;
+	verify_success(temp_dir.Construct(temp_path));
+	verify_success(temp_dir.MakeDirectory());
+
+	OpAutoPtr<OpUndoableOperation> operation;
+	verify(NewOperation(archive_path, extract_to_path, operation,
+				OpStatus::OK));
+
+	verify(FileExists(extract_to_path));
+	operation->Undo();
+	verify(!FileExists(extract_to_path));
+}
+finally
+{
+	DeleteDir(temp_dir);
+}
+
+
+// Just the files, no diectories.
+// This must match the contents of testfiles/archive.zip.
+table ZipFiles(const uni_char*)
+{
+	{UNI_L("file0")}
+	{UNI_L("file1")}
+	{UNI_L("subdir0/file0")}
+	{UNI_L("subdir0/file1")}
+}
+
+table Foreigners(const uni_char*)
+{
+	{UNI_L("i-am-a-foreigner")}
+	{UNI_L("subdir0/i-am-a-foreigner")}
+	{UNI_L("subdir1/i-am-a-foreigner")}
+}
+
+test("With foreign files, undo retains non-empty directories")
+		file uni archive_path		"testfiles/archive.zip";
+		file uni temp_path			"testfiles/tmp";
+		file uni extract_to_path	"testfiles/tmp/extracted/";
+{
+	OpFile temp_dir;
+	verify_success(temp_dir.Construct(temp_path));
+	verify_success(temp_dir.MakeDirectory());
+
+	OpAutoPtr<OpUndoableOperation> operation;
+	verify(NewOperation(archive_path, extract_to_path, operation,
+				OpStatus::OK));
+
+	iterate (file_name) from Foreigners
+	{
+		OpString foreign_path;
+		verify_success(OpPathDirFileCombine(foreign_path,
+					OpStringC(extract_to_path), OpStringC(file_name)));
+		verify_success(Touch(foreign_path));
+	}
+
+	operation->Undo();
+
+	iterate (file_name) from ZipFiles
+	{
+		OpString file_path;
+		verify_success(OpPathDirFileCombine(file_path,
+					OpStringC(extract_to_path),	OpStringC(file_name)));
+		verify(!FileExists(file_path));
+	}
+	iterate (file_name) from Foreigners
+	{
+		OpString foreign_path;
+		verify_success(OpPathDirFileCombine(foreign_path,
+					OpStringC(extract_to_path), OpStringC(file_name)));
+		verify(FileExists(foreign_path));
+	}
+}
+finally
+{
+	DeleteDir(temp_dir);
+}
+
+
+test("Operation appears to be atomic (doesn't partially succeed)")
+		file uni archive_path		"testfiles/archive.zip";
+		file uni temp_path			"testfiles/tmp";
+		file uni extract_to_path	"testfiles/tmp/extracted/";
+		file uni ok_file0			"testfiles/tmp/extracted/file0";
+		file uni ok_file1			"testfiles/tmp/extracted/file1";
+		file uni failed_file		"testfiles/tmp/extracted/subdir0";
+{
+	OpFile temp_dir;
+	verify_success(temp_dir.Construct(temp_path));
+	verify_success(temp_dir.MakeDirectory());
+
+	verify_success(Touch(failed_file));
+
+	OpAutoPtr<OpUndoableOperation> operation;
+	verify(NewOperation(archive_path, extract_to_path, operation,
+				OpStatus::ERR));
+	verify(!FileExists(ok_file0));
+	verify(!FileExists(ok_file1));
+}
+finally
+{
+	DeleteDir(temp_dir);
+}

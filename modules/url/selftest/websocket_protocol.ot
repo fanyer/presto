@@ -1,0 +1,1723 @@
+/* -*- Mode: c++; tab-width: 4; indent-tabs-mode: t; c-basic-offset: 4 -*-
+**
+** Copyright (C) 2012 Opera Software ASA.  All rights reserved.
+**
+** This file is part of the Opera web browser.  It may not be distributed
+** under any circumstances.
+**
+*/
+
+group "url.websocket_protocol";
+
+require init;
+language c++;
+require WEBSOCKETS_SUPPORT;
+
+include "core/pch.h";
+
+include "modules/url/protocols/websocket_protocol.h";
+include "modules/url/protocols/websocket_listener.h";
+include "modules/formats/hdsplit.h";
+include "modules/libcrypto/include/CryptoUtility.h";
+include "modules/libcrypto/include/CryptoHash.h";
+include "modules/libcrypto/include/OpRandomGenerator.h";
+
+table send_lengths_table(const char *name, int lengths)
+{
+	{"0", 0},
+	{"100", 100},
+	{"125", 125},
+	{"126", 126},
+	{"127", 127},
+	{"128", 128},
+	{"32767", 32768},
+	{"32768", 32768},
+	{"32769", 32769},
+	{"65535", 65535},
+	{"65536", 65536},
+	{"65537", 65537},
+	{"1 Mb", 1024*1024}
+}
+
+table illegal_close_codes_table(const char *name, UINT16 close_code)
+{
+	{"0",0},
+	{"999",999},
+	{"1004",1004},
+	{"1005",1005},
+	{"1006",1006},
+	{"1012",1012},
+	{"1015",1015},
+	{"2999",2999},
+	{"5000",5000},
+}
+
+table legal_close_codes_table(const char *name, UINT16 close_code)
+{
+	{"1000",1000},
+	{"1001",1001},
+	{"1002",1002},
+	{"1003",1003},
+
+	{"1007",1007},
+	{"1008",1008},
+	{"1009",1009},
+	{"1010",1010},
+	{"1011",1011},
+
+	{"3000",3000},
+	{"4999",4999},
+}
+
+global
+{
+	#define CRLF  "\x0D\x0A"
+
+	enum RequestMethod
+	{
+		WEB_METH_GET,					/* HTTP 0.9 */
+		WEB_METH_HEAD,					/* HTTP 1.0 */
+		WEB_METH_POST,					/* HTTP 1.0 */
+		WEB_METH_PUT,					/* Poorly defined in HTTP 1.0 */
+		WEB_METH_DELETE,				/* Poorly defined in HTTP 1.0 */
+		WEB_METH_LINK,					/* Poorly defined in HTTP 1.0, not at all in HTTP 1.1 */
+		WEB_METH_UNLINK,				/* Poorly defined in HTTP 1.0, not at all in HTTP 1.1 */
+		WEB_METH_TRACE,					/* HTTP 1.1 */
+		WEB_METH_CONNECT,				/* HTTP 1.1 */
+		WEB_METH_OPTIONS,				/* HTTP 1.1 */
+		WEB_METH_NONE_ERROR				/* In case of error*/
+	};
+
+	BOOL Match(const char *s, unsigned int *state, const char *str, unsigned int length)
+	{
+		int l = op_strlen(s);
+		if (*state + l < length && op_strncmp(s, str+*state, l) == 0)
+		{
+			*state += l;
+			return TRUE;
+		}
+		else
+			return FALSE;
+	}
+
+	BOOL MatchMethod(RequestMethod *method, UINT *state, const char *str)
+	{
+		// In same order as enum WebServerMethod in modules/webserver/webserver_request.h
+		const char *methods[11];
+
+		// Have to do it like this because of Brew
+		methods[0] = "GET";
+		methods[1] = "HEAD";
+		methods[2] = "POST";
+		methods[3] = "PUT";
+		methods[4] = "DELETE";
+		methods[5] = "LINK";
+		methods[6] = "UNLINK";
+		methods[7] = "TRACE";
+		methods[8] = "CONNECT";
+		methods[9] = "OPTIONS";
+		methods[10] = NULL;
+
+		const char * const *meth = &methods[0];
+		while (*meth != NULL && op_strnicmp(str+*state, *meth, op_strlen(*meth)) != 0)
+			meth++;
+		if (*meth == NULL)
+		{
+			*method = WEB_METH_NONE_ERROR;
+			return FALSE;
+		}
+		*method = (RequestMethod)(meth-methods);
+		*state += op_strlen(*meth);
+		return TRUE;
+	}
+
+	int MatchWS(unsigned int *state, const char *str, unsigned int length)
+	{
+		int k=0;
+		while (*state < length && op_isspace(str[*state]))
+		{
+			(*state)++;
+			++k;
+		}
+		return k;
+	}
+
+	BOOL MatchNonWS(unsigned int *start, unsigned int *state, const char *str, unsigned int length)
+	{
+		UINT k=*state;
+		while (*state < length && !op_isspace(str[*state]))
+			(*state)++;
+		if (*state > k)
+		{
+			*start = k;
+			return TRUE;
+		}
+		else
+			return FALSE;
+	}
+
+	BOOL MatchDecimal(int *value, unsigned int *state, const char *str, unsigned  int length)
+	{
+		int k = 0;
+		UINT initial = *state;
+		while (*state < length && op_isdigit(str[*state]))
+		{
+			k = k*10 + (str[*state] - '0');
+			(*state)++;
+		}
+		if (initial < *state)
+		{
+			*value = k;
+			OP_ASSERT( k >= 0);
+			return TRUE;
+		}
+		else
+			return FALSE;
+	}
+
+	class TestListener : public OpWebSocketListener
+	{
+	public:
+
+		enum CallbackType
+		{
+			UNKNOWN,
+			ON_SOCKET_OPEN,
+			ON_SOCKET_CLOSING,
+			ON_SOCKET_CLOSED,
+			ON_SOCKET_MESSAGE,
+			ON_SOCKET_ERROR,
+			ON_SOCKET_INFO
+		};
+
+		class CallbackObject
+		{
+		public:
+			const UINT8 *GetBinaryMessage(unsigned int &length)
+			{
+				OP_ASSERT(message_is_binary);
+				OP_ASSERT(!message_is_file);
+				length = 0;
+				if (message_is_binary && !message_is_file)
+				{
+					length = message_or_filename.Length();
+					return (UINT8*)message_or_filename.Data();
+				}
+				return NULL;
+			}
+
+			// Not null terminated
+			const uni_char *GetTextMessage(unsigned int &length)
+			{
+				OP_ASSERT(!message_is_binary);
+				OP_ASSERT(!message_is_file);
+
+				length = 0;
+				if (!message_is_binary && !message_is_file)
+				{
+					length = message_or_filename.Length() / sizeof(uni_char);
+					return (uni_char*) message_or_filename.Data();
+				}
+				return NULL;
+			}
+
+			const uni_char *GetFileName()
+			{
+				OP_ASSERT(message_is_file);
+
+				if (message_is_file)
+					return (uni_char*) message_or_filename.Data();
+
+				return NULL;
+			}
+
+			CallbackObject(CallbackType type, BOOL close_wasClean, UINT16 close_code, BOOL message_is_binary, BOOL message_is_file, OP_STATUS error_code)
+			: callback_type(type), close_was_clean(close_wasClean), close_code(close_code), message_is_binary(message_is_binary), message_is_file(message_is_file), error_code(error_code) {}
+
+			virtual ~CallbackObject(){}
+
+			CallbackType callback_type;
+
+			BOOL close_was_clean;
+			UINT16 close_code;
+			OpString close_reason;
+
+			BOOL message_is_binary;
+			BOOL message_is_file;
+			OpData message_or_filename;
+
+			OP_STATUS error_code;
+		};
+
+		OpAutoVector<CallbackObject> m_callbacks;
+
+		TestListener()
+		{
+
+		};
+
+		virtual ~TestListener()
+		{
+
+		};
+
+		virtual OP_STATUS OnSocketOpen(OpWebSocket *socket)
+		{
+			return AddCallback(ON_SOCKET_OPEN);
+		}
+
+		virtual OP_STATUS OnSocketClosing(OpWebSocket *socket)
+		{
+			return AddCallback(ON_SOCKET_CLOSING);
+		}
+
+		virtual void OnSocketClosed(OpWebSocket *socket, BOOL wasClean, UINT16 code, const uni_char *reason)
+		{
+			if (OpStatus::IsError(AddCallback(ON_SOCKET_CLOSED, wasClean, code, reason)))
+			{
+				socket->Close(0, NULL);
+			}
+		}
+
+		virtual OP_STATUS OnSocketMessage(OpWebSocket *socket, BOOL is_binary, BOOL is_file)
+		{
+			OpFileLength size = socket->GetReceivedMessageBytes();
+			unsigned int size_i = static_cast<unsigned int>(size);
+
+			if (!is_file)
+			{
+				if (is_binary)
+				{
+					UINT8* buffer = OP_NEWA(UINT8, (size_i));
+					if (!buffer)
+						return OpStatus::ERR_NO_MEMORY;
+
+					ANCHOR_ARRAY(UINT8, buffer);
+
+					OpFileLength read_len;
+					RETURN_IF_ERROR(socket->ReadMessage(buffer, size, read_len));
+
+					OpData data_buffer;
+					data_buffer.SetRawData(OPDATA_DEALLOC_OP_DELETEA, (char*)buffer, static_cast<size_t>(read_len), size_i);
+					ANCHOR_ARRAY_RELEASE(buffer);
+
+					return AddCallback(ON_SOCKET_MESSAGE, FALSE, 0, NULL,  is_binary, is_file, data_buffer);
+				}
+				else
+				{
+					uni_char* buffer = OP_NEWA(uni_char, (size_i));
+					if (!buffer)
+						return OpStatus::ERR_NO_MEMORY;
+
+					ANCHOR_ARRAY(uni_char, buffer);
+
+					OpFileLength read_len;
+					RETURN_IF_ERROR(socket->ReadMessage(buffer, size, read_len));
+
+					OpData data_buffer;
+					data_buffer.SetRawData(OPDATA_DEALLOC_OP_DELETEA, (char*)buffer, static_cast<size_t>(read_len) * sizeof(uni_char), size_i * sizeof(uni_char));
+					ANCHOR_ARRAY_RELEASE(buffer);
+
+					return AddCallback(ON_SOCKET_MESSAGE, FALSE, 0, NULL,  is_binary, is_file, data_buffer);
+				}
+			}
+			else
+			{
+				OpString message_filepath;
+				socket->GetMessageFilePath(message_filepath);
+
+				OpData data_buffer;
+				data_buffer.SetCopyData((char*)message_filepath.CStr(), (message_filepath.Length() + 1)* sizeof(uni_char));
+
+				return AddCallback(ON_SOCKET_MESSAGE, FALSE, 0, NULL, is_binary, is_file, data_buffer);
+			}
+		}
+
+		virtual void OnSocketError(OpWebSocket *socket, OP_STATUS error)
+		{
+			OpData empty_message;
+			OpStatus::Ignore(AddCallback(ON_SOCKET_ERROR, FALSE, 0, NULL,  FALSE, FALSE, empty_message, error));
+		}
+
+		virtual void OnSocketInfo(OpWebSocket *socket, WS_Event evt, const uni_char *str = NULL, const uni_char *str2 = NULL, const uni_char *str3 = NULL)
+		{
+			// We ignore this
+		}
+
+	private:
+		OP_STATUS AddCallback(CallbackType type, BOOL close_wasClean = FALSE,
+				UINT16 close_code = 0, const uni_char *close_reason = NULL,
+				BOOL message_is_binary = FALSE, BOOL message_is_file = FALSE, const OpData &message_or_filename = OpData(),
+				OP_STATUS error_code = OpStatus::OK)
+		{
+
+			OpAutoPtr<CallbackObject> object(OP_NEW(CallbackObject,(type, close_wasClean, close_code, message_is_binary, message_is_file, error_code)));
+			RETURN_OOM_IF_NULL(object.get());
+			RETURN_IF_ERROR(object->close_reason.Set(close_reason));
+			object->message_or_filename = message_or_filename;
+			RETURN_IF_ERROR(m_callbacks.Add(object.get()));
+			object.release();
+			return OpStatus::OK;
+		}
+
+
+	};
+
+	class WebSocketProtocolSocket : public WebSocketProtocol
+	{
+	public:
+		WebSocketProtocolSocket(OpWebSocketListener* listener, MessageHandler* mh) : WebSocketProtocol(listener, mh)  { m_selftest_fake_connection = TRUE;}
+		virtual ~WebSocketProtocolSocket(){}
+
+		OP_STATUS SendRawSocketDataToWebsocketClient(UINT64 integer, int size)
+		{
+			if (size > 8)
+				return OpStatus::ERR;
+
+			UINT8 network_encoded_array[8];
+			for (int i = 0;i < size; i++)
+				network_encoded_array[i] = (integer >> (8*(size - i - 1)))&0xff;
+
+			return SendRawSocketDataToWebsocketClient(network_encoded_array, size);
+		}
+
+		OP_STATUS SendRawSocketDataToWebsocketClient(UINT64 integer)
+		{
+			return SendRawSocketDataToWebsocketClient(integer, sizeof(integer));
+		}
+
+		OP_STATUS SendRawSocketDataToWebsocketClient(UINT32 integer)
+		{
+			return SendRawSocketDataToWebsocketClient(integer, sizeof(integer));
+		}
+
+		OP_STATUS SendRawSocketDataToWebsocketClient(UINT16 integer)
+		{
+
+			return SendRawSocketDataToWebsocketClient(integer, sizeof(integer));
+		}
+
+
+		OP_STATUS SendRawSocketDataToWebsocketClient(char character)
+		{
+
+			return SendRawSocketDataToWebsocketClient((UINT64)character, sizeof(character));
+		}
+
+
+		OP_STATUS SendRawSocketDataToWebsocketClient(const OpData &data)
+		{
+			return SendRawSocketDataToWebsocketClient((UINT8*)data.Data(), data.Length());
+		}
+
+		OP_STATUS SendRawSocketDataToWebsocketClient(const UINT8 *data, UINT data_len)
+		{
+			if (m_state != OpWebSocket::WS_CONNECTED && m_state != OpWebSocket::WS_CONNECTING)
+				return OpStatus::ERR;
+
+			RETURN_IF_ERROR(m_data_to_websocket.AppendCopyData((char*)data, data_len));
+
+			while (m_data_to_websocket.Length() > 0 && (m_state == OpWebSocket::WS_CONNECTED || m_state == OpWebSocket::WS_CONNECTING))
+				WebSocketProtocol::ProcessReceivedData();
+
+			return OpStatus::OK;
+		}
+
+		OP_STATUS SendMessageFromClient(const uni_char* data, OpFileLength length, OpFileLength &buffered_amount)
+		{
+			RETURN_IF_ERROR(SendMessage(data, length, buffered_amount));
+
+			// We send until send buffer is empty (will normally be handled by handlecallback)
+			while (m_send_buffers.Cardinal() > 0 && (m_state == OpWebSocket::WS_CONNECTED || m_state == OpWebSocket::WS_CLOSING))
+				RETURN_IF_ERROR(SendMessageSliceFromQueue());
+
+			return OpStatus::OK;
+		}
+
+		OP_STATUS SendMessageFromClient(const UINT8 *data, OpFileLength length, OpFileLength &buffered_amount)
+		{
+			RETURN_IF_ERROR(SendMessage(data, length, buffered_amount));
+
+			// We send until send buffer is empty (will normally be handled by handlecallback)
+			while (m_send_buffers.Cardinal() > 0 && (m_state == OpWebSocket::WS_CONNECTED || m_state == OpWebSocket::WS_CLOSING))
+				RETURN_IF_ERROR(SendMessageSliceFromQueue());
+			return OpStatus::OK;
+		}
+
+		OP_STATUS SendMessgeFileFromClient(const uni_char *filepath, BOOL is_binary, OpFileLength &buffered_amount)
+		{
+			SendFile(filepath, is_binary, buffered_amount);
+
+			// We send until send buffer is empty (will normally be handled by handlecallback)
+			while (m_send_buffers.Cardinal() > 0 && (m_state == OpWebSocket::WS_CONNECTED || m_state == OpWebSocket::WS_CLOSING))
+				RETURN_IF_ERROR(SendMessageSliceFromQueue());
+
+			return OpStatus::OK;
+		}
+		/*
+		 *  Usage:
+		 *  OpData &data = protocol. ReadRawSocketDataSentFromWebSocketClient()
+		 *
+		 *  Parse data, and then call
+		 *  data.Consume(<amount of data handled>);
+		 */
+		OpData &ReadRawSocketDataSentFromWebSocketClient()
+		{
+			return m_data_from_websocket;
+		}
+
+		OP_STATUS OpenConnection(const uni_char *, const uni_char *origin, const OpVector<OpString> &sub_protocols = OpVector<OpString>())
+		{
+
+			URL origin_url = g_url_api->GetURL(origin);
+
+			RETURN_IF_ERROR(WebSocketProtocol::Open(UNI_L("ws://test.com/test"), origin_url, sub_protocols));
+			WebSocketProtocol::DoConnect();
+
+			return OpStatus::OK;
+		}
+
+	private:
+
+		// we overwrite the functions websocket uses to comminicate with socket layer.
+		virtual unsigned int ReadData(char* buf, unsigned blen)
+		{
+			size_t bytes_copied = m_data_to_websocket.CopyInto(buf, blen);
+			m_data_to_websocket.Consume(bytes_copied);
+			return bytes_copied;
+		}
+
+		virtual void SendData(char *buf, unsigned blen)
+		{
+			if (OpStatus::IsError(m_data_from_websocket.AppendCopyData(buf, blen)))
+				Stop();
+
+			OP_DELETEA(buf);
+
+			SetProgressInformation(UPLOADING_PROGRESS, blen, NULL);
+		}
+
+		OpData m_data_to_websocket;
+		OpData m_data_from_websocket;
+	};
+
+
+}
+
+setup
+{
+
+}
+
+exit
+{
+
+}
+
+/******************** Helper functions/subtests *******************/
+
+subtest ParseWebSocketRequest(OpData &request, RequestMethod &method, HeaderList &clientHeaderList)
+{
+	const char *incommingRequest = request.Data();
+
+	const char* requestEnd = op_strstr(incommingRequest, "\x0D\x0A\x0D\x0A");
+	verify(requestEnd);
+	UINT requestLength = requestEnd - incommingRequest;
+
+	UINT j = 0, req_start = 0;
+
+	int protocol_major;
+	int protocol_minor;
+
+	verify(MatchMethod(&method, &j, incommingRequest) &&
+		(MatchWS(&j,incommingRequest, requestLength), TRUE) &&
+		MatchNonWS(&req_start, &j, incommingRequest, requestLength));
+
+	MatchWS(&j,incommingRequest, requestLength);
+	verify(Match("HTTP", &j, incommingRequest, requestLength));
+	MatchWS(&j, incommingRequest, requestLength);
+
+	verify(Match("/", &j, incommingRequest, requestLength));
+	MatchWS(&j, incommingRequest, requestLength);
+
+	verify(MatchDecimal(&protocol_major, &j, incommingRequest, requestLength));
+	MatchWS(&j,incommingRequest, requestLength);
+
+	verify(Match(".", &j,incommingRequest, requestLength));
+	MatchWS(&j, incommingRequest, requestLength);
+
+	verify(MatchDecimal(&protocol_minor, &j, incommingRequest, requestLength));
+
+	const char *headerStart = op_strstr(incommingRequest, CRLF);
+	verify(headerStart);
+	verify((UINT)(headerStart - incommingRequest) <= requestLength );
+
+	char *headerEnd = op_strstr((char*)headerStart, CRLF CRLF);
+	verify(headerEnd);
+
+	*headerEnd = '\0';
+
+	verify(method == WEB_METH_GET);
+
+	verify_success(clientHeaderList.SetValue(headerStart + 2 ));
+
+
+	request.Consume(requestLength + 4 /* The crlfs */);
+}
+
+subtest CreateChallengeResponse(const char *challenge, OpData &challenge_response, BOOL bad_challenge_response)
+{
+	// Let | denote append. The challenge code is calculated as:
+	// Base_64_encoded(Sha1(challenge | 258EAFA5-E914-47DA-95CA-C5AB0DC85B11));
+	verify(challenge);
+	OpAutoPtr<CryptoHash> hash(CryptoHash::CreateSHA1());
+	verify(hash.get());
+
+	verify_success(hash->InitHash());
+	hash->CalculateHash(challenge);
+	hash->CalculateHash("258EAFA5-E914-47DA-95CA-C5AB0DC85B11");
+
+	if (bad_challenge_response)
+		hash->CalculateHash("derp derp"); // To test that client code doesn't connect.
+
+	UINT8 digest[CRYPTO_MAX_HASH_SIZE];
+	hash->ExtractHash(digest);
+
+	OpString8 correct_response;
+	verify_success(CryptoUtility::ConvertToBase64(digest, hash->Size(), correct_response));
+	verify_success(challenge_response.SetCopyData(correct_response.CStr(), correct_response.Length() + 1));
+}
+
+subtest CheckRequestHeaders(HeaderList &clientHeaderList)
+{
+	// Checks that all proper headers are present with proper values.
+
+	HeaderEntry *header = NULL;
+
+	header = clientHeaderList.GetHeader("Upgrade");
+	verify(header);
+	verify(header->Value());
+	verify(op_strcmp(header->Value(), "websocket") == 0);
+
+	header = clientHeaderList.GetHeader("Connection");
+	verify(header);
+	verify(header->Value());
+	verify(op_strcmp(header->Value(), "Upgrade") == 0);
+
+	header = clientHeaderList.GetHeader("Origin");
+	verify(header);
+	verify(header->Value());
+
+	header = clientHeaderList.GetHeader("Host");
+	verify(header);
+	verify(header->Value());
+
+	header = clientHeaderList.GetHeader("Sec-WebSocket-Version");
+	verify(header);
+	verify(header->Value());
+	verify(op_strcmp(header->Value(), "13") == 0);
+
+	header = clientHeaderList.GetHeader("Sec-WebSocket-Key");
+	verify(header);
+	verify(header->Value());
+	UINT8 *binary;
+	int binary_length;
+	verify_success(CryptoUtility::ConvertFromBase64(header->Value(), binary, binary_length));
+	OP_DELETEA(binary);
+	verify(binary_length == 16);
+}
+
+subtest CreateRequestResponse(OpData &response, HeaderList &clientHeaderList, BOOL bad_challenge_response)
+{
+	HeaderEntry *header = clientHeaderList.GetHeader("Sec-WebSocket-Key");
+	verify(header);
+	verify(header->Value());
+
+	OpData challenge_response;
+	verify(CreateChallengeResponse(header->Value(), challenge_response, bad_challenge_response));
+	verify(!challenge_response.IsEmpty());
+
+	verify_success(response.SetCopyData("HTTP/1.1 101 Switching Protocols\r\n"));
+	verify_success(response.AppendFormat("Server: %s\r\n", "The best there is"));
+	verify_success(response.AppendFormat("Upgrade: %s\r\n", "WebSocket"));
+	verify_success(response.AppendFormat("Connection: %s\r\n", "Upgrade"));
+	verify_success(response.AppendFormat("Sec-WebSocket-Accept: %s\r\n", challenge_response.Data()));
+	verify_success(response.AppendCopyData("\r\n"));
+}
+
+subtest OpenWebsocketConnection(const uni_char *url, const uni_char *origin, WebSocketProtocolSocket &protocol, TestListener &listener, const OpVector<OpString> &sub_protocols, BOOL bad_challenge_response)
+{
+	verify_success(protocol.OpenConnection(url, origin, sub_protocols));
+	OpData &request = protocol.ReadRawSocketDataSentFromWebSocketClient();
+
+	RequestMethod method;
+	HeaderList clientHeaderList;
+	verify(ParseWebSocketRequest(request, method, clientHeaderList));
+
+	verify(CheckRequestHeaders(clientHeaderList));
+
+	OpData response;
+	verify(CreateRequestResponse(response, clientHeaderList, bad_challenge_response));
+
+	verify_success(protocol.SendRawSocketDataToWebsocketClient((UINT8*)response.Data(), response.Length()));
+}
+
+subtest CreateRawFrame(OpData &raw_frame, UINT16 frame_flags, const UINT8* frame_data, int frame_data_length, UINT64 frame_data_claimed_length)
+{
+	int extension_payload_length = 0;
+	//	Fixme : add extensions here, when that is implemented.
+
+	UINT16 frame_control_bits = frame_flags;
+
+	UINT8 frame_protocol_data[14]; // 2 controlbytes, maximum 8 length bytes, and 4 masking bytes
+
+	UINT64 extended_encoded_length = 0;
+	UINT extended_encoded_length_size = 0;
+
+	if (frame_data_claimed_length < 126)
+	{
+		extended_encoded_length_size = 0;
+		frame_control_bits |= frame_data_claimed_length;
+	}
+	else if (frame_data_claimed_length < 0x10000)
+	{
+		// 16 bit;
+		extended_encoded_length_size = 2;
+		frame_control_bits |= 126; // signals 16 bit length
+		extended_encoded_length = frame_data_claimed_length;
+	}
+	else
+	{
+		// 64 bit
+		extended_encoded_length_size = 8;
+		frame_control_bits |= 127; // signals 64 bit length
+
+		extended_encoded_length = frame_data_claimed_length;
+	}
+
+	int mask_key_pos = 2 + extended_encoded_length_size;
+
+	int frame_control_data_length;
+
+	if (frame_flags & WebSocketProtocol::Frame::MASKED)
+		frame_control_data_length = mask_key_pos + 4 /* mask */;
+	else
+		frame_control_data_length = mask_key_pos;
+
+	UINT64 protocol_data_length = frame_control_data_length + extension_payload_length;
+
+	frame_protocol_data[0] = frame_control_bits >> 8;
+	frame_protocol_data[1] = frame_control_bits & 0xff;
+
+	UINT64 length = extended_encoded_length;
+	for (int i = extended_encoded_length_size - 1 ; i >= 0; i --)
+	{
+		frame_protocol_data[2 + i] = length & 0xff;
+		length >>= 8;
+	}
+
+	OP_ASSERT(2 + extended_encoded_length_size - 1 < protocol_data_length);
+
+	if (frame_flags & WebSocketProtocol::Frame::MASKED)
+		g_libcrypto_random_generator->GetRandom(frame_protocol_data + mask_key_pos, 4);
+
+	verify_success(raw_frame.AppendCopyData((char*)frame_protocol_data, static_cast<size_t>(protocol_data_length)));
+
+	// We mask if needed
+	if (frame_flags & WebSocketProtocol::Frame::MASKED)
+	{
+		UINT8* masked_data = OP_NEWA(UINT8, (frame_data_length));
+		ANCHOR_ARRAY(UINT8, masked_data);
+		verify(masked_data);
+
+		UINT8 *mask  = frame_protocol_data + mask_key_pos;
+		for (int i = 0; i < frame_data_length; i++)
+			masked_data[i] = frame_data[i] ^ mask[i%4];
+
+		verify_success(raw_frame.AppendCopyData((char*)masked_data, frame_data_length));
+	}
+	else
+		verify_success(raw_frame.AppendCopyData((char*)frame_data, frame_data_length));
+}
+
+subtest CreateTextFrame(OpData &raw_frame, const uni_char* frame_data, BOOL finish, BOOL mask, BOOL continuation_frame)
+{
+	UINT16 frame_flags = 0;
+
+	if (!continuation_frame)
+		frame_flags = WebSocketProtocol::Frame::OPCODE_TEXT_FRAME;
+	else
+		frame_flags = WebSocketProtocol::Frame::OPCODE_CONTINUATION_FRAME;
+
+	if (finish)
+		frame_flags |= WebSocketProtocol::Frame::FIN;
+
+	if (mask)
+		frame_flags |= WebSocketProtocol::Frame::MASKED;
+
+
+	OpString8 frame_data_utf8;
+	verify_success(frame_data_utf8.SetUTF8FromUTF16(frame_data));
+
+	verify(CreateRawFrame(raw_frame, frame_flags, (UINT8*)frame_data_utf8.CStr(), frame_data_utf8.Length(), frame_data_utf8.Length()));
+}
+
+subtest CreateBinaryFrame(OpData &raw_frame, const UINT8* frame_data, int length, BOOL finish, BOOL mask, BOOL continuation_frame)
+{
+	UINT16 frame_flags = 0;
+
+	if (!continuation_frame)
+		frame_flags = WebSocketProtocol::Frame::OPCODE_BINARY_FRAME;
+	else
+		frame_flags = WebSocketProtocol::Frame::OPCODE_CONTINUATION_FRAME;
+
+	if (finish)
+		frame_flags |= WebSocketProtocol::Frame::FIN;
+
+	if (mask)
+		frame_flags |= WebSocketProtocol::Frame::MASKED;
+
+	verify(CreateRawFrame(raw_frame, frame_flags, frame_data, length, length));
+}
+
+subtest CreateCloseFrame(OpData &raw_frame, UINT16 close_code, const uni_char* reason, WebSocketProtocol::Frame::FrameOperationCode operation_code, BOOL mask)
+{
+	UINT16 frame_flags = 0;
+
+	verify(operation_code >= WebSocketProtocol::Frame::OPCODE_CONNECTION_CLOSE);
+
+	frame_flags = operation_code;
+
+	frame_flags |= WebSocketProtocol::Frame::FIN;
+
+	if (mask)
+		frame_flags |= WebSocketProtocol::Frame::MASKED;
+
+	OpString8 reason_utf8;
+	verify_success(reason_utf8.SetUTF8FromUTF16(reason));
+
+	OpString8 frame_data;
+	verify(frame_data.Reserve(2 + reason_utf8.Length() + 1 /* terminating '\0' */) != NULL);
+	frame_data[0] = (char)(close_code >> 8);
+	frame_data[1] = (char)(close_code & 255);
+
+	op_memcpy(frame_data.CStr() + 2, reason_utf8.CStr(), reason_utf8.Length() + 1 /* terminating '\0' */);
+
+	verify(CreateRawFrame(raw_frame, frame_flags, (UINT8*)frame_data.CStr(), frame_data.Length(), frame_data.Length()));
+}
+
+subtest ParseFrame(OpData &raw_frame, UINT16 &frame_control_bits, OpData &frame_data)
+{
+	verify(raw_frame.Length() >= 2);
+
+	UINT8 *raw_frame_bytes = (UINT8*)raw_frame.Data();
+	unsigned raw_frame_length = raw_frame.Length();
+
+	frame_control_bits = (raw_frame_bytes[0] << 8) | raw_frame_bytes[1];
+
+	// Calculate correct data length;
+	UINT seven_bit_length = (frame_control_bits & WebSocketProtocol::Frame::LENGTH_BIT_MASK);
+
+	INT64 frame_data_length = 0;
+	UINT num_extended_length_bytes = 0;
+
+	if (seven_bit_length < 126)
+		frame_data_length = seven_bit_length;
+	else if (seven_bit_length == 126)
+		num_extended_length_bytes = 2;
+	else if (seven_bit_length == 127)
+		num_extended_length_bytes = 8;
+
+	verify(2 + num_extended_length_bytes <= raw_frame.Length());
+
+
+	// If we have num_extended_length_bytes > 0,
+	// that is we have a 16 or 64 bit length, set length from next extended_length_bytes bytes.
+	UINT index = 2;
+	for (UINT idx = 0; idx < num_extended_length_bytes; idx++)
+	{
+		frame_data_length <<= 8;
+		frame_data_length |= raw_frame_bytes[index++];
+	}
+
+	UINT8 *mask_data = NULL;
+	if (frame_control_bits & WebSocketProtocol::Frame::MASKED)
+	{
+		mask_data = &raw_frame_bytes[index];
+		index += 4;
+
+		verify(frame_data_length <= raw_frame_length - index);
+
+		if (frame_data_length)
+		{
+			UINT8 *frame_data_bytes = OP_NEWA(UINT8, static_cast<UINT>(frame_data_length));
+			ANCHOR_ARRAY(UINT8, frame_data_bytes);
+			verify(frame_data_bytes);
+
+			for (int i = 0; i < frame_data_length; i++)
+				frame_data_bytes[i] =  raw_frame_bytes[index++] ^ mask_data[i%4];
+
+			verify_success(frame_data.SetCopyData((char*)frame_data_bytes, static_cast<UINT>(frame_data_length)));
+		}
+		raw_frame.Consume(index);
+	}
+	else
+	{
+		verify(frame_data_length <= raw_frame_length - index);
+		verify_success(frame_data.SetCopyData((char*)&raw_frame_bytes[index], static_cast<UINT>(frame_data_length)));
+		raw_frame.Consume(index + static_cast<UINT>(frame_data_length));
+	}
+}
+
+subtest MatchFrameTextMessage(OpData &raw_frame_data, const uni_char *message, int message_length)
+{
+	UINT16 frame_from_client_flags;
+	OpData frame_from_client_data;
+	verify(ParseFrame(raw_frame_data, frame_from_client_flags, frame_from_client_data));
+
+	UINT16 operation_code = frame_from_client_flags & WebSocketProtocol::Frame::OPERATION_CODE_BIT_MASK;
+	verify(operation_code == WebSocketProtocol::Frame::OPCODE_TEXT_FRAME);
+
+	// Client is always supposed to mask
+	verify(frame_from_client_flags & WebSocketProtocol::Frame::MASKED);
+
+	if (message && message_length)
+	{
+		OpString16 message_utf16;
+		verify_success(message_utf16.SetFromUTF8(frame_from_client_data.Data(), frame_from_client_data.Length()));
+
+		verify(message_length == message_utf16.Length());
+		verify(uni_strni_eq(message, message_utf16.CStr(), message_utf16.Length()));
+	}
+	else
+		verify(frame_from_client_data.Length() == 0);
+}
+
+subtest MatchFrameBinaryMessage(OpData &raw_frame_data, const UINT8 *message, UINT message_length)
+{
+	UINT16 frame_from_client_flags;
+	OpData frame_from_client_data;
+	verify(ParseFrame(raw_frame_data, frame_from_client_flags, frame_from_client_data));
+
+	UINT16 operation_code = frame_from_client_flags & WebSocketProtocol::Frame::OPERATION_CODE_BIT_MASK;
+	verify(operation_code == WebSocketProtocol::Frame::OPCODE_BINARY_FRAME);
+
+	// Client is always supposed to mask
+	verify(frame_from_client_flags & WebSocketProtocol::Frame::MASKED);
+
+	if (message && message_length)
+	{
+		verify(message_length == frame_from_client_data.Length());
+		verify(op_memcmp(message, frame_from_client_data.Data(), frame_from_client_data.Length()) == 0);
+	}
+	else
+		verify(frame_from_client_data.Length() == 0);
+}
+
+subtest MatchPong(OpData &raw_frame_data, const uni_char *message, int message_length)
+{
+	UINT16 frame_from_client_flags;
+	OpData frame_from_client_data;
+	verify(ParseFrame(raw_frame_data, frame_from_client_flags, frame_from_client_data));
+
+	UINT16 operation_code = frame_from_client_flags & WebSocketProtocol::Frame::OPERATION_CODE_BIT_MASK;
+	verify(operation_code == WebSocketProtocol::Frame::OPCODE_CONNECTION_PONG);
+
+	// Client is always supposed to mask
+	verify(frame_from_client_flags & WebSocketProtocol::Frame::MASKED);
+
+	verify(frame_from_client_flags & WebSocketProtocol::Frame::FIN);
+
+	if (message && message_length)
+	{
+		OpString16 message_utf16;
+		verify_success(message_utf16.SetFromUTF8(frame_from_client_data.Data(), frame_from_client_data.Length()));
+
+		verify(message_length == message_utf16.Length());
+		verify(uni_strni_eq(message, message_utf16.CStr(), message_utf16.Length()));
+	}
+	else
+		verify(frame_from_client_data.Length() == 0);
+}
+
+subtest MatchClose(OpData &raw_frame_data, const uni_char *message, int message_length)
+{
+	UINT16 frame_from_client_flags;
+	OpData frame_from_client_data;
+	verify(ParseFrame(raw_frame_data, frame_from_client_flags, frame_from_client_data));
+
+	UINT16 operation_code = frame_from_client_flags & WebSocketProtocol::Frame::OPERATION_CODE_BIT_MASK;
+	verify(operation_code == WebSocketProtocol::Frame::OPCODE_CONNECTION_CLOSE);
+
+	// Client is always supposed to mask
+	verify(frame_from_client_flags & WebSocketProtocol::Frame::MASKED);
+
+	verify(frame_from_client_flags & WebSocketProtocol::Frame::FIN);
+
+	if (message && message_length)
+	{
+		OpString16 message_utf16;
+		verify_success(message_utf16.SetFromUTF8(frame_from_client_data.Data(), frame_from_client_data.Length()));
+
+		verify(message_length == message_utf16.Length());
+		verify(uni_strni_eq(message, message_utf16.CStr(), message_utf16.Length()));
+	}
+	else
+		verify(frame_from_client_data.Length() == 0);
+}
+subtest TestSendingDifferentLengthsToClient(unsigned int send_length)
+{
+	OpVector<OpString> sub_protocols;
+	TestListener client_listener;
+	WebSocketProtocolSocket protocol(&client_listener, g_main_message_handler);
+
+	verify(OpenWebsocketConnection(UNI_L("ws://test.com/test"), UNI_L("http://test.com"), protocol, client_listener, sub_protocols, FALSE));
+	verify(protocol.GetState() == OpWebSocket::WS_CONNECTED);
+
+	UINT8 *frame_data = OP_NEWA(UINT8, send_length);
+	verify(frame_data);
+	ANCHOR_ARRAY(UINT8, frame_data);
+	for (unsigned int i = 0; i < send_length; i++)
+	{
+		frame_data[i] = i & 255;
+	}
+
+	OpData raw_frame;
+	verify(CreateBinaryFrame(raw_frame, frame_data, send_length, TRUE, FALSE, FALSE));
+
+	verify_success(protocol.SendRawSocketDataToWebsocketClient(raw_frame));
+
+	// Check connection is still open
+	verify(protocol.GetState() == OpWebSocket::WS_CONNECTED);
+
+	// Check that the client received the message
+
+	TestListener::CallbackObject *callback;
+	verify(callback = client_listener.m_callbacks.Get(0));
+	verify(callback->callback_type == TestListener::ON_SOCKET_OPEN);
+
+	verify(callback = client_listener.m_callbacks.Get(1));
+	verify(callback->callback_type == TestListener::ON_SOCKET_MESSAGE);
+
+	// Check the client got the message
+	verify(callback->message_is_binary);
+
+	if (!callback->message_is_file)
+	{
+		unsigned int length;
+		const UINT8 *message = callback->GetBinaryMessage(length);
+
+		verify(length == send_length);
+		verify(op_memcmp(message, frame_data, length) == 0);
+
+	}
+	else
+	{
+		const uni_char *message_filename = callback->GetFileName();
+		verify(message_filename);
+		OpFile message_file;
+		verify_success(message_file.Construct(message_filename, OPFILE_ABSOLUTE_FOLDER));
+
+		BOOL exists;
+		verify_success(message_file.Exists(exists));
+		verify(exists == TRUE);
+
+		verify_success(message_file.Open(OPFILE_READ));
+
+		OpFileLength file_length;
+		verify_success(message_file.GetFileLength(file_length));
+		verify(file_length == send_length);
+
+		UINT8 *received_frame_data = OP_NEWA(UINT8, send_length);
+		ANCHOR_ARRAY(UINT8, received_frame_data);
+
+		OpFileLength bytes_read;
+		verify_success(message_file.Read(received_frame_data, file_length, &bytes_read));
+
+		verify(op_memcmp(received_frame_data, frame_data, static_cast<unsigned int>(file_length)) == 0);
+	}
+
+	TestClientInitiatedCloseHandshake(client_listener, protocol, 1001, UNI_L("derp derp"));
+}
+
+subtest TestSendingDifferentLengthsFromClient(unsigned int send_length)
+{
+	OpVector<OpString> sub_protocols;
+	TestListener client_listener;
+	WebSocketProtocolSocket protocol(&client_listener, g_main_message_handler);
+
+	verify(OpenWebsocketConnection(UNI_L("ws://test.com/test"), UNI_L("http://test.com"), protocol, client_listener, sub_protocols, FALSE));
+
+	TestListener::CallbackObject *callback;
+	verify(callback = client_listener.m_callbacks.Get(0));
+	verify(callback->callback_type == TestListener::ON_SOCKET_OPEN);
+
+	verify(protocol.GetState() == OpWebSocket::WS_CONNECTED);
+
+	UINT8 *frame_data = OP_NEWA(UINT8, send_length);
+	verify(frame_data);
+	ANCHOR_ARRAY(UINT8, frame_data);
+	for (unsigned int i = 0; i < send_length; i++)
+	{
+		frame_data[i] = i & 255;
+	}
+
+	// Let client send a message
+	OpFileLength buffered_amount = 0;
+	verify_success(protocol.SendMessageFromClient(frame_data, send_length, buffered_amount));
+	verify(buffered_amount == send_length);
+
+	// Check connection is still open
+	verify(protocol.GetState() == OpWebSocket::WS_CONNECTED);
+
+	// Check that the server received the message
+	OpData &sent_from_socket = protocol.ReadRawSocketDataSentFromWebSocketClient();
+
+	// Check the message received server side is correct
+	verify(MatchFrameBinaryMessage(sent_from_socket, frame_data, send_length));
+
+	verify(TestServerInitiatedCloseHandshake(client_listener, protocol, 1000, UNI_L("close"), TRUE));
+}
+
+subtest TestClientInitiatedCloseHandshake(TestListener &listener, WebSocketProtocolSocket &protocol, UINT16 close_code, const uni_char *close_reason)
+{
+	listener.m_callbacks.DeleteAll();
+
+	// Check callbacks and state
+	OpWebSocket::State socket_state_before_close = protocol.GetState();
+
+	// Now we close connection from client side
+	protocol.Close(close_code, close_reason);
+	TestListener::CallbackObject *callback = NULL;
+
+	switch (socket_state_before_close)
+	{
+	case OpWebSocket::WS_CONNECTED:
+	{
+		// If the connection was open, check the handshake.
+		// Checks callbacks, state and close reason
+		verify(callback = listener.m_callbacks.Get(0));
+		verify(callback->callback_type == TestListener::ON_SOCKET_CLOSING);
+
+		verify(callback = listener.m_callbacks.Get(1));
+		verify(callback->callback_type == TestListener::ON_SOCKET_CLOSED);
+		verify(callback->close_was_clean == TRUE);
+		verify(callback->close_code == close_code);
+		verify(uni_str_eq(callback->close_reason.CStr(), close_reason));
+
+		verify(listener.m_callbacks.Get(2) == NULL);
+		break;
+	}
+	case OpWebSocket::WS_CLOSING:
+	case OpWebSocket::WS_CLOSED:
+	{
+		// Nothing should happen
+		verify(listener.m_callbacks.GetCount() == 0);
+		break;
+	}
+	case OpWebSocket::WS_CONNECTING:
+	{
+		verify(callback = listener.m_callbacks.Get(0));
+		verify(callback->callback_type == TestListener::ON_SOCKET_ERROR);
+
+		verify(listener.m_callbacks.Get(1) == NULL);
+		break;
+	}
+
+	default:
+		// Should not happen
+		verify(FALSE);
+	}
+
+	verify(protocol.GetState() == OpWebSocket::WS_CLOSED);
+
+	// Now check nothing happens if we try to close again.
+	listener.m_callbacks.DeleteAll();
+	protocol.Close(close_code, close_reason);
+
+	verify(listener.m_callbacks.Get(0) == NULL);
+
+	verify(protocol.GetState() == OpWebSocket::WS_CLOSED);
+}
+
+subtest TestServerInitiatedCloseHandshake(TestListener &client_listener, WebSocketProtocolSocket &protocol, UINT16 close_code, const uni_char *close_reason, BOOL legal_code)
+{
+	client_listener.m_callbacks.DeleteAll();
+
+	// Create and send close frame from server to client
+	OpData raw_frame;
+	verify(CreateCloseFrame(raw_frame, close_code, close_reason, WebSocketProtocol::Frame::OPCODE_CONNECTION_CLOSE, FALSE /* servers do not mask */));
+	verify_success(protocol.SendRawSocketDataToWebsocketClient(raw_frame));
+
+	if (legal_code)
+		verify(CheckClientClose(client_listener, 0, protocol, close_code, close_reason, TRUE));
+	else
+	{
+		if (close_code == 0)
+			verify(CheckClientClose(client_listener, 0, protocol, WebSocketProtocol::Frame::CLOSE_RESERVED_APPLICATION_LAYER_NO_STATUS, UNI_L(""), TRUE));
+		else
+			verify(CheckClientClose(client_listener, 0, protocol, WebSocketProtocol::Frame::CLOSE_PROTOCOL_ERROR, UNI_L("Protocol Error"), TRUE));
+
+	}
+
+	verify(protocol.GetState() == OpWebSocket::WS_CLOSED);
+}
+
+subtest CheckClientClose(TestListener &client_listener, int callback_index, WebSocketProtocolSocket &protocol, UINT16 close_code, const uni_char *close_reason, BOOL clean_close)
+{
+	TestListener::CallbackObject *callback = NULL;
+
+	verify(protocol.GetState() == OpWebSocket::WS_CLOSED);
+
+	if (clean_close)
+	{
+		// We check that the client received the close
+		verify(callback = client_listener.m_callbacks.Get(callback_index));
+		verify(callback->callback_type == TestListener::ON_SOCKET_CLOSING);
+
+		verify(callback = client_listener.m_callbacks.Get(callback_index + 1));
+		verify(callback->callback_type == TestListener::ON_SOCKET_CLOSED);
+
+		verify(callback->close_was_clean == TRUE);
+
+		verify(callback->close_code == close_code);
+		if (callback->close_reason.CStr())
+			verify(uni_strni_eq(callback->close_reason.CStr(), close_reason, callback->close_reason.Length()));
+		verify((size_t)callback->close_reason.Length() == uni_strlen(close_reason));
+	}
+	else
+	{
+		verify(callback = client_listener.m_callbacks.Get(callback_index));
+		verify(callback->callback_type == TestListener::ON_SOCKET_ERROR);
+
+		verify(callback = client_listener.m_callbacks.Get(callback_index + 1));
+		verify(callback->callback_type == TestListener::ON_SOCKET_CLOSED);
+
+		verify(callback->close_was_clean == FALSE);
+
+		if (callback->close_reason.CStr())
+			verify(uni_strni_eq(callback->close_reason.CStr(), UNI_L("Protocol Error"), callback->close_reason.Length()));
+		verify((size_t)callback->close_reason.Length() == uni_strlen(UNI_L("Protocol Error")));
+
+		// Check that the server did not receive a close message (un-clean close)
+		OpData &sent_from_socket = protocol.ReadRawSocketDataSentFromWebSocketClient();
+		verify(sent_from_socket.Length() == 0);
+	}
+	verify(client_listener.m_callbacks.Get(callback_index + 2) == NULL);
+}
+/******************** Start of tests *******************/
+
+test("Open websocket - bad challenge response")
+{
+	OpVector<OpString> sub_protocols;
+	TestListener listener;
+	WebSocketProtocolSocket protocol(&listener, g_main_message_handler);
+	verify(OpenWebsocketConnection(UNI_L("ws://test.com/test"), UNI_L("http://test.com"), protocol, listener, sub_protocols, TRUE));
+
+	// Check callbacks and state
+	TestListener::CallbackObject *callback;
+	verify(callback = listener.m_callbacks.Get(0));
+
+	verify(callback->callback_type == TestListener::ON_SOCKET_ERROR);
+
+	verify(callback = listener.m_callbacks.Get(1));
+	verify(callback->callback_type == TestListener::ON_SOCKET_CLOSED);
+
+	verify(listener.m_callbacks.GetCount() == 2);
+
+	verify(protocol.GetState() == OpWebSocket::WS_CLOSED);
+}
+
+test("Open websocket")
+{
+	OpVector<OpString> sub_protocols;
+	TestListener listener;
+	WebSocketProtocolSocket protocol(&listener, g_main_message_handler);
+
+	// First we open new connection. This will also check all response headers from client in subtests.
+	verify(OpenWebsocketConnection(UNI_L("ws://test.com/test"), UNI_L("http://test.com"), protocol, listener, sub_protocols, FALSE));
+
+
+	// Check callbacks and state
+	TestListener::CallbackObject *callback;
+	verify(callback = listener.m_callbacks.Get(0));
+	verify(callback->callback_type == TestListener::ON_SOCKET_OPEN);
+
+	verify(protocol.GetState() == OpWebSocket::WS_CONNECTED);
+
+	verify(TestClientInitiatedCloseHandshake(listener, protocol, 1001, UNI_L("derp derp")));
+}
+
+test("Send ping")
+{
+	OpVector<OpString> sub_protocols;
+	TestListener listener;
+	WebSocketProtocolSocket protocol(&listener, g_main_message_handler);
+
+	verify(OpenWebsocketConnection(UNI_L("ws://test.com/test"), UNI_L("http://test.com"), protocol, listener, sub_protocols, FALSE));
+	verify(protocol.GetState() == OpWebSocket::WS_CONNECTED);
+
+	verify_success(protocol.SendRawSocketDataToWebsocketClient((UINT16)(WebSocketProtocol::Frame::OPCODE_CONNECTION_PING | WebSocketProtocol::Frame::FIN)));
+
+	// Check connection is still open
+	verify(protocol.GetState() == OpWebSocket::WS_CONNECTED);
+
+	// Read response, and verify we got a pong
+	OpData &sent_from_socket = protocol.ReadRawSocketDataSentFromWebSocketClient();
+	UINT8 *array = (UINT8*)sent_from_socket.Data();
+	verify(sent_from_socket.Length() == 6);
+
+	verify(array[0] == (UINT16)(WebSocketProtocol::Frame::OPCODE_CONNECTION_PONG | WebSocketProtocol::Frame::FIN) >> 8);
+	verify(array[1] ==  WebSocketProtocol::Frame::MASKED);
+	// The rest of the array is the random masking bytes
+
+	verify(TestClientInitiatedCloseHandshake(listener, protocol, 1001, UNI_L("derp derp")));
+}
+
+test("Send message to client and let client close")
+{
+	OpVector<OpString> sub_protocols;
+	TestListener client_listener;
+	WebSocketProtocolSocket protocol(&client_listener, g_main_message_handler);
+
+	verify(OpenWebsocketConnection(UNI_L("ws://test.com/test"), UNI_L("http://test.com"), protocol, client_listener, sub_protocols, FALSE));
+	verify(protocol.GetState() == OpWebSocket::WS_CONNECTED);
+
+	OpData raw_frame;
+	verify(CreateTextFrame(raw_frame, UNI_L("hello"), TRUE, FALSE, FALSE));
+
+	verify_success(protocol.SendRawSocketDataToWebsocketClient(raw_frame));
+
+	// Check connection is still open
+	verify(protocol.GetState() == OpWebSocket::WS_CONNECTED);
+
+	// Check that the client received the message
+
+	TestListener::CallbackObject *callback;
+	verify(callback = client_listener.m_callbacks.Get(0));
+	verify(callback->callback_type == TestListener::ON_SOCKET_OPEN);
+
+	verify(callback = client_listener.m_callbacks.Get(1));
+	verify(callback->callback_type == TestListener::ON_SOCKET_MESSAGE);
+
+	// Check the client got the message
+	unsigned int length;
+	const uni_char *text_message = callback->GetTextMessage(length);
+	verify(uni_strni_eq(text_message, UNI_L("hello"), length));
+
+	// We close from client side
+	verify(TestClientInitiatedCloseHandshake(client_listener, protocol, 1001, UNI_L("derp derp")));
+}
+
+test("Send masked message to client")
+{
+	OpVector<OpString> sub_protocols;
+	TestListener client_listener;
+	WebSocketProtocolSocket protocol(&client_listener, g_main_message_handler);
+
+	verify(OpenWebsocketConnection(UNI_L("ws://test.com/test"), UNI_L("http://test.com"), protocol, client_listener, sub_protocols, FALSE));
+	verify(protocol.GetState() == OpWebSocket::WS_CONNECTED);
+
+	OpData raw_frame;
+	// We send a masked message to client (not allowed)
+	verify(CreateTextFrame(raw_frame, UNI_L("hello"), TRUE, TRUE, FALSE));
+
+	verify_success(protocol.SendRawSocketDataToWebsocketClient(raw_frame));
+
+	// Check that client gets an error event, and that no close message is sent to server
+	CheckClientClose(client_listener, 1, protocol, 1002, UNI_L("Procol Error"), FALSE);
+}
+
+test("Send a single continuation frame to client")
+{
+	OpVector<OpString> sub_protocols;
+	TestListener client_listener;
+	WebSocketProtocolSocket protocol(&client_listener, g_main_message_handler);
+
+	verify(OpenWebsocketConnection(UNI_L("ws://test.com/test"), UNI_L("http://test.com"), protocol, client_listener, sub_protocols, FALSE));
+	verify(protocol.GetState() == OpWebSocket::WS_CONNECTED);
+
+	OpData raw_frame;
+	// We send a single continuation frame message to client (not allowed)
+	verify(CreateTextFrame(raw_frame, UNI_L("hello"), TRUE, FALSE, TRUE));
+
+	verify_success(protocol.SendRawSocketDataToWebsocketClient(raw_frame));
+
+	// Check that client gets an error event, and that no close message is sent to server
+	CheckClientClose(client_listener, 1, protocol, 1002, UNI_L("Procol Error"), FALSE);
+}
+
+test("Send a single unfinished frame, without a following continuation frame")
+{
+	OpVector<OpString> sub_protocols;
+	TestListener client_listener;
+	WebSocketProtocolSocket protocol(&client_listener, g_main_message_handler);
+
+	verify(OpenWebsocketConnection(UNI_L("ws://test.com/test"), UNI_L("http://test.com"), protocol, client_listener, sub_protocols, FALSE));
+	verify(protocol.GetState() == OpWebSocket::WS_CONNECTED);
+
+	OpData raw_frame;
+	// We send unfinished frame message to client (not allowed)
+	verify(CreateTextFrame(raw_frame, UNI_L("hello"), FALSE, FALSE, FALSE));
+	verify_success(protocol.SendRawSocketDataToWebsocketClient(raw_frame));
+
+	// We send a new text frame (should have been continuation frame)
+	verify(CreateTextFrame(raw_frame, UNI_L(" all"), TRUE, FALSE, FALSE));
+	verify_success(protocol.SendRawSocketDataToWebsocketClient(raw_frame));
+
+	// Check that client gets an error event, and that no close message is sent to server
+	CheckClientClose(client_listener, 1, protocol, 1002, UNI_L("Procol Error"), FALSE);
+}
+
+foreach(name, length) from send_lengths_table
+{
+	test("Send frame from server to client of length " name)
+	{
+		verify(TestSendingDifferentLengthsToClient(length));
+	}
+}
+
+test("Send message to client one byte at the time")
+{
+	OpVector<OpString> sub_protocols;
+	TestListener client_listener;
+	WebSocketProtocolSocket protocol(&client_listener, g_main_message_handler);
+
+	verify(OpenWebsocketConnection(UNI_L("ws://test.com/test"), UNI_L("http://test.com"), protocol, client_listener, sub_protocols, FALSE));
+	verify(protocol.GetState() == OpWebSocket::WS_CONNECTED);
+
+	OpData raw_frame;
+	verify(CreateTextFrame(raw_frame, UNI_L("hello"), TRUE, FALSE, FALSE));
+
+	for (unsigned i = 0; i < raw_frame.Length(); i++)
+	{
+		verify_success(protocol.SendRawSocketDataToWebsocketClient(raw_frame[i]));
+	}
+	raw_frame.Clear();
+
+	// Check connection is still open
+	verify(protocol.GetState() == OpWebSocket::WS_CONNECTED);
+
+	// Check that the client received the message
+
+	TestListener::CallbackObject *callback;
+	verify(callback = client_listener.m_callbacks.Get(0));
+	verify(callback->callback_type == TestListener::ON_SOCKET_OPEN);
+
+	verify(callback = client_listener.m_callbacks.Get(1));
+	verify(callback->callback_type == TestListener::ON_SOCKET_MESSAGE);
+
+	// Check the client got the message
+	unsigned int length;
+	const uni_char *text_message = callback->GetTextMessage(length);
+	verify(length > 0);
+	verify(uni_strni_eq(text_message, UNI_L("hello"), length));
+
+	// We close from client side
+	verify(TestClientInitiatedCloseHandshake(client_listener, protocol, 1001, UNI_L("derp derp")));
+}
+
+test("Send fragmented message to client with two pings in between fragments")
+{
+	OpVector<OpString> sub_protocols;
+	TestListener client_listener;
+	WebSocketProtocolSocket protocol(&client_listener, g_main_message_handler);
+
+	verify(OpenWebsocketConnection(UNI_L("ws://test.com/test"), UNI_L("http://test.com"), protocol, client_listener, sub_protocols, FALSE));
+	verify(protocol.GetState() == OpWebSocket::WS_CONNECTED);
+
+	// Check callback
+	TestListener::CallbackObject *callback;
+	verify(callback = client_listener.m_callbacks.Get(0));
+	verify(callback->callback_type == TestListener::ON_SOCKET_OPEN);
+
+
+	// Create a text message without finish flag and send to client.
+	OpData raw_frame;
+	verify(CreateTextFrame(raw_frame, UNI_L("hello "), FALSE, FALSE, FALSE));
+	verify_success(protocol.SendRawSocketDataToWebsocketClient(raw_frame));
+
+	// Check connection is still open
+	verify(protocol.GetState() == OpWebSocket::WS_CONNECTED);
+
+	// Send a couple of pings
+	verify_success(protocol.SendRawSocketDataToWebsocketClient((UINT16)(WebSocketProtocol::Frame::OPCODE_CONNECTION_PING | WebSocketProtocol::Frame::FIN)));
+	verify_success(protocol.SendRawSocketDataToWebsocketClient((UINT16)(WebSocketProtocol::Frame::OPCODE_CONNECTION_PING | WebSocketProtocol::Frame::FIN)));
+
+	verify(protocol.GetState() == OpWebSocket::WS_CONNECTED);
+
+	// Check that we still have not received any message on client side
+	verify(client_listener.m_callbacks.Get(1) == NULL);
+
+	OpData &sent_from_socket = protocol.ReadRawSocketDataSentFromWebSocketClient();
+	verify(MatchPong(sent_from_socket, NULL, 0));
+	verify(MatchPong(sent_from_socket, NULL, 0));
+
+	// All data should have been consumed by parser.
+	verify(sent_from_socket.Length() == 0);
+
+	// Send a continuation frame with finish flag to client.
+	raw_frame.Clear();
+	verify(CreateTextFrame(raw_frame, UNI_L("y'all"), TRUE, FALSE, TRUE));
+	verify_success(protocol.SendRawSocketDataToWebsocketClient(raw_frame));
+
+	// Check that the client received the complete message
+	verify(callback = client_listener.m_callbacks.Get(1));
+	verify(callback->callback_type == TestListener::ON_SOCKET_MESSAGE);
+	unsigned int length;
+	const uni_char *text_message = callback->GetTextMessage(length);
+	verify(uni_strni_eq(text_message, UNI_L("hello y'all"), length));
+
+	// We close from client side
+	verify(TestClientInitiatedCloseHandshake(client_listener, protocol, 1001, UNI_L("derp derp")));
+}
+
+test("Send big message fragmented into 256 fragments to client with pings in between fragments")
+{
+	OpVector<OpString> sub_protocols;
+	TestListener client_listener;
+	WebSocketProtocolSocket protocol(&client_listener, g_main_message_handler);
+
+	verify(OpenWebsocketConnection(UNI_L("ws://test.com/test"), UNI_L("http://test.com"), protocol, client_listener, sub_protocols, FALSE));
+	verify(protocol.GetState() == OpWebSocket::WS_CONNECTED);
+
+	unsigned int send_length = 256;
+
+	for (unsigned int fragment = 0; fragment < 256; fragment++)
+	{
+		UINT8 *frame_data = OP_NEWA(UINT8, send_length);
+		verify(frame_data);
+		ANCHOR_ARRAY(UINT8, frame_data);
+		for (unsigned int i = 0; i < send_length; i++)
+			frame_data[i] = (UINT8)((i + fragment) & 255);
+
+		OpData raw_frame;
+		verify(CreateBinaryFrame(raw_frame, frame_data, send_length, fragment == 255 /* Only last frame is finished */, FALSE, fragment > 0 /* All but first frame are continuation frames */));
+		verify_success(protocol.SendRawSocketDataToWebsocketClient(raw_frame));
+
+		// Send a couple of pings
+		verify_success(protocol.SendRawSocketDataToWebsocketClient((UINT16)(WebSocketProtocol::Frame::OPCODE_CONNECTION_PING | WebSocketProtocol::Frame::FIN)));
+		verify_success(protocol.SendRawSocketDataToWebsocketClient((UINT16)(WebSocketProtocol::Frame::OPCODE_CONNECTION_PING | WebSocketProtocol::Frame::FIN)));
+
+		verify(protocol.GetState() == OpWebSocket::WS_CONNECTED);
+
+		// Check that we still have not received any message on client side, as long as the finished message is not sent
+		if (fragment < 255)
+			verify(client_listener.m_callbacks.Get(1) == NULL);
+
+		OpData &sent_from_socket = protocol.ReadRawSocketDataSentFromWebSocketClient();
+		verify(MatchPong(sent_from_socket, NULL, 0));
+		verify(MatchPong(sent_from_socket, NULL, 0));
+
+		// All data should have been consumed by parser.
+		verify(sent_from_socket.Length() == 0);
+	}
+
+	TestListener::CallbackObject *callback;
+	// Check that the client received the complete message
+	verify(callback = client_listener.m_callbacks.Get(1));
+	verify(callback->callback_type == TestListener::ON_SOCKET_MESSAGE);
+	unsigned int length;
+	const UINT8 *binary_message = callback->GetBinaryMessage(length);
+
+	verify(length == 256*256);
+
+	for (unsigned int fragment = 0; fragment < 256; fragment++)
+	{
+		for (unsigned int i = 0; i < send_length; i++)
+			verify(binary_message[i] == (UINT8)((i + fragment) & 255));
+
+		binary_message += 256;
+	}
+
+	// We close from client side
+	verify(TestClientInitiatedCloseHandshake(client_listener, protocol, 1001, UNI_L("derp derp")));
+}
+
+test("Send bad operation codes to client")
+{
+	// Operation codes 3 to 7 are not yet defined in protocol
+	for (UINT16 bad_operation_codes = 3; bad_operation_codes < 8; bad_operation_codes++)
+	{
+		OpVector<OpString> sub_protocols;
+		TestListener client_listener;
+		WebSocketProtocolSocket protocol(&client_listener, g_main_message_handler);
+
+		verify(OpenWebsocketConnection(UNI_L("ws://test.com/test"), UNI_L("http://test.com"), protocol, client_listener, sub_protocols, FALSE));
+		verify(protocol.GetState() == OpWebSocket::WS_CONNECTED);
+
+		verify_success(protocol.SendRawSocketDataToWebsocketClient((UINT16)((bad_operation_codes << 8)| WebSocketProtocol::Frame::FIN)));
+		verify(protocol.GetState() == OpWebSocket::WS_CLOSED);
+
+		// We check that the client received the correct callbacks, and no close code was sent to server (wasClean == FALSE)
+		CheckClientClose(client_listener, 1, protocol, 1002, UNI_L("Procol Error"), FALSE);
+
+		// No more callbacks
+		verify(client_listener.m_callbacks.Get(3) == NULL);
+	}
+}
+
+test("Send frame with bad length to client")
+{
+	OpVector<OpString> sub_protocols;
+	TestListener client_listener;
+	WebSocketProtocolSocket protocol(&client_listener, g_main_message_handler);
+
+	verify(OpenWebsocketConnection(UNI_L("ws://test.com/test"), UNI_L("http://test.com"), protocol, client_listener, sub_protocols, FALSE));
+	verify(protocol.GetState() == OpWebSocket::WS_CONNECTED);
+
+	UINT16 frame_flags = 0;
+
+	frame_flags = WebSocketProtocol::Frame::OPCODE_CONTINUATION_FRAME;
+
+	frame_flags |= WebSocketProtocol::Frame::FIN;
+
+	OpData raw_frame;
+
+	unsigned int send_length = 0x10000;
+	UINT8 *frame_data = OP_NEWA(UINT8, send_length);
+	ANCHOR_ARRAY(UINT8, frame_data);
+	for (unsigned int i = 0; i < send_length; i++)
+	{
+		frame_data[i] = i & 255;
+	}
+
+	// We send a bad frame length. 
+	verify(CreateRawFrame(raw_frame, frame_flags, frame_data, send_length /* real length */, (OpFileLength)-1 /* set a fake length */));
+	
+	verify_success(protocol.SendRawSocketDataToWebsocketClient(raw_frame));
+	
+	// Check connection is still open
+	verify(protocol.GetState() == OpWebSocket::WS_CLOSED);
+
+	// Check that the client received correct callbacks.
+	TestListener::CallbackObject *callback;
+	verify(callback = client_listener.m_callbacks.Get(0));
+	verify(callback->callback_type == TestListener::ON_SOCKET_OPEN);
+
+	// Check that we receive an error, since frame size is illegal.
+	verify(callback = client_listener.m_callbacks.Get(1));
+	verify(callback->callback_type == TestListener::ON_SOCKET_ERROR);
+	
+	verify(callback = client_listener.m_callbacks.Get(2));
+	verify(callback->callback_type == TestListener::ON_SOCKET_CLOSED);
+
+	verify(client_listener.m_callbacks.Get(3) == NULL);
+}
+
+test("Send message from client and close from serverside")
+{
+	OpVector<OpString> sub_protocols;
+	TestListener client_listener;
+	WebSocketProtocolSocket protocol(&client_listener, g_main_message_handler);
+
+	verify(OpenWebsocketConnection(UNI_L("ws://test.com/test"), UNI_L("http://test.com"), protocol, client_listener, sub_protocols, FALSE));
+
+	TestListener::CallbackObject *callback;
+	verify(callback = client_listener.m_callbacks.Get(0));
+	verify(callback->callback_type == TestListener::ON_SOCKET_OPEN);
+
+	verify(protocol.GetState() == OpWebSocket::WS_CONNECTED);
+
+	// Let client send a message
+	OpFileLength buffered_amount = 0;
+	verify_success(protocol.SendMessageFromClient(UNI_L("hallo"), 5, buffered_amount));
+	verify(buffered_amount == 5);
+
+	// Check connection is still open
+	verify(protocol.GetState() == OpWebSocket::WS_CONNECTED);
+
+	// Check that the server received the message
+	OpData &sent_from_socket = protocol.ReadRawSocketDataSentFromWebSocketClient();
+
+	// Check the message received server side is correct
+	verify(MatchFrameTextMessage(sent_from_socket, UNI_L("hallo"), 5));
+
+	verify(TestServerInitiatedCloseHandshake(client_listener, protocol, 1000, UNI_L("CLOSING"), TRUE));
+}
+
+test("Send file from client")
+{
+	OpVector<OpString> sub_protocols;
+	TestListener client_listener;
+	WebSocketProtocolSocket protocol(&client_listener, g_main_message_handler);
+
+	verify(OpenWebsocketConnection(UNI_L("ws://test.com/test"), UNI_L("http://test.com"), protocol, client_listener, sub_protocols, FALSE));
+
+	TestListener::CallbackObject *callback;
+	verify(callback = client_listener.m_callbacks.Get(0));
+	verify(callback->callback_type == TestListener::ON_SOCKET_OPEN);
+
+	verify(protocol.GetState() == OpWebSocket::WS_CONNECTED);
+
+	// Let client send a message as file
+
+	OpString random_file_name;
+	g_libcrypto_random_generator->GetRandomHexString(random_file_name, 16);
+
+	OpFile message_file;
+	verify_success(message_file.Construct(random_file_name, OPFILE_TEMP_FOLDER));
+
+	verify_success(message_file.Open(OPFILE_WRITE));
+
+	UINT8 *message_array = OP_NEWA(UINT8, 0x30000);
+	ANCHOR_ARRAY(UINT8, message_array);
+	verify(message_array);
+
+	for (unsigned int i = 0; i < 0x30000; i++)
+		message_array[i] = i & 255;
+
+	verify_success(message_file.Write(message_array, 0x30000));
+
+
+	OpFileLength message_file_length;
+	verify_success(message_file.GetFileLength(message_file_length));
+	verify(message_file_length == 0x30000);
+
+	// Let client send a message
+	OpFileLength buffered_amount = 0;
+	verify_success(protocol.SendMessgeFileFromClient(message_file.GetFullPath(), TRUE, buffered_amount));
+
+	// Check connection is still open
+	verify(protocol.GetState() == OpWebSocket::WS_CONNECTED);
+
+	// Check that the server received the message
+	OpData &sent_from_socket = protocol.ReadRawSocketDataSentFromWebSocketClient();
+
+	// Check the message received server side is correct
+	verify(MatchFrameBinaryMessage(sent_from_socket, message_array, 0x30000));
+
+	verify(TestServerInitiatedCloseHandshake(client_listener, protocol, 1000, UNI_L("CLOSING"), TRUE));
+}
+
+foreach(name, length) from send_lengths_table
+{
+	test("Send frame from client to server of length " name)
+	{
+		verify(TestSendingDifferentLengthsFromClient(length));
+	}
+}
+
+foreach(close_code_name, close_code) from illegal_close_codes_table
+{
+	test("Send illlegal close code from server " close_code_name)
+	{
+		OpVector<OpString> sub_protocols;
+		TestListener client_listener;
+		WebSocketProtocolSocket protocol(&client_listener, g_main_message_handler);
+		verify(OpenWebsocketConnection(UNI_L("ws://test.com/test"), UNI_L("http://test.com"), protocol, client_listener, sub_protocols, FALSE));
+		verify(TestServerInitiatedCloseHandshake(client_listener, protocol, close_code, UNI_L("CLOSING"), FALSE));
+	}
+}
+
+foreach(close_code_name, close_code) from legal_close_codes_table
+{
+	test("Send legal close code from server " close_code_name)
+	{
+		OpVector<OpString> sub_protocols;
+		TestListener client_listener;
+		WebSocketProtocolSocket protocol(&client_listener, g_main_message_handler);
+		verify(OpenWebsocketConnection(UNI_L("ws://test.com/test"), UNI_L("http://test.com"), protocol, client_listener, sub_protocols, FALSE));
+		verify(TestServerInitiatedCloseHandshake(client_listener, protocol, close_code, UNI_L("CLOSING"), TRUE));
+	}
+}

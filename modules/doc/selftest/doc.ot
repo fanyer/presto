@@ -1,0 +1,1141 @@
+/* -*- Mode: c++; tab-width: 4; indent-tabs-mode: t; c-basic-offset: 4 -*- */
+group "doc";
+require init;
+
+language C++;
+
+include "modules/dochand/fdelm.h";
+include "modules/doc/frm_doc.h";
+include "modules/doc/html_doc.h";
+include "modules/display/vis_dev.h";
+include "modules/doc/externalinlinelistener.h";
+include "modules/url/url_api.h";
+include "modules/doc/loadinlineelm.h";
+include "modules/doc/searchinfo.h";
+include "modules/doc/documentorigin.h";
+include "modules/windowcommander/src/WindowCommander.h";
+
+
+global
+{
+	// Short name to make code readable
+#define TS(x) (vd->ScaleToScreen(x))
+
+	struct TestExternalInlineListener : public ExternalInlineListener
+	{
+		TestExternalInlineListener() : m_progress_called(0), m_stopped_called(0), m_redirected_called(0)
+		{}
+
+		int m_progress_called;
+		int m_stopped_called;
+		int m_redirected_called;
+		virtual void LoadingProgress(const URL &url) { m_progress_called++; }
+		virtual void LoadingStopped(const URL &url) { m_stopped_called++; }
+		virtual void LoadingRedirected(const URL &from, const URL& to) { m_redirected_called++; }
+	};
+
+	class TestLayoutListener : public DelayedLayoutListener
+	{
+	public:
+		virtual void LayoutContinued() { ST_passed(); }
+	};
+	OpAutoPtr<TestLayoutListener> layout_listener;
+
+	class TestOpDocumentListener : public NullDocumentListener
+	{
+	public:
+		int notifications_count;
+		TestOpDocumentListener() : notifications_count(0) {}
+#ifdef DOM_FULLSCREEN_MODE
+		OP_STATUS OnJSFullScreenRequest(OpWindowCommander* commander, BOOL enable_fullscreen)
+		{
+			++notifications_count;
+			return commander->SetDocumentFullscreenState(enable_fullscreen ? OpWindowCommander::FULLSCREEN_NORMAL : OpWindowCommander::FULLSCREEN_NONE);
+		}
+#endif // DOM_FULLSCREEN_MODE
+	};
+
+#ifdef DOM_FULLSCREEN_MODE
+	WindowCommander* commander;
+	OpDocumentListener* current_listener;
+#endif // DOM_FULLSCREEN_MODE
+
+}
+html
+{
+	//! <html><body onload="document.pip=true;">
+	//! <form><input name="outerpw" type="password">
+	//! <input name="outertxt" type="text"></form>
+	//! <iframe id="idoc" width=100 height=100 src="data:text/plain,Hej"></iframe>
+	//! </body></html>
+}
+
+test("basics")
+{
+	verify(state.doc);
+	verify(state.doc->GetIFrmRoot());
+    FramesDocElm* frames = state.doc->GetIFrmRoot();
+    FramesDocElm* doc_frame = frames->FirstChild();
+	verify(doc_frame);
+
+	verify(state.doc->CountJSFrames() == 1);
+	verify(state.doc->GetJSFrame(0));
+}
+
+html
+{
+	//! <html><body><h1>Hoi</h1>
+	//! <iframe src="data:text/plain,alloeverybody"></iframe>
+}
+
+test("SetMode")
+{
+	verify(state.doc);
+
+	verify(state.doc->GetIFrmRoot());
+
+	BOOL showing_images = state.doc->GetShowImages();
+	BOOL loading_images = state.doc->GetLoadImages();
+	state.doc->SetMode(!showing_images, !loading_images, CSS_FULL, CHECK_EXPIRY_NORMAL);
+	state.doc->SetMode(TRUE, loading_images, CSS_FULL, CHECK_EXPIRY_NORMAL);
+	state.doc->SetMode(FALSE, TRUE, CSS_NONE, CHECK_EXPIRY_NORMAL);
+	state.doc->SetMode(showing_images, loading_images, CSS_FULL, CHECK_EXPIRY_NORMAL);
+
+	// How to verify that the right things happened?
+}
+
+html
+{
+	//! <html><body><h1>data: belong us</h1>
+	//! <iframe src="data:text/plain;illegal-but-treated-as-empty"></iframe>
+}
+test("gracefully-handle-ill-formed-data:-iframes")
+{
+    // cf. CORE-23027
+	verify(state.doc);
+	verify(state.doc->GetIFrmRoot());
+    FramesDocElm* frames = state.doc->GetIFrmRoot();
+    FramesDocElm* doc_frame = frames->FirstChild();
+	verify(doc_frame);
+
+	verify(state.doc->CountJSFrames() == 1);
+	verify(state.doc->GetJSFrame(0));
+}
+
+html
+{
+	//! <html><frameset cols="10,*">
+	//! <frame src="about:blank">
+	//! <frame src="data:text/plain,Foo">
+	//! </frameset>
+}
+
+test("Simple frameset")
+{
+	verify(state.doc);
+	verify(state.doc->IsFrameDoc());
+	verify(!state.doc->GetHtmlDocument());
+
+	state.doc->SetNextActiveFrame(FALSE);
+	state.doc->SetNextActiveFrame(FALSE);
+	state.doc->SetNextActiveFrame(TRUE);
+	state.doc->SetNextActiveFrame(TRUE);
+	state.doc->SetNextActiveFrame(TRUE);
+
+	state.doc->SetNoActiveFrame();
+}
+
+html
+{
+	//! <html><frameset cols="20,*">
+	//! <frame src="about:blank">
+	//! <frame src="data:text/plain,Foo">
+	//! </frameset>
+}
+
+test("Resize frameset")
+	require undefined MOUSELESS;
+{
+	verify(state.doc);
+	verify(state.doc->IsFrameDoc());
+	verify(!state.doc->GetHtmlDocument());
+
+	VisualDevice* vd = state.doc->GetVisualDevice();
+	verify(vd);
+
+	// Try to trigger a frame border drag. TS == vd->ScaleToScreen
+	state.doc->MouseMove(TS(21), TS(10), FALSE, FALSE, FALSE, FALSE, FALSE, FALSE);
+	state.doc->MouseDown(TS(21), TS(10), FALSE, FALSE, FALSE, MOUSE_BUTTON_1, 1);
+	state.doc->MouseMove(TS(40), TS(10), FALSE, FALSE, FALSE, TRUE, FALSE, FALSE);
+	state.doc->MouseUp(TS(40), TS(10), FALSE, FALSE, FALSE, MOUSE_BUTTON_1, 1);
+}
+
+html
+{
+	//! <html><body><blink>Hoi</blink>
+}
+
+test("Blink")
+{
+	verify(state.doc);
+	verify(state.doc->HasBlink());
+
+	state.doc->Blink();
+}
+
+html
+{
+	//! <html><body><h1>Hoi</h1>
+}
+
+test("MouseEvents#1")
+	require undefined MOUSELESS;
+{
+	verify(state.doc);
+
+	VisualDevice* vd = state.doc->GetVisualDevice();
+	verify(vd);
+
+	// Try to trigger a selection. TS == vd->ScaleToScreen
+	state.doc->MouseMove(TS(10), TS(10), FALSE, FALSE, FALSE, FALSE, FALSE, FALSE);
+	state.doc->MouseDown(TS(10), TS(10), FALSE, FALSE, FALSE, MOUSE_BUTTON_1, 1);
+	state.doc->MouseMove(TS(50), TS(10), FALSE, FALSE, FALSE, TRUE, FALSE, FALSE);
+	state.doc->MouseUp(TS(50), TS(10), FALSE, FALSE, FALSE, MOUSE_BUTTON_1, 1);
+}
+
+html
+{
+	//! <html><body><h1 style="font-size: 50px">Hoi</h1>
+}
+
+test("MouseEvents#2")
+	require undefined MOUSELESS;
+{
+	verify(state.doc);
+
+	VisualDevice* vd = state.doc->GetVisualDevice();
+	verify(vd);
+
+	// Try to trigger a selection by double clicking. TS ==
+	// vd->ScaleToScreen
+	state.doc->MouseMove(TS(80), TS(40), FALSE, FALSE, FALSE, FALSE, FALSE, FALSE);
+	state.doc->MouseDown(TS(80), TS(40), FALSE, FALSE, FALSE, MOUSE_BUTTON_1, 1);
+	state.doc->MouseUp(TS(80), TS(40), FALSE, FALSE, FALSE, MOUSE_BUTTON_1, 1);
+	state.doc->MouseDown(TS(80), TS(40), FALSE, FALSE, FALSE, MOUSE_BUTTON_1, 2);
+	state.doc->MouseUp(TS(80), TS(40), FALSE, FALSE, FALSE, MOUSE_BUTTON_1, 2);
+
+	state.doc->MouseOut();
+}
+
+html
+{
+	//! <html><body><h1 style="font-size: 50px">Hoi</h1>
+}
+
+test("GetBGImageURL#1")
+{
+	verify(state.doc);
+	URL url = state.doc->GetBGImageURL();
+	verify(url.IsEmpty());
+}
+
+html
+{
+	//! <html><body background="about:blank"><h1 style="font-size: 50px">Hoi</h1>
+}
+
+test("GetBGImageURL#2")
+{
+	verify(state.doc);
+	URL url = state.doc->GetBGImageURL();
+	verify(!url.IsEmpty());
+	verify(url.Type() == URL_OPERA);
+}
+
+
+html
+{
+	//! <html><body background="about:blank"><h1 style="font-size: 50px">Hoi</h1>
+}
+
+test("SearchText")
+	require undefined HAS_NO_SEARCHTEXT;
+{
+	verify(state.doc);
+	int left_x, right_x;
+	long top_y, bottom_y;
+
+	OP_BOOLEAN status = state.doc->SearchText(UNI_L("Foo"), 3, TRUE, FALSE, FALSE, TRUE, TRUE, left_x, top_y, right_x, bottom_y);
+	verify(status == OpBoolean::IS_FALSE); // No Foo
+
+	status = state.doc->SearchText(UNI_L("hoi"), 3, TRUE, TRUE, FALSE, TRUE, TRUE, left_x, top_y, right_x, bottom_y);
+	verify(status == OpBoolean::IS_FALSE); // Wrong case
+
+	status = state.doc->SearchText(UNI_L("hoi"), 3, TRUE, FALSE, FALSE, TRUE, TRUE, left_x, top_y, right_x, bottom_y);
+	verify(status == OpBoolean::IS_TRUE); // "hoi" == "Hoi" case insensitive
+
+	status = state.doc->SearchText(UNI_L("ho"), 2, TRUE, FALSE, TRUE, TRUE, TRUE, left_x, top_y, right_x, bottom_y);
+	verify(status == OpBoolean::IS_FALSE); // "ho" != "Hoi" case insensitive full word matching
+
+	status = state.doc->SearchText(UNI_L("ho"), 2, TRUE, FALSE, FALSE, TRUE, TRUE, left_x, top_y, right_x, bottom_y);
+	verify(status == OpBoolean::IS_TRUE); // "oi" == "Hoi" case insensitive partial word matching
+}
+
+html
+{
+	//! <html><body background="about:blank"><h1 style="font-size: 50px">FooFooF foo</h1>
+}
+
+test("FindAllMatches Simple")
+	require undefined HAS_NO_SEARCHTEXT;
+	require SEARCH_MATCHES_ALL;
+{
+	verify(state.doc);
+	HTML_Document* html_doc = state.doc->GetHtmlDocument();
+	verify(html_doc);
+	OpRect r, r0, r1, r2, r3;
+
+	SearchData search_foo(FALSE, FALSE, FALSE, TRUE, FALSE);
+	verify(OpStatus::IsSuccess(search_foo.SetSearchText(UNI_L("foo"))));
+
+	OP_BOOLEAN status;
+
+	// Three "foo" and then it should return FALSE
+	status = html_doc->HighlightNextMatch(&search_foo, r0);
+	verify(status == OpBoolean::IS_TRUE);
+	search_foo.SetIsNewSearch(FALSE);
+	status = html_doc->HighlightNextMatch(&search_foo, r1);
+	verify(status == OpBoolean::IS_TRUE);
+	status = html_doc->HighlightNextMatch(&search_foo, r2);
+	verify(status == OpBoolean::IS_TRUE);
+	status = html_doc->HighlightNextMatch(&search_foo, r3);
+	verify(status == OpBoolean::IS_FALSE);
+
+	// New search, reusing the search object, expecting the same result
+	search_foo.SetIsNewSearch(TRUE);
+	status = html_doc->HighlightNextMatch(&search_foo, r);
+	verify(status == OpBoolean::IS_TRUE && r.Equals(r0));
+	search_foo.SetIsNewSearch(FALSE);
+	status = html_doc->HighlightNextMatch(&search_foo, r);
+	verify(status == OpBoolean::IS_TRUE && r.Equals(r1));
+	status = html_doc->HighlightNextMatch(&search_foo, r);
+	verify(status == OpBoolean::IS_TRUE && r.Equals(r2));
+	status = html_doc->HighlightNextMatch(&search_foo, r);
+	verify(status == OpBoolean::IS_FALSE);
+
+	SearchData search_foo2(FALSE, FALSE, FALSE, TRUE, FALSE);
+	verify(OpStatus::IsSuccess(search_foo2.SetSearchText(UNI_L("foo"))));
+
+	// Three "foo" and then it should return FALSE
+	status = html_doc->HighlightNextMatch(&search_foo2, r);
+	verify(status == OpBoolean::IS_TRUE && r.Equals(r0));
+	search_foo2.SetIsNewSearch(FALSE);
+	status = html_doc->HighlightNextMatch(&search_foo2, r);
+	verify(status == OpBoolean::IS_TRUE && r.Equals(r1));
+	status = html_doc->HighlightNextMatch(&search_foo2, r);
+	verify(status == OpBoolean::IS_TRUE && r.Equals(r2));
+	status = html_doc->HighlightNextMatch(&search_foo2, r);
+	verify(status == OpBoolean::IS_FALSE);
+
+	SearchData search_bar(FALSE, FALSE, FALSE, TRUE, FALSE);
+	verify(OpStatus::IsSuccess(search_bar.SetSearchText(UNI_L("bar"))));
+
+	// No "bar"
+	status = html_doc->HighlightNextMatch(&search_bar, r);
+	verify(status == OpBoolean::IS_FALSE);
+}
+
+test("FindAllMatches overlapping")
+	require undefined HAS_NO_SEARCHTEXT;
+	require SEARCH_MATCHES_ALL;
+{
+	verify(state.doc);
+	HTML_Document* html_doc = state.doc->GetHtmlDocument();
+	verify(html_doc);
+
+	SearchData search_foo(FALSE, FALSE, FALSE, TRUE, FALSE);
+	verify(OpStatus::IsSuccess(search_foo.SetSearchText(UNI_L("foof"))));
+
+	OP_BOOLEAN status;
+	OpRect r;
+
+	// Two "foof" and then it should return FALSE
+	status = html_doc->HighlightNextMatch(&search_foo, r);
+	verify(status == OpBoolean::IS_TRUE);
+	search_foo.SetIsNewSearch(FALSE);
+	status = html_doc->HighlightNextMatch(&search_foo, r);
+	verify(status == OpBoolean::IS_TRUE);
+	status = html_doc->HighlightNextMatch(&search_foo, r);
+	verify(status == OpBoolean::IS_FALSE);
+}
+
+test("FindAllMatches case")
+	require undefined HAS_NO_SEARCHTEXT;
+	require SEARCH_MATCHES_ALL;
+{
+	verify(state.doc);
+	HTML_Document* html_doc = state.doc->GetHtmlDocument();
+	verify(html_doc);
+
+	SearchData search_foo(TRUE, FALSE, FALSE, TRUE, FALSE);
+	verify(OpStatus::IsSuccess(search_foo.SetSearchText(UNI_L("foo"))));
+
+	OP_BOOLEAN status;
+	OpRect r;
+
+	// one "foo" (with that case) and then it should return FALSE
+	status = html_doc->HighlightNextMatch(&search_foo, r);
+	verify(status == OpBoolean::IS_TRUE);
+	search_foo.SetIsNewSearch(FALSE);
+	status = html_doc->HighlightNextMatch(&search_foo, r);
+	verify(status == OpBoolean::IS_FALSE);
+}
+
+html
+{
+	//! <html><body>ab <span>a<span>b</span></span></body></html>
+}
+
+test("FindAllMatches remove")
+	require undefined HAS_NO_SEARCHTEXT;
+	require SEARCH_MATCHES_ALL;
+{
+	verify(state.doc);
+	HTML_Document* html_doc = state.doc->GetHtmlDocument();
+	verify(html_doc);
+
+	SearchData search_ab(TRUE, FALSE, FALSE, TRUE, FALSE);
+	verify(OpStatus::IsSuccess(search_ab.SetSearchText(UNI_L("ab"))));
+
+	OP_BOOLEAN status;
+	OpRect r;
+
+	status = html_doc->HighlightNextMatch(&search_ab, r);
+	verify(status == OpBoolean::IS_TRUE);
+
+	HTML_Element *body = state.doc->GetLogicalDocument()->GetDocRoot()->LastChild();
+	verify(body->Type() == HE_BODY);
+
+	HTML_Element *a = body->FirstChild()->Suc()->FirstChild();
+	HTML_Element *b = a->Suc();
+	verify(a->Type() == HE_TEXT);
+	verify(b->Type() == HE_SPAN);
+
+	if (a->OutSafe(html_doc->GetFramesDocument()))
+		a->Free(state.doc);
+
+	if (b->OutSafe(html_doc->GetFramesDocument()))
+		b->Free(state.doc);
+}
+
+// Document with iframe with foo inside
+html
+{
+	//! <html><body>
+	//! <iframe src='data:text/html,<html><body background="about:blank"><h1 style="font-size: 50px">FooFooF foo</h1></body></html>'></iframe></body></html>
+}
+
+test("FindAllMatches frames#1")
+	require undefined HAS_NO_SEARCHTEXT;
+	require SEARCH_MATCHES_ALL;
+{
+	verify(state.doc);
+
+	SearchData search_foo(FALSE, FALSE, FALSE, TRUE, FALSE);
+	verify(OpStatus::IsSuccess(search_foo.SetSearchText(UNI_L("foo"))));
+
+	OP_BOOLEAN status;
+	OpRect r;
+
+	// Three "foo" and then it should return FALSE
+	status = state.doc->HighlightNextMatch(&search_foo, r);
+	verify(status == OpBoolean::IS_TRUE);
+	search_foo.SetIsNewSearch(FALSE);
+	status = state.doc->HighlightNextMatch(&search_foo, r);
+	verify(status == OpBoolean::IS_TRUE);
+	status = state.doc->HighlightNextMatch(&search_foo, r);
+	verify(status == OpBoolean::IS_TRUE);
+	status = state.doc->HighlightNextMatch(&search_foo, r);
+	verify(status == OpBoolean::IS_FALSE);
+
+	SearchData search_bar(FALSE, FALSE, FALSE, TRUE, FALSE);
+	verify(OpStatus::IsSuccess(search_bar.SetSearchText(UNI_L("bar"))));
+
+	// No "bar"
+	status = state.doc->HighlightNextMatch(&search_bar, r);
+	verify(status == OpBoolean::IS_FALSE);
+}
+
+
+html
+{
+	//! <html><body>
+	//! <iframe src='data:text/html,<html><body>babab</body></html>'></iframe>
+	//! <iframe src='data:text/html,<html><body background="about:blank"><h1 style="font-size: 50px">FooFooF foo</h1></body></html>'></iframe>
+	//! </body></html>
+}
+
+test("FindAllMatches frames#2")
+	require undefined HAS_NO_SEARCHTEXT;
+	require SEARCH_MATCHES_ALL;
+{
+	verify(state.doc);
+
+	SearchData search_foo(FALSE, FALSE, FALSE, TRUE, FALSE);
+	verify(OpStatus::IsSuccess(search_foo.SetSearchText(UNI_L("foo"))));
+
+	OP_BOOLEAN status;
+	OpRect r;
+
+	// Three "foo" and then it should return FALSE
+	status = state.doc->HighlightNextMatch(&search_foo, r);
+	verify(status == OpBoolean::IS_TRUE);
+	search_foo.SetIsNewSearch(FALSE);
+	status = state.doc->HighlightNextMatch(&search_foo, r);
+	verify(status == OpBoolean::IS_TRUE);
+	status = state.doc->HighlightNextMatch(&search_foo, r);
+	verify(status == OpBoolean::IS_TRUE);
+	status = state.doc->HighlightNextMatch(&search_foo, r);
+	verify(status == OpBoolean::IS_FALSE);
+
+	SearchData search_bar(FALSE, FALSE, FALSE, TRUE, FALSE);
+	verify(OpStatus::IsSuccess(search_bar.SetSearchText(UNI_L("bar"))));
+
+	// No "bar"
+	status = state.doc->HighlightNextMatch(&search_bar, r);
+	verify(status == OpBoolean::IS_FALSE);
+}
+
+
+html
+{
+	//! <html>
+	//! <frameset rows="100,*">
+    //! <frame src="data:text/html,<html><body>Fum">
+    //! <frame src="data:text/html,<html><body>Foo">
+	//! </frameset>
+}
+
+test("FindAllMatches frames#3")
+	require undefined HAS_NO_SEARCHTEXT;
+	require SEARCH_MATCHES_ALL;
+{
+	verify(state.doc);
+
+	SearchData search_foo(FALSE, FALSE, FALSE, TRUE, FALSE);
+	verify(OpStatus::IsSuccess(search_foo.SetSearchText(UNI_L("foo"))));
+
+	OP_BOOLEAN status;
+	OpRect r;
+
+	// One "foo" and then it should return FALSE
+	status = state.doc->HighlightNextMatch(&search_foo, r);
+	verify(status == OpBoolean::IS_TRUE);
+	search_foo.SetIsNewSearch(FALSE);
+	status = state.doc->HighlightNextMatch(&search_foo, r);
+	verify(status == OpBoolean::IS_FALSE);
+
+	SearchData search_bar(FALSE, FALSE, FALSE, TRUE, FALSE);
+	verify(OpStatus::IsSuccess(search_bar.SetSearchText(UNI_L("bar"))));
+
+	// No "bar"
+	status = state.doc->HighlightNextMatch(&search_bar, r);
+	verify(status == OpBoolean::IS_FALSE);
+}
+
+html
+{
+	//! <html><body><h1>Opera test page</h1><textarea>Opera & opera in text area</textarea></body></html>
+}
+
+test("FindAllMatches ClearSelection")
+	require undefined HAS_NO_SEARCHTEXT;
+	require SEARCH_MATCHES_ALL;
+{
+	verify(state.doc);
+	HTML_Document* html_doc = state.doc->GetHtmlDocument();
+	verify(html_doc);
+
+	HTML_Element* h1 = find_element("h1");
+	verify(h1);
+
+	HTML_Element* h1_text = h1->FirstChild();
+	verify(h1_text);
+
+	HTML_Element* textarea = find_element("textarea");
+	verify(textarea);
+
+	HTML_Element* textarea_text = textarea->FirstChild();
+	verify(textarea_text);
+
+	SearchData search_foo(FALSE, FALSE, FALSE, TRUE, FALSE);
+	verify(OpStatus::IsSuccess(search_foo.SetSearchText(UNI_L("Opera"))));
+
+	OP_BOOLEAN status;
+	OpRect r0;
+	status = html_doc->HighlightNextMatch(&search_foo, r0);
+	verify(status == OpBoolean::IS_TRUE);
+	search_foo.SetIsNewSearch(FALSE);
+	status = html_doc->HighlightNextMatch(&search_foo, r0);
+	verify(status == OpBoolean::IS_TRUE);
+
+	INT32 start_ofs, stop_ofs;
+	textarea->GetFormValue()->GetSelection(textarea, start_ofs, stop_ofs);
+	// There should be characters selected.
+	verify(start_ofs != stop_ofs);
+
+	state.doc->ClearDocumentSelection(FALSE, FALSE, TRUE);
+
+	textarea->GetFormValue()->GetSelection(textarea, start_ofs, stop_ofs);
+
+	// There should be no visible selection.
+	verify(start_ofs == stop_ofs);
+}
+
+html
+{
+	//! <div style="height:10000px;"></div>
+	//! <iframe src='data:text/html,foo' ></iframe>
+}
+
+test("FindAllMatches frames position#1")
+	require undefined HAS_NO_SEARCHTEXT;
+	require SEARCH_MATCHES_ALL;
+{
+	verify(state.doc);
+
+	SearchData search_foo(FALSE, FALSE, FALSE, TRUE, FALSE);
+	verify(OpStatus::IsSuccess(search_foo.SetSearchText(UNI_L("foo"))));
+
+	OP_BOOLEAN status;
+	OpRect r;
+
+	status = state.doc->HighlightNextMatch(&search_foo, r);
+	verify(status == OpBoolean::IS_TRUE);
+	verify(r.y >= 10000);
+}
+
+html
+{
+	//! <body onload="document.querySelector('iframe').style.transform='translate(0px,10000px)';">
+	//! <iframe src='data:text/html,foo' ></iframe>
+}
+
+test("FindAllMatches frames position#2")
+	require undefined HAS_NO_SEARCHTEXT;
+	require SEARCH_MATCHES_ALL;
+	require CSS_TRANSFORMS;
+{
+	verify(state.doc);
+
+	SearchData search_foo(FALSE, FALSE, FALSE, TRUE, FALSE);
+	verify(OpStatus::IsSuccess(search_foo.SetSearchText(UNI_L("foo"))));
+
+	OP_BOOLEAN status;
+	OpRect r;
+
+	status = state.doc->HighlightNextMatch(&search_foo, r);
+	verify(status == OpBoolean::IS_TRUE);
+	verify(r.y >= 10000);
+}
+
+html
+{
+	//! <html><body><img src="data:,foo">
+}
+
+test("Changing image src 2000 times")
+	language ecmascript;
+{
+	// Designed to trigger FramesDocument::LimitUnusedInlines
+	var img = document.getElementsByTagName("img")[0];
+	verify(img);
+	for (var i = 0; i < 2000; i++)
+	{
+		var newurl = "data:,foo"+i;
+		img.src = newurl;
+	}
+}
+
+html
+{
+	//! <html><body>
+	//! <a href="foo">foo</a>
+	//! <a href="bar">bar</a>
+}
+
+test("HighlightNextElm")
+{
+	verify(state.doc);
+	HTML_Element* first_link = find_element("a", 1);
+	HTML_Element* second_link = find_element("a", 2);
+
+	verify(first_link);
+	verify(second_link);
+
+	HTML_Document* html_doc = state.doc->GetHtmlDocument();
+	verify(html_doc);
+
+	BOOL res = state.doc->HighlightNextElm(HE_A, HE_A, TRUE);
+	verify(res);
+	verify (html_doc->GetNavigationElement());
+	HTML_Element* highlighted = html_doc->GetNavigationElement();
+	verify(highlighted == first_link);
+	//	verify(highlighted == state.doc->FindTargetElement());
+
+	res = state.doc->HighlightNextElm(HE_A, HE_A, TRUE);
+	verify(res);
+	verify (html_doc->GetNavigationElement());
+	highlighted = html_doc->GetNavigationElement();
+	verify(highlighted == second_link);
+	//	verify(highlighted == state.doc->FindTargetElement());
+
+	res = state.doc->HighlightNextElm(HE_A, HE_A, FALSE);
+	verify(res);
+	verify (html_doc->GetNavigationElement());
+	highlighted = html_doc->GetNavigationElement();
+	verify(highlighted == first_link);
+
+	res = state.doc->HighlightNextElm(HE_A, HE_A, FALSE);
+	verify(res);
+	verify (html_doc->GetNavigationElement());
+	highlighted = html_doc->GetNavigationElement();
+	verify(highlighted == second_link);
+
+	res = state.doc->HighlightNextElm(HE_A, HE_A, TRUE);
+	verify(res);
+	verify (html_doc->GetNavigationElement());
+	highlighted = html_doc->GetNavigationElement();
+	verify(highlighted == first_link);
+
+	res = state.doc->HighlightNextElm(HE_H1, HE_H1, TRUE);
+	verify(!res);
+	highlighted = html_doc->GetNavigationElement();
+	verify(!highlighted);
+	// verify(!state.doc->FindTargetElement());
+}
+
+
+html
+{
+	//! <html><body>
+	//! <a href="foo">foo</a>
+	//! <input>
+	//! <a href="bar">bar</a>
+	//! <input>
+}
+
+test("NextTabElm")
+{
+	verify(state.doc);
+	HTML_Element* first_link = find_element("a", 1);
+	HTML_Element* second_link = find_element("a", 2);
+	HTML_Element* first_input = find_element("input", 1);
+	HTML_Element* second_input = find_element("input", 2);
+
+	verify(first_link);
+	verify(second_link);
+	verify(first_input);
+	verify(second_input);
+
+	HTML_Document* html_doc = state.doc->GetHtmlDocument();
+	verify(html_doc);
+
+	BOOL res = html_doc->NextTabElm(TRUE);
+	verify(res);
+	verify (html_doc->GetNavigationElement());
+	HTML_Element* highlighted = html_doc->GetNavigationElement();
+	verify(highlighted == first_input);
+	//	verify(highlighted == state.doc->FindTargetElement());
+
+	res = html_doc->NextTabElm(TRUE);
+	verify(res);
+	verify (html_doc->GetNavigationElement());
+	highlighted = html_doc->GetNavigationElement();
+	verify(highlighted == second_input);
+	//	verify(highlighted == state.doc->FindTargetElement());
+
+	res = html_doc->NextTabElm(FALSE);
+	verify(res);
+	verify (html_doc->GetNavigationElement());
+	highlighted = html_doc->GetNavigationElement();
+	verify(highlighted == first_input);
+	//	verify(highlighted == state.doc->FindTargetElement());
+}
+
+
+html
+{
+	//! <html><body><iframe name="foo"></iframe>
+}
+
+test("FindTarget#1")
+{
+	verify(state.doc);
+	const uni_char* target = UNI_L("foo");
+	int sub_win_id = -1;
+	state.doc->FindTarget(target, sub_win_id);
+	verify(!target);
+	verify(sub_win_id >= 0); // Not top level
+}
+
+test("FindTarget#2")
+{
+	verify(state.doc);
+	const uni_char* target = UNI_L("_blank");
+	int sub_win_id = -1;
+	state.doc->FindTarget(target, sub_win_id);
+	verify(!target);
+	verify(sub_win_id == -2); // New window
+}
+
+test("FindTarget#3")
+{
+	verify(state.doc);
+	const uni_char* target = UNI_L("_top");
+	int sub_win_id = -1;
+	state.doc->FindTarget(target, sub_win_id);
+	verify(!target);
+	verify(sub_win_id == -1); // top level
+}
+
+test("FindTarget#4")
+{
+	verify(state.doc);
+	const uni_char* target = UNI_L("bar");
+	const uni_char* orig_target = target;
+	int sub_win_id = -1;
+	state.doc->FindTarget(target, sub_win_id);
+	verify(target == orig_target);
+}
+
+html
+{
+	//! <html><body>Text
+	//! <font size=1>that is small</font>
+	//! <font size=6> and large<font>
+}
+
+test("SetTextScale#1")
+{
+	verify(state.doc);
+	state.doc->SetTextScale(50);
+}
+
+test("SetTextScale#2")
+{
+	verify(state.doc);
+	state.doc->SetTextScale(150);
+}
+
+test("SetTextScale#3")
+{
+	verify(state.doc);
+	state.doc->SetTextScale(100);
+}
+
+// Will trigger some ESLoading code - hangs selftest
+// html
+// {
+// 	//! <html><body onload="location.href='about:blank'">Text
+// }
+
+html
+{
+	//! <html><body>
+	//! <LABEL for="fuser" accesskey="U">User Name</LABEL>
+	//! <INPUT type="text" name="user" id="fuser">
+}
+
+test("HasAccessKeys")
+	require defined ACCESS_KEYS_SUPPORT;
+{
+	verify(state.doc);
+	verify(state.doc->HasAccessKeys());
+}
+
+// Different kind of inlines
+html
+{
+	//! <html>
+	//! <head>
+	//! <LINK REL=StyleSheet HREF="data:text/css,a{background-image:url(data:img/gif,fhjh)}" TYPE="text/css">
+	//! <LINK REL=StyleSheet HREF="data:text/css,a{color:green}" TYPE="text/css">
+	//! </head>
+	//! <body background="data:img/gif,Fooioioio">
+	//! <img src="data:img/jpeg,fhdjfhdsj">
+}
+
+test("ExternalInlineListener")
+{
+	TestExternalInlineListener listener_one;
+	TestExternalInlineListener listener_two;
+	TestExternalInlineListener listener_three;
+	verify(state.doc);
+	URL url = g_url_api->GetURL(state.doc->GetURL(), "about:blank");
+	state.doc->LoadInline(url, &listener_one);
+	state.doc->LoadInline(url, &listener_two);
+	state.doc->StopLoadingInline(url, &listener_one);
+	state.doc->LoadInline(url, &listener_three);
+	state.doc->StopLoadingInline(url, &listener_three);
+	state.doc->StopLoadingInline(url, &listener_two);
+}
+
+html
+{
+	//! <html><body>Hipp</body></html>
+}
+
+test("DOMGetActiveElement")
+{
+	HTML_Element* elm = state.doc->DOMGetActiveElement();
+	verify(elm);
+	verify(elm->IsMatchingType(HE_BODY, NS_HTML));
+}
+
+html
+{
+	//! <iframe src="about:blank"></iframe>
+}
+
+test("about:blank shared origin#1")
+language C++;
+{
+	const DocumentOrigin* origin1 = state.doc->GetOrigin();
+	verify(origin1);
+	HTML_Element* ifrm_elm = find_element("iframe");
+	verify(ifrm_elm);
+	FramesDocElm* fdelm = FramesDocElm::GetFrmDocElmByHTML(ifrm_elm);
+	verify(fdelm);
+	FramesDocument* iframe_doc = fdelm->GetDocManager()->GetCurrentDoc();
+	verify(iframe_doc);
+	const DocumentOrigin* origin2 = iframe_doc->GetOrigin();
+
+	verify(origin1 == origin2);
+}
+
+html
+{
+	//! <iframe src=""></iframe>
+}
+
+test("about:blank shared origin#2")
+language C++;
+{
+	const DocumentOrigin* origin1 = state.doc->GetOrigin();
+	verify(origin1);
+	HTML_Element* ifrm_elm = find_element("iframe");
+	verify(ifrm_elm);
+	FramesDocElm* fdelm = FramesDocElm::GetFrmDocElmByHTML(ifrm_elm);
+	verify(fdelm);
+	FramesDocument* iframe_doc = fdelm->GetDocManager()->GetCurrentDoc();
+	verify(iframe_doc);
+	const DocumentOrigin* origin2 = iframe_doc->GetOrigin();
+
+	verify(origin1 == origin2);
+}
+
+// A document with a link at (0,0) to (including) (9,9)
+html
+{
+	//! <html style="margin: 0; padding:0"><body style="margin: 0; padding:0"><a href="http://www.opera.com/" target="foo" style="display:block; overflow:hidden;width:10px; height:10px;">Link</a></body></html>
+}
+
+test("image url - setup#1")
+{
+	DocumentManager* doc_man = state.doc->GetDocManager();
+	// 1x1 pixel gif
+	URL image_url = g_url_api->GetURL(state.doc->GetURL(),
+									  "data:image/gif;base64,R0lGODlhAQABAIAAAP///////ywAAAAAAQABAAACAkQBADs=");
+	verify(!image_url.IsEmpty());
+
+	DocumentManager::OpenURLOptions options;
+	doc_man->OpenURL(image_url, state.doc, TRUE, TRUE, options);
+}
+
+test("image url - setup#2")
+	language ecmascript;
+{
+	// This is a dummy testcase to give the image time to load
+	verify(true);
+}
+
+test("image url")
+	require success "image url - setup#1";
+{
+	URL image_url = g_url_api->GetURL(state.doc->GetURL(),
+									  "data:image/gif;base64,R0lGODlhAQABAIAAAP///////ywAAAAAAQABAAACAkQBADs=");
+	verify(!image_url.IsEmpty());
+	verify(image_url == state.doc->GetURL());
+	verify(state.doc->GetURL().IsImage());
+	// Check that it it an image document
+	HTML_Element* root = state.doc->GetDocRoot();
+	verify(root);
+	HTML_Element* elm = root;
+	while (elm && !elm->IsMatchingType(HE_IMG, NS_HTML))
+	{
+		elm = elm->Next();
+	}
+
+	// If it has an image element, it's likely the image document.
+	verify(elm);
+	// Check that it has the expected structure
+	elm = elm->ParentActual();
+	verify(elm);
+	verify(elm->IsMatchingType(HE_BODY, NS_HTML));
+
+	elm = elm->ParentActual();
+	verify(elm);
+	verify(elm->IsMatchingType(HE_HTML, NS_HTML));
+
+	elm = elm->ParentActual();
+	verify(elm);
+	verify(elm == root);
+}
+
+html
+{
+	//! <html></html>
+}
+test("DelayedLayoutListener")
+	async;
+	disabled;
+{
+	layout_listener.reset(new TestLayoutListener());
+	if (!layout_listener.get())
+		ST_failed("OOM");
+
+	if (layout_listener->InList())
+		ST_failed("Inconsistant state");
+
+	g_selftest.utils->doc->AddDelayedLayoutListener(layout_listener.get());
+
+	if (!layout_listener->InList())
+		ST_failed("Inconsistant state");
+
+	g_selftest.utils->doc->RemoveDelayedLayoutListener(layout_listener.get());
+	if(layout_listener->InList())
+	{
+		layout_listener->Out();
+		ST_failed("Inconsistant state");
+	}
+	g_selftest.utils->doc->AddDelayedLayoutListener(layout_listener.get());
+
+	// And now make sure TestLayoutListener::LayoutContinued is called
+	// so that the testcase finish
+	HTML_Element* root = g_selftest.utils->doc->GetDocRoot();
+	if (!root)
+	{
+		g_selftest.utils->doc->RemoveDelayedLayoutListener(layout_listener.get());
+		ST_failed("No document root");
+	}
+
+	root->MarkExtraDirty(g_selftest.utils->doc);
+
+	// Now SignalAllDelayedLayoutListeners should be called which
+	// should make the TestLayoutListener call ST_Passed(), delete
+	// itself and then we'll go on with the next test
+}
+
+html
+{
+	//! <html><body>
+	//! <MAP NAME=mymap>
+	//! <AREA HREF="/reference/" ALT="HTML and CSS Reference" COORDS="5,5,95,195">
+	//! <AREA HREF="/design/" ALT="Design Guide" COORDS="105,5,195,195">
+	//! <AREA HREF="/tools/" ALT="Tools" COORDS="205,5,295,195">
+	//! </MAP>
+	//! <IMG SRC="sitemap.gif" ALT="Site map" USEMAP="#mymap" WIDTH=300 HEIGHT=200>
+}
+
+test("Focusing area elements")
+{
+	verify(state.doc);
+	HTML_Document* html_doc = state.doc->GetHtmlDocument();
+	verify(html_doc);
+	HTML_Element* first_area_elm = find_element("area");
+	verify(first_area_elm);
+
+	BOOL was_focused = html_doc->FocusElement(first_area_elm, HTML_Document::FOCUS_ORIGIN_UNKNOWN);
+	verify(was_focused);
+
+	HTML_Element* focused_element = html_doc->GetFocusedElement();
+	verify(focused_element);
+	verify(focused_element == first_area_elm);
+
+	HTML_Element* navigation_element = html_doc->GetNavigationElement();
+	HTML_Element* image_elm = find_element("img");
+	verify(image_elm);
+	verify(navigation_element == image_elm);
+}
+
+html
+{
+	//! <html>
+	//! <head><title>load event order in frameset</title></head>
+	//! <script>top.counter = 0;</script>
+	//! <frameset onload="top.framesetonloadran=top.counter++;">
+	//! <frame src="data:text/html,&lt;script&gt;top.frameonloadran=top.counter++&lt;/script&gt;Hello"></frame>
+	//! </frameset>
+	//! </html>
+}
+
+test("order between onload events in frameset")
+language ecmascript;
+{
+	verify("framesetonloadran" in window);
+	verify("frameonloadran" in window);
+
+	verify(window.counter == 2);
+	verify(window.frameonloadran == 0);
+	verify(window.framesetonloadran == 1);
+}
+
+html
+{
+	//! <html>
+	//! <body>
+	//! </body>
+	//! </html>
+}
+
+test("Fullscreen notifications")
+require DOM_FULLSCREEN_MODE;
+{
+	commander = NULL;
+	current_listener = NULL;
+	FramesDocument* doc = state.doc;
+	verify(doc);
+	HTML_Element* root = state.doc->GetDocRoot();
+	verify(root);
+	Window* win = doc->GetWindow();
+	verify(win);
+	commander = win->GetWindowCommander();
+	verify(commander);
+	TestOpDocumentListener test_doc_listener;
+	current_listener = commander->GetDocumentListener();
+	commander->SetDocumentListener(&test_doc_listener);
+	verify_success(doc->DOMRequestFullscreen(root, NULL, TRUE));
+	verify(test_doc_listener.notifications_count == 1);
+	verify(commander->GetDocumentFullscreenState() == OpWindowCommander::FULLSCREEN_NORMAL);
+	verify_success(commander->SetDocumentFullscreenState(OpWindowCommander::FULLSCREEN_NORMAL));
+	verify(test_doc_listener.notifications_count == 1);
+	verify(commander->GetDocumentFullscreenState() == OpWindowCommander::FULLSCREEN_NORMAL);
+	verify_success(doc->DOMRequestFullscreen(root, NULL, TRUE));
+	verify(test_doc_listener.notifications_count == 1);
+	verify(commander->GetDocumentFullscreenState() == OpWindowCommander::FULLSCREEN_NORMAL);
+	verify_success(doc->DOMExitFullscreen(NULL));
+	verify(test_doc_listener.notifications_count == 2);
+	verify(commander->GetDocumentFullscreenState() == OpWindowCommander::FULLSCREEN_NONE);
+	verify_success(commander->SetDocumentFullscreenState(OpWindowCommander::FULLSCREEN_NONE));
+	verify(test_doc_listener.notifications_count == 2);
+	verify(commander->GetDocumentFullscreenState() == OpWindowCommander::FULLSCREEN_NONE);
+	verify_success(doc->DOMExitFullscreen(NULL));
+	verify(test_doc_listener.notifications_count == 2);
+	verify(commander->GetDocumentFullscreenState() == OpWindowCommander::FULLSCREEN_NONE);
+}
+finally
+{
+	if (commander && current_listener)
+		commander->SetDocumentListener(current_listener);
+}

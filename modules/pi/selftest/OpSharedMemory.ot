@@ -1,0 +1,262 @@
+/* -*- Mode: c++; tab-width: 4; indent-tabs-mode: t; c-basic-offset: 4 -*-
+ *
+ * Copyright (C) 2012 Opera Software AS.  All rights reserved.
+ *
+ * This file is part of the Opera web browser.
+ * It may not be distributed under any circumstances.
+ */
+
+group "pi.OpSharedMemory";
+
+require PI_SHARED_MEMORY;
+
+include "modules/pi/system/OpSharedMemory.h";
+include "modules/util/opautoptr.h";
+
+global
+{
+	struct DestructorListener
+	{
+		DestructorListener() : called(false) {}
+		bool called;
+	};
+
+	class SharedStruct
+	{
+	public:
+		SharedStruct(DestructorListener* destructorListener) :
+			number(0), m_destructorListener(destructorListener)
+		{}
+
+		~SharedStruct()
+		{
+			if(m_destructorListener)
+				m_destructorListener->called = true;
+		}
+
+		int number;
+	private:
+		DestructorListener* m_destructorListener;
+	};
+
+	class Cleaner : public OpSharedMemory::CleanupFunctor
+	{
+		virtual void Cleanup(void* mem) const
+		{
+			reinterpret_cast<SharedStruct*>(mem)->~SharedStruct();
+		}
+	};
+
+	void SetUpCleaner(OpSharedPtr<OpSharedMemory> mem)
+	{
+		mem->SetCleanupFunctor(
+					OpAutoPtr<OpSharedMemory::CleanupFunctor>(OP_NEW(Cleaner, ())));
+	}
+}
+
+
+
+subtest InitSharedMemory(OpSharedPtr<OpSharedMemory>& mem)
+{
+	OpSharedMemory* memory = NULL;
+	verify_success(OpSharedMemory::Create(sizeof(SharedStruct), &memory));
+	verify(memory);
+	mem = OpSharedPtr<OpSharedMemory>(memory);
+	verify(mem);
+	verify(mem->Size() >= sizeof(SharedStruct));
+}
+
+subtest OpenSharedMemory(OpSharedPtr<OpSharedMemory> mem,
+						 OpSharedPtr<OpSharedMemory>& openedMem)
+{
+	OpSharedMemory* openedMemory = NULL;
+	verify_success(OpSharedMemory::Open(mem->GetIdentifier(), &openedMemory));
+	openedMem = OpSharedPtr<OpSharedMemory>(openedMemory);
+
+	verify(openedMem->Size() == mem->Size());
+	verify(openedMem->GetIdentifier() == mem->GetIdentifier());
+}
+
+subtest checkAligned(void* ptr)
+{
+	verify(ptr);
+	size_t alignment = MAX(sizeof(void*), sizeof(double));
+	verify(size_t(ptr) % alignment == 0);
+}
+
+test("Create")
+{
+	OpSharedPtr<OpSharedMemory> mem;
+	InitSharedMemory(mem);
+}
+
+test("Place object in shared memory, clean up after it, single user")
+{
+	DestructorListener listener;
+	{
+		OpSharedPtr<OpSharedMemory> mem;
+		InitSharedMemory(mem);
+
+		// Placing a sharedStruct in shared memory.
+		new (mem->Ptr()) SharedStruct(&listener);
+
+		// Clean up after we go out of scope.
+		SetUpCleaner(mem);
+
+		// We're the only user of this block of shared memory so we'll cleanup.
+	}
+	verify(listener.called); // The destructor was called, through CleanUpFunction.
+}
+
+test("Open and cleanup, two users")
+{
+	DestructorListener listener;
+	{
+		OpSharedPtr<OpSharedMemory> mem;
+		InitSharedMemory(mem);
+
+		// Placing a sharedStruct in shared memory.
+		new (mem->Ptr()) SharedStruct(&listener);
+
+		SetUpCleaner(mem);
+
+		// Set a special number:
+		SharedStruct* firstStruct = reinterpret_cast<SharedStruct*>(mem->Ptr());
+		firstStruct->number = 4242; // This write goes to shared memory.
+
+		{
+			// Open existing memory.
+			OpSharedPtr<OpSharedMemory> openedMem;
+			OpenSharedMemory(mem, openedMem);
+			SetUpCleaner(openedMem);
+
+			SharedStruct* openedStruct = reinterpret_cast<SharedStruct*>(openedMem->Ptr());
+			checkAligned(openedStruct);
+
+			// We see the special number set by the first user.
+			verify(openedStruct->number == 4242);
+			// openedMemory goes out of scope...
+		}
+		verify(!listener.called); // The destructor wasn't called yet, first user lives.
+
+		// We're the only user of this block of shared memory so we'll cleanup.
+	}
+	verify(listener.called); // The destructor was called, through CleanUpFunction.
+}
+
+test("Modify while other user has mapping attached")
+{
+	DestructorListener listener;
+	{
+		OpSharedPtr<OpSharedMemory> mem;
+		InitSharedMemory(mem);
+
+		// Placing a sharedStruct in shared memory.
+		new (mem->Ptr()) SharedStruct(&listener);
+
+		SetUpCleaner(mem);
+
+		// Set a special number:
+		SharedStruct* firstStruct = reinterpret_cast<SharedStruct*>(mem->Ptr());
+		firstStruct->number = 4242; // This write goes to shared memory.
+
+		{
+			// Open existing memory.
+			OpSharedPtr<OpSharedMemory> openedMem;
+			OpenSharedMemory(mem, openedMem);
+			SetUpCleaner(openedMem);
+
+			SharedStruct* openedStruct = reinterpret_cast<SharedStruct*>(openedMem->Ptr());
+			checkAligned(openedStruct);
+
+			// We see the special number set by the first user.
+			verify(openedStruct->number == 4242);
+
+			openedStruct->number = 4343; // Modify.
+			verify(firstStruct->number == 4343);
+
+			// openedMemory goes out of scope...
+		}
+		verify(!listener.called); // The destructor wasn't called yet, first user lives.
+
+		verify(firstStruct->number == 4343); // ... and still has the new number.
+		// We're the only user of this block of shared memory so we'll cleanup.
+	}
+	verify(listener.called); // The destructor was called, through CleanUpFunction.
+}
+
+test("Two shared memory blocks")
+{
+	DestructorListener listener1;
+	DestructorListener listener2;
+	{
+		OpSharedPtr<OpSharedMemory> mem1;
+		InitSharedMemory(mem1);
+
+		OpSharedPtr<OpSharedMemory> mem2;
+		InitSharedMemory(mem2);
+
+		// Placing a sharedStruct in shared memory.
+		new (mem1->Ptr()) SharedStruct(&listener1);
+		SetUpCleaner(mem1);
+
+
+		new (mem2->Ptr()) SharedStruct(&listener2);
+		SetUpCleaner(mem2);
+
+
+		// Set a special number:
+		SharedStruct* firstStruct1 = reinterpret_cast<SharedStruct*>(mem1->Ptr());
+		firstStruct1->number = 4242; // This write goes to shared memory.
+
+		SharedStruct* firstStruct2 = reinterpret_cast<SharedStruct*>(mem2->Ptr());
+		firstStruct2->number = 4545; // This write goes to shared memory.
+
+		{
+			// Open existing memory.
+			OpSharedPtr<OpSharedMemory> openedMem;
+			OpenSharedMemory(mem1, openedMem);
+			SetUpCleaner(openedMem);
+
+			SharedStruct* openedStruct = reinterpret_cast<SharedStruct*>(openedMem->Ptr());
+			checkAligned(openedStruct);
+
+			// We see the special number set by the first user.
+			verify(openedStruct->number == 4242);
+
+			openedStruct->number = 4343; // Modify.
+			verify(firstStruct1->number == 4343);
+			verify(firstStruct2->number == 4545);
+
+			// openedMemory goes out of scope...
+		}
+		verify(!listener1.called); // The destructor wasn't called yet, first user lives.
+
+		verify(firstStruct1->number == 4343); // ... and still has the new number.
+
+		{
+			// Open existing memory.
+			OpSharedPtr<OpSharedMemory> openedMem;
+			OpenSharedMemory(mem2, openedMem);
+			SetUpCleaner(openedMem);
+
+			SharedStruct* openedStruct = reinterpret_cast<SharedStruct*>(openedMem->Ptr());
+			checkAligned(openedStruct);
+
+			// We see the special number set by the first user.
+			verify(openedStruct->number == 4545);
+
+			openedStruct->number = 4646; // Modify.
+			verify(firstStruct1->number == 4343);
+			verify(firstStruct2->number == 4646);
+
+			// openedMemory goes out of scope...
+		}
+		verify(!listener2.called); // The destructor wasn't called yet, first user lives.
+
+		verify(firstStruct2->number == 4646); // ... and still has the new number.
+		// We're the only user of this block of shared memory so we'll cleanup.
+	}
+	verify(listener1.called); // The destructor was called, through CleanUpFunction.
+	verify(listener2.called); // The destructor was called, through CleanUpFunction.
+}

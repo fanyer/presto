@@ -1,0 +1,317 @@
+/* -*- Mode: c++; tab-width: 4; indent-tabs-mode: t; c-basic-offset: 4 -*-
+**
+** Copyright 2009-2011 Opera Software ASA.  All rights reserved.
+**
+** This file is part of the Opera web browser.  It may not be distributed
+** under any circumstances.
+*/
+
+group "security_manager.security_userconsent";
+
+require SECMAN_SET_USERCONSENT;
+require GEOLOCATION_SUPPORT;
+
+include "modules/security_manager/include/security_manager.h";
+
+include "modules/doc/frm_doc.h";
+include "modules/dom/domutils.h";
+include "modules/windowcommander/src/WindowCommander.h";
+
+global
+{
+	class TestPermissionListener : public OpPermissionListener
+	{
+	public:
+		TestPermissionListener() : m_allowed(FALSE), m_persistence(PermissionCallback::PERSISTENCE_TYPE_NONE) { }
+
+		void Reset(BOOL allowed, PermissionCallback::PersistenceType persistence)
+		{
+			m_has_been_asked = FALSE;
+			m_allowed = allowed;
+			m_persistence = persistence;
+		}
+
+		BOOL HasBeenAsked() { return m_has_been_asked; }
+
+		virtual void OnAskForPermission(OpWindowCommander* wic, PermissionCallback* callback)
+		{
+			m_has_been_asked = TRUE;
+			if (m_allowed)
+				callback->OnAllowed(m_persistence);
+			else
+				callback->OnDisallowed(m_persistence);
+		}
+
+		virtual void OnAskForPermissionCancelled(OpWindowCommander* wic, PermissionCallback* callback) { }
+
+#ifdef WIC_SET_PERMISSION
+		virtual void OnUserConsentInformation(OpWindowCommander *commander, const OpVector<OpPermissionListener::ConsentInformation> &consent_information, INTPTR user_data) {}
+		virtual void OnUserConsentError(OpWindowCommander *wic, OP_STATUS error, INTPTR user_data) {}
+#endif // WIC_SET_PERMISSION
+
+	private:
+		BOOL m_allowed;
+		BOOL m_has_been_asked;
+		PermissionCallback::PersistenceType m_persistence;
+	};
+
+	class TestSecurityCheckCallback : public OpSecurityCheckCallback
+	{
+	public:
+		TestSecurityCheckCallback() : m_error(OpStatus::OK) { }
+
+		virtual void OnSecurityCheckSuccess(BOOL allowed, ChoicePersistenceType type = PERSISTENCE_NONE)
+		{
+			m_allowed = allowed;
+		}
+
+		virtual void OnSecurityCheckError(OP_STATUS error)
+		{
+			m_error = error;
+		}
+
+		OP_STATUS GetError() { return m_error; }
+		BOOL IsAllowed() { return m_allowed; }
+
+	private:
+		BOOL m_allowed;
+		OP_STATUS m_error;
+	};
+
+
+	OpPermissionListener* g_original_permission_listener;
+	TestPermissionListener g_test_permission_listener;
+}
+
+setup
+{
+	g_original_permission_listener = state.GetWindow()->GetWindowCommander()->GetPermissionListener();
+	state.GetWindow()->GetWindowCommander()->SetPermissionListener(&g_test_permission_listener);
+}
+
+html
+{
+//! <html></html>
+}
+
+test("Test set user consent")
+{
+	g_test_permission_listener.Reset(FALSE, OpPermissionListener::PermissionCallback::PERSISTENCE_TYPE_NONE);
+
+	OpSecurityContext context(state.doc);
+	TestSecurityCheckCallback security_check_callback_1;
+	verify_success(g_secman_instance->CheckSecurity(OpSecurityManager::GEOLOCATION, context, OpSecurityContext(), &security_check_callback_1));
+
+	verify_success(security_check_callback_1.GetError());
+	verify(g_test_permission_listener.HasBeenAsked());
+	verify(!security_check_callback_1.IsAllowed());
+
+	verify_success(g_secman_instance->SetUserConsent(state.GetWindow(),
+	                                                 OpPermissionListener::PermissionCallback::PERMISSION_TYPE_GEOLOCATION_REQUEST,
+	                                                 OpPermissionListener::PermissionCallback::PERSISTENCE_TYPE_RUNTIME,
+	                                                 OpSecurityManager::GetSelftestHostName(),
+	                                                 ALLOWED));
+
+	g_test_permission_listener.Reset(FALSE, OpPermissionListener::PermissionCallback::PERSISTENCE_TYPE_NONE);
+	TestSecurityCheckCallback security_check_callback_2;
+	verify_success(g_secman_instance->CheckSecurity(OpSecurityManager::GEOLOCATION, context, OpSecurityContext(), &security_check_callback_2));
+
+	verify_success(security_check_callback_2.GetError());
+	verify(!g_test_permission_listener.HasBeenAsked());
+	verify(security_check_callback_2.IsAllowed());
+}
+
+html
+{
+//! <html></html>
+}
+
+test("Clear user consent")
+{
+	g_test_permission_listener.Reset(FALSE, OpPermissionListener::PermissionCallback::PERSISTENCE_TYPE_NONE);
+
+	verify_success(g_secman_instance->SetUserConsent(state.GetWindow(),
+	                                                 OpPermissionListener::PermissionCallback::PERMISSION_TYPE_GEOLOCATION_REQUEST,
+	                                                 OpPermissionListener::PermissionCallback::PERSISTENCE_TYPE_RUNTIME,
+	                                                 OpSecurityManager::GetSelftestHostName(),
+	                                                 ALLOWED));
+
+	OpSecurityContext context(state.doc);
+	TestSecurityCheckCallback security_check_callback_1;
+	g_secman_instance->CheckSecurity(OpSecurityManager::GEOLOCATION, context, OpSecurityContext(), &security_check_callback_1);
+
+	verify_success(security_check_callback_1.GetError());
+	verify(!g_test_permission_listener.HasBeenAsked());
+	verify(security_check_callback_1.IsAllowed());
+
+	verify_success(g_secman_instance->SetUserConsent(state.GetWindow(),
+	                                                 OpPermissionListener::PermissionCallback::PERMISSION_TYPE_GEOLOCATION_REQUEST,
+	                                                 OpPermissionListener::PermissionCallback::PERSISTENCE_TYPE_RUNTIME,
+	                                                 OpSecurityManager::GetSelftestHostName(),
+	                                                 ASK));
+
+	g_test_permission_listener.Reset(FALSE, OpPermissionListener::PermissionCallback::PERSISTENCE_TYPE_NONE);
+	TestSecurityCheckCallback security_check_callback_2;
+	verify_success(g_secman_instance->CheckSecurity(OpSecurityManager::GEOLOCATION, context, OpSecurityContext(), &security_check_callback_2));
+
+	verify_success(security_check_callback_2.GetError());
+	verify(g_test_permission_listener.HasBeenAsked());
+	verify(!security_check_callback_2.IsAllowed());
+}
+
+html
+{
+//! <html></html>
+}
+
+test("Get user consent")
+{
+	g_test_permission_listener.Reset(FALSE, OpPermissionListener::PermissionCallback::PERSISTENCE_TYPE_NONE);
+
+	OpAutoVector<OpPermissionListener::ConsentInformation> consent_information;
+	verify_success(g_secman_instance->GetUserConsent(state.GetWindow(), consent_information));
+
+	verify(consent_information.GetCount() == 0);
+
+	verify_success(g_secman_instance->SetUserConsent(state.GetWindow(),
+	                                                 OpPermissionListener::PermissionCallback::PERMISSION_TYPE_GEOLOCATION_REQUEST,
+	                                                 OpPermissionListener::PermissionCallback::PERSISTENCE_TYPE_RUNTIME,
+	                                                 OpSecurityManager::GetSelftestHostName(),
+	                                                 ALLOWED));
+
+	consent_information.DeleteAll();
+	verify_success(g_secman_instance->GetUserConsent(state.GetWindow(), consent_information));
+
+	verify(consent_information.GetCount() == 1);
+	OpPermissionListener::ConsentInformation *consent = consent_information.Get(0);
+	verify_string(consent->hostname, OpSecurityManager::GetSelftestHostName());
+	verify(consent->is_allowed);
+	verify(consent->permission_type == OpPermissionListener::PermissionCallback::PERMISSION_TYPE_GEOLOCATION_REQUEST);
+	verify(consent->persistence_type == OpPermissionListener::PermissionCallback::PERSISTENCE_TYPE_RUNTIME);
+}
+
+html
+{
+//! <html></html>
+}
+
+test("Revoke user consent")
+{
+	class TestUserConsentListener : public UserConsentListener
+	{
+	public:
+		TestUserConsentListener() : m_is_revoked(FALSE) { }
+
+		virtual void OnUserConsentRevoked()
+		{
+			m_is_revoked = TRUE;
+		}
+
+		virtual void OnBeforeRuntimeDestroyed(DOM_Runtime *runtime)
+		{
+		}
+
+		BOOL m_is_revoked;
+	};
+
+	g_test_permission_listener.Reset(FALSE, OpPermissionListener::PermissionCallback::PERSISTENCE_TYPE_NONE);
+
+	TestUserConsentListener user_consent_listener;
+	DOM_Runtime *runtime = DOM_Utils::GetDOM_Runtime(state.doc->GetESRuntime());
+	verify_success(g_secman_instance->RegisterUserConsentListener(OpSecurityManager::PERMISSION_TYPE_GEOLOCATION, runtime, &user_consent_listener));
+
+	verify_success(g_secman_instance->SetUserConsent(state.GetWindow(),
+	                                                 OpPermissionListener::PermissionCallback::PERMISSION_TYPE_GEOLOCATION_REQUEST,
+	                                                 OpPermissionListener::PermissionCallback::PERSISTENCE_TYPE_RUNTIME,
+	                                                 OpSecurityManager::GetSelftestHostName(),
+	                                                 ALLOWED));
+
+	verify_success(g_secman_instance->SetUserConsent(state.GetWindow(),
+	                                                 OpPermissionListener::PermissionCallback::PERMISSION_TYPE_GEOLOCATION_REQUEST,
+	                                                 OpPermissionListener::PermissionCallback::PERSISTENCE_TYPE_RUNTIME,
+	                                                 OpSecurityManager::GetSelftestHostName(),
+	                                                 ASK));
+
+	verify(user_consent_listener.m_is_revoked);
+}
+finally
+{
+	g_secman_instance->UnregisterUserConsentListener(OpSecurityManager::PERMISSION_TYPE_GEOLOCATION, runtime, &user_consent_listener)
+}
+
+html
+{
+//! <html></html>
+}
+
+table persistence_types
+{
+	// name,        persistence type,                                                   in effect in other runtime
+	{ "runtime",    OpPermissionListener::PermissionCallback::PERSISTENCE_TYPE_RUNTIME, FALSE },
+	{ "session",    OpPermissionListener::PermissionCallback::PERSISTENCE_TYPE_SESSION, TRUE },
+	{ "persistent", OpPermissionListener::PermissionCallback::PERSISTENCE_TYPE_ALWAYS,  TRUE }
+};
+
+foreach (name, persistence_type, is_persistent) from persistence_types
+{
+	html
+	{
+	//! <html></html>
+	}
+
+	test("Test " name " permission, phase 1")
+	{
+		g_test_permission_listener.Reset(FALSE, persistence_type);
+
+		OpSecurityContext context(state.doc);
+		TestSecurityCheckCallback security_check_callback_1;
+		verify_success(g_secman_instance->CheckSecurity(OpSecurityManager::GEOLOCATION, context, OpSecurityContext(), &security_check_callback_1));
+
+		verify_success(security_check_callback_1.GetError());
+		verify(g_test_permission_listener.HasBeenAsked());
+		verify(!security_check_callback_1.IsAllowed());
+
+		g_test_permission_listener.Reset(FALSE, persistence_type);
+		TestSecurityCheckCallback security_check_callback_2;
+		verify_success(g_secman_instance->CheckSecurity(OpSecurityManager::GEOLOCATION, context, OpSecurityContext(), &security_check_callback_2));
+
+		verify_success(security_check_callback_2.GetError());
+		verify(!g_test_permission_listener.HasBeenAsked());
+		verify(!security_check_callback_2.IsAllowed());
+	}
+
+	html
+	{
+	//! <html></html>
+	}
+	test("Test " name " permission, phase 2")
+	{
+		g_test_permission_listener.Reset(FALSE, persistence_type);
+
+		OpSecurityContext context(state.doc);
+		TestSecurityCheckCallback security_check_callback_1;
+		verify_success(g_secman_instance->CheckSecurity(OpSecurityManager::GEOLOCATION, context, OpSecurityContext(), &security_check_callback_1));
+
+		verify_success(security_check_callback_1.GetError());
+		verify(g_test_permission_listener.HasBeenAsked() != is_persistent);
+		verify(!security_check_callback_1.IsAllowed());
+	}
+	finally{
+		g_secman_instance->SetUserConsent(state.GetWindow(),
+		                                  OpPermissionListener::PermissionCallback::PERMISSION_TYPE_GEOLOCATION_REQUEST,
+		                                  OpPermissionListener::PermissionCallback::PERSISTENCE_TYPE_RUNTIME,
+		                                  OpSecurityManager::GetSelftestHostName(),
+		                                  ASK);
+	}
+}
+
+exit
+{
+	g_secman_instance->SetUserConsent(state.GetWindow(),
+	                                  OpPermissionListener::PermissionCallback::PERMISSION_TYPE_GEOLOCATION_REQUEST,
+	                                  OpPermissionListener::PermissionCallback::PERSISTENCE_TYPE_RUNTIME,
+	                                  OpSecurityManager::GetSelftestHostName(),
+	                                  ASK);
+
+	state.GetWindow()->GetWindowCommander()->SetPermissionListener(g_original_permission_listener);
+}

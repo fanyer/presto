@@ -1,0 +1,600 @@
+/* -*- Mode: c++; tab-width: 4; indent-tabs-mode: t; c-basic-offset: 4 -*-
+**
+** Copyright (C) 2004-2012 Opera Software ASA.  All rights reserved.
+**
+** This file is part of the Opera web browser.  It may not be distributed
+** under any circumstances.
+**
+** Kajetan Œwitalski
+*/
+
+group "url.spdy";
+
+require init;
+require PREFS_WRITE;
+require USE_SPDY;
+language c++;
+
+include "core/pch.h";
+
+include "modules/url/url_man.h";
+include "modules/network_selftest/urldoctestman.h";
+include "modules/prefs/prefsmanager/collections/pc_files.h";
+include "modules/prefs/prefsmanager/collections/pc_network.h";
+include "modules/url/protocols/spdy/spdy_connection.h";
+include "modules/url/protocols/spdy/spdy_protocol.h";
+include "modules/url/protocols/spdy/spdy_internal/spdy_frameheaders.h";
+include "modules/url/protocols/spdy/spdy_internal/spdy_headers.h";
+include "modules/util/OpSharedPtr.h";
+
+global {
+	URL_DocSelfTest_Manager *url_tests = NULL;
+	int previous_value_for_SpdyWithoutSSL = 0;
+
+	// Listener for various events in SPDY protocol
+	class SelftestSpdyListener: private OpTimerListener, public SpdyProtocolSelftestsListener
+	{
+		OpTimer timer;
+	public:
+		SelftestSpdyListener()
+		{
+			timer.SetTimerListener(this);
+			timer.Start(2000);
+		}
+
+		virtual void OnTimeOut(OpTimer* timer)
+		{
+			ST_failed("SPDY test timeout");
+		}
+
+		virtual void OnPingTimeout() {}
+		virtual void OnProtocolError() {}
+		virtual void OnGoAway() {}
+		virtual void OnReceivedReset(UINT32 streamId, UINT32 resetStatus) {}
+		virtual void OnReceivedSynStream(UINT32 streamId) {}
+		virtual void OnReceivedSynReply(UINT32 streamId) {}
+		virtual void OnReceivedGoAway() {}
+	};
+
+	class SpdyBridge;
+
+	// Simple connection class for connecting SpdyFramesHandler with SpdyBridge (declared below)
+	class SpdyBridgeConnector: public ProtocolComm, public SpdyFramesHandlerListener
+	{
+		OpSharedPtr<SpdyFramesHandler> spdyHandler;
+		SelftestSpdyListener *listener;
+		SpdyBridge &bridge;
+	public:
+		SpdyBridgeConnector(SpdyBridge &bridge): ProtocolComm(g_main_message_handler, NULL, NULL), listener(NULL), bridge(bridge)
+		{
+			g_main_message_handler->SetCallBack(this, MSG_SPDY_SENDDATA, reinterpret_cast<MH_PARAM_1>(this));
+		}
+
+		~SpdyBridgeConnector()
+		{
+			g_main_message_handler->UnsetCallBack(this, MSG_SPDY_SENDDATA);
+			OP_DELETE(listener);
+		}
+
+		void SetSpdyFramesHandler(OpSharedPtr<SpdyFramesHandler> h) { spdyHandler = h; }
+		SpdyFramesHandler *GetSpdyFramesHandler() { return spdyHandler.get(); }
+
+		void SetListener(SelftestSpdyListener *l)
+		{ 
+			listener = l;
+			if (spdyHandler)
+				spdyHandler->SetSelftestListener(l);
+		}
+		
+		void SendData()
+		{
+			TRAPD(res, spdyHandler->SendDataL(this));
+			if (OpStatus::IsError(res))
+				ST_failed("SPDY protocol leaved");
+		}
+
+		void SendData(OpData &data)
+		{
+			char *buf = OP_NEWA(char, data.Length());
+			if (!buf)
+				ST_failed("OOM");
+			data.CopyInto(buf, data.Length());
+			bridge.SendData(buf, data.Length(), this);
+		}
+
+		virtual void ProcessReceivedData()
+		{
+			TRAPD(res, spdyHandler->ProcessReceivedDataL(this));
+			if (OpStatus::IsError(res))
+				ST_failed("SPDY protocol leaved");
+		}
+
+		virtual void HandleCallback(OpMessage msg, MH_PARAM_1 par1, MH_PARAM_2 par2)
+		{
+			SendData();
+		}
+
+		virtual void SendData(char *buf, unsigned blen) { bridge.SendData(buf, blen, this); }
+		virtual unsigned int ReadData(char* buf, unsigned blen) { return bridge.ReadData(buf, blen, this); }
+		virtual void RequestMoreData() { OnHasDataToSend(); }
+		virtual void OnHasDataToSend() { g_main_message_handler->PostMessage(MSG_SPDY_SENDDATA, reinterpret_cast<MH_PARAM_1>(this), 0); }
+		virtual void OnPingTimeout() { if (listener) listener->OnPingTimeout(); }
+		virtual void OnProtocolError() { if (listener) listener->OnProtocolError(); }
+		virtual void OnGoAway() { if (listener) listener->OnGoAway(); }
+	};
+
+	// Bridge for connecting two SpdyFramesHandlers
+	class SpdyBridge
+	{
+		OpData dataForServer;
+		OpData dataForClient;
+		SpdyBridgeConnector server;
+		SpdyBridgeConnector client;
+	public:
+		SpdyBridge(): server(*this), client(*this) {}
+
+		void SendData(char *buf, unsigned blen, SpdyBridgeConnector *connector)
+		{
+			OpData &data = connector == &server ? dataForClient : dataForServer;
+			SpdyBridgeConnector &connToNotify = connector == &server ? client : server;
+			data.AppendRawData(OPDATA_DEALLOC_OP_DELETEA, buf, blen);
+			connToNotify.ProcessReceivedData();
+		}
+
+		unsigned int ReadData(char *buf, unsigned blen, SpdyBridgeConnector *connector)
+		{
+			OpData &data = connector == &server ? dataForServer : dataForClient;
+			unsigned int dataToRead = MIN(blen, data.Length());
+			data.CopyInto(buf, dataToRead);
+			data.Consume(dataToRead);
+			return dataToRead;
+		}
+
+		void Start()
+		{
+			client.RequestMoreData();
+		}
+
+		SpdyBridgeConnector &GetConnector(BOOL forServer) { return forServer ? server : client; }
+	};
+
+	// Very simple StreamController for opening streams on SpdyFramesHandler
+	class DummyStreamController: public SpdyStreamController
+	{
+	public:
+		virtual UINT8 GetPriority() const { return 0; }
+		virtual SpdyHeaders *GetHeadersL(SpdyVersion version) const
+		{
+			SpdyHeaders *headers = OP_NEW(SpdyHeaders, ());
+			if (!headers)
+				ST_failed("OOM");
+			
+			TRAPD(res, headers->InitL(1));
+			if (OpStatus::IsError(res))
+				ST_failed("Coudn't initialize SpdyHeaders");
+
+			headers->headersArray[0].name.Init("SPDYHeaderName", TRUE);
+			headers->headersArray[0].value.Init("SPDYHeaderValue", TRUE);
+			return headers;
+		}
+		virtual BOOL HasDataToSend() const { return FALSE; }
+		virtual size_t GetNextDataChunkL(char *buffer, size_t bufferLength, BOOL &more) { return 0;}
+		virtual void OnHeadersLoadedL(const SpdyHeaders &headers, SpdyVersion version) {}
+		virtual void OnDataLoadedL(const OpData &data) {}
+		virtual void OnDataLoadingFinished() {}
+		virtual void OnResetStream() {}
+		virtual void OnGoAway() {}
+	};
+}
+
+table filename_list (const char *) filelist "testfiles/simple";
+
+setup
+{
+	url_tests = OP_NEW(URL_DocSelfTest_Manager, ());
+	previous_value_for_SpdyWithoutSSL = g_pcnet->GetIntegerPref(PrefsCollectionNetwork::SpdyWithoutSSL);
+
+	if(HTTP_TmpBuf == NULL || HTTP_TmpBufSize != ((unsigned long) g_pcnet->GetIntegerPref(PrefsCollectionNetwork::NetworkBufferSize))*1024)
+	{
+		unsigned long tmp_len = ((unsigned long) g_pcnet->GetIntegerPref(PrefsCollectionNetwork::NetworkBufferSize))*1024;
+		char *tmp_buf = OP_NEWA(char, tmp_len+1);
+		OP_DELETEA(HTTP_TmpBuf);
+		HTTP_TmpBuf = tmp_buf;
+		HTTP_TmpBufSize = tmp_len;
+	}
+}
+
+exit
+{
+	OP_DELETE(url_tests);
+	url_tests = NULL;
+	g_pcnet->WriteIntegerL(PrefsCollectionNetwork::SpdyWithoutSSL, previous_value_for_SpdyWithoutSSL);
+
+	// Do a shutdown of the pending connections
+	urlManager->FreeUnusedResources(TRUE);
+}
+
+test("Initialized")
+{
+	verify(url_tests != NULL);
+	verify(OpStatus::IsSuccess(g_pcnet->WriteIntegerL(PrefsCollectionNetwork::SpdyWithoutSSL, 1)));
+}
+
+subtest AddVerySimpleTest(URL_DocSelfTest_Batch *batch, const OpStringC8 &baseurl_format, URL &ref_url, const OpStringC8 &filename)
+{
+	verify(batch != NULL);
+	verify(filename.HasContent());
+
+	OpAutoPtr<URL_DocVerySimpleTest> test(OP_NEW(URL_DocVerySimpleTest, ()));
+	verify(test.get() != NULL);
+
+	verify(OpStatus::IsSuccess(test->Construct(baseurl_format, ref_url, filename)));
+
+	verify(batch->AddTestCase(test.release()));
+}
+
+subtest AddBatch(URL_DocSelfTest_Batch *batch)
+{
+	verify(batch != NULL);
+	verify(url_tests->AddBatch(batch));
+}
+
+subtest StartTestSet()
+{
+	verify(url_tests->SetLastBatch());
+}
+
+subtest Setup_SingleTests(const OpStringC8 &batch_id, const OpStringC8 &baseurl_format, URL &ref_url)
+{
+	iterate (filename) from filename_list
+	{
+		OpAutoPtr<URL_DocSelfTest_Batch> batch(OP_NEW(URL_DocSelfTest_Batch, ()));
+
+		verify(batch.get() != NULL);
+
+		batch->SetBatchID(batch_id);
+
+		verify(AddVerySimpleTest(batch.get(), baseurl_format, ref_url, filename));
+
+		verify(!batch->Empty());
+
+		verify(AddBatch(batch.release()));
+	}
+}
+
+subtest Setup_MultipleTests(const OpStringC8 &batch_id, const OpStringC8 &baseurl_format, URL &ref_url, int limit)
+{
+	OpAutoPtr<URL_DocSelfTest_Batch> batch(NULL);
+
+	iterate (filename) from filename_list
+	{
+		if(batch.get() == NULL)
+			batch.reset(OP_NEW(URL_DocSelfTest_Batch, ()));
+
+		verify(batch.get() != NULL);
+
+		batch->SetBatchID(batch_id);
+
+		verify(AddVerySimpleTest(batch.get(), baseurl_format, ref_url, filename));
+
+
+		if(limit && batch->Cardinal() >= limit)
+			verify(AddBatch(batch.release()));
+	}
+	if(batch.get() != NULL)
+	{
+		verify(!batch->Empty());
+		verify(AddBatch(batch.release()));
+	}
+}
+
+test("URL_SPDYLoadingTests")
+	require success "Initialized";
+	async;
+{
+	URL empty_ref;
+
+	if (!Setup_SingleTests("[Simple_1]", URLSpdy2SelftestBase("simple/%s"), empty_ref)
+		|| !Setup_MultipleTests("[Simple_2]", URLSpdy2SelftestBase("simple/%s"), empty_ref, 1)
+		|| !Setup_MultipleTests("[Simple_3]", URLSpdy2SelftestBase("simple/%s"), empty_ref, 1)
+		|| !Setup_MultipleTests("[Simple_4]", URLSpdy2SelftestBase("simple/%s"), empty_ref, 2)
+		|| !Setup_MultipleTests("[Simple_5]", URLSpdy2SelftestBase("simple/%s"), empty_ref, 4)
+		|| !Setup_MultipleTests("[Simple_6]", URLSpdy2SelftestBase("simple/%s"), empty_ref, 8)
+		|| !Setup_MultipleTests("[Simple_7]", URLSpdy2SelftestBase("simple/%s"), empty_ref, 0)
+		|| !Setup_SingleTests("[Zipped_1]",URLSpdy2SelftestBase("zipped/%s"), empty_ref)
+		|| !Setup_MultipleTests("[Zipped_2]",URLSpdy2SelftestBase("zipped/%s"), empty_ref, 1)
+		|| !Setup_MultipleTests("[Zipped_3]",URLSpdy2SelftestBase("zipped/%s"), empty_ref, 1)
+		|| !Setup_MultipleTests("[Zipped_4]",URLSpdy2SelftestBase("zipped/%s"), empty_ref, 2)
+		|| !Setup_MultipleTests("[Zipped_5]",URLSpdy2SelftestBase("zipped/%s"), empty_ref, 4)
+		|| !Setup_MultipleTests("[Zipped_6]",URLSpdy2SelftestBase("zipped/%s"), empty_ref, 8)
+		|| !Setup_MultipleTests("[Zipped_7]",URLSpdy2SelftestBase("zipped/%s"), empty_ref, 0)
+		|| !StartTestSet())
+		ST_failed("Could not start test");
+}
+
+subtest AddRangeSimpleTest(URL_DocSelfTest_Batch *batch, const OpStringC8 &url_str, URL &ref_url, const OpStringC8 &filename, OpFileLength range_start, OpFileLength range_end)
+{
+	verify(batch != NULL);
+	verify(filename.HasContent());
+
+	URL url = g_url_api->GetURL(url_str.CStr(), (const char *) NULL, TRUE);
+	verify(url.IsValid());
+
+	verify(OpStatus::IsSuccess(url.SetAttribute(URL::KHTTPRangeStart, &range_start)));
+	verify(OpStatus::IsSuccess(url.SetAttribute(URL::KHTTPRangeEnd, &range_end)));
+
+	OpAutoPtr<URL_DocSimpleTester> test(OP_NEW(URL_DocSimpleTester, ()));
+	verify(test.get() != NULL);
+
+	verify(OpStatus::IsSuccess(test->Construct(url, ref_url, filename)));
+
+	verify(batch->AddTestCase(test.release()));
+}
+
+subtest Setup_SingleRangeTests(const OpStringC8 &batch_id, const OpStringC8 &url_str,  const OpStringC8 &filename, URL &ref_url, OpFileLength range_start, OpFileLength range_end)
+{
+	OpAutoPtr<URL_DocSelfTest_Batch> batch(OP_NEW(URL_DocSelfTest_Batch, ()));
+
+	verify(batch.get() != NULL);
+
+	batch->SetBatchID(batch_id);
+
+	verify(AddRangeSimpleTest(batch.get(), url_str, ref_url, filename, range_start, range_end));
+
+	verify(!batch->Empty());
+
+	verify(AddBatch(batch.release()));
+}
+
+test("Range with SPDY test1")
+	require success "Initialized";
+	async;
+	file range_1024_199999	"testfiles/ranges/rfc2616.txt.1024-199999-range";
+{
+	URL empty_ref;
+
+	if (!Setup_SingleRangeTests("[Range_1]", URLSpdy2SelftestBase("simple/rfc2616.txt"), range_1024_199999,  empty_ref, 1024, 199999) ||
+		!StartTestSet())
+		ST_failed("Could not start test");
+}
+
+test("Range with SPDY test2")
+	require success "Initialized";
+	async;
+	file range_10240_99999	"testfiles/ranges/rfc2616.txt.10240-99999-range";
+{
+	URL empty_ref;
+
+	if (!Setup_SingleRangeTests("[Range_2]", URLSpdy2SelftestBase("simple/rfc2616.txt"), range_10240_99999,  empty_ref, 10240, 99999) ||
+		!StartTestSet())
+		ST_failed("Could not start test");
+}
+
+subtest verifyNotNull(void *notNull)
+{
+	if (!notNull)
+		ST_failed("OOM");
+}
+
+subtest verifySuccess(OP_STATUS success, const char *msg)
+{
+	if (OpStatus::IsError(success))
+		ST_failed("FAILED");
+}
+
+subtest prepareSpdyBridge(SpdyBridge *&bridge, SpdyVersion clientVersion, SpdyVersion serverVersion)
+{
+	OP_STATUS res;
+	ServerName *sn = ServerName::Create("summy.servername.for.spdy.selftest", res);
+	verifySuccess(OpStatus::IsSuccess(res), "Initialization of ServerName failed");
+	ST_delete_after_group(sn);
+
+	bridge = OP_NEW(SpdyBridge, ());
+	verifyNotNull(bridge);
+	ST_delete_after_group(bridge);
+	
+	OpSharedPtr<SpdyFramesHandler> client = make_shared<SpdyFramesHandler>(clientVersion, sn, 0, TRUE, TRUE, &bridge->GetConnector(FALSE));
+	verifyNotNull(client.get());
+	TRAP(res, client->ConstructL());
+	verifySuccess(res, "Initialization of SpdyFramesHandler failed");
+	bridge->GetConnector(FALSE).SetSpdyFramesHandler(client);
+
+	OpSharedPtr<SpdyFramesHandler> server = make_shared<SpdyFramesHandler>(serverVersion, sn, 0, TRUE, TRUE, &bridge->GetConnector(TRUE), TRUE);
+	verifyNotNull(server.get());
+	TRAP(res, server->ConstructL());
+	verifySuccess(res, "Initialization of SpdyFramesHandler failed");
+	bridge->GetConnector(TRUE).SetSpdyFramesHandler(server);
+}
+
+test("Incompatible SPDY version")
+	async;
+{
+	SpdyBridge *bridge;
+	prepareSpdyBridge(bridge, SPDY_V2, SPDY_V3);
+
+	class ProtocolErrorListener: public SelftestSpdyListener
+	{
+		virtual void OnProtocolError()
+		{
+			ST_passed();
+		}
+	};
+	SelftestSpdyListener *listener = OP_NEW(ProtocolErrorListener, ());
+	verifyNotNull(listener);
+	bridge->GetConnector(TRUE).SetListener(listener);
+	bridge->Start();
+
+	// The connection is already running, let's create stream from the client side
+	DummyStreamController *streamController = OP_NEW(DummyStreamController, ());
+	verifyNotNull(streamController);
+	ST_delete_after_group(streamController);
+	TRAPD(res, bridge->GetConnector(FALSE).GetSpdyFramesHandler()->CreateStreamL(streamController));
+	verifySuccess(res, "Coudn't create stream");
+}
+
+test("DATA for invalid stream-id")
+	async;
+{
+	SpdyBridge *bridge;
+	prepareSpdyBridge(bridge, SPDY_V3, SPDY_V3);
+
+	class ResetStreamListener: public SelftestSpdyListener
+	{
+	public:
+		virtual void OnReceivedReset(UINT32 streamId, UINT32 resetStatus)
+		{
+			if (resetStatus == SRS_INVALID_STREAM)
+				ST_passed();
+		}
+	};
+	SelftestSpdyListener *listener = OP_NEW(ResetStreamListener, ());
+	verifyNotNull(listener);
+	bridge->GetConnector(TRUE).SetListener(listener);
+	bridge->Start();
+
+	OpData dataFrame;
+	DataFrameHeader dfh(97, SCF_CONTROL_FLAG_FIN, 0);
+	verifySuccess(dataFrame.AppendCopyData(reinterpret_cast<char*>(&dfh), DataFrameHeader::GetSize()), "OOM");
+	bridge->GetConnector(TRUE).SendData(dataFrame);
+}
+
+test("Server initiated stream with odd stream-id")
+	async;
+{
+	SpdyBridge *bridge;
+	prepareSpdyBridge(bridge, SPDY_V3, SPDY_V3);
+
+	class ProtocolErrorListener: public SelftestSpdyListener
+	{
+	public:
+		virtual void OnProtocolError()
+		{
+			ST_passed();
+		}
+	};
+	SelftestSpdyListener *listener = OP_NEW(ProtocolErrorListener, ());
+	verifyNotNull(listener);
+	bridge->GetConnector(FALSE).SetListener(listener);
+	bridge->Start();
+
+	OpData synStreamFrame;
+	SynStreamFrameHeader ssfh(SPDY_V3, SCF_CONTROL_FLAG_FIN, 3, 0, 0, 0);
+	verifySuccess(synStreamFrame.AppendCopyData(reinterpret_cast<char*>(&ssfh), SynStreamFrameHeader::GetSize()), "OOM");
+	bridge->GetConnector(TRUE).SendData(synStreamFrame);
+}
+
+test("Server PUSH should be canceled")
+	async;
+{
+	SpdyBridge *bridge;
+	prepareSpdyBridge(bridge, SPDY_V2, SPDY_V2);
+
+	class CancelPushListener: public SelftestSpdyListener
+	{
+	public:
+		virtual void OnReceivedReset(UINT32 streamId, UINT32 resetStatus)
+		{
+			if (resetStatus == SRS_REFUSED_STREAM)
+				ST_passed();
+		}
+	};
+	SelftestSpdyListener *listener = OP_NEW(CancelPushListener, ());
+	verifyNotNull(listener);
+	bridge->GetConnector(TRUE).SetListener(listener);
+	bridge->Start();
+
+	OpData synStreamFrame;
+	SynStreamFrameHeader ssfh(SPDY_V2, SCF_CONTROL_FLAG_FIN, 2, 0, 0, 0);
+	verifySuccess(synStreamFrame.AppendCopyData(reinterpret_cast<char*>(&ssfh), SynStreamFrameHeader::GetSize()), "OOM");
+	bridge->GetConnector(TRUE).SendData(synStreamFrame);
+}
+
+test("Multiple SYN_STREAM frames for the same active stream")
+	async;
+{
+	SpdyBridge *bridge;
+	prepareSpdyBridge(bridge, SPDY_V3, SPDY_V3);
+
+	// Injects multiple SYN _REPLY frames in answer for SYN_STREAM and listens for RESET frame with appropriate status
+	class DoubleSynReplyInjectorListener: public SelftestSpdyListener
+	{
+		SpdyBridgeConnector *serverConnector;
+	public:
+		DoubleSynReplyInjectorListener(SpdyBridgeConnector *serverConnector): serverConnector(serverConnector) {}
+		
+		virtual void OnReceivedSynStream(UINT32 streamId)
+		{
+			OpData synReplyFrame;
+			SynReplyFrameHeader srfh(SPDY_V3, SCF_CONTROL_FLAG_NONE, streamId, 0);
+			if (OpStatus::IsError(synReplyFrame.AppendCopyData(reinterpret_cast<char*>(&srfh), SynReplyFrameHeader::GetSize(SPDY_V3))))
+				ST_failed("OOM");
+			serverConnector->SendData(synReplyFrame);
+			serverConnector->SendData(synReplyFrame);
+		}
+
+		virtual void OnReceivedReset(UINT32 streamId, UINT32 resetStatus)
+		{
+			if (resetStatus == SRS_PROTOCOL_ERROR)
+				ST_passed();
+		}
+	};
+	SelftestSpdyListener *listener = OP_NEW(DoubleSynReplyInjectorListener, (&bridge->GetConnector(TRUE)));
+	verifyNotNull(listener);
+	bridge->GetConnector(TRUE).SetListener(listener);
+	bridge->Start();
+
+	// The connection is already running, let's create stream from the client side
+	DummyStreamController *streamController = OP_NEW(DummyStreamController, ());
+	verifyNotNull(streamController);
+	ST_delete_after_group(streamController);
+	TRAPD(res, bridge->GetConnector(FALSE).GetSpdyFramesHandler()->CreateStreamL(streamController));
+	verifySuccess(res, "Coudn't create stream");
+}
+
+test("DATA frame before SYN_REPLY")
+	async;
+{
+	SpdyBridge *bridge;
+	prepareSpdyBridge(bridge, SPDY_V2, SPDY_V2);
+
+	// Injects multiple SYN _REPLY frames in answer for SYN_STREAM
+	class DataFrameInjectorListener: public SelftestSpdyListener
+	{
+		SpdyBridgeConnector *serverConnector;
+	public:
+		DataFrameInjectorListener(SpdyBridgeConnector *serverConnector): serverConnector(serverConnector) {}
+		
+		virtual void OnReceivedSynStream(UINT32 streamId)
+		{
+			OpData dataFrame;
+			DataFrameHeader srfh(streamId, SCF_CONTROL_FLAG_NONE, 0);
+			if (OpStatus::IsError(dataFrame.AppendCopyData(reinterpret_cast<char*>(&srfh), DataFrameHeader::GetSize())))
+				ST_failed("OOM");
+			serverConnector->SendData(dataFrame);
+		}
+	};
+	SelftestSpdyListener *serverListener = OP_NEW(DataFrameInjectorListener, (&bridge->GetConnector(TRUE)));
+	verifyNotNull(serverListener);
+	bridge->GetConnector(TRUE).SetListener(serverListener);
+
+	// listens for ProtocolError
+	class ProtocolErrorListener: public SelftestSpdyListener
+	{
+	public:
+		virtual void OnProtocolError()
+		{
+			ST_passed();
+		}
+	};
+	SelftestSpdyListener *clientListener = OP_NEW(ProtocolErrorListener, ());
+	verifyNotNull(clientListener);
+	bridge->GetConnector(FALSE).SetListener(clientListener);
+	bridge->Start();
+
+	// The connection is already running, let's create stream from the client side
+	DummyStreamController *streamController = OP_NEW(DummyStreamController, ());
+	verifyNotNull(streamController);
+	ST_delete_after_group(streamController);
+	TRAPD(res, bridge->GetConnector(FALSE).GetSpdyFramesHandler()->CreateStreamL(streamController));
+	verifySuccess(res, "Coudn't create stream");
+}

@@ -1,0 +1,658 @@
+/* -*- Mode: c++; tab-width: 4; indent-tabs-mode: t; c-basic-offset: 4 -*-
+**
+** Copyright (C) 2004-2011 Opera Software ASA.  All rights reserved.
+**
+** This file is part of the Opera web browser.  It may not be distributed
+** under any circumstances.
+**
+** This file tests the basic functionalities of the cache from an higher level:
+** load a document and test if it is really accessed from the cache
+**
+** Luca Venturi
+**
+** Tests used to check that the cache behaves well when the URLs are updated or deleted
+*/
+
+group "cache update";
+disabled;
+require init;
+require DISK_CACHE_SUPPORT;
+require WEBSERVER_SUPPORT;
+include "modules/cache/cache_selftest.h";
+include "modules/cache/cache_st_helpers.h";
+include "modules/cache/cache_ctxman_disk.h";
+include "modules/prefs/prefsmanager/collections/pc_network.h";
+include "modules/prefs/prefsmanager/collections/pc_webserver.h";
+include "modules/windowcommander/OpWindowCommander.h";
+include "modules/dochand/docman.h";
+
+
+#include "cache_html.oth";
+
+global
+{
+	OpSecurityManager::PrivilegedBlock g_webserver_privileged_block;
+
+	UniteCacheTester uct;
+	URL_CONTEXT_ID ctx_inuse;		// Used for "In use" tests
+	URL_CONTEXT_ID ctx_inuse2;		// Used for "In use" tests
+	URL_CONTEXT_ID ctx_inuse3;		// Used for "In use" tests
+	URL_CONTEXT_ID ctx_update;		// Used for update tests
+	URL_CONTEXT_ID ctx_update2;		// Used for update tests
+	URL_CONTEXT_ID ctx_update3;		// Used for update tests
+	URL_CONTEXT_ID ctx_reload;		// Tests performed for "Reload from cache"
+	OpFileFolder folder_inuse;		// Used for "In use" tests
+	OpFileFolder folder_inuse2;		// Used for "In use" tests
+	OpFileFolder folder_inuse3;		// Used for "In use" tests
+	URL url_inuse1;					// URL kept in use
+	URL url_inuse2;					// URL kept in use
+	URL url_inuse3;					// URL kept in use
+	URL url_inuse1_b;				// URL kept in use
+	URL url_inuse2_b;				// URL kept in use
+	URL url_inuse3_b;				// URL kept in use
+	URL url_install;
+	OpString8 html_page1;			// HTML to open "page1", for the reload from cache test
+	OpString8 html_page2;			// HTML to open "page2", for the reload from cache test
+	OpWindowCommander* cmd[3];		// OpWindowCommanders used for reload from cache
+	OpWindow* wnd[3];				// OpWindows used for reload from cache
+	BOOL pref_never_expire;
+	MultiContext *mctx;
+	CacheHelpers ch;
+	URL url_reload_ar[3];			// "Custom URLs" used for reload
+	SelfTestTimer timer;			
+}
+
+setup 
+{
+	mctx=OP_NEW(MultiContext, (TRUE));
+	if(mctx)
+	  mctx->PrefIgnorePopups(FALSE);
+	  
+	uct.SetWindow(state.GetWindow());
+	CacheTester::BlockPeriodicFreeUnusedResources();
+	cmd[0]=cmd[1]=cmd[2]=NULL;
+	wnd[0]=wnd[1]=wnd[2]=NULL;
+}
+
+exit
+{
+	url_inuse1.GetRep()->DecUsed(1);
+	url_inuse2.GetRep()->DecUsed(1);
+	url_inuse3.GetRep()->DecUsed(1);
+	url_inuse1_b.GetRep()->DecUsed(1);
+	url_inuse2_b.GetRep()->DecUsed(1);
+	url_inuse3_b.GetRep()->DecUsed(1);
+	CacheTester::RestorePeriodicFreeUnusedResources();
+	OP_DELETE(mctx);
+}
+
+test("Empty main cache")
+async;
+{
+	mctx->EmptyDCache(0);
+}
+
+/////// Unite initializations
+test("Start WebServer if required")
+async;
+{
+	uct.StartWebServer();
+}
+
+test("Check WebServer and create the service")
+async;
+{
+	uct.StartService(UNI_L("cache_js_selftest"), UNI_L("webserver/cache_js_selftest_service/"));
+}
+
+test("info on output")
+require success("Start WebServer if required");
+{
+#ifdef WEBSERVER_RENDEZVOUS_SUPPORT
+	OpString8 device, proxy, user;
+	
+	device.Set(g_pcwebserver->GetStringPref(PrefsCollectionWebserver::WebserverDevice).CStr());
+	proxy.Set(g_pcwebserver->GetStringPref(PrefsCollectionWebserver::WebserverProxyHost).CStr());
+	user.Set(g_pcwebserver->GetStringPref(PrefsCollectionWebserver::WebserverUser).CStr());
+
+	output("\nPort: %d - Device: %s - Proxy: %s - User: %s\n", g_webserver->GetLocalListeningPort(), device.CStr(), proxy.CStr(), user.CStr());
+#endif
+	output("Number of SubServers running: %d\n", g_webserver->GetSubServerCount());
+	
+	for(UINT32 i=0; i<g_webserver->GetSubServerCount(); i++)
+	{
+		WebSubServer *wss=g_webserver->GetSubServerAtIndex(i);
+
+		if(wss)
+		{
+			OpString8 wss_name;
+			OpString8 wss_storage;
+
+			wss_name.Set(wss->GetSubServerName().CStr());
+			wss_storage.Set(wss->GetSubServerStoragePath().CStr());
+			output("* %d is %s - storage: %s\n", i, wss_name.CStr(), wss_storage.CStr());
+		}
+	}
+}
+
+test("Create the contexts")
+{
+	verify_success(mctx->CreateNewContext(ctx_inuse, UNI_L("in_use"), TRUE, &folder_inuse));
+	verify_success(mctx->CreateNewContext(ctx_inuse2, UNI_L("in_use2"), TRUE, &folder_inuse2));
+	verify_success(mctx->CreateNewContext(ctx_inuse3, UNI_L("in_use3"), TRUE, &folder_inuse3));
+	verify_success(mctx->CreateNewContext(ctx_update, UNI_L("update"), TRUE));
+	verify_success(mctx->CreateNewContext(ctx_update2, UNI_L("update2"), TRUE));
+	verify_success(mctx->CreateNewContext(ctx_update3, UNI_L("update3"), TRUE));
+	verify_success(mctx->CreateNewContext(ctx_reload, UNI_L("reload_from_cache"), TRUE));
+}
+
+test("Install JS service")
+	language ecmascript;
+{
+	InstallCacheServices();
+}
+
+test("Load from JS service")
+async;
+{
+	url_install=uct.JScreatePage(65536, -1, ctx_update);
+}
+
+test("Verify JS Service")
+{
+	int bytes=uct.GetLastTransfer();
+
+	output("Transferred bytes: %d - cache type: %d - Expired: %d ", 65536, (int)url_install.GetAttribute(URL::KCacheType), (int)url_install.Expired(FALSE, FALSE));
+	verify(bytes>(int)65536);
+}
+
+/////// Real tests
+
+// Used to check the basic functionalities, for each size
+table TableSizesInUse(char*, int, OpFileFolder, CacheSize, CacheType, URL, URL)
+{
+  { "[embedded]", ctx_inuse, folder_inuse, SIZE_EMBEDDED, TYPE_EMBEDDED, url_inuse1, url_inuse1_b},
+  { "[container]", ctx_inuse2, folder_inuse2, SIZE_CONTAINERS, TYPE_CONTAINER, url_inuse2, url_inuse2_b},
+  { "[plain]", ctx_inuse3, folder_inuse3, SIZE_PLAIN, TYPE_PLAIN, url_inuse3, url_inuse3_b}
+}
+
+// Test if the behavior with URL in use is fine
+foreach (descr, ctx, folder, file_size, type, url_inuse, url_inuse_b) from TableSizesInUse
+{
+	test("Create " descr)
+	{
+		verify(mctx->CheckIndex(ctx, FALSE) == -1);
+		verify(CacheHelpers::CheckDirectory(folder) == 0);
+		
+		URL url1=ch.CacheBogusURLRetrieve(ctx, file_size, FALSE, FALSE);
+		URL url2=ch.CacheBogusURLRetrieve(ctx, file_size, FALSE, FALSE);
+		
+		output("Ref count: %d-%d, %d-%d\n", url1.GetRep()->GetRefCount(), url1.GetRep()->GetUsedCount(), url2.GetRep()->GetRefCount(), url2.GetRep()->GetUsedCount()); 
+		
+		verify(url1.GetRep()->GetRefCount()==2);
+		verify(url2.GetRep()->GetRefCount()==2);
+		verify(!url1.GetRep()->Expired(FALSE, FALSE));
+		verify(!url2.GetRep()->Expired(FALSE, FALSE));
+
+		verify(mctx->CheckIndex(ctx, FALSE) == -1);
+		verify(CacheHelpers::CheckDirectory(folder) == 0);
+		
+		// Save the index
+		urlManager->FindContextManager(ctx)->FreeUnusedResources(TRUE);
+		
+		verify(mctx->CheckIndex(ctx) == 2);
+		
+		if(type==TYPE_EMBEDDED)
+			verify(CacheHelpers::CheckDirectory(folder) == 0);
+		else if(type==TYPE_CONTAINER)
+			verify(CacheHelpers::CheckDirectory(folder) == 1);
+		else
+			verify(CacheHelpers::CheckDirectory(folder) == 2);
+			
+		
+		// The URLs will now be cleared, as the reference is removed
+		output("Ref count: %d-%d, %d-%d\n", url1.GetRep()->GetRefCount(), url1.GetRep()->GetUsedCount(), url2.GetRep()->GetRefCount(), url2.GetRep()->GetUsedCount());
+	}
+	
+	test("Clean and check for 0 files " descr)
+	async;
+	{
+		CacheTester::DeleteEverythingPossible(ctx, TRUE);
+		
+		int num=mctx->CheckIndex(ctx);
+		
+		if(num == 0)
+			mctx->WaitForFiles(ctx, 0, TRUE);
+		else
+			ST_failed("Incorrect number of files in the index: %d instead of 0", num);
+	}
+	
+	test("One file with one reference " descr)
+	{
+		url_inuse=ch.CacheBogusURLRetrieve(ctx, file_size, FALSE, TRUE);
+		
+		verify(url_inuse.GetRep()->GetUsedCount()==1);
+		verify(mctx->CheckIndex(ctx) == 1);
+		verify(url_inuse.GetRep()->GetUsedCount()==1);
+	}
+	
+	test("Clean and check 1 remaining file (1) " descr)
+	async;
+	{
+		if(url_inuse.GetRep()->GetUsedCount()!=1) { ST_failed("Incorrect Used count: %d instead of 1", url_inuse.GetRep()->GetUsedCount()); return 0; }
+		CacheTester::DeleteEverythingPossible(ctx, TRUE);
+		if(url_inuse.GetRep()->GetUsedCount()!=1) { ST_failed("Incorrect Used count: %d instead of 1", url_inuse.GetRep()->GetUsedCount()); return 0; }
+		
+		int num=mctx->CheckIndex(ctx);
+
+		if(num == 1)
+			mctx->WaitForFiles(ctx, (type==TYPE_EMBEDDED) ? 0 : 1, TRUE);
+		else
+			ST_failed("Incorrect number of files in the index: %d instead of 1", num);
+	}
+	
+	/*test("One file with one reference, made temporary " descr)
+	{
+		CacheTester::ScheduleForDelete(url_inuse);
+
+		verify(url_inuse.GetRep()->GetUsedCount()==1);
+	}
+	
+	test("Clean and check 1 remaining file (2) " descr)
+	async;
+	{
+		CacheTester::DeleteEverythingPossible(ctx, TRUE);
+		
+		int num=mctx->CheckIndex(ctx);
+
+		if(num == 1)
+			mctx->WaitForFiles(ctx, (type==TYPE_EMBEDDED) ? 0 : 1, TRUE);
+		else
+			ST_failed("Incorrect number of files in the index: %d instead of 1", num);
+	}*/
+	
+	test("Remove reference " descr)
+	{
+		url_inuse.GetRep()->DecUsed(1);
+
+		verify(url_inuse.GetRep()->GetUsedCount()==0);
+	}
+	
+	test("Check 0 remaining files" descr)
+	async;
+	{
+		CacheTester::DeleteEverythingPossible(ctx, TRUE);
+		int num=mctx->CheckIndex(ctx);
+
+		if(num == 0)
+			mctx->WaitForFiles(ctx, 0, TRUE);
+		else
+			ST_failed("Incorrect number of files in the index: %d instead of 0", num);
+	}
+	
+	test("2 files, one reference, one marked for delete " descr)
+	{
+		url_inuse_b=ch.CacheBogusURLRetrieve(ctx, file_size, FALSE, TRUE);
+		URL url1=ch.CacheBogusURLRetrieve(ctx, file_size, FALSE, FALSE);
+
+		verify(url_inuse_b.GetRep()->GetUsedCount()==1);
+		verify(url1.GetRep()->GetUsedCount()==0);
+		
+		// FIXME: Removing the following line, cause a strange problem, as the container is still in RAM (unsaved) but still it has to be deleted immediately...
+		verify(mctx->CheckIndex(ctx)==2);
+		CacheTester::ScheduleForDelete(url1);
+	}
+	
+	test("Clean and check 1 remaining file (3) " descr)
+	async;
+	{
+		CacheTester::DeleteEverythingPossible(ctx, TRUE);
+
+		int num=mctx->CheckIndex(ctx);
+
+		if(num == 1)
+			mctx->WaitForFiles(ctx, (type==TYPE_EMBEDDED) ? 0 : 1, TRUE);
+		else
+			ST_failed("Incorrect number of files in the index: %d instead of 1", num);
+	}
+	
+	test("Remove reference again" descr)
+	{
+		url_inuse_b.GetRep()->DecUsed(1);
+
+		verify(url_inuse_b.GetRep()->GetUsedCount()==0);
+	}
+	
+	test("Check 0 remaining files" descr)
+	async;
+	{
+		CacheTester::DeleteEverythingPossible(ctx, TRUE);
+		int num=mctx->CheckIndex(ctx);
+
+		if(num == 0)
+			mctx->WaitForFiles(ctx, 0, TRUE);
+		else
+			ST_failed("Incorrect number of files in the index: %d instead of 0", num);
+	}
+}
+
+test("Create HTML")
+require success("Start WebServer if required");
+{
+	html_page1.AppendFormat("<html><head></head><body onload=\"window.open('http://localhost:%d/cache_js_selftest/page1?a=1'); window.close(); \"></body></html>", g_webserver->GetLocalListeningPort());
+	html_page2.AppendFormat("<html><head></head><body onload=\"window.open('http://localhost:%d/cache_js_selftest/page2?a=1'); window.close(); \"></body></html>", g_webserver->GetLocalListeningPort());
+}
+
+// Used to check the basic functionalities, for each size
+table TableSizesUpdate(char*, int, int, CacheType, OpWindowCommander*, OpWindow*, URL &)
+{
+  { "[embedded]", ctx_update, SIZE_EMBEDDED, TYPE_EMBEDDED, cmd[0], wnd[0], url_reload_ar[0]},
+  { "[container]", ctx_update2, SIZE_CONTAINERS, TYPE_CONTAINER, cmd[1], wnd[1], url_reload_ar[1]},
+  { "[plain]", ctx_update3, SIZE_PLAIN, TYPE_PLAIN, cmd[2], wnd[2], url_reload_ar[2]}
+}
+
+// "Reload from cache" tests
+foreach (descr, ctx, file_size, type, commander, opwindow, url_reload) from TableSizesUpdate
+{
+	test("Initialize PASS conditions" descr)
+	language ecmascript;
+	disabled;
+	{
+		cache_pass_1=cache_pass_2=false;
+	}
+	
+	// It's very difficult to exchange data between the selftest page and a
+	test("Create pages" descr)
+	language ecmascript;
+	{
+		// Enable page1, disable page 2
+		opera.io.webserver.addEventListener("enable1", function(e) { 
+			e.connection.response.setResponseHeader("Cache-Control", "no-cache");
+			e.connection.response.write("<html><head><META HTTP-EQUIV=\"expires\" CONTENT=\"0\"><META HTTP-EQUIV=\"Pragma\" CONTENT=\"no-cache\"><META HTTP-EQUIV=\"CACHE-CONTROL\" CONTENT=\"no-cache, must-revalidate\"></head><body onload=\"window.close();\">ENABLE PAGE 1 </body></html>");
+			e.connection.response.close();
+			
+			cache_pass_1=true;
+			cache_pass_2=false;
+			
+			ST_passed();
+		}, false);
+		
+		// Enable page2, disable page 1
+		opera.io.webserver.addEventListener("enable2", function(e) { 
+			e.connection.response.setResponseHeader("Cache-Control", "no-cache");
+			e.connection.response.write("<html><head><META HTTP-EQUIV=\"expires\" CONTENT=\"0\"><META HTTP-EQUIV=\"Pragma\" CONTENT=\"no-cache\"><META HTTP-EQUIV=\"CACHE-CONTROL\" CONTENT=\"no-cache, must-revalidate\"></head><body onload=\"window.close();\">ENABLE PAGE 2 </body></html>");
+			e.connection.response.close();
+			
+			cache_pass_1=false;
+			cache_pass_2=true;
+			
+			ST_passed();
+		}, false);
+		
+		// Pass if page 1 is enabled
+		opera.io.webserver.addEventListener("page1", function(e) { 
+			e.connection.response.setResponseHeader("Cache-Control", "no-cache");
+			e.connection.response.write("<html><head><META HTTP-EQUIV=\"expires\" CONTENT=\"0\"><META HTTP-EQUIV=\"Pragma\" CONTENT=\"no-cache\"><META HTTP-EQUIV=\"CACHE-CONTROL\" CONTENT=\"no-cache, must-revalidate\"></head><body onload=\"window.close();\">PAGE 1 - PASS: " + cache_pass_1 + "</body></html>");
+			e.connection.response.close();
+			
+			if(cache_pass_1)
+				ST_passed();
+			else
+				ST_failed("Page 1 is marked as FAIL, so it should not have been called!", "cache_update.ot", 0); 
+		}, false);
+		
+		// Pass if page 2 is enabled
+		opera.io.webserver.addEventListener("page2", function(e) { 
+			e.connection.response.setResponseHeader("Cache-Control", "no-cache");
+			e.connection.response.write("<html><head><META HTTP-EQUIV=\"expires\" CONTENT=\"0\"><META HTTP-EQUIV=\"Pragma\" CONTENT=\"no-cache\"><META HTTP-EQUIV=\"CACHE-CONTROL\" CONTENT=\"no-cache, must-revalidate\"></head><body onload=\"window.close();\">PAGE 1 - PASS: " + cache_pass_2 + "</body></html>");
+			e.connection.response.close();
+			
+			if(cache_pass_2)
+				ST_passed();
+			else
+				ST_failed("Page 2 is marked as FAIL, so it should not have been called!", "cache_update.ot", 0); 
+		}, false);
+	}
+	
+	// A page (url_reload) is created, with a function that can make the test pass.
+	test("Create 1st pass page" descr)
+	require DOM_FILE_API_SUPPORT;
+	{
+		// Assumes that embedded are tested before containers, which are tested before normal files
+		int len1=html_page1.Length();
+		int len2=html_page1.Length();
+		
+		html_page1.Reserve(file_size);
+		html_page2.Reserve(file_size);
+		
+		// Correct the pages to get the right size
+		while(len1<file_size-64)
+		{
+			len1+=64;
+			html_page1.Append("                                                                ");
+		}
+		
+		while(len2<file_size-64)
+		{
+			len2+=64;
+			html_page2.Append("                                                                ");
+		}
+		
+		while(len1<file_size)
+		{
+			len1++;
+			html_page1.Append(" ");
+		}
+		
+		while(len2<file_size)
+		{
+			len2++;
+			html_page2.Append(" ");
+		}
+		
+		OP_ASSERT(html_page1.Length()==file_size);
+		OP_ASSERT(html_page2.Length()==file_size);
+		
+		// Create the 1st page
+		url_reload=CacheHelpers::CacheCustomURLText(0, html_page1.CStr(), "http://example.tld/cache_reload", "text/html", FALSE, TRUE, FALSE);
+	}
+	
+	// Enable page 1, disable page 2
+	test("Enable page 1 only" descr)
+	language ecmascript;
+	async;
+	{
+		window.open("http://localhost:" + opera.io.webserver.port + "/cache_js_selftest/enable1?a=9");
+	}
+	
+	// Ensure that the test works
+	test("Direct Test PASS from selftest" descr)
+	language ecmascript;
+	async;
+	{
+		window.open("http://localhost:" + opera.io.webserver.port + "/cache_js_selftest/page1?a=2");
+	}
+	
+	// Ensure that the test is not cached (if Opera hangs, then it's cached...)
+	test("Indirect Test PASS from page" descr)
+	language ecmascript;
+	async;
+	{
+		window.open("http://example.tld/cache_reload");
+	}
+	
+	test("Indirect Test PASS from Window Commander" descr)
+	async;
+	{
+		timer.StartTimer(5000);
+		g_windowCommanderManager->GetWindowCommander(&commander);
+		OpWindow::Create(&opwindow);
+		if(commander && opwindow)
+		{
+			if(OpStatus::IsSuccess(opwindow->Init()))
+			{
+				commander->OnUiWindowCreated(opwindow);
+
+				OpWindowCommander::OpenURLOptions options;
+				options.entered_by_user = TRUE;
+				if(!commander->OpenURL(UNI_L("http://example.tld/cache_reload"), options))
+					ST_failed("Impossibile to open the test URL");
+			}
+			else
+				ST_failed("Impossibile to initialize a window");
+		}
+		else
+			ST_failed("Impossibile to create a window");
+	}
+	
+	test("Stop the timer")
+	{
+		timer.StopTimer();
+	}
+	
+	// Enable page 2, disable page 1, changing the pass condition
+	// Now we need the content of the URL to be changed (from the cache), or the page will generate an error
+	test("Enable page 2 only" descr)
+	language ecmascript;
+	async;
+	{
+		window.open("http://localhost:" + opera.io.webserver.port + "/cache_js_selftest/enable2?a=9");
+	}
+	
+	test("Simulate 'view source' and change of the file" descr)
+	{
+		verify(url_reload.GetRep()->GetDataStorage() && url_reload.GetRep()->GetDataStorage()->GetCacheStorage() && !url_reload.GetRep()->GetDataStorage()->GetCacheStorage()->IsPlainFile());
+		
+		if(type==TYPE_EMBEDDED)
+		{
+			verify(url_reload.GetRep()->GetDataStorage()->GetCacheStorage()->IsEmbedded());
+			verify(!url_reload.GetRep()->GetDataStorage()->GetCacheStorage()->GetContainerID());
+		}
+		else if(type==TYPE_CONTAINER)
+		{
+			verify(!url_reload.GetRep()->GetDataStorage()->GetCacheStorage()->IsEmbedded());
+			verify(url_reload.GetRep()->GetDataStorage()->GetCacheStorage()->GetContainerID());
+		}
+		else
+		{
+			verify(!url_reload.GetRep()->GetDataStorage()->GetCacheStorage()->IsEmbedded());
+			verify(!url_reload.GetRep()->GetDataStorage()->GetCacheStorage()->GetContainerID());
+		}
+		
+		verify(0==url_reload.PrepareForViewing(URL::KFollowRedirect, TRUE, TRUE, TRUE));
+		verify(url_reload.GetRep()->GetDataStorage() && url_reload.GetRep()->GetDataStorage()->GetCacheStorage() && url_reload.GetRep()->GetDataStorage()->GetCacheStorage()->IsPlainFile());
+		
+		OpStringC cache_file=url_reload.GetAttribute(URL::KFileName);
+		OpFile file;
+		
+		// Embedded and containers will become plain files
+		verify(!cache_file.IsEmpty());
+		
+		// Check the content of the file
+		file.Construct(cache_file.CStr(), OPFILE_CACHE_FOLDER);
+		verify_success(CacheFileTest::VerifyFileContent(file.GetFullPath(), html_page1));
+		
+		verify_success(file.Open(OPFILE_WRITE));
+		// Modify it
+		verify_success(file.Write(html_page2, op_strlen(html_page2)));
+		verify_success(file.Close());
+		
+		// Check the new content
+		verify_success(CacheFileTest::VerifyFileContent(file.GetFullPath(), html_page2));
+	}
+	
+	// Fails if cache hasn't been changed. This is the REAL test for reload from cache.
+	test("Reload from cache main test" descr)
+	async;
+	{
+		//commander->Reload();
+		commander->ViolateCoreEncapsulationAndGetWindow()->DocManager()->UpdateCurrentDoc(FALSE, FALSE, FALSE);
+	}
+	
+	test("Cleaning" descr)
+	{
+		commander->OnUiWindowClosing();
+		OP_DELETE(opwindow);
+		g_windowCommanderManager->ReleaseWindowCommander(commander);
+		
+		CacheTester::DecUsed(&url_reload);
+		
+		// Important to avoid the URL to be cached (this will be in any case detected by failing selftests on the second and third run)
+		urlManager->MakeUnique(url_reload.GetRep());
+		
+		//CacheTester::BrutalDelete(&url_reload, FALSE);
+		//url_reload.GetRep()->Unload();
+		//OP_DELETE(url_reload.GetRep());
+	}
+}
+
+// Update tests
+foreach (descr, ctx, file_size, type, commander, opwindow, url_reload) from TableSizesUpdate
+{
+	test("reset 1 " descr)
+	async;
+	{
+		uct.JSResetSteps(ctx, 1);
+	}
+	
+	test("Test step1 " descr)
+	async;
+	{
+		uct.JSAutoStepNormal(ctx, file_size, FULL);
+	}
+	
+	test("Test step2 " descr)
+	async;
+	{
+		uct.JSAutoStepNormal(ctx, file_size, FULL);
+	}
+	
+	test("Test step3 " descr)
+	async;
+	disabled;
+	{
+		uct.JSAutoStepNoReload(ctx, file_size, CONDITIONAL);
+	}
+	
+	// Failure on test 3: so there is a reload
+	test("Test step4 " descr)
+	async;
+	disabled;
+	{
+		uct.JSAutoStepNormal(ctx, file_size, FULL);
+	}
+	
+	// It should be cached...
+	test("Test step5 " descr)
+	async;
+	disabled;
+	{
+		uct.JSAutoStepNoReload(ctx, file_size, NONE);
+	}
+	
+	// It should be cached...
+	test("Test step5 cached " descr)
+	async;
+	disabled;
+	{
+		uct.JSAutoStepNoReload(ctx, file_size, NONE);
+	}
+	
+	test("reset 1 " descr)
+	async;
+	disabled;
+	{
+		uct.JSResetSteps(ctx, 4);
+	}
+}
+
+//////// Finish
+test("Restore WebServer if required")
+{
+	uct.StopWebServer();
+}
+
+test("Delete the contexts")
+{
+	mctx->RemoveFoldersAndContexts();
+}

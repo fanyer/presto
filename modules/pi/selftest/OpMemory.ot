@@ -1,0 +1,321 @@
+/* -*- Mode: c++; tab-width: 4; indent-tabs-mode: t; c-basic-offset: 4 -*-
+ *
+ * Copyright (C) 2009-2011 Opera Software AS.  All rights reserved.
+ *
+ * This file is part of the Opera web browser.  It may not be distributed
+ * under any circumstances.
+ *
+ * Morten Rolland, mortenro@opera.com
+ */
+
+group "pi.opmemory";
+
+/*
+ * Note: Many of the tests in this selftest only scratches the surface
+ * of testing the OpMemory porting interface. For instance, without
+ * having two threads that can be "let loose" on the critical section
+ * mutexes, we can't even make a statistical attempt at verifying that
+ * the mutexes actually works.
+ *
+ * Actually: Proving that it is impossible to break the mutex protection
+ * needs to be just that; a proper proof. Running one million tests that
+ * all work as expected is not a proof...
+ *
+ * The same goes for the virtual memory test that verifies that freed
+ * virtual memory is inaccessible: Accessing the memory should provoke
+ * a page-fault and a program termination, but we generally don't want
+ * that from our selftests.... So the test is disabled for the special
+ * occations when this functionality should be tested (e.g. when
+ * implementing the functionality).
+ */
+
+include "modules/pi/system/OpMemory.h";
+
+global
+{
+#if defined(OPMEMORY_VIRTUAL_MEMORY) || defined(OPMEMORY_EXECUTABLE_SEGMENT)
+	const OpMemory::OpMemSegment* g_mseg;
+#endif
+#ifdef OPMEMORY_VIRTUAL_MEMORY
+	int g_pagesize;
+	unsigned int g_allocsize;
+#endif
+#ifdef OPMEMORY_EXECUTABLE_SEGMENT
+	extern "C" int OpMemory_Test_ExecutableMemory(int arg);
+	extern "C" int OpMemory_Test_ExecutableMemory2(int arg);
+#endif
+}
+
+setup
+{
+#if defined(OPMEMORY_VIRTUAL_MEMORY) || defined(OPMEMORY_EXECUTABLE_SEGMENT)
+	g_mseg = 0;
+#endif
+#ifdef OPMEMORY_VIRTUAL_MEMORY
+	g_pagesize = 0;
+	g_allocsize = 0;
+#endif
+}
+
+exit
+{
+#if defined(OPMEMORY_VIRTUAL_MEMORY) || defined(OPMEMORY_EXECUTABLE_SEGMENT)
+	if (g_mseg)
+		OpMemory::DestroySegment(g_mseg);
+	g_mseg = 0;
+#endif
+}
+
+test("Try locking the malloc lock") leakcheck;
+	require OPMEMORY_MALLOC_LOCK;
+{
+	OpMemory::MallocLock();
+	//
+	// No two threads should ever be here at once
+	//
+	OpMemory::MallocUnlock();
+}
+
+test("Try locking the memory debug lock") leakcheck;
+	require OPMEMORY_MEMDEBUG_LOCK;
+{
+	OpMemory::MemdebugLock();
+	//
+	// No two threads should ever be here at once
+	//
+	OpMemory::MemdebugUnlock();
+}
+
+test("Try locking both malloc and memory locks") leakcheck;
+	require OPMEMORY_MALLOC_LOCK && OPMEMORY_MEMDEBUG_LOCK;
+{
+	OpMemory::MemdebugLock();
+	OpMemory::MallocLock();
+	//
+	// No two treads should ever be here at once
+	//
+	// Note: There should be two *separate* locks that protect
+	// this critical section.  This use-case will happen when
+	// memory debugging is enabled, and the memory debugger
+	// calls lea_malloc for allocations and they are set up
+	// to be threadsafe.
+	//
+	OpMemory::MallocUnlock();
+	OpMemory::MemdebugUnlock();
+}
+
+test("Create memory segments") leakcheck;
+	require OPMEMORY_MEMORY_SEGMENT;
+{
+	const OpMemory::OpMemSegment* mseg;
+
+	mseg = OpMemory::CreateSegment(OpMemory::MEMORY_SEGMENT_TEMPORARY);
+	verify(mseg != 0);
+	verify(mseg->type == OpMemory::MEMORY_SEGMENT_TEMPORARY);
+	verify(mseg->address != 0);
+	verify(mseg->size >= 16384); // Probably sensible absolute minimum
+	op_memset(mseg->address, 17, mseg->size); // Should be perfectly safe
+	OpMemory::DestroySegment(mseg);
+
+	mseg = OpMemory::CreateSegment(OpMemory::MEMORY_SEGMENT_DOCUMENT);
+	verify(mseg != 0);
+	verify(mseg->type == OpMemory::MEMORY_SEGMENT_DOCUMENT);
+	verify(mseg->address != 0);
+	verify(mseg->size >= 16384);
+	op_memset(mseg->address, 42, mseg->size);
+	OpMemory::DestroySegment(mseg);
+
+	mseg = OpMemory::CreateSegment(OpMemory::MEMORY_SEGMENT_PERSISTENT);
+	verify(mseg != 0);
+	verify(mseg->type == OpMemory::MEMORY_SEGMENT_PERSISTENT);
+	verify(mseg->address != 0);
+	verify(mseg->size >= 16384);
+	op_memset(mseg->address, 69, mseg->size);
+}
+finally
+{
+	if ( mseg != 0 )
+		OpMemory::DestroySegment(mseg);
+}
+
+test("Create virtual memory segment")
+	require OPMEMORY_VIRTUAL_MEMORY;
+{
+	g_pagesize = OpMemory::GetPageSize();
+	g_allocsize = g_pagesize * 3000;
+
+	g_mseg = OpMemory::CreateVirtualSegment(2 * g_allocsize);
+	verify(g_mseg != 0);
+
+	verify(g_mseg->size >= g_allocsize);
+}
+
+test("Allocate virtual memory")
+	require success "Create virtual memory segment";
+	require OPMEMORY_VIRTUAL_MEMORY;
+{
+	verify(OpMemory::VirtualAlloc(g_mseg, g_mseg->address, g_allocsize));
+}
+
+test("Write into the virtual memory")
+	require success "Allocate virtual memory";
+	require OPMEMORY_VIRTUAL_MEMORY;
+{
+	op_memset(g_mseg->address, 69, g_allocsize);
+	char* pg = (char*)g_mseg->address;
+	for ( unsigned int k = 0; k < g_allocsize; k++ )
+	    verify(pg[k] == 69);
+}
+
+test("Release the virtual memory")
+	require success "Write into the virtual memory";
+	require OPMEMORY_VIRTUAL_MEMORY;
+{
+	OpMemory::VirtualFree(g_mseg, g_mseg->address, g_allocsize);
+}
+
+test("Crash when writing released memory")
+	require success "Release the virtual memory";
+	require OPMEMORY_VIRTUAL_MEMORY;
+	disabled;
+{
+	//
+	// When this test is run, it is expected to crash since the memory
+	// at the specified location is now gone, and should preferably be
+	// inaccessible.
+	//
+	char* foobar = (char*)g_mseg->address;
+
+	foobar[0] = 42; // Should go Boom!
+}
+
+test("Destroy the virtual memory segment")
+	require success "Release the virtual memory";
+	require OPMEMORY_VIRTUAL_MEMORY;
+{
+	if (g_mseg)
+		OpMemory::DestroySegment(g_mseg);
+	g_mseg = 0;
+}
+
+test("Create executable memory segment")
+	require OPMEMORY_EXECUTABLE_SEGMENT;
+{
+	const size_t request = 16384;
+	g_mseg = OpMemory::CreateExecSegment(request);
+	verify(g_mseg != 0);
+	verify(g_mseg->size >= request);
+	verify(g_mseg->address != 0);
+	verify(g_mseg->type == OpMemory::MEMORY_SEGMENT_EXECUTABLE);
+}
+
+//
+// IMPORTANT NOTE #1: The next two tests are somewhat fragile, and will
+// not neccessarily run correctly on all platforms. The test consists of
+// copying the (assumed) body of a normal function (compiled into
+// Opera) into the executable memory segment, and try to run it from
+// there through a function pointer.
+//
+// IMPORTANT NOTE #2: If you fix issues with these two testcases, then
+// also see if your fixes are applicable to the higher-level testcases for
+// executable memory found in modules/memory/selftest/executable_memory.ot
+//
+// There are a lot of pitfalls, like:
+//  - Assumption that only relative jump are used
+//  - That the function does not use any data/instructions before its
+//    entry point
+//  - That the function is shorter than 256 bytes when compiled
+//
+// So, if this crashes on your platform, it may be because some of the
+// assumptions are not met, instead of having a broken implementation
+// of the executable memory segment.
+//
+test("Write function to executable memory segment")
+	require success "Create executable memory segment";
+	require OPMEMORY_EXECUTABLE_SEGMENT;
+{
+	// Sanity check original test-function
+	// This might also resolve the "real" function address
+	// if lazy binding is used on this platform.
+	verify(OpMemory_Test_ExecutableMemory(10) == 13);
+	verify(OpMemory_Test_ExecutableMemory(100) == 144);
+
+	void* function = (void*)OpMemory_Test_ExecutableMemory;
+	size_t function_size = 256; // Conservative estimate
+	verify(g_mseg->size >= function_size);
+
+//
+// Sometimes (observed on 32-bit WinGogi/Debug_Desktop in VS2008) the
+// compiler will put OpMemory_Test_ExecutableMemory behind a jump
+// table, and we end up copying the jump table instead of the actual
+// function itself. This will cause a crash in the test below if the
+// jump table uses relative function addresses.
+// To counteract this, we try to detect the existence of this jump
+// table, and if one is found, we manually calculate the "real"
+// function address and copy that instead.
+// This code will probably need to be extended to handle similar
+// behavior on other compilers/platforms.
+//
+#ifdef ARCHITECTURE_IA32
+	unsigned char *function_bytes = (unsigned char *)function;
+	if (*function_bytes == 0xe9) // Function starts with JMP <rel32>
+	{
+		// Assume function address points to a jump table that does a
+		// relative jump to the "real" function.
+		// Calculate address to "real" function.
+		INT32 rel_addr = *(INT32 *)(function_bytes + 1);
+		function = (void *)((function_bytes + 5) + rel_addr);
+	}
+#endif // ARCHITECTURE_IA32
+
+	void* wa = OpMemory::WriteExec(g_mseg, g_mseg->address, function_size);
+	op_memcpy(wa, function, function_size);
+	OpMemory::WriteExecDone(g_mseg, g_mseg->address, function_size);
+}
+
+// NOTE: Please read the notes for the previous testcase.
+test("Call function in executable memory segment")
+	require success "Create executable memory segment";
+	require OPMEMORY_EXECUTABLE_SEGMENT;
+	require undefined WIN32 && _DEBUG; // disabled for Visual Studio with incremental linking
+{
+	// Compare test-function with its copied version in the segment
+	int (*copied_function)(int) = (int (*)(int))g_mseg->address;
+
+	// ... for some different values of the argument
+	for ( int k = 0; k < 1000; k++ )
+	{
+		int original = OpMemory_Test_ExecutableMemory(k); // Call original
+		//
+		// If the following function call causes a crash, and you're
+		// pretty sure that it's not caused by the allocated memory
+		// not being executable, then it may be that we have failed
+		// to correctly copy OpMemory_Test_ExecutableMemory into
+		// exmem->address.
+		// See the above test for hints on how to fix that.
+		//
+		int copied = copied_function(k); // Call into segment
+		verify(original == copied);
+	}
+}
+
+test("Rewrite and call function in segment")
+	require success "Call function in executable memory segment";
+	require OPMEMORY_EXECUTABLE_SEGMENT;
+	require undefined WIN32 && _DEBUG; // disabled for Visual Studio with incremental linking
+{
+	void* function = (void*)OpMemory_Test_ExecutableMemory2;
+	size_t function_size = 128; // Conservative estimate
+
+	void* wa = OpMemory::WriteExec(g_mseg, g_mseg->address, function_size);
+	op_memcpy(wa, function, function_size);
+	OpMemory::WriteExecDone(g_mseg, g_mseg->address, function_size);
+
+	int (*copied_function)(int) = (int (*)(int))g_mseg->address;
+	int result = copied_function(42);
+	verify(result == 142);
+
+	if (g_mseg)
+		OpMemory::DestroySegment(g_mseg);
+	g_mseg = 0;
+}

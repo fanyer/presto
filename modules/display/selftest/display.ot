@@ -1,0 +1,700 @@
+/* -*- Mode: c++; tab-width: 4; indent-tabs-mode: t; c-basic-offset: 4 -*-
+ * vim:set syntax=cpp tabstop=4: */
+
+group "display.display";
+
+require MDF_FREETYPE_SUPPORT;
+
+include "modules/display/vis_dev.h";
+include "modules/display/colconv.h";
+include "modules/img/image.h";
+include "modules/img/decoderfactorypng.h";
+include "modules/windowcommander/OpWindowCommander.h";
+include "modules/windowcommander/src/WindowCommander.h";
+include "modules/doc/frm_doc.h";
+include "modules/dochand/win.h";
+include "modules/dochand/fdelm.h";
+include "modules/dochand/viewportcontroller.h";
+include "modules/hardcore/timer/optimer.h";
+include "modules/forms/piforms.h";
+include "modules/forms/formvalue.h";
+include "modules/selftest/src/doc_st_utils.h";
+include "modules/layout/layoutprops.h";
+include "modules/libvega/libvega_module.h";
+include "modules/libvega/vega3ddevice.h";
+
+global
+{
+	int DISPLAY_MAX_RGBA_DIFF = 20;
+
+	int psnr_limit = 0;
+
+#if TV_PROFILE
+# define REF_DIR "tv"
+#elif SMARTPHONE_PROFILE
+# define REF_DIR "smartphone"
+#else
+# define REF_DIR "desktop" // Default to desktop if unknown
+#endif
+	
+	OpString test_path;
+	OP_STATUS VerifyImage(const char* refimage, int width, int height, BOOL generate)
+	{
+		VisualDevice* vd = state.doc->GetVisualDevice();
+
+		OpBitmap* bitmap_to_paint;
+		RETURN_IF_ERROR(OpBitmap::Create(&bitmap_to_paint, width, height, FALSE, FALSE, 0, 0, TRUE));
+
+		OpPainter* painter = bitmap_to_paint->GetPainter();
+		if (!painter)
+		{
+			OP_DELETE(bitmap_to_paint);
+			return OpStatus::ERR;
+		}
+
+		CoreViewContainer* cview = vd->GetView()->GetContainer();
+		cview->Paint(OpRect(0, 0, width, height), painter, 0, 0, TRUE, FALSE);
+
+		bitmap_to_paint->ReleasePainter();
+
+		OP_STATUS status = DecoderFactoryPng::verify(refimage, bitmap_to_paint, height, DISPLAY_MAX_RGBA_DIFF, psnr_limit, generate);
+		if (OpStatus::IsError(status))
+		{
+			OpString8 refimage_failed;
+			refimage_failed.Set(refimage);
+			refimage_failed.Insert(op_strlen(refimage) - 4, "_failed");
+			DecoderFactoryPng::verify(refimage_failed.CStr(), bitmap_to_paint, height, DISPLAY_MAX_RGBA_DIFF, psnr_limit, TRUE);
+		}
+
+		OP_DELETE(bitmap_to_paint);
+		
+		return status;
+	}
+}
+
+setup
+{
+	// Somewhere between 15 and 40 dB difference
+	double C = 15.0;
+#ifdef VEGA_OPPAINTER_SUPPORT
+	// Hack to get PSNR-based comparison working for 16 BPP
+# ifdef VEGA_INTERNAL_FORMAT_RGB565A8
+	C = 13.0;
+# endif
+#endif
+
+	unsigned int psnr = VEGA_DEFAULT_QUALITY;
+#ifdef VEGA_3DDEVICE
+	if (g_vegaGlobals.rasterBackend == LibvegaModule::BACKEND_HW3D)
+	{
+		psnr = g_vegaGlobals.vega3dDevice->getDefaultQuality();
+	}
+#endif // VEGA_3DDEVICE
+	psnr_limit = (int)op_pow(10.0, (double)(C+3*psnr) / 10.0);
+}
+
+exit
+{
+}
+
+test("BgRegion CoalesceRects 1 (horizontal row)")
+{
+	BgRegion reg;
+	reg.AddRect(OpRect(0, 0, 10, 10));
+	reg.AddRect(OpRect(10, 0, 10, 10));
+	reg.AddRect(OpRect(20, 0, 10, 10));
+	reg.AddRect(OpRect(30, 0, 10, 10));
+	reg.AddRect(OpRect(40, 0, 10, 10));
+	verify(reg.num_rects == 5);
+	reg.CoalesceRects();
+	verify(reg.num_rects == 1);
+	verify(reg.rects[0].Equals(OpRect(0, 0, 50, 10)));
+}
+
+test("BgRegion CoalesceRects 2 (vertical row)")
+{
+	BgRegion reg;
+	reg.AddRect(OpRect(0, 0, 10, 10));
+	reg.AddRect(OpRect(0, 10, 10, 10));
+	reg.AddRect(OpRect(0, 20, 10, 10));
+	reg.AddRect(OpRect(0, 30, 10, 10));
+	reg.AddRect(OpRect(0, 40, 10, 10));
+	verify(reg.num_rects == 5);
+	reg.CoalesceRects();
+	verify(reg.num_rects == 1);
+	verify(reg.rects[0].Equals(OpRect(0, 0, 10, 50)));
+}
+
+/* This will pass if we do a little more expensive CoalesceRects() (by setting j = -1 after RemoveRect).
+test("BgRegion CoalesceRects 3 (complex)")
+{
+	BgRegion reg;
+	reg.AddRect(OpRect(0, 0, 10, 10));
+	reg.AddRect(OpRect(0, 10, 10, 10));
+	reg.AddRect(OpRect(10, 0, 10, 10));
+	reg.AddRect(OpRect(10, 10, 10, 10));
+	verify(reg.num_rects == 4);
+	reg.CoalesceRects();
+	verify(reg.num_rects == 1);
+	verify(reg.rects[0].Equals(OpRect(0, 0, 20, 20)));
+}*/
+
+/* This will pass only if we do even more expensive CoalesceRects() (by starting over completly after RemoveRect).
+test("BgRegion CoalesceRects 4 (complex)")
+{
+	BgRegion reg;
+	reg.AddRect(OpRect(20, 0, 20, 20));
+	reg.AddRect(OpRect(0, 20, 40, 20));
+	reg.AddRect(OpRect(10, 10, 10, 10));
+	reg.AddRect(OpRect(10, 0, 10, 10));
+	reg.AddRect(OpRect(0, 10, 10, 10));
+	reg.AddRect(OpRect(0, 0, 10, 10));
+	verify(reg.num_rects == 6);
+	reg.CoalesceRects();
+	verify(reg.num_rects == 1);
+	verify(reg.rects[0].Equals(OpRect(0, 0, 40, 40)));
+}*/
+
+// Open a window for test documents
+
+html
+{
+	//! <body>
+	//! </body>
+}
+
+table test_files(char *) filelist "tests" name "*.html";
+table test_files2(char *) filelist "tests/testframe" or "tests/input_tests" or "tests/misc_tests" or "tests/testimg" name "*.*";
+table ref_images(char *) filelist "tests/" name "*.png" recursively;
+
+foreach (FILE) from test_files
+{
+	test("loadpage_dummy") async;
+	{
+		test_path.Set(FILE);
+		int i = test_path.Length() - 1;
+		while (test_path[i] != '\\' && test_path[i] != '/')
+			i--;
+		test_path.Delete(i);
+		test_path.Append(UNI_L("/"));
+
+		state.doc->GetWindow()->SetFramesPolicy(FRAMES_POLICY_NORMAL);
+		state.doc->GetWindow()->SetLayoutMode(LAYOUT_NORMAL);
+		state.doc->GetWindow()->SetERA_Mode(FALSE);
+
+		OpString file;
+		file.Set(FILE);
+
+		// set layout viewport to that of desktop profile
+		ViewportController* controller = state.doc->GetWindow()->GetViewportController();
+		controller->SetDesktopLayoutViewportSize(1024, 728);
+		// disable text wrap
+		controller->DisableTextParagraphWidthLimit();
+
+		DocSTUtils::SetScale(state.doc, 100);
+		WaitUntilLoadedObj::LoadAndWaitUntilLoaded(state.doc->GetWindow(), file.CStr());
+	}
+
+	test("$(FILE)") leakcheck;
+	{
+		char* tn = 0;
+
+		BOOL generate = FALSE; // Turn to TRUE to generate new refimages.
+
+		// open ref image
+		tn = op_strdup(FILE);
+		
+		// get end of the directory path; excluding file name
+		int path_end = op_strlen(tn) - 1;
+		while (tn[path_end] != '\\' && tn[path_end] != '/')
+			path_end--;
+		
+		// cut file extension
+		char *t = op_strrchr(tn, '.');
+		*t = 0;
+		OpString8 refimage;
+
+		// Use the size of the body element as imagesize.
+		RECT rect;
+		HTML_Element* e = find_element("body");
+		verify(e && "OOM when fetching element");
+		verify(e->GetBoxRect(state.doc, BORDER_BOX, rect) == TRUE);
+		int width = rect.right - rect.left;
+		int height = rect.bottom - rect.top;
+		VisualDevice *vd = state.doc->GetVisualDevice();
+
+		// Test in 100% zoom
+		DocSTUtils::SetScale(state.doc, 100);
+		refimage.Set(tn);
+		refimage.Insert(path_end, PATHSEP "ref_images" PATHSEP REF_DIR);
+		refimage.Append("_zoom_100.png");
+		BOOL success_100 = OpStatus::IsSuccess(VerifyImage(refimage.CStr(), vd->ScaleToScreen(width), vd->ScaleToScreen(height), generate));
+
+		// Test in 50% zoom
+		DocSTUtils::SetScale(state.doc, 50);
+		refimage.Set(tn);
+		refimage.Insert(path_end, PATHSEP "ref_images" PATHSEP REF_DIR);
+		refimage.Append("_zoom_50.png");
+		BOOL success_50 = OpStatus::IsSuccess(VerifyImage(refimage.CStr(), vd->ScaleToScreen(width), vd->ScaleToScreen(height), generate));
+
+		DocSTUtils::SetScale(state.doc, 100);
+
+		verify(success_100);
+		verify(success_50);
+
+	} finally {
+		op_free(tn);
+	}
+}
+
+test("loadpage_dummy") async;
+{
+	OpString filename;
+	RETURN_IF_ERROR(filename.Set(test_path));
+	RETURN_IF_ERROR(filename.Append(UNI_L("input_tests/iframe.html")));
+	Window* win = state.GetWindow();
+	if (!win)
+		ST_failed("No window!");
+	else
+		WaitUntilLoadedObj::LoadAndWaitUntilLoaded(win, filename.CStr());
+}
+
+test("GetMouseHitView")
+{
+	VisualDevice *vd = state.doc->GetVisualDevice();
+	CoreView *top_view = vd->GetContainerView();
+	CoreView *ifrm_view = top_view->GetMouseHitView(20, 20);
+	verify(ifrm_view != vd->GetView());
+}
+
+test("loadpage_dummy") async;
+{
+	OpString filename;
+	RETURN_IF_ERROR(filename.Set(test_path));
+	RETURN_IF_ERROR(filename.Append(UNI_L("input_tests/iframe_overlapped.html")));
+	Window* win = state.GetWindow();
+	if (!win)
+		ST_failed("No window!");
+	else
+		WaitUntilLoadedObj::LoadAndWaitUntilLoaded(win, filename.CStr());
+}
+
+test("GetMouseHitView_overlapped")
+{
+	VisualDevice *vd = state.doc->GetVisualDevice();
+	CoreView *top_view = vd->GetContainerView();
+	CoreView *ifrm_view = top_view->GetMouseHitView(20, 20);
+	verify(ifrm_view == vd->GetView());
+	ifrm_view = top_view->GetMouseHitView(50, 50);
+	verify(ifrm_view != vd->GetView());
+	verify(ifrm_view->GetIsOverlapped());
+	int ifrm_view_w, ifrm_view_h;
+	ifrm_view->GetSize(&ifrm_view_w, &ifrm_view_h);
+	verify(ifrm_view_w <= 100 && ifrm_view_h == 100);
+
+	CoreView *ifrm_container_view = ifrm_view->GetParent();
+	verify(ifrm_container_view->GetVisibleRect().Equals(OpRect(12, 12, 100, 100)));
+}
+
+test("ScrollByScrollbarClick")
+require undefined MOUSELESS;
+{
+	VisualDevice *vd = state.doc->GetVisualDevice();
+	CoreView *top_view = vd->GetContainerView();
+
+	OpPoint p(12 + 95, 12 + 95); // on the scrollbar down arrow
+	top_view->MouseMove(p, SHIFTKEY_NONE);
+	top_view->MouseDown(p, MOUSE_BUTTON_1, 1, SHIFTKEY_NONE);
+	top_view->MouseUp(p, MOUSE_BUTTON_1, SHIFTKEY_NONE);
+
+	verify(state.doc->GetIFrmRoot());
+	verify(state.doc->GetIFrmRoot()->FirstChild());
+	VisualDevice *ifrm_vd = state.doc->GetIFrmRoot()->FirstChild()->GetVisualDevice();
+
+	verify(ifrm_vd->GetRenderingViewY() > 0);
+	ifrm_vd->SetRenderingViewPos(0, 0);
+	verify(ifrm_vd->GetRenderingViewY() == 0);
+}
+
+test("ScrollByMouseWheel")
+require undefined MOUSELESS;
+{
+	VisualDevice *vd = state.doc->GetVisualDevice();
+	CoreViewContainer *top_view = (CoreViewContainer *) vd->GetContainerView();
+
+	if (state.window->GetFramesPolicy() == FRAMES_POLICY_DEFAULT ||
+		state.window->GetFramesPolicy() == FRAMES_POLICY_NORMAL)
+	{
+		OpPoint p(12 + 50, 12 + 50); // on the scrollbar down arrow
+		top_view->OnMouseMove(p, SHIFTKEY_NONE, vd->GetOpView());
+		top_view->OnMouseWheel(10, TRUE, SHIFTKEY_NONE);
+
+		verify(state.doc->GetIFrmRoot());
+		verify(state.doc->GetIFrmRoot()->FirstChild());
+		VisualDevice *ifrm_vd = state.doc->GetIFrmRoot()->FirstChild()->GetVisualDevice();
+		verify(ifrm_vd->GetRenderingViewY() > 0);
+	}
+}
+
+test("loadpage_dummy") async;
+{
+	OpString filename;
+	RETURN_IF_ERROR(filename.Set(test_path));
+	RETURN_IF_ERROR(filename.Append(UNI_L("input_tests/mousetest.html")));
+	Window* win = state.GetWindow();
+	if (!win)
+		ST_failed("No window!");
+	else
+		WaitUntilLoadedObj::LoadAndWaitUntilLoaded(win, filename.CStr());
+}
+
+test("MouseButtonHandling") delay 1;
+require undefined MOUSELESS;
+require PREFS_WRITE;
+{
+	VisualDevice *vd = state.doc->GetVisualDevice();
+	CoreView *top_view = vd->GetContainerView();
+
+	OpPoint p(0, 0);
+	top_view->MouseMove(p, SHIFTKEY_NONE);
+
+	OP_STATUS ret;
+	// Must let rightclicks through the script engine for this test.
+	BOOL old_status = g_pcdisplay->GetIntegerPref(PrefsCollectionDisplay::AllowScriptToReceiveRightClicks);
+	TRAP(ret, g_pcdisplay->WriteIntegerL(PrefsCollectionDisplay::AllowScriptToReceiveRightClicks, TRUE));
+
+	top_view->MouseDown(p, MOUSE_BUTTON_1, 1, SHIFTKEY_NONE);
+	top_view->MouseUp(p, MOUSE_BUTTON_1, SHIFTKEY_NONE);
+	top_view->MouseDown(p, MOUSE_BUTTON_1, 2, SHIFTKEY_NONE);
+	top_view->MouseUp(p, MOUSE_BUTTON_1, SHIFTKEY_NONE);
+	top_view->MouseDown(p, MOUSE_BUTTON_1, 3, SHIFTKEY_NONE);
+	top_view->MouseUp(p, MOUSE_BUTTON_1, SHIFTKEY_NONE);
+	top_view->MouseDown(p, MOUSE_BUTTON_1, 4, SHIFTKEY_NONE);
+	top_view->MouseUp(p, MOUSE_BUTTON_1, SHIFTKEY_NONE);
+
+/*	top_view->MouseDown(p, MOUSE_BUTTON_2, 1, SHIFTKEY_NONE);
+	top_view->MouseUp(p, MOUSE_BUTTON_2, SHIFTKEY_NONE);
+	top_view->MouseDown(p, MOUSE_BUTTON_2, 2, SHIFTKEY_NONE);
+	top_view->MouseUp(p, MOUSE_BUTTON_2, SHIFTKEY_NONE);
+	top_view->MouseDown(p, MOUSE_BUTTON_2, 3, SHIFTKEY_NONE);
+	top_view->MouseUp(p, MOUSE_BUTTON_2, SHIFTKEY_NONE);
+	top_view->MouseDown(p, MOUSE_BUTTON_2, 4, SHIFTKEY_NONE);
+	top_view->MouseUp(p, MOUSE_BUTTON_2, SHIFTKEY_NONE);*/
+
+	top_view->MouseDown(p, MOUSE_BUTTON_3, 1, SHIFTKEY_NONE);
+	top_view->MouseUp(p, MOUSE_BUTTON_3, SHIFTKEY_NONE);
+	top_view->MouseDown(p, MOUSE_BUTTON_3, 2, SHIFTKEY_NONE);
+	top_view->MouseUp(p, MOUSE_BUTTON_3, SHIFTKEY_NONE);
+	top_view->MouseDown(p, MOUSE_BUTTON_3, 3, SHIFTKEY_NONE);
+	top_view->MouseUp(p, MOUSE_BUTTON_3, SHIFTKEY_NONE);
+	top_view->MouseDown(p, MOUSE_BUTTON_3, 4, SHIFTKEY_NONE);
+	top_view->MouseUp(p, MOUSE_BUTTON_3, SHIFTKEY_NONE);
+
+	TRAP(ret, g_pcdisplay->WriteIntegerL(PrefsCollectionDisplay::AllowScriptToReceiveRightClicks, old_status));
+}
+
+test("MouseButtonHandling result")
+require undefined MOUSELESS;
+{
+	HTML_Element *textarea = find_element("textarea");
+	verify(textarea && "OOM when fetching element");
+	FormValue *formval = textarea->GetFormValue();
+	OpString result;
+
+	formval->GetValueAsText(textarea, result);
+
+	verify(result.Compare("DOWN button: 0 detail: 1\r\n"
+						  "UP button: 0 detail: 1\r\n"
+						  "DOWN button: 0 detail: 2\r\n"
+						  "UP button: 0 detail: 2\r\n"
+						  "DOWN button: 0 detail: 3\r\n"
+						  "UP button: 0 detail: 3\r\n"
+						  "DOWN button: 0 detail: 4\r\n"
+						  "UP button: 0 detail: 4\r\n"
+
+/*						  "DOWN button: 2 detail: 1\r\n"
+						  "UP button: 2 detail: 1\r\n"
+						  "DOWN button: 2 detail: 2\r\n"
+						  "UP button: 2 detail: 2\r\n"
+						  "DOWN button: 2 detail: 3\r\n"
+						  "UP button: 2 detail: 3\r\n"
+						  "DOWN button: 2 detail: 4\r\n"
+						  "UP button: 2 detail: 4\r\n"*/
+
+						  "DOWN button: 1 detail: 1\r\n"
+						  "UP button: 1 detail: 1\r\n"
+						  "DOWN button: 1 detail: 2\r\n"
+						  "UP button: 1 detail: 2\r\n"
+						  "DOWN button: 1 detail: 3\r\n"
+						  "UP button: 1 detail: 3\r\n"
+						  "DOWN button: 1 detail: 4\r\n"
+						  "UP button: 1 detail: 4\r\n"
+						) == 0);
+}
+
+html
+{
+	//! <body>
+	//! </body>
+}
+
+test("loadpage_dummy") async;
+{
+	OpString filename;
+	RETURN_IF_ERROR(filename.Set(test_path));
+	RETURN_IF_ERROR(filename.Append(UNI_L("misc_tests/clipview.html")));
+	Window* win = state.GetWindow();
+	if (!win)
+		ST_failed("No window!");
+	else
+		WaitUntilLoadedObj::LoadAndWaitUntilLoaded(win, filename.CStr());
+}
+
+test("ClipView")
+require _PLUGIN_SUPPORT_;
+require undefined ALL_PLUGINS_ARE_WINDOWLESS;
+{
+	verify(state.doc);
+
+	// The plugin code send update_pluginwindow FALSE to ResizePluginWindow first time for some odd reason (bug?!)
+	// So we have to paint a extra time for the plugin view to be initialized correctly.
+	WaitUntilLoadedObj::Paint();
+
+	// FIX: This is not reliable on all platforms since plugins may be disabled or not found etc.
+/*
+	VisualDevice *vd = state.doc->GetVisualDevice();
+	CoreView *top_view = vd->GetContainerView();
+	CoreView *view = top_view->GetMouseHitView(50, 50);
+	// We should have found the ClipView which is a container.
+	verify(view == view->GetContainer());
+
+	OpRect rect = view->GetRect();
+	// The ClipView should be clipped. Actual size is 200x200.
+	verify(rect.width <= 100 && rect.height <= 100);
+*/
+}
+
+test("ConvertColor8_to_1_4_32")
+{
+	UINT8 pal[] = { 255, 255, 255, 0,
+					255, 0, 0, 0,
+					0, 255, 0, 0,
+					0, 0, 255, 0,
+					0, 0, 0, 0 };
+	UINT8 src8[] = { 0, 1, 2, 3, 4 };
+	UINT8 dst4[] = { 0, 0, 0 };
+	UINT8 dst1[] = { 0 };
+	UINT32 dst32[] = { 0, 0, 0, 0, 0 };
+	ConvertColorIndexed(src8, dst1, 5, 8, 1, pal, 0/*transp_color*/, NULL);
+	ConvertColorIndexed(src8, dst4, 5, 8, 4, pal, 0/*transp_color*/, NULL);
+	ConvertColorIndexed(src8, (UINT8*)dst32, 5, 8, 32, pal, 0/*transp_color*/, NULL);
+
+	verify(dst1[0] == 120);
+
+	verify(dst4[0] == 1);
+	verify(dst4[1] == 35);
+	verify(dst4[2] == 64);
+
+	verify(dst32[0] == 0); // This was the transparent color.
+	verify(dst32[1] == (RGB(255, 0, 0) | 0xFF000000));
+	verify(dst32[2] == (RGB(0, 255, 0) | 0xFF000000));
+	verify(dst32[3] == (RGB(0, 0, 255) | 0xFF000000));
+	verify(dst32[4] == (RGB(0, 0, 0) | 0xFF000000));
+}
+
+test("ConvertColor4_to_1_8_32")
+{
+	UINT8 pal[] = { 255, 255, 255, 0,
+					255, 0, 0, 0,
+					0, 255, 0, 0,
+					0, 0, 255, 0,
+					0, 0, 0, 0 };
+	UINT8 src4[] = { 1, 35, 64 };
+	UINT8 dst8[] = { 0, 0, 0, 0, 0 };
+//	UINT8 dst1[] = { 0 }; // NOT IMPLEMENTED AND NOT NEEDED
+	UINT32 dst32[] = { 0, 0, 0, 0, 0 };
+//	ConvertColorIndexed(src4, dst1, 5, 4, 1, pal, 0/*transp_color*/, NULL);
+	ConvertColorIndexed(src4, dst8, 5, 4, 8, pal, 0/*transp_color*/, NULL);
+	ConvertColorIndexed(src4, (UINT8*)dst32, 5, 4, 32, pal, 0/*transp_color*/, NULL);
+
+//	verify(dst1[0] == 120);
+
+	verify(dst8[0] == 0);
+	verify(dst8[1] == 1);
+	verify(dst8[2] == 2);
+	verify(dst8[3] == 3);
+	verify(dst8[4] == 4);
+
+	verify(dst32[0] == 0); // This was the transparent color.
+	verify(dst32[1] == (RGB(255, 0, 0) | 0xFF000000));
+	verify(dst32[2] == (RGB(0, 255, 0) | 0xFF000000));
+	verify(dst32[3] == (RGB(0, 0, 255) | 0xFF000000));
+	verify(dst32[4] == (RGB(0, 0, 0) | 0xFF000000));
+}
+
+test("ConvertColor1_to_4_8_32")
+{
+	UINT8 pal[] = { 255, 255, 255, 0,
+					255, 0, 0, 0 };
+	UINT8 src1[] = { 120 };
+//	UINT8 dst4[] = { 0, 0, 0 }; // NOT IMPLEMENTED AND NOT NEEDED
+	UINT8 dst8[] = { 0, 0, 0, 0, 0 };
+	UINT32 dst32[] = { 0, 0, 0, 0, 0 };
+//	ConvertColorIndexed(src1, dst4, 5, 1, 4, pal, 0/*transp_color*/, NULL);
+	ConvertColorIndexed(src1, dst8, 5, 1, 8, pal, 0/*transp_color*/, NULL);
+	ConvertColorIndexed(src1, (UINT8*)dst32, 5, 1, 32, pal, 0/*transp_color*/, NULL);
+
+//	verify(dst4[0] == 1);
+//	verify(dst4[1] == 35);
+//	verify(dst4[2] == 64);
+
+	verify(dst8[0] == 0);
+	verify(dst8[1] == 1);
+	verify(dst8[2] == 1);
+	verify(dst8[3] == 1);
+	verify(dst8[4] == 1);
+
+	verify(dst32[0] == 0); // This was the transparent color.
+	verify(dst32[1] == (RGB(255, 0, 0) | 0xFF000000));
+	verify(dst32[2] == (RGB(255, 0, 0) | 0xFF000000));
+	verify(dst32[3] == (RGB(255, 0, 0) | 0xFF000000));
+	verify(dst32[4] == (RGB(255, 0, 0) | 0xFF000000));
+}
+
+html
+{
+	//! <body>
+	//! </body>
+}
+
+test("VisualDeviceGettersSanityCheck")
+{
+	verify(state.doc && state.doc->GetVisualDevice());
+	VisualDevice *vd = state.doc->GetVisualDevice();
+	verify(vd->GetScreenAvailWidth() > 0);
+	verify(vd->GetScreenAvailHeight() > 0);
+	verify(vd->GetScreenColorDepth() > 0);
+	verify(vd->GetScreenPixelDepth() > 0);
+	verify(vd->GetScreenWidth() > 0);
+	verify(vd->GetScreenHeight() > 0);
+
+	UINT32 dpi_horizontal = 0, dpi_vertical = 0;
+	vd->GetDPI(&dpi_horizontal, &dpi_vertical);
+	verify(dpi_horizontal > 0 && dpi_vertical > 0);
+
+	verify(!vd->IsPrinter());
+#ifdef PAN_SUPPORT
+	verify(!vd->IsPanning());
+#endif // PAN_SUPPORT
+
+	OpPoint pos_on_screen = vd->GetPosOnScreen();
+	verify(pos_on_screen.x >= 0);
+	verify(pos_on_screen.y >= 0);
+}
+
+html
+{
+	//! <body>
+	//! Some text
+	//! </body>
+}
+
+test("VisualDeviceGetTxtExtentSplit")
+{
+	verify(state.doc && state.doc->GetVisualDevice());
+	VisualDevice *vis_dev = state.doc->GetVisualDevice();
+	vis_dev->Reset();
+
+	const uni_char *txt0 = UNI_L("thisisalongwordthisisalongwordthisisalongwordthisisalongwordthisisalongwordthisisalongwordthisisalongwordthisisalongwordthisisalongwordthisisalongwordthisisalongwordthisisalongwordthisisalongwordthisisalongwordthisisalongwordthisisalongwordthisisalongwordthisisalongwordthisisalongwordthisisalongwordthisisalongwordthisisalongwordthisisalongwordthisisalongwordthisisalongwordthisisalongwordthisisalongwordthisisalongwordthisisalongwordthisisalongwordthisisalongwordthisisalongwordthisisalongwordthisisalongwordthisisalongwordthisisalongwordthisisalongwordthisisalongwordthisisalongwordthisisalongwordthisisalongwordthisisalongword");
+	const uni_char *txt1 = UNI_L("wwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwww");
+	const uni_char *txt2 = UNI_L("iiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiii");
+
+	for(int t = 0; t < 3; t++)
+	{
+		const uni_char *txt = txt0;
+		if (t == 1)
+			txt = txt1;
+		else if (t == 2)
+			txt = txt2;
+		unsigned int txt_len = uni_strlen(txt);
+		unsigned int total_width = vis_dev->GetTxtExtent(txt, txt_len);
+
+		// Extreme cases
+		unsigned int result_width = UINT_MAX;
+		unsigned int result_char_count = UINT_MAX;
+		vis_dev->GetTxtExtentSplit(txt, txt_len, 0, 0, result_width, result_char_count);
+		verify(result_width == 0);
+		verify(result_char_count == 0);
+
+		result_width = UINT_MAX;
+		result_char_count = UINT_MAX;
+		vis_dev->GetTxtExtentSplit(txt, txt_len, 1000000, 0, result_width, result_char_count);
+		verify(result_width == total_width);
+		verify(result_char_count == txt_len);
+
+		result_width = UINT_MAX;
+		result_char_count = UINT_MAX;
+		vis_dev->GetTxtExtentSplit(txt, txt_len, total_width, 0, result_width, result_char_count);
+		verify(result_width == total_width);
+		verify(result_char_count == txt_len);
+
+		// Loop through the whole string and check that we get sane values.
+		result_width = 0;
+		result_char_count = 0;
+		unsigned int increase_count = 0;
+		for(unsigned int i = 0; i <= total_width; i++)
+		{
+			unsigned int old_result_width = result_width;
+			unsigned int old_result_char_count = result_char_count;
+			vis_dev->GetTxtExtentSplit(txt, txt_len, i, 0, result_width, result_char_count);
+			BOOL width_increased = (result_width > old_result_width ? TRUE : FALSE);
+			BOOL count_increased = (result_char_count > old_result_char_count ? TRUE : FALSE);
+			verify(width_increased == count_increased);
+			if (width_increased)
+			{
+				increase_count++;
+				verify(result_width == (unsigned int)vis_dev->GetTxtExtent(txt, result_char_count));
+			}
+		}
+		verify(increase_count == txt_len);
+	}
+}
+
+table TransposeOffsetInsideImage(int)
+{
+	{ -300 },
+	{ -200 },
+	{ -100 },
+	{ 0    },
+	{ 100  },
+	{ 200  },
+	{ 300  }
+}
+
+subtest TransposeOffsetInsideImage(int x, int y, int additional)
+{
+	const int width = 100;
+	const int height = 100;
+	OpPoint offset(x + additional, y + additional);
+
+	VisualDevice::TransposeOffsetInsideImage(offset, width, height);
+
+	verify(offset.x == additional);
+	verify(offset.y == additional);
+}
+
+test("VisualDeviceTransposeOffsetInsideImage")
+{
+
+	iterate (a) from TransposeOffsetInsideImage
+	{
+		verify(TransposeOffsetInsideImage(a, a, 50));
+		verify(TransposeOffsetInsideImage(a, a, 1));
+
+		// The optimization is missed in the -1 and 0 case, but that's no big deal.
+		// Fixing it would involve making the algorithm inobvious.
+		// http://codereview/r/3358/#comment_container_6958
+		//verify(TransposeOffsetInsideImage(a, a, 0));
+		//verify(TransposeOffsetInsideImage(a, a, -1));
+	}
+}

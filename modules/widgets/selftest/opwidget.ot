@@ -1,0 +1,417 @@
+group "widgets.opwidget";
+require init;
+
+language c++;
+
+include "modules/display/vis_dev.h";
+include "modules/dochand/viewportcontroller.h";
+include "modules/forms/piforms.h";
+include "modules/forms/form.h";
+include "modules/logdoc/htm_elm.h";
+include "modules/doc/frm_doc.h";
+include "modules/widgets/OpCalendar.h";
+include "modules/widgets/WidgetWindow.h";
+
+global
+{
+	void SetScale(int scale)
+    {
+	Window* win = g_selftest.utils->GetWindow();
+	ViewportController* controller = win->GetViewportController();
+	// notify viewport controller that we're changing scale
+	controller->GetViewportRequestListener()->OnZoomLevelChangeRequest(controller, (double)scale / 100.,
+									   0, VIEWPORT_CHANGE_REASON_INPUT_ACTION);
+	// change base scale, since reference images are made with truezoom off
+	controller->SetTrueZoomBaseScale(scale);
+	// also set visual device's layout scale directly - shouldn't be necessary but apparently it is
+	state.doc->GetVisualDevice()->SetLayoutScale(scale);
+	// force reflow, since SetTrueZoomBaseScale doesn't
+	state.doc->Reflow(TRUE);
+	win->SetScale(scale);
+    }
+
+	class MouseWheelWidget : public OpWidget
+	{
+	public:
+		MouseWheelWidget() : m_mouse_wheel(FALSE) {}
+		virtual BOOL OnMouseWheel(INT32 delta,BOOL vertical) { m_mouse_wheel = TRUE; return TRUE; }
+		BOOL m_mouse_wheel;
+	};
+
+	class ContextMenuWidget : public OpWidget
+	{
+	public:
+		ContextMenuWidget() : m_context_menu(FALSE) {}
+		virtual BOOL OnContextMenu(const OpPoint &menu_point, const OpRect *avoid_rect, BOOL keyboard_invoked)
+			{ m_context_menu = TRUE; return TRUE; }
+		BOOL m_context_menu;
+	};
+
+	class ContextMenuListener : public OpWidgetListener
+	{
+	public:
+		ContextMenuListener() : m_context_menu(FALSE) {}
+		virtual BOOL OnContextMenu(OpWidget* widget, INT32 child_index, const OpPoint &menu_point, const OpRect *avoid_rect, BOOL keyboard_invoked)
+			{ m_context_menu = TRUE; return TRUE; }
+		BOOL m_context_menu;
+	};
+
+	OpWidget* widget;
+	int fuzz = 5;
+}
+
+setup
+{
+	widget = NULL;
+}
+
+exit
+{
+	SetScale(100);
+}
+
+html
+{
+//! <html><body>
+//! <div><div style="height:100px"/><br/>
+//! <input id="w1" type="file" />
+//! </div>
+//! </body></html>
+}
+
+test("Setup #1")
+{
+	HTML_Element* w1 = find_element("input",1);
+	verify(w1);
+	FormObject* fo = w1->GetFormObject();
+	verify(fo);
+	widget = fo->GetWidget();
+	verify(widget);
+}
+
+test("GetScreenRect")
+	require success "Setup #1";
+{
+	SetScale(100);
+	OpRect b = widget->GetScreenRect();
+	SetScale(200);
+	OpRect a = widget->GetScreenRect();
+	verify(a.width > (b.width*2-fuzz));
+	verify(a.height > (b.height*2-fuzz));
+}
+
+test("GetBestDropdownPosition")
+	require success "Setup #1";
+{
+	SetScale(100);
+	OpRect b = WidgetWindow::GetBestDropdownPosition(widget, 100, 200);
+	SetScale(200);
+	OpRect a = WidgetWindow::GetBestDropdownPosition(widget, 100, 200);
+	verify(a.y > (b.y+fuzz));
+}
+
+html
+{
+//! <html><body>
+//!   <div style="position: absolute; top: 100px"><div style="height:200px"/><br/>
+//!   <input id="w1" type="file"style="transform: rotate(25deg)" />
+//! </div>
+//! </body></html>
+}
+
+test("Setup #2")
+{
+	HTML_Element* w1 = find_element("input",1);
+	verify(w1);
+	FormObject* fo = w1->GetFormObject();
+	verify(fo);
+	widget = fo->GetWidget();
+	verify(widget);
+}
+
+test("GetScreenRect + transforms")
+	require success "Setup #2";
+{
+	SetScale(100);
+	OpRect b = widget->GetScreenRect();
+	SetScale(200);
+	OpRect a = widget->GetScreenRect();
+	verify(a.width > (b.width+fuzz));
+	verify(a.height > (b.height+fuzz));
+}
+
+test("GetBestDropdownPosition + transforms")
+	require success "Setup #2";
+{
+	SetScale(100);
+	OpRect b = WidgetWindow::GetBestDropdownPosition(widget, 100, 200);
+	SetScale(200);
+	OpRect a = WidgetWindow::GetBestDropdownPosition(widget, 100, 200);
+	verify(a.y > (b.y+fuzz));
+}
+
+test("OnMouseWheel is propagated to parents")
+{
+	MouseWheelWidget* parent = OP_NEW(MouseWheelWidget, ());
+	verify(parent);
+	OpWidget* child = OP_NEW(OpWidget, ());
+	verify(child);
+	parent->AddChild(child);
+
+	verify(child->GenerateOnMouseWheel(0, TRUE));
+	verify(parent->m_mouse_wheel);
+}
+finally
+{
+	if (parent)
+		parent->Delete();
+}
+
+test("OnContextMenu is propagated to parents")
+{
+	OpWidget* const captured_widget = g_widget_globals->captured_widget;
+
+	ContextMenuWidget* parent = OP_NEW(ContextMenuWidget, ());
+	verify_not_oom(parent);
+	OpWidget* child = OP_NEW(OpWidget, ());
+	verify_not_oom(child);
+	parent->AddChild(child);
+	g_widget_globals->captured_widget = child;
+
+	child->GenerateOnMouseUp(OpPoint(), MOUSE_BUTTON_2);
+	verify(parent->m_context_menu);
+
+	OpWidget* grandchild = OP_NEW(OpWidget, ());
+	verify_not_oom(grandchild);
+	child->AddChild(grandchild);
+	ContextMenuListener listener;
+	child->SetListener(&listener);
+
+	parent->m_context_menu = FALSE;
+	g_widget_globals->captured_widget = grandchild;
+	grandchild->GenerateOnMouseUp(OpPoint(), MOUSE_BUTTON_2);
+	verify(listener.m_context_menu);
+	verify(!parent->m_context_menu);
+}
+finally
+{
+	if (parent)
+		parent->Delete();
+	g_widget_globals->captured_widget = captured_widget;
+}
+
+
+subtest FindWidget(const char* name)
+{
+	HTML_Element* elm = find_element(name, 1);
+	verify(elm);
+	FormObject* fo = elm->GetFormObject();
+	verify(fo);
+	widget = fo->GetWidget();
+	verify(widget);
+}
+
+subtest VerifyBorderBox(int w, int h)
+{
+	verify(FindWidget("textarea"));
+	INT32 box_width = 0, box_height = 0;
+	widget->GetBorderBox(box_width, box_height);
+	verify(box_width == w);
+	verify(box_height == h);
+}
+
+html
+{
+//! <!doctype html>
+//! <style>
+//!   textarea {
+//!     width: 100px;
+//!     height: 100px;
+//!   }
+//! </style>
+//! <textarea></textarea>
+}
+
+test("GetBorderBox, default border, default padding")
+{
+	VerifyBorderBox(106, 106);
+}
+
+html
+{
+//! <!doctype html>
+//! <style>
+//!   textarea {
+//!     width: 100px;
+//!     height: 100px;
+//!     box-sizing: border-box;
+//!   }
+//! </style>
+//! <textarea></textarea>
+}
+
+test("GetBorderBox, default border, explicit border-box")
+{
+	VerifyBorderBox(100, 100);
+}
+
+html
+{
+//! <!doctype html>
+//! <style>
+//!   textarea {
+//!     width: 100px;
+//!     height: 100px;
+//!     box-sizing: content-box;
+//!   }
+//! </style>
+//! <textarea></textarea>
+}
+
+test("GetBorderBox, default border, explicit content-box")
+{
+	VerifyBorderBox(106, 106);
+}
+
+html
+{
+//! <!doctype html>
+//! <style>
+//!   textarea {
+//!     width: 100px;
+//!     height: 100px;
+//!     padding: 10px;
+//!   }
+//! </style>
+//! <textarea></textarea>
+}
+
+test("GetBorderBox, default border, padding 10px")
+{
+	VerifyBorderBox(124, 124);
+}
+
+html
+{
+//! <!doctype html>
+//! <style>
+//!   textarea {
+//!     width: 100px;
+//!     height: 100px;
+//!     padding: 4px;
+//!     border: 10px solid black;
+//!   }
+//! </style>
+//! <textarea></textarea>
+}
+
+test("GetBorderBox, 10px border, 4px padding")
+{
+	VerifyBorderBox(128, 128);
+}
+
+html
+{
+//! <!doctype html>
+//! <style>
+//!   textarea {
+//!     width: 100px;
+//!     height: 100px;
+//!     padding: 0;
+//!     border-left: 10px solid black;
+//!     border-right: 7px solid black;
+//!     border-bottom: 5px solid black;
+//!     border-top: 8px solid black;
+//!     box-sizing: border-box;
+//!   }
+//! </style>
+//! <textarea></textarea>
+}
+
+test("GetBorderBox, uneven border")
+{
+	VerifyBorderBox(100, 100);
+}
+
+html
+{
+//! <!doctype html>
+//! <style>
+//!   textarea {
+//!     width: 100px;
+//!     height: 100px;
+//!     padding: 0;
+//!     border-left: 10px solid black;
+//!     border-right: 7px solid black;
+//!     border-bottom: 5px solid black;
+//!     border-top: 8px solid black;
+//!     box-sizing: content-box;
+//!     padding: 3px 7px 11px 13px;
+//!   }
+//! </style>
+//! <textarea></textarea>
+}
+
+test("GetBorderBox, uneven border, content-box")
+{
+	VerifyBorderBox(137, 127);
+}
+
+html
+{
+//! <!doctype html>
+//! <style>
+//!   textarea {
+//!     width: 100px;
+//!     height: 100px;
+//!     padding: 0;
+//!     border: 10px solid black;
+//!   }
+//! </style>
+//! <textarea></textarea>
+}
+
+test("GetBorderBox, 10px border")
+{
+	VerifyBorderBox(120, 120);
+}
+
+html
+{
+//! <!doctype html>
+//! <style>
+//!   textarea {
+//!     width: 100px;
+//!     height: 100px;
+//!     border: 10px solid black;
+//!     padding: 10px;
+//!   }
+//! </style>
+//! <textarea></textarea>
+}
+
+test("GetBorderBox, 10px border + 10px padding")
+{
+	VerifyBorderBox(140, 140);
+}
+
+html
+{
+//! <!doctype html>
+//! <style>
+//!   textarea {
+//!     width: 100px;
+//!     height: 100px;
+//!     border: none;
+//!     padding: 0;
+//!   }
+//! </style>
+//! <textarea></textarea>
+}
+
+test("GetBorderBox, no border")
+{
+	VerifyBorderBox(100, 100);
+}
+
+

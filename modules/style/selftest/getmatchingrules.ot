@@ -1,0 +1,1117 @@
+/* -*- Mode: c++; tab-width: 4; indent-tabs-mode: t; c-basic-offset: 4 -*- */
+
+group "style.getmatchingrules";
+
+require init;
+require STYLE_GETMATCHINGRULES_API;
+
+language C++;
+
+include "modules/doc/frm_doc.h";
+include "modules/style/css_collection.h";
+include "modules/style/css_dom.h";
+include "modules/style/css_property_list.h";
+
+global
+{
+	class TestListener : public CSS_MatchRuleListener {
+	public:
+		class RuleEntry : public Link {
+		public:
+			RuleEntry(HTML_Element* e, CSS_DOMRule* r, unsigned short s) : elm(e), rule(r), specificity(s) {}
+			HTML_Element* elm;
+			CSS_DOMRule* rule;
+			unsigned short specificity;
+			TempBuffer name, value, selector;
+
+			const uni_char* GetName() const { return name.GetStorage(); }
+			const uni_char* GetValue() const { return value.GetStorage(); }
+			const uni_char* GetSelector() const { return selector.GetStorage(); }
+		};
+		class StyleEntry : public Link {
+		public:
+			StyleEntry(Markup::Type t, uni_char* n, uni_char* v) : type(t), name(n), value(v) {}
+			~StyleEntry() { OP_DELETEA(name); OP_DELETEA(value); }
+			Markup::Type type;
+			uni_char* name;
+			uni_char* value;
+		};
+
+		TestListener(int pseudo_classes = 0)
+			: pseudo_classes(pseudo_classes)
+			, pseudo_type(ELM_NOT_PSEUDO)
+		{}
+
+		TestListener(PseudoElementType pseudo_type)
+			: pseudo_classes(0)
+			, pseudo_type(pseudo_type)
+		{}
+
+		~TestListener()
+		{
+			rulelist.Clear();
+			inline_list.Clear();
+			default_list.Clear();
+		}
+		OP_STATUS RuleMatched(const CSS_MatchElement& elm, CSS_DOMRule* rule, unsigned short specificity);
+		Head rulelist;
+		Head inline_list;
+		Head default_list;
+		DOM_Environment* dom_env;
+		int pseudo_classes;
+		PseudoElementType pseudo_type;
+
+		OP_STATUS LocalRuleMatched(const CSS_MatchElement& elm, CSS_DOMRule* rule, unsigned short specificity);
+		OP_STATUS InlineStyle(const CSS_MatchElement& elm, CSS_property_list* style);
+		OP_STATUS DefaultStyle(const CSS_MatchElement& elm, CSS_property_list* style);
+		OP_STATUS AddStyle(HTML_Element* element, CSS_property_list* style, Head* list);
+		BOOL MatchPseudo(int pseudo);
+
+		/**
+		 * Store up to 'count' RuleEntries in the specified array (which is
+		 * assumed to be large enough to contain 'count' number of items).
+		 *
+		 * @return The true number of entries available (may be larger or smaller
+		 *         than 'count'.
+		 */
+		unsigned GetRuleEntries(RuleEntry** entries, unsigned count) const;
+
+		/**
+		 * Get an element of the specified type, or NULL if there's no such
+		 * element.
+		 */
+		HTML_Element* GetElement(Markup::Type he_type);
+
+		/**
+		 * Get the matching rules for the first element of the specififed type.
+		 */
+		OP_STATUS GetMatchingRules(Markup::Type he_type, CSS_MatchRuleListener* listener);
+	};
+
+	OP_STATUS TestListener::RuleMatched(const CSS_MatchElement& elm, CSS_DOMRule* rule, unsigned short specificity)
+	{
+		RuleEntry* e = OP_NEW(RuleEntry, (elm.GetHtmlElement(), rule, specificity));
+		if (!e)
+			return OpStatus::ERR_NO_MEMORY;
+		e->Into(&rulelist);
+		BOOL important;
+		RETURN_IF_ERROR(rule->GetPropertyNameAndValue(0, &e->name, &e->value, important));
+		RETURN_IF_ERROR(rule->GetSelectorText(&e->selector));
+
+		DOM_Object* dom_rule;
+		if (dom_env)
+			return dom_env->ConstructCSSRule(dom_rule, rule);
+		else
+			return OpStatus::OK;
+	}
+
+	OP_STATUS TestListener::LocalRuleMatched(const CSS_MatchElement& elm, CSS_DOMRule* rule, unsigned short specificity)
+	{
+		// No local stylesheets should be used. They will affect the test results.
+		OP_ASSERT(FALSE);
+		return OpStatus::OK;
+	}
+
+	OP_STATUS TestListener::InlineStyle(const CSS_MatchElement& elm, CSS_property_list* style)
+	{
+		return AddStyle(elm.GetHtmlElement(), style, &inline_list);
+	}
+
+	OP_STATUS TestListener::DefaultStyle(const CSS_MatchElement& elm, CSS_property_list* style)
+	{
+		return AddStyle(elm.GetHtmlElement(), style, &default_list);
+	}
+
+	BOOL TestListener::MatchPseudo(int pseudo)
+	{
+		return (pseudo & pseudo_classes) != 0;
+	}
+
+	OP_STATUS TestListener::AddStyle(HTML_Element* element, CSS_property_list* style, Head* list)
+	{
+#ifdef STYLE_PROPNAMEANDVALUE_API
+		TempBuffer name, value;
+		BOOL important;
+		int len = style->GetLength();
+		for (int i=0; i<len; i++)
+		{
+			name.Clear(); value.Clear();
+			RETURN_IF_ERROR(style->GetPropertyNameAndValue(i, &name, &value, important));
+			uni_char* nam = SetNewStr(name.GetStorage());
+			ANCHOR_ARRAY(uni_char, nam);
+			uni_char* val = SetNewStr(value.GetStorage());
+			ANCHOR_ARRAY(uni_char, val);
+			if (nam && val)
+			{
+				StyleEntry* entry = OP_NEW(StyleEntry, (element->Type(), nam, val));
+				if (!entry )
+					return OpStatus::ERR_NO_MEMORY;
+				entry->Into(list);
+				ANCHOR_ARRAY_RELEASE(nam);
+				ANCHOR_ARRAY_RELEASE(val);
+			}
+			else
+				return OpStatus::ERR_NO_MEMORY;
+		}
+#endif // STYLE_PROPNAMEANDVALUE_API
+		return OpStatus::OK;
+	}
+
+	unsigned TestListener::GetRuleEntries(RuleEntry** entries, unsigned count) const
+	{
+		OP_ASSERT(entries);
+
+		unsigned size = rulelist.Cardinal();
+
+		RuleEntry* entry = static_cast<RuleEntry*>(rulelist.First());
+		unsigned i = 0;
+
+		while (entry && i < count)
+		{
+			entries[i++] = entry;
+			entry = static_cast<RuleEntry*>(entry->Suc());
+		}
+
+		return size;
+	}
+
+	HTML_Element* TestListener::GetElement(Markup::Type he_type)
+	{
+		FramesDocument* current_doc = state.doc;
+		RETURN_VALUE_IF_NULL(current_doc, NULL);
+
+		HTML_Element* elm = current_doc->GetDocRoot();
+
+		while (elm && elm->Type() != he_type)
+			elm = elm->Next();
+
+		return elm;
+	}
+
+	OP_STATUS TestListener::GetMatchingRules(Markup::Type he_type, CSS_MatchRuleListener* listener)
+	{
+		OP_ASSERT(listener);
+
+		FramesDocument* current_doc = state.doc;
+		RETURN_VALUE_IF_NULL(current_doc, OpStatus::ERR);
+
+		HTML_Element* elm = GetElement(he_type);
+		RETURN_VALUE_IF_NULL(elm, OpStatus::ERR);
+
+		RETURN_IF_ERROR(current_doc->ConstructDOMEnvironment());
+
+		dom_env = current_doc->GetDOMEnvironment();
+		RETURN_VALUE_IF_NULL(dom_env, OpStatus::ERR);
+
+		CSS_Properties props;
+		CSSCollection* collection = const_cast<CSSCollection*>(current_doc->GetHLDocProfile()->GetCSSCollection());
+
+		CSS_MatchElement element(elm, pseudo_type);
+		return collection->GetMatchingStyleRules(element, &props, CSS_MEDIA_TYPE_SCREEN, TRUE, listener);
+	}
+}
+
+html
+{
+	//! <link rel="stylesheet" type="text/css" href="data:text/css,body {color: red;}">
+	//! <style>
+    //! @import url("data:text/css,span.x { color: cyan; }");
+	//! div { color: green; display: block; }
+	//! </style>
+	//! <body style="background-color: black"><span class="x"><div></div></span></body>
+}
+
+test("GetMatchingStyleRules")
+{
+	FramesDocument* current_doc = state.doc;
+	HTML_Element* elm = current_doc->GetDocRoot();
+	while (elm && elm->Type() != Markup::HTE_DIV)
+		elm = elm->Next();
+
+	verify(elm != NULL);
+
+	TestListener listener;
+
+	verify(current_doc->ConstructDOMEnvironment() == OpStatus::OK);
+
+	listener.dom_env = current_doc->GetDOMEnvironment();
+
+	verify(listener.dom_env != NULL);
+
+	CSSCollection* collection = const_cast<CSSCollection*>(current_doc->GetHLDocProfile()->GetCSSCollection());
+	CSS_Properties props;
+	CSS_MatchElement element(elm);
+	OP_STATUS stat = collection->GetMatchingStyleRules(element,
+													   &props,
+													   CSS_MEDIA_TYPE_SCREEN,
+													   TRUE,
+													   &listener);
+
+	verify (stat == OpStatus::OK);
+	if (stat == OpStatus::OK)
+	{
+		UINT size = listener.rulelist.Cardinal();
+		verify(size == 3);
+		if (size == 3)
+		{
+			TestListener::RuleEntry* entry = static_cast<TestListener::RuleEntry*>(listener.rulelist.First());
+			verify(entry->elm->Type() == Markup::HTE_DIV);
+			verify(entry->rule);
+#ifdef STYLE_PROPNAMEANDVALUE_API
+			verify(entry->rule->GetPropertyCount() == 2);
+			TempBuffer name;
+			TempBuffer value;
+			BOOL important;
+			verify(entry->rule->GetPropertyNameAndValue(0, &name, &value, important) == OpStatus::OK);
+			verify(uni_strcmp(name.GetStorage(), UNI_L("color")) == 0);
+			verify(uni_strcmp(value.GetStorage(), UNI_L("rgb(0, 128, 0)")) == 0);
+			name.Clear();
+			value.Clear();
+			verify(entry->rule->GetPropertyNameAndValue(1, &name, &value, important) == OpStatus::OK);
+			verify(uni_strcmp(name.GetStorage(), UNI_L("display")) == 0);
+			verify(uni_strcmp(value.GetStorage(), UNI_L("block")) == 0);
+#endif // STYLE_PROPNAMEANDVALUE_API
+			entry = static_cast<TestListener::RuleEntry*>(entry->Suc());
+			verify(entry->elm->Type() == Markup::HTE_SPAN);
+			verify(entry->rule);
+			entry = static_cast<TestListener::RuleEntry*>(entry->Suc());
+			verify(entry->elm->Type() == Markup::HTE_BODY);
+			verify(entry->rule);
+		}
+
+#if defined(STYLE_MATCH_INLINE_DEFAULT_API) && defined(STYLE_PROPNAMEANDVALUE_API)
+		size = listener.inline_list.Cardinal();
+		verify(size == 1);
+		if (size == 1)
+		{
+			TestListener::StyleEntry* entry = static_cast<TestListener::StyleEntry*>(listener.inline_list.First());
+			verify(entry->type == Markup::HTE_BODY);
+			verify(uni_strcmp(entry->name, UNI_L("background-color")) == 0);
+			verify(uni_strcmp(entry->value, UNI_L("rgb(0, 0, 0)")) == 0);
+		}
+
+		size = listener.default_list.Cardinal();
+		verify(size == 7);
+		if (size == 7)
+		{
+			TestListener::StyleEntry* entry = static_cast<TestListener::StyleEntry*>(listener.default_list.First());
+			verify(entry->type == Markup::HTE_DIV);
+			verify(uni_strcmp(entry->name, UNI_L("display")) == 0);
+			verify(uni_strcmp(entry->value, UNI_L("block")) == 0);
+
+			entry = static_cast<TestListener::StyleEntry*>(entry->Suc());
+			verify(entry->type == Markup::HTE_BODY);
+			verify(uni_strcmp(entry->name, UNI_L("display")) == 0);
+			verify(uni_strcmp(entry->value, UNI_L("block")) == 0);
+
+			entry = static_cast<TestListener::StyleEntry*>(entry->Suc());
+			verify(entry->type == Markup::HTE_BODY);
+			verify(uni_strcmp(entry->name, UNI_L("margin-top")) == 0);
+			verify(uni_strcmp(entry->value, UNI_L("8px")) == 0);
+
+			entry = static_cast<TestListener::StyleEntry*>(entry->Suc());
+			verify(entry->type == Markup::HTE_BODY);
+			verify(uni_strcmp(entry->name, UNI_L("margin-left")) == 0);
+			verify(uni_strcmp(entry->value, UNI_L("8px")) == 0);
+
+			entry = static_cast<TestListener::StyleEntry*>(entry->Suc());
+			verify(entry->type == Markup::HTE_BODY);
+			verify(uni_strcmp(entry->name, UNI_L("margin-right")) == 0);
+			verify(uni_strcmp(entry->value, UNI_L("8px")) == 0);
+
+			entry = static_cast<TestListener::StyleEntry*>(entry->Suc());
+			verify(entry->type == Markup::HTE_BODY);
+			verify(uni_strcmp(entry->name, UNI_L("margin-bottom")) == 0);
+			verify(uni_strcmp(entry->value, UNI_L("8px")) == 0);
+
+			entry = static_cast<TestListener::StyleEntry*>(entry->Suc());
+			verify(entry->type == Markup::HTE_HTML);
+			verify(uni_strcmp(entry->name, UNI_L("display")) == 0);
+			verify(uni_strcmp(entry->value, UNI_L("block")) == 0);
+		}
+#endif // defined(STYLE_MATCH_INLINE_DEFAULT_API) && defined(STYLE_PROPNAMEANDVALUE_API)
+	}
+}
+
+html
+{
+	//! <style>
+	//! div { color: #feebee; display: block; }
+	//! #div { text-decoration: underline; }
+	//! span { text-decoration: none; }
+	//! </style>
+	//! <body style="background-color: black"><div id="div"><span></span></div></body>
+}
+
+test("GetMatchingStyleRules - Check CSS_Properties result.")
+{
+	FramesDocument* current_doc = state.doc;
+	HTML_Element* elm = current_doc->GetDocRoot();
+	while (elm && elm->Type() != Markup::HTE_SPAN)
+		elm = elm->Next();
+
+	verify(elm != NULL);
+
+	TestListener listener;
+
+	verify(current_doc->ConstructDOMEnvironment() == OpStatus::OK);
+
+	listener.dom_env = current_doc->GetDOMEnvironment();
+
+	verify(listener.dom_env != NULL);
+
+	CSS_Properties props;
+	CSS_MatchElement element(elm);
+	CSSCollection* collection = const_cast<CSSCollection*>(current_doc->GetHLDocProfile()->GetCSSCollection());
+	OP_STATUS stat = collection->GetMatchingStyleRules(element,
+													   &props,
+													   CSS_MEDIA_TYPE_SCREEN,
+													   TRUE,
+													   &listener);
+
+	verify (stat == OpStatus::OK);
+	if (stat == OpStatus::OK)
+	{
+		verify(props.GetDecl(CSS_PROPERTY_display) == NULL);
+		verify(props.GetDecl(CSS_PROPERTY_background_color) == NULL);
+
+		CSS_decl* color_decl = props.GetDecl(CSS_PROPERTY_color);
+		verify(color_decl != NULL);
+		if (color_decl)
+		{
+			verify(color_decl->GetDeclType() == CSS_DECL_LONG);
+			verify(color_decl->LongValue() == OP_RGB(0xfe, 0xeb, 0xee));
+		}
+		CSS_decl* textdec_decl = props.GetDecl(CSS_PROPERTY_text_decoration);
+		verify(textdec_decl != NULL);
+		if (textdec_decl)
+		{
+			verify(textdec_decl->GetDeclType() == CSS_DECL_TYPE);
+			verify(textdec_decl->TypeValue() == CSS_VALUE_none);
+		}
+	}
+}
+
+html
+{
+	//! <body background="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAAAXNSR0IArs4c6QAAAAxJREFUCNdjYGhgAAABBACBodXY+gAAAABJRU5ErkJggg=="></body>
+}
+
+test("GetMatchingStyleRules - Default style from background attribute.")
+{
+	FramesDocument* current_doc = state.doc;
+	HTML_Element* elm = current_doc->GetDocRoot();
+	while (elm && elm->Type() != Markup::HTE_BODY)
+		elm = elm->Next();
+
+	verify(elm != NULL);
+
+	TestListener listener;
+
+	verify(current_doc->ConstructDOMEnvironment() == OpStatus::OK);
+
+	listener.dom_env = current_doc->GetDOMEnvironment();
+
+	verify(listener.dom_env != NULL);
+
+	CSSCollection* collection = const_cast<CSSCollection*>(current_doc->GetHLDocProfile()->GetCSSCollection());
+	CSS_Properties props;
+	CSS_MatchElement element(elm);
+	OP_STATUS stat = collection->GetMatchingStyleRules(element,
+													   &props,
+													   CSS_MEDIA_TYPE_SCREEN,
+													   TRUE,
+													   &listener);
+
+	verify (stat == OpStatus::OK);
+
+#if defined(STYLE_MATCH_INLINE_DEFAULT_API) && defined(STYLE_PROPNAMEANDVALUE_API)
+	UINT size = listener.default_list.Cardinal();
+	verify(size == 7);
+	if (size == 7)
+	{
+		TestListener::StyleEntry* entry = static_cast<TestListener::StyleEntry*>(listener.default_list.First());
+		verify(entry->type == Markup::HTE_BODY);
+		verify(uni_strcmp(entry->name, UNI_L("display")) == 0);
+		verify(uni_strcmp(entry->value, UNI_L("block")) == 0);
+
+		entry = static_cast<TestListener::StyleEntry*>(entry->Suc());
+		verify(entry->type == Markup::HTE_BODY);
+		verify(uni_strcmp(entry->name, UNI_L("margin-top")) == 0);
+		verify(uni_strcmp(entry->value, UNI_L("8px")) == 0);
+
+		entry = static_cast<TestListener::StyleEntry*>(entry->Suc());
+		verify(entry->type == Markup::HTE_BODY);
+		verify(uni_strcmp(entry->name, UNI_L("margin-left")) == 0);
+		verify(uni_strcmp(entry->value, UNI_L("8px")) == 0);
+
+		entry = static_cast<TestListener::StyleEntry*>(entry->Suc());
+		verify(entry->type == Markup::HTE_BODY);
+		verify(uni_strcmp(entry->name, UNI_L("margin-right")) == 0);
+		verify(uni_strcmp(entry->value, UNI_L("8px")) == 0);
+
+		entry = static_cast<TestListener::StyleEntry*>(entry->Suc());
+		verify(entry->type == Markup::HTE_BODY);
+		verify(uni_strcmp(entry->name, UNI_L("margin-bottom")) == 0);
+		verify(uni_strcmp(entry->value, UNI_L("8px")) == 0);
+
+		entry = static_cast<TestListener::StyleEntry*>(entry->Suc());
+		verify(entry->type == Markup::HTE_BODY);
+		verify(uni_strcmp(entry->name, UNI_L("background-image")) == 0);
+		verify(uni_strncmp(entry->value, UNI_L("url(\"data:image/png;"), 20) == 0);
+
+		entry = static_cast<TestListener::StyleEntry*>(entry->Suc());
+		verify(entry->type == Markup::HTE_HTML);
+		verify(uni_strcmp(entry->name, UNI_L("display")) == 0);
+		verify(uni_strcmp(entry->value, UNI_L("block")) == 0);
+	}
+#endif // defined(STYLE_MATCH_INLINE_DEFAULT_API) && defined(STYLE_PROPNAMEANDVALUE_API)
+}
+
+html
+{
+	//! <style>
+	//! #t { background-color: #ff0000; }
+	//! #t:hover { background-color: #00ff00; }
+	//! </style>
+	//! <body><div id="t">Hi</div></body>
+}
+
+test("GetMatchingStyleRules - :hover (match)")
+{
+	TestListener listener(CSS_PSEUDO_CLASS_HOVER);
+	verify(OpStatus::IsSuccess(listener.GetMatchingRules(Markup::HTE_DIV, &listener)));
+
+	TestListener::RuleEntry* r[2];
+	verify(listener.GetRuleEntries(r, 2) == 2);
+
+	verify(uni_str_eq(r[0]->GetSelector(), "#t:hover"));
+	verify(uni_str_eq(r[0]->GetName(), "background-color"));
+	verify(uni_str_eq(r[0]->GetValue(), "rgb(0, 255, 0)"));
+
+	verify(uni_str_eq(r[1]->GetSelector(), "#t"));
+	verify(uni_str_eq(r[1]->GetName(), "background-color"));
+	verify(uni_str_eq(r[1]->GetValue(), "rgb(255, 0, 0)"));
+}
+
+test("GetMatchingStyleRules - :hover (do not match)")
+{
+	TestListener listener;
+	verify(OpStatus::IsSuccess(listener.GetMatchingRules(Markup::HTE_DIV, &listener)));
+
+	TestListener::RuleEntry* r[1];
+	verify(listener.GetRuleEntries(r, 1) == 1);
+
+	verify(uni_str_eq(r[0]->GetSelector(), "#t"));
+	verify(uni_str_eq(r[0]->GetName(), "background-color"));
+	verify(uni_str_eq(r[0]->GetValue(), "rgb(255, 0, 0)"));
+}
+
+html
+{
+	//! <style>
+	//! #t { background-color: #ff0000; }
+	//! #t:focus { background-color: #00ff00; }
+	//! </style>
+	//! <body><input id="t" type="button" value="Hi"/></body>
+}
+
+test("GetMatchingStyleRules - :focus (match)")
+{
+	TestListener listener(CSS_PSEUDO_CLASS_FOCUS);
+	verify(OpStatus::IsSuccess(listener.GetMatchingRules(Markup::HTE_INPUT, &listener)));
+
+	TestListener::RuleEntry* r[2];
+	verify(listener.GetRuleEntries(r, 2) == 2);
+
+	verify(uni_str_eq(r[0]->GetSelector(), "#t:focus"));
+	verify(uni_str_eq(r[0]->GetName(), "background-color"));
+	verify(uni_str_eq(r[0]->GetValue(), "rgb(0, 255, 0)"));
+
+	verify(uni_str_eq(r[1]->GetSelector(), "#t"));
+	verify(uni_str_eq(r[1]->GetName(), "background-color"));
+	verify(uni_str_eq(r[1]->GetValue(), "rgb(255, 0, 0)"));
+}
+
+test("GetMatchingStyleRules - :focus (do not match)")
+{
+	TestListener listener;
+	verify(OpStatus::IsSuccess(listener.GetMatchingRules(Markup::HTE_INPUT, &listener)));
+
+	TestListener::RuleEntry* r[1];
+	verify(listener.GetRuleEntries(r, 1) == 1);
+
+	verify(uni_str_eq(r[0]->GetSelector(), "#t"));
+	verify(uni_str_eq(r[0]->GetName(), "background-color"));
+	verify(uni_str_eq(r[0]->GetValue(), "rgb(255, 0, 0)"));
+}
+
+html
+{
+	//! <style>
+	//! a { background-color: #ff0000; }
+	//! a:active { background-color: #00ff00; }
+	//! </style>
+	//! <body><a href="http://soruyvmspgjeueofmvhsu.com">Hi</a></body>
+}
+
+test("GetMatchingStyleRules - :active (match)")
+{
+	TestListener listener(CSS_PSEUDO_CLASS_ACTIVE);
+	verify(OpStatus::IsSuccess(listener.GetMatchingRules(Markup::HTE_A, &listener)));
+
+	TestListener::RuleEntry* r[2];
+	verify(listener.GetRuleEntries(r, 2) == 2);
+
+	verify(uni_str_eq(r[0]->GetSelector(), "a:active"));
+	verify(uni_str_eq(r[0]->GetName(), "background-color"));
+	verify(uni_str_eq(r[0]->GetValue(), "rgb(0, 255, 0)"));
+
+	verify(uni_str_eq(r[1]->GetSelector(), "a"));
+	verify(uni_str_eq(r[1]->GetName(), "background-color"));
+	verify(uni_str_eq(r[1]->GetValue(), "rgb(255, 0, 0)"));
+}
+
+test("GetMatchingStyleRules - :active (do not match)")
+{
+	TestListener listener;
+	verify(OpStatus::IsSuccess(listener.GetMatchingRules(Markup::HTE_A, &listener)));
+
+	TestListener::RuleEntry* r[1];
+	verify(listener.GetRuleEntries(r, 1) == 1);
+
+	verify(uni_str_eq(r[0]->GetSelector(), "a"));
+	verify(uni_str_eq(r[0]->GetName(), "background-color"));
+	verify(uni_str_eq(r[0]->GetValue(), "rgb(255, 0, 0)"));
+}
+
+html
+{
+	//! <style>
+	//! a { background-color: #ff0000; }
+	//! a:visited { background-color: #00ff00; }
+	//! </style>
+	//! <body><a href="http://soruyvmspgjeueofmvhsu.com">Hi</a></body>
+}
+
+test("GetMatchingStyleRules - :visited (match)")
+{
+	TestListener listener(CSS_PSEUDO_CLASS_VISITED);
+	verify(OpStatus::IsSuccess(listener.GetMatchingRules(Markup::HTE_A, &listener)));
+
+	TestListener::RuleEntry* r[2];
+	verify(listener.GetRuleEntries(r, 2) == 2);
+
+	verify(uni_str_eq(r[0]->GetSelector(), "a:visited"));
+	verify(uni_str_eq(r[0]->GetName(), "background-color"));
+	verify(uni_str_eq(r[0]->GetValue(), "rgb(0, 255, 0)"));
+
+	verify(uni_str_eq(r[1]->GetSelector(), "a"));
+	verify(uni_str_eq(r[1]->GetName(), "background-color"));
+	verify(uni_str_eq(r[1]->GetValue(), "rgb(255, 0, 0)"));
+}
+
+test("GetMatchingStyleRules - :visited (do not match)")
+{
+	TestListener listener;
+	verify(OpStatus::IsSuccess(listener.GetMatchingRules(Markup::HTE_A, &listener)));
+
+	TestListener::RuleEntry* r[1];
+	verify(listener.GetRuleEntries(r, 1) == 1);
+
+	verify(uni_str_eq(r[0]->GetSelector(), "a"));
+	verify(uni_str_eq(r[0]->GetName(), "background-color"));
+	verify(uni_str_eq(r[0]->GetValue(), "rgb(255, 0, 0)"));
+}
+
+html
+{
+	//! <style>
+	//! div { background-color: #ff0000; }
+	//! div::first-line { background-color: #00ff00; }
+	//! </style>
+	//! <body><div>Hi</div></body>
+}
+
+test("GetMatchingStyleRules - ::first-line (match)")
+{
+	TestListener listener(CSS_PSEUDO_CLASS_FIRST_LINE);
+	verify(OpStatus::IsSuccess(listener.GetMatchingRules(Markup::HTE_DIV, &listener)));
+
+	TestListener::RuleEntry* r[2];
+	verify(listener.GetRuleEntries(r, 2) == 2);
+
+	verify(uni_str_eq(r[0]->GetSelector(), "div::first-line"));
+	verify(uni_str_eq(r[0]->GetName(), "background-color"));
+	verify(uni_str_eq(r[0]->GetValue(), "rgb(0, 255, 0)"));
+
+	verify(uni_str_eq(r[1]->GetSelector(), "div"));
+	verify(uni_str_eq(r[1]->GetName(), "background-color"));
+	verify(uni_str_eq(r[1]->GetValue(), "rgb(255, 0, 0)"));
+}
+
+test("GetMatchingStyleRules - ::first-line (do not match)")
+{
+	TestListener listener;
+	verify(OpStatus::IsSuccess(listener.GetMatchingRules(Markup::HTE_DIV, &listener)));
+
+	TestListener::RuleEntry* r[1];
+	verify(listener.GetRuleEntries(r, 1) == 1);
+
+	verify(uni_str_eq(r[0]->GetSelector(), "div"));
+	verify(uni_str_eq(r[0]->GetName(), "background-color"));
+	verify(uni_str_eq(r[0]->GetValue(), "rgb(255, 0, 0)"));
+}
+
+html
+{
+	//! <style>
+	//! div { background-color: #ff0000; }
+	//! div::first-letter { background-color: #00ff00; }
+	//! </style>
+	//! <body><div>Hi</div></body>
+}
+
+test("GetMatchingStyleRules - ::first-letter (match)")
+{
+	TestListener listener(CSS_PSEUDO_CLASS_FIRST_LETTER);
+	verify(OpStatus::IsSuccess(listener.GetMatchingRules(Markup::HTE_DIV, &listener)));
+
+	TestListener::RuleEntry* r[2];
+	verify(listener.GetRuleEntries(r, 2) == 2);
+
+	verify(uni_str_eq(r[0]->GetSelector(), "div::first-letter"));
+	verify(uni_str_eq(r[0]->GetName(), "background-color"));
+	verify(uni_str_eq(r[0]->GetValue(), "rgb(0, 255, 0)"));
+
+	verify(uni_str_eq(r[1]->GetSelector(), "div"));
+	verify(uni_str_eq(r[1]->GetName(), "background-color"));
+	verify(uni_str_eq(r[1]->GetValue(), "rgb(255, 0, 0)"));
+}
+
+test("GetMatchingStyleRules - ::first-letter (do not match)")
+{
+	TestListener listener;
+	verify(OpStatus::IsSuccess(listener.GetMatchingRules(Markup::HTE_DIV, &listener)));
+
+	TestListener::RuleEntry* r[1];
+	verify(listener.GetRuleEntries(r, 1) == 1);
+
+	verify(uni_str_eq(r[0]->GetSelector(), "div"));
+	verify(uni_str_eq(r[0]->GetName(), "background-color"));
+	verify(uni_str_eq(r[0]->GetValue(), "rgb(255, 0, 0)"));
+}
+
+html
+{
+	//! <style>
+	//! div { background-color: #ff0000; }
+	//! div::before { content: "weehee"; }
+	//! </style>
+	//! <body><div>Hi</div></body>
+}
+
+test("GetMatchingStyleRules - ::before (match)")
+{
+	TestListener listener(CSS_PSEUDO_CLASS_BEFORE);
+	verify(OpStatus::IsSuccess(listener.GetMatchingRules(Markup::HTE_DIV, &listener)));
+
+	TestListener::RuleEntry* r[2];
+	verify(listener.GetRuleEntries(r, 2) == 2);
+
+	verify(uni_str_eq(r[0]->GetSelector(), "div::before"));
+	verify(uni_str_eq(r[0]->GetName(), "content"));
+	verify(uni_str_eq(r[0]->GetValue(), "\"weehee\""));
+
+	verify(uni_str_eq(r[1]->GetSelector(), "div"));
+	verify(uni_str_eq(r[1]->GetName(), "background-color"));
+	verify(uni_str_eq(r[1]->GetValue(), "rgb(255, 0, 0)"));
+}
+
+test("GetMatchingStyleRules - ::before (do not match)")
+{
+	TestListener listener;
+	verify(OpStatus::IsSuccess(listener.GetMatchingRules(Markup::HTE_DIV, &listener)));
+
+	TestListener::RuleEntry* r[1];
+	verify(listener.GetRuleEntries(r, 1) == 1);
+
+	verify(uni_str_eq(r[0]->GetSelector(), "div"));
+	verify(uni_str_eq(r[0]->GetName(), "background-color"));
+	verify(uni_str_eq(r[0]->GetValue(), "rgb(255, 0, 0)"));
+}
+
+html
+{
+	//! <style>
+	//! div { background-color: #ff0000; }
+	//! div::after { content: "weehee"; }
+	//! </style>
+	//! <body><div>Hi</div></body>
+}
+
+test("GetMatchingStyleRules - ::after (match)")
+{
+	TestListener listener(CSS_PSEUDO_CLASS_AFTER);
+	verify(OpStatus::IsSuccess(listener.GetMatchingRules(Markup::HTE_DIV, &listener)));
+
+	TestListener::RuleEntry* r[2];
+	verify(listener.GetRuleEntries(r, 2) == 2);
+
+	verify(uni_str_eq(r[0]->GetSelector(), "div::after"));
+	verify(uni_str_eq(r[0]->GetName(), "content"));
+	verify(uni_str_eq(r[0]->GetValue(), "\"weehee\""));
+
+	verify(uni_str_eq(r[1]->GetSelector(), "div"));
+	verify(uni_str_eq(r[1]->GetName(), "background-color"));
+	verify(uni_str_eq(r[1]->GetValue(), "rgb(255, 0, 0)"));
+}
+
+test("GetMatchingStyleRules - ::after (do not match)")
+{
+	TestListener listener;
+	verify(OpStatus::IsSuccess(listener.GetMatchingRules(Markup::HTE_DIV, &listener)));
+
+	TestListener::RuleEntry* r[1];
+	verify(listener.GetRuleEntries(r, 1) == 1);
+
+	verify(uni_str_eq(r[0]->GetSelector(), "div"));
+	verify(uni_str_eq(r[0]->GetName(), "background-color"));
+	verify(uni_str_eq(r[0]->GetValue(), "rgb(255, 0, 0)"));
+}
+
+html
+{
+	//! <style>
+	//! p { background-color: #ff0000; }
+	//! p::selection { background-color: #00ff00; }
+	//! </style>
+	//! <body><p>Hi</p></body>
+}
+
+test("GetMatchingStyleRules - ::selection (match)")
+{
+	TestListener listener(CSS_PSEUDO_CLASS_SELECTION);
+	verify(OpStatus::IsSuccess(listener.GetMatchingRules(Markup::HTE_P, &listener)));
+
+	TestListener::RuleEntry* r[2];
+	verify(listener.GetRuleEntries(r, 2) == 2);
+
+	verify(uni_str_eq(r[0]->GetSelector(), "p::selection"));
+	verify(uni_str_eq(r[0]->GetName(), "background-color"));
+	verify(uni_str_eq(r[0]->GetValue(), "rgb(0, 255, 0)"));
+
+	verify(uni_str_eq(r[1]->GetSelector(), "p"));
+	verify(uni_str_eq(r[1]->GetName(), "background-color"));
+	verify(uni_str_eq(r[1]->GetValue(), "rgb(255, 0, 0)"));
+}
+
+test("GetMatchingStyleRules - ::selection (do not match)")
+{
+	TestListener listener;
+	verify(OpStatus::IsSuccess(listener.GetMatchingRules(Markup::HTE_P, &listener)));
+
+	TestListener::RuleEntry* r[1];
+	verify(listener.GetRuleEntries(r, 1) == 1);
+
+	verify(uni_str_eq(r[0]->GetSelector(), "p"));
+	verify(uni_str_eq(r[0]->GetName(), "background-color"));
+	verify(uni_str_eq(r[0]->GetValue(), "rgb(255, 0, 0)"));
+}
+
+
+html
+{
+	//! <style>
+	//! div { background-color: #ff0000; }
+	//! div::first-line { background-color: #00ff00; }
+	//! </style>
+	//! <body><div>Hi</div></body>
+}
+
+test("GetMatchingStyleRules - ::first-line (pseudo-element)")
+{
+	TestListener listener(ELM_PSEUDO_FIRST_LINE);
+	verify(OpStatus::IsSuccess(listener.GetMatchingRules(Markup::HTE_DIV, &listener)));
+
+	TestListener::RuleEntry* r[2];
+	verify(listener.GetRuleEntries(r, 2) == 2);
+
+	verify(uni_str_eq(r[0]->GetSelector(), "div::first-line"));
+	verify(uni_str_eq(r[0]->GetName(), "background-color"));
+	verify(uni_str_eq(r[0]->GetValue(), "rgb(0, 255, 0)"));
+
+	verify(uni_str_eq(r[1]->GetSelector(), "div"));
+	verify(uni_str_eq(r[1]->GetName(), "background-color"));
+	verify(uni_str_eq(r[1]->GetValue(), "rgb(255, 0, 0)"));
+}
+
+test("GetMatchingStyleRules - ::first-line (parent)")
+{
+	TestListener listener;
+	verify(OpStatus::IsSuccess(listener.GetMatchingRules(Markup::HTE_DIV, &listener)));
+
+	TestListener::RuleEntry* r[1];
+	verify(listener.GetRuleEntries(r, 1) == 1);
+
+	verify(uni_str_eq(r[0]->GetSelector(), "div"));
+	verify(uni_str_eq(r[0]->GetName(), "background-color"));
+	verify(uni_str_eq(r[0]->GetValue(), "rgb(255, 0, 0)"));
+}
+
+
+html
+{
+	//! <style>
+	//! div { background-color: #ff0000; }
+	//! div::first-letter { background-color: #00ff00; }
+	//! </style>
+	//! <body><div>Hi</div></body>
+}
+
+test("GetMatchingStyleRules - ::first-letter (pseudo-element)")
+{
+	TestListener listener(ELM_PSEUDO_FIRST_LETTER);
+	verify(OpStatus::IsSuccess(listener.GetMatchingRules(Markup::HTE_DIV, &listener)));
+
+	TestListener::RuleEntry* r[2];
+	verify(listener.GetRuleEntries(r, 2) == 2);
+
+	verify(uni_str_eq(r[0]->GetSelector(), "div::first-letter"));
+	verify(uni_str_eq(r[0]->GetName(), "background-color"));
+	verify(uni_str_eq(r[0]->GetValue(), "rgb(0, 255, 0)"));
+
+	verify(uni_str_eq(r[1]->GetSelector(), "div"));
+	verify(uni_str_eq(r[1]->GetName(), "background-color"));
+	verify(uni_str_eq(r[1]->GetValue(), "rgb(255, 0, 0)"));
+}
+
+
+test("GetMatchingStyleRules - ::first-letter (parent)")
+{
+	TestListener listener;
+	verify(OpStatus::IsSuccess(listener.GetMatchingRules(Markup::HTE_DIV, &listener)));
+
+	TestListener::RuleEntry* r[1];
+	verify(listener.GetRuleEntries(r, 1) == 1);
+
+	verify(uni_str_eq(r[0]->GetSelector(), "div"));
+	verify(uni_str_eq(r[0]->GetName(), "background-color"));
+	verify(uni_str_eq(r[0]->GetValue(), "rgb(255, 0, 0)"));
+}
+
+
+html
+{
+	//! <style>
+	//! div { background-color: #ff0000; }
+	//! div::before { content: "weehee"; }
+	//! </style>
+	//! <body><div>Hi</div></body>
+}
+
+test("GetMatchingStyleRules - ::before (pseudo-element)")
+{
+	TestListener listener(ELM_PSEUDO_BEFORE);
+	verify(OpStatus::IsSuccess(listener.GetMatchingRules(Markup::HTE_DIV, &listener)));
+
+	TestListener::RuleEntry* r[2];
+	verify(listener.GetRuleEntries(r, 2) == 2);
+
+	verify(uni_str_eq(r[0]->GetSelector(), "div::before"));
+	verify(uni_str_eq(r[0]->GetName(), "content"));
+	verify(uni_str_eq(r[0]->GetValue(), "\"weehee\""));
+
+	verify(uni_str_eq(r[1]->GetSelector(), "div"));
+	verify(uni_str_eq(r[1]->GetName(), "background-color"));
+	verify(uni_str_eq(r[1]->GetValue(), "rgb(255, 0, 0)"));
+}
+
+test("GetMatchingStyleRules - ::before (parent)")
+{
+	TestListener listener;
+	verify(OpStatus::IsSuccess(listener.GetMatchingRules(Markup::HTE_DIV, &listener)));
+
+	TestListener::RuleEntry* r[1];
+	verify(listener.GetRuleEntries(r, 1) == 1);
+
+	verify(uni_str_eq(r[0]->GetSelector(), "div"));
+	verify(uni_str_eq(r[0]->GetName(), "background-color"));
+	verify(uni_str_eq(r[0]->GetValue(), "rgb(255, 0, 0)"));
+}
+
+html
+{
+	//! <style>
+	//! div { background-color: #ff0000; }
+	//! div::after { content: "weehee"; }
+	//! </style>
+	//! <body><div>Hi</div></body>
+}
+
+test("GetMatchingStyleRules - ::after (pseudo-element)")
+{
+	TestListener listener(ELM_PSEUDO_AFTER);
+	verify(OpStatus::IsSuccess(listener.GetMatchingRules(Markup::HTE_DIV, &listener)));
+
+	TestListener::RuleEntry* r[2];
+	verify(listener.GetRuleEntries(r, 2) == 2);
+
+	verify(uni_str_eq(r[0]->GetSelector(), "div::after"));
+	verify(uni_str_eq(r[0]->GetName(), "content"));
+	verify(uni_str_eq(r[0]->GetValue(), "\"weehee\""));
+
+	verify(uni_str_eq(r[1]->GetSelector(), "div"));
+	verify(uni_str_eq(r[1]->GetName(), "background-color"));
+	verify(uni_str_eq(r[1]->GetValue(), "rgb(255, 0, 0)"));
+}
+
+test("GetMatchingStyleRules - ::after (parent)")
+{
+	TestListener listener;
+	verify(OpStatus::IsSuccess(listener.GetMatchingRules(Markup::HTE_DIV, &listener)));
+
+	TestListener::RuleEntry* r[1];
+	verify(listener.GetRuleEntries(r, 1) == 1);
+
+	verify(uni_str_eq(r[0]->GetSelector(), "div"));
+	verify(uni_str_eq(r[0]->GetName(), "background-color"));
+	verify(uni_str_eq(r[0]->GetValue(), "rgb(255, 0, 0)"));
+}
+
+/** CSS_MatchElement tests **/
+
+html
+{
+	//! <style>
+	//! div { background-color: #ff0000; }
+	//! </style>
+	//! <body><div>Hi</div></body>
+}
+
+test("CSS_MatchElement - default constructor")
+{
+	CSS_MatchElement elm;
+	verify(elm.GetHtmlElement() == NULL);
+	verify(elm.GetPseudoElementType() == ELM_NOT_PSEUDO);
+	verify(!elm.IsValid());
+}
+
+test("CSS_MatchElement - invalid pseudo-usage")
+{
+	HTML_Element* element = TestListener().GetElement(Markup::HTE_DIV);
+	verify(element != NULL);
+
+	verify(!CSS_MatchElement(element, ELM_PSEUDO_FIRST_LINE).IsValid());
+	verify(!CSS_MatchElement(element, ELM_PSEUDO_FIRST_LETTER).IsValid());
+	verify(!CSS_MatchElement(element, ELM_PSEUDO_BEFORE).IsValid());
+	verify(!CSS_MatchElement(element, ELM_PSEUDO_AFTER).IsValid());
+}
+
+html
+{
+	//! <style>
+	//! div { background-color: #ff0000; }
+	//! div::first-line { background-color: #00ff00; }
+	//! </style>
+	//! <body><div>Hi</div></body>
+}
+
+test("CSS_MatchElement - ::first-line")
+{
+	HTML_Element* element = TestListener().GetElement(Markup::HTE_DIV);
+	verify(element != NULL);
+
+	CSS_MatchElement elm(element, ELM_PSEUDO_FIRST_LINE);
+	verify(elm.GetHtmlElement() == element);
+	verify(elm.GetPseudoElementType() == ELM_PSEUDO_FIRST_LINE);
+	verify(elm.IsValid());
+
+	CSS_MatchElement par = elm.GetParent();
+	verify(par.GetHtmlElement() == element);
+	verify(par.GetPseudoElementType() == ELM_NOT_PSEUDO);
+	verify(par.IsValid());
+
+	verify(par.GetParent().IsValid());
+}
+
+html
+{
+	//! <style>
+	//! div { background-color: #ff0000; }
+	//! div::first-letter { background-color: #00ff00; }
+	//! </style>
+	//! <body><div>Hi</div></body>
+}
+
+test("CSS_MatchElement - ::first-letter")
+{
+	HTML_Element* element = TestListener().GetElement(Markup::HTE_DIV);
+	verify(element != NULL);
+
+	CSS_MatchElement elm(element, ELM_PSEUDO_FIRST_LETTER);
+	verify(elm.GetHtmlElement() == element);
+	verify(elm.GetPseudoElementType() == ELM_PSEUDO_FIRST_LETTER);
+	verify(elm.IsValid());
+
+	CSS_MatchElement par = elm.GetParent();
+	verify(par.GetHtmlElement() == element);
+	verify(par.GetPseudoElementType() == ELM_NOT_PSEUDO);
+	verify(par.IsValid());
+
+	verify(par.GetParent().IsValid());
+}
+
+html
+{
+	//! <style>
+	//! div { background-color: #ff0000; }
+	//! div::before { content: "weehee"; }
+	//! </style>
+	//! <body><div>Hi</div></body>
+}
+
+test("CSS_MatchElement - ::before")
+{
+	HTML_Element* element = TestListener().GetElement(Markup::HTE_DIV);
+	verify(element != NULL);
+
+	CSS_MatchElement elm(element, ELM_PSEUDO_BEFORE);
+	verify(elm.GetHtmlElement() == element);
+	verify(elm.GetPseudoElementType() == ELM_PSEUDO_BEFORE);
+	verify(elm.IsValid());
+
+	CSS_MatchElement par = elm.GetParent();
+	verify(par.GetHtmlElement() == element);
+	verify(par.GetPseudoElementType() == ELM_NOT_PSEUDO);
+	verify(par.IsValid());
+
+	verify(par.GetParent().IsValid());
+}
+
+html
+{
+	//! <style>
+	//! div { background-color: #ff0000; }
+	//! div::after { content: "weehee"; }
+	//! </style>
+	//! <body><div>Hi</div></body>
+}
+
+test("CSS_MatchElement - ::after")
+{
+	HTML_Element* element = TestListener().GetElement(Markup::HTE_DIV);
+	verify(element != NULL);
+
+	CSS_MatchElement elm(element, ELM_PSEUDO_AFTER);
+	verify(elm.GetHtmlElement() == element);
+	verify(elm.GetPseudoElementType() == ELM_PSEUDO_AFTER);
+	verify(elm.IsValid());
+
+	CSS_MatchElement par = elm.GetParent();
+	verify(par.GetHtmlElement() == element);
+	verify(par.GetPseudoElementType() == ELM_NOT_PSEUDO);
+	verify(par.IsValid());
+
+	verify(par.GetParent().IsValid());
+}

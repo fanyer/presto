@@ -1,0 +1,255 @@
+/* -*- Mode: c++; tab-width: 4; indent-tabs-mode: t; c-basic-offset: 4 -*- */
+
+group "Img.Cache";
+
+require IMG_CACHE_UNUSED_IMAGES;
+require undefined DOCHAND_CLEAR_RAMCACHE_ON_STARTPROGRESS;
+
+language c++;
+
+include "core/pch.h";
+
+include "modules/hardcore/timer/optimer.h";
+include "modules/util/opfile/opfile.h";
+include "modules/doc/frm_doc.h";
+include "modules/windowcommander/src/WindowCommander.h";
+include "modules/selftest/src/doc_st_utils.h";
+
+global
+{
+	static HTML_Element *FindElementRec( HTML_Element *cur, const uni_char *elm, int *nelm )
+	{
+		const uni_char *cn = cur->Type() != HE_DOC_ROOT ? cur->GetTagName() : UNI_L("html");
+		if( cn && !uni_stricmp( cn, elm ) && !--*nelm )
+			return cur;
+		for( HTML_Element* he = cur->FirstChild(); he; he = he->Suc() )
+		{
+			HTML_Element *res = FindElementRec( he, elm, nelm );
+			if( res )
+				return res;
+		}
+		return NULL;
+	}
+
+	/** Due to bugs in selftest, state.doc is sometimes not updated so we have to get it from window.
+		This one uses AsyncSTOperationObject::GetTestDocument() to get the document. */
+	static HTML_Element *FindElement( const uni_char *elem, int nelm = 1 )
+	{
+		int _nelmc = nelm;
+		FramesDocument* doc = AsyncSTOperationObject::GetTestDocument();
+		if( !doc || !doc->GetDocRoot() )
+		{
+			return NULL;
+		}
+		return FindElementRec( doc->GetDocRoot(), elem, &_nelmc );
+	}
+
+	class ImageWaitUntilLoadedObj : public WaitUntilLoadedObj
+	{
+	public:
+		/**
+		* Creates the ImageWaitUntilLoadedObj instance for the test purpose.
+		* Opens the file in the doc's Window and waits until loaded (or until timeout occurs).
+		* @param doc the top document
+		* @param url file to load
+		*/
+		static void PerformTest(FramesDocument* top_doc, const uni_char* file)
+		{
+			ImageWaitUntilLoadedObj* new_obj = OP_NEW(ImageWaitUntilLoadedObj, ());
+			
+			if (!new_obj)
+			{
+				ST_failed("Out of memory");
+				return;
+			}
+
+			if (OpStatus::IsError(new_obj->OpenFileURL(top_doc, file)))
+			{
+				new_obj->Abort();
+				ST_failed("Couldn't load the file");
+			}
+		}
+
+	protected:
+
+		virtual BOOL CheckPassCondition()
+		{
+			if (!WaitUntilLoadedObj::CheckPassCondition())
+				return FALSE;
+
+			return URLLoaded();
+		}
+
+		ImageWaitUntilLoadedObj()
+			: WaitUntilLoadedObj() {}
+	private:
+
+		BOOL URLLoaded()
+		{
+			HTML_Element* elm = FindElement(UNI_L("img"));
+			if (!elm)
+				return TRUE;
+
+			if (!m_painted)
+			{
+				if (OpStatus::IsSuccess(Paint()))
+					m_painted = TRUE;
+				return FALSE;
+			}
+
+			HEListElm* hle = elm->GetHEListElmForInline(IMAGE_INLINE);
+			Image img = hle->GetImage();
+			return img.ImageDecoded();
+		}
+
+		OP_STATUS OpenFileURL(FramesDocument* doc, const uni_char* f)
+		{
+			OpFile file;
+			RETURN_IF_ERROR(file.Construct(f, OPFILE_SELFTEST_DATA_FOLDER));
+			OpWindowCommander::OpenURLOptions options;
+			options.entered_by_user = TRUE;
+			doc->GetWindow()->GetWindowCommander()->OpenURL(file.GetFullPath(), options);
+			m_painted = FALSE;
+			return OpStatus::OK;
+		}
+
+		BOOL m_painted;
+	};
+
+	INT32 m_used;
+#ifdef IMG_TOGGLE_CACHE_UNUSED_IMAGES
+	BOOL m_cache_unused;
+#endif // IMG_TOGGLE_CACHE_UNUSED_IMAGES
+}
+
+setup
+{
+#ifdef IMG_TOGGLE_CACHE_UNUSED_IMAGES
+	m_cache_unused = imgManager->IsCachingUnusedImages();
+#endif // IMG_TOGGLE_CACHE_UNUSED_IMAGES
+}
+
+exit
+{
+#ifdef IMG_TOGGLE_CACHE_UNUSED_IMAGES
+	imgManager->CacheUnusedImages(m_cache_unused);
+#endif // IMG_TOGGLE_CACHE_UNUSED_IMAGES
+}
+
+// Dummy html to ensure state.doc is valid.
+html
+{
+//! <!DOCTYPE html>
+//! <DOCTYPE
+//! <html>
+//! <body>
+//! </body>
+//! </html>
+}
+
+/**
+   cache_unused 1
+
+   * check that images in page loadeed with caching of unused images
+     enabled aren't purged
+   * check that disabling caching of unused images purges images
+ */
+test("cache_unused 1.1") async;
+{
+#ifdef IMG_TOGGLE_CACHE_UNUSED_IMAGES
+	imgManager->CacheUnusedImages(TRUE);
+#endif // IMG_TOGGLE_CACHE_UNUSED_IMAGES
+	ImageWaitUntilLoadedObj::PerformTest(state.doc, UNI_L("modules/img/selftest/images/random.html"));
+}
+test("cache_unused 1.2") async;
+require success("cache_unused 1.1");
+{
+	m_used = imgManager->GetUsedCacheMem();
+	ImageWaitUntilLoadedObj::PerformTest(state.doc, UNI_L("modules/img/selftest/empty.html"));
+}
+test("cache_unused 1.3")
+require success("cache_unused 1.2");
+{
+	state.doc->GetDocManager()->GetWindow()->SetMaxHistory(0);
+	INT32 used;
+	// when cashing unused images clearing the history should not
+	// delete the UrlImageContentProvider
+	used = imgManager->GetUsedCacheMem();
+	verify(m_used == used);
+#ifdef IMG_TOGGLE_CACHE_UNUSED_IMAGES
+	imgManager->CacheUnusedImages(FALSE);
+#endif // IMG_TOGGLE_CACHE_UNUSED_IMAGES
+}
+test("cache_unused 1.4")
+require IMG_TOGGLE_CACHE_UNUSED_IMAGES;
+require success("cache_unused 1.3");
+{
+	INT32 used;
+	// disabling cashing of unused images should throw out any unused
+	// images previously referenced by an UrlImageContentProvider
+	used = imgManager->GetUsedCacheMem();
+	verify(used < m_used);
+}
+
+/**
+   cache_unused 2
+
+   * check that images in page loaded with caching of unused images
+   * disabled are purged
+ */
+test("cache_unused 2.1") async;
+require IMG_TOGGLE_CACHE_UNUSED_IMAGES;
+{
+	imgManager->CacheUnusedImages(FALSE);
+	ImageWaitUntilLoadedObj::PerformTest(state.doc, UNI_L("modules/img/selftest/images/image_bmp.html"));
+}
+test("cache_unused 2.2") async;
+require IMG_TOGGLE_CACHE_UNUSED_IMAGES;
+require success("cache_unused 2.1");
+{
+	m_used = imgManager->GetUsedCacheMem();
+	ImageWaitUntilLoadedObj::PerformTest(state.doc, UNI_L("modules/img/selftest/empty.html"));
+}
+test("cache_unused 2.3")
+require IMG_TOGGLE_CACHE_UNUSED_IMAGES;
+require success("cache_unused 2.2");
+{
+	GetTestDocument()->GetDocManager()->GetWindow()->SetMaxHistory(0);
+	INT32 used;
+	// when not cashing unused images clearing the history should
+	// delete the UrlImageContentProvider
+	used = imgManager->GetUsedCacheMem();
+	verify(used < m_used);
+}
+
+/**
+   cache_unused 3
+
+   * check that enabling caching of unused images will keep any loaded
+   * images in cache
+ */
+test("cache_unused 3.1") async;
+require IMG_TOGGLE_CACHE_UNUSED_IMAGES;
+{
+	imgManager->CacheUnusedImages(FALSE);
+	ImageWaitUntilLoadedObj::PerformTest(state.doc, UNI_L("modules/img/selftest/images/image_jpg.html"));
+}
+test("cache_unused 3.2") async;
+require IMG_TOGGLE_CACHE_UNUSED_IMAGES;
+require success("cache_unused 3.1");
+{
+	imgManager->CacheUnusedImages(TRUE);
+	m_used = imgManager->GetUsedCacheMem();
+	ImageWaitUntilLoadedObj::PerformTest(state.doc, UNI_L("modules/img/selftest/empty.html"));
+}
+test("cache_unused 3.3")
+require IMG_TOGGLE_CACHE_UNUSED_IMAGES;
+require success("cache_unused 3.2");
+{
+	GetTestDocument()->GetDocManager()->GetWindow()->SetMaxHistory(0);
+	INT32 used;
+	// enabling caching of unused images shoud affect any images
+	// currently in cache
+	used = imgManager->GetUsedCacheMem();
+	verify(used == m_used);
+}

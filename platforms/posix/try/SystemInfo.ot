@@ -1,0 +1,315 @@
+/* -*- Mode: c++; tab-width: 4; c-basic-offset: 4 -*-
+ *
+ * Copyright (C) 2008-2011 Opera Software AS.  All rights reserved.
+ *
+ * This file is part of the Opera web browser.
+ * It may not be distributed under any circumstances.
+ */
+group "posix.pi.systeminfo";
+require POSIX_OK_SYS;
+import "pi.opsysteminfo";
+
+group "posix.systeminfo";
+require init;
+require POSIX_OK_SYS;
+
+include "platforms/posix/posix_system_info.h";
+include if POSIX_OK_SETENV "platforms/posix/posix_module.h"; // for g_env.Set(name, value)
+include if POSIX_OK_NATIVE "platforms/posix/posix_native_util.h"; // for PosixNativeUtil
+
+// TODO: verify(OpStatus::IsSuccess(X)) -> verify_success(X)
+
+global
+{
+	uni_char *tmpbuf;
+	OpString oldenv;
+
+	OP_STATUS PrecedenceCheck(int depth, const char *boss, bool * ok)
+	{
+#ifdef POSIX_OK_SETENV // implies NATIVE
+		OpString langs;
+		const char * var;
+		switch (depth)
+		{
+		case 0: var = "LANG"; break;
+		case 1: var = "LC_MESSAGES"; break;
+		case 2: var = "LC_ALL"; break;
+		case 3: var = "LANGUAGE"; break;
+		default: return OpStatus::ERR;
+		}
+
+		const char *empty[] =
+			{ ".ENCODING @modifier", " @modifier ", " .ENCODING   ", "   ", "" };
+		if (depth)
+		{
+			RETURN_IF_ERROR(g_env.Unset(var));
+			RETURN_IF_ERROR(PrecedenceCheck(depth-1, boss, ok));
+			for (int i = sizeof(empty) / sizeof(empty[0]); i-- > 0; )
+			{
+				RETURN_IF_ERROR(g_env.Set(var, empty[i]));
+				RETURN_IF_ERROR(PrecedenceCheck(depth-1, boss, ok));
+			}
+		}
+		else
+		{
+			RETURN_IF_ERROR(g_env.Unset(var));
+			RETURN_IF_ERROR(g_op_system_info->GetUserLanguages(&langs));
+			if (langs.Compare(boss))
+				*ok = false;
+			for (int i = sizeof(empty) / sizeof(empty[0]); i-- > 0; )
+			{
+				RETURN_IF_ERROR(g_env.Set(var, empty[i]));
+				RETURN_IF_ERROR(g_op_system_info->GetUserLanguages(&langs));
+				if (langs.Compare(boss))
+					*ok = false;
+			}
+		}
+
+		if (boss)
+			RETURN_IF_ERROR(g_env.Set(var, "i_klingon"));
+		else
+		{
+			boss = "en";
+			RETURN_IF_ERROR(g_env.Set(var, boss));
+		}
+
+		RETURN_IF_ERROR(g_op_system_info->GetUserLanguages(&langs));
+		if (langs.Compare(boss))
+			*ok = false;
+		if (depth) RETURN_IF_ERROR(PrecedenceCheck(depth-1, boss, ok));
+		RETURN_IF_ERROR(g_op_system_info->GetUserLanguages(&langs));
+		if (langs.Compare(boss))
+			*ok = false;
+
+		return g_env.Set(var, "i_klingon");
+#else // If selftest handled #if-ery better, we wouldn't even *define* this function:
+		return OpStatus::ERR; // should not be called unless SETENV.
+#endif // POSIX_OK_SETENV
+	}
+}
+
+test("Environment")
+	require POSIX_OK_SETENV;
+	require POSIX_OK_NATIVE; // actually implied by SETENV.
+{
+	verify(OpStatus::IsSuccess(g_env.Set("FOO_DIR", PATHSEP "Bart" PATHSEP)));
+	verify(OpStatus::IsSuccess(PosixNativeUtil::UniGetEnv(oldenv, "FOO_DIR")) &&
+		   oldenv.Compare(PATHSEP "Bart" PATHSEP) == 0);
+
+	verify(OpStatus::IsSuccess(g_env.Set("FOO", "Bart")));
+	verify(OpStatus::IsSuccess(PosixNativeUtil::UniGetEnv(oldenv, "FOO")) &&
+		   oldenv.Compare("Bart") == 0);
+	verify(OpStatus::IsSuccess(g_env.Set("COMPLEX_AND_SHORT", "simple or long")));
+	verify(OpStatus::IsSuccess(PosixNativeUtil::UniGetEnv(oldenv, "COMPLEX_AND_SHORT")) &&
+		   oldenv.Compare("simple or long") == 0);
+	verify(OpStatus::IsSuccess(g_env.Set("COMPLEX", "nasty, brutish")));
+	verify(OpStatus::IsSuccess(PosixNativeUtil::UniGetEnv(oldenv, "COMPLEX")) &&
+		   oldenv.Compare("nasty, brutish") == 0);
+
+	verify(OpStatus::IsSuccess(g_env.Unset("COMPLEX_SILLY_NAME_FOR_POSIX_TESTING")));
+	verify(OpStatus::IsSuccess(PosixNativeUtil::UniGetEnv(
+								   oldenv, "COMPLEX_SILLY_NAME_FOR_POSIX_TESTING")) &&
+		   oldenv.IsEmpty());
+	verify(OpStatus::IsSuccess(g_env.Unset("COMPLEX_SILLY_\\}NAME_FOR_POSIX_TESTING")));
+	verify(OpStatus::IsSuccess(PosixNativeUtil::UniGetEnv(
+								   oldenv, "COMPLEX_SILLY_\\}NAME_FOR_POSIX_TESTING")) &&
+		   oldenv.IsEmpty());
+	verify(OpStatus::IsSuccess(g_env.Unset("COMPLEX_SILLY_\\NAME_FOR_POSIX_TESTING\\")));
+	verify(OpStatus::IsSuccess(PosixNativeUtil::UniGetEnv(
+								   oldenv, "COMPLEX_SILLY_\\NAME_FOR_POSIX_TESTING\\")) &&
+		   oldenv.IsEmpty());
+}
+
+table ExpandyStrings (const char *, const uni_char*, const uni_char*)
+{
+	{ "plain",			UNI_L("Change me not"),									UNI_L("Change me not") },
+	{ "dull tilde",		UNI_L("Never match /~/ except at start"),				UNI_L("Never match /~/ except at start") },
+	{ "unset",			UNI_L("$COMPLEX_SILLY_NAME_FOR_POSIX_TESTING"),			UNI_L("") },
+	{ "braced unset",	UNI_L("${COMPLEX_SILLY_NAME_FOR_POSIX_TESTING}"),		UNI_L("") },
+	{ "fancy unset",	UNI_L("${COMPLEX_SILLY_\\}NAME_FOR_POSIX_TESTING}"),	UNI_L("") },
+	{ "unset bs",		UNI_L("${COMPLEX_SILLY_\\NAME_FOR_POSIX_TESTING\\\\}"),	UNI_L("") },
+	{ "Bart",			UNI_L("We all laugh at $FOO Simpson"),					UNI_L("We all laugh at Bart Simpson") },
+	{ "underscores",	UNI_L("Is it $COMPLEX_AND_SHORT ?"),					UNI_L("Is it simple or long ?") },
+	{ "brutish",		UNI_L("Life is ${COMPLEX}_AND_SHORT"),					UNI_L("Life is nasty, brutish_AND_SHORT") },
+	{ "error",			UNI_L("${I never did close it"),	  (const uni_char*) NULL }
+	{ "escape end",		UNI_L("Escape the end\\\x0..."),						UNI_L("Escape the end\\") },
+}
+
+foreach (name, question, answer) from ExpandyStrings
+{
+	test("ExpandSystemVariablesInString: " name)
+		require POSIX_SERIALIZE_FILENAME;
+		require success "Environment";
+	{
+		OpString expanded;
+		OP_STATUS res = ((PosixSystemInfo*)g_op_system_info)->
+			ExpandSystemVariablesInString(question, &expanded);
+		if (answer)
+		{
+			verify(OpStatus::IsSuccess(res));
+			verify_string(expanded, answer);
+		}
+		else
+			verify(OpStatus::IsError(res));
+	}
+}
+
+table ExpandyStringsWSeparators (const char*, const uni_char*, const uni_char*)
+{
+    { "simple",		UNI_L("remove redundant $FOO_DIR/separators"),									UNI_L("remove redundant /Bart/separators") },
+    { "simple1",	UNI_L("remove redundant/$FOO_DIR separators"),									UNI_L("remove redundant/Bart/ separators") },
+    { "simple2",	UNI_L("remove redundant/$FOO_DIR/separators"),									UNI_L("remove redundant/Bart/separators") },
+    { "braced",		UNI_L("remove redundant ${FOO_DIR}/separators"),								UNI_L("remove redundant /Bart/separators") },
+    { "braced1",	UNI_L("remove redundant/${FOO_DIR} separators"),								UNI_L("remove redundant/Bart/ separators") },
+    { "braced2",	UNI_L("remove redundant/${FOO_DIR}/separators"),								UNI_L("remove redundant/Bart/separators") },
+    { "start",		UNI_L("/$FOO_DIR/remove redundant separators"),									UNI_L("/Bart/remove redundant separators") },
+    { "start2",		UNI_L("$FOO_DIR/remove redundant separators"),									UNI_L("/Bart/remove redundant separators") },
+    { "end",		UNI_L("remove redundant separators/$FOO_DIR/"),									UNI_L("remove redundant separators/Bart/") },
+    { "end2",		UNI_L("remove redundant separators/$FOO_DIR"),									UNI_L("remove redundant separators/Bart/") },
+    { "no sep",		UNI_L("remove redundant$FOO_DIR separators"),									UNI_L("remove redundant/Bart/ separators") },
+    { "no sep2",	UNI_L("remove redundant${FOO_DIR}separators"),									UNI_L("remove redundant/Bart/separators") },
+}
+
+foreach (name, question, answer) from ExpandyStringsWSeparators
+{
+    test("ExpandSystemVariablesInString: (with separators) " name)
+        require POSIX_SERIALIZE_FILENAME;
+        require success "Environment";
+    {
+#if PATHSEPCHAR != '/'
+        OpString question_str; question_str.Set(question);
+        for (uni_char* c = question_str.CStr(); *c; ++c)
+            if ('/' == *c) *c = PATHSEPCHAR;
+        OpString answer_str; answer_str.Set(answer);
+        for (uni_char* c = answer_str.CStr(); *c; ++c)
+            if ('/' == *c) *c = PATHSEPCHAR;
+#else // PATHSEPCHAR == '/'
+        OpStringC question_str(question);
+        OpStringC answer_str(answer);
+#endif // PATHSEPCHAR != '/'
+        OpString expanded;
+        OP_STATUS res = ((PosixSystemInfo*)g_op_system_info)->
+            ExpandSystemVariablesInString(question_str, &expanded);
+        verify_success(res);
+        verify_string(expanded, answer_str);
+    }
+}
+
+table SimpleLangEnv (const char *) { { "LANG" }, { "LC_MESSAGES" }, { "LC_ALL" } }
+foreach (var) from SimpleLangEnv
+{
+	test("User language: " var)
+		require POSIX_OK_SETENV;
+		require POSIX_OK_SYS_LOCALE;
+		require POSIX_OK_NATIVE; // actually implied by SETENV.
+	{
+		verify(OpStatus::IsSuccess(PosixNativeUtil::UniGetEnv(oldenv, var)));
+		OpString prior, langs, value;
+		verify(g_op_system_info); // prerequisite !
+		verify(OpStatus::IsSuccess(g_op_system_info->GetUserLanguages(&prior)));
+
+		// Start with something obscure enough it probably doesn't match prior:
+		verify(OpStatus::IsSuccess(g_env.Set(var, "el_latin"))); // greek in latin script
+		verify(OpStatus::IsSuccess(g_op_system_info->GetUserLanguages(&langs)));
+		if (langs.Compare(prior)) // skip test if var is over-ridden by some other
+		{
+			verify(langs.Compare("el_latin,el") == 0);
+
+			verify(OpStatus::IsSuccess(g_env.Set(var, "en_GB")));
+			verify(OpStatus::IsSuccess(g_op_system_info->GetUserLanguages(&langs)));
+			verify(langs.Compare("en_GB,en") == 0);
+
+			verify(OpStatus::IsSuccess(g_env.Set(var, "nb")));
+			verify(OpStatus::IsSuccess(g_op_system_info->GetUserLanguages(&langs)));
+			verify(langs.Compare("nb") == 0);
+
+			verify(OpStatus::IsSuccess(g_env.Set(var, "de_DE.UTF-8@modified")));
+			verify(OpStatus::IsSuccess(g_op_system_info->GetUserLanguages(&langs)));
+			verify(langs.Compare("de_DE,de") == 0);
+
+			verify(OpStatus::IsSuccess(g_env.Set(var, " pt_BR . ISO-8859-1 ")));
+			verify(OpStatus::IsSuccess(g_op_system_info->GetUserLanguages(&langs)));
+			verify(langs.Compare("pt_BR,pt") == 0);
+
+			verify(OpStatus::IsSuccess(g_env.Set(var, "fr_FR @ modified")));
+			verify(OpStatus::IsSuccess(g_op_system_info->GetUserLanguages(&langs)));
+			verify(langs.Compare("fr_FR,fr") == 0);
+		}
+		else
+			verify(prior.HasContent());
+	}
+	finally
+	{
+		if (oldenv.IsEmpty()) g_env.Unset(var);
+		else g_env.Set(var, oldenv.CStr());
+	}
+}
+
+test("User language: LANGUAGE")
+	require POSIX_OK_SETENV;
+	require POSIX_OK_SYS_LOCALE;
+	require POSIX_OK_NATIVE; // actually implied by SETENV.
+{
+	verify(OpStatus::IsSuccess(PosixNativeUtil::UniGetEnv(oldenv, "LANGUAGE")));
+	OpString langs, value;
+	verify(g_op_system_info); // prerequisite !
+	// NB: no check against prior: LANGUAGE takes precedence.
+
+	verify(OpStatus::IsSuccess(g_env.Set("LANGUAGE", "en_GB")));
+	verify(OpStatus::IsSuccess(g_op_system_info->GetUserLanguages(&langs)));
+	verify(langs.Compare("en_GB,en") == 0);
+
+	verify(OpStatus::IsSuccess(g_env.Set("LANGUAGE", "nb:nn: :: ")));
+	verify(OpStatus::IsSuccess(g_op_system_info->GetUserLanguages(&langs)));
+	verify(langs.Compare("nb,nn") == 0);
+
+	verify(OpStatus::IsSuccess(g_env.Set("LANGUAGE", "de_DE.UTF-8@modified::de_CH")));
+	verify(OpStatus::IsSuccess(g_op_system_info->GetUserLanguages(&langs)));
+	verify(langs.Compare("de_DE,de_CH,de") == 0);
+
+	verify(OpStatus::IsSuccess(g_env.Set("LANGUAGE", " pt_BR . ISO-8859-1 ")));
+	verify(OpStatus::IsSuccess(g_op_system_info->GetUserLanguages(&langs)));
+	verify(langs.Compare("pt_BR,pt") == 0);
+
+	verify(OpStatus::IsSuccess(g_env.Set("LANGUAGE", "fr_FR @ modified")));
+	verify(OpStatus::IsSuccess(g_op_system_info->GetUserLanguages(&langs)));
+	verify(langs.Compare("fr_FR,fr") == 0);
+
+	verify(OpStatus::IsSuccess(g_env.Set("LANGUAGE",
+										 " fr_FR . ISO-8859-15:fr_CA @ modified:"
+										 " pt_BR . ISO-8859-1 : pt_PT.UTF-8 :"
+										 "de_DE.UTF-8@modified:nb:nn:en_GB")));
+	verify(OpStatus::IsSuccess(g_op_system_info->GetUserLanguages(&langs)));
+	verify(langs.Compare("fr_FR,fr_CA,fr,pt_BR,pt_PT,pt,de_DE,de,nb,nn,en_GB,en") == 0);
+}
+finally
+{
+	if (oldenv.IsEmpty()) g_env.Unset("LANGUAGE");
+	else g_env.Set("LANGUAGE", oldenv.CStr());
+}
+
+test("User language: precedence")
+	require POSIX_OK_SETENV;
+	require POSIX_OK_SYS_LOCALE;
+	require POSIX_OK_NATIVE; // actually implied by SETENV.
+{
+	OpString8 lng, msg, all, gnu;
+	verify(OpStatus::IsSuccess(lng.Set(getenv("LANG"))) &&
+		   OpStatus::IsSuccess(msg.Set(getenv("LC_MESSAGES"))) &&
+		   OpStatus::IsSuccess(all.Set(getenv("LC_ALL"))) &&
+		   OpStatus::IsSuccess(gnu.Set(getenv("LANGUAGE"))));
+
+	bool ok = true;
+	OP_STATUS err = PrecedenceCheck(3, NULL, &ok);
+
+	if (gnu.IsEmpty()) g_env.Unset("LANGUAGE");
+	else g_env.Set("LANGUAGE", gnu.CStr());
+	if (all.IsEmpty()) g_env.Unset("LC_ALL");
+	else g_env.Set("LC_ALL", all.CStr());
+	if (msg.IsEmpty()) g_env.Unset("LC_MESSAGES");
+	else g_env.Set("LC_MESSAGES", msg.CStr());
+	if (lng.IsEmpty()) g_env.Unset("LANG");
+	else g_env.Set("LANG", lng.CStr());
+
+	verify(OpStatus::IsSuccess(err) && ok);
+}

@@ -1,0 +1,177 @@
+/* -*- Mode: c++; tab-width: 4; indent-tabs-mode: t; c-basic-offset: 4 -*-
+**
+** Copyright (C) 2004-2011 Opera Software ASA.  All rights reserved.
+**
+** This file is part of the Opera web browser.  It may not be distributed
+** under any circumstances.
+**
+** Yngve N. Pettersen
+*/
+
+group "auth ftp simple loading";
+
+require init;
+language c++;
+
+include "core/pch.h";
+
+require _ENABLE_AUTHENTICATE;
+require FTP_SUPPORT;
+
+include "modules/dochand/win.h";
+include "modules/dochand/docman.h";
+include "modules/doc/frm_doc.h";
+
+include "modules/url/url_man.h";
+include "modules/network_selftest/basicwincom.h";
+include "modules/prefs/prefsmanager/collections/pc_files.h";
+
+global {
+
+	URL_DocSelfTest_Manager *auth_tests = NULL;
+	
+
+	class SimpleAuthenticationListener 
+		: public BasicWindowListener
+	{
+	public:
+		SimpleAuthenticationListener (URL_DocSelfTest_Manager *manager, OpLoadingListener *fallback)
+			: BasicWindowListener(manager, fallback) {}
+
+		virtual ~SimpleAuthenticationListener(){}
+
+		BOOL Authenticate(OpAuthenticationCallback* callback)
+		{
+			if(callback == NULL)
+				return FALSE;
+
+			callback->Authenticate(UNI_L("ftpuser"), UNI_L("opera"));
+			return TRUE;
+		}
+
+		virtual void OnAuthenticationRequired(OpWindowCommander* commander, OpAuthenticationCallback* callback)
+		{
+			if (Authenticate(callback))
+				return;
+			else
+			{
+				callback->CancelAuthentication();
+				URL empty;
+				ReportFailure(empty,"Authentication failed");
+			}
+		}
+	};
+
+    SimpleAuthenticationListener *listener = NULL;
+	WindowCommander *wc=NULL;
+
+    OpString folder;
+}
+
+table included_filelist filelist "testfiles/simple_ftp";
+
+table filename_list(const char *, const uni_char *) 
+{
+	{"ftp://certo.opera.com:6899/1Kb.txt", UNI_L("simple_ftp/1Kb.txt")},
+	{"ftp://certo.opera.com:6899/1Kb.bin", UNI_L("simple_ftp/1Kb.bin")},
+	{"ftp://certo.opera.com:6899/10Kb.txt", UNI_L("simple_ftp/10Kb.txt")},
+	{"ftp://certo.opera.com:6899/10Kb.bin", UNI_L("simple_ftp/10Kb.bin")},
+	{"ftp://certo.opera.com:6899/50Kb.txt", UNI_L("simple_ftp/50Kb.txt")},
+	{"ftp://certo.opera.com:6899/50Kb.bin", UNI_L("simple_ftp/50Kb.bin")},
+	{"ftp://certo.opera.com:6899/100Kb.txt", UNI_L("simple_ftp/100Kb.txt")},
+	{"ftp://certo.opera.com:6899/100Kb.bin", UNI_L("simple_ftp/100Kb.bin")},
+	{"ftp://certo.opera.com:6899/200Kb.txt", UNI_L("simple_ftp/200Kb.txt")},
+	{"ftp://certo.opera.com:6899/200Kb.bin", UNI_L("simple_ftp/200Kb.bin")},
+	{"ftp://certo.opera.com:6899/300Kb.txt", UNI_L("simple_ftp/300Kb.txt")},
+	{"ftp://certo.opera.com:6899/300Kb.bin", UNI_L("simple_ftp/300Kb.bin")}
+};
+ 
+html { "<html><body>Empty document, Authentication going on. An authentication dialog is a failure.</body></html>" };
+ 
+setup 
+{
+	urlManager->Clear_Authentication_List();
+	auth_tests = OP_NEW(URL_DocSelfTest_Manager, ());
+	
+	OpString tmp_storage;
+	folder.Set(g_folder_manager->GetFolderPathIgnoreErrors(OPFILE_SELFTEST_DATA_FOLDER, tmp_storage));
+	folder.Append(UNI_L("modules/auth/selftest/testfiles/"));
+}
+
+exit
+{
+	OP_DELETE(auth_tests);
+	auth_tests = NULL;
+	if(wc)
+	    wc->SetLoadingListener(listener->GetFallback());
+	OP_DELETE(listener);
+	listener = NULL;
+	urlManager->Clear_Authentication_List();
+}
+
+test("Initialized")
+{
+	verify(auth_tests != NULL);
+	verify(folder.HasContent());
+}
+
+subtest AddSimpleTest(URL_DocSelfTest_Batch *batch, const OpStringC8 &url, URL &ref_url, const OpStringC &filename)
+{
+	verify(batch != NULL);
+	verify(filename.HasContent());
+
+	OpAutoPtr<URL_DocSimpleTester> test(OP_NEW(URL_DocSimpleTester, ()));
+	verify(test.get() != NULL);
+
+	OpString fullfilename;
+	verify(OpStatus::IsSuccess(fullfilename.SetConcat(folder,filename)));
+
+	verify(OpStatus::IsSuccess(test->Construct(url, ref_url, fullfilename)));
+
+	verify(batch->AddTestCase(test.release()));
+}
+
+subtest AddBatch(URL_DocSelfTest_Batch *batch)
+{
+	verify(batch != NULL);
+	verify(auth_tests->AddBatch(batch));
+}
+
+subtest StartTestSet()
+{
+	verify(auth_tests->SetLastBatch());
+}
+
+subtest Setup_SingleTests(const OpStringC8 &batch_id)
+{
+	URL empty_ref;
+	iterate (url, filename) from filename_list
+	{
+		OpAutoPtr<URL_DocSelfTest_Batch> batch(OP_NEW(URL_DocSelfTest_Batch, ()));
+
+		verify(batch.get() != NULL);
+
+		batch->Construct(state.doc->GetMessageHandler());
+		batch->SetBatchID(batch_id);
+
+		verify(AddSimpleTest(batch.get(), url, empty_ref, filename));
+
+		verify(!batch->Empty());
+
+		verify(AddBatch(batch.release()));
+	}
+}
+
+test("test ftp authentication")
+	require success "Initialized";
+    async;
+{
+    wc = state.doc->GetWindow()->GetWindowCommander();
+    WindowCommander::SelftestHelper helper(wc);
+    listener = OP_NEW(SimpleAuthenticationListener, (auth_tests, helper.GetPlatformLoadingListener()));
+    wc->SetLoadingListener(listener);
+
+	if (!Setup_SingleTests("[FTP Simple]") ||
+		!StartTestSet())
+		ST_failed("Could not start test set");
+}

@@ -1,0 +1,704 @@
+/* -*- Mode: c++; tab-width: 4; indent-tabs-mode: t; c-basic-offset: 4 -*-
+ *
+ * Copyright (C) 2008-2012 Opera Software ASA.  All rights reserved.
+ *
+ * This file is part of the Opera web browser.
+ * It may not be distributed under any circumstances.
+ */
+group "spellchecker";
+
+require INTERNAL_SPELLCHECK_SUPPORT;
+require initialization;
+
+language c++;
+
+include "modules/spellchecker/src/opspellchecker.h";
+include "modules/spellchecker/opspellcheckerapi.h";
+include "modules/encodings/utility/opstring-encodings.h";
+
+global
+{
+	class DummyOpSpellCheckerListener : public OpSpellCheckerListener
+	{
+	public:
+		DummyOpSpellCheckerListener(int total) : m_total(total), m_count(0) {}
+		virtual ~DummyOpSpellCheckerListener() {}
+		virtual void OnSessionReady(OpSpellCheckerSession *session) { m_count++; if ( m_count == m_total ) ST_passed(); }
+		virtual void OnError(OpSpellCheckerSession *session, OP_STATUS error_status, const uni_char *error_string) {}
+		virtual void OnMisspellingFound(OpSpellCheckerSession *session, OpSpellCheckerWordIterator *word, const uni_char **replacements) {}
+		virtual void OnCorrectSpellingFound(OpSpellCheckerSession *session, OpSpellCheckerWordIterator *word) {}
+		virtual void OnCheckingComplete(OpSpellCheckerSession *session) {}
+		virtual void OnCheckingTakesABreak(OpSpellCheckerSession *session) {}
+	private:
+		int m_total;
+		int m_count;
+	};
+
+	class FileWordIterator : public OpSpellCheckerWordIterator
+	{
+		private:
+		BOOL m_ok;
+		OpFile m_file;
+		OpString m_line;
+		OpString m_current_word;
+		InputConverter *m_input_converter;
+		BOOL m_comma_separated;
+
+		public:
+
+		FileWordIterator(OpString& file_name, const char* charset) : m_input_converter(NULL)
+			{
+				m_ok = OpStatus::IsSuccess(m_file.Construct(file_name.CStr(), OPFILE_DICTIONARY_FOLDER));
+				if ( !m_ok )
+					return;
+
+				m_ok = OpStatus::IsSuccess(m_file.Open(OPFILE_READ));
+				if ( !m_ok )
+				{
+					// Assume an error here is caused by a missing file.
+					m_ok = TRUE;
+					return;
+				}
+
+				int extofs = file_name.FindLastOf('.');
+				m_comma_separated = extofs > 0 && uni_strcmp(file_name.CStr() + extofs, UNI_L(".sug")) == 0;
+					
+				m_ok = OpStatus::IsSuccess(InputConverter::CreateCharConverter(charset, &m_input_converter, FALSE /* allowUTF7*/));
+				if ( !m_ok )
+					return;
+				
+				ReadWord();
+			}
+		
+		virtual ~FileWordIterator()
+			{
+				OP_DELETE(m_input_converter);
+			}
+
+		virtual const uni_char *GetCurrentWord()
+			{
+				return m_current_word.CStr();
+			}
+		
+		virtual BOOL ContinueIteration()
+			{
+				return FALSE; // Only one at a time or we need to implement listeners.
+			}
+		
+
+		BOOL NextWordOnLine()
+			{
+				if ( m_line.IsEmpty() )
+					return FALSE;
+
+				int ws_pos = 0;
+				int break_pos;
+
+				if ( m_comma_separated )
+				{
+					break_pos = m_line.FindFirstOf(',');
+					if ( break_pos != KNotFound )
+						ws_pos = break_pos + (*(m_line.CStr()+break_pos+1) == ' ' ? 1 : 0);
+				}
+				else
+				{
+					ws_pos = m_line.FindFirstOf(' ');
+					break_pos = ws_pos;
+				}
+
+				if ( break_pos != KNotFound )
+				{
+					m_ok = OpStatus::IsSuccess(m_current_word.Set(m_line.CStr(),break_pos));
+					if ( m_ok )
+					{
+						m_line.Delete(0, ws_pos+1);
+					}
+				}
+				else
+				{
+					m_ok = OpStatus::IsSuccess(m_current_word.Set(m_line));
+					m_line.Empty();
+				}
+
+				return TRUE;
+			}
+
+		BOOL ReadWord()
+			{
+				OpString8 line;
+
+				if ( NextWordOnLine() )
+					return IsOK() && !m_current_word.IsEmpty();
+
+				m_line.Empty();
+				m_current_word.Empty();
+							   
+				while ( m_ok && !m_file.Eof() && m_line.IsEmpty() )
+				{
+					m_ok = OpStatus::IsSuccess(m_file.ReadLine(line));
+					if ( !m_ok )
+						return FALSE;
+					int invalid_inputs;
+					m_ok = OpStatus::IsSuccess(SetFromEncoding(&m_line, m_input_converter, line.CStr(), line.Length(), &invalid_inputs)) && invalid_inputs == 0;
+					if ( !m_ok )
+					{
+						return FALSE;
+					}
+					m_line.Strip(TRUE,TRUE);
+				}
+
+				NextWordOnLine();
+
+				return IsOK() && !m_current_word.IsEmpty();
+			}
+
+		BOOL IsOK()
+			{
+				return m_ok;
+			}
+		
+		BOOL IsEmpty()
+			{
+				return m_current_word.IsEmpty();
+			}
+	};
+}
+
+
+
+test("Creating multiple async sessions") async; disabled;   // Need some more work to fail nicely
+{
+	OpSpellCheckerSession* sessions[10];
+	OP_STATUS status;
+	DummyOpSpellCheckerListener* listener=new DummyOpSpellCheckerListener(10);
+
+	for ( int i = 0; i < 10; i++ )
+	{
+		sessions[i] = NULL;
+		status = g_internal_spellcheck->CreateSession(UNI_L("sv_SE"), listener, sessions[i], FALSE);
+//		verify(OpStatus::IsSuccess(status));
+//		verify(sessions[i] != NULL);
+	}
+}
+finally
+{
+//	for ( int i = 0; i < 10 && sessions[i]; i++ )
+//	{
+//		delete sessions[i];
+//	}
+}
+
+
+test("Dictionary Version") disabled; // Should use test dictionaries with known versions.
+{
+	int num = g_internal_spellcheck->GetInstalledLanguageCount();
+
+	for (int i = 0; i < num; i++)
+	{
+		OpSpellCheckerLanguage* lang = g_internal_spellcheck->GetInstalledLanguageAt(i);
+		output("%s,%d\n",ST_down(lang->GetLanguageString()),lang->GetVersion());
+
+	}
+}
+
+test("Correctly spelled word")
+{
+	OpSpellCheckerSession* session;
+	verify(OpStatus::IsSuccess(g_internal_spellcheck->CreateSession(UNI_L("sv_SE"), g_spell_ui_data, session, TRUE)));
+	SingleWordIterator iter(UNI_L("gitarr"));
+	BOOL find_replacements = TRUE;
+	session->CheckText(&iter, find_replacements);
+	verify(g_spell_ui_data->IsCorrect());
+	verify(g_spell_ui_data->GetReplacementCount() == 0);
+}
+finally
+{
+  if (session)
+	  delete session;
+}
+
+test("Correctly spelled compound sv_SE word")
+{
+	OpSpellCheckerSession* session;
+	verify(OpStatus::IsSuccess(g_internal_spellcheck->CreateSession(UNI_L("sv_SE"), g_spell_ui_data, session, TRUE)));
+	SingleWordIterator iter(UNI_L("dadelstavning"));
+	BOOL find_replacements = TRUE;
+	session->CheckText(&iter, find_replacements);
+	verify(g_spell_ui_data->IsCorrect());
+	verify(g_spell_ui_data->GetReplacementCount() == 0);
+	session->CheckText(&iter, find_replacements);
+	verify(g_spell_ui_data->IsCorrect());
+	verify(g_spell_ui_data->GetReplacementCount() == 0);
+}
+finally
+{
+  if (session)
+	  delete session;
+}
+
+table misspelled_en_US_words(const uni_char*, const uni_char*, const char*)
+{
+	{ UNI_L("oppera"), UNI_L("opera"), "opera" }
+	{ UNI_L("developper"), UNI_L("developer"), "developer" }
+	{ UNI_L("Developper"), UNI_L("Developer"), "Developer" }
+	{ UNI_L("mischevious"), UNI_L("mischievous"), "mischievous" }
+//This one fails:    { UNI_L("occurance"), UNI_L("occurrence"), "occurrence" } 
+
+}
+
+test("Misspelled en_US_words")
+{
+	OpSpellCheckerSession* session = NULL;
+	iterate (misspelled_word, correct_replacement, label) from misspelled_en_US_words
+	{
+		verify(OpStatus::IsSuccess(g_internal_spellcheck->CreateSession(UNI_L("en_US"), g_spell_ui_data, session, TRUE)));
+		SingleWordIterator iter(misspelled_word);
+		BOOL find_replacements = FALSE;
+
+		session->CheckText(&iter, find_replacements);
+		int res = g_spell_ui_data->IsCorrect();
+		if ( res )
+			output("Word is not misspelled!: %s spelled as %s\n", label, ST_down(misspelled_word));
+
+		delete session;
+		session = NULL;
+	}
+}
+finally
+{
+  if (session)
+	  delete session;
+}
+
+
+//test("Misspelled en_US_words")
+//{
+//	OpSpellCheckerSession* session = NULL;
+//	iterate (misspelled_word, correct_replacement, label) from misspelled_en_US_words
+//	{
+//		g_internal_spellcheck->CreateSession(UNI_L("en_US"), g_spell_ui_data, session, TRUE);
+//		SingleWordIterator iter(misspelled_word);
+//		BOOL find_replacements = TRUE;
+//
+//		session->CheckText(&iter, find_replacements);
+//		int res = g_spell_ui_data->IsCorrect();
+//		if ( res )
+//			output("Word in dictionary is: %s\n", label);
+//		else
+//		{
+//			verify(!res);
+//			verify(g_spell_ui_data->GetReplacementCount() > 0);
+//			const uni_char* replacement = g_spell_ui_data->GetReplacement(0);
+//			res = uni_strcmp(replacement, correct_replacement);
+//			if (res)
+//				output("Failing word is: %s\n", label);
+//			//verify(res == 0);
+//		}
+//
+//		delete session;
+//		session = NULL;
+//	}
+//}
+//finally
+//{
+//  if (session)
+//	  delete session;
+//}
+
+
+test("No suggest")
+{
+	OpSpellCheckerSession* session = NULL;
+
+	verify(OpStatus::IsSuccess(g_internal_spellcheck->CreateSession(UNI_L("en_US"), g_spell_ui_data, session, TRUE)));
+
+	SingleWordIterator iter(UNI_L("fnart"));
+	verify(OpStatus::IsSuccess(session->CheckText(&iter, TRUE /*find_replacements*/)));
+	verify(!g_spell_ui_data->IsCorrect());
+	verify(g_spell_ui_data->GetReplacementCount() > 0);
+	const uni_char* replacement = g_spell_ui_data->GetReplacement(0);
+	verify(uni_strcmp(replacement, "fart") != 0);
+}
+finally
+{
+  if (session)
+	  delete session;
+}
+
+
+test("Add word to own dictionary")
+{
+	OpSpellCheckerSession* session;
+	verify(OpStatus::IsSuccess(g_internal_spellcheck->CreateSession(UNI_L("en_US"), g_spell_ui_data, session, TRUE)));
+	verify(session);
+
+	SingleWordIterator iter(UNI_L("opselftestword"));
+	BOOL find_replacements = FALSE;
+
+	// Remove word from previous selftest runs
+	verify(session->CheckText(&iter, find_replacements) == OpStatus::OK);
+	if (g_spell_ui_data->IsCorrect())
+		verify(session->DeleteWord(UNI_L("opselftestword")) == OpStatus::OK);
+	
+	
+	verify(session->CheckText(&iter, find_replacements) == OpStatus::OK);
+	verify(!g_spell_ui_data->IsCorrect());
+
+	// Add the word
+	verify(session->AddWord(UNI_L("opselftestword")) == OpStatus::OK);
+	verify(session->CheckText(&iter, find_replacements) == OpStatus::OK);
+	verify(g_spell_ui_data->IsCorrect());
+}
+finally
+{
+  if (session)
+	  delete session;
+}
+
+
+test("Remove word from own dictionary") require success "Add word to own dictionary";
+{
+	OpSpellCheckerSession* session;
+	verify(OpStatus::IsSuccess(g_internal_spellcheck->CreateSession(UNI_L("en_US"), g_spell_ui_data, session, TRUE)));
+	verify(session);
+	
+	SingleWordIterator iter(UNI_L("opselftestword"));
+	BOOL find_replacements = FALSE;
+	verify(session->CheckText(&iter, find_replacements) == OpStatus::OK);
+	verify(g_spell_ui_data->IsCorrect());
+
+	// Remove the word
+	verify(session->DeleteWord(UNI_L("opselftestword")) == OpStatus::OK);
+	verify(session->CheckText(&iter, find_replacements) == OpStatus::OK);
+	verify(!g_spell_ui_data->IsCorrect());
+}
+finally
+{
+  if (session)
+	  delete session;
+}
+
+test("Remove word from language dictionary") require success "Remove word from own dictionary";
+{
+	OpSpellCheckerSession* session;
+	verify(OpStatus::IsSuccess(g_internal_spellcheck->CreateSession(UNI_L("en_US"), g_spell_ui_data, session, TRUE)));
+	verify(session);
+	
+	SingleWordIterator iter(UNI_L("remove"));
+	BOOL find_replacements = FALSE;
+	verify(session->CheckText(&iter, find_replacements) == OpStatus::OK);
+	verify(g_spell_ui_data->IsCorrect());
+
+	// Remove the word (will add it to remove section in oow file since it is a word in the real language dictionary)
+	verify(session->DeleteWord(UNI_L("remove")) == OpStatus::OK);
+	verify(session->CheckText(&iter, find_replacements) == OpStatus::OK);
+	verify(!g_spell_ui_data->IsCorrect());
+
+	// Add the word again (will remove it from removed section in oow file)
+	verify(session->AddWord(UNI_L("remove")) == OpStatus::OK);
+	verify(session->CheckText(&iter, find_replacements) == OpStatus::OK);
+	verify(g_spell_ui_data->IsCorrect());
+}
+finally
+{
+  if (session)
+	  delete session;
+}
+
+test("Ignore word")
+{
+	OpSpellCheckerSession* session;
+	verify(OpStatus::IsSuccess(g_internal_spellcheck->CreateSession(UNI_L("en_US"), g_spell_ui_data, session, TRUE)));
+	verify(session);
+	
+	SingleWordIterator iter(UNI_L("opselftestignore"));
+	BOOL find_replacements = FALSE;
+	verify(session->CheckText(&iter, find_replacements) == OpStatus::OK);
+	verify(!g_spell_ui_data->IsCorrect());
+
+	// Ignore the word
+	verify(session->IgnoreWord(UNI_L("opselftestignore")) == OpStatus::OK);
+	verify(session->CheckText(&iter, find_replacements) == OpStatus::OK);
+	verify(g_spell_ui_data->IsCorrect());
+
+	// Remove the word (will no longer ignore it)
+	verify(session->DeleteWord(UNI_L("opselftestignore")) == OpStatus::OK);
+	verify(session->CheckText(&iter, find_replacements) == OpStatus::OK);
+	verify(!g_spell_ui_data->IsCorrect());
+}
+finally
+{
+  if (session)
+	  delete session;
+}
+
+test("Flags")
+{
+	OpSpellCheckerSession* session;
+	verify(OpStatus::IsSuccess(g_internal_spellcheck->CreateSession(UNI_L("optest"), g_spell_ui_data, session, TRUE)));
+	verify(session);
+	
+	SingleWordIterator iter(UNI_L("worked"));
+	BOOL find_replacements = TRUE;
+	verify(session->CheckText(&iter, find_replacements) == OpStatus::OK);
+	verify(g_spell_ui_data->IsCorrect());
+}
+finally
+{
+  if (session)
+	  delete session;
+}
+
+test("Italian dictionary") timer; disabled; // Need to add the dicitonary somewhere for this test.
+{
+	OpSpellCheckerSession* session;
+	verify(OpStatus::IsSuccess(g_internal_spellcheck->CreateSession(UNI_L("it_IT"), g_spell_ui_data, session, TRUE)));
+	verify(session);
+	verify(session->GetState() == OpSpellCheckerSession::IDLE);
+
+	SingleWordIterator iter(UNI_L("buon'andata"));
+//	SingleWordIterator iter(UNI_L("abbacchiare"));
+	BOOL find_replacements = FALSE;
+	verify(session->CheckText(&iter, find_replacements) == OpStatus::OK);
+	verify(g_spell_ui_data->IsCorrect());
+}
+finally
+{
+  if (session)
+	  delete session;
+}
+
+
+test("de_AT dictionary") timer; disabled; // Need to add this dictionary somewhere.
+{
+	OpSpellCheckerSession* session;
+	verify(OpStatus::IsSuccess(g_internal_spellcheck->CreateSession(UNI_L("de_AT"), g_spell_ui_data, session, TRUE)));
+	verify(session);
+	verify(session->GetState() == OpSpellCheckerSession::IDLE);
+
+	SingleWordIterator iter(UNI_L("Adjunkt"));
+	BOOL find_replacements = FALSE;
+	verify(session->CheckText(&iter, find_replacements) == OpStatus::OK);
+	verify(g_spell_ui_data->IsCorrect());
+}
+finally
+{
+  if (session)
+	  delete session;
+}
+
+
+
+//test("Break en_US")
+//{
+//	OpSpellCheckerSession* session;
+//	verify(OpStatus::IsSuccess(g_internal_spellcheck->CreateSession(UNI_L("en_US"), g_spell_ui_data, session, TRUE)));
+////	SingleWordIterator iter(UNI_L("'Woah!"));
+////	SingleWordIterator iter(UNI_L("c13010-ls.f.core.cdn.streamfarm.net"));
+////	SingleWordIterator iter(UNI_L("'operation'"));
+//	SingleWordIterator iter(UNI_L("Hiddink's")); //Misspelled, the suggestions are interesting.
+////	SingleWordIterator iter(UNI_L("'"));
+////	SingleWordIterator iter(UNI_L("O.J.'"));
+////  SingleWordIterator iter(UNI_L("8-year-old"));
+////	SingleWordIterator iter(UNI_L("A-list"));
+////	SingleWordIterator iter(UNI_L("Natural-born"));
+////	SingleWordIterator iter(UNI_L("In-form"));
+////	SingleWordIterator iter(UNI_L("so-called"));
+////	SingleWordIterator iter(UNI_L("Never-kissed"));
+////	SingleWordIterator iter(UNI_L("six-hour"));
+////	SingleWordIterator iter(UNI_L("Soviet-era"));
+//	BOOL find_replacements = TRUE;
+//	session->CheckText(&iter, find_replacements);
+//	verify(g_spell_ui_data->IsCorrect());
+//	verify(g_spell_ui_data->GetReplacementCount() == 0);
+//}
+//finally
+//{
+//  if (session)
+//	  delete session;
+//}
+//
+//test("Break de_DE_frami")
+//{
+//	OpSpellCheckerSession* session;
+//	verify(OpStatus::IsSuccess(g_internal_spellcheck->CreateSession(UNI_L("de_DE_frami"), g_spell_ui_data, session, TRUE)));
+//	SingleWordIterator iter(UNI_L("c13010-ls.f.core.cdn.streamfarm.net"));
+//	BOOL find_replacements = TRUE;
+//	session->CheckText(&iter, find_replacements);
+//	verify(g_spell_ui_data->IsCorrect());
+//	verify(g_spell_ui_data->GetReplacementCount() == 0);
+//}
+//finally
+//{
+//  if (session)
+//	  delete session;
+//}
+//
+//test("Break it_IT")
+//{
+//	OpSpellCheckerSession* session;
+//	verify(OpStatus::IsSuccess(g_internal_spellcheck->CreateSession(UNI_L("it_IT"), g_spell_ui_data, session, TRUE)));
+//	SingleWordIterator iter(UNI_L("all'estero"));
+////	SingleWordIterator iter(UNI_L("l'anno"));
+////	SingleWordIterator iter(UNI_L("à"));
+////	SingleWordIterator iter(UNI_L("l'ecran"));
+//	BOOL find_replacements = TRUE;
+//	session->CheckText(&iter, find_replacements);
+//	verify(g_spell_ui_data->IsCorrect());
+//	verify(g_spell_ui_data->GetReplacementCount() == 0);
+//}
+//finally
+//{
+//  if (session)
+//	  delete session;
+//}
+
+table hunspell_tests(const char *, const char *) read "hunspell_tests.txt";
+
+test( "Hunspell test: $(tname)" )
+    multi hunspell_tests(tname, enc);
+    file uni hunspell_tests_dir "../hunspell_3p/tests";
+{
+	OpSpellCheckerSession* session = NULL;
+	BOOL delete_session = TRUE;
+	//output("%s %s %s %s\n", dic, aff, good, wrong);
+
+	OpString orig_dic_folder;
+
+	if ( op_strcmp("break", tname) != 0 &&
+		 op_strcmp("breakoff", tname) != 0 &&
+		 op_strcmp("opentaal_keepcase", tname) != 0) // Bugs in Opera related to hyphens and compound words, see CORE-41412.
+	{
+
+		verify_success(g_folder_manager->GetFolderPath(OPFILE_DICTIONARY_FOLDER, orig_dic_folder));
+		verify(orig_dic_folder.CStr() != NULL);
+		
+		verify(OpStatus::IsSuccess(g_folder_manager->SetFolderPath(OPFILE_DICTIONARY_FOLDER, hunspell_tests_dir)));
+		
+		verify(OpStatus::IsSuccess(g_internal_spellcheck->RefreshInstalledLanguages()));
+		
+		
+		OpString test_name;
+		verify(OpStatus::IsSuccess(test_name.SetFromUTF8(tname)));
+		
+		OpString good_name;
+		verify(OpStatus::IsSuccess(good_name.SetConcat(test_name, UNI_L(".good"))));
+		
+		OpString wrong_name;
+		verify(OpStatus::IsSuccess(wrong_name.SetConcat(test_name, UNI_L(".wrong"))));
+		
+		OpString suggest_name;
+		verify(OpStatus::IsSuccess(suggest_name.SetConcat(test_name, UNI_L(".sug"))));
+		
+		verify(OpStatus::IsSuccess(g_internal_spellcheck->CreateSession(test_name.CStr(), g_spell_ui_data, session, TRUE)));
+		verify(session);
+		verify(session->GetState() == OpSpellCheckerSession::IDLE);
+		
+		FileWordIterator good_iter(good_name, enc);
+		FileWordIterator wrong_iter(wrong_name, enc);
+		FileWordIterator suggest_iter(suggest_name, enc);
+		
+		FileWordIterator* iters[] = {&good_iter, &wrong_iter};
+		BOOL cond[] = {TRUE, FALSE};
+		
+		BOOL check_suggestions = !suggest_iter.IsEmpty();
+		
+		for ( unsigned int i=0; i < (sizeof(cond) / sizeof(BOOL)); i++ )
+		{
+			FileWordIterator* iter = iters[i];
+			if ( !iter->IsEmpty() )
+			{
+				delete_session = FALSE; //Session is deleted when the iterator is deleted.
+				do
+				{
+					session->CheckText(iter, TRUE /*find_replacements*/);
+					verify(cond[i] == !!g_spell_ui_data->IsCorrect());
+					if ( cond[i] == TRUE )
+					{
+						verify( g_spell_ui_data->GetReplacementCount() == 0 );
+					}
+					else if ( check_suggestions )
+					{
+						int s;
+						for (s=0; s < g_spell_ui_data->GetReplacementCount() && !suggest_iter.IsEmpty(); s++ )
+						{
+							verify( uni_strcmp(g_spell_ui_data->GetReplacement(s), suggest_iter.GetCurrentWord()) == 0 );
+							suggest_iter.ReadWord();
+							verify(suggest_iter.IsOK());
+						}
+						verify(s == g_spell_ui_data->GetReplacementCount());
+					}
+				} while ( iter->ReadWord() );
+			}
+			verify(iter->IsOK());
+		}
+		verify(suggest_iter.IsEmpty());
+	}
+}
+finally
+{
+	if (delete_session && session)
+		delete session;
+
+	if ( orig_dic_folder.CStr() != NULL && OpStatus::IsSuccess(g_folder_manager->SetFolderPath(OPFILE_DICTIONARY_FOLDER, orig_dic_folder.CStr())) )
+		g_internal_spellcheck->RefreshInstalledLanguages();
+}
+
+test ("Verify that we can read our own dictionary file when using zip. Ref.: DSK-266453")
+	file uni this_tests_dir ".";
+{
+	OpSpellCheckerSession* session = NULL;
+	BOOL delete_session = TRUE;
+	OpString orig_dic_folder;
+
+	verify_success(g_folder_manager->GetFolderPath(OPFILE_DICTIONARY_FOLDER, orig_dic_folder));
+	verify(orig_dic_folder.CStr() != NULL);
+
+	verify(OpStatus::IsSuccess(g_folder_manager->SetFolderPath(OPFILE_DICTIONARY_FOLDER, this_tests_dir)));
+
+	verify(OpStatus::IsSuccess(g_internal_spellcheck->RefreshInstalledLanguages()));
+
+	verify(OpStatus::IsSuccess(g_internal_spellcheck->CreateSession(UNI_L("test-own"), g_spell_ui_data, session, TRUE)));
+	verify(session);
+
+	SingleWordIterator iter(UNI_L("opselftestword"));
+	BOOL find_replacements = FALSE;
+
+	// Remove word from previous selftest runs
+	verify(session->CheckText(&iter, find_replacements) == OpStatus::OK);
+	if (g_spell_ui_data->IsCorrect())
+		verify(session->DeleteWord(UNI_L("opselftestword")) == OpStatus::OK);
+
+	verify(session->CheckText(&iter, find_replacements) == OpStatus::OK);
+	verify(!g_spell_ui_data->IsCorrect());
+
+	// Add the word
+	verify(session->AddWord(UNI_L("opselftestword")) == OpStatus::OK);
+	verify(session->CheckText(&iter, find_replacements) == OpStatus::OK);
+	verify(g_spell_ui_data->IsCorrect());
+
+	// Close session, reopen and test again
+	OP_DELETE(session);
+	verify(OpStatus::IsSuccess(g_internal_spellcheck->RefreshInstalledLanguages()));
+	verify(OpStatus::IsSuccess(g_internal_spellcheck->CreateSession(UNI_L("test-own"), g_spell_ui_data, session, TRUE)));
+	verify(session);
+	verify(session->CheckText(&iter, find_replacements) == OpStatus::OK);
+	verify(g_spell_ui_data->IsCorrect());
+}
+finally {
+	// In the failing case:
+	OpFile own_file1;
+	own_file1.Construct(UNI_L("test_own.oow"), OPFILE_DICTIONARY_FOLDER);
+	own_file1.Delete(TRUE);
+	// In the pass case:
+	OpFile own_file2;
+	own_file2.Construct(UNI_L("test-own.oow"), OPFILE_DICTIONARY_FOLDER);
+	own_file2.Delete(TRUE);
+
+	if (delete_session && session)
+		OP_DELETE(session);
+
+	if ( orig_dic_folder.CStr() != NULL && OpStatus::IsSuccess(g_folder_manager->SetFolderPath(OPFILE_DICTIONARY_FOLDER, orig_dic_folder.CStr())) )
+		g_internal_spellcheck->RefreshInstalledLanguages();
+}
+

@@ -1,0 +1,308 @@
+/* -*- Mode: c++; tab-width: 4; indent-tabs-mode: t; c-basic-offset: 4 -*- */
+
+group "vega_backends.blocklist_fetch";
+require VEGA_BACKENDS_BLOCKLIST_FETCH;
+require PREFS_WRITE;
+
+include "modules/hardcore/timer/optimer.h";
+include "modules/prefs/prefsmanager/collections/pc_core.h";
+include "modules/util/opfile/opfile.h";
+include "platforms/vega_backends/vega_blocklist_device.h";
+include "platforms/vega_backends/vega_blocklist_file.h";
+
+// doesn't really matter which file is used
+global
+{
+#define LIST_URL g_vega_backends_module.m_selftest_blocklist_url
+#define DEV_TYPE VEGABlocklistDevice::SelftestBlocklistFile
+
+	class BlocklistUtils
+	{
+	public:
+		static OP_STATUS CreateBlocklistFile(OpFile& file)
+		{
+			return file.Construct(ST_VEGABlocklistFileAccessor::GetName(DEV_TYPE), OPFILE_HOME_FOLDER);
+		}
+		static BOOL FileExists(time_t* modified = 0)
+		{
+			OpFile f;
+			BOOL exists;
+			if (OpStatus::IsError(CreateBlocklistFile(f)) || OpStatus::IsError(f.Exists(exists)))
+				return FALSE;
+			if (exists && modified)
+				f.GetLastModified(*modified);
+			return exists;
+		}
+	};
+
+	class BlocklistChecker : public OpTimerListener
+	{
+	public:
+		// called from OnTimeOut. return TRUE to stop exectuion (after
+		// calling ST_passed or ST_failed), or FALSE
+		// to continue waiting.
+		virtual BOOL CheckStatus() = 0;
+
+		BlocklistChecker(UINT32 timeout = 100, UINT32 max_count = 100)
+			: m_times(0), m_times_max(max_count)
+			, m_timeout(timeout)
+		{
+			m_timer.SetTimerListener(this);
+			m_timer.Start(m_timeout);
+		}
+		virtual ~BlocklistChecker() {}
+
+		void OnTimeOut(OpTimer* timer)
+		{
+			if (++ m_times > m_times_max)
+			{
+				ST_failed("timeout");
+				OP_DELETE(this);
+				return;
+			}
+
+			if (CheckStatus())
+			{
+				OP_DELETE(this);
+				return;
+			}
+
+			timer->Start(m_timeout);
+		}
+
+	private:
+		OpTimer m_timer;
+		UINT32 m_times;
+		UINT32 m_times_max;
+		UINT32 m_timeout;
+	};
+
+	class FetchedChecker : public BlocklistChecker
+	{
+	public:
+		FetchedChecker()
+		{
+			m_existing = BlocklistUtils::FileExists(&m_modified);
+		}
+		BOOL CheckStatus()
+		{
+			if (!m_existing)
+			{
+				if (BlocklistUtils::FileExists())
+				{
+					ST_passed();
+					return TRUE;
+				}
+				return FALSE;
+			}
+
+			OpFile f;
+			time_t mod;
+			if (OpStatus::IsError(BlocklistUtils::CreateBlocklistFile(f)) ||
+			    OpStatus::IsError(f.GetLastModified(mod)))
+			{
+				ST_failed("unknown file error");
+				return TRUE;
+			}
+			if (mod > m_modified)
+			{
+				ST_passed();
+				return TRUE;
+			}
+			return FALSE;
+		}
+
+	private:
+		BOOL m_existing;
+		time_t m_modified;
+	};
+	void WaitUntilFetched()
+	{
+		FetchedChecker* c = OP_NEW(FetchedChecker, ());
+		if (!c)
+		{
+			ST_failed("OOM");
+			return;
+		}
+	}
+
+	class NotFetchedChecker : public OpTimerListener
+	{
+	public:
+		NotFetchedChecker()
+		{
+			m_existing = BlocklistUtils::FileExists(&m_modified);
+			m_timer.SetTimerListener(this);
+			m_timer.Start(10000);
+		}
+		void OnTimeOut(OpTimer* timer)
+		{
+			time_t modified;
+			BOOL existing = BlocklistUtils::FileExists(&modified);
+			if (existing && (!m_existing || modified > m_modified))
+				ST_failed("file was fetched");
+			else
+				ST_passed();
+			OP_DELETE(this);
+		}
+	private:
+		OpTimer m_timer;
+		BOOL m_existing;
+		time_t m_modified;
+	};
+	void WaitNotFetched()
+	{
+		NotFetchedChecker* c = OP_NEW(NotFetchedChecker, ());
+		if (!c)
+		{
+			ST_failed("OOM");
+			return;
+		}
+	}
+
+	int g_set_retry;           // retry delay set in prefs
+	int g_set_refetch;         // refetch delay set in prefs
+	OpString g_existing_url;   // URL to a blocklist file known to exist
+	OpString g_tmp_url;        // temp URL, will live while tests are running
+}
+
+setup
+{
+	// get currently set timeouts etc from prefs - tests below will overwrite these values
+	g_set_retry   = g_pccore->GetIntegerPref(PrefsCollectionCore::BlocklistRetryDelay);
+	g_set_refetch = g_pccore->GetIntegerPref(PrefsCollectionCore::BlocklistRefetchDelay);
+
+	// remove current blocklist file
+	OpFile f;
+	if (OpStatus::IsSuccess(BlocklistUtils::CreateBlocklistFile(f)))
+	{
+		f.Delete();
+	}
+}
+exit
+{
+	// restore previously set timeouts etc from prefs
+	g_pccore->WriteIntegerL(PrefsCollectionCore::BlocklistRetryDelay,   g_set_retry);
+	g_pccore->WriteIntegerL(PrefsCollectionCore::BlocklistRefetchDelay, g_set_refetch);
+	LIST_URL = 0;
+}
+
+
+test("setup existing url")
+file uni path "blocklists/blocked_devices.json";
+{
+	verify(OpStatus::IsSuccess(g_existing_url.Set(UNI_L("file://localhost/"))));
+	verify(OpStatus::IsSuccess(g_existing_url.Append(path)));
+}
+
+
+// tests to check that fetching an existing file works as expected
+test("test that fetching an existing file works when no blocklist exists")
+require success("setup existing url");
+async;
+{
+	LIST_URL = g_existing_url.CStr();
+	ST_VEGABlocklistFileAccessor::Fetch(DEV_TYPE, 0);
+	WaitUntilFetched();
+}
+// resolution of GetLastModified is 1s
+test("dummy 2s delay") delay 2;
+require success("test that fetching an existing file works when no blocklist exists");
+{}
+test("test that fetching an existing file works when a blocklist exists")
+require success("setup existing url");
+require success("test that fetching an existing file works when no blocklist exists");
+async;
+{
+	LIST_URL = g_existing_url.CStr();
+	ST_VEGABlocklistFileAccessor::Fetch(DEV_TYPE, 0);
+	WaitUntilFetched();
+}
+
+
+// test that fetching a non-existing file will trigger re-fetch
+test("fetching non-existing file - setup")
+file uni path "blocklists/blocked_devices.nonexisting.json";
+{
+	// remove the file if it for some reason already exists
+	OpFile f;
+	verify(OpStatus::IsSuccess(f.Construct(path)));
+	BOOL exists;
+	if (OpStatus::IsSuccess(f.Exists(exists)) && exists)
+		f.Delete();
+
+	verify_success(g_tmp_url.Set(UNI_L("file://localhost/")));
+	verify_success(OpStatus::IsError(g_tmp_url.Append(path)));
+	g_pccore->WriteIntegerL(PrefsCollectionCore::BlocklistRetryDelay,   5); // retry every 5s
+	LIST_URL = g_tmp_url.CStr();
+}
+test("fetching non-existing file - fetching") async;
+{
+	ST_VEGABlocklistFileAccessor::Fetch(DEV_TYPE, 0);
+	WaitNotFetched();
+}
+test("fetching non-existing file - copying")
+file uni path_src "blocklists/blocked_devices.json";
+file uni path_dst "blocklists/blocked_devices.nonexisting.json";
+{
+	OpFile src;
+	OpFile dst;
+	verify(OpStatus::IsSuccess(src.Construct(path_src)));
+
+	// create the "non-existing" file
+	verify(OpStatus::IsSuccess(dst.Construct(path_dst)));
+	verify(OpStatus::IsSuccess(dst.CopyContents(&src, FALSE)));
+}
+test("fetching non-existing file - after creating") async;
+{
+	// should already be re-fetching
+	WaitUntilFetched();
+}
+test("fetching non-existing file - cleanup")
+file uni path "blocklists/blocked_devices.nonexisting.json";
+{
+	OpFile f;
+	if (OpStatus::IsSuccess(f.Construct(path)))
+		f.Delete();
+}
+
+
+// test that fetching a file returning 404 will trigger re-fetch
+test("fetching 404 file - setup")
+{
+	verify_success(g_tmp_url.Set(UNI_L("http://t/resources/nonexisting_blocklist_file.json")));
+	g_pccore->WriteIntegerL(PrefsCollectionCore::BlocklistRetryDelay,   5); // retry every 5s
+	LIST_URL = g_tmp_url.CStr();
+}
+test("fetching 404 file - fetching") async;
+{
+	ST_VEGABlocklistFileAccessor::Fetch(DEV_TYPE, 0);
+	WaitNotFetched();
+}
+test("fetching 404 file - after changing to existing") async;
+require success("setup existing url");
+{
+	LIST_URL = g_existing_url.CStr();
+	WaitUntilFetched();
+}
+
+
+// test that re-fetching after expiry works
+test("re-fetching after expiry - first fetch") async;
+require success("setup existing url");
+{
+	g_pccore->WriteIntegerL(PrefsCollectionCore::BlocklistRefetchDelay, 5); // refetch after 5s
+	LIST_URL = g_existing_url;
+	ST_VEGABlocklistFileAccessor::Fetch(DEV_TYPE, 0);
+	WaitUntilFetched();
+}
+test("re-fetching after expiry - re-fetch") async;
+{
+	WaitUntilFetched();
+}
+test("re-fetching after expiry - cleanup") async;
+{
+	g_pccore->WriteIntegerL(PrefsCollectionCore::BlocklistRefetchDelay, g_set_refetch);
+	// next fetch will read new re-fetch time
+	WaitUntilFetched();
+}

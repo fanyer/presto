@@ -1,0 +1,213 @@
+/* -*- Mode: c++; tab-width: 4; indent-tabs-mode: t; c-basic-offset: 4 -*-
+**
+** Copyright (C) 2004-2006 Opera Software ASA.  All rights reserved.
+**
+	** This file is part of the Opera web browser.  It may not be distributed
+** under any circumstances.
+**
+** Yngve N. Pettersen
+*/
+
+/*
+ *	This test runs a test of URLs loaded from a textfile, usually
+ *  several thousands, or hundreds of thousands, and report how many 
+ *	succeeded, and how many failed, which can be used to determine 
+ *	if there was an major regression between versions.
+ *
+ *	Failed URLs are retested to make sure it was not an unrelated accident
+ *
+ *	Running time for the test is usually several days, and the test
+ *	therefore have to be enabled with a preference.
+ *
+ *	Default configuration URL is http://testsuites.oslo.osa/core/selftest/libssl/longbatch/all-ssl-urls.txt
+ *
+ *	This particular test runs with SSl v3 and TLS 1.0 enabled, TLS 1.1 and 1.2 disabled.
+ *
+ *	To run, use commandline arguments: --test="libssl load lots of URLS TLS 1.0" -set-pref "[Network].Test Longbatch=1"
+ *	Optionally change URL with: -set-pref "[Network].LongbatchURL=http://testsuites.oslo.osa/exampleURL" 
+ */
+
+group "libssl load lots of URLS TLS 1.0";
+require init;
+
+require _NATIVE_SSL_SUPPORT_;
+require USE_SSL_CERTINSTALLER;
+require _SUPPORT_TLS_1_2;
+
+language c++;
+
+include "core/pch.h";
+
+include "modules/dochand/win.h";
+include "modules/dochand/docman.h";
+include "modules/doc/frm_doc.h";
+
+include "modules/url/url_man.h";
+include "modules/network_selftest/urldoctestman.h";
+include "modules/network_selftest/justload.h";
+include "modules/network_selftest/basicwincom.h";
+include "modules/network_selftest/sslwincom.h";
+include "modules/network_selftest/remote_framework.h";
+include "modules/network_selftest/ssl_waitupdate.h";
+
+include "modules/prefs/prefsmanager/collections/pc_network.h";
+include "modules/network_selftest/prefs_replace.h";
+
+include "modules/olddebug/tstdump.h";
+include "modules/libssl/selftest/longbatch_tls.h";
+
+global {
+
+	class SimpleCancelAuthenticationListener 
+		: public BasicWindowListener
+	{
+	public:
+		SimpleCancelAuthenticationListener (URL_DocSelfTest_Manager *manager, OpLoadingListener *fallback)
+			: BasicWindowListener(manager, fallback) {}
+
+		virtual ~SimpleCancelAuthenticationListener(){}
+
+		virtual void OnAuthenticationRequired(OpWindowCommander* commander, OpAuthenticationCallback* callback)
+		{
+			callback->CancelAuthentication();
+		}
+	};
+	
+	class SimpleClientAuthListener 
+		: public BasicSSLWindowListener
+	{
+	public:
+		SimpleClientAuthListener (URL_DocSelfTest_Manager *manager, OpSSLListener *fallback)
+			: BasicSSLWindowListener(manager, fallback) {}
+
+		virtual ~SimpleClientAuthListener (){}
+		
+		virtual void OnCertificateBrowsingNeeded(OpWindowCommander* wic, SSLCertificateContext* context, SSLCertificateReason reason, SSLCertificateOption options)
+		{
+			if(context)
+			{
+				context->OnCertificateBrowsingDone(TRUE, SSL_CERT_OPTION_ACCEPT);
+				return;
+			}
+		
+			URL empty;
+			ReportFailure(empty,"Certificate dialog called when it should not have been");
+		}
+
+		virtual void OnSecurityPasswordNeeded(OpWindowCommander* wic, SSLSecurityPasswordCallback* callback)
+		{
+			if(callback)
+			{
+				callback->OnSecurityPasswordDone(FALSE, NULL, NULL);
+				return;
+			}
+				
+			URL empty;
+			ReportFailure(empty,"Password dialog called when it should not have been");
+		}
+
+	};
+
+	NeverFail_RemoteFrameworkManager testmanager;
+
+	SimpleClientAuthListener *listener = NULL;
+	SimpleCancelAuthenticationListener *auth_listener = NULL;
+	WindowCommander *wc=NULL;
+	
+#ifdef LIBSSL_AUTO_UPDATE
+	SSL_WaitForPendingAutoUpdate update_waiter;
+#endif
+
+	Selftest_IntegerPrefOverride sslv3;
+	Selftest_IntegerPrefOverride tls10;
+	Selftest_IntegerPrefOverride tls11;
+	Selftest_IntegerPrefOverride tls12;
+	Selftest_IntegerPrefOverride connections;
+	Selftest_IntegerPrefOverride redirects;
+}
+
+html { "<html><body>Empty document, SSL testing with extra certificates going on. A displayed certificate dialog is a failure.</body></html>" };
+
+setup 
+{
+	urlManager->RemoveSensitiveData();
+}
+
+exit
+{
+	if(wc)
+	    wc->SetSSLListener(listener->GetFallback());
+	
+	OP_DELETE(listener);
+	listener = NULL;
+
+	if(wc)
+	    wc->SetLoadingListener(auth_listener->GetFallback());
+	OP_DELETE(auth_listener);
+	auth_listener = NULL;
+}
+
+test("Initialized")
+{
+	verify((BOOL) g_pcnet->GetIntegerPref(PrefsCollectionNetwork::TestLongbatch) == TRUE);
+	verify_success(testmanager.Construct(state.doc->GetMessageHandler()));
+
+    wc = state.doc->GetWindow()->GetWindowCommander();
+    verify(wc != NULL);
+	WindowCommander::SelftestHelper helper(wc);
+
+    listener = OP_NEW(SimpleClientAuthListener, (testmanager.GetTestManager(), wc->GetSSLListener()));
+    verify(listener != NULL);
+    wc->SetSSLListener(listener);
+
+	auth_listener = OP_NEW(SimpleCancelAuthenticationListener, (testmanager.GetTestManager(), helper.GetPlatformLoadingListener()));
+    wc->SetLoadingListener(auth_listener);
+
+	verify(OpStatus::IsSuccess(sslv3.Construct(PrefsCollectionNetwork::EnableSSL3_0,TRUE)));
+	verify(OpStatus::IsSuccess(tls10.Construct(PrefsCollectionNetwork::EnableSSL3_1,TRUE)));
+	verify(OpStatus::IsSuccess(tls11.Construct(PrefsCollectionNetwork::EnableTLS1_1,FALSE)));
+	verify(OpStatus::IsSuccess(tls12.Construct(PrefsCollectionNetwork::EnableTLS1_2,FALSE)));
+	verify(sslv3.Active());
+	verify(tls10.Active());
+	verify(tls11.Active());
+	verify(tls12.Active());
+	verify(OpStatus::IsSuccess(connections.Construct(PrefsCollectionNetwork::MaxConnectionsTotal,40)));
+	verify(connections.Active());
+	verify(OpStatus::IsSuccess(redirects.Construct(PrefsCollectionNetwork::EnableClientPull,FALSE)));
+	verify(redirects.Active());
+}
+
+test("Flush auto updates")
+	require defined LIBSSL_AUTO_UPDATE;
+	require success "Initialized";
+	async;
+{
+	update_waiter.Activate();
+}
+
+subtest setupframework()
+		{
+	verify_success(testmanager.AddTestSuite(g_pcnet->GetStringPref(PrefsCollectionNetwork::LongbatchURL)));
+		}
+
+
+test("Load long batch")
+	require success "Initialized";
+	async;
+{
+	if (!setupframework())
+		ST_failed("Could not setup framework");
+}
+
+test("Result")
+	require success "Initialized";
+{
+	output("Loaded %d URL.\n",testmanager.GetTestManager()->GetCompleted());
+	output("Completed successfully %d\n",testmanager.GetTestManager()->GetCompletedSuccess());
+	output("Completed unsuccessfully %d\n",testmanager.GetTestManager()->GetCompletedNoSuccess());
+
+	output("\nCompleted successfully %7.2%%f\n",((double)testmanager.GetTestManager()->GetCompletedSuccess()/(double) testmanager.GetTestManager()->GetCompleted())*100.0);
+	verify(testmanager.GetTestManager()->GetCompletedSuccess() + testmanager.GetTestManager()->GetCompletedNoSuccess()== testmanager.GetTestManager()->GetCompleted());
+}
+
+

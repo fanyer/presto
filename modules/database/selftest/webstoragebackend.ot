@@ -1,0 +1,1091 @@
+/* -*- Mode: c++; tab-width: 4; indent-tabs-mode: t; c-basic-offset: 4 -*-
+ *
+ * Copyright (C) 2009 Opera Software AS.  All rights reserved.
+ *
+ * This file is part of the Opera web browser.
+ * It may not be distributed under any circumstances.
+ */
+
+
+group "database.webstorage.backend";
+
+require init;
+require OPSTORAGE_SUPPORT;
+
+language c++;
+
+include "modules/database/opdatabasemanager.h";
+include "modules/database/webstorage_data_abstraction.h";
+include "modules/hardcore/timer/optimer.h";
+include "modules/database/src/opdatabase_base.h";
+
+global
+{
+#undef SELFTEST_URLCTXID
+#define SELFTEST_URLCTXID 0
+#undef WEBDB_SELFTEST_ORIGIN
+#define WEBDB_SELFTEST_ORIGIN UNI_L("http://opera.selftest")
+
+	//each instance stores the status of a single test
+	class TestStatus;
+	List<TestStatus> all_status;
+	class TestStatusLinkBase : public ListElement<TestStatusLinkBase>
+	{
+	public:
+		TestStatus *test_status;
+		TestStatusLinkBase(TestStatus* _test_status) : test_status(_test_status) {}
+		~TestStatusLinkBase() {}
+	};
+	class TestStatus :
+		public ListElement<TestStatus>,
+		public OpTimer,
+		public OpTimerListener,
+		public WebStorageStateChangeListener
+	{
+		unsigned m_flags;
+		enum TestStatusFlags {IS_RUNNING=1,CAN_DELETE=2,BEGIN_DELETED=4};
+		BOOL GetFlag(unsigned flag) const{return (m_flags&flag)!=0;}
+		void SetFlag(unsigned flag) {m_flags|=flag;}
+		void UnsetFlag(unsigned flag) {m_flags&=~flag;}
+
+		List<TestStatusLinkBase> callbacks;
+		TestStatus* test_status;
+	public:
+		unsigned mutation_count;
+		WebStorageBackend* m_wsb;
+		unsigned m_global_callback_count;
+
+		TestStatus(List<TestStatus>* h) :
+			m_flags(IS_RUNNING),
+			test_status(this),
+			mutation_count(0),
+			m_wsb(NULL),
+			m_global_callback_count(0)
+		{
+			Into(h);
+			SetTimerListener(this);
+			Start(2000); // Start the timer.
+		}
+		~TestStatus()
+		{
+			OP_ASSERT(!GetFlag(BEGIN_DELETED));
+			SetFlag(BEGIN_DELETED);
+			Out();
+			Finish();
+			if (m_wsb != NULL)
+			{
+				WebStorageBackend *wsb = m_wsb;
+				m_wsb = NULL;
+				wsb->CancelAll();
+				wsb->RemoveListener(this);
+				wsb->Release(TRUE);
+			}
+			TestStatusLinkBase *n = callbacks.First(), *m;
+			while(n != NULL)
+			{
+				m = n->Suc();
+				n->test_status = NULL;
+				n->Out();
+				OP_DELETE(n);
+				n = m;
+			}
+		}
+		static TestStatus* Create(List<TestStatus>* h)
+		{
+			return OP_NEW(TestStatus,(h));
+		}
+		virtual void OnTimeOut(OpTimer* timer) { OpStatus::Ignore(OnTimeOut()); }
+		OP_STATUS OnTimeOut();
+
+		virtual void HandleStateChange(StateChange v)
+		{
+			if (v == STORAGE_MUTATED)
+				mutation_count++;
+			else if (v == SHUTDOWN)
+			{
+				m_wsb->Release(FALSE);
+				m_wsb = NULL;
+			}
+		}
+		void Finish() {
+			UnsetFlag(IS_RUNNING);
+		}
+		BOOL IsTestRunning() const{
+			return GetFlag(IS_RUNNING);
+		}
+		void AddCallback(TestStatusLinkBase *callback) {
+			callback->Into(&callbacks);
+			callback->test_status = this;
+		}
+		void RemoveCallback(TestStatusLinkBase *callback) {
+			callback->test_status = NULL;
+			callback->Out();
+			if (!HasRunningCallbacks() && GetFlag(CAN_DELETE) )
+				if (!GetFlag(BEGIN_DELETED))
+					OP_DELETE(this);
+		}
+		BOOL HasRunningCallbacks() const{return callbacks.First() != NULL;}
+		unsigned NumberOfRunningCallbacks() const{return callbacks.Cardinal();}
+		void SetCanDelete() {
+			SetFlag(CAN_DELETE);
+			if (!IsTestRunning() || !HasRunningCallbacks() )
+				if (!GetFlag(BEGIN_DELETED))
+					OP_DELETE(this);
+		}
+	};
+	void DeleteAllStatus()
+	{
+		TestStatus* n = (TestStatus*)all_status.First();
+		while(n != NULL)
+		{
+			TestStatus *m = (TestStatus*)n->Suc();
+			n->Out();
+			n->SetCanDelete();
+			n = m;
+		}
+		OP_ASSERT(all_status.First() == NULL);
+	}
+
+	static BOOL _verify(BOOL b, unsigned line_number, const char *msg, TestStatus *test_status) {
+		if(!b && test_status != NULL && test_status->IsTestRunning()) {
+			test_status->Finish();
+			char buf[1000]={0}; /* ARRAY OK 2009-04-16 joaoe */
+			op_snprintf(buf,999,"\b\b\b%d: %s should be true", line_number, msg);
+			ST_failed(buf);
+		}
+		return b;
+	}
+
+	static BOOL _verify(const void* p, unsigned line_number, const char *msg, TestStatus *test_status) {
+		return _verify(p != NULL, line_number, msg, test_status);
+	}
+
+	static void IgnorePtr(const void*p) { }
+	static void IgnorePtr(int p) { }
+
+#undef WEBSTORAGE_VERIFY
+#define WEBSTORAGE_VERIFY(b) do{ \
+	if(!_verify(b,__LINE__,#b,test_status)) {return OpStatus::ERR;} }while(0)
+
+#undef WEBSTORAGE_VERIFYL
+#define WEBSTORAGE_VERIFYL(b) do{ \
+	if(!_verify(b,0       ,#b,test_status)) {return OpStatus::ERR;} }while(0)
+
+#undef WEBSTORAGE_VERIFY_RES_ERROR
+#define WEBSTORAGE_VERIFY_RES_ERROR(wants_error, err_obj) \
+	do { \
+		if(test_status != NULL) { \
+			BOOL expr = (wants_error) == (err_obj)->IsError(); \
+			char msg[256] = {0}; \
+			op_snprintf(msg, 255, "%s holds %d", #err_obj, \
+					(err_obj)->IsError() ? (err_obj)->m_error_data.m_error : OpStatus::OK); \
+			if (!_verify(expr,__LINE__,msg,test_status)) { \
+				return OpStatus::ERR; \
+			} \
+		} \
+	}while(0)
+
+	OP_STATUS TestStatus::OnTimeOut()
+	{
+		WEBSTORAGE_VERIFY(!"Test timed out");
+		return OpStatus::OK;
+	}
+
+	static void DeleteUniCharArray(void* p)
+	{
+		OP_DELETEA(static_cast<uni_char*>(p));
+	}
+
+#undef EVIL_KEY_SIZE
+#define EVIL_KEY_SIZE 0x10000
+
+//callback section common to success and error callbacks
+//cleanup_fn is used to cleanup args, if the callback section is not called
+#undef CALLBACK_OPERATION_SECTION_START
+#define CALLBACK_OPERATION_SECTION_START(type) \
+	class type : public WebStorageOperationCallback, public TestStatusLinkBase { \
+		OP_STATUS status; \
+		void* m_args; \
+		void (*m_args_cleanup_fn)(void*); \
+	public: \
+		type(TestStatus *_test_status, void* args = NULL, void (*cleanup_fn)(void*) = NULL) : \
+			TestStatusLinkBase(_test_status), \
+			m_args(args), \
+			m_args_cleanup_fn(cleanup_fn) \
+		{ \
+			test_status->AddCallback(this);\
+		} \
+		virtual ~type() {}\
+		virtual void Discard() { \
+			if (test_status != NULL) { \
+				TestStatus* _test_status = test_status; \
+				test_status = NULL; \
+				_test_status->RemoveCallback(this);\
+				if (_test_status->NumberOfRunningCallbacks()<1 && _test_status->IsTestRunning()) { \
+					_test_status->Finish(); \
+					ST_passed(); \
+				} \
+			} \
+			if (m_args_cleanup_fn) \
+				m_args_cleanup_fn(m_args); \
+			OP_DELETE(static_cast<TestStatusLinkBase*>(this)); \
+		} \
+		virtual Window* GetWindow() { return g_selftest.utils->window; } \
+		virtual OP_STATUS HandleOperation(const WebStorageOperation* result) { \
+			status = OpStatus::OK;\
+			if (test_status != NULL && test_status->IsTestRunning()) \
+			{ \
+				m_args_cleanup_fn = NULL; \
+				status = HandleOperationCustom(result); \
+			} \
+			return status; \
+		} \
+		OP_STATUS HandleOperationCustom(const WebStorageOperation* result) {\
+			WebStorageBackend*& wsb = test_status->m_wsb; \
+			unsigned global_callback_count = test_status->m_global_callback_count++; \
+			unsigned mutation_count = test_status->mutation_count; \
+			if (wsb == NULL) return OpStatus::ERR; \
+			void*& args = m_args; \
+			IgnorePtr(args); \
+			IgnorePtr(wsb); \
+			IgnorePtr(global_callback_count);\
+			IgnorePtr(mutation_count);
+			//dbg_printf(#type "::HandleCallbackCustom(%d,%x)\n",global_callback_count,result->m_type);
+
+#undef CALLBACK_OPERATION_SECTION_END
+#define CALLBACK_OPERATION_SECTION_END(type) return OpStatus::OK;}};
+
+#undef ENUMERATOR_SECTION_START
+#define ENUMERATOR_SECTION_START(type) \
+	class type : public WebStorageKeyEnumerator, public TestStatusLinkBase { \
+		OP_STATUS status; \
+		unsigned last_index; \
+	public: \
+		type(TestStatus *_test_status) : TestStatusLinkBase(_test_status), last_index(0) { \
+			test_status->AddCallback(this);\
+		} \
+		virtual ~type() {}\
+		virtual void Discard() { \
+			if (test_status != NULL) { \
+				TestStatus* _test_status = test_status; \
+				test_status = NULL; \
+				_test_status->RemoveCallback(this);\
+				if (_test_status->NumberOfRunningCallbacks()<1 && _test_status->IsTestRunning()) { \
+					_test_status->Finish(); \
+					ST_passed(); \
+				} \
+			} \
+			OP_DELETE(static_cast<TestStatusLinkBase*>(this)); \
+		} \
+		virtual void HandleError(OP_STATUS status) { OpStatus::Ignore(HandleErrorCustom(status)); } \
+		OP_STATUS HandleErrorCustom(OP_STATUS status) { \
+			OP_ASSERT(OpStatus::IsError(status)); \
+			WEBSTORAGE_VERIFY(!"an error occurred"); \
+			return OpStatus::OK; \
+		} \
+		virtual BOOL WantsValues() { return TRUE; } \
+		virtual OP_STATUS HandleKey(unsigned index, const WebStorageValue* key, const WebStorageValue* value) { \
+			status = OpStatus::OK;\
+			if (test_status != NULL && test_status->IsTestRunning()) \
+				status = HandleKeyCustom(index, key, value); \
+			return status; \
+		} \
+		OP_STATUS HandleKeyCustom(unsigned index, const WebStorageValue* key, const WebStorageValue* value) {\
+			WebStorageBackend*& wsb = test_status->m_wsb; \
+			if (wsb == NULL) return OpStatus::ERR; \
+			WEBSTORAGE_VERIFY(index == last_index++); \
+			IgnorePtr(wsb);
+
+#undef ENUMERATOR_SECTION_END
+#define ENUMERATOR_SECTION_END(type) return OpStatus::OK;}};
+
+#undef CALLBACK_OBJECT_DECL
+#define CALLBACK_OBJECT_DECL(type, var_name) \
+	type* var_name = OP_NEW(type, (test_status)); \
+	WEBSTORAGE_VERIFY(var_name != NULL);
+
+#undef CALLBACK_OBJECT_DECL_WARGS
+#define CALLBACK_OBJECT_DECL_WARGS(type, var_name, args, cleanup_fn) \
+	type* var_name = OP_NEW(type, (test_status, args, cleanup_fn)); \
+	WEBSTORAGE_VERIFY(var_name != NULL);
+
+#undef ASYNC_TEST_START
+#define ASYNC_TEST_START \
+	class ASYNC_TEST_WRAP_TEMP{\
+	public:\
+		static OP_STATUS do_test(List<TestStatus>* all_status) { \
+		OP_STATUS status = OpStatus::OK;\
+		OpStatus::Ignore(status);\
+		TestStatus* test_status = TestStatus::Create(all_status); \
+		WebStorageBackend*& wsb = test_status->m_wsb; \
+		status = WebStorageBackend::Create(WEB_STORAGE_LOCAL, WEBDB_SELFTEST_ORIGIN, FALSE, SELFTEST_URLCTXID, &wsb); \
+		WEBSTORAGE_VERIFYL(OpStatus::IsSuccess(status)); \
+		wsb->AddListener(test_status); \
+		IgnorePtr(wsb);
+
+#undef ASYNC_TEST_END
+#define ASYNC_TEST_END return OpStatus::OK;}}; \
+	OpStatus::Ignore(ASYNC_TEST_WRAP_TEMP::do_test(&all_status));
+}
+
+setup
+{
+	DATABASE_MODULE_ADD_CONTEXT(0, OPFILE_PERSISTENT_STORAGE_FOLDER);
+}
+
+test("creation")
+{
+	WebStorageBackend* wsb = NULL;
+
+	verify_success(WebStorageBackend::Create(WEB_STORAGE_LOCAL, WEBDB_SELFTEST_ORIGIN, FALSE, SELFTEST_URLCTXID, &wsb));
+	verify(wsb->GetType() == WEB_STORAGE_LOCAL);
+	verify_string(wsb->GetOrigin(), WEBDB_SELFTEST_ORIGIN);
+	verify(!wsb->IsPersistent());
+	verify_success(WEBSTORAGE_CLEAR_ALL(wsb, NULL));
+}
+finally
+{
+	if (wsb != NULL)
+		wsb->Release(TRUE);
+}
+
+test("storage empty") async;
+{
+	ASYNC_TEST_START;
+
+	CALLBACK_OPERATION_SECTION_START(CB_1)
+
+		WEBSTORAGE_VERIFY(result);
+		WEBSTORAGE_VERIFY_RES_ERROR(FALSE, result);
+		WEBSTORAGE_VERIFY(result->m_type == WebStorageOperation::GET_ITEM_COUNT);
+		WEBSTORAGE_VERIFY(result->m_data.m_item_count == 0);
+		WEBSTORAGE_VERIFY(global_callback_count == 0);
+		WEBSTORAGE_VERIFY(mutation_count == 0);
+
+		CALLBACK_OPERATION_SECTION_START(CB_2)
+
+			WEBSTORAGE_VERIFY(result);
+			WEBSTORAGE_VERIFY_RES_ERROR(FALSE, result);
+			WEBSTORAGE_VERIFY(result->m_type == WebStorageOperation::GET_KEY_BY_INDEX);
+			WEBSTORAGE_VERIFY(result->m_data.m_storage.m_value == NULL);
+			WEBSTORAGE_VERIFY(!result->m_data.m_storage.m_storage_mutated);
+			WEBSTORAGE_VERIFY(global_callback_count == 1);
+			WEBSTORAGE_VERIFY(mutation_count == 0);
+
+			CALLBACK_OPERATION_SECTION_START(CB_3)
+
+				WEBSTORAGE_VERIFY(result);
+				WEBSTORAGE_VERIFY_RES_ERROR(FALSE, result);
+				WEBSTORAGE_VERIFY(result->m_type == WebStorageOperation::GET_ITEM_BY_KEY);
+				WEBSTORAGE_VERIFY(result->m_data.m_storage.m_value == NULL);
+				WEBSTORAGE_VERIFY(!result->m_data.m_storage.m_storage_mutated);
+				WEBSTORAGE_VERIFY(global_callback_count == 2);
+				WEBSTORAGE_VERIFY(mutation_count == 0);
+
+				ENUMERATOR_SECTION_START(EN_1)
+
+					WEBSTORAGE_VERIFY(!"enumerator should not have been called because there is nothing stored");
+
+				ENUMERATOR_SECTION_END(EN_1)
+
+				CALLBACK_OBJECT_DECL(EN_1, en_1)
+
+				WEBSTORAGE_VERIFY(OpStatus::IsSuccess(wsb->EnumerateAllKeys(en_1)));
+
+			CALLBACK_OPERATION_SECTION_END(CB_3)
+
+			CALLBACK_OBJECT_DECL(CB_3, cb_3)
+
+			WebStorageValueTemp v(UNI_L("a"),1);
+			WEBSTORAGE_VERIFY(OpStatus::IsSuccess(wsb->GetItem(&v, cb_3)));
+
+		CALLBACK_OPERATION_SECTION_END(CB_2)
+
+		CALLBACK_OBJECT_DECL(CB_2, cb_2)
+
+		WEBSTORAGE_VERIFY(OpStatus::IsSuccess(wsb->GetKeyAtIndex(2, cb_2)));
+
+	CALLBACK_OPERATION_SECTION_END(CB_1)
+
+	CALLBACK_OBJECT_DECL(CB_1, cb_1)
+
+	WEBSTORAGE_VERIFY(OpStatus::IsSuccess(wsb->GetNumberOfItems(cb_1)));
+
+	ASYNC_TEST_END;
+}
+
+test("storage - everything naturally") async;
+{
+	ASYNC_TEST_START;
+
+	CALLBACK_OPERATION_SECTION_START(CB_a)
+
+		WEBSTORAGE_VERIFY(result);
+		WEBSTORAGE_VERIFY_RES_ERROR(FALSE, result);
+		WEBSTORAGE_VERIFY(result->m_type == WebStorageOperation::CLEAR);
+		WEBSTORAGE_VERIFY(!result->m_data.m_storage.m_storage_mutated);
+		WEBSTORAGE_VERIFY(global_callback_count == 0);
+		WEBSTORAGE_VERIFY(mutation_count == 0);
+
+	CALLBACK_OPERATION_SECTION_END(CB_a)
+
+	CALLBACK_OBJECT_DECL(CB_a, cb_a)
+
+	WEBSTORAGE_VERIFY(OpStatus::IsSuccess(wsb->Clear(cb_a)));
+
+	CALLBACK_OPERATION_SECTION_START(CB_0)
+
+		WEBSTORAGE_VERIFY(result);
+		WEBSTORAGE_VERIFY_RES_ERROR(FALSE, result);
+		WEBSTORAGE_VERIFY(result->m_type == WebStorageOperation::SET_ITEM);
+		WEBSTORAGE_VERIFY(result->m_data.m_storage.m_value == NULL);
+		WEBSTORAGE_VERIFY(result->m_data.m_storage.m_storage_mutated);
+		WEBSTORAGE_VERIFY(global_callback_count == 1 || global_callback_count == 2);
+		WEBSTORAGE_VERIFY(mutation_count == 1 || mutation_count == 2);
+
+	CALLBACK_OPERATION_SECTION_END(CB_0)
+
+	CALLBACK_OBJECT_DECL(CB_0, cb_01)
+	CALLBACK_OBJECT_DECL(CB_0, cb_02)
+
+	WebStorageValueTemp k1(UNI_L("a\0b"),3);
+	WebStorageValueTemp v1(UNI_L("c\0d"),3);
+	WebStorageValueTemp k2(UNI_L("e\0f"),3);
+	WebStorageValueTemp v2(UNI_L("g\0h"),3);
+
+	WEBSTORAGE_VERIFY(OpStatus::IsSuccess(wsb->SetItem(&k1, &v1, cb_01)));
+	WEBSTORAGE_VERIFY(OpStatus::IsSuccess(wsb->SetItem(&k2, &v2, cb_02)));
+
+	CALLBACK_OPERATION_SECTION_START(CB_1)
+
+		WEBSTORAGE_VERIFY(result);
+		//this var ensures proper serialization and queing of operations
+		WEBSTORAGE_VERIFY(global_callback_count == 3);
+		WEBSTORAGE_VERIFY(mutation_count == 2);
+		WEBSTORAGE_VERIFY_RES_ERROR(FALSE, result);
+		WEBSTORAGE_VERIFY(result->m_type == WebStorageOperation::GET_ITEM_COUNT);
+		WEBSTORAGE_VERIFY(result->m_data.m_item_count == 2);
+
+		CALLBACK_OPERATION_SECTION_START(CB_2)
+
+			WEBSTORAGE_VERIFY(result);
+			WEBSTORAGE_VERIFY(global_callback_count == 4);
+			WEBSTORAGE_VERIFY(mutation_count == 2);
+			WEBSTORAGE_VERIFY_RES_ERROR(FALSE, result);
+			WEBSTORAGE_VERIFY(result->m_type == WebStorageOperation::GET_KEY_BY_INDEX);
+			WEBSTORAGE_VERIFY(!result->m_data.m_storage.m_storage_mutated);
+			WEBSTORAGE_VERIFY(result->m_data.m_storage.m_value != NULL);
+			WEBSTORAGE_VERIFY(result->m_data.m_storage.m_value->Equals(UNI_L("e\0f"),3));
+
+			CALLBACK_OPERATION_SECTION_START(CB_3)
+
+				WEBSTORAGE_VERIFY(result);
+				WEBSTORAGE_VERIFY(global_callback_count == 5);
+				WEBSTORAGE_VERIFY(mutation_count == 2);
+				WEBSTORAGE_VERIFY_RES_ERROR(FALSE, result);
+				WEBSTORAGE_VERIFY(result->m_type == WebStorageOperation::GET_ITEM_BY_KEY);
+				WEBSTORAGE_VERIFY(!result->m_data.m_storage.m_storage_mutated);
+				WEBSTORAGE_VERIFY(result->m_data.m_storage.m_value != NULL);
+				WEBSTORAGE_VERIFY(result->m_data.m_storage.m_value->Equals(UNI_L("c\0d"),3));
+
+				// ---------------
+
+				ENUMERATOR_SECTION_START(EN_1)
+					//dbg_printf("index %d %S %S\n",index, key != NULL ? key->m_value : 0, value != NULL ? value->m_value : 0);
+					switch(index)
+					{
+					case 0:
+						WEBSTORAGE_VERIFY(key != NULL);
+						WEBSTORAGE_VERIFY(value != NULL);
+
+						WEBSTORAGE_VERIFY(key->Equals(UNI_L("a\0b"),3));
+						WEBSTORAGE_VERIFY(value->Equals(UNI_L("c\0d"),3));
+						break;
+					case 1:
+						WEBSTORAGE_VERIFY(key != NULL);
+						WEBSTORAGE_VERIFY(value != NULL);
+
+						WEBSTORAGE_VERIFY(key->Equals(UNI_L("e\0f"),3));
+						WEBSTORAGE_VERIFY(value->Equals(UNI_L("g\0h"),3));
+						break;
+					case 2:
+						WEBSTORAGE_VERIFY(!"Opps! Too many items");
+					}
+				ENUMERATOR_SECTION_END(EN_1)
+
+				CALLBACK_OBJECT_DECL(EN_1, en_1)
+
+				WEBSTORAGE_VERIFY(OpStatus::IsSuccess(wsb->EnumerateAllKeys(en_1)));
+
+				// ---------------
+
+				CALLBACK_OPERATION_SECTION_START(CB_4)
+
+					WEBSTORAGE_VERIFY(result);
+					WEBSTORAGE_VERIFY_RES_ERROR(FALSE, result);
+					WEBSTORAGE_VERIFY(result->m_type == WebStorageOperation::SET_ITEM);
+					WEBSTORAGE_VERIFY(result->m_data.m_storage.m_storage_mutated);
+					WEBSTORAGE_VERIFY(result->m_data.m_storage.m_value != NULL);
+					WEBSTORAGE_VERIFY(result->m_data.m_storage.m_value->Equals(UNI_L("c\0d"),3));
+					WEBSTORAGE_VERIFY(global_callback_count == 6);
+					WEBSTORAGE_VERIFY(mutation_count == 3);
+
+				CALLBACK_OPERATION_SECTION_END(CB_4)
+
+				CALLBACK_OBJECT_DECL(CB_4, cb_4)
+
+				WebStorageValueTemp k1(UNI_L("a\0b"),3);
+				WebStorageValueTemp v1(UNI_L("x\0z"),3);
+
+				WEBSTORAGE_VERIFY(OpStatus::IsSuccess(wsb->SetItem(&k1, &v1, cb_4)));
+
+				// ---------------
+
+				CALLBACK_OPERATION_SECTION_START(CB_5)
+
+					WEBSTORAGE_VERIFY(result);
+					WEBSTORAGE_VERIFY_RES_ERROR(FALSE, result);
+					WEBSTORAGE_VERIFY(result->m_type == WebStorageOperation::GET_ITEM_COUNT);
+					WEBSTORAGE_VERIFY(result->m_data.m_item_count == 2);
+					WEBSTORAGE_VERIFY(global_callback_count == 7);
+					WEBSTORAGE_VERIFY(mutation_count == 3);
+
+					CALLBACK_OPERATION_SECTION_START(CB_6)
+
+						WEBSTORAGE_VERIFY(result);
+						WEBSTORAGE_VERIFY_RES_ERROR(FALSE, result);
+						WEBSTORAGE_VERIFY(result->m_type == WebStorageOperation::SET_ITEM);
+						WEBSTORAGE_VERIFY(!result->m_data.m_storage.m_storage_mutated);
+						WEBSTORAGE_VERIFY(result->m_data.m_storage.m_value != NULL);
+						WEBSTORAGE_VERIFY(result->m_data.m_storage.m_value->Equals(UNI_L("x\0z"),3));
+						WEBSTORAGE_VERIFY(global_callback_count == 8);
+						WEBSTORAGE_VERIFY(mutation_count == 3);
+
+					CALLBACK_OPERATION_SECTION_END(CB_6)
+
+					CALLBACK_OBJECT_DECL(CB_6, cb_6)
+
+					//repeat the same values, should not cause modifications
+					WebStorageValueTemp k1(UNI_L("a\0b"),3);
+					WebStorageValueTemp v1(UNI_L("x\0z"),3);
+
+					WEBSTORAGE_VERIFY(OpStatus::IsSuccess(wsb->SetItem(&k1, &v1, cb_6)));
+
+					CALLBACK_OPERATION_SECTION_START(CB_7)
+
+						WEBSTORAGE_VERIFY(result);
+						WEBSTORAGE_VERIFY_RES_ERROR(FALSE, result);
+						WEBSTORAGE_VERIFY(result->m_type == WebStorageOperation::SET_ITEM);
+						WEBSTORAGE_VERIFY(result->m_data.m_storage.m_storage_mutated);
+						WEBSTORAGE_VERIFY(result->m_data.m_storage.m_value != NULL);
+						WEBSTORAGE_VERIFY(result->m_data.m_storage.m_value->Equals(UNI_L("x\0z"),3));
+						WEBSTORAGE_VERIFY(global_callback_count == 9);
+						WEBSTORAGE_VERIFY(mutation_count == 4);
+
+					CALLBACK_OPERATION_SECTION_END(CB_7)
+
+					CALLBACK_OBJECT_DECL(CB_7, cb_7)
+
+					//delete a value
+					WEBSTORAGE_VERIFY(OpStatus::IsSuccess(wsb->SetItem(&k1, NULL, cb_7)));
+
+					CALLBACK_OPERATION_SECTION_START(CB_8)
+
+						WEBSTORAGE_VERIFY(result);
+						WEBSTORAGE_VERIFY_RES_ERROR(FALSE, result);
+						WEBSTORAGE_VERIFY(result->m_type == WebStorageOperation::GET_ITEM_COUNT);
+						WEBSTORAGE_VERIFY(result->m_data.m_item_count == 1);
+						WEBSTORAGE_VERIFY(global_callback_count == 10);
+						WEBSTORAGE_VERIFY(mutation_count == 4);
+
+						CALLBACK_OPERATION_SECTION_START(CB_9)
+
+							WEBSTORAGE_VERIFY(result);
+							WEBSTORAGE_VERIFY_RES_ERROR(FALSE, result);
+							WEBSTORAGE_VERIFY(result->m_type == WebStorageOperation::GET_KEY_BY_INDEX);
+							WEBSTORAGE_VERIFY(!result->m_data.m_storage.m_storage_mutated);
+							WEBSTORAGE_VERIFY(result->m_data.m_storage.m_value != NULL);
+							WEBSTORAGE_VERIFY(result->m_data.m_storage.m_value->Equals(UNI_L("e\0f"),3));
+							WEBSTORAGE_VERIFY(global_callback_count == 11);
+							WEBSTORAGE_VERIFY(mutation_count == 4);
+
+						CALLBACK_OPERATION_SECTION_END(CB_9)
+
+						CALLBACK_OBJECT_DECL(CB_9, cb_9)
+
+						WEBSTORAGE_VERIFY(OpStatus::IsSuccess(wsb->GetKeyAtIndex(0, cb_9)));
+
+						CALLBACK_OPERATION_SECTION_START(CB_10)
+
+							WEBSTORAGE_VERIFY(result);
+							WEBSTORAGE_VERIFY_RES_ERROR(FALSE, result);
+							WEBSTORAGE_VERIFY(result->m_type == WebStorageOperation::SET_ITEM);
+							WEBSTORAGE_VERIFY(result->m_data.m_storage.m_value == NULL);
+							WEBSTORAGE_VERIFY(result->m_data.m_storage.m_storage_mutated);
+							WEBSTORAGE_VERIFY(global_callback_count == 12);
+							WEBSTORAGE_VERIFY(mutation_count == 5);
+
+						CALLBACK_OPERATION_SECTION_END(CB_10)
+
+						CALLBACK_OBJECT_DECL(CB_10, cb_10)
+
+						//set a new key, then Clear
+						WebStorageValueTemp k1(UNI_L("a\0b"),3);
+						WebStorageValueTemp v1(UNI_L("c\0d"),3);
+
+						WEBSTORAGE_VERIFY(OpStatus::IsSuccess(wsb->SetItem(&k1, &v1, cb_10)));
+
+						CALLBACK_OPERATION_SECTION_START(CB_11)
+
+							WEBSTORAGE_VERIFY(result);
+							WEBSTORAGE_VERIFY_RES_ERROR(FALSE, result);
+							WEBSTORAGE_VERIFY(result->m_type == WebStorageOperation::CLEAR);
+							WEBSTORAGE_VERIFY(result->m_data.m_storage.m_value == NULL);
+							WEBSTORAGE_VERIFY(result->m_data.m_storage.m_storage_mutated);
+							WEBSTORAGE_VERIFY(global_callback_count == 13);
+							WEBSTORAGE_VERIFY(mutation_count == 6);
+
+							CALLBACK_OPERATION_SECTION_START(CB_12)
+
+								WEBSTORAGE_VERIFY(result);
+								WEBSTORAGE_VERIFY_RES_ERROR(FALSE, result);
+								WEBSTORAGE_VERIFY(result->m_type == WebStorageOperation::GET_ITEM_COUNT);
+								WEBSTORAGE_VERIFY(result->m_data.m_item_count == 0);
+								WEBSTORAGE_VERIFY(global_callback_count == 14);
+								WEBSTORAGE_VERIFY(mutation_count == 6);
+
+								//tiny dot so, if we see it, we are sure all this code ran !
+								output(".");
+
+							CALLBACK_OPERATION_SECTION_END(CB_12)
+
+							CALLBACK_OBJECT_DECL(CB_12, cb_12)
+
+							WEBSTORAGE_VERIFY(OpStatus::IsSuccess(wsb->GetNumberOfItems(cb_12)));
+
+						CALLBACK_OPERATION_SECTION_END(CB_11)
+
+						CALLBACK_OBJECT_DECL(CB_11, cb_11)
+
+						WEBSTORAGE_VERIFY(OpStatus::IsSuccess(wsb->Clear(cb_11)));
+
+					CALLBACK_OPERATION_SECTION_END(CB_8)
+
+					CALLBACK_OBJECT_DECL(CB_8, cb_8)
+
+					WEBSTORAGE_VERIFY(OpStatus::IsSuccess(wsb->GetNumberOfItems(cb_8)));
+
+				CALLBACK_OPERATION_SECTION_END(CB_5)
+
+				CALLBACK_OBJECT_DECL(CB_5, cb_5)
+
+				WEBSTORAGE_VERIFY(OpStatus::IsSuccess(wsb->GetNumberOfItems(cb_5)));
+
+			CALLBACK_OPERATION_SECTION_END(CB_3)
+
+			CALLBACK_OBJECT_DECL(CB_3, cb_3)
+
+			WebStorageValueTemp v(UNI_L("a\0b"),3);
+			WEBSTORAGE_VERIFY(OpStatus::IsSuccess(wsb->GetItem(&v, cb_3)));
+
+		CALLBACK_OPERATION_SECTION_END(CB_2)
+
+		CALLBACK_OBJECT_DECL(CB_2, cb_2)
+
+		WEBSTORAGE_VERIFY(OpStatus::IsSuccess(wsb->GetKeyAtIndex(1, cb_2)));
+
+	CALLBACK_OPERATION_SECTION_END(CB_1)
+
+	CALLBACK_OBJECT_DECL(CB_1, cb_1)
+
+	WEBSTORAGE_VERIFY(OpStatus::IsSuccess(wsb->GetNumberOfItems(cb_1)));
+
+	ASYNC_TEST_END;
+}
+
+test("storage - simple deletion")
+async;
+{
+	ASYNC_TEST_START;
+
+	WEBSTORAGE_VERIFY(OpStatus::IsSuccess(WEBSTORAGE_CLEAR_ALL(wsb, NULL)));
+
+	//----------------
+
+	CALLBACK_OPERATION_SECTION_START(CB_1)
+
+		WEBSTORAGE_VERIFY(result);
+		WEBSTORAGE_VERIFY_RES_ERROR(FALSE, result);
+		WEBSTORAGE_VERIFY(result->m_type == WebStorageOperation::SET_ITEM);
+		WEBSTORAGE_VERIFY(result->m_data.m_storage.m_storage_mutated);
+		WEBSTORAGE_VERIFY(result->m_data.m_storage.m_value == NULL);
+		WEBSTORAGE_VERIFY(global_callback_count == 0);
+		WEBSTORAGE_VERIFY(mutation_count == 1);
+
+	CALLBACK_OPERATION_SECTION_END(CB_1)
+
+	CALLBACK_OBJECT_DECL(CB_1, cb_1)
+
+	WebStorageValueTemp k1(UNI_L("a\0b"),3);
+	WebStorageValueTemp v1(UNI_L("x\0z"),3);
+
+	WEBSTORAGE_VERIFY(OpStatus::IsSuccess(wsb->SetItem(&k1, &v1, cb_1)));
+
+	//----------------
+
+	WEBSTORAGE_VERIFY(OpStatus::IsSuccess(wsb->SetItem(&k1, NULL, NULL)));
+
+	//----------------
+
+	CALLBACK_OPERATION_SECTION_START(CB_2)
+
+		WEBSTORAGE_VERIFY(result);
+		WEBSTORAGE_VERIFY_RES_ERROR(FALSE, result);
+		WEBSTORAGE_VERIFY(result->m_type == WebStorageOperation::GET_ITEM_COUNT);
+		WEBSTORAGE_VERIFY(result->m_data.m_item_count == 0);
+		WEBSTORAGE_VERIFY(global_callback_count == 1);
+		WEBSTORAGE_VERIFY(mutation_count == 2);
+
+	CALLBACK_OPERATION_SECTION_END(CB_2)
+
+	CALLBACK_OBJECT_DECL(CB_2, cb_2)
+
+	WEBSTORAGE_VERIFY(OpStatus::IsSuccess(wsb->GetNumberOfItems(cb_2)));
+
+	WEBSTORAGE_VERIFY(OpStatus::IsSuccess(WEBSTORAGE_CLEAR_ALL(wsb, NULL)));
+	WEBSTORAGE_VERIFY(OpStatus::IsSuccess(WEBSTORAGE_CLEAR_ALL(wsb, NULL)));
+	WEBSTORAGE_VERIFY(OpStatus::IsSuccess(WEBSTORAGE_CLEAR_ALL(wsb, NULL)));
+
+	ASYNC_TEST_END;
+}
+
+test("storage - read-only props")
+async;
+require WEBSTORAGE_RO_PAIRS_SUPPORT;
+{
+	ASYNC_TEST_START;
+
+	CALLBACK_OPERATION_SECTION_START(CB_a)
+
+		WEBSTORAGE_VERIFY(result);
+		WEBSTORAGE_VERIFY_RES_ERROR(FALSE, result);
+		WEBSTORAGE_VERIFY(result->m_type == WebStorageOperation::CLEAR_RO);
+		WEBSTORAGE_VERIFY(global_callback_count == 0);
+		WEBSTORAGE_VERIFY(mutation_count == 0);
+
+	CALLBACK_OPERATION_SECTION_END(CB_a)
+
+	CALLBACK_OBJECT_DECL(CB_a, cb_a)
+
+	WEBSTORAGE_VERIFY(OpStatus::IsSuccess(wsb->ClearAll(cb_a)));
+
+	//----------------
+
+	CALLBACK_OPERATION_SECTION_START(CB_1)
+
+		WEBSTORAGE_VERIFY(result);
+		WEBSTORAGE_VERIFY_RES_ERROR(FALSE, result);
+		WEBSTORAGE_VERIFY(result->m_type == WebStorageOperation::SET_ITEM_RO);
+		WEBSTORAGE_VERIFY(result->m_data.m_storage.m_storage_mutated);
+		WEBSTORAGE_VERIFY(result->m_data.m_storage.m_value == NULL);
+		WEBSTORAGE_VERIFY(global_callback_count == 1);
+		WEBSTORAGE_VERIFY(mutation_count == 1);
+
+	CALLBACK_OPERATION_SECTION_END(CB_1)
+
+	CALLBACK_OBJECT_DECL(CB_1, cb_1)
+
+	WebStorageValueTemp k1(UNI_L("a\0b"),3);
+	WebStorageValueTemp v1(UNI_L("x\0z"),3);
+
+	WEBSTORAGE_VERIFY(OpStatus::IsSuccess(wsb->SetItemReadOnly(&k1, &v1, TRUE, cb_1)));
+
+	//-------------------------
+
+	CALLBACK_OPERATION_SECTION_START(CB_2)
+
+		WEBSTORAGE_VERIFY(result);
+		WEBSTORAGE_VERIFY(result->m_type == WebStorageOperation::SET_ITEM);
+		WEBSTORAGE_VERIFY_RES_ERROR(TRUE, result);
+		WEBSTORAGE_VERIFY(result->m_error_data.m_error == PS_Status::ERR_READ_ONLY);
+		WEBSTORAGE_VERIFY(global_callback_count == 2);
+		WEBSTORAGE_VERIFY(mutation_count == 1);
+
+	CALLBACK_OPERATION_SECTION_END(CB_2)
+
+	CALLBACK_OBJECT_DECL(CB_2, cb_2)
+
+	WebStorageValueTemp k2(UNI_L("a\0b"),3);
+	WebStorageValueTemp v2(UNI_L("c\0d"),3);
+
+	//new value, but will not mutate
+	WEBSTORAGE_VERIFY(OpStatus::IsSuccess(wsb->SetItem(&k2, &v2, cb_2)));
+
+	// --------------------
+
+	CALLBACK_OPERATION_SECTION_START(CB_3)
+
+		WEBSTORAGE_VERIFY(result);
+		WEBSTORAGE_VERIFY_RES_ERROR(FALSE, result);
+		WEBSTORAGE_VERIFY(result->m_type == WebStorageOperation::CLEAR);
+		WEBSTORAGE_VERIFY(global_callback_count == 3);
+		WEBSTORAGE_VERIFY(mutation_count == 1);
+
+	CALLBACK_OPERATION_SECTION_END(CB_3)
+
+	CALLBACK_OBJECT_DECL(CB_3, cb_3)
+
+	//clear does not erase our only read-only item
+	WEBSTORAGE_VERIFY(OpStatus::IsSuccess(wsb->Clear(cb_3)));
+
+	// ------------------
+
+	CALLBACK_OPERATION_SECTION_START(CB_4)
+
+		WEBSTORAGE_VERIFY(result);
+		WEBSTORAGE_VERIFY_RES_ERROR(FALSE, result);
+		WEBSTORAGE_VERIFY(result->m_type == WebStorageOperation::SET_ITEM_RO);
+		WEBSTORAGE_VERIFY(result->m_data.m_storage.m_storage_mutated);
+		WEBSTORAGE_VERIFY(result->m_data.m_storage.m_value != NULL);
+		//previous value
+		WEBSTORAGE_VERIFY(result->m_data.m_storage.m_value->Equals(UNI_L("x\0z"),3));
+		WEBSTORAGE_VERIFY(global_callback_count == 4);
+		WEBSTORAGE_VERIFY(mutation_count == 2);
+
+	CALLBACK_OPERATION_SECTION_END(CB_4)
+
+	CALLBACK_OBJECT_DECL(CB_4, cb_4)
+
+	WebStorageValueTemp k3(UNI_L("a\0b"),3);
+	WebStorageValueTemp v3(UNI_L("c\0d"),3);
+
+	WEBSTORAGE_VERIFY(OpStatus::IsSuccess(wsb->SetItemReadOnly(&k3, &v3, FALSE, cb_4)));
+
+	// ------------------
+
+	CALLBACK_OPERATION_SECTION_START(CB_5)
+
+		WEBSTORAGE_VERIFY(result);
+		WEBSTORAGE_VERIFY_RES_ERROR(FALSE, result);
+		WEBSTORAGE_VERIFY(result->m_type == WebStorageOperation::GET_ITEM_BY_KEY);
+		WEBSTORAGE_VERIFY(!result->m_data.m_storage.m_storage_mutated);
+		WEBSTORAGE_VERIFY(result->m_data.m_storage.m_value != NULL);
+		//previous value
+		WEBSTORAGE_VERIFY(result->m_data.m_storage.m_value->Equals(UNI_L("c\0d"),3));
+		WEBSTORAGE_VERIFY(global_callback_count == 5);
+		WEBSTORAGE_VERIFY(mutation_count == 2);
+
+	CALLBACK_OPERATION_SECTION_END(CB_5)
+
+	CALLBACK_OBJECT_DECL(CB_5, cb_5)
+
+	WEBSTORAGE_VERIFY(OpStatus::IsSuccess(wsb->GetItem(&k3, cb_5)));
+
+	//-----------------------------
+
+	CALLBACK_OPERATION_SECTION_START(CB_6)
+
+		WEBSTORAGE_VERIFY(result);
+		WEBSTORAGE_VERIFY_RES_ERROR(FALSE, result);
+		WEBSTORAGE_VERIFY(result->m_type == WebStorageOperation::CLEAR);
+		WEBSTORAGE_VERIFY(global_callback_count == 6 || global_callback_count == 7);
+		WEBSTORAGE_VERIFY(mutation_count == 3);
+
+	CALLBACK_OPERATION_SECTION_END(CB_6)
+
+	CALLBACK_OBJECT_DECL(CB_6, cb_61)
+	CALLBACK_OBJECT_DECL(CB_6, cb_62)
+
+	WEBSTORAGE_VERIFY(OpStatus::IsSuccess(wsb->Clear(cb_61)));
+	WEBSTORAGE_VERIFY(OpStatus::IsSuccess(wsb->Clear(cb_62)));
+
+	ASYNC_TEST_END;
+}
+
+test("storage - evil")
+async;
+{
+	ASYNC_TEST_START;
+
+	WEBSTORAGE_VERIFY(OpStatus::IsSuccess(WEBSTORAGE_CLEAR_ALL(wsb, NULL)));
+
+	//----------------
+
+	uni_char* evil_key = OP_NEWA(uni_char,EVIL_KEY_SIZE * 2);
+	WEBSTORAGE_VERIFY(evil_key != NULL);
+	ANCHOR_ARRAY(uni_char, evil_key);
+
+	uni_char* evil_value = evil_key + EVIL_KEY_SIZE;
+
+	for(unsigned k = 0; k < EVIL_KEY_SIZE; k++)
+	{
+		evil_key[k] = k;
+		evil_value[k] = EVIL_KEY_SIZE - k - 1;
+	}
+	//----------------
+
+	CALLBACK_OPERATION_SECTION_START(CB_1)
+
+		WEBSTORAGE_VERIFY(args);
+		uni_char* evil_key = static_cast<uni_char*>(args);
+		ANCHOR_ARRAY(uni_char, evil_key);
+
+		WEBSTORAGE_VERIFY(result);
+		WEBSTORAGE_VERIFY_RES_ERROR(FALSE, result);
+		WEBSTORAGE_VERIFY(result->m_type == WebStorageOperation::SET_ITEM);
+		WEBSTORAGE_VERIFY(result->m_data.m_storage.m_storage_mutated);
+		WEBSTORAGE_VERIFY(result->m_data.m_storage.m_value == NULL);
+		WEBSTORAGE_VERIFY(global_callback_count == 0);
+		WEBSTORAGE_VERIFY(mutation_count == 1);
+
+		CALLBACK_OPERATION_SECTION_START(CB_2)
+
+			WEBSTORAGE_VERIFY(args);
+			uni_char* evil_key = static_cast<uni_char*>(args);
+			uni_char* evil_value = evil_key + EVIL_KEY_SIZE;
+			ANCHOR_ARRAY(uni_char, evil_key);
+
+			WEBSTORAGE_VERIFY(result);
+			WEBSTORAGE_VERIFY_RES_ERROR(FALSE, result);
+			WEBSTORAGE_VERIFY(result->m_type == WebStorageOperation::GET_ITEM_BY_KEY);
+			WEBSTORAGE_VERIFY(!result->m_data.m_storage.m_storage_mutated);
+			WEBSTORAGE_VERIFY(result->m_data.m_storage.m_value != NULL);
+			WEBSTORAGE_VERIFY(result->m_data.m_storage.m_value->Equals(evil_value, EVIL_KEY_SIZE));
+			WEBSTORAGE_VERIFY(global_callback_count == 1);
+			WEBSTORAGE_VERIFY(mutation_count == 1);
+
+		CALLBACK_OPERATION_SECTION_END(CB_2)
+
+		CALLBACK_OBJECT_DECL_WARGS(CB_2, cb_2, args, DeleteUniCharArray)
+
+		WebStorageValueTemp k2(evil_key, EVIL_KEY_SIZE);
+
+		WEBSTORAGE_VERIFY(OpStatus::IsSuccess(wsb->GetItem(&k2, cb_2)));
+
+		ANCHOR_ARRAY_RELEASE(evil_key);
+
+	CALLBACK_OPERATION_SECTION_END(CB_1)
+
+	CALLBACK_OBJECT_DECL_WARGS(CB_1, cb_1, evil_key, DeleteUniCharArray)
+
+	WebStorageValueTemp k1(evil_key, EVIL_KEY_SIZE);
+	WebStorageValueTemp v1(evil_value, EVIL_KEY_SIZE);
+
+	WEBSTORAGE_VERIFY(OpStatus::IsSuccess(wsb->SetItem(&k1, &v1, cb_1)));
+
+	ANCHOR_ARRAY_RELEASE(evil_key);
+
+	ASYNC_TEST_END;
+}
+
+test("storage - empty key and value")
+async;
+{
+	ASYNC_TEST_START;
+
+	CALLBACK_OPERATION_SECTION_START(CB_1)
+
+		WEBSTORAGE_VERIFY(result);
+		WEBSTORAGE_VERIFY_RES_ERROR(FALSE, result);
+		WEBSTORAGE_VERIFY(result->m_type == WebStorageOperation::SET_ITEM);
+		WEBSTORAGE_VERIFY(result->m_data.m_storage.m_storage_mutated);
+		WEBSTORAGE_VERIFY(result->m_data.m_storage.m_value == NULL);
+		WEBSTORAGE_VERIFY(global_callback_count == 0);
+		WEBSTORAGE_VERIFY(mutation_count == 1);
+
+		CALLBACK_OPERATION_SECTION_START(CB_2)
+
+			WEBSTORAGE_VERIFY(result);
+			WEBSTORAGE_VERIFY_RES_ERROR(FALSE, result);
+			WEBSTORAGE_VERIFY(result->m_type == WebStorageOperation::GET_ITEM_BY_KEY);
+			WEBSTORAGE_VERIFY(!result->m_data.m_storage.m_storage_mutated);
+			WEBSTORAGE_VERIFY(result->m_data.m_storage.m_value != NULL);
+			WEBSTORAGE_VERIFY(result->m_data.m_storage.m_value->Equals(UNI_L("a"), 1));
+			WEBSTORAGE_VERIFY(global_callback_count == 1);
+			WEBSTORAGE_VERIFY(mutation_count == 1);
+
+			CALLBACK_OPERATION_SECTION_START(CB_3)
+
+				WEBSTORAGE_VERIFY(result);
+				WEBSTORAGE_VERIFY_RES_ERROR(FALSE, result);
+				WEBSTORAGE_VERIFY(result->m_type == WebStorageOperation::SET_ITEM);
+				WEBSTORAGE_VERIFY(result->m_data.m_storage.m_storage_mutated);
+				WEBSTORAGE_VERIFY(result->m_data.m_storage.m_value != NULL);
+				WEBSTORAGE_VERIFY(result->m_data.m_storage.m_value->Equals(UNI_L("a"), 1));
+				WEBSTORAGE_VERIFY(global_callback_count == 2);
+				WEBSTORAGE_VERIFY(mutation_count == 2);
+
+				CALLBACK_OPERATION_SECTION_START(CB_4)
+
+					WEBSTORAGE_VERIFY(result);
+					WEBSTORAGE_VERIFY_RES_ERROR(FALSE, result);
+					WEBSTORAGE_VERIFY(result->m_type == WebStorageOperation::GET_ITEM_BY_KEY);
+					WEBSTORAGE_VERIFY(!result->m_data.m_storage.m_storage_mutated);
+					WEBSTORAGE_VERIFY(result->m_data.m_storage.m_value != NULL);
+					WEBSTORAGE_VERIFY(result->m_data.m_storage.m_value->Equals(UNI_L(""), 0));
+					WEBSTORAGE_VERIFY(global_callback_count == 3);
+					WEBSTORAGE_VERIFY(mutation_count == 2);
+
+					CALLBACK_OPERATION_SECTION_START(CB_5)
+
+						WEBSTORAGE_VERIFY(result);
+						WEBSTORAGE_VERIFY_RES_ERROR(FALSE, result);
+						WEBSTORAGE_VERIFY(result->m_type == WebStorageOperation::SET_ITEM);
+						WEBSTORAGE_VERIFY(result->m_data.m_storage.m_storage_mutated);
+						WEBSTORAGE_VERIFY(result->m_data.m_storage.m_value != NULL);
+						WEBSTORAGE_VERIFY(result->m_data.m_storage.m_value->Equals(UNI_L(""), 0));
+						WEBSTORAGE_VERIFY(global_callback_count == 4);
+						WEBSTORAGE_VERIFY(mutation_count == 3);
+
+						// The end
+
+					CALLBACK_OPERATION_SECTION_END(CB_5)
+
+					CALLBACK_OBJECT_DECL(CB_5, cb_5)
+
+					WebStorageValueTemp k5(UNI_L(""), 0);
+					WebStorageValueTemp v5(UNI_L("x"), 1);
+
+					WEBSTORAGE_VERIFY(OpStatus::IsSuccess(wsb->SetItem(&k5, &v5, cb_5)));
+
+				CALLBACK_OPERATION_SECTION_END(CB_4)
+
+				CALLBACK_OBJECT_DECL(CB_4, cb_4)
+
+				WebStorageValueTemp k4(UNI_L(""), 0);
+
+				WEBSTORAGE_VERIFY(OpStatus::IsSuccess(wsb->GetItem(&k4, cb_4)));
+
+			CALLBACK_OPERATION_SECTION_END(CB_3)
+
+			CALLBACK_OBJECT_DECL(CB_3, cb_3)
+
+			WebStorageValueTemp k3(UNI_L(""), 0);
+			WebStorageValueTemp v3(UNI_L(""), 0);
+
+			WEBSTORAGE_VERIFY(OpStatus::IsSuccess(wsb->SetItem(&k3, &v3, cb_3)));
+
+		CALLBACK_OPERATION_SECTION_END(CB_2)
+
+		CALLBACK_OBJECT_DECL(CB_2, cb_2)
+
+		WebStorageValueTemp k2(UNI_L(""), 0);
+
+		WEBSTORAGE_VERIFY(OpStatus::IsSuccess(wsb->GetItem(&k2, cb_2)));
+
+	CALLBACK_OPERATION_SECTION_END(CB_1)
+
+	CALLBACK_OBJECT_DECL(CB_1, cb_1)
+
+	WebStorageValueTemp k1(UNI_L(""), 0);
+	WebStorageValueTemp v1(UNI_L("a"), 1);
+
+	WEBSTORAGE_VERIFY(OpStatus::IsSuccess(wsb->SetItem(&k1, &v1, cb_1)));
+
+	ASYNC_TEST_END;
+}
+
+exit
+{
+	DeleteAllStatus();
+}

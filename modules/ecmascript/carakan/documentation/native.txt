@@ -1,0 +1,413 @@
+Native code generation
+======================
+
+The input to native code generation is the same bytecode instruction stream as
+the bytecode interpreter executes.  The advantage of this is that the parser and
+(bytecode) compiler is unaffected of mode of operation.  It also provides an
+effective insulation between the parser/compiler, which are already complicated,
+and the native code generator, which is also complicated.  In essence, the
+bytecode instruction set is the API between the compiler and the native code
+generator.
+
+Bytecode analysis
+-----------------
+
+  Class: ES_Analyzer
+
+Before native code is generated from the bytecode stream, the bytecode stream is
+analyzed by the class ES_Analyzer (src/compiler/es_analyzer.cpp) to figure out
+how individual registers are used and reused throughout the bytecode stream, and
+to perform static type inference.  The result of the analysis is collected in a
+ES_CodeOptimizationData object.
+
+The analysis is performed as follows:
+
+First one pass is made over all instructions, and for each instruction, every
+read register and every written register is recorded.  For read registers, the
+"preferred" type is recorded.  The preferred type is essentially simply the type
+into which the register's value will be converted, if such a type is known.  For
+written registers, the type that will be written is recorded, if known.  In some
+cases, the written type is known statically -- for bitwise operations it is
+always Int32.  In other cases, the written type can be inferred from the type of
+the read registers, if known -- an add writes a string if either read register
+is known to contain a string.  For most instructions, the actual code for
+recording register interactions is auto-generated from the information in
+src/compiler/es_instructions.txt.
+
+After this, a loop alternates between two secondary passes until those passes
+find no additional information.  These secondary passes are:
+
+1) Jump analysis: for every backwards and forwards jump in the bytecode stream
+that jump past a write to a register, the information about the register at the
+jump instruction is merged with the information about the register at the jump
+target instruction.  If the information is incompatible, for instance if the
+register was known to contain a string at the jump target instruction but known
+to contain an integer at the jump instruction, then the information is reduced
+to "unknown type" at (and after) the jump target instruction.
+
+2) Type inference corrections: if the jump analysis pass made adjustments
+because of jumps, a pass is made to reasses all inferred types to ensure they
+were not based on now incorrect assumptions.  If this pass also makes
+ajustments, another jump analysis pass is made, and so on.
+
+(And hopefully this loop terminates.)
+
+Bytecode analysis is generally performed as the final step of compiling a
+function.  It is not performed on program code (code outside of function
+declarations) or eval:ed code, since native code is not generated for such code.
+(Native code, on the other hand, is not generated until just before execution of
+the program starts.)  It is also not done on functions that are overly long,
+since both analysis and actual native code generation for such functions would
+be expensive.  The strategy is to instead generate machine code for individual
+loops in such functions, if relevant.
+
+For more information about the output from the bytecode analyzer, please see the
+documentation in the class definitions of ES_CodeOptimizationData and its member
+classes, all in src/compiler/es_code.h.
+
+Basic concepts in the native code generator
+-------------------------------------------
+
+Virtual register: a register in the virtual machine.  Largely, the generated
+                  native code performs the same work on the same virtual machine
+                  state as the bytecode interpreter would have done.  Access to
+                  virtual registers is thus central in the generated native
+                  code.
+
+                  Class: ES_Native::VirtualRegister
+
+Native register: a CPU register.  The architecture independet register allocator
+                 and native code generator deals with a set of native registers
+                 that are set up by the architecture dependent part.  There are
+                 two types of native registers: integer and double (at least on
+                 architectures that have sufficient hardware floating point
+                 support.)
+
+                 Class: ES_Native::NativeRegister
+
+Register allocation: a register allocation typically binds together a virtual
+                     register and a native register during one or more bytecode
+                     instructions.  The register allocation means that the value
+                     of the virtual register is stored in the native register,
+                     either by having been read into the native register, or by
+                     having been calculated into the native register.
+
+                     Class: ES_Native::RegisterAllocation
+
+The native code generator is divided into a high-level architecture independent
+part and rather low-level architecure dependent part.  Both parts are in
+practice implemented as member functions of the class ES_Native.  The
+architecture dependent functions typically have names that start with "Emit".
+The architecture dependent part also defines functions for generating a function
+prolouge and epilouge, and for generating small utility functions like a
+trampoline function that is called from C++ code to transfer control to a
+generated native code function, since the generated native code functions use a
+custom calling convention.
+
+Arithmetic blocks
+------------------
+
+  Class: ES_Native::ArithmeticBlock
+
+An arithmetic block is a sequence of bytecode instructions consisting of
+arithmetic instructions and simple constant loads or register copying
+instructions, and possibly including a conditional jump (if the condition was
+calculated in the arithmetic block) or return instruction (if the returned value
+was calculated in the arithmeti block.)  Essentially it's a basic block, but
+rather than just being delimited by jumps, complex instruction such as property
+accesses also terminate arithmetic blocks.
+
+The basic code generation strategy for an arithmetic block is that type checks
+on registers containing unknown values, and overflow checks after integer
+instruction that can overflow, jump to a parallel code path consisting of calls
+to instruction handlers (that is, "pure" context threading.)  The two code paths
+merge only at the end of the arithmetic block.  The benefit of this is that the
+code in the main path can assume that all previous type checks and overflow
+checks succeeded, and thus never need to check the type in a register twice, nor
+type check a register containing the result of a previous instruction that might
+have overflowed.
+
+Arithmetic block identification and preparation
+-----------------------------------------------
+
+  Function: ES_Native::AllocateRegisters()
+            ES_Native::StartsArithmeticBlock()
+            ES_Native::ContinuesArithmeticBlock()
+            ES_Native::ProfileArithmeticBlock()
+
+The first pass in the native code generation identifies arithmetic blocks in the
+bytecode stream.  For each found arithmetic block, a plan is made regarding what
+type of instructions to generate.  The choice is typically between an integer
+instruction and a floating point instruction.  The following sources of
+information are used in making the decision, by determining or guessing the type
+of values stored in each instruction's input registers:
+
+1) If a register was written by an earlier instruction in the arithmetic block,
+   then it's type is defined by a previous choice of instruction (integer or
+   floating point) and thus fully known.
+
+2) If the bytecode stream has been executed by the bytecode interpreter, the
+   interpreter will have recorded which types each input register has contained,
+   and which output types have been produced (referred to later as "runtime type
+   profiling".)
+
+3) Static type information calculated by the bytecode analyzer is used as a last
+   resort.
+
+For each input register, a set of possible types and a set of handled types are
+calculated.  The set of possible types are typically either "anything" (because
+we knew nothing for sure,) "one specific type" (because the value was produced
+by a previous instruction in the arithmetic block, or could be fully determined
+statically) or "int32 or double" (from static analysis.)  The set of handled
+types are either "int32", "double" or "int32 and double".  In the latter case, a
+floating point operation will be performed, and the input will be converted from
+int32 to double via a type-check, unless the instruction is a bitwise operation,
+in which case the input will be converted from double to int32 via a type-check
+instead.  If the set of handled types equals the set of possible types for an
+instruction, no type-check that switches to the context threading code path will
+be generated.
+
+The heuristics for determining whether to do a integer of floating point
+operation, and for determining what input types to support, is roughly as
+follows:
+
+  Note: Supporting an input type means that if a register contains a supported
+        type, we use it or convert it.  If a register contains an unsupported
+        type, a type-check will fail and we'll switch to the context threading
+        code path.  In practice, there are only three options: we support int32
+        and double (and all other types) switches code path; we support double
+        and int32 (and all other types) switches code path; or we support both
+        int32 and double, and all other types switches code path.
+
+If no runtime type profiling information is available, nor any definitive static
+type information, an integer operation is selected, except for divisions, for
+which a floating point operation is selected.  Input type support is determined
+by selected operation type; for an integer operation only int32 is supported and
+for a floating point operation only double is supported.
+
+If runtime type profiling information is available, then a floating point
+operation is selected if any input register has ever contained, or the result
+has ever been, a floating point value.  (The latter ensures that a floating
+point operation is selected if an integer operation tends to overflow, even if
+the input registers have always contained int32:s.)  For a division, an integer
+operation is selected if the input registers have only contained, and the result
+has only been, an integer.
+
+For bitwise operations (shifts and bitwise AND, OR, XOR and one's complement) an
+integer operation is of course always selected, but input types to support are
+determined roughly the same way.
+
+  Note: Due to the fact that some instructions (ESI_ADD and ESI_REM, primarily)
+        participate in arithmetic blocks in some cases (numerical additions, but
+        not string additions, integer remainder but not floating point) the
+        choices made in ES_Native::ProfileArithmeticBlock(), which determines
+        the types of intermediate values, are relevant already during arithmetic
+        block identification in ES_Native::ContinuesArithmeticBlock(), but
+        currently not available.  Because of this, and because it generally
+        sounds more efficient, the pass that identifies the instructions that
+        make up an arithmetic block will in the future probably be merged with
+        the pass that makes instruction type choices.
+
+Register allocation
+-------------------
+
+  Function: ES_Native::AllocateRegistersInArithmeticBlock()
+
+The next pass in the native code generation performs register allocations in a
+more or less architecture independent way.  Its strategy and constraints are
+fully defined by the architecture's instruction set, but it is meant to be as
+generic as possible.
+
+Register allocations are always local to arithmetic blocks.  That is, at the
+beginning of an arithmetic block, no register allocations are active, and at the
+end of it, all register allocations will end.  This fact and the fact that
+arithmetic blocks contain neither jump instructions, nor instructions that are
+target of jumps, make register allocation rather more simple than it would
+otherwise have been.
+
+The register allocation pass processes bytecode instructions in reverse order,
+starting with the last instruction in each arithmetic block, working its way to
+the first instruction in the arithmetic block.  This means that by allocating a
+register for an input operand to one instruction, the target operand of the
+instruction that produces that value might be readily defined when that
+instruction is processed simply by observing that there is a current register
+allocation for the target (virtual) register.  The main benefit of this is that
+if a certain input operand to one instruction (such as the shift count operand
+in a bitwise shift operation) needs to be in a certain native register, it can
+be requested to be calculated into that register simply by making the proper
+allocation.
+
+The register allocator makes a few different types of allocations:
+
+READ: A read allocation starting at bytecode instruction X signals that just
+      prior to generating code for instruction X, the allocated virtual
+      register's value should be read into the allocated native register.
+
+CONVERT: Like READ, except that the value in the allocated virtual register is
+         known (possibly because of an immediately preceding type-check) to be
+         of the opposite numeric type relative the native register, and thus
+         needs to be converted while reading it into the native register.
+
+COPY: Rather than to read a value from the allocated virtual register, the value
+      in previously allocated native register is copied to the newly allocated
+      native register.  It is assumed that there exists a previous allocation of
+      the same virtual register ending at bytecode instruction immediately
+      preceding the instructino at which the COPY allocation starts.  If the two
+      allocated native registers are of different types, the value is converted
+      as it is copied.
+
+WRITE: A write allocation starting at bytecode instruction X signals that
+       instruction X produces a value into the allocated native register, and
+       that at the end of the allocation, that value might need to be written
+       back to the virtual register.  The value need never be (and cannot be)
+       read from the virtual register into the native register.
+
+Typically, allocations for input operands start as READ or CONVERT; READ if the
+expected value type in the virtual register matches that of the native register
+to read into, and CONVERT otherwise.  If a suitable READ or CONVERT allocation
+already exists for the virtual register in question, it is simply extended to
+cover more instructions.
+
+If an output operand needs to be a register (due to architectural requirements
+or otherwise) and no current allocation is active, a new WRITE allocation is
+created.  Otherwise if the current allocation's type is READ it is changed to
+WRITE.  Otherwise if the current allocation's type is CONVERT, it is changed to
+COPY, and a new WRITE allocation is created from which the value is to be
+copied.  The output operand's allocation is always terminated, which, since
+instructions are processed in reverse order, means it always starts at the
+instruction that wrote the value.
+
+The output from the register allocator largely defines the code that the code
+generator later generates, since it both determines the operands to be used in
+individual generated instructions, and defines when values are moved between
+virtual registers and native registers.  Much of the (in practice) architecture
+dependent choices made regarding how to structure the generated native code are
+made in the register allocate step.
+
+Code generation
+---------------
+
+  Function: ES_Native::GenerateCode()
+
+Code generation occurs on two levels: between arithmetic blocks and inside
+arithmetic blocks.
+
+Instructions between arithmetic blocks generally produce independent blocks of
+machine code instructions.  Exceptions are some short sequences of instructions
+such as { ESI_LOAD_IMM, ESI_RETURN_VALUE } for "return 10;" and { ESI_GET,
+ESI_CONDITION, ESI_JUMP_IF_* } for "if (o.x) ...", that generated combined
+machine code blocks that essentially avoids unnecessary value copying.  The only
+complex non-arithmetic instructions that are handled inline by generated machine
+code are property accessing instructions, for all other complex instructions
+simple calls to instruction handlers are generated.  Property accessing cases
+that are handled inline in machine code are indexing of compact arrays and
+cached accesses to named properties.
+
+Code generation in arithmetic blocks
+------------------------------------
+
+  Function: ES_Native::GenerateCodeInArithmeticBlock()
+
+The more advanced code generation takes place inside arithmetic blocks.
+Generally, two paths of code are generated: a slow path consisting mostly of
+calls to instruction handlers, and a fast path with inlined arithmetic
+operations.  Type checks and overflow checks transfers the control flow from the
+fast path into the slow paths.  Multiple points where such transfer can occur
+generally exists, which means the slow path has multiple entry points where
+values in native registers are transferred into the appropriate virtual machine
+registers before instruction handlers are called.
+
+The arithmetic block is processed in two passes.  The first pass generates the
+code for the slow path, by emitting calls to instruction handlers (or for some
+simple instructions, like ESI_LOAD_IMM, by emitting inlined machine code.)  It
+also emits entry point code that flushes values from native registers into
+virtual registers, and records jump targets for each entry point.
+
+The second pass generates the code for the fast path.  Each instruction is
+handled in three stages.  First, input operands are type-checked and loaded into
+native registers from virtual machine registers or constants, as needed.  This
+mostly involves detecting that register allocations for the input operands start
+at the current instruction, and then either simply loading the value (for a READ
+allocation) or type-converting it (for a CONVERT allocation.)  Type-checks jump
+to entry point jump targets recorded during the first pass.
+
+The second stage emits the actual machine code for the instruction.  In the
+architecure independent part of the code, this is really the simplest stage,
+since it only relays the choices made by the register allocator to the
+architecture dependent code emission functions.  The architecture dependent code
+emission functions are also rather simple; they often simply emits one machine
+code instruction with the operands provided to it.  For integer instructions
+that can overflow, like addition, subtraction and multiplication, or otherwise
+fail, such as division (by zero, yielding infinity) or multiplication (negative
+value times zero produces negative zero, which can't be represented as an
+integer,) the architecture dependent code emits code to detect the various
+failures and jump to provided slow path entry point jump targets.
+
+The third stage writes values from native registers to virtual register when
+register allocations end (unless the value will not be used again) and emits the
+code to copy values between native registers in response to COPY allocations.
+
+Machine code regeneration
+-------------------------
+
+When machine code is generated compile-time, the machine code generator is
+typically forced to make certain guesses, such as whether function arguments are
+integers, floats or something else entirely, and such as whether a certain
+property access is an array indexing operation or whether it can be cached.
+
+Often, these compile-time guesses will be correct, but at other times they will
+not.  When they are not, the generated machine code will revert to calling
+regular bytecode instruction handlers to perform the task instead.  In the case
+of an arithmetic block, the rest of the arithmetic block will be executed that
+way.  Since this is generally sub-optimal, we have a mechanism that allows the
+machine code to be regenerated, taking into account information about what
+actually happens, and thus dynamically adapt to fit reality.
+
+For arithmetic blocks, the slow path always ends with a call to the function
+ES_Execution_Context::UpdateNativeDispatcher().  This function evaluates whether
+there's new information to take into account, and whether there is "enough" of
+it.  If so, it generates a new version of the machine code for the bytecode
+stream, and returns an address that corresponds to the end of the same
+arithmetic block's slow path in the new machine code version.  The old machine
+code then simply jumps to the new machine code, and continues execution there.
+
+Other instructions that can generate adapted machine are currently (cached)
+property reads.  These call ES_Execution_Context::GetNamedImmediate() instead of
+one of the corresponding instruction handlers.  This function calls the
+instruction handler, and then if it seems appropriate generates new machine code
+and returns an entry point address, like is done for arithmetic blocks.
+
+Runtime type profiling
+----------------------
+
+To aid in the generation of machine code that makes correct assumptions about
+the type of values stored in various registers at various times, and thus
+avoiding type check failures and execution of slow paths, the bytecode
+interpreter, when it is used as a fallback execution mechanism when type checks
+fail, records what types have actually occured while it is execution bytecode.
+
+Such type information is recorded in an array stored in ES_Code::profile_data.
+This array contains one byte (unsigned char) per codeword (note: not per
+instruction) in the bytecode stream.  The actual usage of the bytes that
+correspond to the full bytecode instruction differs between instructions (and
+many instructions don't do runtime profiling at all.)  The array is allocated on
+demand, and when allocated, all bytes are initialized to zero.
+
+All arithmetic instructions use the bytes the same way:
+
+The byte corresponding to the instruction codeword is used as a flag: if it's
+zero, the instruction has not seen/recorded any new information since machine
+code was last generated for the bytecode stream in question.  If it's one, it
+has.  In addition, every time the instruction handler is called when the flag is
+one (either from before or set to one during the call) the counter
+ES_Code::slow_case_calls is incremented.  When this counter reaches a limit, new
+machine code is generated later.  The idea is that generating new machine code
+"consumes" the currently recorded information, and unless new information
+becomes available, there is no point in generating new machine code either.
+
+Each byte that corresponds to a register operand (whether input or output) is
+used as a bitfield.  Each bit represents one type.  See ES_ValueTypeBits.
+
+For an input operand, the bitfield represents what value types have occured in
+the register when the instruction handler was called.  For an output operand,
+the bitfield represents what types the instruction's result has been.

@@ -1,0 +1,100 @@
+/* -*- Mode: c++; tab-width: 4; indent-tabs-mode: t; c-basic-offset: 4; c-file-style: "stroustrup" -*-
+ *
+ * Copyright (C) 2011 Opera Software ASA.  All rights reserved.
+ *
+ * This file is part of the Opera web browser.
+ * It may not be distributed under any circumstances.
+ */
+
+group "Media.MediaSourceUtil";
+
+require MEDIA_PLAYER_SUPPORT;
+
+include "modules/media/src/mediasourceutil.h";
+
+global
+{
+	class TestClient : public MediaSourceClient
+	{
+	public:
+		TestClient(const MediaByteRange& pending, const MediaByteRange& preload)
+		{
+			m_pending = pending;
+			m_preload = pending;
+		}
+	};
+
+	class TestClients : public List<MediaSourceClient>
+	{
+	public:
+		void AddClient(const MediaByteRange& pending, const MediaByteRange& preload) {
+			TestClient* client = OP_NEW(TestClient, (pending, preload));
+			client->Into(this);
+		}
+		~TestClients() {
+			while (TestClient* client = static_cast<TestClient*>(First()))
+			{
+				client->Out();
+				OP_DELETE(client);
+			}
+		}
+	private:
+
+	};
+}
+
+table ReduceData(OpFileLength, OpFileLength, OpFileLength, OpFileLength, OpFileLength, OpFileLength, OpFileLength, OpFileLength)
+{
+	//         a_start,            a_end,          b_start,            b_end,    pending_start,      pending_end,    preload_start,      preload_end
+	{ FILE_LENGTH_NONE, FILE_LENGTH_NONE, FILE_LENGTH_NONE, FILE_LENGTH_NONE, FILE_LENGTH_NONE, FILE_LENGTH_NONE,                0, FILE_LENGTH_NONE }, // no ranges
+	{               13,               42, FILE_LENGTH_NONE, FILE_LENGTH_NONE,               13,               42,               13,               42 }, // one range
+	{                3,                7,                5,               12,                3,                7,                3,               12 }, // two overlapping ranges
+	{                3,                7,                8,               12,                3,                7,                3,               12 }, // two disjoint ranges
+}
+
+test("ReduceRanges")
+{
+	// Note: this test assumes that pending and preload don't
+	// interfere with each other and test both at once.
+	iterate (a_start, a_end, b_start, b_end, pending_start, pending_end, preload_start, preload_end) from ReduceData
+	{
+		MediaByteRange a_range(a_start, a_end);
+		MediaByteRange b_range(b_start, b_end);
+		TestClients clients;
+		if (!a_range.IsEmpty())
+			clients.AddClient(a_range, a_range);
+		if (!b_range.IsEmpty())
+			clients.AddClient(b_range, b_range);
+		MediaByteRange pending, preload;
+		ReduceRanges(clients, pending, preload);
+		verify(pending.start == pending_start);
+		verify(pending.end == pending_end);
+		verify(preload.start == preload_start);
+		verify(preload.end == preload_end);
+	}
+}
+
+
+table CombineData(OpFileLength, OpFileLength, OpFileLength, OpFileLength, OpFileLength, OpFileLength)
+{
+	//   pending_start,      pending_end,    preload_start,      preload_end,    request_start,      request_end
+	{ FILE_LENGTH_NONE, FILE_LENGTH_NONE, FILE_LENGTH_NONE, FILE_LENGTH_NONE, FILE_LENGTH_NONE, FILE_LENGTH_NONE }, // both empty
+	{             4000,             4096, FILE_LENGTH_NONE, FILE_LENGTH_NONE,             4000,             4096 }, // just pending
+	{ FILE_LENGTH_NONE, FILE_LENGTH_NONE,                0, FILE_LENGTH_NONE,                0, FILE_LENGTH_NONE }, // just preload
+	{             4000,             4096,                0,              100,             4000,             4096 }, // disjoint
+	{              512,             1024,                0,             2011,              512,             2011 }, // overlapping with pending > preload
+	{                0,             1337,              512,             1984,                0,             1984 }, // overlapping with pending < preload
+}
+
+test("CombineRanges")
+{
+	iterate (pending_start, pending_end, preload_start, preload_end, request_start, request_end) from CombineData
+	{
+		MediaByteRange pending(pending_start, pending_end);
+		MediaByteRange preload(preload_start, preload_end);
+		MediaByteRange request;
+		CombineRanges(pending, preload, request);
+		verify(request.start == request_start);
+		verify(request.end == request_end);
+	}
+}

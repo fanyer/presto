@@ -1,0 +1,1140 @@
+group "DOM.JIL.Messaging";
+
+require GADGET_SUPPORT;
+require DOM_JIL_API_SUPPORT;
+include "modules/security_manager/include/security_manager.h";
+include "modules/gadgets/gadget_selftest_utils.h";
+include "modules/device_api/jil/JILFSMgr.h";
+
+
+global
+{
+	OpSecurityManager::PrivilegedBlock disable_security;
+	OpAutoVector<OpString> g_current_virt_roots;
+	OpString g_selftest_mount_point;
+	GadgetSelftestUtils g_utils;
+}
+
+exit
+{
+	g_utils.UnloadGadget();
+	g_DAPI_jil_fs_mgr->RemoveMapping(g_selftest_mount_point, NULL, NULL);
+	for (UINT32 i = 0; i < g_current_virt_roots.GetCount(); ++i)
+		g_DAPI_jil_fs_mgr->SetActive(g_current_virt_roots.Get(i)->CStr(), TRUE);
+}
+
+table dummy1(const char *) filelist "messaging_test_wgt" recursively;
+
+test("Load Messaging test widget")
+	file zip_file "messaging_test_wgt/config.xml";
+	async;
+{
+	OP_GADGET_STATUS status = g_utils.LoadGadgetForSelftest(zip_file, URL_GADGET_INSTALL_CONTENT);
+
+	if (OpStatus::IsError(status))
+		ST_failed("Unable to install test widget, status: %d", status);
+	else if (status != OpGadgetStatus::OK_SIGNATURE_VERIFICATION_IN_PROGRESS)
+		ST_passed();
+}
+
+test("Setup JIL FS mapping configuration")
+	file uni mount_point "messaging_test_wgt";
+{
+	verify_success(g_DAPI_jil_fs_mgr->GetAvailableVirtualDirs(&g_current_virt_roots));
+	for (UINT32 i = 0; i < g_current_virt_roots.GetCount(); ++i)
+	{
+		verify_success(g_DAPI_jil_fs_mgr->SetActive(g_current_virt_roots.Get(i)->CStr(), FALSE));
+	}
+
+	verify_success(g_selftest_mount_point.Set(mount_point));
+
+	verify_success(g_DAPI_jil_fs_mgr->AddMapping(mount_point, UNI_L(PATHSEP), UNI_L("/selftest"), TRUE));
+}
+
+test("Test Messaging existence")
+	language ecmascript;
+	require success "Load Messaging test widget";
+{
+	verify(Widget);
+	verify(Widget.Messaging);
+}
+
+test("Test Messaging.MessageFolderTypes")
+	language ecmascript;
+	require success "Test Messaging existence";
+{
+	var drafts = Widget.Messaging.MessageFolderTypes.DRAFTS;
+	var inbox = Widget.Messaging.MessageFolderTypes.INBOX;
+	var outbox = Widget.Messaging.MessageFolderTypes.OUTBOX;
+	var sentbox = Widget.Messaging.MessageFolderTypes.SENTBOX;
+	verify(drafts == "drafts");
+	verify(inbox == "inbox");
+	verify(outbox == "outbox");
+	verify(sentbox == "sentbox");
+	drafts = "wrongdraft";
+	inbox = "wrongin";
+	outbox = "wrongout";
+	sentbox = "wrongsent";
+	Widget.Messaging.MessageFolderTypes.DRAFTS = "wrong";
+	Widget.Messaging.MessageFolderTypes.INBOX = "wrong";
+	Widget.Messaging.MessageFolderTypes.OUTBOX = "wrong";
+	Widget.Messaging.MessageFolderTypes.SENTBOX = "wrong";
+	verify(Widget.Messaging.MessageFolderTypes.DRAFTS == "drafts");
+	verify(Widget.Messaging.MessageFolderTypes.INBOX == "inbox");
+	verify(Widget.Messaging.MessageFolderTypes.OUTBOX == "outbox");
+	verify(Widget.Messaging.MessageFolderTypes.SENTBOX == "sentbox");
+}
+
+test("Test Messaging Account constructor")
+	language ecmascript;
+	require success "Test Messaging existence";
+{
+	var account = new Widget.Messaging.Account;
+	verify(account);
+	verify(account.accountId === undefined);
+	verify(account.accountName === undefined);
+	verify(account instanceof Widget.Messaging.Account);
+}
+
+test("Test Messaging.Account and Messaging.getEmailAccounts")
+	language ecmascript;
+	require success "Test Messaging existence";
+{
+	var accounts = Widget.Messaging.getEmailAccounts();
+	for (var i=0; i<accounts.length; i++)
+	{
+		verify(typeof(accounts[i].accountId) == "string");
+		verify(typeof(accounts[i].accountName) == "string");
+		verify(accounts[i] instanceof Widget.Messaging.Account);
+	}
+}
+
+test("Test Messaging.getCurrentEmailAccount")
+	language ecmascript;
+	require success "Test Messaging existence";
+{
+	var account;
+	var catched = false;
+	try {
+		account = Widget.Messaging.getCurrentEmailAccount();
+	} catch(e) {
+		verify(e.message == 'Wrong email account');
+		catched = true;
+	}
+	if (!catched)
+	{
+		verify(account != null);
+		verify(typeof(account.accountId) == "string");
+		verify(typeof(account.accountName) == "string");
+	}
+}
+
+test("Test Messaging.createFolder")
+	language ecmascript;
+	require success "Test Messaging existence";
+{
+	var catched = false;
+	try {
+		Widget.Messaging.createFolder('wrong', 'something');
+	} catch(e) {
+		catched = true;
+	}
+	verify(catched == true);
+
+	Widget.Messaging.createFolder(Widget.Messaging.MessageTypes.EmailMessage, 'firstemailfolder');
+	Widget.Messaging.createFolder(Widget.Messaging.MessageTypes.SMSMessage, 'firstsmsfolder');
+	Widget.Messaging.createFolder(Widget.Messaging.MessageTypes.MMSMessage, 'firstmmsfolder');
+}
+
+test("Test Messaging.getFolderNames")
+	language ecmascript;
+	require success "Test Messaging.createFolder";
+{
+	var email_folders = Widget.Messaging.getFolderNames(Widget.Messaging.MessageTypes.EmailMessage);
+	var sms_folders = Widget.Messaging.getFolderNames(Widget.Messaging.MessageTypes.SMSMessage);
+	var mms_folders = Widget.Messaging.getFolderNames(Widget.Messaging.MessageTypes.MMSMessage);
+	verify(email_folders != null);
+	verify(sms_folders != null);
+	verify(mms_folders != null);
+	verify(email_folders.length > 0);
+	verify(sms_folders.length > 0);
+	verify(mms_folders.length > 0);
+	verify(typeof(email_folders[0]) == 'string');
+	verify(typeof(sms_folders[0]) == 'string');
+	verify(typeof(mms_folders[0]) == 'string');
+	var found_email_folder = false;
+	for(var i=0; i<email_folders.length; i++)
+		if(email_folders[i] == 'firstemailfolder')
+		{
+			found_email_folder = true;
+			break;
+		}
+	verify(found_email_folder == true);
+	var found_sms_folder = false;
+	for(var i=0; i<sms_folders.length; i++)
+		if(sms_folders[i] == 'firstsmsfolder')
+		{
+			found_sms_folder = true;
+			break;
+		}
+	verify(found_sms_folder == true);
+	var found_mms_folder = false;
+	for(var i=0; i<mms_folders.length; i++)
+		if(mms_folders[i] == 'firstmmsfolder')
+		{
+			found_mms_folder = true;
+			break;
+		}
+	verify(found_mms_folder == true);
+}
+
+test("Test Messaging.delete empty Folder")
+	language ecmascript;
+	require success "Test Messaging.createFolder";
+{
+	var to_remove = 'emptyfolder3';
+	Widget.Messaging.createFolder(Widget.Messaging.MessageTypes.SMSMessage, 'emptyfolder1');
+	Widget.Messaging.createFolder(Widget.Messaging.MessageTypes.SMSMessage, 'emptyfolder2');
+	Widget.Messaging.createFolder(Widget.Messaging.MessageTypes.SMSMessage, to_remove);
+	Widget.Messaging.createFolder(Widget.Messaging.MessageTypes.MMSMessage, 'emptyfolder1');
+	Widget.Messaging.createFolder(Widget.Messaging.MessageTypes.EmailMessage, 'emptyfolder1');
+	var prev_email_folders = Widget.Messaging.getFolderNames(Widget.Messaging.MessageTypes.EmailMessage);
+	var prev_sms_folders = Widget.Messaging.getFolderNames(Widget.Messaging.MessageTypes.SMSMessage);
+	var prev_mms_folders = Widget.Messaging.getFolderNames(Widget.Messaging.MessageTypes.MMSMessage);
+
+	Widget.Messaging.deleteFolder(Widget.Messaging.MessageTypes.SMSMessage, to_remove);
+	var next_email_folders = Widget.Messaging.getFolderNames(Widget.Messaging.MessageTypes.EmailMessage);
+	var next_sms_folders = Widget.Messaging.getFolderNames(Widget.Messaging.MessageTypes.SMSMessage);
+	var next_mms_folders = Widget.Messaging.getFolderNames(Widget.Messaging.MessageTypes.MMSMessage);
+	verify(next_sms_folders.length == prev_sms_folders.length - 1);
+	verify(next_mms_folders.length == prev_mms_folders.length);
+	verify(next_email_folders.length == prev_email_folders.length);
+	for (var i=0; i<next_sms_folders.length; i++)
+		if (next_sms_folders[i] == to_remove)
+			verify(false);
+}
+
+test("Test Messaging.getMessageQuantities")
+	language ecmascript;
+	require success "Test Messaging.getFolderNames";
+{
+	var email_folders = Widget.Messaging.getFolderNames(Widget.Messaging.MessageTypes.EmailMessage);
+	var sms_folders = Widget.Messaging.getFolderNames(Widget.Messaging.MessageTypes.SMSMessage);
+	var mms_folders = Widget.Messaging.getFolderNames(Widget.Messaging.MessageTypes.MMSMessage);
+	if (email_folders.length == 0 && mms_folders.length == 0 && sms_folders.length == 0)
+		output('Warning: Not enough folders to check getMessageQuantities.');
+
+	for (var i=0; i<email_folders.length; i++)
+	{
+		var mq = Widget.Messaging.getMessageQuantities(Widget.Messaging.MessageTypes.EmailMessage, email_folders[i]);
+		verify(typeof(mq.totalMessageCnt) == 'number');
+		verify(typeof(mq.totalMessageReadCnt) == 'number');
+		verify(typeof(mq.totalMessageUnreadCnt) == 'number');
+		verify(mq.totalMessageReadCnt + mq.totalMessageUnreadCnt <= mq.totalMessageCnt);
+	}
+	for (var i=0; i<mms_folders.length; i++)
+	{
+		var mq = Widget.Messaging.getMessageQuantities(Widget.Messaging.MessageTypes.MMSMessage, mms_folders[i]);
+		verify(typeof(mq.totalMessageCnt) == 'number');
+		verify(typeof(mq.totalMessageReadCnt) == 'number');
+		verify(typeof(mq.totalMessageUnreadCnt) == 'number');
+		verify(mq.totalMessageReadCnt + mq.totalMessageUnreadCnt <= mq.totalMessageCnt);
+	}
+	for (var i=0; i<sms_folders.length; i++)
+	{
+		var mq = Widget.Messaging.getMessageQuantities(Widget.Messaging.MessageTypes.SMSMessage, sms_folders[i]);
+		verify(typeof(mq.totalMessageCnt) == 'number');
+		verify(typeof(mq.totalMessageReadCnt) == 'number');
+		verify(typeof(mq.totalMessageUnreadCnt) == 'number');
+		verify(mq.totalMessageReadCnt + mq.totalMessageUnreadCnt <= mq.totalMessageCnt);
+	}
+}
+
+test("Test Messaging.getMessage")
+	language ecmascript;
+	require success "Test Messaging.getMessageQuantities";
+{
+	var email_folders = Widget.Messaging.getFolderNames(Widget.Messaging.MessageTypes.EmailMessage);
+	var sms_folders = Widget.Messaging.getFolderNames(Widget.Messaging.MessageTypes.SMSMessage);
+	var mms_folders = Widget.Messaging.getFolderNames(Widget.Messaging.MessageTypes.MMSMessage);
+	if (email_folders.length == 0 && mms_folders.length == 0 && sms_folders.length == 0)
+		output('Warning: Not enough folders to check getMessageQuantities.');
+
+	var has_run = false;
+	for (var i=0; i<email_folders.length; i++)
+	{
+		var mq = Widget.Messaging.getMessageQuantities(Widget.Messaging.MessageTypes.EmailMessage, email_folders[i]);
+		if (mq.totalMessageCnt > 0)
+		{
+			has_run = true;
+			var msg = Widget.Messaging.getMessage(Widget.Messaging.MessageTypes.EmailMessage, email_folders[i], mq.totalMessageCnt - 1);
+			verify(msg);
+			verify(typeof(msg) == 'object');
+			verify(msg instanceof Widget.Messaging.Message);
+			verify(typeof(msg.messageId) == 'string');
+			verify(msg.messageId != '');
+			verify(msg.type == Widget.Messaging.MessageTypes.EmailMessage || msg.type == undefined);
+		}
+	}
+	for (var i=0; i<mms_folders.length; i++)
+	{
+		var mq = Widget.Messaging.getMessageQuantities(Widget.Messaging.MessageTypes.MMSMessage, mms_folders[i]);
+		if (mq.totalMessageCnt > 0)
+		{
+			has_run = true;
+			var msg = Widget.Messaging.getMessage(Widget.Messaging.MessageTypes.MMSMessage, mms_folders[i], mq.totalMessageCnt - 1);
+			verify(msg);
+			verify(typeof(msg) == 'object');
+			verify(typeof(msg.messageId) == 'string');
+			verify(msg.messageId != '');
+			verify(msg.type == Widget.Messaging.MessageTypes.MMSMessage || msg.type == undefined);
+		}
+	}
+	for (var i=0; i<sms_folders.length; i++)
+	{
+		var mq = Widget.Messaging.getMessageQuantities(Widget.Messaging.MessageTypes.SMSMessage, sms_folders[i]);
+		if (mq.totalMessageCnt > 0)
+		{
+			has_run = true;
+			var msg = Widget.Messaging.getMessage(Widget.Messaging.MessageTypes.SMSMessage, sms_folders[i], mq.totalMessageCnt - 1);
+			verify(msg);
+			verify(typeof(msg) == 'object');
+			verify(typeof(msg.messageId) == 'string');
+			verify(msg.messageId != '');
+			verify(msg.type == Widget.Messaging.MessageTypes.SMSMessage || msg.type == undefined);
+		}
+	}
+	if (!has_run)
+		output('Warning: There is no message to test getMessage.');
+}
+
+test("Test Messaging.createMessage")
+	language ecmascript;
+	require success "Test Messaging existence";
+{
+	verify(typeof(Widget.Messaging.createMessage(Widget.Messaging.MessageTypes.EmailMessage)) == "object");
+	verify(typeof(Widget.Messaging.createMessage(Widget.Messaging.MessageTypes.MMSMessage)) == "object");
+	verify(typeof(Widget.Messaging.createMessage(Widget.Messaging.MessageTypes.SMSMessage)) == "object");
+}
+
+test("Test Messaging.findMessage simple")
+	language ecmascript;
+	require success "Test Messaging existence";
+	async;
+{
+//require dummy
+	setupOnMessagesFoundWithTimeout(function(msg_arr, folder) 
+		{
+			Widget.Messaging.onMessagesFound = null;
+			if (folder != Widget.Messaging.MessageFolderTypes.DRAFTS)
+				ST_failed("Test Messaging.findMessage simple: wrong folder name (" + folder + ").", "", "");
+			if (msg_arr.length < 1)
+				ST_failed("Test Messaging.findMessage simple: no messages found.", "", "");
+			else
+			{
+				for (var i = 0; i < msg_arr.length; ++i)
+				{
+					if (!(msg_arr[i] instanceof Widget.Messaging.Message))
+					{
+						ST_failed("Find result item is not an instance of Widget.Messaging.Message: " + msg_arr[i], "", "");
+						return;
+					}
+				}
+				ST_passed();
+			}
+		},
+		1000);
+
+	var message_to_find = Widget.Messaging.createMessage(Widget.Messaging.MessageTypes.EmailMessage);
+	Widget.Messaging.findMessages(message_to_find, Widget.Messaging.MessageFolderTypes.DRAFTS, 0, 1000);
+}
+
+test("Test Messaging.findMessages with no callback (CORE-32957) - should not crash")
+	language ecmascript;
+	require success "Test Messaging existence";
+{
+	Widget.Messaging.onMessagesFound = null;
+	Widget.Messaging.findMessages(new Widget.Messaging.Message(), Widget.Messaging.MessageFolderTypes.DRAFTS, 0, 1);
+	Widget.Messaging.findMessages(new Widget.Messaging.Message(), Widget.Messaging.MessageFolderTypes.DRAFTS, 2, 1);
+}
+
+test("Test Messaging.findMessage isRead")
+	language ecmascript;
+	require success "Test Messaging.findMessage simple";
+	async;
+{
+	var message_to_find = Widget.Messaging.createMessage(Widget.Messaging.MessageTypes.EmailMessage);
+	message_to_find.isRead = true;
+
+	setupOnMessagesFoundWithTimeout(function(msg_arr, folder)
+		{
+			var passed = findMessagesCallbackCommonCheck('isRead', msg_arr, folder);
+			if (!passed) return;
+
+			for (var i=0; i<msg_arr.length; i++)
+				if (msg_arr[i].isRead != true) {
+					ST_failed("Test Messaging.findMessage: resulting message isRead does not match requested one.", "", "");
+					return;
+				}
+			ST_passed();
+		}, 1000);
+
+	Widget.Messaging.findMessages(message_to_find, Widget.Messaging.MessageFolderTypes.DRAFTS, 0, 1000);
+}
+
+test("Test Messaging.findMessage messagePriority")
+	language ecmascript;
+	require success "Test Messaging.findMessage simple";
+	async;
+{
+	var message_to_find = Widget.Messaging.createMessage(Widget.Messaging.MessageTypes.EmailMessage);
+	message_to_find.messagePriority = true;
+
+	setupOnMessagesFoundWithTimeout(Widget.Messaging.onMessagesFound = function(msg_arr, folder)
+		{
+			var passed = findMessagesCallbackCommonCheck('messagePriority', msg_arr, folder);
+			if (!passed) return;
+
+			for (var i=0; i<msg_arr.length; i++)
+				if (msg_arr[i].messagePriority != true)
+				{
+					ST_failed("Test Messaging.findMessage: resulting message messagePriority does not match requested one.", "", "");
+					return;
+				}
+			ST_passed();
+		}, 1000);
+
+	Widget.Messaging.findMessages(message_to_find, Widget.Messaging.MessageFolderTypes.DRAFTS, 0, 1000);
+}
+
+test("Test Messaging.findMessage body")
+	language ecmascript;
+	require success "Test Messaging.findMessage simple";
+	async;
+{
+	var message_to_find = Widget.Messaging.createMessage(Widget.Messaging.MessageTypes.EmailMessage);
+	message_to_find.body = 'body contents';
+
+	setupOnMessagesFoundWithTimeout(function(msg_arr, folder)
+		{
+			var passed = findMessagesCallbackCommonCheck('body', msg_arr, folder);
+			if (!passed) return;
+
+			for (var i=0; i<msg_arr.length; i++)
+				if (msg_arr[i].body != 'body contents')
+				{
+					ST_failed("Test Messaging.findMessage: resulting message body does not match requested one.", "", "");
+					return;
+				}
+			ST_passed();
+		}, 1000);
+
+	Widget.Messaging.findMessages(message_to_find, Widget.Messaging.MessageFolderTypes.DRAFTS, 0, 1000);
+}
+
+test("Test Messaging.findMessage subject")
+	language ecmascript;
+	require success "Test Messaging.findMessage simple";
+	async;
+{
+	var message_to_find = Widget.Messaging.createMessage(Widget.Messaging.MessageTypes.EmailMessage);
+	message_to_find.subject = '*subject contents';
+
+	setupOnMessagesFoundWithTimeout(function(msg_arr, folder)
+		{
+			var passed = findMessagesCallbackCommonCheck('subject', msg_arr, folder);
+			if (!passed) return;
+
+			for (var i=0; i<msg_arr.length; i++)
+				if (!msg_arr[i].subject.match(/subject contents/))
+					ST_failed("Test Messaging.findMessage: resulting message subject(" +msg_arr[i].subject+ ") does not match requested one (" +message_to_find.subject+ ").", "", "");
+			ST_passed();
+		}, 1000);
+
+	Widget.Messaging.findMessages(message_to_find,  Widget.Messaging.MessageFolderTypes.DRAFTS, 0, 1000);
+}
+
+test("Test Messaging.findMessage callbackNumber")
+	language ecmascript;
+	require success "Test Messaging.findMessage simple";
+	async;
+{
+	var message_to_find = Widget.Messaging.createMessage(Widget.Messaging.MessageTypes.EmailMessage);
+	message_to_find.callbackNumber = 'reply_to@him.com';
+
+	setupOnMessagesFoundWithTimeout(function(msg_arr, folder)
+		{
+			var passed = findMessagesCallbackCommonCheck('callbackNumber', msg_arr, folder);
+			if (!passed) return;
+
+			for (var i=0; i<msg_arr.length; i++)
+				if (msg_arr[i].callbackNumber != message_to_find.callbackNumber)
+				{
+					ST_failed("Test Messaging.findMessage: resulting message callbackNumber does not match requested one.", "", "");
+					return;
+				}
+			ST_passed();
+		}, 1000);
+
+	Widget.Messaging.findMessages(message_to_find, Widget.Messaging.MessageFolderTypes.DRAFTS, 0, 1000);
+}
+
+test("Test Messaging.findMessage destinationAddress")
+	language ecmascript;
+	require success "Test Messaging.findMessage simple";
+	async;
+{
+	var message_to_find = Widget.Messaging.createMessage(Widget.Messaging.MessageTypes.EmailMessage);
+	message_to_find.addAddress('destination', 'to@him.com');
+
+	setupOnMessagesFoundWithTimeout(function(msg_arr, folder)
+		{
+			var passed = findMessagesCallbackCommonCheck('destinationAddress', msg_arr, folder);
+			if (!passed) return;
+
+			for (var i_result_messages = 0; i_result_messages < msg_arr.length; i_result_messages++)
+			{
+				if (helperCompareAddresses('destination', message_to_find, msg_arr[i_result_messages]) == false)
+				{
+					ST_failed("Test Messaging.findMessage: resulting message destinationAddress does not match requested one.", "", "");
+					return;
+				}
+			}
+			ST_passed();
+		}, 1000);
+
+	Widget.Messaging.findMessages(message_to_find, Widget.Messaging.MessageFolderTypes.DRAFTS, 0, 1000);
+}
+
+test("Test Messaging.findMessage bccAddress")
+	language ecmascript;
+	require success "Test Messaging.findMessage simple";
+	async;
+{
+	var message_to_find = Widget.Messaging.createMessage(Widget.Messaging.MessageTypes.EmailMessage);
+	message_to_find.addAddress('bcc', 'bcc1@him.com');
+	message_to_find.addAddress('bcc', 'bcc2@him.com');
+
+	setupOnMessagesFoundWithTimeout(function(msg_arr, folder)
+		{
+			var passed = findMessagesCallbackCommonCheck('bccAddress', msg_arr, folder);
+			if (!passed) return;
+
+			for (var i_result_messages = 0; i_result_messages < msg_arr.length; i_result_messages++)
+				if (helperCompareAddresses('bcc', message_to_find, msg_arr[i_result_messages]) == false)
+				{
+					ST_failed("Test Messaging.findMessage: resulting message bccAddress does not match requested one.", "", "");
+					return;
+				}
+			ST_passed();
+		}, 1000);
+
+	Widget.Messaging.findMessages(message_to_find, Widget.Messaging.MessageFolderTypes.DRAFTS, 0, 1000);
+}
+
+test("Test Messaging.findMessage attachments")
+	language ecmascript;
+	require success "Test Messaging.findMessage simple";
+	async;
+{
+	var message_to_insert = Widget.Messaging.createMessage(Widget.Messaging.MessageTypes.EmailMessage);
+	message_to_insert.body = "";
+	message_to_insert.addAttachment(fileToAttach);
+	Widget.Messaging.copyMessageToFolder(message_to_insert, Widget.Messaging.MessageFolderTypes.DRAFTS);
+
+
+	var message_to_find = Widget.Messaging.createMessage(Widget.Messaging.MessageTypes.EmailMessage);
+	message_to_find.addAttachment(fileToAttach);
+
+	setupOnMessagesFoundWithTimeout(function(msg_arr, folder)
+		{
+			var passed = findMessagesCallbackCommonCheck('attachments', msg_arr, folder);
+			if (!passed) return;
+
+			for (var i_result_messages = 0; i_result_messages < msg_arr.length; i_result_messages++)
+				if (helperCompareAttachments(message_to_find, msg_arr[i_result_messages]) == false)
+				{
+					ST_failed("Test Messaging.findMessage: resulting message attachments does not match requested one.", "", "");
+					return;
+				}
+			ST_passed();
+		}, 1000);
+
+	Widget.Messaging.findMessages(message_to_find, Widget.Messaging.MessageFolderTypes.DRAFTS, 0, 1000);
+}
+
+test("Test simple Messaging.sendMessage")
+	language ecmascript;
+	require success "Test Messaging.createMessage";
+{
+	var message = Widget.Messaging.createMessage(Widget.Messaging.MessageTypes.EmailMessage);
+	message.addAddress('destination', 'to@him.com');
+	message.body = '';
+	Widget.Messaging.sendMessage(message);
+}
+
+test("Test Messaging.sendMessage no body")
+	language ecmascript;
+	require success "Test simple Messaging.sendMessage";
+{
+	var message = Widget.Messaging.createMessage(Widget.Messaging.MessageTypes.EmailMessage);
+	message.addAddress('destination', 'to@him.com');
+	var catched = false;
+	try {
+		Widget.Messaging.sendMessage(message);
+	} catch(e) {
+		catched = true;
+		verify(e.type == Widget.ExceptionTypes.INVALID_PARAMETER);
+	}
+	verify(catched);
+}
+
+test("Test Messaging.sendMessage with non-Message object")
+	language ecmascript;
+	require success "Test simple Messaging.sendMessage";
+{
+	var non_message = new Object();
+	var catched = false;
+	try {
+		Widget.Messaging.sendMessage(non_message);
+	} catch(e) {
+		catched = true;
+		verify(e.type == Widget.ExceptionTypes.INVALID_PARAMETER);
+		verify(e.message == 'Invalid object type');
+	}
+	verify(catched);
+}
+
+test("Test Messaging.onMessageSendingFailure")
+	language ecmascript;
+	require success "Test simple Messaging.sendMessage";
+	async;
+{
+	// dummy_pi_imp of messaging.sendMessage always calls
+	// onMessageSendingFailure for MMS messages
+	var timeoutMs = 10000;
+	var timeoutId = setTimeout(function()
+	{
+		Widget.Messaging.onMessageSendingFailure = null;
+		ST_failed("Test Messaging.onMessageSendingFailure: Widget.Messaging.onMessageSendingFailure was not called in " + timeoutMs + "ms.","","");
+	}, timeoutMs);
+	Widget.Messaging.onMessageSendingFailure = function(msg, str)
+	{
+		clearTimeout(timeoutId);
+		Widget.Messaging.onMessageSendingFailure = null;
+		var messageCopy = helperSetupMessage(Widget.Messaging.MessageTypes.MMSMessage);
+		var ok = helperCompareMessages(messageCopy, msg, false, false);
+		if(!ok)
+			ST_failed('not the same message', '', '');
+		else if (str != "4:Unknown error")
+			ST_failed('incorrect error message string: expected "4:Unknown error", received "' + str + '"', '', '')
+		else
+			ST_passed();
+	}
+
+	var message = helperSetupMessage(Widget.Messaging.MessageTypes.MMSMessage);
+	Widget.Messaging.sendMessage(message);  // this should end up in onMessageSendingFailure
+}
+
+
+test("Test Messaging.sendMessage SMS")
+	language ecmascript;
+	require success "Test simple Messaging.sendMessage";
+{
+	var message = Widget.Messaging.createMessage(Widget.Messaging.MessageTypes.SMSMessage);
+	message.addAddress('destination', 'qwertyuiop[]asdfghjklzxcvbnm,./¹ê+*#1234567890');
+	message.body = 'whatever';
+	Widget.Messaging.sendMessage(message);
+}
+
+test("Test Messaging.sendMessage exceptions")
+	language ecmascript;
+	require success "Test simple Messaging.sendMessage";
+{
+	var exceptionThrown = false;
+	try {
+		var message = Widget.Messaging.createMessage('wrong');
+	} catch(e) {
+		verify(e.message == 'Wrong message type');
+		verify(e.type == Widget.ExceptionTypes.INVALID_PARAMETER);
+		exceptionThrown = true;
+	}
+	verify(exceptionThrown);
+
+	exceptionThrown = false;
+	try {
+		var message = Widget.Messaging.createMessage(Widget.Messaging.MessageTypes.SMSMessage);
+		message.body = 'whatever';
+		Widget.Messaging.sendMessage(message);
+	} catch(e) {
+		verify(e.type == Widget.ExceptionTypes.INVALID_PARAMETER);
+		verify(e.message == 'No message destination address');
+		exceptionThrown = true;
+	}
+	verify(exceptionThrown);
+
+	exceptionThrown = false;
+	try {
+		var message = Widget.Messaging.createMessage(Widget.Messaging.MessageTypes.EmailMessage);
+		message.addAddress('destination', 'wrong.address');
+		message.body = 'whatever';
+		Widget.Messaging.sendMessage(message);
+	} catch(e) {
+		verify(e.type == Widget.ExceptionTypes.INVALID_PARAMETER);
+		verify(e.message == 'Wrong message address');
+		exceptionThrown = true;
+	}
+
+	exceptionThrown = false;
+	try {
+		var message = Widget.Messaging.createMessage(Widget.Messaging.MessageTypes.EmailMessage);
+		message.addAddress('destination', 'to@him.com');
+		message.addAddress('cc', 'wrong');
+		message.body = 'whatever';
+		Widget.Messaging.sendMessage(message);
+	} catch(e) {
+		verify(e.type == Widget.ExceptionTypes.INVALID_PARAMETER);
+		verify(e.message == 'Wrong message address');
+		exceptionThrown = true;
+	}
+
+	exceptionThrown = false;
+	try {
+		var message = Widget.Messaging.createMessage(Widget.Messaging.MessageTypes.EmailMessage);
+		message.addAddress('destination', 'to@him.com');
+		message.body = 'whatever';
+		message.validityPeriodHours = 7;
+		Widget.Messaging.sendMessage(message);
+	} catch(e) {
+		verify(e.type == Widget.ExceptionTypes.INVALID_PARAMETER);
+		verify(e.message == 'Wrong message parameter');
+		exceptionThrown = true;
+	}
+}
+
+test("Test Messaging.onMessageSendingFailure before succesfull sending")
+	language ecmascript;
+	require success "Test Messaging.onMessageSendingFailure";
+	async;
+{
+	var timeoutMs = 10000;
+	var timeoutId = setTimeout(function()
+	{
+		Widget.Messaging.onMessageSendingFailure = null;
+		ST_failed("Test Messaging.onMessageSendingFailure before succesfull sending: Widget.Messaging.onMessageSendingFailure was not called in " + timeoutMs + "ms.","","");
+	}, timeoutMs);
+	Widget.Messaging.onMessageSendingFailure = function(msg, str)
+	{
+		clearTimeout(timeoutId);
+		Widget.Messaging.onMessageSendingFailure = null;
+		var messageCopy = helperSetupMessage(Widget.Messaging.MessageTypes.MMSMessage);
+		var ok = helperCompareMessages(messageCopy, msg, false, false);
+		if(!ok)
+			ST_failed('not the same message', '', '');
+		else
+			ST_passed();
+	}
+
+	var messageMMS = helperSetupMessage(Widget.Messaging.MessageTypes.MMSMessage);
+	Widget.Messaging.sendMessage(messageMMS);  // this one will fail
+	var messageEmail = helperSetupMessage(Widget.Messaging.MessageTypes.EmailMessage);
+	Widget.Messaging.sendMessage(messageEmail);  // this one will succeed
+}
+
+test("Test Messaging.onMessageSendingFailure after succesfull sending")
+	language ecmascript;
+	require success "Test Messaging.onMessageSendingFailure";
+	async;
+{
+	var timeoutMs = 10000;
+	var timeoutId = setTimeout(function()
+	{
+		Widget.Messaging.onMessageSendingFailure = null;
+		ST_failed("Test Messaging.onMessageSendingFailure after succesfull sending: Widget.Messaging.onMessageSendingFailure was not called in " + timeoutMs + "ms.","","");
+	}, timeoutMs);
+	Widget.Messaging.onMessageSendingFailure = function(msg, str)
+	{
+		clearTimeout(timeoutId);
+		Widget.Messaging.onMessageSendingFailure = null;
+		var messageCopy = helperSetupMessage(Widget.Messaging.MessageTypes.MMSMessage);
+		var ok = helperCompareMessages(messageCopy, msg, false, false);
+		if(!ok)
+			ST_failed('not the same message', '', '');
+		else
+			ST_passed();
+	}
+
+	var messageEmail = helperSetupMessage(Widget.Messaging.MessageTypes.EmailMessage);
+	Widget.Messaging.sendMessage(messageEmail);  // this one will succeeed
+	var messageMMS = helperSetupMessage(Widget.Messaging.MessageTypes.MMSMessage);
+	Widget.Messaging.sendMessage(messageMMS);  // this one will fail
+}
+
+test("Test Messaging.onMessageSendingFailure - preserve unset values")
+	language ecmascript;
+	require success "Test simple Messaging.sendMessage";
+	async;
+{
+	// dummy_pi_imp of messaging.sendMessage always calls
+	// onMessageSendingFailure for MMS messages
+	var timeoutMs = 10000;
+	var timeoutId = setTimeout(function()
+	{
+		Widget.Messaging.onMessageSendingFailure = null;
+		ST_failed("Test Messaging.onMessageSendingFailure: Widget.Messaging.onMessageSendingFailure was not called in " + timeoutMs + "ms.","","");
+	}, timeoutMs);
+
+	var message = Widget.Messaging.createMessage(Widget.Messaging.MessageTypes.MMSMessage);
+	message.addAddress('destination', 'destinationAddress@somewhere.com');
+	message.body = 'body';
+
+	Widget.Messaging.onMessageSendingFailure = function(msg, str)
+	{
+		clearTimeout(timeoutId);
+		Widget.Messaging.onMessageSendingFailure = null;
+		output('Message validityPeriodHours: ' + msg.validityPeriodHours + "; " + message.validityPeriodHours + "\n");
+		output('Message subject: ' + msg.subject + "; " + message.subject + "\n");
+		var ok = helperCompareMessages(message, msg, false, false);
+		if(!ok)
+			ST_failed('not the same message', '', '');
+		else
+			ST_passed();
+	}
+
+	Widget.Messaging.sendMessage(message);  // this should end up in onMessageSendingFailure
+}
+
+
+test("Test Messaging.sendMessage not changing contents of the message")
+	language ecmascript;
+	require success "Test simple Messaging.sendMessage";
+{
+	var message = Widget.Messaging.createMessage(Widget.Messaging.MessageTypes.SMSMessage);
+
+	// setup message
+	message.messageType = Widget.Messaging.MessageTypes.EmailMessage;
+	message.addAttachment(fileToAttach);
+	message.addAttachment(secondFileToAttach);
+	message.addAddress('bcc', 'bccAddresscp@somewhere.com');
+	message.body = 'body';
+	message.callbackNumber = 'me@here.com';
+	message.addAddress('cc', 'ccAddress@somewhere.com;secondCcAddress@else.com');
+	message.addAddress('destination', 'destinationAddress@somewhere.com');
+	message.isRead = false;
+	message.messagePriority = true;
+	message.sourceAddress = 'sourceAddress@here.com';
+	message.subject = 'subject';
+
+	// copy message properties
+	var attachments = message.attachments;
+	var bccAddress = message.bccAddress;
+	var body = message.body;
+	var callbackNumber = message.callbackNumber;
+	var ccAddress = message.ccAddress;
+	var destinationAddress = message.destinationAddress;
+	var isRead = message.isRead;
+	var messageId = message.messageId;
+	var messagePriority = message.messagePriority;
+	var messageType = message.messageType;
+	var sourceAddress = message.sourceAddress;
+	var subject = message.subject;
+	var validityPeriodHours = message.validityPeriodHours;
+	var time = message.time;
+
+	// check if properties were properly copied
+	verify(attachments.length == 2);
+	verify(attachments[0].MIMEType == 'application/octet-stream');
+	verify(attachments[0].fileName == 'fileToAttach');
+	verify(attachments[0].size == 7);
+	verify(attachments[1].MIMEType == 'application/octet-stream');
+	verify(attachments[1].fileName == 'secondFileToAttach');
+	verify(attachments[1].size == 14);
+	verify(bccAddress.length == 1);
+	verify(bccAddress[0] == 'bccAddresscp@somewhere.com');
+	verify(ccAddress.length == 2);
+	verify(ccAddress[0] == 'ccAddress@somewhere.com');
+	verify(ccAddress[1] == 'secondCcAddress@else.com');
+	verify(destinationAddress.length == 1);
+	verify(destinationAddress[0] == 'destinationAddress@somewhere.com');
+	verify(body == 'body');
+	verify(callbackNumber == 'me@here.com');
+	verify(isRead == false);
+	verify(messageId == undefined);
+	verify(messagePriority == true);
+	verify(messageType == Widget.Messaging.MessageTypes.EmailMessage);
+	verify(sourceAddress == 'sourceAddress@here.com');
+	verify(subject == 'subject');
+	verify(validityPeriodHours == undefined);
+	verify(time == undefined);
+
+	Widget.Messaging.sendMessage(message);
+
+	// check if sending message changed its fields
+	verify(attachments.length == message.attachments.length);
+	for(var i=0; i<attachments.length; i++)
+	{
+		verify(attachments[i].MIMEType == message.attachments[i].MIMEType);
+		verify(attachments[i].size == message.attachments[i].size);
+		verify(attachments[i].fileName == message.attachments[i].fileName);
+	}
+	verify(bccAddress.length == message.bccAddress.length);
+	for(var i=0; i<bccAddress.length; i++)
+	{
+		verify(bccAddress[i] == message.bccAddress[i]);
+	}
+	verify(ccAddress.length == message.ccAddress.length);
+	for(var i=0; i<ccAddress.length; i++)
+	{
+		verify(ccAddress[i] == message.ccAddress[i]);
+	}
+	verify(destinationAddress.length == message.destinationAddress.length);
+	for(var i=0; i<destinationAddress.length; i++)
+	{
+		verify(destinationAddress[i] == message.destinationAddress[i]);
+	}
+	verify(body == message.body);
+	verify(callbackNumber == message.callbackNumber);
+	verify(isRead == message.isRead);
+	verify(messageId == message.messageId);
+	verify(messagePriority == message.messagePriority);
+	verify(messageType == message.messageType);
+	verify(sourceAddress == message.sourceAddress);
+	verify(subject == message.subject);
+	verify(validityPeriodHours == message.validityPeriodHours);
+	verify(time == message.time);
+}
+
+test("Messaging.copyMessageTo / Messaging.moveMessageTo")
+	require success "Test Messaging.getMessageQuantities";
+	require success "Test Messaging.getMessage";
+	require success "Test Messaging.createMessage";
+	language ecmascript;
+{
+	var email_folders = Widget.Messaging.getFolderNames(Widget.Messaging.MessageTypes.EmailMessage);
+	var sms_folders = Widget.Messaging.getFolderNames(Widget.Messaging.MessageTypes.SMSMessage);
+	var mms_folders = Widget.Messaging.getFolderNames(Widget.Messaging.MessageTypes.MMSMessage);
+	verify(email_folders != null);
+	verify(sms_folders != null);
+	verify(mms_folders != null);
+	if (email_folders.length <= 2 && mms_folders.length <= 2 && sms_folders.length <= 2)
+	{
+		output('Warning: Not enough folders to check copyMessageTo / moveMessageTo.');
+		verify(false);
+	}
+
+	var src_folder;
+	var dst_folder1;
+	var dst_folder2;
+	var wrong_dst;
+	var type;
+	if (email_folders.length > 2)
+	{
+		src_folder = email_folders[0];
+		dst_folder1 = email_folders[1];
+		dst_folder2 = email_folders[2];
+		type = Widget.Messaging.MessageTypes.EmailMessage;
+		wrong_dst = sms_folders[0];
+	}
+	else if (sms_folders.length > 2)
+	{
+		src_folder = sms_folders[0];
+		dst_folder1 = sms_folders[1];
+		dst_folder2 = sms_folders[2];
+		type = Widget.Messaging.MessageTypes.SMSMessage;
+		wrong_dst = email_folders[0];
+	}
+	else
+	{
+		src_folder = mms_folders[0];
+		dst_folder1 = mms_folders[1];
+		dst_folder2 = mms_folders[2];
+		type = Widget.Messaging.MessageTypes.MMSMessage;
+		wrong_dst = sms_folders[0];
+	}
+
+	var message = Widget.Messaging.createMessage(type);
+	verify(message != null);
+
+	var mq_before = Widget.Messaging.getMessageQuantities(type, src_folder);
+	Widget.Messaging.moveMessageToFolder(message, src_folder);	// add message to src folder to make sure at least one message is there
+	var mq_after = Widget.Messaging.getMessageQuantities(type, src_folder);
+	verify(mq_after.totalMessageCnt == mq_before.totalMessageCnt + 1);
+
+	var found = false;
+	var msg_to_copy = Widget.Messaging.getMessage(type, src_folder, 0);
+
+	mq_before = Widget.Messaging.getMessageQuantities(type, dst_folder1);
+	Widget.Messaging.copyMessageToFolder(msg_to_copy, dst_folder1);
+	// check if stayed in the src location
+	found = false;
+	for (i = 0; i < mq_after.totalMessageCnt; i++)
+	{
+		var msg = Widget.Messaging.getMessage(type, src_folder, i);
+		verify(msg);
+		if (msg.messageId == msg_to_copy.messageId)
+		{
+			found = true;
+			break;
+		}
+	}
+	verify(found);
+
+	// copy to the wrong destination
+//	try
+//	{
+//		Widget.Messaging.copyMessageToFolder(msg_to_copy, wrong_dst);
+//		verify(!"copy to folder of different type than message's type succeeded which was not expected");
+//	}
+//	catch(e)
+//	{
+//		verify(e.type == "invalid_parameter");
+//	}
+
+	mq_after = Widget.Messaging.getMessageQuantities(type, dst_folder1);
+	// check if exists in the dest location
+	verify(mq_after.totalMessageCnt == mq_before.totalMessageCnt + 1);
+
+	Widget.Messaging.moveMessageToFolder(msg_to_copy, dst_folder2);
+	mq_after = Widget.Messaging.getMessageQuantities(type, dst_folder2);
+	// check if exists in the dest location
+	found = false;
+	for (i = 0; i < mq_after.totalMessageCnt; i++)
+	{
+		var msg = Widget.Messaging.getMessage(type, dst_folder2, i);
+		verify(msg);
+		if (msg.messageId == msg_to_copy.messageId)
+		{
+			found = true;
+			break;
+		}
+	}
+	verify(found);
+
+	mq_after = Widget.Messaging.getMessageQuantities(type, src_folder);
+	// check if removed from src location
+	found = false;
+	for (i = 0; i < mq_after.totalMessageCnt; i++)
+	{
+		var msg = Widget.Messaging.getMessage(type, src_folder, i);
+		verify(msg);
+		if (msg.messageId == msg_to_copy.messageId)
+		{
+			found = true;
+			break;
+		}
+	}
+	verify(found == false);
+
+	// move to the wrong destination
+//	try
+//	{
+//		Widget.Messaging.moveMessageToFolder(msg_to_copy, wrong_dst);
+//		verify(!"move to folder of different type than message's type succeeded which was not expected");
+//	}
+//	catch(e)
+//	{
+//		verify(e.type == "invalid_parameter");
+//	}
+}
+
+test("Messaging.deleteMessage")
+	require success "Test Messaging.getMessageQuantities";
+	require success "Test Messaging.getMessage";
+	require success "Test Messaging.createMessage";
+	language ecmascript;
+{
+	var email_folders = Widget.Messaging.getFolderNames(Widget.Messaging.MessageTypes.EmailMessage);
+	verify(email_folders != null);
+	verify(email_folders.length > 0);
+	var message = Widget.Messaging.createMessage(Widget.Messaging.MessageTypes.EmailMessage);
+	verify(message != null);
+
+	var mq_before = Widget.Messaging.getMessageQuantities(Widget.Messaging.MessageTypes.EmailMessage, email_folders[0]);
+	Widget.Messaging.moveMessageToFolder(message, email_folders[0]);	// add message to src folder to make sure at least one message is there
+	var mq_after = Widget.Messaging.getMessageQuantities(Widget.Messaging.MessageTypes.EmailMessage, email_folders[0]);
+	verify(mq_after.totalMessageCnt == mq_before.totalMessageCnt + 1);
+	message = Widget.Messaging.getMessage(Widget.Messaging.MessageTypes.EmailMessage, email_folders[0], 0);
+	Widget.Messaging.deleteMessage(Widget.Messaging.MessageTypes.EmailMessage, email_folders[0], message.messageId);
+	mq_after = Widget.Messaging.getMessageQuantities(Widget.Messaging.MessageTypes.EmailMessage, email_folders[0]);
+	verify(mq_after.totalMessageCnt == mq_before.totalMessageCnt);
+
+	var found = false;
+	for (i = 0; i < mq_after.totalMessageCnt; i++)
+	{
+		var msg = Widget.Messaging.getMessage(Widget.Messaging.MessageTypes.EmailMessage, email_folders[0], i);
+		verify(msg);
+		if (msg.messageId == message.messageId)
+		{
+			found = true;
+			break;
+		}
+	}
+	verify(found == false);
+}
+
+test("Test Messaging.setCurrentEmailAccount")
+	language ecmascript;
+	require success "Test Messaging.Account and Messaging.getEmailAccounts";
+	require success "Test Messaging.getCurrentEmailAccount";
+{
+	var accounts = Widget.Messaging.getEmailAccounts();
+	if (accounts.length > 1)
+	{
+		var current_account = Widget.Messaging.getCurrentEmailAccount();
+		var found_other_id = false;
+		for (var i=0; i<accounts.length; i++)
+			if (accounts[i].accountId != current_account.accountId)
+			{
+				Widget.Messaging.setCurrentEmailAccount(accounts[i].accountId);
+				found_other_id = true;
+				break;
+			}
+		verify(found_other_id);
+		var next_current_account = Widget.Messaging.getCurrentEmailAccount();
+		verify(next_current_account.accountId != current_account.accoundId);
+	}
+	else
+		output('Warning:  Not enough accounts to check setEmailAccount.');
+}
+
+test("Test Messaging.deleteEmailAccount")
+	language ecmascript;
+	require success "Test Messaging.getCurrentEmailAccount";
+{
+	var accounts_prev = Widget.Messaging.getEmailAccounts();
+	if (accounts_prev.length > 0)
+	{
+		Widget.Messaging.deleteEmailAccount(accounts_prev[0].accountId);
+		var accounts_next = Widget.Messaging.getEmailAccounts();
+		verify(accounts_prev.length == accounts_next.length + 1);
+	}
+	else
+		output('Warning:  Not enough accounts to check deleteEmailAccount.');
+}
+
+test("Messaging.deleteAllMessages")
+	require success "Test Messaging.getMessageQuantities";
+	require success "Test Messaging.getMessage";
+	require success "Test Messaging.createMessage";
+	require success "Test Messaging.createFolder";
+	require success "Test Messaging.delete empty Folder";
+	language ecmascript;
+{
+	Widget.Messaging.createFolder(Widget.Messaging.MessageTypes.EmailMessage, 'secondemailfolder');
+	var message = Widget.Messaging.createMessage(Widget.Messaging.MessageTypes.EmailMessage);
+	verify(message != null);
+	Widget.Messaging.moveMessageToFolder(message, 'secondemailfolder');
+	message = Widget.Messaging.createMessage(Widget.Messaging.MessageTypes.EmailMessage);
+	verify(message != null);
+	Widget.Messaging.moveMessageToFolder(message, 'secondemailfolder');
+	message = Widget.Messaging.createMessage(Widget.Messaging.MessageTypes.EmailMessage);
+	verify(message != null);
+	Widget.Messaging.moveMessageToFolder(message, 'secondemailfolder');
+	var mq_after = Widget.Messaging.getMessageQuantities(Widget.Messaging.MessageTypes.EmailMessage, 'secondemailfolder');
+	verify(mq_after.totalMessageCnt == 3);
+	Widget.Messaging.deleteAllMessages(Widget.Messaging.MessageTypes.EmailMessage, 'secondemailfolder');
+	mq_after = Widget.Messaging.getMessageQuantities(Widget.Messaging.MessageTypes.EmailMessage, 'secondemailfolder');
+	verify(mq_after.totalMessageCnt == 0);
+	Widget.Messaging.deleteFolder(Widget.Messaging.MessageTypes.EmailMessage, 'secondemailfolder');
+}
+

@@ -1,0 +1,419 @@
+/* -*- Mode: c++; tab-width: 4; indent-tabs-mode: t; c-basic-offset: 4 -*-
+**
+** Copyright (C) 2010-2011 Opera Software ASA.  All rights reserved.
+**
+** This file is part of the Opera web browser.  It may not be distributed
+** under any circumstances.
+**
+** Peter Krefting
+*/
+
+group "gadgets.extensions";
+require GADGET_SUPPORT;
+require EXTENSION_SUPPORT;
+require init;
+
+include "modules/gadgets/OpGadgetManager.h";
+include "modules/gadgets/OpGadgetClass.h";
+include "modules/gadgets/gadget_selftest_utils.h";
+include "modules/dochand/docman.h";
+include "modules/dochand/win.h";
+include "modules/pi/OpSystemInfo.h";
+include "modules/windowcommander/OpWindowCommander.h";
+include "modules/windowcommander/src/WindowCommander.h";
+include "modules/style/cssmanager.h";
+
+table extension_pass
+{
+    { "Basic extension",            "testfiles/extensions/selftest.oex" },
+    { "Unknown extension feature",  "testfiles/extensions/unknownfeature.oex" },
+    { "Speeddial feature",          "testfiles/extensions/speeddial.oex" },
+    { "Speeddial feature with IP fallback URL", "testfiles/extensions/speeddialipurl.oex" },
+}
+
+table extension_fail
+{
+    { "Standard widget",            "testfiles/widgets/selftest.wgt" },
+    { "Required unknown feature",   "testfiles/extensions/unknownfeaturefail.oex" },
+    { "Speeddial bad feature param","testfiles/extensions/speeddialfail.oex" },
+}
+
+table extension_reqext_fail
+{
+	{ "No file extension oex",      "testfiles/extensions/noextension" },
+}
+
+table extension_reject
+{
+    { "Extension with Unite app",       "testfiles/extensions/unite.oex" },
+    { "Extension without a start page", "testfiles/extensions/nostartpage.oex" },
+}
+
+// Mention all the contained files such that
+// they get listed in the selftest_data file.
+table dummy1(const char *) filelist "testfiles/extensions/selftest.oex" recursively;
+table dummy2(const char *) filelist "testfiles/extensions/nostartpage.oex" recursively;
+table dummy7(const char *) filelist "testfiles/extensions/unknownfeature.oex" recursively;
+table dummy8(const char *) filelist "testfiles/extensions/unknownfeaturefail.oex" recursively;
+table dummy9(const char *) filelist "testfiles/extensions/unite.oex" recursively;
+table dummy10(const char *) filelist "testfiles/extensions/noextension" recursively;
+table dummy11(const char *) filelist "testfiles/extensions/speeddial.oex" recursively;
+table dummy12(const char *) filelist "testfiles/extensions/speeddialfail.oex" recursively;
+table dummy13(const char *) filelist "testfiles/extensions/speeddialipurl.oex" recursively;
+table dummy14(const char *) filelist "testfiles/extensions/speeddialrelativeurl.oex" recursively;
+
+global
+{
+	OpGadget *css_gadget = NULL, *js_gadget = NULL, *uiitem_gadget = NULL;
+	OpGadget *options_gadget = NULL, *no_options_gadget = NULL;
+	OpGadget *speeddial_gadget = NULL;
+	int original_js_count;
+	int original_css_count;
+
+	GadgetSelftestUtils g_utils;
+
+	/*
+	 * This listener also extends GadgetSelftestUtils::GadgetOpenCallback
+	 * and installs itself as the UI listener as soon as the gadget is
+	 * opened.
+	 */
+	class SelftestExtensionUIListener
+		: public OpExtensionUIListener
+		, public GadgetSelftestUtils::GadgetOpenCallback
+	{
+	public:
+		SelftestExtensionUIListener()
+			: m_expect_add(true), m_expect_remove(false)
+			{}
+
+		void OnGadgetOpen(OP_GADGET_STATUS status)
+		{
+			if (OpStatus::IsSuccess(status))
+				state.GetWindow()->GetWindowCommander()->SetExtensionUIListener(this);
+			else
+				ST_failed("Gadget open failed, status: %d", status);
+		}
+
+		void OnExtensionUIItemAddRequest(OpWindowCommander *, ExtensionUIItem *item)
+		{
+			if (m_expect_add)
+				m_expect_remove = true;
+			else
+				ST_failed("Did not expect OnExtensionUIItemAddRequest now");
+			m_expect_add = false;
+			item->callbacks->ItemAdded(item->id, OpExtensionUIListener::ItemAddedSuccess);
+		}
+
+		void OnExtensionUIItemRemoveRequest(OpWindowCommander *, ExtensionUIItem *item)
+		{
+			if (m_expect_remove)
+				ST_passed();
+			else
+				ST_failed("Did not expect OnExtensionUIItemRemoveRequest now");
+			m_expect_remove = false;
+			item->callbacks->ItemRemoved(item->id, OpExtensionUIListener::ItemRemovedSuccess);
+		}
+
+		void OnExtensionSpeedDialInfoUpdated(OpWindowCommander* commander) {};
+
+
+	private:
+		bool m_expect_add, m_expect_remove;
+	} selfinstalling_uilistener;
+}
+
+foreach (testname, path) from extension_pass
+{
+    test("IsThisAnExtensionGadgetPath() " testname " should pass")
+        file uni extension path;
+    {
+        verify(g_gadget_manager->IsThisAnExtensionGadgetPath(extension));
+        verify(g_gadget_manager->IsThisAGadgetPath(extension));
+    }
+}
+
+foreach (testname, path) from extension_fail
+{
+    test("IsThisAnExtensionGadgetPath() " testname " should fail")
+        file uni widget path;
+    {
+        verify(!g_gadget_manager->IsThisAnExtensionGadgetPath(widget));
+        verify( g_gadget_manager->IsThisAGadgetPath(widget));
+    }
+}
+
+foreach (testname, path) from extension_reqext_fail
+{
+    test("IsThisAnExtensionGadgetPath() " testname " require extension flag")
+        file uni widget path;
+    {
+        verify(!g_gadget_manager->IsThisAnExtensionGadgetPath(widget, FALSE));
+        verify( g_gadget_manager->IsThisAnExtensionGadgetPath(widget, TRUE));
+        verify( g_gadget_manager->IsThisAGadgetPath(widget));
+    }
+}
+
+foreach (testname, path) from extension_reject
+{
+    test(testname " should be rejected")
+        file uni widget path;
+    {
+        verify(!g_gadget_manager->IsThisAnExtensionGadgetPath(widget));
+#ifdef WEBSERVER_SUPPORT
+        verify(!g_gadget_manager->IsThisAnAlienGadgetPath(widget));
+#endif
+    }
+}
+
+table dummyuiitem(const char *) filelist "testfiles/extensions/uiitem.oex" recursively;
+
+test("Loading uiitem extension calls callbacks")
+	async;
+	file zip_file "testfiles/extensions/uiitem.oex";
+{
+	OP_GADGET_STATUS status = g_utils.LoadGadgetForSelftest(zip_file, URL_EXTENSION_INSTALL_CONTENT, &uiitem_gadget, &selfinstalling_uilistener);
+
+	if (OpStatus::IsError(status))
+		ST_failed("Unable to install test widget, got status: %d", status);
+}
+
+test("uiitem_gadget - URLFilter API disabled")
+	require success "Loading uiitem extension calls callbacks";
+{
+	verify(!uiitem_gadget->HasURLFilterAccess());
+}
+
+test("Close uiitem extension")
+	require success "Loading uiitem extension calls callbacks";
+{
+	g_utils.UnloadGadget();
+	state.GetWindow()->GetWindowCommander()->SetExtensionUIListener(NULL);
+}
+
+table dummyjs(const char *) filelist "testfiles/extensions/simplejs.oex" recursively;
+
+test("Load JS extension")
+	async;
+	file uni zip_file "testfiles/extensions/simplejs.oex";
+{
+	original_js_count = 0;
+	OpGadgetExtensionUserJS *extjs = g_gadget_manager->GetFirstActiveExtensionUserJS();
+	while (extjs)
+	{
+		++ original_js_count;
+		extjs = extjs->Suc();
+	}
+
+	OP_GADGET_STATUS status = g_utils.LoadAndOpenGadget(zip_file, URL_EXTENSION_INSTALL_CONTENT, &js_gadget);
+
+	if (OpStatus::IsError(status))
+		ST_failed("Unable to install test widget, got status: %d", status);
+	else if (status != OpGadgetStatus::OK_SIGNATURE_VERIFICATION_IN_PROGRESS)
+		ST_passed();
+}
+
+test("js_gadget - URLFilter API disabled")
+	require success "Load JS extension";
+{
+	verify(!js_gadget->HasURLFilterAccess());
+}
+
+test("Extension JS: GetClass")
+	require success "Load JS extension";
+{
+	verify(js_gadget->GetClass()->GetClass() == GADGET_CLASS_EXTENSION, "Gadget class");
+}
+
+test("Extension JS is enumerated")
+	require success "Load JS extension";
+{
+	OpString expected_pass_filename;
+	verify_success(js_gadget->GetClass()->GetGadgetIncludesPath(expected_pass_filename));
+	verify_success(expected_pass_filename.Append(UNI_L("/pass.js")));
+
+	bool found_pass_file = false;
+	int new_js_count = 0;
+	OpGadgetExtensionUserJS *extjs = g_gadget_manager->GetFirstActiveExtensionUserJS();
+	while (extjs)
+	{
+		++ new_js_count;
+		
+		if (extjs->userjs_filename.CStr() &&
+		    extjs->owner == js_gadget)
+		{
+			BOOL paths_equal;
+			verify_success(g_op_system_info->PathsEqual(extjs->userjs_filename.CStr(), expected_pass_filename.CStr(), &paths_equal));
+			if (paths_equal)
+				found_pass_file = true;
+		}
+		extjs = extjs->Suc();
+	}
+
+	verify(new_js_count > original_js_count);
+	verify(found_pass_file);
+}
+
+test("Close JS extension")
+	require success "Load JS extension";
+{
+	g_utils.UnloadGadget();
+}
+
+table dummycss(const char *) filelist "testfiles/extensions/simplecss.oex" recursively;
+
+test("Load CSS extension")
+	async;
+	file uni zip_file "testfiles/extensions/simplecss.oex";
+	disabled;
+{
+	original_css_count = 0;
+	CSSManager::ExtensionStylesheet *extcss = g_cssManager->GetExtensionUserCSS();
+	while (extcss)
+	{
+		++ original_css_count;
+		extcss = static_cast<CSSManager::ExtensionStylesheet *>(extcss->Suc());
+	}
+
+	OP_GADGET_STATUS status = g_utils.LoadAndOpenGadget(zip_file, URL_EXTENSION_INSTALL_CONTENT, &css_gadget);
+
+	if (OpStatus::IsError(status))
+		ST_failed("Unable to install test widget, got status: %d", status);
+	else if (status != OpGadgetStatus::OK_SIGNATURE_VERIFICATION_IN_PROGRESS)
+		ST_passed();
+	verify(!css_gadget->HasURLFilterAccess());
+}
+
+test("Extension CSS: GetClass")
+	require success "Load CSS extension";
+{
+	verify(css_gadget->GetClass()->GetClass() == GADGET_CLASS_EXTENSION, "Gadget class");
+}
+
+test("Extension CSS is enumerated")
+	require success "Load CSS extension";
+	disabled;
+{
+	bool found_pass_file = false;
+	int new_css_count = 0;
+	CSSManager::ExtensionStylesheet *extcss = g_cssManager->GetExtensionUserCSS();
+	while (extcss)
+	{
+		++ new_css_count;
+		if (extcss->path.Find("pass.css") != KNotFound &&
+		    extcss->owner == reinterpret_cast<CSSManager::ExtensionStylesheetOwnerID>(css_gadget))
+			found_pass_file = true;
+		extcss = static_cast<CSSManager::ExtensionStylesheet *>(extcss->Suc());
+	}
+
+	verify(new_css_count > original_css_count);
+	verify(found_pass_file);
+}
+
+test("Close CSS extension")
+	require success "Load CSS extension";
+	disabled;
+{
+	g_utils.UnloadGadget();
+}
+
+table dummy_hasoptionpage(const char *) filelist "testfiles/extensions/hasoptionspage.oex" recursively;
+
+test("Load hasoptionspage extension")
+	async;
+	file uni zip_file "testfiles/extensions/hasoptionspage.oex";
+{
+	OP_GADGET_STATUS status = g_utils.LoadAndOpenGadget(zip_file, URL_EXTENSION_INSTALL_CONTENT, &options_gadget);
+
+	if (OpStatus::IsError(status))
+		ST_failed("Unable to install test widget, got status: %d", status);
+	else if (status != OpGadgetStatus::OK_SIGNATURE_VERIFICATION_IN_PROGRESS)
+		ST_passed();
+}
+
+test("Has options page")
+	require success "Load hasoptionspage extension";
+{
+	verify(options_gadget->HasOptionsPage());
+	verify(!options_gadget->HasURLFilterAccess());
+}
+
+test("Close has options page")
+	require success "Load hasoptionspage extension";
+{
+	g_utils.UnloadGadget();
+}
+
+table dummy_hasnooptionpage(const char *) filelist "testfiles/extensions/hasnotoptionspage.oex" recursively;
+
+test("Load hasnooptionspage extension")
+	async;
+	file uni zip_file "testfiles/extensions/hasnotoptionspage.oex";
+{
+	OP_GADGET_STATUS status = g_utils.LoadAndOpenGadget(zip_file, URL_EXTENSION_INSTALL_CONTENT, &no_options_gadget);
+
+	if (OpStatus::IsError(status))
+		ST_failed("Unable to install test widget, got status: %d", status);
+	else if (status != OpGadgetStatus::OK_SIGNATURE_VERIFICATION_IN_PROGRESS)
+		ST_passed();
+}
+
+test("Has no options page")
+	require success "Load hasnooptionspage extension";
+{
+	verify(!no_options_gadget->HasOptionsPage());
+	verify(!no_options_gadget->HasURLFilterAccess());
+}
+
+test("Close has no options page")
+	require success "Load hasnooptionspage extension";
+{
+	g_utils.UnloadGadget();
+}
+
+test("Speed dial extension")
+	file uni zip_file "testfiles/extensions/speeddial.oex";
+{
+	verify(OpStatus::IsSuccess(g_gadget_manager->CreateGadget(&speeddial_gadget, zip_file, URL_EXTENSION_INSTALL_CONTENT)));
+	verify(OpStatus::IsSuccess(g_gadget_manager->OpenGadget(speeddial_gadget)));
+	verify(speeddial_gadget->GetAttribute(WIDGET_EXTENSION_SPEEDDIAL_CAPABLE));
+	verify_string(speeddial_gadget->GetAttribute(WIDGET_EXTENSION_SPEEDDIAL_URL), UNI_L("http://opera.com/"));
+}
+
+test("Close speed dial extension")
+	require success "Speed dial extension";
+{
+	Window *win = speeddial_gadget->GetWindow();
+	OpStatus::Ignore(g_gadget_manager->CloseWindowPlease(win));
+	win->SetType(WIN_TYPE_NORMAL);
+	win->SetGadget(NULL);
+	win->GetWindowCommander()->OpenURL(UNI_L("opera:blank"), FALSE);
+	speeddial_gadget->SetIsClosing(FALSE);
+	speeddial_gadget->SetIsRunning(FALSE);
+	verify(OpStatus::IsSuccess(g_gadget_manager->DestroyGadget(speeddial_gadget)));
+}
+
+test("Load speeddialrelativeurl extension")
+	async;
+	file uni zip_file "testfiles/extensions/speeddialrelativeurl.oex";
+{
+	OP_GADGET_STATUS status = g_utils.LoadAndOpenGadget(zip_file, URL_EXTENSION_INSTALL_CONTENT, &speeddial_gadget);
+
+	if (OpStatus::IsError(status))
+		ST_failed("Unable to install test widget, got status: %d", status);
+	else if (status != OpGadgetStatus::OK_SIGNATURE_VERIFICATION_IN_PROGRESS)
+		ST_passed();
+}
+
+test("Relative speed dial url prepended with http://")
+	require success "Load speeddialrelativeurl extension";
+{
+	const uni_char* fallback_url = speeddial_gadget->GetAttribute(WIDGET_EXTENSION_SPEEDDIAL_FALLBACK_URL);
+	verify(fallback_url != NULL);
+	verify_string(UNI_L("http://www.opera.com"), fallback_url);
+}
+
+test("Close speeddialrelativeurl extension")
+	require success "Load speeddialrelativeurl extension";
+{
+	g_utils.UnloadGadget();
+}

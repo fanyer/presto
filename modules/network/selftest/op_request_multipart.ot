@@ -1,0 +1,223 @@
+/* -*- Mode: c++; tab-width: 4; indent-tabs-mode: t; c-basic-offset: 4 -*-
+**
+** Copyright (C) 2012-2012 Opera Software ASA.  All rights reserved.
+**
+** This file is part of the Opera web browser.  It may not be distributed
+** under any circumstances.
+**
+*/
+
+group "OpRequest.multipart test";
+require init;
+language c++;
+
+include "modules/network/op_url.h";
+include "modules/network/op_request.h";
+include "modules/network/op_response.h";
+include "modules/network/op_resource.h";
+include "modules/network/network.h";
+include "modules/locale/locale-enum.h";
+
+global {
+	OpRequest *singleRequest;
+
+	/* First a request listener that retrieves every part of the multiparts */
+	class RequestListener1 : public OpRequestListener
+	{
+	public:
+		void OnRequestFailed(OpRequest *req, OpResponse *res, Str::LocaleString error)
+		{
+			ST_failed("Request failed");
+		}
+
+		void OnResponseFinished(OpRequest *req, OpResponse *response)
+		{
+			ST_passed();
+		}
+
+		void OnResponseMultipartBodyLoaded(OpRequest *req, OpResponse *res, OpMultipartCallback *callback)
+		{
+			//For multiparts we have to retrieve data in order for the remaining messages to be sent.
+			OpResource *resource = res->GetResource();
+			if (resource)
+			{
+				OpDataDescriptor *desc = NULL;
+				resource->GetDataDescriptor(desc);
+				if (desc)
+				{
+					OpData data;
+					desc->RetrieveData(data);
+				}
+				OP_DELETE(desc);
+			}
+			callback->LoadNextMultipart();
+		}
+	};
+
+	/* Then a request listener that retrieves only one part of the multiparts */
+	class RequestListener2 : public OpRequestListener
+	{
+	public:
+		void OnRequestFailed(OpRequest *req, OpResponse *res, Str::LocaleString error)
+		{
+			ST_failed("Request failed");
+		}
+
+		void OnResponseAvailable(OpRequest *req, OpResponse *response)
+		{
+		}
+
+		void OnResponseFinished(OpRequest *req, OpResponse *response)
+		{
+			ST_passed();
+		}
+
+	};
+
+	/* Then a request listener that accesses the multipart parts by GetMIMEAttachment() */
+	class RequestListener3 : public OpRequestListener
+	{
+	public:
+		const uni_char *expected_content;
+
+		void OnRequestFailed(OpRequest *req, OpResponse *res, Str::LocaleString error)
+		{
+			ST_failed("Request failed");
+		}
+
+		void OnResponseAvailable(OpRequest *req, OpResponse *response)
+		{
+		}
+
+		void OnResponseFinished(OpRequest *req, OpResponse *response)
+		{
+			OpResource *resource = response->GetResource();
+			if (!resource)
+			{
+				ST_failed("Failed to get resource for root part");
+				return;
+			}
+#ifdef _MIME_SUPPORT_
+			if (!resource->IsMHTML())
+			{
+				ST_failed("Expected MHTML resource");
+				return;
+			}
+			OpResponse *root;
+			if (OpStatus::IsError(resource->GetMHTMLRootPart(root)))
+			{
+				ST_failed("Failed to access root part");
+				return;
+			}
+			resource = root->GetResource();
+			if (!resource)
+			{
+				ST_failed("Failed to get resource for root part");
+				return;
+			}
+			OpDataDescriptor *desc = NULL;
+			resource->GetDataDescriptor(desc);
+			if (!desc)
+			{
+				ST_failed("Failed to get data descriptor for root part");
+				return;
+			}
+			UniString content;
+			desc->RetrieveData(content);
+			if (content.FindFirst(expected_content) == OpDataNotFound)
+				ST_failed("Didn't find the expected content in root part");
+			else
+#endif // _MIME_SUPPORT_
+				ST_passed();
+
+#ifdef _MIME_SUPPORT_
+			OP_DELETE(desc);
+#endif // _MIME_SUPPORT_
+		}
+
+	};
+
+	RequestListener1 *requestListener1 = NULL;
+	RequestListener2 *requestListener2 = NULL;
+	RequestListener3 *requestListener3 = NULL;
+}
+
+setup
+{
+	requestListener1 = OP_NEW(RequestListener1, ());
+	requestListener2 = OP_NEW(RequestListener2, ());
+	requestListener3 = OP_NEW(RequestListener3, ());
+	singleRequest = NULL;
+}
+
+exit
+{
+	OP_DELETE(singleRequest);
+	OP_DELETE(requestListener1);
+	OP_DELETE(requestListener2);
+	OP_DELETE(requestListener3);
+}
+
+test("Initialized")
+{
+	verify(requestListener1 != NULL);
+	verify(requestListener2 != NULL);
+	verify(requestListener3 != NULL);
+}
+
+
+test("Retrieve multipart 1 URL")
+	require success "Initialized";
+	async;
+{
+	OpURL test_url = OpURL::Make("http://t/platforms/Mocha/wap/wap/media/multipart/replace.php");
+	OP_STATUS result = OpRequest::Make(singleRequest, requestListener2, test_url, 0);
+
+	if (result != OpStatus::OK)
+	{
+		ST_failed("Failed to create request");
+	}
+	else
+	{
+		singleRequest->SendRequest();
+	}
+}
+
+
+test("Retrieve multipart 2 URL")
+	require success "Retrieve multipart 1 URL";
+	async;
+{
+	OP_DELETE(singleRequest);
+	OpURL test_url = OpURL::Make("http://t/platforms/Mocha/wap/wap/media/multipart/replace.php");
+	OP_STATUS result = OpRequest::Make(singleRequest, requestListener1, test_url, 0);
+
+	if (result != OpStatus::OK)
+	{
+		ST_failed("Failed to create request");
+	}
+	else
+	{
+		singleRequest->SendRequest();
+	}
+}
+
+test("Get root part from MHTML archive")
+	require undefined MHTML_ARCHIVE_REDIRECT_SUPPORT; // This feature will bypass and hide the fact that it is MHTML from the client code
+	require success "Initialized";
+	async;
+{
+	OP_DELETE(singleRequest);
+	OpURL test_url = OpURL::Make("http://t/core/networking/multipart/related/mhtml-1.mht");
+	requestListener3->expected_content = UNI_L("green square"); // Text contained in the main HTML part of the MHTML archive
+	OP_STATUS result = OpRequest::Make(singleRequest, requestListener3, test_url, 0);
+
+	if (result != OpStatus::OK)
+	{
+		ST_failed("Failed to create request");
+	}
+	else
+	{
+		singleRequest->SendRequest();
+	}
+}

@@ -1,0 +1,176 @@
+/* -*- Mode: c++; tab-width: 4; indent-tabs-mode: t; c-basic-offset: 4 -*-
+**
+** Copyright (C) 1995-2010 Opera Software ASA.  All rights reserved.
+**
+** This file is part of the Opera web browser.  It may not be distributed
+** under any circumstances.
+*/
+
+group "device_api.orientation.OrientationManager";
+
+require DAPI_ORIENTATION_MANAGER_SUPPORT;
+
+include "modules/device_api/OrientationManager.h";
+
+global
+{
+	OrientationManager* orientation_manager;
+//	class NullOpSensor : public OpSensor
+//	{
+//	public:
+//		NullOpSensor(OpSensorType type) : m_type(type) {}
+//		OP_STATUS Watch(OpSensorListener* ) { return OpStatus::OK;}
+//		OpSensorType GetType() const { return m_type; }
+//	private:
+//		OpSensorType m_type;
+//	};
+//
+	class NullOrientationListener : public OpOrientationListener
+	{
+	public:
+		NullOrientationListener() {}
+		virtual void OnOrientationChange(const Data& data){}
+		virtual void OnCompassNeedsCalibration(){ OP_ASSERT(!"unexpected"); }
+	};
+
+	class NullMotionListener : public OpMotionListener
+	{
+	public:
+		NullMotionListener() {}
+		virtual void OnAccelerationChange(const Data& data){}
+	};
+
+	class OneShotOrientationListener : public OpOrientationListener, public OpTimerListener
+	{
+	public:
+		OneShotOrientationListener(OrientationManager* manager) : m_manager(manager)
+		{
+			m_timer.SetTimerListener(this);
+		}
+		virtual void OnOrientationChange(const Data& data)
+		{
+			m_manager->DetachOrientationListener(this);
+			m_timer.Stop();
+			ST_passed();
+
+		}
+
+		virtual void OnCompassNeedsCalibration(){ OP_ASSERT(!"unexpected"); }
+
+		virtual void OnTimeOut(OpTimer* timer)
+		{
+			m_manager->DetachOrientationListener(this);
+			ST_failed("Timed out");
+		}
+		OrientationManager* m_manager;
+		OpTimer m_timer;
+	};
+
+}
+setup
+{
+	orientation_manager = NULL;
+}
+
+exit
+{
+	OP_DELETE(orientation_manager);
+}
+
+test("Test construct orientation manager")
+{
+	verify_success(OrientationManager::Make(orientation_manager));
+	verify(orientation_manager);
+	orientation_manager->m_force_use_mock_sensors = TRUE;
+	// verify the initial state of the Orientation manager
+	verify(!orientation_manager->IsOrientationSensorInitialized());
+	verify(!orientation_manager->IsMotionSensorInitialized());
+}
+
+test("Test GetSensorForType")
+	require success "Test construct orientation manager";
+{
+	verify(&orientation_manager->GetSensorForType(SENSOR_TYPE_LINEAR_ACCELERATION) == &orientation_manager->m_acceleration_sensor);
+	verify(&orientation_manager->GetSensorForType(SENSOR_TYPE_ACCELERATION) == &orientation_manager->m_acceleration_with_gravity_sensor);
+	verify(&orientation_manager->GetSensorForType(SENSOR_TYPE_ROTATION_SPEED) == &orientation_manager->m_rotation_speed_sensor);
+	verify(&orientation_manager->GetSensorForType(SENSOR_TYPE_ORIENTATION) == &orientation_manager->m_orientation_sensor);
+}
+
+test("Test GetSensorForType")
+	require success "Test construct orientation manager";
+{
+	verify(&orientation_manager->GetLastSensorDataForType(SENSOR_TYPE_LINEAR_ACCELERATION) == &orientation_manager->m_last_acceleration_data);
+	verify(&orientation_manager->GetLastSensorDataForType(SENSOR_TYPE_ACCELERATION) == &orientation_manager->m_last_acceleration_with_gravity_data);
+	verify(&orientation_manager->GetLastSensorDataForType(SENSOR_TYPE_ROTATION_SPEED) == &orientation_manager->m_last_rotation_speed_data);
+	verify(&orientation_manager->GetLastSensorDataForType(SENSOR_TYPE_ORIENTATION) == &orientation_manager->m_last_orientation_data);
+}
+
+test("Test Attaching/Detaching Orientation listeners")
+	require success "Test construct orientation manager";
+{
+	verify(!orientation_manager->m_orientation_sensor);
+
+	NullOrientationListener listener1, listener2;
+
+	verify_success(orientation_manager->AttachOrientationListener(&listener1));
+	verify(orientation_manager->m_orientation_sensor);
+
+	verify_success(orientation_manager->AttachOrientationListener(&listener2));
+	verify(orientation_manager->m_orientation_sensor);
+
+	verify_success(orientation_manager->DetachOrientationListener(&listener1));
+	orientation_manager->Cleanup();
+	verify(orientation_manager->m_orientation_sensor);
+
+	verify_success(orientation_manager->DetachOrientationListener(&listener2));
+	orientation_manager->Cleanup();
+	verify(!orientation_manager->m_orientation_sensor);
+}
+
+test("Test Attaching/Detaching Motion listeners")
+	require success "Test construct orientation manager";
+{
+	verify(!orientation_manager->m_acceleration_sensor);
+	verify(!orientation_manager->m_acceleration_with_gravity_sensor);
+	verify(!orientation_manager->m_rotation_speed_sensor);
+	NullMotionListener listener1, listener2;
+
+	verify_success(orientation_manager->AttachMotionListener(&listener1));
+	verify(orientation_manager->m_acceleration_sensor);
+	verify(orientation_manager->m_acceleration_with_gravity_sensor);
+	verify(orientation_manager->m_rotation_speed_sensor);
+
+	verify_success(orientation_manager->AttachMotionListener(&listener2));
+	verify(orientation_manager->m_acceleration_sensor);
+	verify(orientation_manager->m_acceleration_with_gravity_sensor);
+	verify(orientation_manager->m_rotation_speed_sensor);
+
+	verify_success(orientation_manager->DetachMotionListener(&listener1));
+	orientation_manager->Cleanup();
+	verify(orientation_manager->m_acceleration_sensor);
+	verify(orientation_manager->m_acceleration_with_gravity_sensor);
+	verify(orientation_manager->m_rotation_speed_sensor);
+
+	verify_success(orientation_manager->DetachMotionListener(&listener2));
+	orientation_manager->Cleanup();
+	verify(!orientation_manager->m_acceleration_sensor);
+	verify(!orientation_manager->m_acceleration_with_gravity_sensor);
+	verify(!orientation_manager->m_rotation_speed_sensor);
+}
+
+test("Test one shot orientation request")
+	require success "Test construct orientation manager";
+	async;
+{
+	OneShotOrientationListener* listener = OP_NEW(OneShotOrientationListener, (orientation_manager));
+	if (!listener)
+		ST_failed_with_status("", OpStatus::ERR_NO_MEMORY, __LINE__);
+
+	ST_delete_after_group(listener);
+	OP_STATUS err = orientation_manager->AttachOrientationListener(listener);
+	if (OpStatus::IsError(err))
+		ST_failed_with_status("", err, __LINE__);
+
+	listener->m_timer.Start(2000);
+}
+

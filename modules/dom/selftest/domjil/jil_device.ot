@@ -1,0 +1,620 @@
+/* o*- Mode: c++; tab-width: 4; indent-tabs-mode: t; c-basic-offset: 4 -*-
+**
+** Copyright 2009-2010 Opera Software ASA.  All rights reserved.
+**
+** This file is part of the Opera web browser.
+** It may not be distributed under any circumstances.
+*/
+
+group "DOM.JIL.Device";
+
+require GADGET_SUPPORT;
+require DOM_JIL_API_SUPPORT;
+include "modules/security_manager/include/security_manager.h";
+include "modules/gadgets/gadget_selftest_utils.h";
+include "modules/dom/selftest/domselftestutils.h";
+include "modules/util/opfile/opfile.h";
+include "modules/util/opstring.h";
+include "modules/dom/src/domobj.h";
+include "modules/device_api/device_api_module.h";
+include "modules/device_api/jil/JILFSMgr.h";
+
+global
+{
+	OpString selftest_mount_point;
+	OpString virt_photos;
+	OpString virt_music;
+	OpAutoVector<OpString> curr_virt_roots;
+
+	OpSecurityManager::PrivilegedBlock disable_security;
+
+	GadgetSelftestUtils g_utils;
+}
+
+exit
+{
+	g_utils.UnloadGadget();
+	g_DAPI_jil_fs_mgr->RemoveMapping(selftest_mount_point, NULL, NULL);
+	for (UINT32 i = 0; i < curr_virt_roots.GetCount(); ++i)
+		g_DAPI_jil_fs_mgr->SetActive(curr_virt_roots.Get(i)->CStr(), TRUE);
+}
+
+table dummy1(const char *) filelist "device_test_wgt" recursively;
+
+test("Load Device test gadget")
+	file zip_file "device_test_wgt/config.xml";
+	async;
+{
+	OP_GADGET_STATUS status = g_utils.LoadGadgetForSelftest(zip_file, URL_GADGET_INSTALL_CONTENT);
+
+	if (OpStatus::IsError(status))
+		ST_failed("Unable to install test widget, status: %d", status);
+	else if (status != OpGadgetStatus::OK_SIGNATURE_VERIFICATION_IN_PROGRESS)
+		ST_passed();
+}
+
+test("Setup mapping configuration")
+	file uni test_mount_point "device_test_wgt";
+{
+	OP_STATUS result = g_DAPI_jil_fs_mgr->GetAvailableVirtualDirs(&curr_virt_roots);
+	verify_success(result);
+	for (UINT32 i = 0; i < curr_virt_roots.GetCount(); ++i)
+	{
+		result = g_DAPI_jil_fs_mgr->SetActive(curr_virt_roots.Get(i)->CStr(), FALSE);
+		verify_success(result);
+	}
+
+	result = selftest_mount_point.Set(test_mount_point);
+	verify_success(result);
+	result = virt_photos.AppendFormat(UNI_L("%cfile_tests%cphotos"), PATHSEPCHAR, PATHSEPCHAR);
+	verify_success(result);
+	result = virt_music.AppendFormat(UNI_L("%cfile_tests%cmusic"), PATHSEPCHAR, PATHSEPCHAR);
+	verify_success(result);
+
+	result = g_DAPI_jil_fs_mgr->AddMapping(test_mount_point, virt_photos.CStr(), UNI_L("/selftest/photos"), TRUE);
+	verify_success(result);
+	result = g_DAPI_jil_fs_mgr->AddMapping(test_mount_point, virt_music.CStr(), UNI_L("/selftest/music"), TRUE);
+	verify_success(result);
+}
+
+test("Test Device existence")
+	language ecmascript;
+	require success "Load Device test gadget";
+{
+	verify(Widget);
+	verify(Widget.Device);
+}
+
+test("Test Device properties")
+	language ecmascript;
+	require success "Test Device existence";
+{
+	var widgetEngineName = Widget.Device.widgetEngineName;
+	var widgetEngineProvider = Widget.Device.widgetEngineProvider;
+	var widgetEngineVersion = Widget.Device.widgetEngineVersion;
+	var clipboardString = Widget.Device.clipboardString;
+	verify(typeof(widgetEngineName) == "string");
+	verify(typeof(widgetEngineProvider) == "string");
+	verify(typeof(widgetEngineVersion) == "string");
+	verify(typeof(clipboardString) == "string");
+}
+
+test("Test Device.getAvailableApplications()")
+	language ecmascript;
+	require success "Test Device existence";
+{
+	var apps = Widget.Device.getAvailableApplications();
+	verify(apps);
+	verify(apps instanceof Array);
+}
+
+test("Test Device.File properties")
+	language ecmascript;
+	require success "Test Device existence";
+{
+	var file = Widget.Device.File;
+	// The values should be null or undefined
+	verify(file.createDate == null);
+	verify(file.fileName == null);
+	verify(file.filePath == null);
+	verify(file.fileSize == null);
+	verify(file.isDirectory == null);
+	verify(file.lastModifyDate == null);
+
+	var now = new Date();
+
+	file.createDate = now;
+	file.fileName = "name";
+	file.filePath = "/virtual/";
+	file.fileSize = 100;
+	file.isDirectory = false;
+	file.lastModifyDate = now;
+
+	verify(typeof file.createDate == "object");
+	verify(file.createDate instanceof Date);
+	verify(file.createDate.getTime() == now.getTime());
+
+	verify(file.fileName === "name");
+	verify(file.filePath === "/virtual/");
+	verify(file.fileSize === 100);
+	verify(file.isDirectory === false);
+
+	verify(typeof file.lastModifyDate == "object");
+	verify(file.lastModifyDate instanceof Date);
+	verify(file.lastModifyDate.getTime() == now.getTime());
+}
+
+test("Test Device.getDirectoryFileNames()")
+	language ecmascript;
+	require success "Test Device existence";
+	require success "Setup mapping configuration";
+{
+	var dirs = Widget.Device.getDirectoryFileNames("/selftest");
+	verify(dirs instanceof Array);
+	var virtual_photos = false;
+	var virtual_music = false;
+
+	for (i in dirs.sort()) // sorting to simplify looking for duplicates
+	{
+		if (dirs[i] == "music")
+			virtual_music = true;
+		if (dirs[i] == "photos")
+			virtual_photos = true;
+		verify (i == 0 || dirs[i] != dirs[i-1]); // duplicate check
+	}
+	verify(virtual_photos);
+	verify(virtual_music);
+
+	try
+	{
+		Widget.Device.getDirectoryFileNames("invalid_param");
+	}
+	catch (e)
+	{
+		verify((e instanceof Widget.Exception) && (e.type == Widget.ExceptionTypes.INVALID_PARAMETER));
+	}
+}
+
+test("Test Device.findFiles with no callback (CORE-32957) - should not crash")
+	language ecmascript;
+	require success "Test Device existence";
+	require success "Setup mapping configuration";
+{
+	Widget.Device.onFilesFound = null;
+	Widget.Device.findFiles(new Widget.Device.File(), 0, 1);
+	Widget.Device.findFiles(new Widget.Device.File(), 2, 1);
+}
+
+
+test("Test Device.findFiles()")
+	language ecmascript;
+	require success "Test Device existence";
+	require success "Setup mapping configuration";
+	async;
+{
+	make_search = function(path, name, size, creationTime, lastModified, isDir, start, end, result_paths, result_names)
+	{
+		if (result_paths.length != result_names.length)
+			throw new Error("expected paths array length != expected names array length");
+
+		var file = new Widget.Device.File;
+		if (!file)
+		{
+			throw new Error("Failed to create File");
+		}
+
+		file.filePath = path;
+		file.fileName = name;
+
+		if (size != null)
+			file.fileSize = size;
+
+		if (creationTime != null)
+			file.createDate = creationTime;
+
+		if (lastModified != null)
+			file.lastModifyDate = lastModified;
+
+		if (isDir != null)
+			file.isDirectory = isDir;
+
+		var object = {patternFile:file, start_idx:start, end_idx:end, expected_paths:result_paths, expected_names:result_names};
+		return object;
+	}
+	var searches = new Array;
+	searches.push(make_search("/selftest/music", "*.m", null, null, null, null, 0, 2, ["/selftest/music/"], ["music_file.m"]));
+	searches.push(make_search("/", "*t*", null, null, null, null, 0, 2, ["/", "/selftest/", "/selftest/photos/"], ["selftest", "photos", "photo_file.p"]));
+	searches.push(make_search("/selftest", "*s*", null, null, null, null, 0, 0, ["/selftest/"], ["music"]));
+	searches.push(make_search("/selftest", "*s*", null, null, null, true, 0, 3, ["/selftest/", "/selftest/"], ["music", "photos"]));
+	var file = Widget.Device.getFile("/selftest/photos/photo_file.p");
+	verify(file != null);
+	searches.push(make_search("/", "*t*", file.fileSize, null, null, null, 0, 2, ["/selftest/photos/"], ["photo_file.p"]));
+	searches.push(make_search("/", "*t*", null, file.createDate, null, false, 0, 2, ["/selftest/photos/"], ["photo_file.p"]));
+	searches.push(make_search("/", "*t*", null, null, file.lastModifyDate, false, 0, 2, ["/selftest/photos/"], ["photo_file.p"]));
+	searches.push(make_search("/", "*t*", file.fileSize, file.createDate, file.lastModifyDate, null, 0, 2, ["/selftest/photos/"], ["photo_file.p"]));
+	searches.push(make_search("/", "*t*", file.fileSize, file.createDate, file.lastModifyDate, false, 0, 2, ["/selftest/photos/"], ["photo_file.p"]));
+	searches.push(make_search("/", "*t*", file.fileSize, file.createDate, file.lastModifyDate, true, 0, 2, [], []));
+	searches.push(make_search("invalid param", "*", null, null, null, null, 0, 2, [], []));
+	searches.push(make_search("/", "*", null, null, null, null, -1, 0, [], []));
+	searches.push(make_search("/", "*", null, null, null, null, 0, -1, [], []));
+	searches.push(make_search("/", "*", null, null, null, null, 5, 3, [], []));
+	searches.push(make_search("/", null, null, null, null, null, 0, Number.POSITIVE_INFINITY, ["/", "/selftest/", "/selftest/", "/selftest/music/", "/selftest/photos/"], ["selftest", "music", "photos", "music_file.m", "photo_file.p"]));
+	test_search = function(searches_array, search_count)
+	{
+		var timeout_id = setTimeout(function()
+									{
+										if (timeout_id)
+										{
+											ST_failed("Request timed out", "", "");
+											clearTimeout(timeout_id);
+										}
+									}, 10000);
+
+		if (searches_array.length == 0)
+		{
+			ST_passed();
+			return;
+		}
+
+		Widget.Device.onFilesFound = function(results)
+		{
+			clearTimeout(timeout_id);
+			if (!results)
+			{
+				ST_failed("Search failed", "", "");
+				return;
+			}
+
+			if (results.length != searches_array[0].expected_paths.length ||
+				results.length != searches_array[0].expected_names.length)
+			{
+				var s = searches_array[0]
+				var result_full_paths = ''
+				for (var i in results)
+					result_full_paths += results[i].filePath + results[i].fileName + "  "
+				var expected_full_paths = ''
+				for (var i in s.expected_paths)
+					expected_full_paths += s.expected_paths[i] + s.expected_names[i] + "  "
+				var pattern = ''
+				for (var i in s.patternFile)
+					pattern += i + ': ' + s.patternFile[i] + '; '
+
+				ST_failed("Wrong number of results: expected " + searches_array[0].expected_paths.length +
+					"; got " + results.length +
+					"\nPattern file:       " + pattern +
+					"\nThe expected paths: " + expected_full_paths +
+					"\nThe actual results: " + result_full_paths, "", "");
+				return;
+			}
+
+			for (i = 0; i < results.length; ++i)
+			{
+				var found = false;
+				var errorMessage = "got unexpected results: " + results[i].filePath + "/" + results[i].fileName;
+				for (j = 0; j < results.length; ++j)
+				{
+					if (!(results[i] instanceof Widget.Device.File))
+					{
+						errorMessage = "result item is not an instance of Widget.Device.File: " + results[i];
+						break;
+					}
+					if (results[i].filePath == searches_array[0].expected_paths[j] &&
+						results[i].fileName == searches_array[0].expected_names[j])
+					{
+						found = true;
+						break;
+					}
+				}
+
+				if (!found)
+				{
+					ST_failed("Wrong results: " + errorMessage, "", "");
+					return;
+				}
+			}
+
+			test_search(searches_array.slice(1), search_count + 1);
+		}
+
+		try
+		{
+			Widget.Device.findFiles(searches_array[0].patternFile, searches_array[0].start_idx, searches_array[0].end_idx);
+		}
+		catch(e)
+		{
+			if ((e instanceof Widget.Exception) && (e.type == Widget.ExceptionTypes.INVALID_PARAMETER) &&
+				(searches_array[0].start_idx < 0 ||
+				searches_array[0].end_idx < 0))
+			{
+				test_search(searches_array.slice(1), search_count + 1);
+			}
+			else
+			{
+				ST_failed("Unexpected exception, got: " + e, "", "");
+				return;
+			}
+		}
+	}
+	test_search(searches, 0);
+}
+
+test("Test Device.getFileSystemRoots()")
+	language ecmascript;
+	require success "Test Device existence";
+	require success "Setup mapping configuration";
+{
+	var roots = Widget.Device.getFileSystemRoots();
+	verify(roots instanceof Array);
+	// Not in the spec, but it is expected that there are no duplicates in roots array
+
+	var virtual_photos = false;
+	var virtual_music = false;
+
+	for (i in roots.sort()) // sorting to simplify looking for duplicates
+	{
+		if (roots[i] == "/selftest/music")
+			virtual_music = true;
+		if (roots[i] == "/selftest/photos")
+			virtual_photos = true;
+		verify (i == 0 || roots[i] != roots[i-1]); // duplicate check
+	}
+	verify(virtual_photos);
+	verify(virtual_music);
+}
+
+test("Test Device.getFile()")
+	language ecmascript;
+	require success "Test Device existence";
+	require success "Setup mapping configuration";
+{
+	//get existing file
+	try
+	{
+		var file = Widget.Device.getFile("/selftest/music/music_file.m");
+		verify(file.fileName == "music_file.m");
+		verify(file.filePath == "/selftest/music/");
+		verify(file.isDirectory == false);
+		verify(file instanceof Widget.Device.File);
+	}
+	catch (e)
+	{
+		verify(false);
+	}
+
+	//get not existing file
+	try
+	{
+		var file = Widget.Device.getFile("/selftest/music/not_exisiting_music_file.m");
+	}
+	catch (e)
+	{
+		verify(e instanceof Widget.Exception);
+		verify(e.type == Widget.ExceptionTypes.INVALID_PARAMETER);
+	}
+
+	//get existing directory
+	try
+	{
+		var file = Widget.Device.getFile("/selftest/photos");
+		verify(file.fileName == "photos");
+		verify(file.filePath == "/selftest/");
+		verify(file.isDirectory == true);
+	}
+	catch (e)
+	{
+		verify(false);
+	}
+
+	//get existing directory
+	try
+	{
+		var file = Widget.Device.getFile("/selftest/");
+		verify(file.fileName == "selftest");
+		verify(file.filePath == "/");
+		verify(file.isDirectory == true);
+	}
+	catch (e)
+	{
+		verify(false);
+	}
+
+	//get existing by default directory
+	try
+	{
+		var file = Widget.Device.getFile("/");
+		verify(file.fileName == "");
+		verify(file.filePath == "/");
+		verify(file.isDirectory == true);
+	}
+	catch (e)
+	{
+		verify(false);
+	}
+
+	//get not exisitng directory
+	try
+	{
+		var file = Widget.Device.getFile("/home");
+	}
+	catch (e)
+	{
+		verify(e instanceof Widget.Exception);
+		verify(e.type == Widget.ExceptionTypes.INVALID_PARAMETER);
+	}
+}
+
+test("Test Device.copyFile() / Test Device.deleteFile()")
+	language ecmascript;
+	require success "Test Device existence";
+	require success "Setup mapping configuration";
+{
+	//copy file
+	try
+	{
+		var result = Widget.Device.copyFile("/selftest/music/music_file.m", "/selftest/photos/copied_file.txt");
+		verify(result);
+		var file = Widget.Device.getFile("/selftest/photos/copied_file.txt");
+		verify(file.fileName == "copied_file.txt");
+		verify(file.filePath == "/selftest/photos/");
+		verify(file.isDirectory == false);
+	}
+	catch (e)
+	{
+		verify(false);
+	}
+
+	//delete copied file
+	try
+	{
+		var result = Widget.Device.deleteFile("/selftest/photos/copied_file.txt");
+		verify(result);
+	}
+	catch (e)
+	{
+		verify(false);
+	}
+
+	//copy to existing file
+	try
+	{
+		var result = Widget.Device.copyFile("/selftest/photos/photo_file.p", "/selftest/music/music_file.m");
+	}
+	catch (e)
+	{
+		verify(e instanceof Widget.Exception);
+		verify(e.type == Widget.ExceptionTypes.INVALID_PARAMETER);
+	}
+
+	//copy to existing directory
+	try
+	{
+		var result = Widget.Device.copyFile("/selftest/photos", "/selftest/music");
+	}
+	catch (e)
+	{
+		verify(e instanceof Widget.Exception);
+		verify(e.type == Widget.ExceptionTypes.INVALID_PARAMETER);
+	}
+
+	//copy not existing file
+	try
+	{
+		var result = Widget.Device.copyFile("/selftest/music/not_existing_file.txt", "/selftest/photos/copied_file.txt");
+	}
+	catch (e)
+	{
+		verify(e instanceof Widget.Exception);
+		verify(e.type == Widget.ExceptionTypes.INVALID_PARAMETER);
+	}
+
+	//copy to not defined root
+	try
+	{
+		var result = Widget.Device.copyFile("/selftest/music", "/selftest/download");
+	}
+	catch (e)
+	{
+		verify(e instanceof Widget.Exception);
+		verify(e.type == Widget.ExceptionTypes.INVALID_PARAMETER);
+	}
+
+	//copy directory
+	try
+	{
+		var result = Widget.Device.copyFile("/selftest/music", "/selftest/photos/download");
+		verify(result);
+		var file = Widget.Device.getFile("/selftest/photos/download");
+		verify(file.fileName == "download");
+		verify(file.filePath == "/selftest/photos/");
+		verify(file.isDirectory == true);
+	}
+	catch (e)
+	{
+		verify(false);
+	}
+
+	//delete directory
+	try
+	{
+		var result = Widget.Device.deleteFile("/selftest/photos/download");
+		verify(result);
+	}
+	catch (e)
+	{
+		verify(false);
+	}
+
+	//delete directory with files
+	try
+	{
+		var result = Widget.Device.deleteFile("/selftest/music");
+	}
+	catch (e)
+	{
+		verify(e instanceof Widget.Exception);
+		verify(e.type == Widget.ExceptionTypes.INVALID_PARAMETER);
+	}
+
+	//delete not existing directory
+	try
+	{
+		var result = Widget.Device.deleteFile("/selftest/download");
+	}
+	catch (e)
+	{
+		verify(e instanceof Widget.Exception);
+		verify(e.type == Widget.ExceptionTypes.INVALID_PARAMETER);
+	}
+}
+
+test("Test Device.clipboardString")
+	language ecmascript;
+	require success "Load Device test gadget";
+{
+	var oldClipboardString = Widget.Device.clipboardString
+	verify(typeof(oldClipboardString) == "string");
+	Widget.Device.clipboardString = "test1";
+	verify(Widget.Device.clipboardString === "test1");
+	Widget.Device.clipboardString = 5;
+	verify(Widget.Device.clipboardString === "5");
+
+	Widget.Device.clipboardString = "test";
+	verify(Widget.Device.clipboardString === "test");
+
+	Widget.Device.clipboardString = ""
+	verify(Widget.Device.clipboardString === "");
+	// restore old clipboard string
+	Widget.Device.clipboardString = oldClipboardString;
+}
+
+test("Test Device.PositionInfo constructor")
+	language ecmascript;
+	require success "Test Device existence";
+{
+	verify(Widget.Device.PositionInfo != null);
+	verify(typeof Widget.Device.PositionInfo == "function");
+}
+
+test("Test object constructed by Device.PositionInfo")
+	language ecmascript;
+	require success "Test Device.PositionInfo constructor";
+{
+	var positionInfo = new Widget.Device.PositionInfo();
+
+	verify(positionInfo != null);
+	verify(positionInfo instanceof Widget.Device.PositionInfo);
+
+	var expectedProperties = [
+		'accuracy',
+		'altitude',
+		'altitudeAccuracy',
+		'cellID',
+		'latitude',
+		'longitude',
+		'timeStamp' ];
+
+	for (var i in expectedProperties)
+	{
+		verify(expectedProperties[i] in positionInfo);
+	}
+}

@@ -1,0 +1,225 @@
+/* -*- Mode: c++; tab-width: 4; indent-tabs-mode: t; c-basic-offset: 4 -*-
+ *
+ * Copyright (C) 1995-2010 Opera Software AS.  All rights reserved.
+ *
+ * This file is part of the Opera web browser.	It may not be distributed
+ * under any circumstances.
+ *
+ * @author Wojciech Dzierzanowski (wdzierzanowski)
+ */
+
+group "windows.registry";
+
+require MSWIN;
+
+include "platforms/windows/windows_ui/Registry.h";
+include "platforms/windows/windows_ui/RegKeyIterator.h";
+
+
+global
+{
+	const uni_char* TEST_KEY_NAME =
+			UNI_L("Software\\Opera Software\\selftest-windows.registry");
+	const uni_char* TEST_SUBKEY_NAMES[] = {
+			UNI_L("test"), UNI_L("me"), UNI_L("tender")};
+
+	BOOL IsKeyOpen(HKEY key_handle)
+	{
+		OpString value;
+		return OpStatus::IsSuccess(
+				OpSafeRegQueryValue(key_handle, UNI_L(""), value, NULL));
+	}
+}
+
+setup
+{
+	size_t i = 0;
+
+	if (RegCreateKeyWithValue(HKEY_CURRENT_USER, TEST_KEY_NAME, UNI_L("")))
+	{
+		for (i = 0; i < ARRAY_SIZE(TEST_SUBKEY_NAMES); ++i)
+		{
+			OpString subkey_full_name;
+			if (OpStatus::IsError(subkey_full_name.SetConcat(
+						TEST_KEY_NAME, UNI_L("\\"), TEST_SUBKEY_NAMES[i]))
+					|| !RegCreateKeyWithValue(
+							HKEY_CURRENT_USER, subkey_full_name, UNI_L("")))
+			{
+				break;
+			}
+		}
+	}
+
+	OP_ASSERT(ARRAY_SIZE(TEST_SUBKEY_NAMES) == i || !"Test set-up failed.");
+}
+
+exit
+{
+	const BOOL ok =
+			ERROR_SUCCESS == RegDeleteKeyNT(HKEY_CURRENT_USER, TEST_KEY_NAME);
+	OP_ASSERT(ok || !"Test tear-down failed.");
+}
+
+
+table StringValues(const uni_char*, const uni_char*)
+{
+	{UNI_L("sname1"),	UNI_L("")},
+	{UNI_L("sname2"),	UNI_L("f")},
+	// Same name, will test overwriting.
+	{UNI_L("sname2"),	UNI_L(" foo ")},
+}
+
+table IntValues(const uni_char*, UINT32)
+{
+	{UNI_L("iname1"),	0},
+	{UNI_L("iname2"),	1},
+	// Same name, will test overwriting.
+	{UNI_L("iname2"),	UINT32_MAX},
+}
+
+
+test("Trying to read non-existent values")
+{
+	uni_char string_result[MAX_PATH];
+	iterate (name, str_value) from StringValues
+	{
+		verify(OpRegReadStrValue(HKEY_CURRENT_USER, TEST_KEY_NAME, name,
+					string_result, (DWORD*)NULL) != ERROR_SUCCESS);
+		verify(OpRegReadStrValue(HKEY_CURRENT_USER, TEST_KEY_NAME, name,
+					string_result, MAX_PATH - 1) != ERROR_SUCCESS);
+	}
+
+	UINT32 int_result;
+	iterate (name, int_value) from IntValues
+	{
+		verify(OpRegReadDWORDValue(HKEY_CURRENT_USER, TEST_KEY_NAME, name,
+					(LPDWORD)&int_result) != ERROR_SUCCESS);
+	}
+}
+
+
+test("Writing values and reading them back")
+{
+	uni_char string_result[MAX_PATH];
+	iterate (name, str_value) from StringValues
+	{
+		verify(OpRegWriteStrValue(
+					HKEY_CURRENT_USER, TEST_KEY_NAME, name, str_value));
+		verify(OpRegReadStrValue(HKEY_CURRENT_USER, TEST_KEY_NAME, name,
+					string_result, MAX_PATH - 1) == ERROR_SUCCESS);
+		verify_string(string_result, str_value);
+	}
+
+	UINT32 int_result;
+	iterate (name, int_value) from IntValues
+	{
+		verify(OpRegWriteDWORDValue(
+					HKEY_CURRENT_USER, TEST_KEY_NAME, name, int_value));
+		verify(OpRegReadDWORDValue(HKEY_CURRENT_USER, TEST_KEY_NAME, name,
+					(LPDWORD)&int_result) == ERROR_SUCCESS);
+		verify(int_result == int_value);
+	}
+}
+
+
+test("RegKeyIterator: create / destroy")
+{
+	HKEY key_handle = HKEY(-1);
+
+	{
+		OpString subkey_name;
+		RegKeyIterator it;
+
+		// Should be unsuable before Init().
+
+		verify_status(it.GetCurrent(subkey_name), OpStatus::ERR);
+		it.Next();
+		verify_status(it.GetCurrent(subkey_name), OpStatus::ERR);
+
+		// Should be unsuable after a failed Init().
+
+		verify_status(it.Init(
+					HKEY_CURRENT_USER,
+					UNI_L("NooneWouldEverNameAKeyLikeThat")), OpStatus::ERR);
+		verify_status(it.GetCurrent(subkey_name), OpStatus::ERR);
+		it.Next();
+		verify_status(it.GetCurrent(subkey_name), OpStatus::ERR);
+
+		// And now a typical (successful) Init().
+
+		verify_success(it.Init(
+				HKEY_CURRENT_USER, TEST_KEY_NAME, &key_handle));
+		verify(IsKeyOpen(key_handle));
+	}
+
+	// Key is closed when iterator goes out of scope.
+	verify(!IsKeyOpen(key_handle));
+}
+finally
+{
+	if (IsKeyOpen(key_handle))
+	{
+		(void) RegCloseKey(key_handle);
+	}
+}
+
+
+test("RegKeyIterator: iterate")
+		require success "RegKeyIterator: create / destroy";
+{
+	OpString key_name;
+
+	RegKeyIterator it;
+	verify_success(it.Init(HKEY_CURRENT_USER, TEST_KEY_NAME));
+
+	// A key with subkeys.  Verify we iterate over all expected keys, but accept
+	// any iteration order.
+
+	OpAutoVector<OpString> unmatched_keys;
+	for (size_t i = 0; i < ARRAY_SIZE(TEST_SUBKEY_NAMES); ++i)
+	{
+		OpString* exp_key_name = OP_NEW(OpString, ());
+		OP_ASSERT(NULL != exp_key_name);
+		OP_STATUS status = exp_key_name->SetConcat(
+				TEST_KEY_NAME, UNI_L("\\"), TEST_SUBKEY_NAMES[i]);
+		OP_ASSERT(OpStatus::IsSuccess(status));
+		status = unmatched_keys.Add(exp_key_name);
+		OP_ASSERT(OpStatus::IsSuccess(status));
+	}
+
+	for ( ; !it.AtEnd(); it.Next())
+	{
+		verify_success(it.GetCurrent(key_name));
+
+		for (size_t i = 0; i < unmatched_keys.GetCount(); ++i)
+		{
+			if (*unmatched_keys.Get(i) == key_name)
+			{
+				unmatched_keys.Delete(i);
+				break;
+			}
+		}
+	}
+
+	verify(unmatched_keys.GetCount() == 0);
+
+	// Make sure the iterator really stops iterating now.
+
+	verify_status(it.GetCurrent(key_name), OpStatus::ERR);
+	it.Next();
+	verify_status(it.GetCurrent(key_name), OpStatus::ERR);
+
+	// Just to see if it can be reinitialized...
+
+	verify_success(it.Init(HKEY_CURRENT_USER, TEST_KEY_NAME));
+	verify(!it.AtEnd());
+
+	// A key with no subkeys.
+	
+	const OP_STATUS status = key_name.SetConcat(
+			TEST_KEY_NAME, UNI_L("\\"), TEST_SUBKEY_NAMES[0]);
+	OP_ASSERT(OpStatus::IsSuccess(status));
+	verify_success(it.Init(HKEY_CURRENT_USER, key_name));
+	verify(it.AtEnd());
+	verify_status(it.GetCurrent(key_name), OpStatus::ERR);
+}

@@ -1,0 +1,1818 @@
+group "Gif"; // -*- Mode: c++; tab-width: 4; c-basic-offset: 4 -*-
+
+include "modules/img/src/imagedecodergif.h";
+include "modules/img/src/ogifenc.h";
+include "modules/img/src/imagedecoderbmp.h";
+include "modules/util/opfile/opfile.h";
+
+global
+{
+	const char nosize_image[] = "GIF89a\0\0\0\0\0\0\0\x3b";
+	int nosize_image_len = 14;
+	const char nowidth_image[] = "GIF89a\0\0\x10\0\0\0\0\x3b";
+	int nowidth_image_len = 14;
+	const char noheight_image[] = "GIF89a\x10\0\0\0\0\0\0\x3b";
+	int noheight_image_len = 14;
+
+	int GetReferenceCodeSize(int table_size)
+	{
+		if (table_size < 2) return 1;
+		if (table_size < 4) return 2;
+		if (table_size < 8) return 3;
+		if (table_size < 16) return 4;
+		if (table_size < 32) return 5;
+		if (table_size < 64) return 6;
+		if (table_size < 128) return 7;
+		if (table_size < 256) return 8;
+		if (table_size < 512) return 9;
+		if (table_size < 1024) return 10;
+		if (table_size < 2048) return 11;
+		return 12;
+	}
+
+	class TestLzwListener : public LzwListener
+	{
+	public:
+		TestLzwListener() { fill = FALSE; char_buf_len = 0; }
+		void SetFillable() { fill = TRUE; char_buf_len = 0; }
+		void OnCodesDecoded(const UINT8* codes, int nr_of_codes);
+
+		unsigned char char_buf[4096];
+		int char_buf_len;
+		BOOL fill;
+	};
+
+	void TestLzwListener::OnCodesDecoded(const UINT8* codes, int nr_of_codes)
+	{
+		if (fill == 1)
+		{
+			op_memcpy(&char_buf[char_buf_len], codes, nr_of_codes);
+			char_buf_len += nr_of_codes;
+		}
+		else
+		{
+			op_memcpy(char_buf, codes, nr_of_codes);
+			char_buf_len = nr_of_codes;
+		}
+	}
+
+	class TestGifListener : public ImageDecoderListener
+	{
+	public:
+		void OnLineDecoded(void* data, INT32 line, INT32 lineHeight);
+		BOOL OnInitMainFrame(INT32 width, INT32 height);
+		void OnNewFrame(const ImageFrameData& image_frame_data);
+		void OnAnimationInfo(INT32 nrOfRepeats);
+		void OnDecodingFinished();
+#ifdef IMAGE_METADATA_SUPPORT
+		void OnMetaData(ImageMetaData id, const char* data){}
+#endif // IMAGE_METADATA_SUPPORT
+#ifdef EMBEDDED_ICC_SUPPORT
+		void OnICCProfileData(const UINT8* data, unsigned datalen){}
+#endif // EMBEDDED_ICC_SUPPORT
+
+		void Init();
+
+		int animation_data;
+		BOOL finished;
+		BOOL got_first_frame;
+		int num_cols;
+		UINT8 pal[768];
+		DisposalMethod disposal_method;
+		int duration;
+		int width;
+		int height;
+		int x;
+		int y;
+		BOOL transparent;
+		int transparent_color;
+	};
+
+	void TestGifListener::OnLineDecoded(void* data, INT32 line, INT32 lineHeight)
+	{
+	}
+
+	BOOL TestGifListener::OnInitMainFrame(INT32 width, INT32 height)
+	{
+		this->width = width;
+		this->height = height;
+		return TRUE;
+	}
+
+	void TestGifListener::OnNewFrame(const ImageFrameData& image_frame_data)
+	{
+		//OP_ASSERT((image_frame_data.pal != NULL && image_frame_data.num_colors > 0) ||
+		//		  (image_frame_data.pal == NULL && image_frame_data.num_colors == 0));
+		num_cols = image_frame_data.num_colors;
+		if (image_frame_data.pal)
+			op_memcpy(pal, image_frame_data.pal, num_cols * 3);
+		disposal_method = image_frame_data.disposal_method;
+		duration = image_frame_data.duration;
+		transparent = image_frame_data.transparent;
+		transparent_color = image_frame_data.transparent_index;
+		if (!got_first_frame)
+		{
+			x = image_frame_data.rect.x;
+			y = image_frame_data.rect.y;
+			got_first_frame = TRUE;
+		}
+	}
+
+	void TestGifListener::OnAnimationInfo(INT32 nrOfRepeats)
+	{
+		animation_data = nrOfRepeats;
+	}
+
+	void TestGifListener::OnDecodingFinished()
+	{
+		finished = TRUE;
+	}
+
+	void TestGifListener::Init()
+	{
+		animation_data = -1;
+		finished = FALSE;
+		got_first_frame = FALSE;
+		num_cols = 0;
+		disposal_method = DISPOSAL_METHOD_DO_NOT_DISPOSE;
+		duration = 0;
+		width = 0;
+		height = 0;
+		x = 0;
+		y = 0;
+		transparent = FALSE;
+		transparent_color = 0;
+	}
+
+	class RealDecoderListener : public ImageDecoderListener
+	{
+	public:
+		RealDecoderListener(BOOL indexed_bitmap);
+		~RealDecoderListener();
+
+		void OnLineDecoded(void* data, INT32 line, INT32 lineHeight);
+		BOOL OnInitMainFrame(INT32 width, INT32 height);
+		void OnNewFrame(const ImageFrameData& image_frame_data);
+		void OnAnimationInfo(INT32 nrOfRepeats);
+		void OnDecodingFinished();
+#ifdef IMAGE_METADATA_SUPPORT
+		void OnMetaData(ImageMetaData id, const char* data){}
+#endif // IMAGE_METADATA_SUPPORT
+#ifdef EMBEDDED_ICC_SUPPORT
+		void OnICCProfileData(const UINT8* data, unsigned datalen){}
+#endif // EMBEDDED_ICC_SUPPORT
+
+		BOOL Compare(RealDecoderListener* listener);
+
+		BOOL use_indexed_bitmap;
+		int frame_nr;
+		int width;
+		int height;
+		BOOL finished;
+		BOOL transparent;
+		int transparent_index;
+		UINT32* image_data;
+		UINT8* palette;
+		INT32 num_colors;
+		BOOL outside_index_error;
+	};
+
+	RealDecoderListener::RealDecoderListener(BOOL indexed_bitmap)
+	{
+		use_indexed_bitmap = indexed_bitmap;
+		frame_nr = 0;
+		width = 0;
+		height = 0;
+		finished = FALSE;
+		transparent = FALSE;
+		transparent_index = 0;
+		image_data = NULL;
+		palette = NULL;
+		num_colors = 0;
+		outside_index_error = FALSE;
+	}
+
+	RealDecoderListener::~RealDecoderListener()
+	{
+		OP_DELETEA(image_data);
+		OP_DELETEA(palette);
+	}
+
+	BOOL RealDecoderListener::Compare(RealDecoderListener* listener)
+	{
+		if (width == listener->width && height == listener->height && image_data != NULL && listener->image_data != NULL)
+		{
+			return (op_memcmp(image_data, listener->image_data, 4 * width * height) == 0);
+		}
+		return FALSE;
+	}
+
+	void RealDecoderListener::OnLineDecoded(void* data, INT32 line, INT32 lineHeight)
+	{
+		// Only decode the first frame
+		if (frame_nr != 1)
+			return;
+		if (use_indexed_bitmap && image_data && palette)
+		{
+			// Copy each pixel from the palette.
+			for (int i = 0; i < lineHeight; i++)
+			{
+				if (line + i < height)
+				{
+					for (int j = 0; j < width; j ++)
+					{
+						const UINT8* char_data = (const UINT8*)data;
+						int index = char_data[j];
+						if (transparent && index == transparent_index)
+						{
+							image_data[((line + i) * width) + j] = 0x00;
+						}
+						else
+						{
+							if (index < 0 || index >= num_colors)
+							{
+								outside_index_error = TRUE;
+							}
+							UINT8* col = &palette[index * 3];
+							image_data[((line + i) * width) + j] = 0xff000000 | (col[0] << 16) | (col[1] << 8) | col[2];
+						}
+					}
+				}
+			}
+		}
+		else if (!use_indexed_bitmap && image_data)
+		{
+			// Just copy the line.
+			for (int i = 0; i < lineHeight; i++)
+			{
+				if (line + i < height)
+				{
+					op_memcpy(image_data + ((line + i) * width), data, width * 4);
+				}
+			}
+		}
+	}
+
+	BOOL RealDecoderListener::OnInitMainFrame(INT32 width, INT32 height)
+	{
+		return TRUE;
+	}
+
+	void RealDecoderListener::OnNewFrame(const ImageFrameData& image_frame_data)
+	{
+		frame_nr++;
+		if (frame_nr == 1)
+		{
+			width = image_frame_data.rect.width;
+			height = image_frame_data.rect.height;
+			OP_ASSERT(width > 0 && height > 0);
+			image_data = OP_NEWA(UINT32, width * height);
+			if (use_indexed_bitmap)
+			{
+				OP_ASSERT(image_frame_data.num_colors > 0);
+				palette = OP_NEWA(UINT8, 3 * image_frame_data.num_colors);
+				if (palette)
+					op_memcpy(palette, image_frame_data.pal, 3 * image_frame_data.num_colors);
+			}
+			transparent = image_frame_data.transparent;
+			transparent_index = image_frame_data.transparent_index;
+			num_colors = image_frame_data.num_colors;
+		}
+	}
+
+	void RealDecoderListener::OnAnimationInfo(INT32 nrOfRepeats)
+	{
+	}
+
+	void RealDecoderListener::OnDecodingFinished()
+	{
+		OP_ASSERT(!finished);
+		finished = TRUE;
+	}
+
+
+	class CodesDecodedListener : public ImageDecoderListener
+	{
+	public:
+		CodesDecodedListener();
+
+		void OnLineDecoded(void* data, INT32 line, INT32 lineHeight);
+		BOOL OnInitMainFrame(INT32 width, INT32 height);
+		void OnNewFrame(const ImageFrameData& image_frame_data);
+		void OnAnimationInfo(INT32 nrOfRepeats);
+		void OnDecodingFinished();
+#ifdef IMAGE_METADATA_SUPPORT
+		void OnMetaData(ImageMetaData id, const char* data){}
+#endif // IMAGE_METADATA_SUPPORT
+#ifdef EMBEDDED_ICC_SUPPORT
+		void OnICCProfileData(const UINT8* data, unsigned datalen){}
+#endif // EMBEDDED_ICC_SUPPORT
+
+		BOOL CheckData();
+
+	private:
+		int width;
+		int height;
+		BOOL interlaced;
+		UINT32 values[16];
+	};
+
+	CodesDecodedListener::CodesDecodedListener()
+	{
+		width = 0;
+		height = 0;
+		interlaced = FALSE;
+		for (int i = 0; i < 16; i++)
+		{
+			values[i] = 0xdeadbeef;
+		}
+	}
+
+	void CodesDecodedListener::OnLineDecoded(void* data, INT32 line, INT32 lineHeight)
+	{
+		if (!interlaced)
+		{
+			OP_ASSERT(lineHeight == 1);
+		}
+		OP_ASSERT(line < height);
+		int last_line = MIN(line + lineHeight, height);
+		for (int i = line; i < last_line; i++)
+		{
+#ifdef SUPPORT_INDEXED_OPBITMAP
+			const UINT8* char_data = (const UINT8*)data;
+			values[i] = char_data[0];
+#else
+			UINT32* int_data = (UINT32*)data;
+			values[i] = int_data[0];
+#endif // SUPPORT_INDEXED
+		}
+	}
+
+	BOOL CodesDecodedListener::OnInitMainFrame(INT32 width, INT32 height)
+	{
+		return TRUE;
+	}
+
+	void CodesDecodedListener::OnNewFrame(const ImageFrameData& image_frame_data)
+	{
+		width = image_frame_data.rect.width;
+		height = image_frame_data.rect.height;
+		interlaced = image_frame_data.interlaced;
+	}
+
+	void CodesDecodedListener::OnAnimationInfo(INT32 nrOfRepeats)
+	{
+	}
+
+	void CodesDecodedListener::OnDecodingFinished()
+	{
+	}
+
+	BOOL CodesDecodedListener::CheckData()
+	{
+		for (UINT i = 0; i < (UINT)height; i++)
+		{
+#ifdef SUPPORT_INDEXED_OPBITMAP
+			if (values[i] != i)
+			{
+				return FALSE;
+			}
+#else
+			if (values[i] == 0xdeadbeef)
+			{
+				return FALSE;
+			}
+#endif // SUPPORT_INDEXED_OPBITMAP
+		}
+		return TRUE;
+	}
+
+    OP_STATUS DecodeImage(ImageDecoder* decoder, const char* filename, BOOL will_fail)
+    {
+        OpFile f;
+        uni_char* uni_filename = uni_up_strdup(filename);
+        RETURN_IF_ERROR(f.Construct(uni_filename, OPFILE_ABSOLUTE_FOLDER));
+        op_free(uni_filename);
+        RETURN_IF_ERROR(f.Open(OPFILE_READ));
+        UINT8 buf[40960];
+        int buf_len = 0;
+        BOOL more_data = TRUE;
+        int bytes_read = 0;
+        BOOL has_failed = FALSE;
+        while (more_data)
+        {
+            OpFileLength read_from_file;
+            OP_STATUS ret_val = f.Read(&buf[buf_len], 1, &read_from_file);
+            if (read_from_file >= 1 && OpStatus::IsSuccess(ret_val))
+            {
+                buf_len += (int)read_from_file;
+                bytes_read += (int)read_from_file;
+            }
+            more_data = !f.Eof();
+            int bytes_left;
+            if (OpStatus::IsError(decoder->DecodeData(buf, buf_len, more_data, bytes_left)))
+            {
+                has_failed = TRUE;
+                break;
+            }
+            int move_step = buf_len - bytes_left;
+            if (move_step < 0)
+            {
+                has_failed = TRUE;
+                break;
+            }
+            op_memmove(buf, buf + move_step, buf_len - move_step);
+            buf_len -= move_step;
+        }
+        f.Close();
+        return (will_fail == has_failed) ? OpStatus::OK : OpStatus::ERR;
+    }
+}
+
+table ResetTable(int, int, int, int)
+{
+	{ 0, 2, 6, 3 } // 2 color
+	{ 1, 2, 6, 3 } // 4 color
+	{ 2, 3, 10, 4 } // 8 color
+	{ 3, 4, 18, 5 } // 16 color
+	{ 4, 5, 34, 6 } // 32 color
+	{ 5, 6, 66, 7 } // 64 color
+	{ 6, 7, 130, 8 } // 128 color
+	{ 7, 8, 258, 9 } // 256 color
+}
+
+
+table OutputStringTable(int, int, const char*, int)
+{
+	{ 0, 0, "\0\0", 2 } // 1000 is base for created codes (will be translated during testing to the correct value).
+	{ 1, 1, "\1\1", 2 } // 1001
+	{ 1000, 1, "\0\0\1", 3 } // 1002
+	{ 1002, 0, "\0\0\1\0", 4 } // 1003
+	{ 1001, 0, "\1\1\0", 3 } // 1004
+	{ 1, 0, "\1\0", 2 } // 1005
+	{ 1005, 0, "\1\0\0", 3 } // 1006
+	{ 1006, 1, "\1\0\0\1", 4 } // 1007
+	{ 1003, 1, "\0\0\1\0\1", 5 } // 1008
+	{ 1008, 0, "\0\0\1\0\1\0", 6 } // 1009
+}
+
+test("LzwStringTable reset")
+{
+	TestLzwListener listener;
+	LzwStringTable tbl(&listener);
+
+	iterate (a, b, c, d) from ResetTable
+	{
+		tbl.Reset(a, b, 0);
+		verify(tbl.GetNrOfCodes() == c);
+		verify(tbl.GetCodeSize() == d);
+	}
+}
+
+test("LzwStringTable clear")
+{
+	TestLzwListener listener;
+	LzwStringTable tbl(&listener);
+
+	iterate (a, b, c, d) from ResetTable
+	{
+		tbl.Reset(a, b, 0);
+		verify_success(tbl.AddString(0, 0));
+		verify_success(tbl.AddString(1, 1));
+		verify_success(tbl.AddString(c, 1));
+		verify_success(tbl.AddString(c + 1, 0));
+		tbl.Clear();
+		verify(tbl.GetNrOfCodes() == c);
+		verify(tbl.GetCodeSize() == d);
+	}
+}
+
+test("LzwStringTable CodeType")
+{
+	TestLzwListener listener;
+	LzwStringTable tbl(&listener);
+
+	iterate (a, b, c, d) from ResetTable
+	{
+		tbl.Reset(a, b, 0);
+		int start_code = 1 << b;
+		for (int i = 0; i < start_code; i++)
+		{
+			verify(tbl.CodeType(i) == LZW_CODE);
+		}
+		verify(tbl.CodeType(start_code) == LZW_CLEAR_CODE);
+		verify(tbl.CodeType(start_code + 1) == LZW_END_CODE);
+		for (int j = start_code + 2; j < 4096; j++)
+		{
+			verify(tbl.CodeType(j) == LZW_CODE);
+		}
+	}
+}
+
+test("LzwStringTable GetFirstCharacter")
+{
+	TestLzwListener listener;
+	LzwStringTable tbl(&listener);
+
+	iterate (a, b, c, d) from ResetTable
+	{
+		UINT8 ch;
+		tbl.Reset(a, b, 0);
+		int num_cols = 1 << (a + 1);
+		for (int i = 0; i < num_cols; i++)
+		{
+			verify_success(tbl.GetFirstCharacter(i, ch));
+			verify(ch == i);
+		}
+		verify_success(tbl.AddString(0, 0));
+		verify_success(tbl.AddString(1, 1));
+		verify_success(tbl.AddString(c, 1));
+		verify_success(tbl.AddString(c + 1, 0));
+		verify_success(tbl.GetFirstCharacter(c + 0, ch));
+		verify(ch == 0);
+		verify_success(tbl.GetFirstCharacter(c + 1, ch));
+		verify(ch == 1);
+		verify_success(tbl.GetFirstCharacter(c + 2, ch));
+		verify(ch == 0);
+		verify_success(tbl.GetFirstCharacter(c + 3, ch));
+		verify(ch == 1);
+	}
+}
+
+test("LzwStringTable GetNumberOfCodes")
+{
+	TestLzwListener listener;
+	LzwStringTable tbl(&listener);
+
+	iterate (a, b, c, d) from ResetTable
+	{
+		tbl.Reset(a, b, 0);
+		verify(tbl.GetNrOfCodes() == c);
+		for (int i = 0; i < 3800; i++)
+		{
+			verify_success(tbl.AddString(0, 0));
+			verify(tbl.GetNrOfCodes() == c + 1 + i);
+		}
+	}
+}
+
+test("LzwStringTable GetCodeSize")
+{
+	TestLzwListener listener;
+	LzwStringTable tbl(&listener);
+
+	iterate (a, b, c, d) from ResetTable
+	{
+		tbl.Reset(a, b, 0);
+		verify(tbl.GetNrOfCodes() == c);
+		for (int i = 0; i < 3800; i++)
+		{
+			verify_success(tbl.AddString(0, 0));
+			verify(tbl.GetCodeSize() == GetReferenceCodeSize(c + 1 + i));
+		}
+	}
+}
+
+test("LzwStringTable OutputString")
+{
+	TestLzwListener listener;
+	LzwStringTable tbl(&listener);
+
+	int a = 1;
+	int b = 2;
+
+	tbl.Reset(a, b, 0);
+	int num_codes = tbl.GetNrOfCodes();
+	int i = 0;
+	iterate (e, f, g, h) from OutputStringTable
+	{
+		int code = e;
+		if (code >= 1000)
+		{
+			code -= 1000;
+			code += num_codes;
+		}
+		verify_success(tbl.AddString(code, f));
+		tbl.OutputString(num_codes + i);
+		verify(h == listener.char_buf_len);
+		verify(op_memcmp(listener.char_buf, g, h) == 0);
+		i++;
+	}
+}
+
+test("LzwStringTable circular reference")
+{
+	TestLzwListener listener;
+	LzwStringTable tbl(&listener);
+	tbl.Reset(7, 8, 0);
+	// would create circular reference
+	const OP_STATUS add = tbl.AddString(258, 0);
+	verify(OpStatus::IsError(add));
+}
+
+//////////////////////////////////////////////////////////
+// LzwCodeDecoder                                       //
+//////////////////////////////////////////////////////////
+
+test("LzwCodeDecoder Reset")
+{
+	TestLzwListener listener;
+	LzwCodeDecoder* decoder = LzwCodeDecoder::Create(&listener);
+	verify(decoder != NULL);
+	iterate (a, b, c, d) from ResetTable
+	{
+		decoder->Reset(a, b, 0);
+		verify(decoder->GetCodeSize() == d);
+	}
+	OP_DELETE(decoder);
+}
+
+table DecodeDataTable(int, int, const char*, int)
+{
+	{ 0, 2, "\0\0\0\1\1\0\0\0\0\1\0", 11 }
+	{ 0, 2, "\0\0\0\0\0\0\0\0", 8 }
+	{ 1, 2, "\0\3\0\2\0\0\3\0\3\3", 10 }
+	{ 1, 2, "\3\3\3\3\3\3\3\3\3\3", 10 }
+	{ 2, 3, "\3\1\7\7\7\6\4\2\0\0\3\1\7\7\7\6\4\2\0\0", 20 }
+	{ 3, 4, "\3\1\7\7\7\6\4\2\0\0\3\1\7\7\7\6\4\2\0\0\3\1\7\7\7\6\4\2\0\10\3\11\7\7\7\6\14\12\10\0", 40 }
+}
+
+test("LzwCodeDecoder DecodeCode")
+{
+	TestLzwListener listener;
+	LzwCodeDecoder* decoder = LzwCodeDecoder::Create(&listener);
+	verify(decoder != NULL);
+	LzwEncoder encoder;
+	iterate (a, b, c, d) from DecodeDataTable
+	{
+		listener.SetFillable();
+		encoder.Reset(a, b);
+		decoder->Reset(a, b, 0);
+		for (int i = 0; i < d; i++)
+		{
+			verify_success(encoder.AddCode(c[i]));
+		}
+		encoder.Finish();
+		int packed_len = encoder.GetPackedLen();
+		UINT8* packed_string = encoder.GetPackedString();
+		for (int j = 0; j < packed_len; j++)
+		{
+			decoder->DecodeCode(packed_string[j]);
+		}
+		verify(listener.char_buf_len == d);
+		verify(op_memcmp(listener.char_buf, c, d) == 0);
+	}
+}
+finally
+{
+    OP_DELETE(decoder);
+}
+
+//////////////////////////////////////////////////////////
+// LzwDecoder                                           //
+//////////////////////////////////////////////////////////
+
+test("LzwDecoder DecodeData")
+{
+	TestLzwListener listener;
+	LzwDecoder* decoder = LzwDecoder::Create(&listener);
+	verify(decoder != NULL);
+	LzwEncoder encoder;
+	iterate (a, b, c, d) from DecodeDataTable
+	{
+		listener.SetFillable();
+		encoder.Reset(a, b);
+		decoder->Reset(a, b);
+		for (int i = 0; i < d; i++)
+		{
+			verify_success(encoder.AddCode(c[i]));
+		}
+		encoder.Finish();
+		verify_success(decoder->DecodeData(encoder.GetBitEncodedString(), encoder.GetBitEncodedLen(), FALSE));
+		verify(listener.char_buf_len == d);
+		verify(op_memcmp(listener.char_buf, c, d) == 0);
+	}
+}
+finally
+{
+    OP_DELETE(decoder);
+}
+
+//////////////////////////////////////////////////////////
+// ImageDecoderGif                                      //
+//////////////////////////////////////////////////////////
+
+subtest DecodeData(const char* data, int len)
+{
+	TestGifListener gif_listener;
+	gif_listener.Init();
+	ImageDecoderGif* decoder = ImageDecoderGif::Create(&gif_listener, FALSE);
+	verify(decoder != NULL);
+	int resendBytes;
+	verify_success(decoder->DecodeData((const UINT8*)data, len, FALSE, resendBytes));
+	verify(gif_listener.finished);
+	OP_DELETE(decoder);
+	gif_listener.Init();
+	decoder = ImageDecoderGif::Create(&gif_listener, FALSE);
+	verify(decoder != NULL);
+	UINT8 buf[4096];
+	int buf_len = len;
+	int send_in_len = 1;
+	op_memcpy(buf, data, len);
+	for (int i = 0; i < len; i++)
+	{
+		int bytes_left;
+		verify_success(decoder->DecodeData(buf, send_in_len, send_in_len != buf_len, bytes_left));
+		int move_step = send_in_len - bytes_left;
+		op_memmove(buf, buf + move_step, buf_len - move_step);
+		buf_len -= move_step;
+		send_in_len = bytes_left + 1;
+	}
+	verify(gif_listener.finished);
+	OP_DELETE(decoder);
+}
+
+subtest DecodeDataCheckAnimation(const char* data, int len, int given_anim_value)
+{
+	TestGifListener gif_listener;
+	gif_listener.Init();
+	ImageDecoderGif* decoder = ImageDecoderGif::Create(&gif_listener, FALSE);
+	verify(decoder != NULL);
+	int resendBytes;
+	verify_success(decoder->DecodeData((const UINT8 *)data, len, FALSE, resendBytes));
+	verify(gif_listener.animation_data == given_anim_value);
+	verify(gif_listener.finished);
+	OP_DELETE(decoder);
+	gif_listener.Init();
+	decoder = ImageDecoderGif::Create(&gif_listener, FALSE);
+	verify(decoder != NULL);
+	UINT8 buf[4096];
+	int buf_len = len;
+	int send_in_len = 1;
+	op_memcpy(buf, data, len);
+	for (int i = 0; i < len; i++)
+	{
+		int bytes_left;
+		verify_success(decoder->DecodeData(buf, send_in_len, send_in_len != buf_len, bytes_left));
+		int move_step = send_in_len - bytes_left;
+		op_memmove(buf, buf + move_step, buf_len - move_step);
+		buf_len -= move_step;
+		send_in_len = bytes_left + 1;
+	}
+	verify(gif_listener.animation_data == given_anim_value);
+	verify(gif_listener.finished);
+}
+finally
+{
+	OP_DELETE(decoder);
+}
+
+subtest DecodeDataCheckDuration(const char* data, int len, DisposalMethod disposal_method, int duration)
+{
+	TestGifListener gif_listener;
+	gif_listener.Init();
+	ImageDecoderGif* decoder = ImageDecoderGif::Create(&gif_listener, FALSE);
+	verify(decoder != NULL);
+	int resendBytes;
+	verify_success(decoder->DecodeData((const UINT8 *)data, len, FALSE, resendBytes));
+	verify(gif_listener.disposal_method == disposal_method);
+	verify(gif_listener.duration == duration);
+	verify(gif_listener.finished);
+	OP_DELETE(decoder);
+	gif_listener.Init();
+	decoder = ImageDecoderGif::Create(&gif_listener, FALSE);
+	verify(decoder != NULL);
+	UINT8 buf[4096];
+	int buf_len = len;
+	int send_in_len = 1;
+	op_memcpy(buf, data, len);
+	for (int i = 0; i < len; i++)
+	{
+		int bytes_left;
+		verify_success(decoder->DecodeData(buf, send_in_len, send_in_len != buf_len, bytes_left));
+		int move_step = send_in_len - bytes_left;
+		op_memmove(buf, buf + move_step, buf_len - move_step);
+		buf_len -= move_step;
+		send_in_len = bytes_left + 1;
+	}
+	verify(gif_listener.disposal_method == disposal_method);
+	verify(gif_listener.duration == duration);
+	verify(gif_listener.finished);
+}
+finally
+{
+	OP_DELETE(decoder);
+}
+
+subtest DecodeDataCheckSize(const char* data, int len, int width, int height, int x, int y)
+{
+	TestGifListener gif_listener;
+	gif_listener.Init();
+	ImageDecoderGif* decoder = ImageDecoderGif::Create(&gif_listener, FALSE);
+	verify(decoder != NULL);
+	int resendBytes;
+	verify_success(decoder->DecodeData((const UINT8 *)data, len, FALSE, resendBytes));
+	verify(gif_listener.width == width);
+	verify(gif_listener.height == height);
+	verify(gif_listener.x == x);
+	verify(gif_listener.y == y);
+	verify(gif_listener.finished);
+	OP_DELETE(decoder);
+	gif_listener.Init();
+	decoder = ImageDecoderGif::Create(&gif_listener, FALSE);
+	verify(decoder != NULL);
+	UINT8 buf[4096];
+	int buf_len = len;
+	int send_in_len = 1;
+	op_memcpy(buf, data, len);
+	for (int i = 0; i < len; i++)
+	{
+		int bytes_left;
+		verify_success(decoder->DecodeData(buf, send_in_len, send_in_len != buf_len, bytes_left));
+		int move_step = send_in_len - bytes_left;
+		op_memmove(buf, buf + move_step, buf_len - move_step);
+		buf_len -= move_step;
+		send_in_len = bytes_left + 1;
+	}
+	verify(gif_listener.width == width);
+	verify(gif_listener.height == height);
+	verify(gif_listener.x == x);
+	verify(gif_listener.y == y);
+	verify(gif_listener.finished);
+}
+finally
+{
+	OP_DELETE(decoder);
+}
+
+subtest DecodeDataCheckTransparent(const char* data, int len, BOOL transparent, int transparent_color)
+{
+	TestGifListener gif_listener;
+	gif_listener.Init();
+	ImageDecoderGif* decoder = ImageDecoderGif::Create(&gif_listener, FALSE);
+	verify(decoder != NULL);
+	int resendBytes;
+	verify_success(decoder->DecodeData((const UINT8 *)data, len, FALSE, resendBytes));
+	verify((gif_listener.transparent && transparent) || (!gif_listener.transparent && !transparent));
+	if (transparent)
+	{
+		verify(gif_listener.transparent_color ==  transparent_color);
+	}
+	verify(gif_listener.finished);
+	OP_DELETE(decoder);
+	gif_listener.Init();
+	decoder = ImageDecoderGif::Create(&gif_listener, FALSE);
+	verify(decoder != NULL);
+	UINT8 buf[4096];
+	int buf_len = len;
+	int send_in_len = 1;
+	op_memcpy(buf, data, len);
+	for (int i = 0; i < len; i++)
+	{
+		int bytes_left;
+		verify_success(decoder->DecodeData(buf, send_in_len, send_in_len != buf_len, bytes_left));
+		int move_step = send_in_len - bytes_left;
+		op_memmove(buf, buf + move_step, buf_len - move_step);
+		buf_len -= move_step;
+		send_in_len = bytes_left + 1;
+	}
+	verify((gif_listener.transparent && transparent) || (!gif_listener.transparent && !transparent));
+	if (transparent)
+	{
+		verify(gif_listener.transparent_color ==  transparent_color);
+	}
+	verify(gif_listener.finished);
+}
+finally
+{
+	OP_DELETE(decoder);
+}
+
+subtest OnCodesDecoded(int height, BOOL interlaced, const char* data)
+{
+	CodesDecodedListener listener;
+	ImageDecoderGif* decoder = ImageDecoderGif::Create(&listener, FALSE);
+	verify(decoder != NULL);
+	decoder->InitTestingCodesDecoded(1, height, interlaced);
+	decoder->OnCodesDecoded((const UINT8*)data, height);
+    OP_DELETE(decoder);
+	verify(listener.CheckData());
+}
+
+test("ImageDecoderGif OnCodesDecoded")
+{
+	verify(OnCodesDecoded(1, TRUE, "\0"));
+	verify(OnCodesDecoded(1, FALSE, "\0"));
+	verify(OnCodesDecoded(2, TRUE, "\0\1"));
+	verify(OnCodesDecoded(2, FALSE, "\0\1"));
+	verify(OnCodesDecoded(3, TRUE, "\0\2\1"));
+	verify(OnCodesDecoded(3, FALSE, "\0\1\2"));
+	verify(OnCodesDecoded(4, TRUE, "\0\2\1\3"));
+	verify(OnCodesDecoded(4, FALSE, "\0\1\2\3"));
+	verify(OnCodesDecoded(5, TRUE, "\0\4\2\1\3"));
+	verify(OnCodesDecoded(5, FALSE, "\0\1\2\3\4"));
+	verify(OnCodesDecoded(6, TRUE, "\0\4\2\1\3\5"));
+	verify(OnCodesDecoded(6, FALSE, "\0\1\2\3\4\5"));
+	verify(OnCodesDecoded(7, TRUE, "\0\4\2\6\1\3\5"));
+	verify(OnCodesDecoded(7, FALSE, "\0\1\2\3\4\5\6"));
+	verify(OnCodesDecoded(8, TRUE, "\0\4\2\6\1\3\5\7"));
+	verify(OnCodesDecoded(8, FALSE, "\0\1\2\3\4\5\6\7"));
+	verify(OnCodesDecoded(9, TRUE, "\0\x8\4\2\6\1\3\5\7"));
+	verify(OnCodesDecoded(9, FALSE, "\0\1\2\3\4\5\6\7\x8"));
+}
+
+table test_image_decoder_gif(const char* testname, const char* data, int len)
+{
+    { "GIF89a", "GIF89a\x10\0\x10\0\0\0\0\x3b", 14 },
+    { "GIF87a", "GIF87a\x10\0\x10\0\0\0\0\x3b", 14 },
+    { "with 2 global colors", "GIF89a\x10\0\x10\0\x80\0\0\x22\x22\x22\x32\x32\x32\x3b", 20 },
+    { "with 4 global colors", "GIF89a\x10\0\x10\0\x81\0\0\x22\x22\x22\x32\x32\x32\x22\x24\x22\x42\x32\x32\x3b", 26 },
+    { "with 8 global colors", "GIF89a\x10\0\x10\0\x82\0\0\x22\x22\x22\x32\x32\x32\x22\x24\x22\x42\x32\x32\x22\x22\x22\x32\x32\x32\x22\x24\x22\x42\x32\x32\x3b", 38 },
+    { "with minimal comment", "GIF89a\x10\0\x10\0\0\0\0\x21\xfe\0\x3b", 17 },
+    { "with standard comment", "GIF89a\x10\0\x10\0\0\0\0\x21\xfe\3abc\0\x3b", 21 },
+    { "with two part comment", "GIF89a\x10\0\x10\0\0\0\0\x21\xfe\3abc\4abcd\0\x3b", 26 },
+    { "with minimal app extension", "GIF89a\x10\0\x10\0\0\0\0\x21\xff\x0bmiffomif111\0\x3b", 29 },
+    { "with standard app extension", "GIF89a\x10\0\x10\0\0\0\0\x21\xff\x0bmiffomif111\3abc\0\x3b", 33 },
+    { "with two part app extension", "GIF89a\x10\0\x10\0\0\0\0\x21\xff\x0bmiffomif111\3abc\4abcd\0\x3b", 38 },
+    { "with minimal image data", "GIF89a\x10\0\x10\0\0\0\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x3b", 26 },
+    { "with standard image data", "GIF89a\x10\0\x10\0\0\0\0\x2c\0\0\0\0\0\0\0\0\0\2\3abc\0\x3b", 30 },
+    { "with two part image data", "GIF89a\x10\0\x10\0\0\0\0\x2c\0\0\0\0\0\0\0\0\0\2\3abc\4abcd\0\x3b", 35 },
+    { "with minimal test plain extension", "GIF89a\x10\0\x10\0\0\0\0\x21\x01\x0c\0\0\0\0\0\0\0\0\0\0\0\0\0\x3b", 30 },
+    { "with standard test plain extension", "GIF89a\x10\0\x10\0\0\0\0\x21\x01\x0c\0\0\0\0\0\0\0\0\0\0\0\0\3abc\0\x3b", 34 },
+    { "with two part test plain extension", "GIF89a\x10\0\x10\0\0\0\0\x21\x01\x0c\0\0\0\0\0\0\0\0\0\0\0\0\3abc\4abcd\0\x3b", 39 },
+    { "with minimal image data and 2 color local table",
+      "GIF89a\x10\0\x10\0\0\0\0\x2c\0\0\0\0\0\0\0\0\x80\x22\x22\x22\x44\x44\x44\2\0\x3b", 32 },
+    { "with minimal image data and 4 color local table",
+      "GIF89a\x10\0\x10\0\0\0\0\x2c\0\0\0\0\0\0\0\0\x81\x22\x22\x22\x44\x44\x44\x66\x66\x66\x88\x88\x88\2\0\x3b", 38 },
+    { "with minimal image data and 8 color local table",
+      "GIF89a\x10\0\x10\0\0\0\0\x2c\0\0\0\0\0\0\0\0\x82\x22\x22\x22\x44\x44\x44\x66\x66\x66\x88\x88\x88\x22\x22\x22\x44\x44\x44\x66\x66\x66\x88\x88\x88\3\0\x3b", 50 },
+    { "image data and 32 color local table",
+      "GIF89a\x10\0\x10\0\0\0\0\x2c\0\0\0\0\0\0\0\0\x84\x22\x22\x22\x44\x44\x44\x66\x66\x66\x88\x88\x88\x22\x22\x22\x44\x44\x44\x66\x66\x66\x88\x88\x88\x22\x22\x22\x44\x44\x44\x66\x66\x66\x88\x88\x88\x22\x22\x22\x44\x44\x44\x66\x66\x66\x88\x88\x88\x22\x22\x22\x44\x44\x44\x66\x66\x66\x88\x88\x88\x22\x22\x22\x44\x44\x44\x66\x66\x66\x88\x88\x88\x22\x22\x22\x44\x44\x44\x66\x66\x66\x88\x88\x88\x22\x22\x22\x44\x44\x44\x66\x66\x66\x88\x88\x88\5\0\x3b", 122 }
+}
+
+foreach (testname, data, len) from test_image_decoder_gif
+{
+    test("ImageDecoderGif Minimal image " testname)
+    {
+        verify(DecodeData(data, len));
+    }
+}
+
+test("ImageDecoderGif Netscape extension")
+{
+	verify(DecodeDataCheckAnimation("GIF89a\x10\0\x10\0\0\0\0\x21\xff\x0bNETSCAPE2.0\3\1\2\0\0\x3b", 33, 2));
+}
+
+table test_image_decoder_gif_palette(const char* testname, const char* test_data, int data_len, const char* test_pal, int test_num_cols)
+{
+    { "Use local color table",
+      "GIF89a\x10\0\x10\0\x81\0\0\x11\x11\x11\x22\x22\x22\x33\x33\x33\x44\x44\x44\x2c\0\0\0\0\0\0\0\0\x80\x55\x55\x55\x66\x66\x66\2\0\x3b", 44,
+      "\x55\x55\x55\x66\x66\x66", 2 },
+    { "Use global color table",
+      "GIF89a\x10\0\x10\0\x81\0\0\x11\x11\x11\x22\x22\x22\x33\x33\x33\x44\x44\x44\x2c\0\0\0\0\0\0\0\0\0\2\0\x3b", 38,
+      "\x11\x11\x11\x22\x22\x22\x33\x33\x33\x44\x44\x44", 4 },
+    { "two frame image, both uses the local color table",
+      "GIF89a\x10\0\x10\0\x81\0\0\x11\x11\x11\x22\x22\x22\x33\x33\x33\x44\x44\x44\x2c\0\0\0\0\0\0\0\0\x80\x55\x55\x55\x66\x66\x66\2\0\x2c\0\0\0\0\0\0\0\0\x80\x77\x77\x77\x88\x88\x88\2\0\x3b", 62,
+      "\x77\x77\x77\x88\x88\x88", 2 },
+    { "two frame image, both uses the global color table",
+      "GIF89a\x10\0\x10\0\x81\0\0\x11\x11\x11\x22\x22\x22\x33\x33\x33\x44\x44\x44\x2c\0\0\0\0\0\0\0\0\0\2\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x3b", 50,
+      "\x11\x11\x11\x22\x22\x22\x33\x33\x33\x44\x44\x44", 4 },
+    { "ImageDecoderGif two frame image, second one uses the global color table",
+      "GIF89a\x10\0\x10\0\x81\0\0\x11\x11\x11\x22\x22\x22\x33\x33\x33\x44\x44\x44\x2c\0\0\0\0\0\0\0\0\x80\x55\x55\x55\x66\x66\x66\2\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x3b", 56,
+      "\x11\x11\x11\x22\x22\x22\x33\x33\x33\x44\x44\x44", 4 }
+}
+
+foreach (testname, test_data, data_len, test_pal, test_num_cols) from test_image_decoder_gif_palette
+{
+    test("ImageDecoderGif " testname)
+        require SUPPORT_INDEXED_OPBITMAP;
+    {
+        TestGifListener gif_listener;
+        gif_listener.Init();
+        ImageDecoderGif* decoder = ImageDecoderGif::Create(&gif_listener, FALSE);
+        verify(decoder != NULL);
+        int resendBytes;
+        verify_success(decoder->DecodeData((const UINT8 *)test_data, data_len, FALSE, resendBytes));
+        verify(gif_listener.num_cols == test_num_cols);
+        verify(op_memcmp(gif_listener.pal, test_pal, 3 * test_num_cols) == 0);
+        verify(gif_listener.finished);
+        OP_DELETE(decoder);
+        gif_listener.Init();
+        decoder = ImageDecoderGif::Create(&gif_listener, FALSE);
+        verify(decoder != NULL);
+        UINT8 buf[4096];
+        int buf_len = data_len;
+        int send_in_len = 1;
+        op_memcpy(buf, test_data, data_len);
+        for (int i = 0; i < data_len; i++)
+        {
+            int bytes_left;
+            verify_success(decoder->DecodeData(buf, send_in_len, send_in_len != buf_len, bytes_left));
+            int move_step = send_in_len - bytes_left;
+            op_memmove(buf, buf + move_step, buf_len - move_step);
+            buf_len -= move_step;
+            send_in_len = bytes_left + 1;
+        }
+        verify(gif_listener.num_cols == test_num_cols);
+        verify(op_memcmp(gif_listener.pal, test_pal, 3 * test_num_cols) == 0);
+        verify(gif_listener.finished);
+    }
+    finally
+    {
+        OP_DELETE(decoder);
+    }
+}
+
+test("ImageDecoderGif duration no disposal")
+{
+	verify(DecodeDataCheckDuration("GIF89a\x10\0\x10\0\0\0\0\x21\xf9\4\0\0\0\0\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x21\xf9\4\0\0\0\0\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x3b", 54, DISPOSAL_METHOD_DO_NOT_DISPOSE, 10));
+#ifdef IMG_FULL_SPEED_GIF
+	verify(DecodeDataCheckDuration("GIF89a\x10\0\x10\0\0\0\0\x21\xf9\4\0\0\0\0\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x21\xf9\4\0\2\0\0\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x3b", 54, DISPOSAL_METHOD_DO_NOT_DISPOSE, 2));
+	verify(DecodeDataCheckDuration("GIF89a\x10\0\x10\0\0\0\0\x21\xf9\4\0\0\0\0\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x21\xf9\4\0\x08\0\0\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x3b", 54, DISPOSAL_METHOD_DO_NOT_DISPOSE, 8));
+#else
+	verify(DecodeDataCheckDuration("GIF89a\x10\0\x10\0\0\0\0\x21\xf9\4\0\0\0\0\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x21\xf9\4\0\2\0\0\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x3b", 54, DISPOSAL_METHOD_DO_NOT_DISPOSE, 10));
+	verify(DecodeDataCheckDuration("GIF89a\x10\0\x10\0\0\0\0\x21\xf9\4\0\0\0\0\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x21\xf9\4\0\x08\0\0\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x3b", 54, DISPOSAL_METHOD_DO_NOT_DISPOSE, 10));
+#endif
+	verify(DecodeDataCheckDuration("GIF89a\x10\0\x10\0\0\0\0\x21\xf9\4\0\0\0\0\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x21\xf9\4\0\x0a\0\0\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x3b", 54, DISPOSAL_METHOD_DO_NOT_DISPOSE, 10));
+	verify(DecodeDataCheckDuration("GIF89a\x10\0\x10\0\0\0\0\x21\xf9\4\0\0\0\0\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x21\xf9\4\0\x14\0\0\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x3b", 54, DISPOSAL_METHOD_DO_NOT_DISPOSE, 20));
+	verify(DecodeDataCheckDuration("GIF89a\x10\0\x10\0\0\0\0\x21\xf9\4\0\0\0\0\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x21\xf9\4\0\xff\0\0\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x3b", 54, DISPOSAL_METHOD_DO_NOT_DISPOSE, 255));
+	verify(DecodeDataCheckDuration("GIF89a\x10\0\x10\0\0\0\0\x21\xf9\4\0\0\0\0\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x21\xf9\4\0\0\1\0\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x3b", 54, DISPOSAL_METHOD_DO_NOT_DISPOSE, 256));
+	verify(DecodeDataCheckDuration("GIF89a\x10\0\x10\0\0\0\0\x21\xf9\4\0\0\0\0\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x21\xf9\4\0\xff\xff\0\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x3b", 54, DISPOSAL_METHOD_DO_NOT_DISPOSE, 65535));
+
+	verify(DecodeDataCheckDuration("GIF89a\x10\0\x10\0\0\0\0\x21\xf9\4\0\0\0\0\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x3b", 46, DISPOSAL_METHOD_DO_NOT_DISPOSE, 10));
+	verify(DecodeDataCheckDuration("GIF89a\x10\0\x10\0\0\0\0\x21\xf9\4\0\2\0\0\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x3b", 46, DISPOSAL_METHOD_DO_NOT_DISPOSE, 10));
+	verify(DecodeDataCheckDuration("GIF89a\x10\0\x10\0\0\0\0\x21\xf9\4\0\x08\0\0\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x3b", 46, DISPOSAL_METHOD_DO_NOT_DISPOSE, 10));
+	verify(DecodeDataCheckDuration("GIF89a\x10\0\x10\0\0\0\0\x21\xf9\4\0\x0a\0\0\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x3b", 46, DISPOSAL_METHOD_DO_NOT_DISPOSE, 10));
+	verify(DecodeDataCheckDuration("GIF89a\x10\0\x10\0\0\0\0\x21\xf9\4\0\x14\0\0\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x3b", 46, DISPOSAL_METHOD_DO_NOT_DISPOSE, 10));
+	verify(DecodeDataCheckDuration("GIF89a\x10\0\x10\0\0\0\0\x21\xf9\4\0\xff\0\0\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x3b", 46, DISPOSAL_METHOD_DO_NOT_DISPOSE, 10));
+	verify(DecodeDataCheckDuration("GIF89a\x10\0\x10\0\0\0\0\x21\xf9\4\0\0\1\0\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x3b", 46, DISPOSAL_METHOD_DO_NOT_DISPOSE, 10));
+	verify(DecodeDataCheckDuration("GIF89a\x10\0\x10\0\0\0\0\x21\xf9\4\0\xff\xff\0\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x3b", 46, DISPOSAL_METHOD_DO_NOT_DISPOSE, 10));
+
+	verify(DecodeDataCheckDuration("GIF89a\x10\0\x10\0\0\0\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x3b", 38, DISPOSAL_METHOD_DO_NOT_DISPOSE, 10));
+
+	verify(DecodeDataCheckDuration("GIF89a\x10\0\x10\0\0\0\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x21\xf9\4\0\0\0\0\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x3b", 46, DISPOSAL_METHOD_DO_NOT_DISPOSE, 10));
+#ifdef IMG_FULL_SPEED_GIF
+	verify(DecodeDataCheckDuration("GIF89a\x10\0\x10\0\0\0\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x21\xf9\4\0\2\0\0\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x3b", 46, DISPOSAL_METHOD_DO_NOT_DISPOSE, 2));
+	verify(DecodeDataCheckDuration("GIF89a\x10\0\x10\0\0\0\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x21\xf9\4\0\x08\0\0\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x3b", 46, DISPOSAL_METHOD_DO_NOT_DISPOSE, 8));
+#else
+	verify(DecodeDataCheckDuration("GIF89a\x10\0\x10\0\0\0\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x21\xf9\4\0\2\0\0\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x3b", 46, DISPOSAL_METHOD_DO_NOT_DISPOSE, 10));
+	verify(DecodeDataCheckDuration("GIF89a\x10\0\x10\0\0\0\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x21\xf9\4\0\x08\0\0\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x3b", 46, DISPOSAL_METHOD_DO_NOT_DISPOSE, 10));
+#endif
+	verify(DecodeDataCheckDuration("GIF89a\x10\0\x10\0\0\0\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x21\xf9\4\0\x0a\0\0\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x3b", 46, DISPOSAL_METHOD_DO_NOT_DISPOSE, 10));
+	verify(DecodeDataCheckDuration("GIF89a\x10\0\x10\0\0\0\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x21\xf9\4\0\x14\0\0\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x3b", 46, DISPOSAL_METHOD_DO_NOT_DISPOSE, 20));
+	verify(DecodeDataCheckDuration("GIF89a\x10\0\x10\0\0\0\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x21\xf9\4\0\xff\0\0\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x3b", 46, DISPOSAL_METHOD_DO_NOT_DISPOSE, 255));
+	verify(DecodeDataCheckDuration("GIF89a\x10\0\x10\0\0\0\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x21\xf9\4\0\0\1\0\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x3b", 46, DISPOSAL_METHOD_DO_NOT_DISPOSE, 256));
+	verify(DecodeDataCheckDuration("GIF89a\x10\0\x10\0\0\0\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x21\xf9\4\0\xff\xff\0\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x3b", 46, DISPOSAL_METHOD_DO_NOT_DISPOSE, 65535));
+}
+
+test("ImageDecoderGif duration do not dispose")
+{
+	verify(DecodeDataCheckDuration("GIF89a\x10\0\x10\0\0\0\0\x21\xf9\4\0\0\0\0\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x21\xf9\4\x04\0\0\0\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x3b", 54, DISPOSAL_METHOD_DO_NOT_DISPOSE, 10));
+#ifdef IMG_FULL_SPEED_GIF
+	verify(DecodeDataCheckDuration("GIF89a\x10\0\x10\0\0\0\0\x21\xf9\4\0\0\0\0\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x21\xf9\4\x04\2\0\0\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x3b", 54, DISPOSAL_METHOD_DO_NOT_DISPOSE, 2));
+	verify(DecodeDataCheckDuration("GIF89a\x10\0\x10\0\0\0\0\x21\xf9\4\0\0\0\0\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x21\xf9\4\x04\x08\0\0\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x3b", 54, DISPOSAL_METHOD_DO_NOT_DISPOSE, 8));
+#else
+	verify(DecodeDataCheckDuration("GIF89a\x10\0\x10\0\0\0\0\x21\xf9\4\0\0\0\0\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x21\xf9\4\x04\2\0\0\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x3b", 54, DISPOSAL_METHOD_DO_NOT_DISPOSE, 10));
+	verify(DecodeDataCheckDuration("GIF89a\x10\0\x10\0\0\0\0\x21\xf9\4\0\0\0\0\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x21\xf9\4\x04\x08\0\0\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x3b", 54, DISPOSAL_METHOD_DO_NOT_DISPOSE, 10));
+#endif
+	verify(DecodeDataCheckDuration("GIF89a\x10\0\x10\0\0\0\0\x21\xf9\4\0\0\0\0\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x21\xf9\4\x04\x0a\0\0\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x3b", 54, DISPOSAL_METHOD_DO_NOT_DISPOSE, 10));
+	verify(DecodeDataCheckDuration("GIF89a\x10\0\x10\0\0\0\0\x21\xf9\4\0\0\0\0\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x21\xf9\4\x04\x14\0\0\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x3b", 54, DISPOSAL_METHOD_DO_NOT_DISPOSE, 20));
+	verify(DecodeDataCheckDuration("GIF89a\x10\0\x10\0\0\0\0\x21\xf9\4\0\0\0\0\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x21\xf9\4\x04\xff\0\0\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x3b", 54, DISPOSAL_METHOD_DO_NOT_DISPOSE, 255));
+	verify(DecodeDataCheckDuration("GIF89a\x10\0\x10\0\0\0\0\x21\xf9\4\0\0\0\0\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x21\xf9\4\x04\0\1\0\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x3b", 54, DISPOSAL_METHOD_DO_NOT_DISPOSE, 256));
+	verify(DecodeDataCheckDuration("GIF89a\x10\0\x10\0\0\0\0\x21\xf9\4\0\0\0\0\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x21\xf9\4\x04\xff\xff\0\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x3b", 54, DISPOSAL_METHOD_DO_NOT_DISPOSE, 65535));
+
+	verify(DecodeDataCheckDuration("GIF89a\x10\0\x10\0\0\0\0\x21\xf9\4\0\0\0\0\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x3b", 46, DISPOSAL_METHOD_DO_NOT_DISPOSE, 10));
+	verify(DecodeDataCheckDuration("GIF89a\x10\0\x10\0\0\0\0\x21\xf9\4\0\2\0\0\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x3b", 46, DISPOSAL_METHOD_DO_NOT_DISPOSE, 10));
+	verify(DecodeDataCheckDuration("GIF89a\x10\0\x10\0\0\0\0\x21\xf9\4\0\x08\0\0\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x3b", 46, DISPOSAL_METHOD_DO_NOT_DISPOSE, 10));
+	verify(DecodeDataCheckDuration("GIF89a\x10\0\x10\0\0\0\0\x21\xf9\4\0\x0a\0\0\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x3b", 46, DISPOSAL_METHOD_DO_NOT_DISPOSE, 10));
+	verify(DecodeDataCheckDuration("GIF89a\x10\0\x10\0\0\0\0\x21\xf9\4\0\x14\0\0\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x3b", 46, DISPOSAL_METHOD_DO_NOT_DISPOSE, 10));
+	verify(DecodeDataCheckDuration("GIF89a\x10\0\x10\0\0\0\0\x21\xf9\4\0\xff\0\0\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x3b", 46, DISPOSAL_METHOD_DO_NOT_DISPOSE, 10));
+	verify(DecodeDataCheckDuration("GIF89a\x10\0\x10\0\0\0\0\x21\xf9\4\0\0\1\0\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x3b", 46, DISPOSAL_METHOD_DO_NOT_DISPOSE, 10));
+	verify(DecodeDataCheckDuration("GIF89a\x10\0\x10\0\0\0\0\x21\xf9\4\0\xff\xff\0\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x3b", 46, DISPOSAL_METHOD_DO_NOT_DISPOSE, 10));
+
+	verify(DecodeDataCheckDuration("GIF89a\x10\0\x10\0\0\0\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x3b", 38, DISPOSAL_METHOD_DO_NOT_DISPOSE, 10));
+
+	verify(DecodeDataCheckDuration("GIF89a\x10\0\x10\0\0\0\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x21\xf9\4\x04\0\0\0\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x3b", 46, DISPOSAL_METHOD_DO_NOT_DISPOSE, 10));
+#ifdef IMG_FULL_SPEED_GIF
+	verify(DecodeDataCheckDuration("GIF89a\x10\0\x10\0\0\0\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x21\xf9\4\x04\2\0\0\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x3b", 46, DISPOSAL_METHOD_DO_NOT_DISPOSE, 2));
+	verify(DecodeDataCheckDuration("GIF89a\x10\0\x10\0\0\0\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x21\xf9\4\x04\x08\0\0\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x3b", 46, DISPOSAL_METHOD_DO_NOT_DISPOSE, 8));
+#else
+	verify(DecodeDataCheckDuration("GIF89a\x10\0\x10\0\0\0\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x21\xf9\4\x04\2\0\0\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x3b", 46, DISPOSAL_METHOD_DO_NOT_DISPOSE, 10));
+	verify(DecodeDataCheckDuration("GIF89a\x10\0\x10\0\0\0\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x21\xf9\4\x04\x08\0\0\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x3b", 46, DISPOSAL_METHOD_DO_NOT_DISPOSE, 10));
+#endif
+	verify(DecodeDataCheckDuration("GIF89a\x10\0\x10\0\0\0\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x21\xf9\4\x04\x0a\0\0\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x3b", 46, DISPOSAL_METHOD_DO_NOT_DISPOSE, 10));
+	verify(DecodeDataCheckDuration("GIF89a\x10\0\x10\0\0\0\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x21\xf9\4\x04\x14\0\0\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x3b", 46, DISPOSAL_METHOD_DO_NOT_DISPOSE, 20));
+	verify(DecodeDataCheckDuration("GIF89a\x10\0\x10\0\0\0\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x21\xf9\4\x04\xff\0\0\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x3b", 46, DISPOSAL_METHOD_DO_NOT_DISPOSE, 255));
+	verify(DecodeDataCheckDuration("GIF89a\x10\0\x10\0\0\0\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x21\xf9\4\x04\0\1\0\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x3b", 46, DISPOSAL_METHOD_DO_NOT_DISPOSE, 256));
+	verify(DecodeDataCheckDuration("GIF89a\x10\0\x10\0\0\0\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x21\xf9\4\x04\xff\xff\0\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x3b", 46, DISPOSAL_METHOD_DO_NOT_DISPOSE, 65535));
+}
+
+test("ImageDecoderGif duration restore background")
+{
+	verify(DecodeDataCheckDuration("GIF89a\x10\0\x10\0\0\0\0\x21\xf9\4\0\0\0\0\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x21\xf9\4\x08\0\0\0\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x3b", 54, DISPOSAL_METHOD_RESTORE_BACKGROUND, 10));
+#ifdef IMG_FULL_SPEED_GIF
+	verify(DecodeDataCheckDuration("GIF89a\x10\0\x10\0\0\0\0\x21\xf9\4\0\0\0\0\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x21\xf9\4\x08\2\0\0\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x3b", 54, DISPOSAL_METHOD_RESTORE_BACKGROUND, 2));
+	verify(DecodeDataCheckDuration("GIF89a\x10\0\x10\0\0\0\0\x21\xf9\4\0\0\0\0\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x21\xf9\4\x08\x08\0\0\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x3b", 54, DISPOSAL_METHOD_RESTORE_BACKGROUND, 8));
+#else
+	verify(DecodeDataCheckDuration("GIF89a\x10\0\x10\0\0\0\0\x21\xf9\4\0\0\0\0\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x21\xf9\4\x08\2\0\0\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x3b", 54, DISPOSAL_METHOD_RESTORE_BACKGROUND, 10));
+	verify(DecodeDataCheckDuration("GIF89a\x10\0\x10\0\0\0\0\x21\xf9\4\0\0\0\0\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x21\xf9\4\x08\x08\0\0\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x3b", 54, DISPOSAL_METHOD_RESTORE_BACKGROUND, 10));
+#endif
+	verify(DecodeDataCheckDuration("GIF89a\x10\0\x10\0\0\0\0\x21\xf9\4\0\0\0\0\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x21\xf9\4\x08\x0a\0\0\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x3b", 54, DISPOSAL_METHOD_RESTORE_BACKGROUND, 10));
+	verify(DecodeDataCheckDuration("GIF89a\x10\0\x10\0\0\0\0\x21\xf9\4\0\0\0\0\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x21\xf9\4\x08\x14\0\0\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x3b", 54, DISPOSAL_METHOD_RESTORE_BACKGROUND, 20));
+	verify(DecodeDataCheckDuration("GIF89a\x10\0\x10\0\0\0\0\x21\xf9\4\0\0\0\0\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x21\xf9\4\x08\xff\0\0\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x3b", 54, DISPOSAL_METHOD_RESTORE_BACKGROUND, 255));
+	verify(DecodeDataCheckDuration("GIF89a\x10\0\x10\0\0\0\0\x21\xf9\4\0\0\0\0\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x21\xf9\4\x08\0\1\0\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x3b", 54, DISPOSAL_METHOD_RESTORE_BACKGROUND, 256));
+	verify(DecodeDataCheckDuration("GIF89a\x10\0\x10\0\0\0\0\x21\xf9\4\0\0\0\0\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x21\xf9\4\x08\xff\xff\0\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x3b", 54, DISPOSAL_METHOD_RESTORE_BACKGROUND, 65535));
+
+	verify(DecodeDataCheckDuration("GIF89a\x10\0\x10\0\0\0\0\x21\xf9\4\x04\0\0\0\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x3b", 46, DISPOSAL_METHOD_DO_NOT_DISPOSE, 10));
+	verify(DecodeDataCheckDuration("GIF89a\x10\0\x10\0\0\0\0\x21\xf9\4\x04\2\0\0\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x3b", 46, DISPOSAL_METHOD_DO_NOT_DISPOSE, 10));
+	verify(DecodeDataCheckDuration("GIF89a\x10\0\x10\0\0\0\0\x21\xf9\4\x04\x08\0\0\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x3b", 46, DISPOSAL_METHOD_DO_NOT_DISPOSE, 10));
+	verify(DecodeDataCheckDuration("GIF89a\x10\0\x10\0\0\0\0\x21\xf9\4\x04\x0a\0\0\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x3b", 46, DISPOSAL_METHOD_DO_NOT_DISPOSE, 10));
+	verify(DecodeDataCheckDuration("GIF89a\x10\0\x10\0\0\0\0\x21\xf9\4\x04\x14\0\0\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x3b", 46, DISPOSAL_METHOD_DO_NOT_DISPOSE, 10));
+	verify(DecodeDataCheckDuration("GIF89a\x10\0\x10\0\0\0\0\x21\xf9\4\x04\xff\0\0\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x3b", 46, DISPOSAL_METHOD_DO_NOT_DISPOSE, 10));
+	verify(DecodeDataCheckDuration("GIF89a\x10\0\x10\0\0\0\0\x21\xf9\4\x04\0\1\0\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x3b", 46, DISPOSAL_METHOD_DO_NOT_DISPOSE, 10));
+	verify(DecodeDataCheckDuration("GIF89a\x10\0\x10\0\0\0\0\x21\xf9\4\x04\xff\xff\0\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x3b", 46, DISPOSAL_METHOD_DO_NOT_DISPOSE, 10));
+
+	verify(DecodeDataCheckDuration("GIF89a\x10\0\x10\0\0\0\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x3b", 38, DISPOSAL_METHOD_DO_NOT_DISPOSE, 10));
+
+	verify(DecodeDataCheckDuration("GIF89a\x10\0\x10\0\0\0\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x21\xf9\4\x08\0\0\0\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x3b", 46, DISPOSAL_METHOD_RESTORE_BACKGROUND, 10));
+#ifdef IMG_FULL_SPEED_GIF
+	verify(DecodeDataCheckDuration("GIF89a\x10\0\x10\0\0\0\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x21\xf9\4\x08\2\0\0\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x3b", 46, DISPOSAL_METHOD_RESTORE_BACKGROUND, 2));
+	verify(DecodeDataCheckDuration("GIF89a\x10\0\x10\0\0\0\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x21\xf9\4\x08\x08\0\0\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x3b", 46, DISPOSAL_METHOD_RESTORE_BACKGROUND, 8));
+#else
+	verify(DecodeDataCheckDuration("GIF89a\x10\0\x10\0\0\0\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x21\xf9\4\x08\2\0\0\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x3b", 46, DISPOSAL_METHOD_RESTORE_BACKGROUND, 10));
+	verify(DecodeDataCheckDuration("GIF89a\x10\0\x10\0\0\0\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x21\xf9\4\x08\x08\0\0\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x3b", 46, DISPOSAL_METHOD_RESTORE_BACKGROUND, 10));
+#endif
+	verify(DecodeDataCheckDuration("GIF89a\x10\0\x10\0\0\0\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x21\xf9\4\x08\x0a\0\0\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x3b", 46, DISPOSAL_METHOD_RESTORE_BACKGROUND, 10));
+	verify(DecodeDataCheckDuration("GIF89a\x10\0\x10\0\0\0\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x21\xf9\4\x08\x14\0\0\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x3b", 46, DISPOSAL_METHOD_RESTORE_BACKGROUND, 20));
+	verify(DecodeDataCheckDuration("GIF89a\x10\0\x10\0\0\0\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x21\xf9\4\x08\xff\0\0\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x3b", 46, DISPOSAL_METHOD_RESTORE_BACKGROUND, 255));
+	verify(DecodeDataCheckDuration("GIF89a\x10\0\x10\0\0\0\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x21\xf9\4\x08\0\1\0\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x3b", 46, DISPOSAL_METHOD_RESTORE_BACKGROUND, 256));
+	verify(DecodeDataCheckDuration("GIF89a\x10\0\x10\0\0\0\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x21\xf9\4\x08\xff\xff\0\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x3b", 46, DISPOSAL_METHOD_RESTORE_BACKGROUND, 65535));
+}
+
+test("ImageDecoderGif duration restore previous")
+{
+	verify(DecodeDataCheckDuration("GIF89a\x10\0\x10\0\0\0\0\x21\xf9\4\0\0\0\0\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x21\xf9\4\x0c\0\0\0\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x3b", 54, DISPOSAL_METHOD_RESTORE_PREVIOUS, 10));
+#ifdef IMG_FULL_SPEED_GIF
+	verify(DecodeDataCheckDuration("GIF89a\x10\0\x10\0\0\0\0\x21\xf9\4\0\0\0\0\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x21\xf9\4\x0c\2\0\0\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x3b", 54, DISPOSAL_METHOD_RESTORE_PREVIOUS, 2));
+	verify(DecodeDataCheckDuration("GIF89a\x10\0\x10\0\0\0\0\x21\xf9\4\0\0\0\0\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x21\xf9\4\x0c\x08\0\0\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x3b", 54, DISPOSAL_METHOD_RESTORE_PREVIOUS, 8));
+#else
+	verify(DecodeDataCheckDuration("GIF89a\x10\0\x10\0\0\0\0\x21\xf9\4\0\0\0\0\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x21\xf9\4\x0c\2\0\0\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x3b", 54, DISPOSAL_METHOD_RESTORE_PREVIOUS, 10));
+	verify(DecodeDataCheckDuration("GIF89a\x10\0\x10\0\0\0\0\x21\xf9\4\0\0\0\0\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x21\xf9\4\x0c\x08\0\0\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x3b", 54, DISPOSAL_METHOD_RESTORE_PREVIOUS, 10));
+#endif
+	verify(DecodeDataCheckDuration("GIF89a\x10\0\x10\0\0\0\0\x21\xf9\4\0\0\0\0\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x21\xf9\4\x0c\x0a\0\0\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x3b", 54, DISPOSAL_METHOD_RESTORE_PREVIOUS, 10));
+	verify(DecodeDataCheckDuration("GIF89a\x10\0\x10\0\0\0\0\x21\xf9\4\0\0\0\0\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x21\xf9\4\x0c\x14\0\0\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x3b", 54, DISPOSAL_METHOD_RESTORE_PREVIOUS, 20));
+	verify(DecodeDataCheckDuration("GIF89a\x10\0\x10\0\0\0\0\x21\xf9\4\0\0\0\0\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x21\xf9\4\x0c\xff\0\0\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x3b", 54, DISPOSAL_METHOD_RESTORE_PREVIOUS, 255));
+	verify(DecodeDataCheckDuration("GIF89a\x10\0\x10\0\0\0\0\x21\xf9\4\0\0\0\0\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x21\xf9\4\x0c\0\1\0\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x3b", 54, DISPOSAL_METHOD_RESTORE_PREVIOUS, 256));
+	verify(DecodeDataCheckDuration("GIF89a\x10\0\x10\0\0\0\0\x21\xf9\4\0\0\0\0\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x21\xf9\4\x0c\xff\xff\0\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x3b", 54, DISPOSAL_METHOD_RESTORE_PREVIOUS, 65535));
+
+	verify(DecodeDataCheckDuration("GIF89a\x10\0\x10\0\0\0\0\x21\xf9\4\x04\0\0\0\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x3b", 46, DISPOSAL_METHOD_DO_NOT_DISPOSE, 10));
+	verify(DecodeDataCheckDuration("GIF89a\x10\0\x10\0\0\0\0\x21\xf9\4\x04\2\0\0\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x3b", 46, DISPOSAL_METHOD_DO_NOT_DISPOSE, 10));
+	verify(DecodeDataCheckDuration("GIF89a\x10\0\x10\0\0\0\0\x21\xf9\4\x04\x08\0\0\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x3b", 46, DISPOSAL_METHOD_DO_NOT_DISPOSE, 10));
+	verify(DecodeDataCheckDuration("GIF89a\x10\0\x10\0\0\0\0\x21\xf9\4\x04\x0a\0\0\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x3b", 46, DISPOSAL_METHOD_DO_NOT_DISPOSE, 10));
+	verify(DecodeDataCheckDuration("GIF89a\x10\0\x10\0\0\0\0\x21\xf9\4\x04\x14\0\0\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x3b", 46, DISPOSAL_METHOD_DO_NOT_DISPOSE, 10));
+	verify(DecodeDataCheckDuration("GIF89a\x10\0\x10\0\0\0\0\x21\xf9\4\x04\xff\0\0\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x3b", 46, DISPOSAL_METHOD_DO_NOT_DISPOSE, 10));
+	verify(DecodeDataCheckDuration("GIF89a\x10\0\x10\0\0\0\0\x21\xf9\4\x04\0\1\0\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x3b", 46, DISPOSAL_METHOD_DO_NOT_DISPOSE, 10));
+	verify(DecodeDataCheckDuration("GIF89a\x10\0\x10\0\0\0\0\x21\xf9\4\x04\xff\xff\0\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x3b", 46, DISPOSAL_METHOD_DO_NOT_DISPOSE, 10));
+
+	verify(DecodeDataCheckDuration("GIF89a\x10\0\x10\0\0\0\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x3b", 38, DISPOSAL_METHOD_DO_NOT_DISPOSE, 10));
+
+	verify(DecodeDataCheckDuration("GIF89a\x10\0\x10\0\0\0\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x21\xf9\4\x0c\0\0\0\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x3b", 46, DISPOSAL_METHOD_RESTORE_PREVIOUS, 10));
+#ifdef IMG_FULL_SPEED_GIF
+	verify(DecodeDataCheckDuration("GIF89a\x10\0\x10\0\0\0\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x21\xf9\4\x0c\2\0\0\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x3b", 46, DISPOSAL_METHOD_RESTORE_PREVIOUS, 2));
+	verify(DecodeDataCheckDuration("GIF89a\x10\0\x10\0\0\0\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x21\xf9\4\x0c\x08\0\0\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x3b", 46, DISPOSAL_METHOD_RESTORE_PREVIOUS, 8));
+#else
+	verify(DecodeDataCheckDuration("GIF89a\x10\0\x10\0\0\0\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x21\xf9\4\x0c\2\0\0\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x3b", 46, DISPOSAL_METHOD_RESTORE_PREVIOUS, 10));
+	verify(DecodeDataCheckDuration("GIF89a\x10\0\x10\0\0\0\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x21\xf9\4\x0c\x08\0\0\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x3b", 46, DISPOSAL_METHOD_RESTORE_PREVIOUS, 10));
+#endif
+	verify(DecodeDataCheckDuration("GIF89a\x10\0\x10\0\0\0\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x21\xf9\4\x0c\x0a\0\0\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x3b", 46, DISPOSAL_METHOD_RESTORE_PREVIOUS, 10));
+	verify(DecodeDataCheckDuration("GIF89a\x10\0\x10\0\0\0\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x21\xf9\4\x0c\x14\0\0\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x3b", 46, DISPOSAL_METHOD_RESTORE_PREVIOUS, 20));
+	verify(DecodeDataCheckDuration("GIF89a\x10\0\x10\0\0\0\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x21\xf9\4\x0c\xff\0\0\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x3b", 46, DISPOSAL_METHOD_RESTORE_PREVIOUS, 255));
+	verify(DecodeDataCheckDuration("GIF89a\x10\0\x10\0\0\0\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x21\xf9\4\x0c\0\1\0\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x3b", 46, DISPOSAL_METHOD_RESTORE_PREVIOUS, 256));
+	verify(DecodeDataCheckDuration("GIF89a\x10\0\x10\0\0\0\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x21\xf9\4\x0c\xff\xff\0\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x3b", 46, DISPOSAL_METHOD_RESTORE_PREVIOUS, 65535));
+}
+
+test("ImageDecoderGif size")
+{
+	verify(DecodeDataCheckSize("GIF87a\x32\0\x64\0\0\0\0\x3b", 14, 50, 100, 0, 0));
+	verify(DecodeDataCheckSize("GIF89a\x32\0\x64\0\0\0\0\x3b", 14, 50, 100, 0, 0));
+
+	verify(DecodeDataCheckSize("GIF87a\x10\0\x10\0\0\0\0\x2c\0\0\0\0\x20\0\x20\0\0\2\0\x3b", 26, 32, 32, 0, 0));
+	verify(DecodeDataCheckSize("GIF87a\x10\0\x20\0\0\0\0\x2c\0\0\0\0\x20\0\x20\0\0\2\0\x3b", 26, 32, 32, 0, 0));
+	verify(DecodeDataCheckSize("GIF87a\x10\0\x30\0\0\0\0\x2c\0\0\0\0\x20\0\x20\0\0\2\0\x3b", 26, 32, 32, 0, 0));
+	verify(DecodeDataCheckSize("GIF87a\x20\0\x20\0\0\0\0\x2c\0\0\0\0\x20\0\x20\0\0\2\0\x3b", 26, 32, 32, 0, 0));
+	verify(DecodeDataCheckSize("GIF87a\x20\0\x30\0\0\0\0\x2c\0\0\0\0\x20\0\x20\0\0\2\0\x3b", 26, 32, 32, 0, 0));
+	verify(DecodeDataCheckSize("GIF87a\x30\0\x30\0\0\0\0\x2c\0\0\0\0\x20\0\x20\0\0\2\0\x3b", 26, 32, 32, 0, 0));
+
+	verify(DecodeDataCheckSize("GIF89a\x10\0\x10\0\0\0\0\x2c\0\0\0\0\x20\0\x20\0\0\2\0\x3b", 26, 32, 32, 0, 0));
+	verify(DecodeDataCheckSize("GIF89a\x10\0\x20\0\0\0\0\x2c\0\0\0\0\x20\0\x20\0\0\2\0\x3b", 26, 32, 32, 0, 0));
+	verify(DecodeDataCheckSize("GIF89a\x10\0\x30\0\0\0\0\x2c\0\0\0\0\x20\0\x20\0\0\2\0\x3b", 26, 32, 32, 0, 0));
+	verify(DecodeDataCheckSize("GIF89a\x20\0\x20\0\0\0\0\x2c\0\0\0\0\x20\0\x20\0\0\2\0\x3b", 26, 32, 32, 0, 0));
+	verify(DecodeDataCheckSize("GIF89a\x20\0\x30\0\0\0\0\x2c\0\0\0\0\x20\0\x20\0\0\2\0\x3b", 26, 32, 48, 0, 0));
+	verify(DecodeDataCheckSize("GIF89a\x30\0\x30\0\0\0\0\x2c\0\0\0\0\x20\0\x20\0\0\2\0\x3b", 26, 48, 48, 0, 0));
+
+	verify(DecodeDataCheckSize("GIF87a\x10\0\x10\0\0\0\0\x2c\x20\0\x20\0\x20\0\x20\0\0\2\0\x3b", 26, 32, 32, 32, 32));
+	verify(DecodeDataCheckSize("GIF87a\x10\0\x20\0\0\0\0\x2c\x20\0\x20\0\x20\0\x20\0\0\2\0\x3b", 26, 32, 32, 32, 32));
+	verify(DecodeDataCheckSize("GIF87a\x10\0\x30\0\0\0\0\x2c\x20\0\x20\0\x20\0\x20\0\0\2\0\x3b", 26, 32, 32, 32, 32));
+	verify(DecodeDataCheckSize("GIF87a\x10\0\x40\0\0\0\0\x2c\x20\0\x20\0\x20\0\x20\0\0\2\0\x3b", 26, 32, 32, 32, 32));
+	verify(DecodeDataCheckSize("GIF87a\x10\0\x50\0\0\0\0\x2c\x20\0\x20\0\x20\0\x20\0\0\2\0\x3b", 26, 32, 32, 32, 32));
+	verify(DecodeDataCheckSize("GIF87a\x20\0\x20\0\0\0\0\x2c\x20\0\x20\0\x20\0\x20\0\0\2\0\x3b", 26, 32, 32, 0, 0));
+	verify(DecodeDataCheckSize("GIF87a\x20\0\x30\0\0\0\0\x2c\x20\0\x20\0\x20\0\x20\0\0\2\0\x3b", 26, 32, 32, 32, 32));
+	verify(DecodeDataCheckSize("GIF87a\x20\0\x40\0\0\0\0\x2c\x20\0\x20\0\x20\0\x20\0\0\2\0\x3b", 26, 32, 32, 32, 32));
+	verify(DecodeDataCheckSize("GIF87a\x20\0\x50\0\0\0\0\x2c\x20\0\x20\0\x20\0\x20\0\0\2\0\x3b", 26, 32, 32, 32, 32));
+	verify(DecodeDataCheckSize("GIF87a\x30\0\x30\0\0\0\0\x2c\x20\0\x20\0\x20\0\x20\0\0\2\0\x3b", 26, 32, 32, 32, 32));
+	verify(DecodeDataCheckSize("GIF87a\x30\0\x40\0\0\0\0\x2c\x20\0\x20\0\x20\0\x20\0\0\2\0\x3b", 26, 32, 32, 32, 32));
+	verify(DecodeDataCheckSize("GIF87a\x30\0\x50\0\0\0\0\x2c\x20\0\x20\0\x20\0\x20\0\0\2\0\x3b", 26, 32, 32, 32, 32));
+	verify(DecodeDataCheckSize("GIF87a\x40\0\x40\0\0\0\0\x2c\x20\0\x20\0\x20\0\x20\0\0\2\0\x3b", 26, 32, 32, 0, 0));
+	verify(DecodeDataCheckSize("GIF87a\x40\0\x50\0\0\0\0\x2c\x20\0\x20\0\x20\0\x20\0\0\2\0\x3b", 26, 64, 80, 32, 32));
+	verify(DecodeDataCheckSize("GIF87a\x50\0\x50\0\0\0\0\x2c\x20\0\x20\0\x20\0\x20\0\0\2\0\x3b", 26, 80, 80, 32, 32));
+
+	verify(DecodeDataCheckSize("GIF89a\x10\0\x10\0\0\0\0\x2c\x20\0\x20\0\x20\0\x20\0\0\2\0\x3b", 26, 32, 32, 32, 32));
+	verify(DecodeDataCheckSize("GIF89a\x10\0\x20\0\0\0\0\x2c\x20\0\x20\0\x20\0\x20\0\0\2\0\x3b", 26, 32, 32, 32, 32));
+	verify(DecodeDataCheckSize("GIF89a\x10\0\x30\0\0\0\0\x2c\x20\0\x20\0\x20\0\x20\0\0\2\0\x3b", 26, 32, 32, 32, 32));
+	verify(DecodeDataCheckSize("GIF89a\x10\0\x40\0\0\0\0\x2c\x20\0\x20\0\x20\0\x20\0\0\2\0\x3b", 26, 32, 32, 32, 32));
+	verify(DecodeDataCheckSize("GIF89a\x10\0\x50\0\0\0\0\x2c\x20\0\x20\0\x20\0\x20\0\0\2\0\x3b", 26, 32, 32, 32, 32));
+	verify(DecodeDataCheckSize("GIF89a\x20\0\x20\0\0\0\0\x2c\x20\0\x20\0\x20\0\x20\0\0\2\0\x3b", 26, 32, 32, 0, 0));
+	verify(DecodeDataCheckSize("GIF89a\x20\0\x30\0\0\0\0\x2c\x20\0\x20\0\x20\0\x20\0\0\2\0\x3b", 26, 32, 32, 32, 32));
+	verify(DecodeDataCheckSize("GIF89a\x20\0\x40\0\0\0\0\x2c\x20\0\x20\0\x20\0\x20\0\0\2\0\x3b", 26, 32, 32, 32, 32));
+	verify(DecodeDataCheckSize("GIF89a\x20\0\x50\0\0\0\0\x2c\x20\0\x20\0\x20\0\x20\0\0\2\0\x3b", 26, 32, 32, 32, 32));
+	verify(DecodeDataCheckSize("GIF89a\x30\0\x30\0\0\0\0\x2c\x20\0\x20\0\x20\0\x20\0\0\2\0\x3b", 26, 32, 32, 32, 32));
+	verify(DecodeDataCheckSize("GIF89a\x30\0\x40\0\0\0\0\x2c\x20\0\x20\0\x20\0\x20\0\0\2\0\x3b", 26, 32, 32, 32, 32));
+	verify(DecodeDataCheckSize("GIF89a\x30\0\x50\0\0\0\0\x2c\x20\0\x20\0\x20\0\x20\0\0\2\0\x3b", 26, 32, 32, 32, 32));
+	verify(DecodeDataCheckSize("GIF89a\x40\0\x40\0\0\0\0\x2c\x20\0\x20\0\x20\0\x20\0\0\2\0\x3b", 26, 64, 64, 32, 32));
+	verify(DecodeDataCheckSize("GIF89a\x40\0\x50\0\0\0\0\x2c\x20\0\x20\0\x20\0\x20\0\0\2\0\x3b", 26, 64, 80, 32, 32));
+	verify(DecodeDataCheckSize("GIF89a\x50\0\x50\0\0\0\0\x2c\x20\0\x20\0\x20\0\x20\0\0\2\0\x3b", 26, 80, 80, 32, 32));
+}
+
+test("ImageDecoderGif wrong size w 0 h 0") fails;
+{
+	const UINT8* empty_image = (const UINT8*)nosize_image;
+	int empty_image_len = nosize_image_len;
+	TestGifListener gif_listener;
+	gif_listener.Init();
+	ImageDecoderGif* decoder = ImageDecoderGif::Create(&gif_listener, FALSE);
+
+    // WONKO: cludge until finally works for tests that should fail
+#if 0
+	verify(decoder != NULL);
+	int resendBytes;
+	verify_success(decoder->DecodeData(empty_image, empty_image_len, FALSE, resendBytes));
+	verify(gif_listener.finished);
+	OP_DELETE(decoder);
+#else
+    if (decoder)
+    {
+		int resendBytes;
+        OP_STATUS status = decoder->DecodeData(empty_image, empty_image_len, FALSE, resendBytes);
+        BOOL finished = gif_listener.finished;
+        OP_DELETE(decoder);
+        decoder = 0;
+        verify(OpStatus::IsSuccess(status) && finished);
+    }
+    else
+        verify(decoder);
+#endif
+
+	gif_listener.Init();
+	decoder = ImageDecoderGif::Create(&gif_listener, FALSE);
+
+    // WONKO: cludge until finally works for tests that should fail
+#if 0
+	verify(decoder != NULL);
+	UINT8 buf[4096];
+	int buf_len = empty_image_len;
+	int send_in_len = 1;
+	op_memcpy(buf, empty_image, empty_image_len);
+	for (int i = 0; i < empty_image_len; i++)
+	{
+		int bytes_left;
+		verify_success(decoder->DecodeData(buf, send_in_len, send_in_len != buf_len, bytes_left));
+		int move_step = send_in_len - bytes_left;
+		op_memmove(buf, buf + move_step, buf_len - move_step);
+		buf_len -= move_step;
+		send_in_len = bytes_left + 1;
+	}
+	verify(gif_listener.finished);
+#else
+    if (decoder)
+    {
+        UINT8 buf[4096];
+        int buf_len = empty_image_len;
+        int send_in_len = 1;
+        op_memcpy(buf, empty_image, empty_image_len);
+        for (int i = 0; i < empty_image_len; i++)
+        {
+            int bytes_left;
+            OP_STATUS status = decoder->DecodeData(buf, send_in_len, send_in_len != buf_len, bytes_left);
+            if (OpStatus::IsError(status))
+            {
+                OP_DELETE(decoder);
+                decoder = 0;
+                verify_success(status);
+            }
+            int move_step = send_in_len - bytes_left;
+            op_memmove(buf, buf + move_step, buf_len - move_step);
+            buf_len -= move_step;
+            send_in_len = bytes_left + 1;
+        }
+        BOOL finished = gif_listener.finished;
+        OP_DELETE(decoder);
+        decoder = 0;
+        verify(finished);
+    }
+    else
+        verify(decoder);
+#endif
+}
+finally
+{
+    output("deleting decoder\n");
+	OP_DELETE(decoder);
+}
+
+test("ImageDecoderGif wrong size w 0") fails;
+{
+	const UINT8* empty_image = (const UINT8*)nowidth_image;
+	int empty_image_len = nowidth_image_len;
+	TestGifListener gif_listener;
+	gif_listener.Init();
+	ImageDecoderGif* decoder = ImageDecoderGif::Create(&gif_listener, FALSE);
+
+    // WONKO: cludge until finally works for tests that should fail
+#if 0
+	verify(decoder != NULL);
+	int resendBytes;
+	verify_success(decoder->DecodeData(empty_image, empty_image_len, FALSE, resendBytes));
+	verify(gif_listener.finished);
+	OP_DELETE(decoder);
+#else
+    if (decoder)
+    {
+		int resendBytes;
+        OP_STATUS status = decoder->DecodeData(empty_image, empty_image_len, FALSE, resendBytes);
+        BOOL finished = gif_listener.finished;
+        OP_DELETE(decoder);
+        decoder = 0;
+        verify(OpStatus::IsSuccess(status) && finished);
+    }
+    else
+        verify(decoder);
+#endif
+
+	gif_listener.Init();
+	decoder = ImageDecoderGif::Create(&gif_listener, FALSE);
+
+    // WONKO: cludge until finally works for tests that should fail
+#if 0
+	verify(decoder != NULL);
+	UINT8 buf[4096];
+	int buf_len = empty_image_len;
+	int send_in_len = 1;
+	op_memcpy(buf, empty_image, empty_image_len);
+	for (int i = 0; i < empty_image_len; i++)
+	{
+		int bytes_left;
+		verify_success(decoder->DecodeData(buf, send_in_len, send_in_len != buf_len, bytes_left));
+		int move_step = send_in_len - bytes_left;
+		op_memmove(buf, buf + move_step, buf_len - move_step);
+		buf_len -= move_step;
+		send_in_len = bytes_left + 1;
+	}
+	verify(gif_listener.finished);
+	OP_DELETE(decoder);
+#else
+    if (decoder)
+    {
+        UINT8 buf[4096];
+        int buf_len = empty_image_len;
+        int send_in_len = 1;
+        op_memcpy(buf, empty_image, empty_image_len);
+        for (int i = 0; i < empty_image_len; i++)
+        {
+            int bytes_left;
+            OP_STATUS status = decoder->DecodeData(buf, send_in_len, send_in_len != buf_len, bytes_left);
+            if (OpStatus::IsError(status))
+            {
+                OP_DELETE(decoder);
+                decoder = 0;
+                verify_success(status);
+            }
+            int move_step = send_in_len - bytes_left;
+            op_memmove(buf, buf + move_step, buf_len - move_step);
+            buf_len -= move_step;
+            send_in_len = bytes_left + 1;
+        }
+        BOOL finished = gif_listener.finished;
+        OP_DELETE(decoder);
+        decoder = 0;
+        verify(finished);
+    }
+    else
+        verify(decoder);
+#endif
+}
+finally
+{
+    OP_DELETE(decoder);
+}
+
+test("ImageDecoderGif wrong size h 0") fails;
+{
+	const UINT8* empty_image = (const UINT8*)noheight_image;
+	int empty_image_len = noheight_image_len;
+	TestGifListener gif_listener;
+	gif_listener.Init();
+	ImageDecoderGif* decoder = ImageDecoderGif::Create(&gif_listener, FALSE);
+
+    // WONKO: cludge until finally works for tests that should fail
+#if 0
+	verify(decoder != NULL);
+	int resendBytes;
+	verify_success(decoder->DecodeData(empty_image, empty_image_len, FALSE, resendBytes));
+	verify(gif_listener.finished);
+	OP_DELETE(decoder);
+#else
+    if (decoder)
+    {
+		int resendBytes;
+        OP_STATUS status = decoder->DecodeData(empty_image, empty_image_len, FALSE, resendBytes);
+        BOOL finished = gif_listener.finished;
+        OP_DELETE(decoder);
+        decoder = 0;
+        verify(OpStatus::IsSuccess(status) && finished);
+    }
+    else
+        verify(decoder);
+#endif
+
+	gif_listener.Init();
+	decoder = ImageDecoderGif::Create(&gif_listener, FALSE);
+
+    // WONKO: cludge until finally works for tests that should fail
+#if 0
+	verify(decoder != NULL);
+	UINT8 buf[4096];
+	int buf_len = empty_image_len;
+	int send_in_len = 1;
+	op_memcpy(buf, empty_image, empty_image_len);
+	for (int i = 0; i < empty_image_len; i++)
+	{
+		int bytes_left;
+		verify_success(decoder->DecodeData(buf, send_in_len, send_in_len != buf_len, bytes_left));
+		int move_step = send_in_len - bytes_left;
+		op_memmove(buf, buf + move_step, buf_len - move_step);
+		buf_len -= move_step;
+		send_in_len = bytes_left + 1;
+	}
+	verify(gif_listener.finished);
+	OP_DELETE(decoder);
+#else
+    if (decoder)
+    {
+        UINT8 buf[4096];
+        int buf_len = empty_image_len;
+        int send_in_len = 1;
+        op_memcpy(buf, empty_image, empty_image_len);
+        for (int i = 0; i < empty_image_len; i++)
+        {
+            int bytes_left;
+            OP_STATUS status = decoder->DecodeData(buf, send_in_len, send_in_len != buf_len, bytes_left);
+            if (OpStatus::IsError(status))
+            {
+                OP_DELETE(decoder);
+                decoder = 0;
+                verify_success(status);
+            }
+            int move_step = send_in_len - bytes_left;
+            op_memmove(buf, buf + move_step, buf_len - move_step);
+            buf_len -= move_step;
+            send_in_len = bytes_left + 1;
+        }
+        BOOL finished = gif_listener.finished;
+        OP_DELETE(decoder);
+        decoder = 0;
+        verify(finished);
+    }
+    else
+        verify(decoder);
+#endif
+}
+finally
+{
+    OP_DELETE(decoder);
+}
+
+test("ImageDecoderGif transparent")
+{
+	// nocontrol
+	verify(DecodeDataCheckTransparent("GIF89a\x10\0\x10\0\0\0\0\x2c\0\0\0\0\0\0\0\0\x80\x22\x22\x22\x44\x44\x44\2\0\x3b", 32, FALSE, 0));
+	// opaquecontrol
+	verify(DecodeDataCheckTransparent("GIF89a\x10\0\x10\0\0\0\0\x21\xf9\4\0\0\0\0\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x3b", 34, FALSE, 0));
+	// transpcontrol
+	verify(DecodeDataCheckTransparent("GIF89a\x10\0\x10\0\0\0\0\x21\xf9\4\1\0\0\3\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x3b", 34, TRUE, 3));
+
+	// nocontrol nocontrol
+	verify(DecodeDataCheckTransparent("GIF89a\x10\0\x10\0\0\0\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x3b", 38, FALSE, 0));
+	// nocontrol opaquecontrol
+	verify(DecodeDataCheckTransparent("GIF89a\x10\0\x10\0\0\0\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x21\xf9\4\0\0\0\0\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x3b", 46, FALSE, 0));
+	// nocontrol transpcontrol
+	verify(DecodeDataCheckTransparent("GIF89a\x10\0\x10\0\0\0\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x21\xf9\4\1\0\0\3\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x3b", 46, TRUE, 3));
+	// opaquecontrol nocontrol
+	verify(DecodeDataCheckTransparent("GIF89a\x10\0\x10\0\0\0\0\x21\xf9\4\0\0\0\0\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x3b", 46, FALSE, 0));
+	// opaquecontrol opaquecontrol
+	verify(DecodeDataCheckTransparent("GIF89a\x10\0\x10\0\0\0\0\x21\xf9\4\0\0\0\0\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x21\xf9\4\0\0\0\0\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x3b", 54, FALSE, 0));
+	// opaquecontrol transpcontrol
+	verify(DecodeDataCheckTransparent("GIF89a\x10\0\x10\0\0\0\0\x21\xf9\4\0\0\0\0\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x21\xf9\4\1\0\0\3\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x3b", 54, TRUE, 3));
+	// transpcontrol nocontrol
+	verify(DecodeDataCheckTransparent("GIF89a\x10\0\x10\0\0\0\0\x21\xf9\4\1\0\0\3\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x3b", 46, FALSE, 0));
+	// transpcontrol opaquecontrol
+	verify(DecodeDataCheckTransparent("GIF89a\x10\0\x10\0\0\0\0\x21\xf9\4\1\0\0\3\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x21\xf9\4\0\0\0\0\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x3b", 54, FALSE, 0));
+	// transpcontrol transpcontrol
+	verify(DecodeDataCheckTransparent("GIF89a\x10\0\x10\0\0\0\0\x21\xf9\4\1\0\0\0\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x21\xf9\4\1\0\0\3\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x3b", 54, TRUE, 3));
+}
+
+// error below here
+
+test("ImageDecoderGif leakcheck") leakcheck;
+{
+	// 2 color global palette.
+	verify(DecodeData("GIF89a\x10\0\x10\0\x80\0\0\x22\x22\x22\x32\x32\x32\x3b", 20));
+	// 2 color local palette.
+	verify(DecodeData("GIF89a\x10\0\x10\0\0\0\0\x2c\0\0\0\0\0\0\0\0\x80\x22\x22\x22\x44\x44\x44\2\0\x3b", 32));
+	// 2 color global palette and 2 color local palette.
+	verify(DecodeData("GIF89a\x10\0\x10\0\x80\0\0\x22\x22\x22\x32\x32\x32\x2c\0\0\0\0\0\0\0\0\x80\x22\x22\x22\x44\x44\x44\2\0\x3b", 38));
+	// 2 color global palette + 2 color local + 2 color local
+	verify(DecodeData("GIF89a\x10\0\x10\0\x80\0\0\x22\x22\x22\x32\x32\x32\x2c\0\0\0\0\0\0\0\0\x80\x22\x22\x22\x44\x44\x44\2\0\x2c\0\0\0\0\0\0\0\0\x80\x66\x66\x66\x88\x88\x88\2\0\x3b", 56));
+	// 2 color global palette + 0 color local + 0 color local
+	verify(DecodeData("GIF89a\x10\0\x10\0\x80\0\0\x22\x22\x22\x32\x32\x32\x2c\0\0\0\0\0\0\0\0\0\2\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x3b", 44));
+	// 2 color global palette + 2 color local + 0 color local
+	verify(DecodeData("GIF89a\x10\0\x10\0\x80\0\0\x22\x22\x22\x32\x32\x32\x2c\0\0\0\0\0\0\0\0\x80\x22\x22\x22\x44\x44\x44\2\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x3b", 50));
+	// 2 color global palette + 0 color local + 2 color local
+	verify(DecodeData("GIF89a\x10\0\x10\0\x80\0\0\x22\x22\x22\x32\x32\x32\x2c\0\0\0\0\0\0\0\0\0\2\0\x2c\0\0\0\0\0\0\0\0\x80\x66\x66\x66\x88\x88\x88\2\0\x3b", 50));
+	// 0 color global palette + 2 color local + 2 color local
+	verify(DecodeData("GIF89a\x10\0\x10\0\0\0\0\x2c\0\0\0\0\0\0\0\0\x80\x22\x22\x22\x44\x44\x44\2\0\x2c\0\0\0\0\0\0\0\0\x80\x66\x66\x66\x88\x88\x88\2\0\x3b", 50));
+	// 0 color global palette + 2 color local + 0 color local
+	verify(DecodeData("GIF89a\x10\0\x10\0\0\0\0\x2c\0\0\0\0\0\0\0\0\x80\x22\x22\x22\x44\x44\x44\2\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x3b", 44));
+	// 0 color global palette + 0 color local + 2 color local
+	verify(DecodeData("GIF89a\x10\0\x10\0\0\0\0\x2c\0\0\0\0\0\0\0\0\0\2\0\x2c\0\0\0\0\0\0\0\0\x80\x66\x66\x66\x88\x88\x88\2\0\x3b", 44));
+}
+
+// Test position of frames. Test size of frames.
+
+// Test interlaced images. Do this on top level.
+
+// Animated image test.
+
+//////////////////////////////////////////////////////////
+// Real image testing                                   //
+//////////////////////////////////////////////////////////
+
+table RealImages(const char*) filelist "images" name "*.gif";
+
+test("ImageDecoderGif compare real images")
+	require _BMP_SUPPORT_;
+{
+	iterate (c) from RealImages
+	{
+		// Decode both into 32 bit images.
+		// We will have to decode into 8 bits under Windows,
+		// and 32 bits on Linux. Different tests.
+		// We need to be able to decode image one byte at a time, and in bigger chunks.
+		// We need to succeed with the image (decoding all of it), never fail.
+		// We need to compare output with the output from a bmp.
+#ifdef SUPPORT_INDEXED_OPBITMAP
+		RealDecoderListener gif_listener(TRUE);
+#else
+		RealDecoderListener gif_listener(FALSE);
+#endif // SUPPORT_INDEXED_OPBITMAP
+		ImageDecoder* gif_decoder = ImageDecoderGif::Create(&gif_listener);
+		verify(gif_decoder != NULL);
+		verify_success(DecodeImage(gif_decoder, c, FALSE));
+		verify(gif_listener.finished);
+
+		char buf[4096]; /* ARRAY OK 2009-04-16 wonko */
+        verify(op_strlen(c) < 4096);
+		op_strcpy(buf, c);
+		op_strncpy(buf + op_strlen(c) - 4, ".bmp", 4);
+		RealDecoderListener bmp_listener(FALSE);
+		ImageDecoder* bmp_decoder = OP_NEW(ImageDecoderBmp, ());
+		verify(bmp_decoder != NULL);
+		bmp_decoder->SetImageDecoderListener(&bmp_listener);
+		verify_success(DecodeImage(bmp_decoder, buf, FALSE));
+		verify(bmp_listener.finished);
+        OP_DELETE(bmp_decoder);
+
+		verify(gif_listener.Compare(&bmp_listener));
+        OP_DELETE(gif_decoder);
+	}
+}
+
+table Bug134335(const char*) filelist "images/bug_images" name "bug134335.gif";
+
+test("Bug 134335, index outside palette")
+{
+#ifdef SUPPORT_INDEXED_OPBITMAP
+	RealDecoderListener gif_listener(TRUE);
+#else
+	RealDecoderListener gif_listener(FALSE);
+#endif // SUPPORT_INDEXED_OPBITMAP
+	ImageDecoder* gif_decoder = ImageDecoderGif::Create(&gif_listener);
+	verify(gif_decoder != NULL);
+	iterate (c) from Bug134335
+	{
+		verify_success(DecodeImage(gif_decoder, c, FALSE));
+	}
+	verify(gif_listener.finished);
+	verify(!gif_listener.outside_index_error);
+}
+finally
+{
+    OP_DELETE(gif_decoder);
+}
+
+table Bug134128(const char*) filelist "images/bug_images" name "bug134128.gif";
+
+test("Bug 134128, index outside palette")
+{
+#ifdef SUPPORT_INDEXED_OPBITMAP
+	RealDecoderListener gif_listener(TRUE);
+#else
+	RealDecoderListener gif_listener(FALSE);
+#endif // SUPPORT_INDEXED_OPBITMAP
+	ImageDecoder* gif_decoder = ImageDecoderGif::Create(&gif_listener);
+	verify(gif_decoder != NULL);
+	iterate (c) from Bug134128
+	{
+		verify_success(DecodeImage(gif_decoder, c, FALSE));
+	}
+	verify(gif_listener.finished);
+	verify(!gif_listener.outside_index_error);
+}
+finally
+{
+    OP_DELETE(gif_decoder);
+}
+
+table Bug136262(const char*) filelist "images/bug_images" name "bug136262.gif";
+
+test("Bug 136262, 14*1 pixel, no trailer, double 0 where not allowed")
+{
+#ifdef SUPPORT_INDEXED_OPBITMAP
+	RealDecoderListener gif_listener(TRUE);
+#else
+	RealDecoderListener gif_listener(FALSE);
+#endif // SUPPORT_INDEXED_OPBITMAP
+	ImageDecoder* gif_decoder = ImageDecoderGif::Create(&gif_listener);
+	verify(gif_decoder != NULL);
+	iterate (c) from Bug136262
+	{
+		verify_success(DecodeImage(gif_decoder, c, FALSE));
+	}
+	verify(gif_listener.finished);
+	verify(!gif_listener.outside_index_error);
+}
+finally
+{
+    OP_DELETE(gif_decoder);
+}
+
+table Bug136267(const char*) filelist "images/bug_images" name "bug136267.gif";
+
+test("Bug 136267, 1*1 pixel, interlaced, writes outside image")
+{
+#ifdef SUPPORT_INDEXED_OPBITMAP
+	RealDecoderListener gif_listener(TRUE);
+#else
+	RealDecoderListener gif_listener(FALSE);
+#endif // SUPPORT_INDEXED_OPBITMAP
+	ImageDecoder* gif_decoder = ImageDecoderGif::Create(&gif_listener);
+	verify(gif_decoder != NULL);
+	iterate (c) from Bug136267
+	{
+		verify_success(DecodeImage(gif_decoder, c, FALSE));
+	}
+	verify(gif_listener.finished);
+	verify(!gif_listener.outside_index_error);
+}
+finally
+{
+    OP_DELETE(gif_decoder);
+}
+
+table Bug138572(const char*) filelist "images/bug_images" name "bug138572.gif";
+
+test("Bug 138572, image with wrong data block size at the end.")
+{
+	// We may come to the conclusion that we want to try to read the
+	// remaining pixels in the last data block.
+#ifdef SUPPORT_INDEXED_OPBITMAP
+	RealDecoderListener gif_listener(TRUE);
+#else
+	RealDecoderListener gif_listener(FALSE);
+#endif // SUPPORT_INDEXED_OPBITMAP
+	ImageDecoder* gif_decoder = ImageDecoderGif::Create(&gif_listener);
+	verify(gif_decoder != NULL);
+	iterate (c) from Bug138572
+	{
+		verify_success(DecodeImage(gif_decoder, c, FALSE));
+	}
+	verify(gif_listener.finished);
+	verify(!gif_listener.outside_index_error);
+}
+finally
+{
+    OP_DELETE(gif_decoder);
+}
+
+table Bug137091(const char*) filelist "images/bug_images" name "bug137091.gif";
+
+test("Bug 137091, 7 byte broken image.")
+{
+#ifdef SUPPORT_INDEXED_OPBITMAP
+	RealDecoderListener gif_listener(TRUE);
+#else
+	RealDecoderListener gif_listener(FALSE);
+#endif // SUPPORT_INDEXED_OPBITMAP
+	ImageDecoder* gif_decoder = ImageDecoderGif::Create(&gif_listener);
+	verify(gif_decoder != NULL);
+	iterate (c) from Bug137091
+	{
+		verify_success(DecodeImage(gif_decoder, c, TRUE));
+	}
+	verify(!gif_listener.finished);
+	verify(!gif_listener.outside_index_error);
+}
+finally
+{
+    OP_DELETE(gif_decoder);
+}
+
+table Bug138727(const char*) filelist "images/bug_images" name "bug138727.gif";
+
+test("Bug 138727, an image with two graphic control extensions in a row .")
+{
+#ifdef SUPPORT_INDEXED_OPBITMAP
+	RealDecoderListener gif_listener(TRUE);
+#else
+	RealDecoderListener gif_listener(FALSE);
+#endif // SUPPORT_INDEXED_OPBITMAP
+	ImageDecoder* gif_decoder = ImageDecoderGif::Create(&gif_listener);
+	verify(gif_decoder != NULL);
+	iterate (c) from Bug138727
+	{
+		verify_success(DecodeImage(gif_decoder, c, FALSE));
+	}
+	verify(gif_listener.finished);
+	verify(!gif_listener.outside_index_error);
+}
+finally
+{
+    OP_DELETE(gif_decoder);
+}
+
+table CORE_45593(const char*) filelist "images/bug_images" name "CORE-45593.gif";
+
+test("CORE-45593: circular table entry")
+{
+#ifdef SUPPORT_INDEXED_OPBITMAP
+	RealDecoderListener gif_listener(TRUE);
+#else
+	RealDecoderListener gif_listener(FALSE);
+#endif // SUPPORT_INDEXED_OPBITMAP
+	ImageDecoder* gif_decoder = ImageDecoderGif::Create(&gif_listener);
+	verify(gif_decoder != NULL);
+	iterate (c) from CORE_45593
+	{
+		const OP_STATUS decode = DecodeImage(gif_decoder, c, FALSE);
+		verify(OpStatus::IsError(decode));
+	}
+	verify(!gif_listener.finished);
+	verify(!gif_listener.outside_index_error);
+}
+finally
+{
+	OP_DELETE(gif_decoder);
+}
+
+table CORE_47982(const char*) filelist "images/bug_images" name "CORE-47982.gif";
+
+test("CORE-47982: circular table entry")
+{
+#ifdef SUPPORT_INDEXED_OPBITMAP
+	RealDecoderListener gif_listener(TRUE);
+#else
+	RealDecoderListener gif_listener(FALSE);
+#endif // SUPPORT_INDEXED_OPBITMAP
+	ImageDecoder* gif_decoder = ImageDecoderGif::Create(&gif_listener);
+	verify(gif_decoder != NULL);
+	iterate (c) from CORE_47982
+	{
+		const OP_STATUS decode = DecodeImage(gif_decoder, c, FALSE);
+		verify(OpStatus::IsError(decode));
+	}
+	verify(!gif_listener.finished);
+	verify(!gif_listener.outside_index_error);
+}
+finally
+{
+	OP_DELETE(gif_decoder);
+}

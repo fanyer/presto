@@ -1,0 +1,384 @@
+/* -*- Mode: c++; tab-width: 4; indent-tabs-mode: t; c-basic-offset: 4 -*-
+**
+** Copyright (C) 1995-2010 Opera Software ASA.  All rights reserved.
+**
+** This file is part of the Opera web browser.  It may not be distributed
+** under any circumstances.
+*/
+
+group "device_api.JIL.Filesystem";
+
+require DOM_JIL_API_SUPPORT;
+
+include "modules/util/opstring.h";
+include "modules/device_api/device_api_module.h";
+include "modules/device_api/jil/JILFSMgr.h";
+include "modules/device_api/jil/JILFileFinder.h";
+include "modules/device_api/jil/JILFolderLister.h";
+include "modules/util/opfile/opfile.h";
+include "modules/pi/device_api/OpStorageMonitor.h";
+
+language c++;
+
+table dummy1(const char *) filelist "filesystem_test_files" recursively;
+
+global
+{
+	OpString virt_photos;
+	OpString virt_music;
+	OpString selftest_mount_point;
+	OpAutoVector<OpString> curr_virt_roots;
+
+	class TestFilesFoundListener : public FilesFoundListener
+	{
+	private:
+		OpString *m_expected_results;
+		unsigned int m_num_of_results;
+		OpFileInfo *m_file_info;
+
+	public:
+		void OnFilesFound(OpVector<OpString> *file_list)
+		{
+			BOOL passed = FALSE;
+			if (m_num_of_results == file_list->GetCount())
+			{
+				unsigned int the_same_cnt = 0;
+				for (UINT32 i = 0; i < m_num_of_results; ++i)
+				{
+					for (UINT32 j = 0; j < m_num_of_results; ++j)
+					{
+						if (file_list->Get(i)->Compare(m_expected_results[j]) == 0)
+						{
+							++the_same_cnt;
+							break;
+						}
+					}
+				}
+
+				passed = (m_num_of_results == the_same_cnt);
+			}
+
+			if (passed)
+				ST_passed();
+			else
+				ST_failed("Wrong results", "", "");
+
+			OP_DELETE(m_file_info);
+			m_file_info = NULL;
+		}
+
+		void OnError(OP_STATUS err)
+		{
+			ST_failed("Unexpected error notification", "", "");
+		}
+
+		void SetExpectedResults(OpString *expected, unsigned int length)
+		{
+			m_expected_results = expected;
+			m_num_of_results = length;
+		}
+
+		void TakeOver(OpFileInfo *file_info)
+		{
+			m_file_info = file_info;
+		}
+
+		TestFilesFoundListener() : m_expected_results(NULL), m_num_of_results(0), m_file_info(NULL) {}
+		virtual ~TestFilesFoundListener() {}
+	};
+
+	TestFilesFoundListener files_found_listener;
+	JILFileFinder file_finder;
+
+	enum { MAX_EXPECTED_RESULTS = 3 };
+	OpString expect_results[MAX_EXPECTED_RESULTS];
+}
+
+exit
+{
+	if (!selftest_mount_point.IsEmpty())
+	{
+		g_DAPI_jil_fs_mgr->RemoveMapping(selftest_mount_point.CStr(), NULL, NULL);
+		for (UINT32 i = 0; i < curr_virt_roots.GetCount(); ++i)
+			g_DAPI_jil_fs_mgr->SetActive(curr_virt_roots.Get(i)->CStr(), TRUE);
+	}
+}
+
+test("Setup filesystem")
+	file uni test_mount_point "";
+{
+	OP_STATUS result = g_DAPI_jil_fs_mgr->GetAvailableVirtualDirs(&curr_virt_roots);
+	verify_success(result);
+	for (UINT32 i = 0; i < curr_virt_roots.GetCount(); ++i)
+	{
+		result = g_DAPI_jil_fs_mgr->SetActive(curr_virt_roots.Get(i)->CStr(), FALSE);
+		verify_success(result);
+	}
+
+	result = selftest_mount_point.Set(test_mount_point);
+	verify_success(result);
+	result = virt_photos.Set("/selftest/photos");
+	verify_success(result);
+	result= virt_music.Set("/selftest/music");
+	verify_success(result);
+
+	OpString real_path;
+	result = real_path.AppendFormat(UNI_L("%cfilesystem_test_files%cphotos"), PATHSEPCHAR, PATHSEPCHAR);
+	verify_success(result);
+	result = g_DAPI_jil_fs_mgr->AddMapping(test_mount_point, real_path.CStr(), virt_photos.CStr(), TRUE);
+	verify_success(result);
+	real_path.Empty();
+	real_path.AppendFormat(UNI_L("%cfilesystem_test_files%cmusic"), PATHSEPCHAR, PATHSEPCHAR);
+	result = g_DAPI_jil_fs_mgr->AddMapping(test_mount_point, real_path.CStr(), virt_music.CStr(), TRUE);
+	verify_success(result);
+
+	real_path.Empty();
+	real_path.AppendFormat(UNI_L("%cfilesystem_test_files"), PATHSEPCHAR);
+	result = g_DAPI_jil_fs_mgr->AddMapping(test_mount_point, real_path.CStr(), UNI_L("/selftest"), TRUE);
+	verify_status(OpStatus::ERR, result);
+}
+
+test("Test JILFSMgr::IsVirtualRoot()")
+	require success "Setup filesystem";
+{
+	BOOL is_virt_root = g_DAPI_jil_fs_mgr->IsVirtualRoot(UNI_L("/selftest"), FALSE);
+	verify(is_virt_root == FALSE);
+
+	is_virt_root = g_DAPI_jil_fs_mgr->IsVirtualRoot(UNI_L("/selftest"), TRUE);
+	verify(is_virt_root == TRUE);
+
+	is_virt_root = g_DAPI_jil_fs_mgr->IsVirtualRoot(UNI_L("/selftest/photos"), FALSE);
+	verify(is_virt_root == TRUE);
+
+	is_virt_root = g_DAPI_jil_fs_mgr->IsVirtualRoot(UNI_L("/selftest/photos"), TRUE);
+	verify(is_virt_root == TRUE);
+
+	is_virt_root = g_DAPI_jil_fs_mgr->IsVirtualRoot(UNI_L("/sdcard"), TRUE);
+	verify(is_virt_root == FALSE);
+
+	is_virt_root = g_DAPI_jil_fs_mgr->IsVirtualRoot(UNI_L("/sdcard"), FALSE);
+	verify(is_virt_root == FALSE);
+}
+
+test("Test JILFSMgr::GetAvailableVirtualDirs()")
+	require success "Setup filesystem";
+{
+	OpAutoVector<OpString> virt_dirs;
+	OpVector<OpString> expected_roots;
+	OP_STATUS result = expected_roots.Add(&virt_photos);
+	verify_success(result);
+	result = expected_roots.Add(&virt_music);
+	verify_success(result);
+
+	result = g_DAPI_jil_fs_mgr->GetAvailableVirtualDirs(NULL);
+	verify(OpStatus::IsError(result));
+
+	result = g_DAPI_jil_fs_mgr->GetAvailableVirtualDirs(&virt_dirs);
+	verify_success(result);
+
+	verify(virt_dirs.GetCount() == expected_roots.GetCount());
+
+	for (UINT32 i = 0; i < virt_dirs.GetCount(); ++i)
+	{
+		verify_string(expected_roots.Get(i)->CStr(), virt_dirs.Get(i)->CStr());
+	}
+}
+
+test("Test JILFSMgr::IsFileAccessAllowed()")
+	require success "Setup filesystem";
+	file uni path_to_music_file "filesystem_test_files/music/music_file.m";
+{
+	OpString sys_file;
+	URL test_url = g_url_api->GetURL(UNI_L("file:///selftest/download/downloaded_file.p"));
+	BOOL allowed = g_DAPI_jil_fs_mgr->IsFileAccessAllowed(test_url);
+	verify(allowed == FALSE);
+
+	// Host name should be allowed but is ignored
+	test_url = g_url_api->GetURL(UNI_L("file://localhost/selftest/music/music_file.m"));
+	allowed = g_DAPI_jil_fs_mgr->IsFileAccessAllowed(test_url);
+	verify(allowed == TRUE);
+
+	test_url = g_url_api->GetURL(UNI_L("file:///selftest/music/music_file.m"));
+	allowed = g_DAPI_jil_fs_mgr->IsFileAccessAllowed(test_url);
+	verify(allowed == TRUE);
+
+	g_DAPI_jil_fs_mgr->JILToSystemPath(test_url.GetAttribute(URL::KUniPath), sys_file);
+	verify_string(path_to_music_file, sys_file.CStr());
+}
+
+test("Test JILFSMgr::JILToSystemPath() and JILFSMgr::SystemToJILPath()")
+	require success "Setup filesystem";
+	file uni path_to_photo_file "filesystem_test_files/photos/photo_file.p";
+{
+	OpString sys_path;
+	OpString jil_path;
+
+	OP_STATUS result = g_DAPI_jil_fs_mgr->JILToSystemPath(UNI_L("/selftest"), sys_path);
+	verify(OpStatus::IsError(result) && sys_path.IsEmpty());
+
+	result = g_DAPI_jil_fs_mgr->JILToSystemPath(UNI_L("/selftest/music/not_existing_file.f"), sys_path);
+	verify_success(result);
+	verify(!sys_path.IsEmpty());
+
+	sys_path.Wipe();
+	result = g_DAPI_jil_fs_mgr->JILToSystemPath(UNI_L("/selftest/photos/photo_file.p"), sys_path);
+	verify_success(result);
+	verify(!sys_path.IsEmpty());
+	verify_string(path_to_photo_file, sys_path.CStr());
+
+	result = g_DAPI_jil_fs_mgr->SystemToJILPath(sys_path.CStr(), jil_path);
+	verify_success(result);
+	verify(!jil_path.IsEmpty());
+	verify_string(UNI_L("/selftest/photos/photo_file.p"), jil_path.CStr());
+
+	jil_path.Wipe();
+	result = g_DAPI_jil_fs_mgr->SystemToJILPath(UNI_L("C:\\some_folder"), jil_path);
+	verify(OpStatus::IsError(result) && jil_path.IsEmpty());
+}
+
+test("Test JILFileFinder::Find() 1")
+	require success "Setup filesystem";
+	async;
+{
+	expect_results[0].Set("/selftest/music");
+	expect_results[1].Set("/selftest/music/music_file.m");
+	expect_results[2].Set("/selftest/photos");
+
+	files_found_listener.SetExpectedResults(expect_results, 3);
+	file_finder.Find(UNI_L("/selftest"), UNI_L("*s*"), &files_found_listener, TRUE);
+}
+
+test("Test JILFileFinder::Find() 2")
+	require success "Setup filesystem";
+	async;
+{
+	expect_results[0].Set("/selftest/music");
+	expect_results[1].Set("/selftest/photos");
+
+	files_found_listener.SetExpectedResults(expect_results, 2);
+	file_finder.Find(UNI_L("/selftest"), UNI_L("*s*"), &files_found_listener, FALSE);
+}
+
+test("Test JILFileFinder::Find() 3")
+	require success "Setup filesystem";
+	file uni path_to_photo_file "filesystem_test_files/photos/photo_file.p";
+	async;
+{
+	expect_results[0].Set("/selftest/photos/photo_file.p");
+	files_found_listener.SetExpectedResults(expect_results, 1);
+
+	OpFile photo_file;
+	OP_STATUS result = photo_file.Construct(path_to_photo_file);
+	if (OpStatus::IsError(result))
+	{
+		ST_failed_with_status("Could not construct file", result, 244);
+		return -2;
+	}
+
+	OpFileInfo *file_info;
+	file_info = OP_NEW(OpFileInfo, ());
+	if (!file_info)
+	{
+		ST_failed_with_status("OOM while allocating file info", OpStatus::ERR_NO_MEMORY, 252);
+		return -2;
+	}
+
+	files_found_listener.TakeOver(file_info);
+
+	file_info->flags = OpFileInfo::LENGTH | OpFileInfo::LAST_MODIFIED | OpFileInfo::CREATION_TIME | OpFileInfo::MODE;
+	result = photo_file.GetFileInfo(file_info);
+	if (OpStatus::IsError(result))
+	{
+		ST_failed_with_status("Could not get file's info", result, 262);
+		return -2;
+	}
+
+	file_finder.Find(UNI_L("/selftest"), UNI_L("*"), &files_found_listener, TRUE, file_info);
+}
+
+test("Test JILFileFinder::Find() 4")
+	require success "Setup filesystem";
+	async;
+{
+	files_found_listener.SetExpectedResults(expect_results, 0);
+	file_finder.Find(UNI_L("/"), UNI_L("not_existing_file.txt"), &files_found_listener, TRUE);
+}
+
+test("Test JILFolderLister")
+	require success "Setup filesystem";
+	file uni root "filesystem_test_files";
+{
+	JILFolderLister jil_folder_lister;
+	OpString path, pattern;
+	path.Set("/selftest");
+	pattern.Set("*s*");
+	verify_success(jil_folder_lister.Construct(path, pattern, FALSE));
+
+	int next_cnt = 0;
+	int expected_next_cnt = 2;
+	OpFile file;
+	OpFileInfo file_info;
+	OpString file_path;
+	while(jil_folder_lister.Next())
+	{
+		++next_cnt;
+		if (uni_strcmp("/selftest/music", jil_folder_lister.GetFullPath()) == 0)
+		{
+			verify(jil_folder_lister.Matches());
+			verify_string("music", jil_folder_lister.GetFileName());
+			verify_string("/selftest/", jil_folder_lister.GetDirName());
+			file_path.Set(root);
+			file_path.Append("/music");
+			JILFSMgr::ToSystemPathSeparator(file_path.CStr());
+			verify_success(file.Construct(file_path));
+			op_memset(&file_info, 0, sizeof(file_info));
+			file_info.flags = OpFileInfo::LENGTH | OpFileInfo::LAST_MODIFIED;
+			verify_success(file.GetFileInfo(&file_info));
+			file_info.mode = OpFileInfo::NOT_REGULAR;
+			verify(jil_folder_lister.Matches(&file_info));
+			continue;
+		}
+
+		if (uni_strcmp("/selftest/photos", jil_folder_lister.GetFullPath()) == 0)
+		{
+			verify(jil_folder_lister.Matches());
+			verify_string("photos", jil_folder_lister.GetFileName());
+			verify_string("/selftest/", jil_folder_lister.GetDirName());
+			file_path.Set(root);
+			file_path.Append("/photos");
+			JILFSMgr::ToSystemPathSeparator(file_path.CStr());
+			verify_success(file.Construct(file_path));
+			op_memset(&file_info, 0, sizeof(file_info));
+			file_info.flags = OpFileInfo::CREATION_TIME | OpFileInfo::MODE;
+			verify_success(file.GetFileInfo(&file_info));
+			verify(jil_folder_lister.Matches(&file_info));
+			continue;
+		}
+
+		verify(jil_folder_lister.Matches() == FALSE);
+	}
+
+	verify(next_cnt == expected_next_cnt);
+}
+
+test("Test AddMapping after mount point information is received")
+	require success "Setup filesystem";
+{
+	const uni_char *mount_point_path = UNI_L("dummy_mount_point");
+
+	StorageInfo storage_info;
+	storage_info.mountpoint = mount_point_path;
+	storage_info.label = UNI_L("");
+	storage_info.type = STORAGE_REMOVABLE;
+
+	verify_success(g_DAPI_jil_fs_mgr->OnStorageMounted(storage_info));
+	verify_success(g_DAPI_jil_fs_mgr->AddMapping(mount_point_path, UNI_L(PATHSEP), UNI_L("/test_mount_point")));
+
+	verify(g_DAPI_jil_fs_mgr->IsMounted(mount_point_path) == OpBoolean::IS_TRUE);
+	verify_success(g_DAPI_jil_fs_mgr->OnStorageUnmounted(storage_info));
+	verify(g_DAPI_jil_fs_mgr->IsMounted(mount_point_path) == OpBoolean::IS_FALSE);
+}
+finally
+{
+	g_DAPI_jil_fs_mgr->RemoveMapping(mount_point_path, NULL, NULL);
+}

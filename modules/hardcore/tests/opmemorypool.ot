@@ -1,0 +1,254 @@
+/* -*- Mode: c++; tab-width: 4; indent-tabs-mode: t; c-basic-offset: 4 -*-
+ *
+ * Copyright (C) 1995-2011 Opera Software ASA.  All rights reserved.
+ *
+ * This file is part of the Opera web browser.
+ * It may not be distributed under any circumstances.
+ */
+
+group "hardcore.component.opmemorypool";
+language c++;
+
+require HC_MEMORY_POOL_SELFTEST_ENABLED;
+
+include "modules/hardcore/component/OpMemoryPool.h";
+include "modules/hardcore/tests/testmemorypool.h";
+include "modules/hardcore/mem/mem_man.h";
+
+test("OP_NEW TestPoolElement")
+{
+	TestPool::TestPoolElement* element = NULL;
+	element = OP_NEW(TestPool::TestPoolElement, ("foo"));
+	verify(element);
+	verify(g_memory_manager->GetSelftestPool()->GetUsed() == 1);
+	verify(g_memory_manager->GetSelftestPool()->Contains(element));
+	verify_string(element->Name(), "foo");
+	OP_DELETE(element);
+	element = NULL;
+	verify(g_memory_manager->GetSelftestPool()->GetUsed() == 0);
+}
+finally
+{
+	OP_DELETE(element);
+}
+
+test("OP_NEW_L TestPoolElement")
+{
+	TestPool::TestPoolElement* element = NULL;
+	TRAPD(err, element = OP_NEW_L(TestPool::TestPoolElement, ("foo")));
+	verify_success(err);
+	verify(element);
+	verify(g_memory_manager->GetSelftestPool()->GetUsed() == 1);
+	verify(g_memory_manager->GetSelftestPool()->Contains(element));
+	verify_string(element->Name(), "foo");
+	OP_DELETE(element);
+	element = NULL;
+	verify(g_memory_manager->GetSelftestPool()->GetUsed() == 0);
+}
+finally
+{
+	OP_DELETE(element);
+}
+
+table memory_pool_sizes(const char* name,
+						size_t obj_size, size_t obj_align, size_t mem_size,
+						size_t expected_elements)
+{
+	{ "<101*16+15>", 16, 8, 101*16+15, 101 }
+	{ "<101*16+10>", 16, 8, 101*16+10, 101 }
+	{ "<101*16+8>",  16, 8, 101*16+8,  101 }
+	{ "<101*16+7>",  16, 8, 101*16+7,  101 }
+	{ "<101*16+1>",  16, 8, 101*16+1,  101 }
+	{ "<101*16>",    16, 8, 101*16,    101 }
+}
+
+/* Verify that an OpMemoryPool<obj_size, obj_align, mem_size>, with the values
+ * from the above table, has the expected number of elements. I.e. we can
+ * allocated expected_elements and allocating once more will return NULL. */
+foreach (name, obj_size, obj_align, mem_size, expected_elements)
+	from memory_pool_sizes
+{
+	test("OpMemoryPool init " name)
+	{
+		/* Copied the calculation of POOL_OVERHEAD and POOL_PADDING from
+		 * OpMemoryPool.h to be sure to get the correct pool-size: */
+		const unsigned short POOL_OVERHEAD =
+			2*sizeof(void*) + sizeof(unsigned short);
+		const unsigned short POOL_PADDING =
+			((obj_align*POOL_OVERHEAD - POOL_OVERHEAD) % obj_align);
+		const size_t pool_size = POOL_OVERHEAD + POOL_PADDING + mem_size;
+		OpMemoryPool<obj_size, obj_align, pool_size> pool;
+		void* mem[expected_elements];
+		op_memset(mem, 0, sizeof(mem));
+		verify(pool.NET_POOL_SIZE == mem_size);
+		verify(pool.POOL_OBJS == expected_elements);
+		// The first free memory is always equal to the memory-pointer:
+		for (size_t i=0; i < expected_elements; i++)
+		{
+			verify(pool.GetUsed() == i);
+			mem[i] = pool.Allocate();
+			verify(mem[i]);
+			verify(pool.Contains(mem[i]));
+		}
+		verify(pool.Allocate() == NULL);
+		verify(pool.GetUsed() == expected_elements);
+	}
+	finally
+	{
+		for (size_t i=0; i < expected_elements; i++)
+			if (mem[i]) pool.Deallocate(mem[i]);
+	}
+}
+
+table memory_pool_align(const char* name, size_t obj_align)
+{
+	{ "1", 1 }
+	{ "2", 2 }
+	{ "3", 3 }
+	{ "4", 4 }
+	{ "5", 5 }
+	{ "6", 6 }
+	{ "7", 7 }
+	{ "8", 8 }
+	{ "9", 9 }
+	{ "10", 10 }
+}
+
+/* Verify that an OpMemoryPool<8, obj_align> has the correct padding and that
+ * the first allocated object has the correct memory alignment. */
+foreach (name, obj_align)
+	from memory_pool_align
+{
+	test("OpMemoryPool<8, " name ">::POOL_PADDING")
+	{
+		OpMemoryPool<8, obj_align> pool;
+		if (obj_align)
+			verify(pool.POOL_PADDING < obj_align);
+		else
+			verify(pool.POOL_PADDING == 0);
+		void* mem = pool.Allocate();
+		pool.Deallocate(mem);
+		verify((reinterpret_cast<INTPTR>(&pool) % obj_align) == (reinterpret_cast<INTPTR>(mem) % obj_align));
+	}
+}
+
+table memory_pool_obj_align(const char* name, size_t obj_size, size_t obj_align)
+{
+	{ "<11,4>", 11, 4 }
+	{ "<8,3>", 8, 3 }
+	{ "<13,7>", 13, 7 }
+}
+
+/* Verifies that each allocated object has the expected alignment. */
+foreach (name, obj_size, obj_align)
+	from memory_pool_obj_align
+{
+	test("OpMemoryPool" name " object alignment")
+	{
+		OpMemoryPool<obj_size, obj_align> pool;
+		void* mem[pool.POOL_OBJS];
+		op_memset(mem, 0, sizeof(mem));
+		verify(pool.OBJ_ALIGNED_SIZE >= obj_size);
+		for (size_t i=0; i < pool.POOL_OBJS; i++)
+		{
+			verify(pool.GetUsed() == i);
+			mem[i] = pool.Allocate();
+			verify(mem[i]);
+			verify(pool.Contains(mem[i]));
+			/* Here we assume that the OpMemoryPool allocates the next chunk of
+			 * memory from the previous memory address + obj_size + alignment:
+			 */
+			if (i > 0)
+				verify((reinterpret_cast<INTPTR>(mem[i]) - reinterpret_cast<INTPTR>(mem[i-1])) >= (INTPTR) pool.OBJ_ALIGNED_SIZE);
+			verify(((reinterpret_cast<INTPTR>(mem[i]) - reinterpret_cast<INTPTR>(&pool)) % obj_align) == 0);
+		}
+		verify(pool.Allocate() == NULL);
+		verify(pool.GetUsed() == pool.POOL_OBJS);
+	}
+	finally
+	{
+		for (size_t i=0; i < pool.POOL_OBJS; i++)
+			if (mem[i]) pool.Deallocate(mem[i]);
+	}
+}
+
+/* Verify that OpMemoryPool::Allocate(true) grows. */
+test("OpMemoryPool::Allocate(true)")
+{
+	OpMemoryPool<8> pool;
+	void* mem[pool.POOL_OBJS*2];
+	op_memset(mem, 0, sizeof(mem));
+	// allocate all objects from the first pool
+	size_t i;
+	for (i=0; i < pool.POOL_OBJS; i++)
+	{
+		verify(pool.GetUsed() == i);
+		mem[i] = pool.Allocate();
+		verify(mem[i]);
+		verify(pool.Contains(mem[i]));
+	}
+	verify(pool.Allocate() == NULL);
+	verify(pool.GetUsed() == pool.POOL_OBJS);
+	verify(pool.GetNext() == NULL);
+	for (; i < pool.POOL_OBJS*2; i++)
+	{
+		verify(pool.GetUsed() == pool.POOL_OBJS);
+		mem[i] = pool.Allocate(true);
+		verify(mem[i]);
+		verify(pool.GetNext());
+		verify(pool.GetNext()->GetUsed() == i - pool.POOL_OBJS + 1);
+		verify(!pool.Contains(mem[i]));
+		verify(pool.GetNext()->Contains(mem[i]));
+	}
+	verify(pool.GetNext()->GetUsed() == pool.POOL_OBJS);
+	verify(pool.Allocate() == NULL);
+	verify(pool.GetNext()->GetNext() == NULL);
+}
+finally
+{
+	for (size_t i=0; i < 2*pool.POOL_OBJS; i++)
+		if (mem[i]) pool.Deallocate(mem[i]);
+}
+
+
+/* Verify that OpMemoryPool::Deallocate() deletes a chained OpMemoryPool
+ * instance. */
+test("OpMemoryPool::Deallocate()")
+{
+	OpMemoryPool<8> pool;
+	void* mem[pool.POOL_OBJS+1];
+	op_memset(mem, 0, sizeof(mem));
+	// allocate all objects from the first pool
+	size_t i;
+	for (i=0; i < pool.POOL_OBJS; i++)
+	{
+		verify(pool.GetUsed() == i);
+		mem[i] = pool.Allocate();
+		verify(mem[i]);
+		verify(pool.Contains(mem[i]));
+	}
+	verify(pool.Allocate() == NULL);
+	verify(pool.GetUsed() == pool.POOL_OBJS);
+	verify(pool.GetNext() == NULL);
+	mem[pool.POOL_OBJS] = pool.Allocate(true);
+	verify(mem[pool.POOL_OBJS]);
+	verify(pool.GetNext());
+	verify(pool.GetNext()->GetNext() == NULL);
+	verify(pool.GetNext()->GetUsed() == 1);
+	verify(!pool.Contains(mem[pool.POOL_OBJS]));
+	verify(pool.GetNext()->Contains(mem[pool.POOL_OBJS]));
+	verify(pool.Deallocate(mem[pool.POOL_OBJS]));
+	mem[pool.POOL_OBJS] = NULL;
+	verify(pool.GetNext() == NULL);
+	for (i=0; i < pool.POOL_OBJS; i++)
+	{
+		verify(pool.Deallocate(mem[i]));
+		mem[i] = 0;
+	}
+}
+finally
+{
+	for (size_t i=0; i < pool.POOL_OBJS+1; i++)
+		if (mem[i]) pool.Deallocate(mem[i]);
+}
+

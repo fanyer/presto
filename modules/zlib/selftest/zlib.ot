@@ -1,0 +1,246 @@
+group "ZLib";
+require USE_ZLIB;
+include "modules/zlib/zlib.h";
+
+test("Init and exit zlib")
+    leakcheck;
+{
+   z_stream test_stream;
+   op_memset( &test_stream, 0, sizeof(test_stream));
+
+   test_stream.next_in = NULL;
+   test_stream.avail_in = 0;
+   test_stream.next_out = NULL;
+   test_stream.avail_out = 0;
+
+   verify( inflateInit2( &test_stream, MAX_WBITS ) == Z_OK );
+   verify( inflateEnd(&test_stream) == Z_OK );
+}
+
+
+table compress_data(int, const char*, int, const char*) {
+    /* compressed size, compressed data, uncompressed size, uncompressed data */
+    { 8, "x\332\3\0\0\0\0\1", 0, "" }
+    { 11, "x\332K\313\317\7\0\2\202\1E", 3, "foo" }
+    { 14, "x\332K\313\317OJ,\2\0\b\253\2z", 6, "foobar" }
+    { 14, "x\332K\313\317WHC\140\0+k\5q", 15, "foo foo foo foo" }
+    { 23, "x\332K\313\317Wpr\14Rp\363\367WHJ,\2\0$\251\4\223", 15, "foo BAR FOO bar" }
+    { 14, "x\332;\274\364\360\222\303\333\0\17\5\4I", 6, "\303\245\303\244\303\266" }
+    { 11, "x\332c\140\300\17\0\0 \0\1", 32, "\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0" }
+};
+
+test("Simple decompression")
+{
+    unsigned char *result = NULL;
+    iterate(compressed_size,compressed,uncompressed_size,uncompressed) from compress_data
+    {
+	z_stream test_stream;
+	OP_DELETEA(result);
+	result = OP_NEWA(unsigned char, uncompressed_size);
+	op_memset( &test_stream, 0, sizeof(test_stream));
+	test_stream.next_in = (Bytef *)compressed;
+	test_stream.avail_in = compressed_size;
+	test_stream.next_out = (Bytef *)result;
+	test_stream.avail_out = uncompressed_size;
+	verify( inflateInit( &test_stream ) == Z_OK );
+	verify( inflate( &test_stream, Z_FINISH ) == Z_STREAM_END );
+	verify( inflateEnd( &test_stream ) == Z_OK );
+	verify( op_memcmp( result, uncompressed, uncompressed_size ) == 0 );
+    }
+}
+finally
+{
+    OP_DELETEA(result);
+}
+
+test("Compress-Decompress test")
+require ZLIB_COMPRESSION;
+{
+	// test data: will be compressed and decompressed. the result is compared to the original.
+	const unsigned char OriginalData[] = "neither a borrower nor a lender be"; // for loan oft loses both itself and friend
+	const size_t OriginalDataSize = op_strlen((const char*)OriginalData);
+
+	// size of the compressed buffer, should be big enough that the test data fits after compression.
+	// from zlib.h: ... "avail_out must be at least 0.1% larger than avail_in plus 12 bytes".
+	// however, do some funky stuff in order to trigger more of the internal code, so this won't hold.
+	// assuming that doubling the size is enough. (this is probably highly pessimistic...)
+	const size_t CompressedBufferSize = 2 * ((OriginalDataSize*1001 + 999)/1000 + 12);
+	
+	// buffers for compression and decompression
+	unsigned char *compressed_data = 0, *decompressed_data = 0;
+	compressed_data = OP_NEWA(unsigned char, CompressedBufferSize);
+	decompressed_data = OP_NEWA(unsigned char, OriginalDataSize);
+
+	if (!compressed_data || !decompressed_data)
+		output("OOM: failed to allocate memory for temporary buffers, test will fail.");
+	verify ( compressed_data && decompressed_data );
+	
+	z_stream test_stream;
+	op_memset(&test_stream, 0, sizeof(test_stream));
+
+#ifndef ZLIB_REDUCE_FOOTPRINT
+	// custom dictionary
+	const unsigned char CustDict[] = "er\0 a \0";
+	const unsigned char CustDictLen = 7;
+#endif // ZLIB_REDUCE_FOOTPRINT
+
+	// init stream for compression
+	size_t first_run = OriginalDataSize >> 1;
+	test_stream.next_in = (Bytef*)OriginalData;
+	test_stream.avail_in = first_run;
+	test_stream.next_out = (Bytef*)compressed_data;
+	test_stream.avail_out = CompressedBufferSize;
+	verify( deflateInit( &test_stream, Z_DEFAULT_COMPRESSION ) == Z_OK );
+
+#ifndef ZLIB_REDUCE_FOOTPRINT
+	// set dictionary
+	verify ( deflateSetDictionary( &test_stream, CustDict, CustDictLen ) == Z_OK );
+#endif // ZLIB_REDUCE_FOOTPRINT
+
+	// compress first half of data
+	verify( deflate( &test_stream, Z_NO_FLUSH ) == Z_OK );
+	// flush (this is done to trigger more of the internal zlib code)
+	verify( deflate( &test_stream, Z_FULL_FLUSH ) == Z_OK );
+#ifdef Z_RLE // on some platforms zlib doesn't support Z_RLE
+	// change compression level and strategy (again, to trigger more of the internal zlib code)
+	verify ( deflateParams( &test_stream, Z_BEST_COMPRESSION, Z_RLE) == Z_OK );
+#endif // Z_RLE
+	// compress rest of data
+	test_stream.avail_in += OriginalDataSize-first_run;
+	verify( deflate( &test_stream, Z_FINISH ) == Z_STREAM_END );
+	const size_t CompressedDataSize = CompressedBufferSize - test_stream.avail_out;
+	verify( deflateEnd( &test_stream ) == Z_OK );
+
+	// init stream for decompression
+	test_stream.next_in = (Bytef*)compressed_data;
+	test_stream.avail_in = CompressedDataSize;
+	test_stream.next_out = (Bytef*)decompressed_data;
+	test_stream.avail_out = OriginalDataSize;
+	verify( inflateInit( &test_stream ) == Z_OK );
+	// decompress data
+	int r = inflate( &test_stream, Z_FINISH );
+
+#ifndef ZLIB_REDUCE_FOOTPRINT
+	// use dictionary if requested
+	if (r == Z_NEED_DICT)
+	{
+		verify( inflateSetDictionary( &test_stream, CustDict, CustDictLen ) == Z_OK );
+		r = inflate( &test_stream, Z_FINISH );
+	}
+#endif // ZLIB_REDUCE_FOOTPRINT
+
+	verify( r == Z_STREAM_END );
+	verify( inflateEnd( &test_stream ) == Z_OK );
+	
+	// compare
+	verify(!op_memcmp(OriginalData, decompressed_data, OriginalDataSize));
+}
+finally
+{
+	OP_DELETEA(compressed_data);
+	OP_DELETEA(decompressed_data);
+}
+
+
+test("Fast and stored compression")
+require ZLIB_COMPRESSION; require undefined ZLIB_REDUCE_FOOTPRINT;
+{
+	// test data: will be compressed and decompressed. the result is compared to the original.
+	const unsigned char OriginalData[] = "do you hear what i hear? see what i see? feel what i feel?";
+	const size_t OriginalDataSize = op_strlen((const char*)OriginalData);
+
+	// size of the compressed buffer, should be big enough that the test data fits after compression.
+	// from zlib.h: ... "avail_out must be at least 0.1% larger than avail_in plus 12 bytes".
+	// however, do some funky stuff in order to trigger more of the internal code, so this won't hold.
+	// assuming that doubling the size is enough. (this is probably highly pessimistic...)
+	const size_t CompressedBufferSize = 2 * ((OriginalDataSize*1001 + 999)/1000 + 12);
+
+	// buffers for compression and decompression
+	unsigned char *compressed_data = 0, *decompressed_data = 0;
+	compressed_data = OP_NEWA(unsigned char, CompressedBufferSize);
+	decompressed_data = OP_NEWA(unsigned char, OriginalDataSize);
+
+	if (!compressed_data || !decompressed_data)
+		output("OOM: failed to allocate memory for temporary buffers, test will fail.");
+	verify ( compressed_data && decompressed_data );
+
+	// create stream
+	z_stream test_stream;
+	op_memset(&test_stream, 0, sizeof(test_stream));
+
+	// init stream for compression
+	size_t first_run = OriginalDataSize >> 1;
+	test_stream.next_in = (Bytef*)OriginalData;
+	test_stream.avail_in = first_run;
+	test_stream.next_out = (Bytef*)compressed_data;
+	test_stream.avail_out = CompressedBufferSize;
+	verify( deflateInit( &test_stream, Z_BEST_SPEED ) == Z_OK );
+
+	// compress first half of data
+	verify( deflate( &test_stream, Z_NO_FLUSH ) == Z_OK );
+#ifdef Z_RLE // on some platforms zlib doesn't support Z_RLE
+	// change compression level
+	verify ( deflateParams( &test_stream, Z_NO_COMPRESSION, Z_RLE) == Z_OK );
+#endif // Z_RLE
+	// compress second half of data
+	test_stream.avail_in = OriginalDataSize - first_run;
+	verify( deflate( &test_stream, Z_FINISH ) == Z_STREAM_END );
+	const size_t CompressedDataSize = CompressedBufferSize - test_stream.avail_out;
+	verify( deflateEnd( &test_stream ) == Z_OK );
+
+	// init stream for decompression
+	test_stream.next_in = (Bytef*)compressed_data;
+	test_stream.avail_in = CompressedDataSize;
+	test_stream.next_out = (Bytef*)decompressed_data;
+	test_stream.avail_out = OriginalDataSize;
+	verify( inflateInit( &test_stream ) == Z_OK );
+	// decompress data
+	verify ( inflate( &test_stream, Z_FINISH ) == Z_STREAM_END );
+	verify( inflateEnd( &test_stream ) == Z_OK );
+	
+	// compare
+	verify(!op_memcmp(OriginalData, decompressed_data, OriginalDataSize));
+}
+finally
+{
+	OP_DELETEA(compressed_data);
+	OP_DELETEA(decompressed_data);
+}
+
+// table compress_data_nohdr(int, const char*, int, const char*)  {
+//     /* compressed size, compressed data, uncompressed size, uncompressed data */
+//     { 2, "\3\0", 0, "" }
+//     { 5, "K\313\317\7\0", 3, "foo" }
+//     { 8, "K\313\317OJ,\2\0", 6, "foobar" }
+//     { 8, "K\313\317WHC\140\0", 15, "foo foo foo foo" }
+//     { 17, "K\313\317Wpr\14Rp\363\367WHJ,\2\0", 15, "foo BAR FOO bar" }
+//     { 8, ";\274\364\360\222\303\333\0", 6, "\303\245\303\244\303\266" }
+//     { 5, "c\140\300\17\0", 32, "\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0" }
+// };
+
+// test("Decompression without header (.ZIP)")
+// {
+//     unsigned char *result = NULL;
+//     iterate(compressed_size,compressed,uncompressed_size,uncompressed) from compress_data_nohdr
+//     {
+// 	z_stream test_stream;
+// 	delete[] result;
+// 	result = OP_NEWA(unsigned char, uncompressed_size);
+// 	op_memset( &test_stream, 0, sizeof(test_stream));
+// 	test_stream.next_in = (Bytef *)compressed;
+// 	test_stream.avail_in = compressed_size;
+// 	test_stream.next_out = (Bytef *)result;
+// 	test_stream.avail_out = uncompressed_size;
+// 	output( (char *)uncompressed );
+// 	output("\n");
+// 	verify( inflateInit2( &test_stream, -MAX_WBITS ) == Z_OK );
+// 	verify( inflate( &test_stream, Z_FINISH ) == Z_OK );
+// 	verify( inflateEnd( &test_stream ) == Z_OK );
+// 	verify( op_memcmp( result, uncompressed, uncompressed_size ) == 0 );
+//     }
+// }
+// finally
+// {
+//     delete[] result;
+// }
+

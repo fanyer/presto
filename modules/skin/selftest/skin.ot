@@ -1,0 +1,949 @@
+group "Skin";
+
+require SKIN_SUPPORT;
+require init;
+
+include "modules/img/image.h";
+include "modules/img/imagedump.h";
+include "modules/img/decoderfactorypng.h";
+include "modules/skin/OpSkinManager.h";
+include "modules/doc/frm_doc.h";
+include "modules/skin/IndpWidgetPainter.h";
+include "modules/skin/OpSkinUtils.h";
+
+global
+{
+	OpString test_path;
+	OpFile skinfile;
+	OpSkinManager* skinmanager;
+	OP_STATUS VerifyImage(const char* refimage, OpBitmap *bitmap)
+	{
+		OP_STATUS status = DecoderFactoryPng::verify(refimage, bitmap, bitmap->Height(), 5, 0, FALSE);
+		if (OpStatus::IsError(status))
+		{
+			OpString8 refimage_failed;
+			RETURN_IF_ERROR(refimage_failed.Set(refimage));
+			RETURN_IF_ERROR(refimage_failed.Insert(op_strlen(refimage_failed) - 4, "_failed"));
+			DecoderFactoryPng::verify(refimage_failed.CStr(), bitmap, bitmap->Height(), 5, 0, TRUE);
+		}
+
+		return status;
+	}
+
+	class SelftestTransparentBackgroundListener : public TransparentBackgroundListener
+	{
+		OpRect m_expected_rect;
+		BOOL m_success;
+	public:
+		SelftestTransparentBackgroundListener(OpRect& expected_rect) : m_expected_rect(expected_rect), m_success(FALSE) {}
+		virtual void OnBackgroundCleared(OpPainter* painter, const OpRect& r)
+		{
+			/*
+			printf("\n%d %d %d %d\n%d %d %d %d\n",
+					r.x, r.y, r.width, r.height,
+					m_expected_rect.x, m_expected_rect.y, m_expected_rect.width, m_expected_rect.height
+					);
+			*/
+			m_success = painter && r.Equals(m_expected_rect);
+		}
+		BOOL Passed() { return m_success; }
+	};
+
+	class TestButton : public OpWidget
+	{
+	public:
+		TestButton()
+		{
+			SetSkinned(TRUE);
+		}
+		void PaintWidget(int x, int y)
+		{
+			vis_dev->Translate(x, y);
+			GenerateOnPaint(OpRect(0, 0, 10000, 10000));
+			vis_dev->Translate(-x, -y);
+		}
+	};
+	
+	BOOL color_component_close(double c1, double c2)
+	{
+		double d = c1-c2;
+		return d < 0.01 && d > -0.01;
+	}
+}
+
+table test_files(char *) filelist "." name "*.png";
+
+foreach (FILE) from test_files
+{
+	test("getpath_dummy")
+	{
+		test_path.Set(FILE);
+		int i = test_path.Length() - 1;
+		while (test_path[i] != '\\' && test_path[i] != '/')
+			i--;
+		test_path.Delete(i);
+		test_path.Append(UNI_L("/"));
+	}
+}
+
+// Ensure to reference recursively all files in "test_skin/" so all
+// these files are listed in modules/selftest/selftest_data
+table test_skin_files(char*) filelist "test_skin" recursively;
+
+// Open a window for test documents
+
+html
+{
+	//! <body>
+	//! </body>
+}
+
+test("SelectSkinByFile")
+	file uni test_skin_ini "test_skin/skin.ini";
+{
+	verify(OpStatus::IsSuccess(skinfile.Construct(test_skin_ini)));
+	verify(OpStatus::IsSuccess(skinmanager->SelectSkinByFile(&skinfile, FALSE)));
+}
+
+test("DrawElement")
+	file ref_drawelement "ref_drawelement.png";
+{
+	VisualDevice* vd = state.doc->GetVisualDevice();
+	BOOL in_paint = FALSE;
+	OpBitmap* bitmap_to_paint = NULL;
+	verify(OpStatus::IsSuccess(OpBitmap::Create(&bitmap_to_paint, 100, 100, FALSE, FALSE, 0, 0, TRUE)));
+
+	OpPainter* painter = bitmap_to_paint->GetPainter();
+	verify(painter);
+
+	vd->BeginPaint(painter, OpRect(0, 0, 10000, 10000), OpRect(0, 0, 10000, 10000));
+	in_paint = TRUE;
+
+	vd->SetColor(255, 255, 255);
+	vd->FillRect(OpRect(0, 0, 10000, 10000));
+
+	// Use a tileskin
+	verify(OpStatus::IsSuccess(skinmanager->DrawElement(vd, "Push Button Skin", OpRect(10, 10, 20, 20), 0, 0, NULL)));
+	verify(OpStatus::IsSuccess(skinmanager->DrawElement(vd, "Push Button Skin", OpRect(40, 10, 20, 20), SKINSTATE_DISABLED, 0, NULL)));
+	verify(OpStatus::IsSuccess(skinmanager->DrawElement(vd, "Push Button Skin", OpRect(70, 10, 20, 20), SKINSTATE_PRESSED, 0, NULL)));
+
+	verify(OpStatus::IsSuccess(skinmanager->DrawElement(vd, "Push Button Skin", OpRect(10, 40, 20, 20), SKINSTATE_FOCUSED, 0, NULL)));
+	verify(OpStatus::IsSuccess(skinmanager->DrawElement(vd, "Push Button Skin", OpRect(40, 40, 20, 20), SKINSTATE_HOVER, 100, NULL)));
+	verify(OpStatus::IsSuccess(skinmanager->DrawElement(vd, "Push Button Skin", OpRect(70, 40, 20, 20), SKINSTATE_PRESSED | SKINSTATE_FOCUSED | SKINSTATE_HOVER, 100, NULL)));
+
+	// Use a imageskin
+	verify(OpStatus::IsSuccess(skinmanager->DrawElement(vd, "Smiley Happy", OpPoint(10, 70), 0, 1, NULL)));
+	verify(OpStatus::IsSuccess(skinmanager->DrawElement(vd, "Smiley Happy", OpPoint(40, 70), SKINSTATE_DISABLED, 1, NULL)));
+	verify(OpStatus::IsSuccess(skinmanager->DrawElement(vd, "Smiley Happy", OpPoint(70, 70), SKINSTATE_DISABLED | SKINSTATE_FOCUSED, 1, NULL)));
+
+	vd->EndPaint();
+
+	bitmap_to_paint->ReleasePainter();
+	in_paint = FALSE;
+
+	BOOL image_equal = OpStatus::IsSuccess(VerifyImage(ref_drawelement, bitmap_to_paint));
+	verify(image_equal);
+}
+finally
+{
+	if (in_paint)
+	{
+		vd->EndPaint();
+		bitmap_to_paint->ReleasePainter();
+	}
+	OP_DELETE(bitmap_to_paint);
+}
+
+test("DrawElementDifferentSizes")
+	file ref_drawelement_differentsizes "ref_drawelement_differentsizes.png";
+{
+	VisualDevice* vd = state.doc->GetVisualDevice();
+	BOOL in_paint = FALSE;
+	OpBitmap* bitmap_to_paint;
+	verify(OpStatus::IsSuccess(OpBitmap::Create(&bitmap_to_paint, 400, 215, FALSE, FALSE, 0, 0, TRUE)));
+
+	OpPainter* painter = bitmap_to_paint->GetPainter();
+	verify(painter);
+
+	vd->BeginPaint(painter, OpRect(0, 0, 10000, 10000), OpRect(0, 0, 10000, 10000));
+	in_paint = TRUE;
+
+	vd->SetColor(255, 255, 255);
+	vd->FillRect(OpRect(0, 0, 10000, 10000));
+
+	int i, x = 5;
+	for(i = 0; i < 15; i++)
+	{
+		int s = 10 + i * 2;
+		verify(OpStatus::IsSuccess(skinmanager->DrawElement(vd, "Push Button Skin", OpRect(x, 5, s, s), 0, 0, NULL)));
+		verify(OpStatus::IsSuccess(skinmanager->DrawElement(vd, "BoxStretch Button Skin", OpRect(x, 60, s, s), 0, 0, NULL)));
+		verify(OpStatus::IsSuccess(skinmanager->DrawElement(vd, "Push Button Skin", OpRect(x, 110, s, s), SKINSTATE_DISABLED, 0, NULL)));
+		verify(OpStatus::IsSuccess(skinmanager->DrawElement(vd, "BoxStretch Button Skin", OpRect(x, 165, s, s), SKINSTATE_DISABLED, 0, NULL)));
+		x += s + 5;
+	}
+
+	vd->EndPaint();
+
+	bitmap_to_paint->ReleasePainter();
+	in_paint = FALSE;
+
+	BOOL image_equal = OpStatus::IsSuccess(VerifyImage(ref_drawelement_differentsizes, bitmap_to_paint));
+	verify(image_equal);
+}
+finally
+{
+	if (in_paint)
+	{
+		vd->EndPaint();
+		bitmap_to_paint->ReleasePainter();
+	}
+	OP_DELETE(bitmap_to_paint);
+}
+
+test("DrawColorizedWidget")
+	file ref_draw_colorized "ref_draw_colorized.png";
+{
+	VisualDevice* vd = state.doc->GetVisualDevice();
+	TestButton *button = NULL;
+	BOOL in_paint = FALSE;
+	OpBitmap* bitmap_to_paint;
+	verify(OpStatus::IsSuccess(OpBitmap::Create(&bitmap_to_paint, 800, 800, FALSE, FALSE, 0, 0, TRUE)));
+
+	OpPainter* painter = bitmap_to_paint->GetPainter();
+	verify(painter);
+
+	vd->BeginPaint(painter, OpRect(0, 0, 10000, 10000), OpRect(0, 0, 10000, 10000));
+	in_paint = TRUE;
+
+	button = OP_NEW(TestButton, ());
+	verify(button);
+	button->SetVisualDevice(vd);
+	button->SetRect(OpRect(0, 0, 70, 70));
+	button->SetSkinManager(skinmanager);
+	button->GetBorderSkin()->SetImage("Color Tooltip Button Skin");
+
+	vd->SetColor(255, 255, 255);
+	vd->FillRect(OpRect(0, 0, 10000, 10000));
+	vd->Translate(10, 10);
+
+	for(int i = 0; i < 10; i++)
+	{
+		UINT32 alpha = 255 - i*25;
+		button->GetBorderSkin()->ApplyColorization( OP_RGBA(0xff, 0x00, 0x00, alpha) );
+		button->PaintWidget(i*70, 0);
+	}
+
+	for(int i = 0; i < 10; i++)
+	{
+		UINT32 alpha = 255 - i*25;
+		button->GetBorderSkin()->ApplyColorization( OP_RGBA(0x00, 0xff, 0x00, alpha) );
+		button->PaintWidget(i*70, 70);
+	}
+
+	//button->GetBorderSkin()->GetArrow()->SetLeft();
+	for(int i = 0; i < 10; i++)
+	{
+		UINT32 alpha = 255 - i*25;
+		button->GetBorderSkin()->ApplyColorization( OP_RGBA(0x00, 0x00, 0xff, alpha) );
+		button->PaintWidget(i*70, 140);
+	}
+
+	vd->Translate(-10, -10);
+	vd->EndPaint();
+
+	bitmap_to_paint->ReleasePainter();
+	in_paint = FALSE;
+
+	BOOL image_equal = OpStatus::IsSuccess(VerifyImage(ref_draw_colorized, bitmap_to_paint));
+	verify(image_equal);
+}
+finally
+{
+	if (in_paint)
+	{
+		vd->EndPaint();
+		bitmap_to_paint->ReleasePainter();
+	}
+	OP_DELETE(bitmap_to_paint);
+	if (button)
+		button->Delete();
+}
+
+test("DrawBitmapImage") leakcheck;
+	file ref_draw_bitmaps "ref_draw_bitmaps.png";
+	require SKIN_SKIN_COLOR_THEME;
+{
+	VisualDevice* vd = state.doc->GetVisualDevice();
+	TestButton *button = NULL;
+	BOOL in_paint = FALSE;
+	OpBitmap* bitmap_to_paint;
+	verify(OpStatus::IsSuccess(OpBitmap::Create(&bitmap_to_paint, 950, 4*260, FALSE, FALSE, 0, 0, TRUE)));
+
+	OpPainter* painter = bitmap_to_paint->GetPainter();
+	verify(painter);
+
+	vd->BeginPaint(painter, OpRect(0, 0, 10000, 10000), OpRect(0, 0, 10000, 10000));
+	in_paint = TRUE;
+
+	button = OP_NEW(TestButton, ());
+	verify(button);
+	button->SetVisualDevice(vd);
+	button->SetSkinManager(skinmanager);
+
+	OpSkinElement* skinelm = skinmanager->GetSkinElement("Omenu Button Skin");
+	verify(skinelm);
+	Image image = skinelm->GetImage(SKINPART_TILE_CENTER);
+
+	vd->SetColor(255, 255, 255);
+	vd->FillRect(OpRect(0, 0, 10000, 10000));
+	vd->Translate(10, 10);
+
+	struct looper {
+		void paint(TestButton *button, int pos_y) {
+			int x = 0;
+			for(int i = 0; i <= 10; i++)
+			{
+				int w = 17 + i*10;
+				x += w + 5;
+				button->SetRect(OpRect(0, 0, w, w));
+
+				button->GetBorderSkin()->UnsetStretchBorder();
+				button->PaintWidget(x, pos_y);
+
+				button->GetBorderSkin()->SetStretchBorder(2,5,5,5);
+				button->PaintWidget(x, pos_y+130);
+			}
+		}
+	};
+
+	looper row;
+	int y = 0;
+
+	button->GetBorderSkin()->SetBitmapImage(image);
+	row.paint(button, y);
+
+	button->GetBorderSkin()->SetBitmapImageWithEffect(image, Image::EFFECT_BLEND, 50);
+	y += 260;
+	row.paint(button, y);
+
+	button->GetBorderSkin()->SetColorizedBitmapImage(image, OP_RGBA(0x00, 0xff, 0x00, 0xff));
+	y += 260;
+	row.paint(button, y);
+	
+	button->GetBorderSkin()->SetColorizedBitmapImage(image, OP_RGBA(0x00, 0x00, 0xff, 0xaa));
+	y += 260;
+	row.paint(button, y);
+
+	vd->Translate(-10, -10);
+	vd->EndPaint();
+
+	bitmap_to_paint->ReleasePainter();
+	in_paint = FALSE;
+
+	BOOL image_equal = OpStatus::IsSuccess(VerifyImage(ref_draw_bitmaps, bitmap_to_paint));
+	verify(image_equal);
+}
+finally
+{
+	if (in_paint)
+	{
+		vd->EndPaint();
+		bitmap_to_paint->ReleasePainter();
+	}
+	OP_DELETE(bitmap_to_paint);
+	if (button)
+		button->Delete();
+}
+
+test("DrawElementBestFit")
+	file ref_drawelement_bestfit "ref_drawelement_bestfit.png";
+{
+	VisualDevice* vd = state.doc->GetVisualDevice();
+	BOOL in_paint = FALSE;
+	OpBitmap* bitmap_to_paint;
+	verify(OpStatus::IsSuccess(OpBitmap::Create(&bitmap_to_paint, 200, 200, FALSE, FALSE, 0, 0, TRUE)));
+
+	OpPainter* painter = bitmap_to_paint->GetPainter();
+	verify(painter);
+
+	vd->BeginPaint(painter, OpRect(0, 0, 10000, 10000), OpRect(0, 0, 10000, 10000));
+	in_paint = TRUE;
+
+	vd->SetColor(255, 255, 255);
+	vd->FillRect(OpRect(0, 0, 10000, 10000));
+
+	verify(OpStatus::IsSuccess(skinmanager->DrawElement(vd, "BestFitTest Skin", OpRect(50, 10, 50, 100), 0, 0, NULL)));
+	verify(OpStatus::IsSuccess(skinmanager->DrawElement(vd, "BestFitTest Skin", OpRect(50, 125, 100, 50), 0, 0, NULL)));
+
+	vd->EndPaint();
+
+	bitmap_to_paint->ReleasePainter();
+	in_paint = FALSE;
+
+	BOOL image_equal = OpStatus::IsSuccess(VerifyImage(ref_drawelement_bestfit, bitmap_to_paint));
+	verify(image_equal);
+}
+finally
+{
+	if (in_paint)
+	{
+		vd->EndPaint();
+		bitmap_to_paint->ReleasePainter();
+	}
+	OP_DELETE(bitmap_to_paint);
+}
+
+test("DrawElement4ValueStretchBorder")
+	file ref_drawelement_4stretchbordervalues "ref_drawelement_stretchbordervalues.png";
+{
+	VisualDevice* vd = state.doc->GetVisualDevice();
+	BOOL in_paint = FALSE;
+	OpBitmap* bitmap_to_paint;
+	verify(OpStatus::IsSuccess(OpBitmap::Create(&bitmap_to_paint, 75, 60, FALSE, FALSE, 0, 0, TRUE)));
+
+	OpPainter* painter = bitmap_to_paint->GetPainter();
+	verify(painter);
+
+	vd->BeginPaint(painter, OpRect(0, 0, 10000, 10000), OpRect(0, 0, 10000, 10000));
+	in_paint = TRUE;
+
+	vd->SetColor(255, 255, 255);
+	vd->FillRect(OpRect(0, 0, 10000, 10000));
+
+	verify(OpStatus::IsSuccess(skinmanager->DrawElement(vd, "4BoxStretch Test Skin", OpRect(5, 5, 10, 10), 0, 0, NULL)));
+	verify(OpStatus::IsSuccess(skinmanager->DrawElement(vd, "4BoxStretch Test Skin", OpRect(20, 5, 50, 50), 0, 0, NULL)));
+
+	vd->EndPaint();
+
+	bitmap_to_paint->ReleasePainter();
+	in_paint = FALSE;
+
+
+	BOOL image_equal = OpStatus::IsSuccess(VerifyImage(ref_drawelement_4stretchbordervalues, bitmap_to_paint));
+	verify(image_equal);
+}
+finally
+{
+	if (in_paint)
+	{
+		vd->EndPaint();
+		bitmap_to_paint->ReleasePainter();
+	}
+	OP_DELETE(bitmap_to_paint);
+}
+
+test("DrawWidgetWithRadius")
+	file ref_radius_button "ref_radius_button.png";
+{
+	class RadiusButton : public OpWidget
+	{
+	public:
+		RadiusButton()
+		{
+			SetSkinned(TRUE);
+			GetBorderSkin()->SetImage("Radius Button Skin");
+		}
+		virtual void OnPaint(OpWidgetPainter* widget_painter, const OpRect &paint_rect)
+		{
+			if (GetForegroundSkin()->HasContent())
+			{
+				OpRect rect = GetBounds();
+				AddPadding(rect);
+				GetForegroundSkin()->Draw(vis_dev, rect);
+			}
+			else
+			{
+				vis_dev->SetColor(255, 0, 0, 128);
+				vis_dev->FillRect(GetBounds());
+			}
+		}
+	};
+
+	VisualDevice* vd = state.doc->GetVisualDevice();
+	RadiusButton *button = NULL;
+	BOOL in_paint = FALSE;
+	OpBitmap* bitmap_to_paint;
+	verify(OpStatus::IsSuccess(OpBitmap::Create(&bitmap_to_paint, 100, 150, FALSE, FALSE, 0, 0, TRUE)));
+
+	OpPainter* painter = bitmap_to_paint->GetPainter();
+	verify(painter);
+
+	vd->BeginPaint(painter, OpRect(0, 0, 10000, 10000), OpRect(0, 0, 10000, 10000));
+	in_paint = TRUE;
+
+	button = OP_NEW(RadiusButton, ());
+	verify(button);
+	button->SetVisualDevice(vd);
+	button->SetRect(OpRect(10, 10, 80, 60));
+	button->SetSkinManager(skinmanager);
+
+	// Must transfer skin padding to widget padding (normally, quick does this and not core)
+	INT32 left, top, right, bottom;
+	button->GetBorderSkin()->GetPadding(&left, &top, &right, &bottom);
+	button->SetPadding(left, top, right, bottom);
+
+	vd->SetColor(255, 255, 255);
+	vd->FillRect(OpRect(0, 0, 10000, 10000));
+
+	vd->Translate(10, 10);
+		button->GenerateOnPaint(OpRect(0, 0, 10000, 10000));
+	vd->Translate(-10, -10);
+	vd->Translate(10, 80);
+		button->GetForegroundSkin()->SetImage("Radius Button Picture");
+		button->GenerateOnPaint(OpRect(0, 0, 10000, 10000));
+	vd->Translate(-10, -80);
+
+	vd->EndPaint();
+
+	bitmap_to_paint->ReleasePainter();
+	in_paint = FALSE;
+
+	BOOL image_equal = OpStatus::IsSuccess(VerifyImage(ref_radius_button, bitmap_to_paint));
+	verify(image_equal);
+}
+finally
+{
+	if (in_paint)
+	{
+		vd->EndPaint();
+		bitmap_to_paint->ReleasePainter();
+	}
+	OP_DELETE(bitmap_to_paint);
+	if (button)
+		button->Delete();
+}
+
+test("DrawWidgetWithArrows")
+	file ref_arrow_button "ref_arrow_button.png";
+{
+	VisualDevice* vd = state.doc->GetVisualDevice();
+	TestButton *button = NULL;
+	BOOL in_paint = FALSE;
+	OpBitmap* bitmap_to_paint;
+	verify(OpStatus::IsSuccess(OpBitmap::Create(&bitmap_to_paint, 230, 370, FALSE, FALSE, 0, 0, TRUE)));
+
+	OpPainter* painter = bitmap_to_paint->GetPainter();
+	verify(painter);
+
+	vd->BeginPaint(painter, OpRect(0, 0, 10000, 10000), OpRect(0, 0, 10000, 10000));
+	in_paint = TRUE;
+
+	button = OP_NEW(TestButton, ());
+	verify(button);
+	button->SetVisualDevice(vd);
+	button->SetRect(OpRect(0, 0, 70, 70));
+	button->SetSkinManager(skinmanager);
+	button->GetBorderSkin()->SetImage("Tooltip Button Skin");
+
+	vd->SetColor(255, 255, 255);
+	vd->FillRect(OpRect(0, 0, 10000, 10000));
+
+	int i;
+
+	vd->Translate(10, 10);
+
+	button->PaintWidget(0, 0);
+
+	button->GetBorderSkin()->GetArrow()->SetLeft();
+	for(i = 0; i < 3; i++)
+	{
+		button->GetBorderSkin()->GetArrow()->SetOffset(i * 50);
+		button->PaintWidget(0 + i * 70, 70);
+	}
+
+	button->GetBorderSkin()->GetArrow()->SetTop();
+	for(i = 0; i < 3; i++)
+	{
+		button->GetBorderSkin()->GetArrow()->SetOffset(i * 50);
+		button->PaintWidget(0 + i * 70, 140);
+	}
+
+	button->GetBorderSkin()->GetArrow()->SetRight();
+	for(i = 0; i < 3; i++)
+	{
+		button->GetBorderSkin()->GetArrow()->SetOffset(i * 50);
+		button->PaintWidget(0 + i * 70, 210);
+	}
+
+	button->GetBorderSkin()->GetArrow()->SetBottom();
+	for(i = 0; i < 3; i++)
+	{
+		button->GetBorderSkin()->GetArrow()->SetOffset(i * 50);
+		button->PaintWidget(0 + i * 70, 280);
+	}
+
+	vd->Translate(-10, -10);
+	vd->EndPaint();
+
+	bitmap_to_paint->ReleasePainter();
+	in_paint = FALSE;
+
+	BOOL image_equal = OpStatus::IsSuccess(VerifyImage(ref_arrow_button, bitmap_to_paint));
+	verify(image_equal);
+}
+finally
+{
+	if (in_paint)
+	{
+		vd->EndPaint();
+		bitmap_to_paint->ReleasePainter();
+	}
+	OP_DELETE(bitmap_to_paint);
+	if (button)
+		button->Delete();
+}
+
+test("DrawWidgetWithChildAndOverlay")
+	file ref_child_overlay_button "ref_child_overlay_button.png";
+{
+	VisualDevice* vd = state.doc->GetVisualDevice();
+	TestButton *button = NULL;
+	BOOL in_paint = FALSE;
+	OpBitmap* bitmap_to_paint;
+	verify(OpStatus::IsSuccess(OpBitmap::Create(&bitmap_to_paint, 70, 70, FALSE, FALSE, 0, 0, TRUE)));
+
+	OpPainter* painter = bitmap_to_paint->GetPainter();
+	verify(painter);
+
+	vd->BeginPaint(painter, OpRect(0, 0, 10000, 10000), OpRect(0, 0, 10000, 10000));
+	in_paint = TRUE;
+
+	button = OP_NEW(TestButton, ());
+	verify(button);
+	button->SetVisualDevice(vd);
+	button->SetRect(OpRect(0, 0, 50, 50));
+	button->SetSkinManager(skinmanager);
+	button->GetBorderSkin()->SetImage("Child And Overlay Button Skin");
+
+	vd->SetColor(255, 255, 255);
+	vd->FillRect(OpRect(0, 0, 10000, 10000));
+
+	button->PaintWidget(10, 10);
+
+	vd->EndPaint();
+
+	bitmap_to_paint->ReleasePainter();
+	in_paint = FALSE;
+
+	BOOL image_equal = OpStatus::IsSuccess(VerifyImage(ref_child_overlay_button, bitmap_to_paint));
+	verify(image_equal);
+}
+finally
+{
+	if (in_paint)
+	{
+		vd->EndPaint();
+		bitmap_to_paint->ReleasePainter();
+	}
+	OP_DELETE(bitmap_to_paint);
+	if (button)
+		button->Delete();
+}
+
+test("DrawRadiusStyleColorSkin")
+	file ref_radius_style_color "ref_radius_style_color.png";
+{
+	VisualDevice* vd = state.doc->GetVisualDevice();
+	BOOL in_paint = FALSE;
+	OpBitmap* bitmap_to_paint;
+	verify(OpStatus::IsSuccess(OpBitmap::Create(&bitmap_to_paint, 100, 100, FALSE, FALSE, 0, 0, TRUE)));
+
+	OpPainter* painter = bitmap_to_paint->GetPainter();
+	verify(painter);
+
+	vd->BeginPaint(painter, OpRect(0, 0, 10000, 10000), OpRect(0, 0, 10000, 10000));
+	in_paint = TRUE;
+
+	vd->SetColor(255, 255, 255);
+	vd->FillRect(OpRect(0, 0, 10000, 10000));
+
+	verify(OpStatus::IsSuccess(skinmanager->DrawElement(vd, "Style Radius Color 1 Skin", OpRect(5, 5, 30, 30), 0, 0, NULL)));
+	verify(OpStatus::IsSuccess(skinmanager->DrawElement(vd, "Style Radius Color 2 Skin", OpRect(45, 5, 45, 80), 0, 0, NULL)));
+	verify(OpStatus::IsSuccess(skinmanager->DrawElement(vd, "Style Radius Color 3 Skin", OpRect(5, 45, 30, 45), 0, 0, NULL)));
+
+	vd->EndPaint();
+
+	bitmap_to_paint->ReleasePainter();
+	in_paint = FALSE;
+
+	BOOL image_equal = OpStatus::IsSuccess(VerifyImage(ref_radius_style_color, bitmap_to_paint));
+	verify(image_equal);
+}
+finally
+{
+	if (in_paint)
+	{
+		vd->EndPaint();
+		bitmap_to_paint->ReleasePainter();
+	}
+	OP_DELETE(bitmap_to_paint);
+}
+
+// Ensure to reference recursively all files in "user_test_skin/" so
+// all these files are listed in modules/selftest/selftest_data
+table user_test_skin_files(char*) filelist "user_test_skin" recursively;
+
+test("Leaktest of skinmanager") leakcheck;
+{
+	OpSkinManager* tmp_skinmanager;
+	tmp_skinmanager = OP_NEW(OpSkinManager, ());
+	verify(tmp_skinmanager->InitL(FALSE) == OpStatus::OK);
+	verify(OpStatus::IsSuccess(tmp_skinmanager->SelectSkinByFile(&skinfile, FALSE)));
+
+	OpSkinElement* skinelm = tmp_skinmanager->GetSkinElement("Push Button Skin");
+	verify(skinelm);
+
+#ifdef SKIN_SKIN_COLOR_THEME
+	tmp_skinmanager->SetColorSchemeColor(RGB(255, 0, 0));
+	tmp_skinmanager->SetColorSchemeMode(OpSkin::COLOR_SCHEME_MODE_CUSTOM);
+#endif
+
+	tmp_skinmanager->Flush();
+
+	skinelm = tmp_skinmanager->GetSkinElement("Push Button Skin");
+	verify(skinelm);
+
+	tmp_skinmanager->SetScale(150);
+
+	skinelm = tmp_skinmanager->GetSkinElement("Push Button Skin");
+	verify(skinelm);
+}
+finally
+{
+	OP_DELETE(tmp_skinmanager);
+}
+
+test("Transparent background clearing")
+	file uni user_test_skin_ini "user_test_skin/skin.ini";
+	file ref_transparent_background "ref_transparent_background.png";
+{
+	OpRect skin_expected_rect(10,20,50,30);
+	VisualDevice* vd = state.doc->GetVisualDevice();
+	BOOL in_paint = FALSE;
+	OpBitmap* bitmap_to_paint = NULL;
+	OpFile skinfile;
+	SelftestTransparentBackgroundListener *listener = OP_NEW(SelftestTransparentBackgroundListener, (skin_expected_rect));
+	verify(listener);
+
+	skinfile.Construct(user_test_skin_ini);
+
+	OpSkin* before = skinmanager->GetCurrentSkin();
+	verify(before);
+
+	verify(OpStatus::IsSuccess(skinmanager->SelectSkinByFile(&skinfile, FALSE)));
+
+	OpSkin* after = skinmanager->GetCurrentSkin();
+	verify(after);
+
+	verify(after != before);
+
+	skinmanager->AddTransparentBackgroundListener(listener);
+
+	OpSkinElement* skinelm = skinmanager->GetSkinElement("Push Default Button Skin");
+	verify(skinelm);
+
+	verify(OpStatus::IsSuccess(OpBitmap::Create(&bitmap_to_paint, 100, 100, FALSE, FALSE, 0, 0, TRUE)));
+
+	OpPainter* painter = bitmap_to_paint->GetPainter();
+	verify(painter);
+
+	vd->BeginPaint(painter, OpRect(0, 0, 10000, 10000), OpRect(0, 0, 10000, 10000));
+	in_paint = TRUE;
+
+	vd->SetColor(255, 255, 255);
+	vd->FillRect(OpRect(0, 0, 10000, 10000));
+
+	// This is just to make sure we use the correct background-listener list (g_skin_manager is being used in OpSkinElement::Draw)
+	{
+		OpSkinManager* old_skinmanager = g_skin_manager;
+		g_skin_manager = skinmanager;
+		verify(OpStatus::IsSuccess(skinmanager->DrawElement(vd, "Push Default Button Skin", skin_expected_rect, 0, 0, NULL)));
+
+		// set another transparent background color to test that too
+		skinmanager->SetTransparentBackgroundColor(0x22663344);
+		// remove listener
+		skinmanager->RemoveTransparentBackgroundListener(listener);
+
+		verify(OpStatus::IsSuccess(skinmanager->DrawElement(vd, "Push Default Button Skin", OpRect(30,60,40,20), 0, 0, NULL)));
+
+		g_skin_manager = old_skinmanager;
+	}
+
+	vd->EndPaint();
+
+	bitmap_to_paint->ReleasePainter();
+	in_paint = FALSE;
+
+	verify(listener->Passed());
+
+	BOOL image_equal = OpStatus::IsSuccess(VerifyImage(ref_transparent_background, bitmap_to_paint));
+	verify(image_equal);
+}
+finally
+{
+	if (in_paint)
+	{
+		vd->EndPaint();
+		bitmap_to_paint->ReleasePainter();
+	}
+	OP_DELETE(bitmap_to_paint);
+	OP_DELETE(listener);
+}
+
+
+// Ensure to reference recursively all files in "native_test_skin/" so
+// all these files are listed in modules/selftest/selftest_data
+table native_test_skin_files(char*) filelist "native_test_skin" recursively;
+
+test("CreateNativeElement")
+	file uni native_test_skin_ini "native_test_skin/skin.ini";
+	file ref_create_native_elm "ref_create_native_elm.png";
+{
+	VisualDevice* vd = state.doc->GetVisualDevice();
+	BOOL in_paint = FALSE;
+	OpBitmap* bitmap_to_paint = NULL;
+	OpFile native_skinfile;
+	native_skinfile.Construct(native_test_skin_ini);
+
+	OpSkin* before = skinmanager->GetCurrentSkin();
+	verify(before);
+
+	verify(OpStatus::IsSuccess(skinmanager->SelectSkinByFile(&native_skinfile, FALSE)));
+
+	OpSkin* after = skinmanager->GetCurrentSkin();
+	verify(after);
+
+	verify(after != before);
+
+	OpSkinElement* skinelm = skinmanager->GetSkinElement("Selftest Dummy Icon");
+	verify(skinelm);
+
+	verify(OpStatus::IsSuccess(OpBitmap::Create(&bitmap_to_paint, 16, 16, FALSE, FALSE, 0, 0, TRUE)));
+
+	OpPainter* painter = bitmap_to_paint->GetPainter();
+	verify(painter);
+
+	vd->BeginPaint(painter, OpRect(0, 0, 10000, 10000), OpRect(0, 0, 10000, 10000));
+	in_paint = TRUE;
+
+	vd->SetColor(255, 255, 255);
+	vd->FillRect(OpRect(0, 0, 10000, 10000));
+
+	verify(OpStatus::IsSuccess(skinmanager->DrawElement(vd, "Selftest Dummy Icon", OpRect(0, 0, 16, 16), 0, 0, NULL)));
+
+	vd->EndPaint();
+
+	bitmap_to_paint->ReleasePainter();
+	in_paint = FALSE;
+
+	BOOL image_equal = OpStatus::IsSuccess(VerifyImage(ref_create_native_elm, bitmap_to_paint));
+	verify(image_equal);
+}
+finally
+{
+	if (in_paint)
+	{
+		vd->EndPaint();
+		bitmap_to_paint->ReleasePainter();
+	}
+	OP_DELETE(bitmap_to_paint);
+}
+
+table Colours(UINT32, double, double, double,  double, double)
+{
+// Exact values for hsv and hsl values were counted using
+// python (module colorsys) and verified with WolframAlpha.
+//
+//     rrggbb	hue			hsv_s		value		hsl_s		light
+	{0xfd0003,	359.288538,	1.000000,	0.992157,	1.000000,	0.496078} // official opera red
+
+	{0xffffff,	  0.000000,	0.000000,	1.000000,	0.000000,	1.000000}
+	{0x000000,	  0.000000,	0.000000,	0.000000,	0.000000,	0.000000}
+	{0xff0000,	  0.000000,	1.000000,	1.000000,	1.000000,	0.500000}
+	{0x00ff00,	120.000000,	1.000000,	1.000000,	1.000000,	0.500000}
+	{0x0000ff,	240.000000,	1.000000,	1.000000,	1.000000,	0.500000}
+	{0x00ffff,	180.000000,	1.000000,	1.000000,	1.000000,	0.500000}
+	{0xff00ff,	300.000000,	1.000000,	1.000000,	1.000000,	0.500000}
+	{0xffff00,	 60.000000,	1.000000,	1.000000,	1.000000,	0.500000}
+
+	{0xababab,	  0.000000,	0.000000,	0.670588,	0.000000,	0.670588}
+	{0x224b68,	204.857143,	0.673077,	0.407843,	0.507246,	0.270588}
+	{0xaaf5d0,	150.400000,	0.306122,	0.960784,	0.789474,	0.813725}
+}
+
+test("Colours conversions RGB, HSV, HSL")
+	require SKIN_SKIN_COLOR_THEME;
+{
+	iterate (rgb, h, hsv_s, v, hsl_s, l) from Colours
+	{
+		//printf("#%06x\n", rgb);
+
+		UINT32 result_rgb;
+		double result_h, result_s, result_v, result_l;
+
+		// HSV -> RGB
+		result_rgb = OpSkinUtils::ConvertHSVToRGB(h, hsv_s, v);
+		//printf("#%06x\n", result_rgb);
+		verify(result_rgb == rgb);
+
+		// HSL -> RGB
+		result_rgb = OpSkinUtils::ConvertHSLToRGB(h, hsl_s, l);
+		//printf("#%06x\n", result_rgb);
+		verify(result_rgb == rgb);
+
+		// HSV -> RGB
+		//printf("h:%f s:%f v:%f\n", h, hsv_s, v);
+		OpSkinUtils::ConvertRGBToHSV(rgb, result_h, result_s, result_v);
+		//printf("h:%f s:%f v:%f\n", result_h, result_s, result_v);
+		verify(color_component_close(h, result_h));
+		verify(color_component_close(hsv_s, result_s));
+		verify(color_component_close(v, result_v));
+
+		// HSL -> RGB
+		//printf("h:%f s:%f l:%f\n", h, hsl_s, l);
+		OpSkinUtils::ConvertRGBToHSL(rgb, result_h, result_s, result_l);
+		//printf("h:%f s:%f l:%f\n", result_h, result_s, result_l);
+		verify(color_component_close(h, result_h));
+		verify(color_component_close(hsl_s, result_s));
+		verify(color_component_close(l, result_l));
+
+		// RGB -> HSV -> RGB
+		OpSkinUtils::ConvertRGBToHSV(rgb, result_h, result_s, result_v);
+		result_rgb = OpSkinUtils::ConvertHSVToRGB(result_h, result_s, result_v);
+		//printf("#%06x\n", result_rgb);
+		verify(result_rgb == rgb);
+
+		// RGB -> HSL -> RGB
+		OpSkinUtils::ConvertRGBToHSL(rgb, result_h, result_s, result_l);
+		result_rgb = OpSkinUtils::ConvertHSLToRGB(result_h, result_s, result_l);
+		//printf("#%06x\n", result_rgb);
+		verify(result_rgb == rgb);
+	}
+}
+test("Premultiply and invert pixel")
+	require SKIN_SKIN_COLOR_THEME;
+{
+	UINT32 ref_color = 0xa01a1e1f;
+	UINT32 color = OpSkinUtils::PremultiplyAlphaPixel(ref_color);
+
+	color = OpSkinUtils::InvertPremultiplyAlphaPixel(color);
+
+	// this is normally a lossy operation so accept some variation when
+	// comparing with the original value
+	INT8 diff_1 = ((color >> 16) & 0xff) - ((ref_color >> 16) & 0xff);
+	INT8 diff_2 = ((color >> 8) & 0xff) - ((ref_color >> 8) & 0xff);
+	INT8 diff_3 = (color & 0xff) - (ref_color & 0xff);
+
+	verify(op_abs(diff_1) < 3 && op_abs(diff_2) < 3 && op_abs(diff_3) < 3);
+}
+setup
+{
+	skinmanager = OP_NEW(OpSkinManager, ());
+	skinmanager->InitL(FALSE);
+}
+
+exit
+{
+	OP_DELETE(skinmanager);
+}
+

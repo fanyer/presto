@@ -1,0 +1,181 @@
+/* -*- Mode: c++; tab-width: 4; indent-tabs-mode: t; c-basic-offset: 4 -*- */
+
+group "quick_sync.speeddial";
+require init;
+require SUPPORT_DATA_SYNC;
+require SUPPORT_SYNC_SPEED_DIAL;
+
+include "adjunct/quick/selftest/src/ST_SyncSpeedDialEntries.h";
+include "modules/sync/sync_coordinator.h";
+include "modules/sync/sync_dataitem.h";
+include "modules/sync/sync_util.h";
+include "adjunct/desktop_util/string/stringutils.h";
+include "adjunct/quick/Application.h";
+include "adjunct/quick/managers/SyncManager.h";
+include "adjunct/quick/hotlist/HotlistManager.h";
+include "adjunct/quick/managers/SpeedDialManager.h";
+
+language C++;
+
+// table incorrect_dials (const uni_char*, const uni_char*, const uni_char *, const uni_char*)
+// {
+// 	{ UNI_L("0"), UNI_L("Db"),        UNI_L("http://www.db.no"),          UNI_L("1")},
+// 	{ UNI_L("9"), UNI_L("ulv"),       UNI_L("http://www.ulv.no"),          UNI_L("1"),FALSE},
+// 	{ UNI_L("10"), UNI_L(""),          UNI_L(""), TRUE},
+// }
+
+table incoming_dials (const uni_char*, const uni_char*, const uni_char *, const uni_char*)
+{
+	{ UNI_L("1"), UNI_L("myopera"),   UNI_L("my.opera.com"),             UNI_L("1")},
+	{ UNI_L("2"), UNI_L("Db"),        UNI_L("http://www.db.no"),           UNI_L("1")},
+	{ UNI_L("3"), UNI_L("Ap"),        UNI_L("http://www.ap.no"),           UNI_L("1")},
+	{ UNI_L("4"), UNI_L("vg"),        UNI_L("http://www.vg.no"),           UNI_L("1")},
+	{ UNI_L("5"), UNI_L("opera"),     UNI_L("http://www.opera.com/"),     UNI_L("1")},
+	{ UNI_L("7"), UNI_L("sau"),       UNI_L("http://www.sau.no"),         UNI_L("1")},
+	{ UNI_L("9"), UNI_L("ulv"),       UNI_L("http://www.ulv.no"),         UNI_L("1")},
+}
+
+table local_dials (const uni_char*, const uni_char*, const uni_char *, const uni_char*)
+{
+
+	{ UNI_L("5"), UNI_L("myopera"),   UNI_L("http://my.opera.com/"),      UNI_L("1")},
+	{ UNI_L("8"), UNI_L("elg"),       UNI_L("http://www.elg.no"),         UNI_L("1")},
+	{ UNI_L("9"), UNI_L("opera-unite"),     UNI_L("http://unite.opera.com/"),     UNI_L("1")},
+}
+
+table server_dup_dials (const uni_char*, const uni_char*, const uni_char *, const uni_char*)
+{
+
+	{ UNI_L("1"), UNI_L("myopera"),   UNI_L("http://my.opera.com/"),      UNI_L("1")},
+	{ UNI_L("2"), UNI_L("elg"),       UNI_L("http://www.elg.no"),         UNI_L("1")},
+	{ UNI_L("3"), UNI_L("opera-unite"),     UNI_L("http://unite.opera.com/"),     UNI_L("1")},
+}
+
+test("ProcessSyncItem(Speeddial) on bookmark item")
+				disabled;
+{
+	ST_SyncSpeedDialEntries syncer;
+
+	// --- Store away original value of m_is_recieving_items
+	BOOL stored_value = syncer.IsProcessingIncomingItems();
+
+	// Test add bookmark 
+	OpString guid;
+	OpSyncItem* bookmark = 0;
+	BOOL dirty;
+	verify(OpStatus::IsSuccess(StringUtils::GenerateClientID(guid)));
+	verify(OpStatus::IsSuccess(g_sync_coordinator->GetSyncItem(&bookmark, OpSyncDataItem::DATAITEM_BOOKMARK, OpSyncItem::SYNC_KEY_ID, guid.CStr())));
+	verify(OpStatus::IsError(syncer.ProcessSyncItem(bookmark,dirty)));
+
+	// --- Check that m_is_receiving_items value has been reset
+	verify(syncer.IsProcessingIncomingItems() == stored_value);
+
+	g_sync_coordinator->ReleaseSyncItem(bookmark);
+}
+
+test("Test Listening and ProcessSyncItem not resulting in send to server")
+	disabled; 
+{
+	ST_SyncSpeedDialEntries syncer;
+	int position = 1;
+	g_sync_coordinator->SetSyncDataClient(&syncer, OpSyncDataItem::DATAITEM_SPEEDDIAL); // results in EnableSDListening
+	verify(g_sync_manager->SupportsType(SyncManager::SYNC_SPEEDDIAL));
+	verify(syncer.IsListening());
+
+	
+	// --- Store away original value of m_is_recieving_items
+	BOOL stored_value = syncer.IsProcessingIncomingItems();
+	
+	OpSyncItem *item = 0;
+	
+	OpString guid;
+		
+	OpString pos;
+	pos.AppendFormat(UNI_L("%d"), position);
+	verify(OpStatus::IsSuccess(g_sync_coordinator->GetSyncItem(&item, OpSyncDataItem::DATAITEM_SPEEDDIAL, OpSyncItem::SYNC_KEY_POSITION, pos.CStr()))); 
+	// -- Set action and a set of elements / attributes on the item
+	item->SetStatus(OpSyncDataItem::DATAITEM_ACTION_ADDED);
+	verify(OpStatus::IsSuccess(item->SetData(OpSyncItem::SYNC_KEY_URI, UNI_L("opera:%s"))));
+	verify(OpStatus::IsSuccess(item->SetData(OpSyncItem::SYNC_KEY_TITLE, UNI_L("opera page"))));
+	
+	BOOL dirty = FALSE;
+	// -- Test ProcessSyncItem on the item 
+	verify(OpStatus::IsSuccess(syncer.ProcessSyncItem(item, dirty)));
+	verify(syncer.ReceivedNotification());
+	syncer.ResetNotification();
+	g_sync_coordinator->ReleaseSyncItem(item);
+
+	// --- Check that m_is_receiving_items value has been reset
+	verify(syncer.IsProcessingIncomingItems() == stored_value);
+	verify(!syncer.ItemsSentToServer());
+	syncer.ResetSentToServer();
+}
+finally
+{
+	g_sync_coordinator->RemoveSyncDataClient(&syncer, OpSyncDataItem::DATAITEM_SPEEDDIAL);
+	SpeedDialManager::GetInstance()->Clear(position);
+	// Remove listeners before deletion
+	syncer.EnableSpeedDialListening(FALSE);
+}
+
+/***
+ *
+ * ProcessSyncItem - 
+ * checks that the value of IsReceivingItems is reset after the call
+ * that the item is added to sds
+ *
+ *
+ */
+test("ProcessSyncItem - Locking")
+	disabled; // crasher [pobara 2011-01-12]
+{
+	g_sync_manager->SetSupportsType(SyncManager::SYNC_SPEEDDIAL, TRUE);
+
+	ST_SyncSpeedDialEntries syncer;
+	
+	// --- Store away original value of m_is_recieving_items
+	BOOL stored_value = syncer.IsProcessingIncomingItems();
+	
+	OpSyncItem *item = 0;
+	
+	OpString guid;
+		
+	int position = 1;
+	OpString pos;
+	pos.AppendFormat(UNI_L("%d"), position);
+	verify(OpStatus::IsSuccess(g_sync_coordinator->GetSyncItem(&item, OpSyncDataItem::DATAITEM_SPEEDDIAL, OpSyncItem::SYNC_KEY_POSITION, pos.CStr()))); 
+	// -- Set action and a set of elements / attributes on the item
+	item->SetStatus(OpSyncDataItem::DATAITEM_ACTION_ADDED);
+	verify(OpStatus::IsSuccess(item->SetData(OpSyncItem::SYNC_KEY_URI, UNI_L("opera:%s"))));
+	verify(OpStatus::IsSuccess(item->SetData(OpSyncItem::SYNC_KEY_TITLE, UNI_L("opera page"))));
+	
+	BOOL dirty = FALSE;
+	// -- Test ProcessSyncItem on the item 
+	verify(OpStatus::IsSuccess(syncer.ProcessSyncItem(item, dirty)));
+	g_sync_coordinator->ReleaseSyncItem(item);
+
+	// --- Check that m_is_receiving_items value has been reset
+	verify(syncer.IsProcessingIncomingItems() == stored_value);
+
+	SpeedDialManager::GetInstance()->Clear(position);
+}
+
+test("ProcessSyncItem(speeddial) on null item")
+	disabled;
+{
+	ST_SyncSpeedDialEntries syncer;
+
+	// --- Store away original value of m_is_recieving_items
+	BOOL stored_value = syncer.IsProcessingIncomingItems();
+
+	// Test add null item
+	OpSyncItem* empty_item = 0;
+	BOOL dirty = FALSE; 
+	verify(OpStatus::IsError(syncer.ProcessSyncItem(empty_item, dirty)));
+
+	// --- Check that m_is_receiving_items value has been reset
+	verify(syncer.IsProcessingIncomingItems() == stored_value);
+
+	syncer.EnableSpeedDialListening(FALSE);
+
+}

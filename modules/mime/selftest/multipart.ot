@@ -1,0 +1,483 @@
+/* -*- Mode: c; tab-width: 4; c-basic-offset: 4 -*-
+ *
+ * Copyright (C) 2005-2010 Opera Software ASA.  All rights reserved.
+ *
+ * This file is part of the Opera web browser.
+ * It may only be distributed as agreed with Opera Software.
+ */
+
+group "mime.MIME_Multipart_Decoder";
+
+require _MIME_SUPPORT_;
+
+/* Tests for modules/mime: MIME_Multipart_Decoder
+ *
+ * Multipart document testcases are stored as files; one document per
+ * file. Valid testcases (testcases that should be decoded successfully) are
+ * stored in the 'multipart_valid' subdirectory. Invalid testcases
+ * are stored in the 'multipart_invalid' subdirectory.
+ *
+ * All testcases in these two subdirectories are automatically included into the
+ * testsuite at runtime. In order to add another testcase, one must simply
+ * add the file containing the raw multipart document to the appropriate
+ * subdirectory (observing the file naming rules below), and rerun selftests.
+ * One must also add the testcase filename to the "tc_list.txt" file in the
+ * same directory where the test is added.
+ *
+ * For each testcase, the filename must be of the form '<name>.<num>.<ext>',
+ * where <name> is the name of the testcase, <num> is the number of parts in the
+ * testcase (for invalid testcases, this is the number of valid parts in the
+ * document preceding the first invalid part), and <ext> is "mpc" for text
+ * multipart documents, and "bmpc" for binary multipart documents.
+ *
+ * There are also other files that may accompany each ".(b)mpc" file:
+ * - <name>.<num>.<ext>.boundary: Contains boundary to preload into as it would
+ *                                appear in the Content-Type header. If missing,
+ *                                boundary will be auto-detected by the decoder.
+ * - <name>.<num>.<ext>.<x>.headers: Contains HTTP headers for part #x. If
+ *                                   missing, headers will not be checked for
+ *                                   correctness.
+ * - <name>.<num>.<ext>.<x>.data: Contains part data for part #x. If missing,
+ *                                data will not be checked for correctness.
+ */
+
+include "modules/mime/mimedec2.h";
+include "modules/util/opfile/opfile.h";
+
+global
+{
+	/** Dump file contents into a newly allocated buffer.
+	 *
+	 * @param f Read from this unopened file.
+	 * @param length Output size of returned buffer (== #bytes read from file).
+	 * @return Allocated buffer with file contents. 0 on failure.
+	 */
+	char *ReadFile (OpFile& f, OpFileLength& length)
+	{
+		char *data = 0;
+		OpFileLength bytes_read;
+		length = 0;
+		BOOL exists;
+		if (OpStatus::IsSuccess(f.Exists(exists)) && exists) { // boundary exists
+			if (OpStatus::IsSuccess(f.Open(OPFILE_READ)) &&  f.IsOpen()) {
+				if (OpStatus::IsSuccess(f.GetFileLength(length)) && length) {
+					data = OP_NEWA(char, (int)length);
+					if (!data || OpStatus::IsError(f.Read(data, length, &bytes_read)) || bytes_read != length) {
+						OP_DELETEA(data);
+						data = 0;
+						length = 0;
+					}
+				}
+			}
+			f.Close();
+		}
+		return data;
+	}
+
+	/** Return TRUE iff the given testcase document is a binary multipart.
+	 *
+	 * @param tc File object representing the testcase.
+	 * @return TRUE iff tc is a binary multipart document, FALSE otherwise.
+	 */
+	BOOL tcIsBinary (OpFile& tc)
+	{
+		// If testcase filename ends in ".bmpc", this is a binary multipart testcase.
+		OpString filename;
+		filename.Set(tc.GetFullPath());
+		int lastDot = filename.FindLastOf('.');
+		if (lastDot == KNotFound || lastDot < 0) return FALSE;
+		return uni_stri_eq(filename.SubString(lastDot + 1).CStr(), UNI_L("bmpc"));
+	}
+
+	/** Retrieve the name and #parts in the given testcase.
+	 *
+	 * @param tc File object representing the testcase.
+	 * @param name Retrieved name is stored in this string.
+	 * @param numParts Retrieved number of expected successfully decoded parts is stored here.
+	 */
+	void parseTcName (OpFile& tc, OpString& name, unsigned int& numParts)
+	{
+		// Tc's filename should follow this form: <prefix><DIRSEP><tcName>.<numParts>.<extension>,
+		// where <prefix> may be anything, <DIRSEP> is the last directory separator, <tcName> is the
+		// testcase name, <numParts> is the decimal integer number of parts in this testcase, and
+		// <extension> is "bmpc" for binary multipart testcases and "mpc" for text multipart testcases.
+		name.SetL(UNI_L("(unknown)"));
+		numParts = 0;
+		OpString filename;
+		filename.Set(tc.GetFullPath());
+		int lastDirSep = filename.FindLastOf(PATHSEPCHAR);
+		int lastDot = filename.FindLastOf('.');
+		if (lastDirSep == KNotFound || lastDot == KNotFound || lastDot <= (lastDirSep + 2) || lastDirSep < 0 || lastDot < 0) return;
+		OpString basename;
+		basename.SetL(filename.SubString(lastDirSep + 1).CStr(), lastDot - (lastDirSep + 1));
+		int numDot = basename.FindLastOf('.');
+		if (numDot == KNotFound || numDot < 0) return;
+		name.SetL(basename.CStr(), numDot);
+// ***		output("Set name to '%s'\n", uni_down_strdup(name.CStr())); // ***
+		OpString numString;
+		numString.SetL(basename.SubString(numDot + 1));
+// ***		output("numString is '%s'\n", uni_down_strdup(numString.CStr())); // ***
+		uni_char *dummy;
+		numParts = (unsigned int) uni_strtoul(numString.CStr(), &dummy, 10);
+	}
+
+	/** Return TRUE iff the two given HeaderLists have matching entries.
+	 *
+	 * @param hl1 A HeaderList.
+	 * @param hl2 Another HeaderList.
+	 * @return TRUE iff h1 and h2 are equivalent (i.e. have identical entries); FALSE otherwise.
+	 */
+	BOOL equalHeaders (HeaderList& hl1, HeaderList& hl2)
+	{
+		HeaderEntry *he1 = hl1.First();
+		HeaderEntry *he2 = hl2.First();
+		while (he1 && he2) {
+			// he1 and he2 should be identical.
+			if (op_strcmp(he1->Name(),  he2->Name()))  return FALSE;
+			if (op_strcmp(he1->Value(), he2->Value())) return FALSE;
+
+			// Go to next entry in hl1 and hl2.
+			he1 = he1->Suc();
+			he2 = he2->Suc();
+		}
+		// At this point, both hl1 and hl2 should be exhausted, thus he1 and he2 should both be nullpointers.
+		if (he1 || he2) return FALSE;
+		return TRUE;
+	}
+
+	//***********************************************************************
+
+	/**
+	 * A test MIME_Decoder for collecting a whole multipart part in a buffer
+	 */
+	class Test_Multipart_Part : public MIME_Decoder
+	{
+	public:
+		Test_Multipart_Part(HeaderList &hdrs) : MIME_Decoder(hdrs), buffer(NULL), buffer_size(0) {}
+		virtual ~Test_Multipart_Part() { op_free(buffer); }
+		HeaderList *GetHeaders() { return &headers; }
+		unsigned char* buffer;
+		unsigned long buffer_size;
+	
+	protected:
+		virtual void ProcessDecodedDataL(BOOL more);
+		virtual void WriteDisplayDocumentL(URL &target, DecodedMIME_Storage *attach_target) {}
+		virtual void WriteDisplayAttachmentsL(URL &target, DecodedMIME_Storage *attach_target, BOOL display_as_links = TRUE) {}
+	};
+	
+	void Test_Multipart_Part::ProcessDecodedDataL(BOOL more)
+	{
+		unsigned long count = GetLengthDecodedData();
+		const unsigned char* data = AccessDecodedData();
+		buffer = (unsigned char*)op_realloc(buffer, buffer_size+count);
+		op_memcpy(buffer+buffer_size, data, count);
+		buffer_size += count;
+		CommitDecodedDataL(count);
+	}
+
+	//***********************************************************************
+
+	/**
+	 * A test MIME_Multipart_Decoder for creating Test_Multipart_Part decoders
+	 * in CreateNewBodyPartL(), and providing access for verification
+	 */
+	class Test_Multipart_Decoder : public MIME_Multipart_Decoder
+	{
+		Test_Multipart_Part* current_part;
+	public:
+		Test_Multipart_Decoder(HeaderList &hdrs, BOOL binary) : MIME_Multipart_Decoder(hdrs,URL_ATTACHMENT,binary), current_part(NULL) {}
+		virtual MIME_Decoder *CreateNewBodyPartL(MIME_ContentTypeID id, HeaderList &hdrs, URLType url_type);
+		virtual void CreateNewBodyPartL(const unsigned char *src, unsigned long src_len);
+		virtual void HandleFinishedL() { MIME_Multipart_Decoder::HandleFinishedL(); current_part = static_cast<Test_Multipart_Part*>(sub_elements.First()); }
+
+		BOOL IsValid() { return !HaveDecodeWarnings(); }
+		void SetValid() { info.decode_warning = FALSE; }
+		BOOL NoMoreParts() { return current_part == NULL; }
+		void FinishCurrentPart() { current_part = static_cast<Test_Multipart_Part*>(current_part->Suc()); }
+		unsigned long GetCurrentPartDataPointer(unsigned char* &decoderData) { decoderData = current_part->buffer; return current_part->buffer_size; }
+		HeaderList *GetCurrentPartHeaders() { return current_part->GetHeaders(); }
+		const char *GetStatus() { return parser->getStatus(); }
+	};
+
+	MIME_Decoder *Test_Multipart_Decoder::CreateNewBodyPartL(MIME_ContentTypeID id, HeaderList &hdrs, URLType url_type)
+	{
+		MIME_Decoder* decoder = OP_NEW_L(Test_Multipart_Part, (hdrs));
+		decoder->ConstructL();
+		return decoder;
+	}
+
+	void Test_Multipart_Decoder::CreateNewBodyPartL(const unsigned char *src, unsigned long src_len)
+	{
+		FinishSubElementL();
+		HeaderList headers;
+		OpString8 headersOpString;
+		headersOpString.SetL((const char*) src, src_len);
+		headers.SetValueL(headersOpString.CStr());
+		current_element = OP_NEW_L(Test_Multipart_Part, (headers));
+		current_element->ConstructL();
+		current_element->Into(&sub_elements);
+	}
+}
+
+/** Verify the decoder status after the given testcase has been loaded.
+ *
+ * @param tc Testcase file object currently being tested.
+ * @param decoder Multipart decoder that has already been load()ed with multipart data.
+ * @param valid Whether or not testcases in above file are valid or not (i.e. whether decoder should end up in STATE_FINISHED_MULTIPART or STATE_FAILURE).
+ * @param bufSize the buffer size that was used during loading
+ * @param use_boundary TRUE if this test used an explicit boundary
+ */
+subtest verifyDecoder (OpFile& tc, Test_Multipart_Decoder *decoder, BOOL valid, unsigned int bufSize, int use_boundary)
+{
+	OpString tcName;
+	unsigned int numParts;
+	char *headersStr = NULL;
+	char *data = NULL;
+
+	parseTcName(tc, tcName, numParts);
+	char *cTcName = uni_down_strdup(tcName.CStr());
+// ***	output("Verifying %svalid %s multipart document '%s' with %u expected valid parts and %splicit boundary. Buffer size=%u\n", valid ? "" : "in", tcIsBinary(tc) ? "binary" : "text", cTcName, numParts, use_boundary ? "ex" : "im", bufSize);
+	op_free(cTcName);
+
+	// Verify correct status
+	if (valid && !decoder->IsValid())
+		output("Parsing failed, status: %s\n",decoder->GetStatus());
+	verify(valid == decoder->IsValid());
+
+	// Verify each expected valid part.
+	unsigned int i = 0;
+	while (i < numParts) {
+		if (decoder->NoMoreParts())
+			output("found %d parts\n",i);
+		verify(!decoder->NoMoreParts());
+		++i; // Increment expected part number.
+
+		// Verify part headers.
+		HeaderList *headers = decoder->GetCurrentPartHeaders();
+		verify(headers != 0);
+		// Check if we have expected headers stored on file.
+		OpString headersFilename;
+		headersFilename.SetL(tc.GetFullPath());
+		char tmp[128]; /* ARRAY OK 2008-04-18 roarl */
+		op_snprintf(tmp, 120, ".%u.headers", i);
+		headersFilename.Append(OpString().SetFromUTF8L(tmp));
+		OpFile headersFile;
+		verify_success(headersFile.Construct(headersFilename.CStr()));
+		OpFileLength headersLength = 0;
+		headersStr = ReadFile(headersFile, headersLength);
+		if (headersStr) {
+			HeaderList expectedHeaders;
+			OpString8 headersOpString;
+			headersOpString.SetL(headersStr, (int)headersLength);
+			expectedHeaders.SetValueL(headersOpString.CStr());
+			// Compare headers to expectedHeaders
+			verify(equalHeaders(*headers, expectedHeaders));
+			OP_DELETEA(headersStr);
+			headersStr = NULL;
+		}
+
+		// Verify part data
+		// Check if we have expected data stored on file.
+		OpString dataFilename;
+		dataFilename.SetL(tc.GetFullPath());
+		verify(op_snprintf(tmp, 120, ".%u.data", i) < 128);
+		dataFilename.Append(OpString().SetFromUTF8L(tmp));
+		OpFile dataFile;
+		verify_success(dataFile.Construct(dataFilename.CStr()));
+		OpFileLength dataLength = 0;
+		data = ReadFile(dataFile, dataLength);
+		unsigned char *decoderData = 0;
+		unsigned int decoderDataLength = decoder->GetCurrentPartDataPointer(decoderData);
+		if (data) {
+			if (dataLength != decoderDataLength)
+				output("part %u: dataLength = %u, decoderDataLength = %u\n", i, dataLength, decoderDataLength);
+			verify(dataLength == decoderDataLength); // Verify correct length
+			verify(op_memcmp(data, decoderData, decoderDataLength) == 0); // Verify that data is correct.
+			OP_DELETEA(data);
+			data = NULL;
+		}
+
+		decoderData = NULL; // Invalidate data pointer
+		decoder->FinishCurrentPart();
+	}
+
+	// Verify number of parts.
+	verify(i == numParts);
+	verify(decoder->NoMoreParts());
+}
+finally
+{
+	OP_DELETEA(headersStr);
+	OP_DELETEA(data);
+}
+
+/** Execute the given testcase.
+ *
+ * @param tc Unopened file object containing testcase.
+ * @param valid Whether or not testcases in above file are valid or not (i.e. whether decoder should end up in STATE_FINISHED_MULTIPART or STATE_FAILURE).
+ */
+subtest executeTc (OpFile& tc, BOOL valid)
+{
+	char *multipart = NULL;
+	char *boundary = NULL;
+	Test_Multipart_Decoder *decoder = 0;
+
+#ifndef WBMULTIPART_MIXED_SUPPORT
+	if (tcIsBinary(tc))
+		return TRUE; // Without WBMULTIPART_MIXED_SUPPORT we cannot test this
+#endif
+	OpStringC tcFilename = tc.GetFullPath();
+	char *cTcFilename = uni_down_strdup(tcFilename.CStr());
+// ***	output("Executing %svalid testcase in file '%s'\n", valid ? "" : "in", cTcFilename);
+	op_free(cTcFilename);
+
+	// Check if we have a boundary defined for this testcase.
+	OpString boundaryFilename;
+	boundaryFilename.SetL(tcFilename);
+	boundaryFilename.Append(OpString().SetFromUTF8L(".boundary"));
+	OpFile boundaryFile;
+	verify_success(boundaryFile.Construct(boundaryFilename.CStr()));
+	OpFileLength boundaryLength = 0;
+	boundary = ReadFile(boundaryFile, boundaryLength);
+	// Chop boundary at newline
+	if (op_memchr(boundary, '\r', (size_t)boundaryLength) != NULL)
+		boundaryLength = (char*)op_memchr(boundary, '\r', (size_t)boundaryLength)-boundary;
+	if (op_memchr(boundary, '\n', (size_t)boundaryLength) != NULL)
+		boundaryLength = (char*)op_memchr(boundary, '\n', (size_t)boundaryLength)-boundary;
+	OpString8 header_string_no_boundary;
+	OpString8 header_string;
+	if (tcIsBinary(tc))
+	{
+		verify_success(header_string_no_boundary.Set("Content-Type: application/vnd.wap.multipart.mixed\r\n\r\n"));
+		verify_success(header_string.Set("Content-Type: application/vnd.wap.multipart.mixed"));
+	}
+	else
+	{
+		verify_success(header_string_no_boundary.Set("Content-Type: multipart/mixed\r\n\r\n"));
+		verify_success(header_string.Set("Content-Type: multipart/mixed"));
+	}
+	if (boundary) {
+		verify_success(header_string.Append("; boundary=\""));
+		verify_success(header_string.Append(boundary, (int)boundaryLength));
+		verify_success(header_string.Append("\"\r\n\r\n"));
+	}
+	HeaderList main_header(KeywordIndex_HTTP_MIME);
+
+	// Read multipart data from testcase file.
+	OpFileLength multipartLength = 0;
+	multipart = ReadFile(tc, multipartLength);
+
+	// Start running testcase through decoder
+	// Run each testcase with and without boundary
+	for (int use_boundary=1; use_boundary>=0; use_boundary--) {
+		if (use_boundary && (!boundary || tcIsBinary(tc)))
+			continue;
+		// Run each testcase with 3 different buffer sizes: 1 MB, 1 KB and 1 byte.
+		for (unsigned int bufSize = 1024 * 1024; bufSize; bufSize /= 1024) {
+			main_header.SetValueL(use_boundary ? header_string.CStr() : header_string_no_boundary.CStr(), 0);
+			decoder = OP_NEW(Test_Multipart_Decoder, (main_header, tcIsBinary(tc)));
+			decoder->ConstructL();
+			if (!use_boundary && !tcIsBinary(tc)) {
+				verify(!decoder->IsValid());
+				decoder->SetValid(); // The decoder should be able to find the boundary
+			}
+
+			unsigned int offset = 0;
+			while (offset < multipartLength) {
+				decoder->LoadDataL((unsigned char*)multipart + offset, (unsigned long)MIN(bufSize, multipartLength - offset));
+				offset += bufSize;
+			}
+			decoder->FinishedLoadingL();
+			if (!verifyDecoder(tc, decoder, valid, bufSize, use_boundary))
+				bufSize = 0; // Pointless to try smaller buffer size
+
+			OP_DELETE(decoder);
+			decoder = NULL;
+		}
+	}
+}
+finally
+{
+	OP_DELETEA(multipart);
+	OP_DELETEA(boundary);
+	OP_DELETE(decoder);
+}
+
+/** Process list of testcases and execute each testcase.
+ *
+ * @param filename File containing list of testcases.
+ * @param valid Whether or not testcases in above file are valid or not (i.e. whether decoder should have warning or not).
+ */
+subtest processTcList (const char *filename, BOOL valid)
+{
+	uni_char *uni_filename = uni_up_strdup(filename);
+	verify(uni_filename);
+	OpFile tcList;
+	verify_success(tcList.Construct(uni_filename));
+	BOOL exists;
+	verify_success(tcList.Exists(exists));
+	verify(exists);
+	OpString tcLoc;
+	verify_success(tcList.GetDirectory(tcLoc)); // Retrieve directory holding tcList. This is also the directory holding the individual testcase files.
+	char *cLoc = uni_down_strdup(tcLoc.CStr());
+// ***	output("\nProcessing %svalid testcases located in directory %s\n", valid ? "" : "in", cLoc);
+	op_free(cLoc);
+	tcList.Open(OPFILE_READ | OPFILE_TEXT);
+	verify(tcList.IsOpen());
+
+	// tcList is now open and readable.
+	// Process each testcase found in the tcList.
+	OpString8 line;
+	do {
+		// Parse line from tcList. Blank lines and lines starting with '#' are ignored.
+		verify_success(tcList.ReadLine(line));
+		line.Strip(); // Strip leading and trailing whitespace.
+		if (line.IsEmpty() || line[0] == '#') continue; // Blank line or comment.
+
+		// Create file object for current testcase.
+		OpFile tc;
+		verify_success(tcList.GetDirectory(tcLoc));
+		tcLoc.Append(line);
+		verify_success(tc.Construct(tcLoc.CStr()));
+		BOOL exists;
+		verify_success(tc.Exists(exists));
+		if (!exists)
+		{
+			cLoc = uni_down_strdup(tcLoc.CStr());
+			output("\nCould not find test file: %s\n", cLoc);
+			op_free(cLoc);
+		}
+		verify(exists);
+
+		// Execute current testcase.
+		verify(executeTc(tc, valid));
+
+		// Clean up
+		verify(!tc.IsOpen());
+	} while (!tcList.Eof());
+
+	tcList.Close();
+	verify(!tcList.IsOpen());
+}
+finally
+{
+	op_free(uni_filename);
+}
+
+// Tables needed to get the required files in bauhaus packages
+table invalid_mpc(const char *) filelist "testfiles/multipart_invalid" name "*.mpc";
+table invalid_bmpc(const char *) filelist "testfiles/multipart_invalid" name "*.bmpc";
+table valid_mpc(const char *) filelist "testfiles/multipart_valid" name "*.mpc";
+table valid_bmpc(const char *) filelist "testfiles/multipart_valid" name "*.bmpc";
+
+test("Valid multipart documents")
+	file filename "testfiles/multipart_valid/tc_list.txt";
+{
+	verify(processTcList(filename, TRUE));
+}
+
+test("Invalid multipart documents")
+	file filename "testfiles/multipart_invalid/tc_list.txt";
+{
+	verify(processTcList(filename, FALSE));
+}

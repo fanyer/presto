@@ -1,0 +1,313 @@
+/* -*- Mode: c++; tab-width: 4; indent-tabs-mode: t; c-basic-offset: 4; c-file-style: "stroustrup"; -*-
+**
+** Copyright (C) 1995-2011 Opera Software AS.  All rights reserved.
+**
+** This file is part of the Opera web browser.
+** It may not be distributed under any circumstances.
+*/
+group "libvega.postscript.postscriptbody";
+
+require VEGA_POSTSCRIPT_PRINTING;
+
+include "modules/libvega/src/postscript/postscriptbody.h";
+include "modules/util/opfile/opmemfile.h";
+
+constant BUFFER_SIZE = 1024*1024;
+
+global
+{
+	class PSBodyHolder
+	{
+	public:
+		PSBodyHolder()
+		{
+			const size_t BufferSize = BUFFER_SIZE;
+			output_data = OP_NEWA(unsigned char, BufferSize);
+			if(!output_data)
+				return;
+
+			memfile = OpMemFile::Create(output_data, BufferSize, TRUE);
+			if(!memfile)
+			{
+				OP_DELETEA(output_data);
+				return;
+			}
+
+			initMetrics(screen_metrics);
+			initMetrics(paper_metrics);
+			ps_body.Init(*memfile, &screen_metrics, &paper_metrics);
+		}
+
+		~PSBodyHolder()
+		{
+			OP_DELETE(memfile);
+		}
+
+		void initMetrics(PostScriptOutputMetrics& metrics)
+		{
+			metrics.width = 595;
+			metrics.height = 842;
+			metrics.offset_top = 30;
+			metrics.offset_left = 40;
+			metrics.offset_bottom = 40;
+			metrics.offset_right = 30;
+			metrics.dpi_x = 72;
+			metrics.dpi_y = 72;
+		}
+
+		unsigned char* output_data;
+		OpFileDescriptor* memfile;
+		PostScriptOutputMetrics screen_metrics;
+		PostScriptOutputMetrics paper_metrics;
+		PostScriptBody ps_body;
+	};
+};
+
+
+subtest CompareResult(PSBodyHolder& holder, const char* expected)
+{
+	OpFileLength result_len;
+	holder.memfile->GetFilePos(result_len);
+	const size_t expected_len = op_strlen(expected);
+	verify(result_len == (OpFileLength)expected_len);
+	verify(!op_strncmp(reinterpret_cast<const char*>(holder.output_data), expected, expected_len));
+}
+
+test("generate postscript for page start")
+{
+	PSBodyHolder ps_body_holder;
+
+	ps_body_holder.ps_body.startPage();
+
+	verify(CompareResult(ps_body_holder,
+						 "%%Page: 1 1\n"
+						 "%%PageOrientation: Portrait\n"
+						 "%%PageBoundingBox: 0 0 595 842\n"
+						 "translatescreen\n"
+						 "scalescreen\n"));
+}
+
+
+test("generate postscript for page end outside page")
+{
+	PSBodyHolder ps_body_holder;
+
+	ps_body_holder.ps_body.endPage();
+
+	verify(CompareResult(ps_body_holder,
+						 ""));
+}
+
+
+test("generate postscript for page end on page")
+{
+	PSBodyHolder ps_body_holder;
+
+	ps_body_holder.ps_body.startPage();
+	ps_body_holder.ps_body.endPage();
+
+	verify(CompareResult(ps_body_holder,
+						 "%%Page: 1 1\n"
+						 "%%PageOrientation: Portrait\n"
+						 "%%PageBoundingBox: 0 0 595 842\n"
+						 "translatescreen\n"
+						 "scalescreen\n"
+						 "showpage\n"));
+}
+
+
+test("generate postscript for complete page with circle")
+{
+	PSBodyHolder ps_body_holder;
+
+	ps_body_holder.ps_body.startPage();
+	ps_body_holder.ps_body.pushGraphicsState();
+	ps_body_holder.ps_body.setColor(0xffaabbcc);
+	ps_body_holder.ps_body.ellipseFill(100, 100, 50, 50);
+	ps_body_holder.ps_body.popGraphicsState();
+	ps_body_holder.ps_body.endPage();
+
+	verify(CompareResult(ps_body_holder,
+						 "%%Page: 1 1\n"
+						 "%%PageOrientation: Portrait\n"
+						 "%%PageBoundingBox: 0 0 595 842\n"
+						 "translatescreen\n"
+						 "scalescreen\n"
+						 "gsave\n"
+						 "  0.667 0.733 0.800 sc\n"
+						 "  125.000000 716.000000 25.000000 25.000000 true ellipse\n"
+						 "grestore\n"
+						 "showpage\n"));
+}
+
+
+test("generate postscript for pushing and poping graphic states")
+{
+	PSBodyHolder ps_body_holder;
+
+	ps_body_holder.ps_body.pushGraphicsState();
+	ps_body_holder.ps_body.pushGraphicsState();
+	ps_body_holder.ps_body.pushGraphicsState();
+	ps_body_holder.ps_body.pushGraphicsState();
+	ps_body_holder.ps_body.pushGraphicsState();
+	ps_body_holder.ps_body.popGraphicsState();
+	ps_body_holder.ps_body.popGraphicsState();
+	ps_body_holder.ps_body.popGraphicsState();
+	ps_body_holder.ps_body.popGraphicsState();
+	ps_body_holder.ps_body.popGraphicsState();
+
+	verify(CompareResult(ps_body_holder,
+						 "gsave\n"
+						 "  gsave\n"
+						 "    gsave\n"
+						 "      gsave\n"
+						 "        gsave\n"
+						 "        grestore\n"
+						 "      grestore\n"
+						 "    grestore\n"
+						 "  grestore\n"
+						 "grestore\n"));
+}
+
+
+test("generate postscript for rect clip")
+{
+	PSBodyHolder ps_body_holder;
+
+	ps_body_holder.ps_body.rectClip(100, 100, 200, 200);
+
+	verify(CompareResult(ps_body_holder,
+						 "initclip 100 541 200 200 rectclip\n"));
+}
+
+
+test("generate postscript for a thick line in a graphics state")
+{
+	PSBodyHolder ps_body_holder;
+
+	ps_body_holder.ps_body.pushGraphicsState();
+	ps_body_holder.ps_body.setLineWidth(10);
+	ps_body_holder.ps_body.moveTo(100, 100);
+	ps_body_holder.ps_body.lineTo(200, 200);
+	ps_body_holder.ps_body.popGraphicsState();
+	ps_body_holder.ps_body.stroke();
+
+	verify(CompareResult(ps_body_holder,
+						 "gsave\n"
+						 "  10 setlinewidth\n"
+						 "  100 741 mt\n"
+						 "  200 641 lt\n"
+						 "grestore\n"
+						 "stroke\n"));
+}
+
+
+test("generate postscript linetos for a square")
+{
+	PSBodyHolder ps_body_holder;
+
+	ps_body_holder.ps_body.moveTo(100, 100);
+	ps_body_holder.ps_body.lineTo(200, 100);
+	ps_body_holder.ps_body.lineTo(200, 200);
+	ps_body_holder.ps_body.lineTo(100, 200);
+	ps_body_holder.ps_body.lineTo(100, 100);
+	ps_body_holder.ps_body.stroke();
+
+	verify(CompareResult(ps_body_holder,
+						 "100 741 mt\n"
+						 "200 741 lt\n"
+						 "200 641 lt\n"
+						 "100 641 lt\n"
+						 "100 741 lt\n"
+						 "stroke\n"));
+}
+
+
+test("generate postscript for non filled squares")
+{
+	PSBodyHolder ps_body_holder;
+
+	ps_body_holder.ps_body.rectDraw(100, 100, 40, 40);
+	ps_body_holder.ps_body.rectDraw(120, 120, 50, 50);
+	ps_body_holder.ps_body.rectDraw(150, 150, 60, 60);
+
+	verify(CompareResult(ps_body_holder,
+						 "100 701 40 40 rs\n"
+						 "120 671 50 50 rs\n"
+						 "150 631 60 60 rs\n"));
+}
+
+
+test("generate postscript for filled squares")
+{
+	PSBodyHolder ps_body_holder;
+
+	ps_body_holder.ps_body.rectFill(100, 100, 40, 40);
+	ps_body_holder.ps_body.rectFill(120, 120, 50, 50);
+	ps_body_holder.ps_body.rectFill(150, 150, 60, 60);
+
+	verify(CompareResult(ps_body_holder,
+						 "100 701 40 40 rf\n"
+						 "120 671 50 50 rf\n"
+						 "150 631 60 60 rf\n"));
+}
+
+
+test("generate postscript for a non filled ellipse")
+{
+	PSBodyHolder ps_body_holder;
+
+	ps_body_holder.ps_body.ellipseDraw(100, 100, 150, 150);
+
+	verify(CompareResult(ps_body_holder,
+						 "175.000000 666.000000 75.000000 75.000000 false ellipse\n"));
+}
+
+
+test("generate postscript for a filled ellipse")
+{
+	PSBodyHolder ps_body_holder;
+
+	ps_body_holder.ps_body.ellipseFill(100, 100, 150, 150);
+
+	verify(CompareResult(ps_body_holder,
+						 "175.000000 666.000000 75.000000 75.000000 true ellipse\n"));
+}
+
+
+test("generate postscript for colored shapes")
+{
+	PSBodyHolder ps_body_holder;
+
+	ps_body_holder.ps_body.pushGraphicsState();
+	ps_body_holder.ps_body.setColor(0xffff0000);
+	ps_body_holder.ps_body.ellipseFill(100, 100, 50, 50);
+	ps_body_holder.ps_body.setColor(0xff00ff00);
+	ps_body_holder.ps_body.rectFill(130, 130, 50, 50);
+	ps_body_holder.ps_body.setColor(0xff0000ff);
+	ps_body_holder.ps_body.ellipseFill(160, 160, 50, 50);
+	ps_body_holder.ps_body.popGraphicsState();
+
+	verify(CompareResult(ps_body_holder,
+						 "gsave\n"
+						 "  1.000 0.000 0.000 sc\n"
+						 "  125.000000 716.000000 25.000000 25.000000 true ellipse\n"
+						 "  0.000 1.000 0.000 sc\n"
+						 "  130 661 50 50 rf\n"
+						 "  0.000 0.000 1.000 sc\n"
+						 "  185.000000 656.000000 25.000000 25.000000 true ellipse\n"
+						 "grestore\n"));
+}
+
+
+test("generate postscript for translation and scale")
+{
+	PSBodyHolder ps_body_holder;
+
+	ps_body_holder.ps_body.translate(100, 100);
+	ps_body_holder.ps_body.scale(2, 2);
+
+	verify(CompareResult(ps_body_holder,
+						 "100 741 translate\n"
+						 "2 2 scale\n"));
+}

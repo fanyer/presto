@@ -1,0 +1,192 @@
+/* -*- Mode: c++; tab-width: 4; indent-tabs-mode: t; c-basic-offset: 4 -*-
+**
+** Copyright 2010 Opera Software ASA.  All rights reserved.
+**
+** This file is part of the Opera web browser.
+** It may not be distributed under any circumstances.
+*/
+group "DOM.JIL.Multimedia.AudioPlayer";
+
+require GADGET_SUPPORT;
+require DOM_JIL_API_SUPPORT;
+include "modules/security_manager/include/security_manager.h";
+include "modules/gadgets/gadget_selftest_utils.h";
+
+global
+{
+	OpSecurityManager::PrivilegedBlock disable_security;
+	GadgetSelftestUtils g_utils;
+}
+
+
+exit
+{
+	g_utils.UnloadGadget();
+}
+
+table dummy1(const char *) filelist "audioplayer_test_wgt" recursively;
+
+test("Load AudioPlayer test gadget")
+	file zip_file "audioplayer_test_wgt/config.xml";
+	async;
+{
+	OP_GADGET_STATUS status = g_utils.LoadGadgetForSelftest(zip_file, URL_GADGET_INSTALL_CONTENT);
+
+	if (OpStatus::IsError(status))
+		ST_failed("Unable to install test widget, status: %d", status);
+	else if (status != OpGadgetStatus::OK_SIGNATURE_VERIFICATION_IN_PROGRESS)
+		ST_passed();
+}
+
+test("Test AudioPlayer exists")
+	require success "Load AudioPlayer test gadget";
+	language ecmascript;
+{
+	verify(Widget);
+	verify(Widget.Multimedia);
+	verify(Widget.Multimedia.AudioPlayer);
+	verify(Widget.Multimedia.AudioPlayer.getState() == "begin");
+}
+
+test("Test AudioPlayer state open")
+	require success "Test AudioPlayer exists";
+	language ecmascript;
+	async;
+{
+	var timeout_id = setTimeout(function() {
+			Widget.Multimedia.AudioPlayer.onStateChange = null;
+			ST_failed("AudioPlayer.open timed out" , "", "");
+		}, 10000);
+	Widget.Multimedia.AudioPlayer.onStateChange = function(state)
+	{
+		try {
+			clearTimeout(timeout_id);
+			Widget.Multimedia.AudioPlayer.onStateChange = null;
+			if (state == "opened")
+				ST_passed();
+			else
+				ST_failed("Unexpected state after open : " + state , "", "");
+		}
+		catch(e)
+		{
+			ST_failed("Unexpected exception in state change handler: " + e, "", "");
+		}
+	}
+	try {
+		Widget.Multimedia.AudioPlayer.open("test.wav");
+	}
+	catch(e)
+	{
+		ST_failed("Unexpected exception when opening audio file: " + e, "", "");
+	}
+}
+
+test("Test AudioPlayer basic state changes")
+	require success "Test AudioPlayer state open";
+	language ecmascript;
+	disabled;	// This test seems to have timing issues. It has to be rewritten to wait for state changes.
+{
+	verify(Widget.Multimedia.AudioPlayer.getState() == "opened");
+	Widget.Multimedia.AudioPlayer.play(1);
+	verify(Widget.Multimedia.AudioPlayer.getState() == "playing");
+	Widget.Multimedia.AudioPlayer.stop();
+	verify(Widget.Multimedia.AudioPlayer.getState() == "stopped");
+	Widget.Multimedia.AudioPlayer.play(1);
+	verify(Widget.Multimedia.AudioPlayer.getState() == "playing");
+	Widget.Multimedia.AudioPlayer.pause();
+	verify(Widget.Multimedia.AudioPlayer.getState() == "paused");
+	Widget.Multimedia.AudioPlayer.resume();
+	verify(Widget.Multimedia.AudioPlayer.getState() == "playing");
+	Widget.Multimedia.AudioPlayer.pause();
+	verify(Widget.Multimedia.AudioPlayer.getState() == "paused");
+	Widget.Multimedia.AudioPlayer.stop();
+	verify(Widget.Multimedia.AudioPlayer.getState() == "stopped");
+	Widget.Multimedia.AudioPlayer.play(1);
+	verify(Widget.Multimedia.AudioPlayer.getState() == "playing");
+
+	Widget.Multimedia.AudioPlayer.resume();
+	verify(Widget.Multimedia.AudioPlayer.getState() == "playing");
+	Widget.Multimedia.AudioPlayer.play(1);
+	verify(Widget.Multimedia.AudioPlayer.getState() == "playing");
+
+	Widget.Multimedia.AudioPlayer.pause();
+	verify(Widget.Multimedia.AudioPlayer.getState() == "paused");
+	Widget.Multimedia.AudioPlayer.pause();
+	verify(Widget.Multimedia.AudioPlayer.getState() == "paused");
+	Widget.Multimedia.AudioPlayer.play(1); //  NOPE you have to use resume():P
+	verify(Widget.Multimedia.AudioPlayer.getState() == "paused");
+
+	Widget.Multimedia.AudioPlayer.stop();
+	verify(Widget.Multimedia.AudioPlayer.getState() == "stopped");
+	Widget.Multimedia.AudioPlayer.stop();
+	verify(Widget.Multimedia.AudioPlayer.getState() == "stopped");
+	Widget.Multimedia.AudioPlayer.pause();
+	verify(Widget.Multimedia.AudioPlayer.getState() == "stopped");
+	Widget.Multimedia.AudioPlayer.resume();
+	verify(Widget.Multimedia.AudioPlayer.getState() == "stopped");
+}
+
+test("Test AudioPlayer loop state change callback")
+	require success "Test AudioPlayer state open";
+	language ecmascript;
+	async;
+{
+	Widget.Multimedia.AudioPlayer.stop();
+	var initial_state = Widget.Multimedia.AudioPlayer.getState();
+	verify(initial_state == "begin" || initial_state == "opened" || initial_state == "stopped" || initial_state == "completed");
+
+	var timeout_id
+	var playing_state_count = 0;
+	Widget.Multimedia.AudioPlayer.onStateChange = function(new_state) {
+		if (timeout_id)
+		{
+			if (new_state == "opened")
+				Widget.Multimedia.AudioPlayer.play(3);
+			else if (new_state == "playing")
+			{
+				playing_state_count++;
+			}
+			else if (new_state == "completed")
+			{
+				clearTimeout(timeout_id);
+				if (playing_state_count == 1)
+					ST_passed();
+				else
+					ST_failed('The "playing" state notification has been obtained ' + playing_state_count + ' times instead of just once.', "", "");
+			}
+		}
+	}
+
+	timeout_id = setTimeout(function() {
+		timeout_id = null;
+		ST_failed("Timed out", "", "");
+		}, 10000);
+
+	Widget.Multimedia.AudioPlayer.open("test.wav");
+}
+
+test("Test AudioPlayer double open callback")
+	require success "Test AudioPlayer state open";
+	language ecmascript;
+	async;
+{
+	Widget.Multimedia.AudioPlayer.stop();
+	var initial_state = Widget.Multimedia.AudioPlayer.getState();
+	verify(initial_state == "begin" || initial_state == "opened" || initial_state == "stopped" || initial_state == "completed");
+
+	var open_state_count = 0;
+	Widget.Multimedia.AudioPlayer.onStateChange = function(new_state) {
+		if (new_state == "opened")
+			open_state_count++;
+	}
+
+	setTimeout(function() {
+		if (open_state_count == 2)
+			ST_passed();
+		else
+			ST_failed('State "opened" notification expected twice, got: ' + open_state_count + ' times.', '', '');
+		}, 2000);
+
+	Widget.Multimedia.AudioPlayer.open("test.wav");
+	Widget.Multimedia.AudioPlayer.open("test.wav");
+}

@@ -1,0 +1,427 @@
+/* -*- mode: c++; tab-width: 4; indent-tabs-mode: t; c-basic-offset: 4 */
+
+group "DOM.DOM_RestartObject";
+
+include "modules/dom/src/domrestartobject.h";
+include "modules/dom/domenvironment.h";
+include "modules/ecmascript_utils/esasyncif.h";
+include "modules/ecmascript_utils/essched.h";
+include "modules/hardcore/timer/optimer.h";
+include "modules/doc/frm_doc.h";
+include "modules/dom/selftest/domselftestutils.h";
+
+global
+{
+	class TestAsyncAPIListener
+	{
+	public:
+		virtual void OnFinished(OP_STATUS status, double result) = 0;
+	};
+
+	class TestAsyncAPI
+		: public OpTimerListener
+	{
+	public:
+		TestAsyncAPI()
+			: m_callback(NULL)
+			, m_arg(0.0)
+			, m_expected_result(OpStatus::OK)
+		{
+			m_timer.SetTimerListener(this);
+		}
+
+		void TestAsyncFunction(double arg, OP_STATUS expected_result, UINT32 timeout, TestAsyncAPIListener* callback)
+		{
+			m_arg = arg;
+			m_callback = callback;
+			m_expected_result = expected_result;
+			if (timeout == 0)
+				OnTimeOut(&m_timer);
+			else
+				m_timer.Start(timeout);
+		}
+
+		void Abort()
+		{
+			m_timer.Stop();
+		}
+
+	private:
+		virtual void OnTimeOut(OpTimer* timer)
+		{
+			m_callback->OnFinished(m_expected_result, m_arg*2);
+		}
+
+		TestAsyncAPIListener* m_callback;
+		double m_arg;
+		OP_STATUS m_expected_result;
+		OpTimer m_timer;
+
+	};
+
+	TestAsyncAPI test_api;
+
+	class TestRestartObject
+			: public DOM_RestartObject
+			, public TestAsyncAPIListener
+	{
+	public:
+		static OP_STATUS Make(TestRestartObject*& new_obj, TestAsyncAPI* api, DOM_Runtime* origining_runtime)
+		{
+			CALL_FAILED_IF_ERROR(DOM_Object::DOMSetObjectRuntime(new_obj = OP_NEW(TestRestartObject, (api)), origining_runtime));
+			return new_obj->KeepAlive();
+		}
+
+		virtual void OnFinished(OP_STATUS status, double result)
+		{
+			m_status = status;
+			m_finished = TRUE;
+			m_result = result;
+			Resume();
+		}
+
+		virtual void OnAbort() 
+		{
+			m_api->Abort();
+			OnFinished(OpStatus::ERR, 0.0);
+		}
+
+		double GetReturnValue() { return m_result; }
+		OP_STATUS GetStatus() { return m_status; }
+		BOOL IsFinished() { return m_finished; }
+	private:
+		TestRestartObject(TestAsyncAPI* api) 
+			: m_api(api)
+			, m_result(0.0)
+		    , m_status(OpStatus::OK)
+			, m_finished(FALSE)
+			{}
+		TestAsyncAPI* m_api;
+		double m_result;
+		OP_STATUS m_status;
+		BOOL m_finished;
+	};
+
+	class TestFunctionObject
+		: public EcmaScript_Object
+		, public OpTimerListener
+	{
+	public:
+		/**
+		 * @param - expected result of suspending call
+		 * @param - timeout time after suspending call finishes
+		 * @param - kill_the_thread - if this is set to TRUE then instead of unsuspending the call after timeout the thread will be killed
+		 */
+		TestFunctionObject(OP_STATUS result, UINT32 timeout, TestAsyncAPI* api, BOOL kill_the_thread = FALSE)
+			: m_result(result)
+			, m_timeout(timeout)
+			, m_kill_the_thread(kill_the_thread)
+			, m_api(api)
+			, m_thread_to_kill(NULL)
+		{
+			m_timer.SetTimerListener(this);
+		}
+
+		virtual int Call(ES_Object* this_es_object, ES_Value* argv, int argc, ES_Value* return_value, ES_Runtime* origining_es_runtime)
+		{
+			DOM_Runtime* origining_runtime = static_cast<DOM_Runtime*>(origining_es_runtime);
+			TestRestartObject* listener;
+			if (argc >= 0)
+			{
+				DOM_CHECK_ARGUMENTS("n");
+				CALL_FAILED_IF_ERROR(TestRestartObject::Make(listener, m_api, origining_runtime));
+				m_api->TestAsyncFunction(argv[0].value.number, m_result, m_kill_the_thread ? 1000 : m_timeout, listener);
+				if (m_kill_the_thread)
+				{
+					m_thread_to_kill = DOM_Object::GetCurrentThread(origining_es_runtime);
+					m_timer.Start(1);
+				}
+			}
+			else
+				listener = DOM_VALUE2OBJECT(*return_value, TestRestartObject);
+	
+			if (listener->IsFinished())
+			{
+				CALL_FAILED_IF_ERROR(listener->GetStatus());
+				DOM_Object::DOMSetNumber(return_value, listener->GetReturnValue());
+				return ES_VALUE;
+			}
+			else
+				return listener->BlockCall(return_value, origining_es_runtime);
+		}
+
+
+		virtual ES_GetState GetName(const uni_char* property_name, int property_code, ES_Value* value, ES_Runtime* origining_runtime)
+		{
+			if (uni_str_eq(property_name, "four"))
+				return GetFour(value, origining_runtime, NULL);
+			else
+				return EcmaScript_Object::GetName(property_name, property_code, value, origining_runtime);
+		}
+
+		virtual ES_GetState GetNameRestart(const uni_char* property_name, int property_code, ES_Value* value, ES_Runtime* origining_runtime, ES_Object* restart_object)
+		{
+			if (uni_str_eq(property_name, "four"))
+				return GetFour(value, origining_runtime, restart_object);
+			else
+				return EcmaScript_Object::GetNameRestart(property_name, property_code, value, origining_runtime, restart_object);
+		}
+
+		virtual ES_GetState GetFour(ES_Value* value, ES_Runtime* origining_es_runtime, ES_Object* restart_object)
+		{
+			DOM_Runtime* origining_runtime = static_cast<DOM_Runtime*>(origining_es_runtime);
+			TestRestartObject* listener;
+			if (restart_object == 0)
+			{
+				GET_FAILED_IF_ERROR(TestRestartObject::Make(listener, m_api, origining_runtime));
+				m_api->TestAsyncFunction(2.0, m_result, m_kill_the_thread ? 1000 : m_timeout, listener);
+				if (m_kill_the_thread)
+				{
+					m_thread_to_kill = DOM_Object::GetCurrentThread(origining_es_runtime);
+					m_timer.Start(1);
+				}
+			}
+			else
+				listener = DOM_HOSTOBJECT(restart_object, TestRestartObject);
+	
+			if (listener->IsFinished())
+			{
+				GET_FAILED_IF_ERROR(listener->GetStatus());
+				DOM_Object::DOMSetNumber(value, listener->GetReturnValue());
+				return GET_SUCCESS;
+			}
+			else
+				return listener->BlockGet(value, origining_es_runtime);
+		}
+
+
+
+		virtual ES_PutState PutName(const uni_char* property_name, int property_code, ES_Value* value, ES_Runtime* origining_runtime)
+		{
+			if (uni_str_eq(property_name, "four"))
+				return PutFour(value, origining_runtime, NULL);
+			else
+				return EcmaScript_Object::PutName(property_name, property_code, value, origining_runtime);
+		}
+
+		virtual ES_PutState PutNameRestart(const uni_char* property_name, int property_code, ES_Value* value, ES_Runtime* origining_runtime, ES_Object* restart_object)
+		{
+			if (uni_str_eq(property_name, "four"))
+				return PutFour(value, origining_runtime, restart_object);
+			else
+				return EcmaScript_Object::PutNameRestart(property_name, property_code, value, origining_runtime, restart_object);
+		}
+
+		// This doesn't actually put anything, but it does something asynchronously.
+		virtual ES_PutState PutFour(ES_Value* value, ES_Runtime* origining_es_runtime, ES_Object* restart_object)
+		{
+			DOM_Runtime* origining_runtime = static_cast<DOM_Runtime*>(origining_es_runtime);
+			TestRestartObject* listener;
+			if (restart_object == 0)
+			{
+				PUT_FAILED_IF_ERROR(TestRestartObject::Make(listener, m_api, origining_runtime));
+				m_api->TestAsyncFunction(2.0, m_result, m_kill_the_thread ? 1000 : m_timeout, listener);
+				if (m_kill_the_thread)
+				{
+					m_thread_to_kill = DOM_Object::GetCurrentThread(origining_es_runtime);
+					m_timer.Start(1);
+				}
+			}
+			else
+				listener = DOM_HOSTOBJECT(restart_object, TestRestartObject);
+	
+			if (listener->IsFinished())
+			{
+				PUT_FAILED_IF_ERROR(listener->GetStatus());
+				return PUT_SUCCESS;
+			}
+			else
+				return listener->BlockPut(value, origining_es_runtime);
+		}
+
+
+	private:
+		virtual void OnTimeOut(OpTimer* timer)
+		{
+			m_thread_to_kill->GetScheduler()->CancelThread(m_thread_to_kill);
+		}
+		OP_STATUS m_result;
+		UINT32 m_timeout;
+		BOOL m_kill_the_thread;
+		TestAsyncAPI* m_api;
+		ES_Thread* m_thread_to_kill;
+		OpTimer m_timer;;
+	};
+}
+
+test("Init: Add test Callback to global object")
+{
+	verify_success(state.doc->ConstructDOMEnvironment());
+	ES_Runtime* runtime = state.doc->GetESRuntime();
+	ES_Object* global_obj = runtime->GetGlobalObject();
+	TestFunctionObject* fun = OP_NEW(TestFunctionObject, (OpStatus::OK, 1, &test_api, FALSE)); // 1  = 1ms timeout
+	verify_success(fun->SetFunctionRuntime(runtime, UNI_L("TestFunctionObject"), "TestFunctionObject", NULL));
+	ES_Value fun_val;
+	DOM_Object::DOMSetObject(&fun_val, fun);
+
+	verify(runtime->PutName(global_obj, UNI_L("testFunAsync"), fun_val) == PUT_SUCCESS);
+
+	TestFunctionObject* fun_sync = OP_NEW(TestFunctionObject, (OpStatus::OK, 0, &test_api, FALSE)); // 1  = 1ms timeout
+	verify_success(fun_sync->SetFunctionRuntime(runtime, UNI_L("TestFunctionObject"), "TestFunctionObject", NULL));
+	DOM_Object::DOMSetObject(&fun_val, fun_sync);
+	verify(runtime->PutName(global_obj, UNI_L("testFunSync"), fun_val) == PUT_SUCCESS);
+
+	TestFunctionObject* fun_fail_async = OP_NEW(TestFunctionObject, (OpStatus::ERR_NO_MEMORY, 1, &test_api, FALSE)); // 1  = 1ms timeout
+	verify_success(fun_fail_async->SetFunctionRuntime(runtime, UNI_L("TestFunctionObject"), "TestFunctionObject", NULL));
+	DOM_Object::DOMSetObject(&fun_val, fun_fail_async);
+	verify(runtime->PutName(global_obj, UNI_L("testFunFailingAsync"), fun_val) == PUT_SUCCESS);
+
+	TestFunctionObject* fun_fail_sync = OP_NEW(TestFunctionObject, (OpStatus::ERR_NO_MEMORY, 0, &test_api, FALSE)); // 1  = 1ms timeout
+	verify_success(fun_fail_sync->SetFunctionRuntime(runtime, UNI_L("TestFunctionObject"), "TestFunctionObject", NULL));
+	DOM_Object::DOMSetObject(&fun_val, fun_fail_sync);
+	verify(runtime->PutName(global_obj, UNI_L("testFunFailingSync"), fun_val) == PUT_SUCCESS);
+
+	TestFunctionObject* fun_canceling = OP_NEW(TestFunctionObject, (OpStatus::OK, 1, &test_api, TRUE)); // 1  = 1ms timeout
+	verify_success(fun_canceling->SetFunctionRuntime(runtime, UNI_L("TestFunctionObject"), "TestFunctionObject", NULL));
+	DOM_Object::DOMSetObject(&fun_val, fun_canceling);
+	verify(runtime->PutName(global_obj, UNI_L("testFunCancelingThread"), fun_val) == PUT_SUCCESS);
+}
+
+test("Test suspending call sync - success")
+	async;
+	require success("Init: Add test Callback to global object");
+{
+	ES_Value val;
+	DOM_Object::DOMSetNumber(&val, 8);
+	DOM_SelftestUtils::TestAsyncEval(UNI_L("testFunSync(4)"), ES_ASYNC_SUCCESS, val, __LINE__);
+}
+
+test("Test suspending call async - success")
+	async;
+	require success("Init: Add test Callback to global object");
+{
+	ES_Value val;
+	DOM_Object::DOMSetNumber(&val, 8);
+	DOM_SelftestUtils::TestAsyncEval(UNI_L("testFunAsync(4)"), ES_ASYNC_SUCCESS, val, __LINE__);
+}
+
+test("Test suspending call sync - OOM")
+	async;
+	require success("Init: Add test Callback to global object");
+{
+	ES_Value val;
+	DOM_SelftestUtils::TestAsyncEval(UNI_L("testFunFailingSync(4)"), ES_ASYNC_NO_MEMORY, val, __LINE__);
+}
+
+test("Test suspending call async - OOM")
+	async;
+	require success("Init: Add test Callback to global object");
+{
+	ES_Value val;
+	DOM_SelftestUtils::TestAsyncEval(UNI_L("testFunFailingAsync(4)"), ES_ASYNC_NO_MEMORY, val, __LINE__);
+}
+
+test("Test suspending call - thread canceled")
+	async;
+	require success("Init: Add test Callback to global object");
+{
+	ES_Value val;
+	DOM_SelftestUtils::TestAsyncEval(UNI_L("testFunCancelingThread(4)"), ES_ASYNC_CANCELLED, val, __LINE__);
+}
+
+
+test("Test suspending Get sync - success")
+	async;
+	require success("Init: Add test Callback to global object");
+{
+	ES_Value val;
+	DOM_Object::DOMSetNumber(&val, 4);
+	DOM_SelftestUtils::TestAsyncEval(UNI_L("testFunSync.four"), ES_ASYNC_SUCCESS, val, __LINE__);
+}
+
+test("Test suspending Get async - success")
+	async;
+	require success("Init: Add test Callback to global object");
+{
+	ES_Value val;
+	DOM_Object::DOMSetNumber(&val, 4);
+	DOM_SelftestUtils::TestAsyncEval(UNI_L("testFunAsync.four"), ES_ASYNC_SUCCESS, val, __LINE__);
+}
+
+test("Test suspending Get sync - OOM")
+	async;
+	require success("Init: Add test Callback to global object");
+{
+	ES_Value val;
+	DOM_SelftestUtils::TestAsyncEval(UNI_L("testFunFailingSync.four"), ES_ASYNC_NO_MEMORY, val, __LINE__);
+}
+
+test("Test suspending Get async - OOM")
+	async;
+	require success("Init: Add test Callback to global object");
+{
+	ES_Value val;
+	DOM_SelftestUtils::TestAsyncEval(UNI_L("testFunFailingAsync.four"), ES_ASYNC_NO_MEMORY, val, __LINE__);
+}
+
+test("Test suspending Get cancelled")
+	async;
+	require success("Init: Add test Callback to global object");
+{
+	ES_Value val;
+	DOM_SelftestUtils::TestAsyncEval(UNI_L("testFunCancelingThread.four"), ES_ASYNC_CANCELLED, val, __LINE__);
+}
+
+
+test("Test suspending Put sync - success")
+	async;
+	require success("Init: Add test Callback to global object");
+{
+	ES_Value val;
+	DOM_Object::DOMSetNumber(&val, 5);
+	DOM_SelftestUtils::TestAsyncEval(UNI_L("testFunSync.four = 5"), ES_ASYNC_SUCCESS, val, __LINE__);
+}
+
+test("Test suspending Put async - success")
+	async;
+	require success("Init: Add test Callback to global object");
+{
+	ES_Value val;
+	DOM_Object::DOMSetNumber(&val, 5);
+	DOM_SelftestUtils::TestAsyncEval(UNI_L("testFunAsync.four = 5"), ES_ASYNC_SUCCESS, val, __LINE__);
+}
+
+test("Test suspending Put sync - OOM")
+	async;
+	require success("Init: Add test Callback to global object");
+{
+	ES_Value val;
+	DOM_SelftestUtils::TestAsyncEval(UNI_L("testFunFailingSync.four = 5"), ES_ASYNC_NO_MEMORY, val, __LINE__);
+}
+
+test("Test suspending Put async - OOM")
+	async;
+	require success("Init: Add test Callback to global object");
+{
+	ES_Value val;
+	DOM_SelftestUtils::TestAsyncEval(UNI_L("testFunFailingAsync.four = 5"), ES_ASYNC_NO_MEMORY, val, __LINE__);
+}
+
+test("Test suspending Put cancelled")
+	async;
+	require success("Init: Add test Callback to global object");
+{
+	ES_Value val;
+	DOM_SelftestUtils::TestAsyncEval(UNI_L("testFunCancelingThread.four = 5"), ES_ASYNC_CANCELLED, val, __LINE__);
+}
+
+test("Cleanup")
+	language ecmascript;
+	require success("Init: Add test Callback to global object");
+{
+	delete testFunSync;
+	delete testFunAsync;
+	delete testFunFailingSync;
+	delete testFunFailingAsync;
+	delete testFunCancelingThread;
+}

@@ -1,0 +1,123 @@
+/* -*- Mode: c++; tab-width: 4; indent-tabs-mode: t; c-basic-offset: 4 -*-
+ *
+ * Copyright (C) 2007 Opera Software AS.  All rights reserved.
+ *
+ * This file is part of the Opera web browser.  It may not be distributed
+ * under any circumstances.
+ */
+
+group "memory.elopool";
+
+language C++;
+
+require ARCHITECTS_API_APPROVAL;
+require MEMORY_ELOPOOL_ALLOCATOR;
+
+global
+{
+	OpMemPools* test;
+}
+
+setup
+{
+	// Create a temporary pooling infrastructure we can test against
+	test = OP_NEW(OpMemPools,());
+	test->PlatformInit();
+	test->Install();
+}
+
+exit
+{
+	// We don't need it any more
+	test->Uninstall();
+	OP_DELETE(test);
+}
+
+test("Simple ELSA allocations")
+{
+	OpMemLife life;
+
+	char* a1 = OP_NEWELSA(char, 4000, life); // Goes into first pool
+	char* a2 = OP_NEWELSA(char, 96, life);   // Goes into first pool
+
+	//
+	// aa1 and aa2 are the *actual* allocations, i.e. the memory allocated
+	// in the pools. a1 and a2 may point to the heap, where memory guards
+	// and debugging info is also allocated together with the data.
+	//
+	char* aa1 = (char*)OpMemGuard_Real2Shadow((void*)a1);
+	char* aa2 = (char*)OpMemGuard_Real2Shadow((void*)a2);
+
+	unsigned int n1 = test->AddrToBlocknum((void*)aa1);
+	unsigned int n2 = test->AddrToBlocknum((void*)aa2);
+
+	verify(a1 != 0);	// Both allocations should succeed
+	verify(a2 != 0);
+	verify(n1 != 0);
+	verify(n2 != 0);
+
+	verify(aa1 < aa2);	// The first allocation should go first in memory
+	verify(n1 == n2);	// .... and into the same pool
+
+	char* a3 = OP_NEWELSA(char, 4001, life); // Goes into second pool
+	char* a4 = OP_NEWELSA(char, 95, life);   // Does not fit, due to padding
+
+	char* aa3 = (char*)OpMemGuard_Real2Shadow((void*)a3);
+	char* aa4 = (char*)OpMemGuard_Real2Shadow((void*)a4);
+	
+
+	unsigned int n3 = test->AddrToBlocknum((void*)aa3);
+	unsigned int n4 = test->AddrToBlocknum((void*)aa4);
+
+	verify(a3 != 0);	// Should not fail
+	verify(a4 != 0);
+	verify(n3 != 0);
+	verify(n4 != 0);
+
+	verify(n3 != n4);	// The fourth does not fit in the second pool
+
+	verify(n3 != n1);	// Sanity checks
+	verify(n3 != n2);
+	verify(n4 != n1);
+	verify(n4 != n2);
+}
+
+test("Alignment")
+{
+	OpMemLife life;
+
+	char* a1 = OP_NEWELSA(char, 1, life);
+	char* a2 = OP_NEWELO(char, (), life);
+	char* a3 = OP_NEWELO(char, (), life);
+
+	char* aa1 = (char*)OpMemGuard_Real2Shadow((void*)a1);
+	char* aa2 = (char*)OpMemGuard_Real2Shadow((void*)a2);
+	char* aa3 = (char*)OpMemGuard_Real2Shadow((void*)a3);
+
+	verify((((UINTPTR)a1)  & 1) == 0);
+	verify((((UINTPTR)aa1) & 1) == 0);
+
+	verify((((UINTPTR)a2)  & (MEMORY_ALIGNMENT-1)) == 0);
+	verify((((UINTPTR)aa2) & (MEMORY_ALIGNMENT-1)) == 0);
+
+	verify((aa2 - aa1) == MEMORY_ALIGNMENT);
+	verify((aa3 - aa2) == MEMORY_ALIGNMENT);
+
+	char* a4 = OP_NEWELSA(char, 1, life);
+	char* a5 = OP_NEWELSA(char, 1, life);
+
+	char* aa4 = (char*)OpMemGuard_Real2Shadow((void*)a4);
+	char* aa5 = (char*)OpMemGuard_Real2Shadow((void*)a5);
+
+	verify(((UINTPTR)a4)  & 1 == 0);
+	verify(((UINTPTR)aa4) & 1 == 0);
+	verify((aa5 - aa4) == 2);
+
+	char* a6 = (char*)OP_NEWELO(double, (), life);
+	char* a7 = (char*)OP_NEWELO(double, (), life);
+
+	char* aa6 = (char*)OpMemGuard_Real2Shadow((void*)a6);
+	char* aa7 = (char*)OpMemGuard_Real2Shadow((void*)a7);
+
+	verify((aa7 - aa6) == sizeof(double));
+}

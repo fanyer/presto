@@ -1,0 +1,84 @@
+group "formats.encoder";
+
+include "modules/formats/encoder.h";
+
+//MIME_Encode_Error:                  MIME_NO_ERROR, MIME_8BIT_FAIL, MIME_7BIT_FAIL, MIME_FAILURE
+//   MIME_Encode_SetStr
+//      char *&target:                (input) NULL, previous new[]-allocated, (output) encoded
+//      int &targetlen:               (output) encoded_len
+//      const char *source:           unencoded, NULL (esp: encoding==UUENCODE)
+//      int sourcelen:                unencoded_len, 0 (UUENCODE)
+//		const char *charset:          IGNORED
+//      Mime_EncodeTypes encoding:    MAIL_QP, MAIL_QP_E, GEN_BASE64, GEN_BASE64_ONELINE, GEN_BASE64_ONLY_LF, MAIL_BASE64,
+//                                    UUENCODE, BINHEX, MAIL_BINARY, NO_ENCODING
+
+table encoding_tests(const char*, Mime_EncodeTypes, const char*)
+{
+// Must comment out some cases since #ifdef doesn't work here!
+//	{ "", MAIL_QP, NULL },
+	{ "", UUENCODE, "\x60\r\n"},
+	{ "Opera ftw", GEN_BASE64, "T3BlcmEgZnR3" },
+	{ "Opera ftw!", GEN_BASE64, "T3BlcmEgZnR3IQ=="},
+	{ "Opera ftw\n", UUENCODE, "*3W!E<F$@9G1W\"@``\r\n`\r\n" },
+//	{ "Opera ftw=true_? \n", MAIL_QP, "Opera ftw=3Dtrue_?=20\n" },
+//	{ "Opera ftw=true_? \n", MAIL_QP_E, "Opera=20ftw=3Dtrue=5F=3F=20\n" },
+	{ "Opera ftw", MAIL_BINARY, "Opera ftw" },
+	{ "Opera ftw", NO_ENCODING, "Opera ftw" },
+	{ "Mary had a little lamb, Its fleece was white as snow", GEN_BASE64,
+	  "TWFyeSBoYWQgYSBsaXR0bGUgbGFtYiwgSXRzIGZsZWVjZSB3YXMgd2hpdGUgYXMg\r\nc25vdw==" },
+	{ "Mary had a little lamb, Its fleece was white as snow", MAIL_BASE64,
+	  "TWFyeSBoYWQgYSBsaXR0bGUgbGFtYiwgSXRzIGZsZWVjZSB3YXMgd2hpdGUgYXMg\r\nc25vdw==" },
+	{ "Mary had a little lamb, Its fleece was white as snow", GEN_BASE64_ONELINE,
+	  "TWFyeSBoYWQgYSBsaXR0bGUgbGFtYiwgSXRzIGZsZWVjZSB3YXMgd2hpdGUgYXMgc25vdw==" },
+	{ "Mary had a little lamb, Its fleece was white as snow", GEN_BASE64_ONLY_LF,
+	  "TWFyeSBoYWQgYSBsaXR0bGUgbGFtYiwgSXRzIGZsZWVjZSB3YXMgd2hpdGUgYXMg\nc25vdw==" },
+
+	// Odd cases (for coverage)
+	{ "Opera ftw", BINHEX, NULL },
+}
+
+test("MIME encoding") leakcheck;
+{
+	char* encoded = NULL;
+	int encoded_len;
+	iterate (unencoded, encode_type, expected_encoded) from encoding_tests
+	{
+		MIME_Encode_SetStr(encoded, encoded_len,
+			unencoded, (int)op_strlen(unencoded),
+			NULL, encode_type);
+		if (expected_encoded == NULL)
+		{
+			verify(encoded_len == 0);
+			verify(encoded == NULL);
+		}
+		else
+		{
+			verify(encoded_len == (int)op_strlen(expected_encoded));
+			if (encode_type != MAIL_BINARY && encode_type != NO_ENCODING)
+				verify(encoded[encoded_len] == 0);
+			verify(op_memcmp(expected_encoded, encoded, encoded_len) == 0);
+		}
+	}
+}
+finally
+{
+	OP_DELETEA(encoded);
+}
+
+test("quoted printable") leakcheck;
+{
+#if defined URL_UPLOAD_QP_SUPPORT
+	verify(CountQPEscapes("=? _\x01\x7f\x80", 7) == 7);
+	verify(CountQPEscapes("(\")\t\n\r", 6) == 0);
+	for (int i=0; i<=512; i++) {
+		BOOL expected                 = i<=8 || i==11 || i==12 || (i>=14 && i<=31) || i==61 || i>=127;
+		BOOL notCleanspaceExpected    = expected || i==32 || i==63 || i==95;
+		BOOL inCommentExpected        = expected || i== 9 || i==10 || i==13;
+		BOOL unrestricted8BitExpected = expected && i<128;
+		verify(NeedQPEscape((uni_char)i, 0)                     == expected);
+		verify(NeedQPEscape((uni_char)i, MIME_NOT_CLEANSPACE)   == notCleanspaceExpected);
+		verify(NeedQPEscape((uni_char)i, MIME_IN_COMMENT)       == inCommentExpected);
+		verify(NeedQPEscape((uni_char)i, MIME_8BIT_RESTRICTION) == unrestricted8BitExpected);
+	}
+#endif
+}

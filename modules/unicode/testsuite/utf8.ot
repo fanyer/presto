@@ -1,0 +1,214 @@
+/* -*- Mode: c++; tab-width: 4; indent-tabs-mode: t; c-basic-offset: 4 -*-
+**
+** Copyright (C) 2012 Opera Software ASA.  All rights reserved.
+**
+** This file is part of the Opera web browser.  It may not be distributed
+** under any circumstances.
+**
+** Peter Krefting
+*/
+
+group "unicode.utf8";
+
+include "modules/unicode/utf8.h";
+include "modules/unicode/unicode_stringiterator.h";
+
+global
+{
+	/* Inherit the UTF8Decoder to be able to count and verify the
+	 * number of invalid input code units. */
+	class UTF8CheckedDecoder : public UTF8Decoder
+	{
+	public:
+		UTF8CheckedDecoder()
+			: UTF8Decoder()
+			, m_invalid(0)
+		{}
+
+		virtual int HandleInvalid(int)
+		{
+			++ m_invalid;
+			return 0;
+		}
+
+		int GetInvalid()
+		{
+			return m_invalid;
+		}
+
+		virtual void ResetInvalid()
+		{
+			m_invalid = 0;
+		}
+
+	private:
+		int m_invalid;
+	};
+}
+
+subtest from_utf8(const unsigned char *utf8, size_t utf8_len, const UnicodePoint *utf32, size_t utf32_len, int numinvalid)
+{
+	UTF8CheckedDecoder decoder;
+
+	uni_char workbuf[256]; /* ARRAY OK 2012-04-23 peter */
+
+	// Perform measurements
+	int measured;
+	int destlen = decoder.Measure(utf8, utf8_len, sizeof workbuf, &measured);
+	verify(destlen <= int(ARRAY_SIZE(workbuf)));
+	verify(measured == int(utf8_len));
+#ifdef ENCODINGS_HAVE_CHECK_ENDSTATE
+	verify(decoder.IsValidEndState());
+#endif
+
+	// Convert the text
+	decoder.Reset();
+	decoder.ResetInvalid();
+	int read;
+	int written = decoder.Convert(utf8, utf8_len, workbuf, sizeof workbuf, &read);
+	verify(read == measured);
+#ifdef ENCODINGS_HAVE_CHECK_ENDSTATE
+	verify(decoder.IsValidEndState());
+#endif
+	verify(written == destlen);
+
+	// Verify against reference
+	UnicodeStringIterator iterator(workbuf, 0, UNICODE_DOWNSIZE(written));
+	size_t i = 0;
+	while (iterator.At() != 0)
+	{
+		verify(iterator.At() == utf32[i]);
+		iterator.Next();
+		++ i;
+	}
+	verify(i == utf32_len);
+	verify(decoder.GetInvalid() == numinvalid);
+}
+
+subtest to_utf8(const unsigned char *utf8, size_t utf8_len, const UnicodePoint *utf32, size_t utf32_len)
+{
+	UTF8Encoder encoder;
+	uni_char sourcebuf[256]; /* ARRAY OK 2012-04-23 peter */
+	char workbuf[256]; /* ARRAY OK 2012-04-23 peter */
+
+	// Construct UTF-16 input
+	size_t i = 0, utf16_len = 0;
+	while (i < utf32_len)
+	{
+		utf16_len += Unicode::WriteUnicodePoint(sourcebuf + utf16_len, utf32[i ++]);
+		verify(utf16_len < ARRAY_SIZE(sourcebuf) - 1);
+	}
+
+	// Perform measurements
+	int measured;
+	int destlen = encoder.Measure(sourcebuf, UNICODE_SIZE(utf16_len), sizeof workbuf, &measured);
+	verify(measured == int(UNICODE_SIZE(utf16_len)));
+
+	// Convert the text
+	encoder.Reset();
+	int read;
+	int written = encoder.Convert(sourcebuf, UNICODE_SIZE(utf16_len), workbuf, sizeof workbuf, &read);
+	verify(read == measured);
+	verify(written == destlen);
+
+	// Verify against reference
+	verify(written == int(utf8_len));
+	verify(0 == op_memcmp(workbuf, utf8, utf8_len));
+}
+
+test("Basic test")
+{
+	/* 6.0 D92 example */
+	const unsigned char d92_utf8[] = { 0x4D,   0xD0, 0xB0, 0xE4, 0xBA, 0x8C, 0xF0, 0x90, 0x8C, 0x82 };
+	const UnicodePoint d92_uni[] =   { 0x004D, 0x0430,     0x4E8C,           0x10302                };
+
+	verify(from_utf8(d92_utf8, ARRAY_SIZE(d92_utf8), d92_uni, ARRAY_SIZE(d92_uni), 0));
+	verify(to_utf8  (d92_utf8, ARRAY_SIZE(d92_utf8), d92_uni, ARRAY_SIZE(d92_uni)));
+}
+
+test("Ill-formed")
+{
+	const unsigned char ill_utf8[] = { 0xC0, 0xAF };
+	const UnicodePoint ill_uni[] = { 0xFFFD, 0xFFFD };
+
+	verify(from_utf8(ill_utf8, ARRAY_SIZE(ill_utf8), ill_uni, ARRAY_SIZE(ill_uni), 2));
+}
+
+test("Non-shortest form")
+{
+	const unsigned char ill_utf8[] = { 0xE0, 0x9F, 0x80 };
+	const UnicodePoint ill_uni[] = { 0xFFFD };
+
+	verify(from_utf8(ill_utf8, ARRAY_SIZE(ill_utf8), ill_uni, ARRAY_SIZE(ill_uni), 1));
+}
+
+test("ASCII only")
+{
+	const unsigned char ascii_utf8[] = { 'A', 'S', 'C', 'I', 'I', ' ', 'o', 'n', 'l', 'y' };
+	const UnicodePoint  ascii_uni[]  = { 'A', 'S', 'C', 'I', 'I', ' ', 'o', 'n', 'l', 'y' };
+
+	verify(from_utf8(ascii_utf8, ARRAY_SIZE(ascii_utf8), ascii_uni, ARRAY_SIZE(ascii_uni), 0));
+	verify(to_utf8  (ascii_utf8, ARRAY_SIZE(ascii_utf8), ascii_uni, ARRAY_SIZE(ascii_uni)));
+}
+
+test("Two-byte form")
+{
+	const unsigned char two_utf8[] = { 0xC2,0x80, 0xC2,0xBF, 0xDF,0x80, 0xDF,0xBF };
+	const UnicodePoint  two_uni[]  = { 0x0080,    0x00BF,    0x07C0,    0x07FF     };
+
+	verify(from_utf8(two_utf8, ARRAY_SIZE(two_utf8), two_uni, ARRAY_SIZE(two_uni), 0));
+	verify(to_utf8  (two_utf8, ARRAY_SIZE(two_utf8), two_uni, ARRAY_SIZE(two_uni)));
+}
+
+test("Three-byte form")
+{
+	const unsigned char three_utf8[] = { 0xE0,0xA0,0x80, 0xE0,0xBF,0xBF, 0xEF,0x80,0x80, 0xEF,0xBF,0xBF };
+	const UnicodePoint  three_uni[]  = { 0x0800,         0x0FFF,         0xF000,         0xFFFF         };
+
+	verify(from_utf8(three_utf8, ARRAY_SIZE(three_utf8), three_uni, ARRAY_SIZE(three_uni), 0));
+	verify(to_utf8  (three_utf8, ARRAY_SIZE(three_utf8), three_uni, ARRAY_SIZE(three_uni)));
+}
+
+test("Four-byte form")
+{
+	const unsigned char four_utf8[] = { 0xF0,0x90,0x80,0x80, 0xF0,0xBF,0xBF,0xBF, 0xF4,0x80,0x80,0x80, 0xF4,0x8F,0xBF,0xBF };
+	const UnicodePoint  four_uni[]  = { 0x10000,             0x3FFFF,             0x100000,            0x10FFFF            };
+
+	verify(from_utf8(four_utf8, ARRAY_SIZE(four_utf8), four_uni, ARRAY_SIZE(four_uni), 0));
+	verify(to_utf8  (four_utf8, ARRAY_SIZE(four_utf8), four_uni, ARRAY_SIZE(four_uni)));
+}
+
+test("Five-byte form")
+{
+	/* Disallowed as of RFC 3629 */
+	const unsigned char five_utf8[] = { 0xF8,   0x82,   0x80,   0x80,   0x80   };
+	const UnicodePoint  five_uni[] =  { 0xFFFD, 0xFFFD, 0xFFFD, 0xFFFD, 0xFFFD };
+
+	verify(from_utf8(five_utf8, ARRAY_SIZE(five_utf8), five_uni, ARRAY_SIZE(five_uni), 5));
+}
+
+test("Six-byte form")
+{
+	/* Disallowed as of RFC 3629 */
+	const unsigned char six_utf8[] = { 0xFC,   0x84,   0x80,   0x80,   0x80,   0x80   };
+	const UnicodePoint  six_uni[] =  { 0xFFFD, 0xFFFD, 0xFFFD, 0xFFFD, 0xFFFD, 0xFFFD };
+
+	verify(from_utf8(six_utf8, ARRAY_SIZE(six_utf8), six_uni, ARRAY_SIZE(six_uni), 6));
+}
+
+test("Unpaired surrogates in input")
+{
+	const uni_char unpaired[] = { 0x0020, 0xD800, 0x0020, 0xDC00, 0x0020 };
+	const unsigned char expected[] = { 0x20, 0xEF, 0xBF, 0xBD, 0x20, 0xEF, 0xBF, 0xBD, 0x20 };
+
+	char workbuf[256]; /* ARRAY OK 2012-04-23 peter */
+	UTF8Encoder encoder;
+	int read;
+	int measured = encoder.Measure(unpaired, sizeof unpaired);
+	encoder.Reset();
+	int written = encoder.Convert(unpaired, sizeof unpaired, workbuf, sizeof workbuf, &read);
+	verify(read == sizeof unpaired);
+	verify(written == sizeof expected);
+	verify(written == measured);
+	verify(0 == op_memcmp(workbuf, expected, sizeof expected));
+}

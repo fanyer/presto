@@ -1,0 +1,321 @@
+; -*- mode: text; mode: font-lock -*-
+
+This is a beginning design for the alpha version.  It is not complete.
+Draft 1 / 2003-01-27 / lth
+
+
+   (Meta-comment about the style, appropriate because this document is
+    part of a pilot project: each paragraph, section, or subsection is
+    tagged in a way that attempts to (a) describe it and its relation
+    to the surrounding sections, (b) allow it to be cross-referenced
+    from other documentation, from the code, and in electronic and
+    spoken communication, and (c) focus it on one topic.  The
+    precedence for this syntax comes from a group I worked with that
+    used this with some effectiveness (though they also used CMM and
+    very rigorous development methodology).
+
+    References within the file always start with a '.'; references
+    out of file always start with the name of the file.
+
+    Emacs users will want to take a look at the end of the file for
+    some font-lock tricks that increase readability.
+
+    The file tag for this file is 'jsplugin', thus what is tagged here
+    as 'overview.loading' is really 'jsplugin.overview.loading', when
+    referred to globally.)
+
+   (Critique of this draft: It is not very good.  It mixes design on
+    at least two levels, conceptual and implementation, and on top of
+    that there is commentary on the design.)
+
+
+file: jsplugin.
+
+overview.whatis: JS plugins provide DOM-like functionality on objects
+that are not part of DOM or JavaScript; these objects may be
+system-dependent, unsafe, obscure, or otherwise not desirable to
+include in Opera in general.
+
+overview.opera-functionality: JS plugins provide additional
+functionality for some DOM/DHTML objects, namely JS_Window,
+DOM_HTMLObjectElement, and a new kind of DHTML object type called a
+JS_Plugin_Object.
+
+overview.loading: JS plugins are loaded from shared objects residing
+in a file system and are implemented in C, C++ or other low-level
+language.  For portability their interface is a C interface.
+
+overview.manager: A new manager keeps track of loaded plugins and
+their functionality.  JS_Window and DOM_HTMLObjectElement instances
+may query the manager about the availability of extended
+functionality.  Instances of JS_Plugin_Object are created by the
+plugins themselves and are hooks for functionality that resides in the
+plugin.
+
+overview.no-object-tag-support-in-alpha: Plugins to the
+DOM_HTMLObjectElement are not discussed further in this alpha design.
+
+overview.client-interface: A client C interface allows the plugin to
+implement most operations that we support in our own DOM.
+
+overview.more-info: For a more general discussion see the older
+overview document.
+
+
+
+manager.exists: There is a distinguished object called the "JavaScript
+Plugin Manager".  It is an instance of the class JS_PluginManager.  It
+is accessible through the global variable g_jsPluginManager.
+
+manager.create-destroy: The plugin manager is created by Initcore()
+and destroyed by Terminate().  When it is created it initializes
+itself, but does nothing further.  When it is destroyed it unloads all
+its plugins and frees all its resources.
+
+manager.starting: The manager is *started* by calling its Startup()
+method.  The Startup() method goes through the plugin loading process
+(described below) and makes the manager available for queries.
+
+manager.when-to-start: The manager can be started by Initcore or by
+the ECMAScript manager, when the first ECMAScript environment is
+created.  I recommend the former, as it requires no API change for the
+ECMAScript module.
+
+
+
+loading.filesystem: Plugins are located in a dedicated directory, eg
+$OPERADIR/jsplugins.  When the JS Plugin Manager (ref .manager)
+starts, it scans this directory looking for shared objects, using a
+platform-dependent mechanism.
+
+loading.naming: Each shared object's file name maps to a plugin name,
+which is the alphanumeric all-lowercase translation of the plugin's
+file name without any path components or extension.  For example, on
+Windows the shared object can be called C:\Foo\whatever-37.dll; the
+plugin name is "whatever37".
+
+loading.naming.unique: Every plugin in the same Opera process has a
+unique plugin name.
+
+loading.exported-name: The shared object must export one named
+function, called "jsplugin_<name>_capabilities", where <name> is the
+plugin's plugin name.  This function must conform to the signature
+defined in jsplugin.h as "jsplugin_capabilties".  (ref .plugin-caps)
+
+loading.exported-name.required: If a shared object in the plugins
+directory does not export such a function, then it is not a plugin.
+
+loading.querying: The capabilities function may be called one or more
+times.  If called multiple times, later calls should return data that
+mean the same thing as the data returned on earlier calls.
+
+loading.querying.lifetime: Input parameters to the capabilities
+function will point to static (ie, live until the plugin is unloaded)
+data inside Opera; output parameters must point to static data in the
+plugin.
+
+loading.unloading: A plugin is unloaded when its unloading function is
+called.
+
+
+mgr-internal.global-names: The plugin manager constructs a global
+plugin namespace based on the return values from the capabilities
+function: the global names exported from *all* plugins are mapped to a
+flat namespace.  All these are available in all windows.
+
+mgr-internal.conflicts: Naming conflicts should be resolved by always
+choosing names on a first-come first-served basis, rejecting entire
+plugins whose names conflict with previously defined names.  (A plugin
+may export a name only once.)
+
+mgr-internal.query: There is a function 'GetGlobalContext' on the
+plugin manager that returns a JS_PluginContext object.  This object
+replies to queries about the contents of the global JS plugin
+namespace.
+
+mgr-internal.query.context-object.discussion: The reason this is an
+object is that, once we support OBJECT subclassing, then there will be
+several of them -- one for the global namespace and one for each
+object type supported by plugins.  Yes, I'm looking ahead, and yes,
+I'd be comfortable if this were to be simplified for the alpha.
+
+mgr-internal.query.method: Generally, it has a Lookup function which
+replies with FALSE if there is no such defined name; or with TRUE, the
+pertinent value, and a flag for whether the value should be cached
+somewhere, if there is a value.
+
+mgr-internal.query.caching.discuss: For queries from JS_Window the
+value is cached in the window object, as a global variable.  This is
+normal for mostly-immutable values, like functions, but not for actual
+values that can be written by the object.
+
+mgr-internal.query.performance: JS_PluginContext::Lookup must be very
+fast in the common case -- no such name defined -- or it will be a
+bottleneck on lookups that end up in the prototype object of the
+object that was originally the target of the query.
+
+
+
+js-plugin-obj: There is a new object type called JS_Plugin_Object.
+
+js-plugin-obj.functionality: Instances of this object translate
+requests that use the DOM object access protocol into requests that
+use the jsplugin access protocol: GetName, GetIndex, PutName,
+PutIndex, Call, Construct, and object destruction.
+
+js-plugin-obj.creation: JS_Plugin_Objects are created by the plugin
+itself, using the callbacks CreateObject and CreateFunction.  They are
+just DOM objects that have no associated HTML element (they are not
+DOM_Node or DOM_Element, just DOM_Object).  I guess in Opera6 these
+objects will just be subclasses of EcmaScript_Object.
+
+js-plugin-obj.destruction: JS_Plugin_Objects are destroyed by the
+ECMAScript garbage collector.  (Again Opera6 is a little iffy here.)
+
+js-plugin-obj.callbacks: When a JS_Plugin_Object is created it is
+initialized with callbacks into the plugin code; these are used to
+implement the various functionality on the plugin object.
+
+js-plugin-obj.named-access: GetName and PutName are translated to
+calls to the getter and setter callbacks the plugin supplied when the
+object was created.
+
+js-plugin-obj.indexed-access: GetIndex and PutIndex are to be
+translated directly into calls to GetName and PutName with the string
+equivalents of the indices.
+
+js-plugin-obj.call-and-construct: Call and Construct are translated to
+calls to the call and construct callbacks the plugin supplied when the
+object was created.
+
+js-plugin-obj.construct-for-call: If a call is made to a
+JS_Plugin_Object and its call callback has not been defined but the
+construct callback exists, then the construct callback should be
+called in the stead of call.
+
+js-plugin-obj.construct-for-call.discuss: The conventional behavior of
+a constructor when it is called as a function is either to behave like
+a type converter, when that makes sense, or to work as if it were
+called with a 'new' expression.
+
+js-plugin-obj.foreign: A given plugin that creates a JS_Plugin_Object
+will normally need to maintain private data for this object inside the
+plugin.  We call this object the 'plugin-side aspect' of the
+JS_Plugin_Object.  In the same vein, the 'dom-side aspect' is the
+JS_Plugin_Object itself, and the 'engine-side aspect' is the ES_Object
+inside the ECMAScript engine.
+
+
+shared-representation.def: The object type 'jsplugin_context' is a C
+type that holds two opaque pointers: one to the dom-side aspect and
+one to the plugin-side aspect:
+
+    struct jsplugin_context {
+        void *plugin_private;
+        void *opera_private;
+    };
+
+shared-representation.use: By communicating with this object, there
+are few protocol hassles.  Furthermore, the DOM side and plugin side
+aspects will usually contain a pointer to the jsplugin_context, so it
+is easy to get a hold of the object.
+
+shared-representation.mustfix: jsplugin_context is a horrible name, it
+needs to be jsplugin_object or something like that.
+
+
+plugin-caps.def: At startup the capabilities of the plugin are
+communicated to Opera through a C structure called 'jsplugin_cap'.
+Capabilities include names of global variables and OBJECT subtypes,
+as well as methods for getting and setting global names, creating
+and destroying OBJECT plugins, and unloading the plugin.
+
+    struct jsplugin_cap {
+        const uni_char **global_names;
+        const uni_char **object_type_names;
+        jsplugin_getter *global_getter;
+        jsplugin_setter *global_setter;
+        int (*object_subclass_create)( jsplugin_context *ctx, const uni_char *type );
+        int (*object_subclass_destroy)( jsplugin_context *ctx );
+        void (*unload)( void );
+    };
+
+
+opera-callbacks.def: When the plugin is initialized Opera provides it
+with methods (callbacks) that the plugin can use to create objects and
+functions.  They are passed in through a structure called
+'jsplugin_callbacks'.  When objects are created they are initialized
+with methods to implement its operations (ref .js-plugin-obj.callbacks).
+
+    struct jsplugin_callbacks {
+        int (*create_function)( jsplugin_getter *g, jsplugin_setter *s, 
+                                jsplugin_function *f, const char *f_signature,
+                                jsplugin_constructor *c, const char *c_signature,
+                                jsplugin_destructor_hook *h,
+                                jsplugin_context **result );
+    
+        int (*create_object)( jsplugin_getter *g, 
+                              jsplugin_setter *s, 
+                              jsplugin_destructor_hook *h,
+                              jsplugin_context **result );
+    };
+
+opera-callbacks.signatures: The signatures on the constructor and call
+methoss, if not NULL, are used to convert the actual parameters to
+specific types expected by the methods.  The signatures follow the
+conventions used internally by the ECMAScript engine.
+
+opera-callbacks.destructor-hook: The destructor hook, if not NULL, is
+called when the garbage collector is about to destroy the object.
+(When the destructor hook is called it is too late to prevent
+destruction.)
+
+
+plugin-interface.def: The plugin client interface -- types, enums,
+functions -- is defined in the file jsplugin.h.
+
+plugin-interface.error-codes: With the exception of the initialization
+function, all methods return a result code to signal the status of the
+request.  Different methods have different sets of result codes.  The
+result codes are enums whose names start with "JSP_GET_", "JSP_PUT_",
+"JSP_CALL_" (used also for constructors), or "JSP_DESTROY_".
+
+plugin-interface.error-codes.discuss: The tagged error code namespace
+reduces rather than increases conceptual clutter.  It is possible that
+we should use separate enums and enum return types (and not int) to
+get full benefits from this.
+
+plugin-interface.values: The C type "jsplugin_value" is used to
+communicate values between the plugin and Opera.  The type is a tagged
+union; the types are defined by enums whose names start with
+"JSP_TYPE_".
+
+    struct jsplugin_value {
+        int type;
+        union {
+            struct {
+                const uni_char *string;
+                int len;
+            };
+            double number;
+            int boolean;
+            jsplugin_context *object;
+        } u;
+    };
+
+
+
+
+
+;;; Emacs users: merge the following into your .emacs, and if you
+;;; find out how to accomplish the same with buffer-local variables,
+;;; please let me know :-)   --lars
+
+(defvar text-font-lock-keywords
+  '(("^[-a-zA-Z0-9_.]*:" . font-lock-keyword-face)))
+
+(add-hook 'text-mode-hook
+          (function (lambda ()
+                      (make-local-variable 'font-lock-defaults)
+                      (setq font-lock-defaults '(text-font-lock-keywords t)))))
+

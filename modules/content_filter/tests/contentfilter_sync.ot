@@ -1,0 +1,195 @@
+/* -*- Mode: c++; tab-width: 4; indent-tabs-mode: t; c-basic-offset: 4; c-file-style:"stroustrup" -*-
+**
+** Copyright (C) 1995-2010 Opera Software AS.  All rights reserved.
+**
+** This file is part of the Opera web browser.  It may not be distributed
+** under any circumstances.
+**
+*/
+
+group "content_filter.sync";
+require URL_FILTER;
+require SYNC_CONTENT_FILTERS;
+
+include "modules/content_filter/content_filter.h";
+include "modules/sync/sync_coordinator.h";
+
+table Table_createfilter_guids(const uni_char*, const uni_char*)
+{
+	{ UNI_L("90C8044666DC7544975E9F2B2F434BA1"), UNI_L("http://flash.vg.no/annonser/*") }
+	{ UNI_L("4D37D39021EECC48A94A4FD06E2A2D81"), UNI_L("http://ad2.se.thepiratebay.org/pokerclub.gif*") }
+	{ UNI_L("B05B755C1201D54C846ADC9676833081"), UNI_L("http://adcache.aftenposten.no/RealMedia/*") }
+	{ UNI_L("8F296189DF987F42AEA4700036A579EA"), UNI_L("http://ad.no.doubleclick.net/*") }
+	{ UNI_L("69B99132AE8ED4498BA7CC186278DA32"), UNI_L("http://ad.eu.doubleclick.net/*") }
+}
+
+global
+{
+	// forward calling class to test protected methods
+	class ST_URLFilter : public URLFilter
+	{
+		public:
+			OP_STATUS URLFilterItem_to_OpSyncItem(FilterURLnode* item, OpSyncItem*& sync_item, OpSyncDataItem::DataItemStatus sync_status)
+			{
+				return URLFilter::URLFilterItem_to_OpSyncItem(item, sync_item, sync_status);
+			}
+			OP_STATUS OpSyncItem_to_URLFilterItem(OpSyncItem* sync_item, FilterURLnode*& item, BOOL enable_update)
+			{
+				return URLFilter::OpSyncItem_to_URLFilterItem(sync_item, item, enable_update);
+			}
+			
+			OP_STATUS ProcessAddedSyncItem(OpSyncItem* item, BOOL enable_update)
+			{
+				return URLFilter::ProcessAddedSyncItem(item, enable_update);
+			}
+	};
+	ST_URLFilter* urlfilter;
+}
+
+test("create object")
+{
+	urlfilter = OP_NEW(ST_URLFilter, ());
+	verify(urlfilter != NULL);
+}
+
+test("Sync support methods: FindNodeByID - SetGUID() - UUID()") require success "create object";
+{
+	iterate (guid, block_url) from Table_createfilter_guids
+	{
+		FilterURLnode* newnode = OP_NEW(FilterURLnode, ());
+		verify(newnode);
+		verify_success(newnode->SetURL(block_url));
+		verify_success(newnode->SetGUID(guid));
+		verify_success(urlfilter->AddURL(newnode, NULL, NULL));
+	}
+	FilterURLnode* node = urlfilter->FindNodeByID(UNI_L("8F296189DF987F42AEA4700036A579EA"));
+	verify(node != NULL);
+
+	OpString guid;
+
+	guid.Set(UNI_L("UUID:"));
+	guid.Append(UNI_L("69B99132AE8ED4498BA7CC186278DA32"));
+
+	// "UUID:" will be stripped now:
+	node->SetGUID(guid.CStr());
+
+	verify(!uni_strcmp(UNI_L("69B99132AE8ED4498BA7CC186278DA32"), node->GUID()));
+}
+
+test("Sync support methods: DeleteNodeByID") require success "create object";
+{
+	FilterURLnode* node = urlfilter->FindNodeByID(UNI_L("B05B755C1201D54C846ADC9676833081"));
+	verify(node != NULL);
+
+	urlfilter->DeleteNodeByID(UNI_L("B05B755C1201D54C846ADC9676833081"));
+
+	node = urlfilter->FindNodeByID(UNI_L("B05B755C1201D54C846ADC9676833081"));
+	verify(node == NULL);
+}
+
+test("Sync support methods: URLFilterItem_to_OpSyncItem") require success "create object";
+{
+	FilterURLnode item_to_sync;
+	OpSyncItem *sync_item;
+
+	verify_success(item_to_sync.SetURL(UNI_L("http://some.url/*.gif")));
+	item_to_sync.SetIsExclude(TRUE);
+	verify_success(item_to_sync.SetGUID(UNI_L("AA6913A315E8AC4AB202A74366304308")));
+
+	verify_success(urlfilter->URLFilterItem_to_OpSyncItem(&item_to_sync, sync_item, OpSyncDataItem::DATAITEM_ACTION_ADDED));
+
+	OpString data;
+
+	verify_success(sync_item->GetData(OpSyncItem::SYNC_KEY_TYPE, data));
+	verify(!data.Compare("exclude"));
+
+	verify_success(sync_item->GetData(OpSyncItem::SYNC_KEY_ID, data));
+	verify(!data.Compare(UNI_L("AA6913A315E8AC4AB202A74366304308")));
+
+	verify_success(sync_item->GetData(OpSyncItem::SYNC_KEY_CONTENT, data));
+	verify(!data.Compare(UNI_L("http://some.url/*.gif")));
+
+	sync_item->SetDataSyncItem(NULL);
+	g_sync_coordinator->ReleaseSyncItem(sync_item);
+}
+
+test("Sync support methods: OpSyncItem_to_URLFilterItem") require success "create object";
+{
+	OpSyncItem *sync_item;
+	FilterURLnode *item;
+
+	RETURN_IF_ERROR(g_sync_coordinator->GetSyncItem(&sync_item,
+													OpSyncDataItem::DATAITEM_URLFILTER,
+													OpSyncItem::SYNC_KEY_ID,
+													UNI_L("1A3BF2F1B67BD247BD099286CC38895B")));
+
+	// Set the action / status
+	sync_item->SetStatus(OpSyncDataItem::DATAITEM_ACTION_ADDED);
+
+	// Set the other attributes:
+	verify_success(sync_item->SetData(OpSyncItem::SYNC_KEY_TYPE, UNI_L("exclude")));
+	verify_success(sync_item->SetData(OpSyncItem::SYNC_KEY_CONTENT, UNI_L("http://jallababba.*")));
+
+	verify_success(urlfilter->OpSyncItem_to_URLFilterItem(sync_item, item, FALSE));
+	verify(item->Excluded());
+
+	verify(!uni_strcmp(item->GUID(), UNI_L("1A3BF2F1B67BD247BD099286CC38895B")));
+	verify(!uni_strcmp(item->GetURL()->CStr(), UNI_L("http://jallababba.*")));
+
+	sync_item->SetDataSyncItem(NULL);
+	g_sync_coordinator->ReleaseSyncItem(sync_item);
+	OP_DELETE(item);
+}
+
+test("Duplication")
+{
+	#define JALLA UNI_L("http://jallababba.*")
+	#define JALLA2 UNI_L("http://jallababbadabba.*")
+	
+	OpSyncItem *sync_item;
+
+	RETURN_IF_ERROR(g_sync_coordinator->GetSyncItem(&sync_item,
+													OpSyncDataItem::DATAITEM_URLFILTER,
+													OpSyncItem::SYNC_KEY_ID,
+													UNI_L("1A3BF2F1B67BD247BD099286CC38895B")));
+
+	// Set the action / status
+	sync_item->SetStatus(OpSyncDataItem::DATAITEM_ACTION_ADDED);
+
+	// Set the other attributes:
+	verify_success(sync_item->SetData(OpSyncItem::SYNC_KEY_TYPE, UNI_L("exclude")));
+	verify_success(sync_item->SetData(OpSyncItem::SYNC_KEY_CONTENT, JALLA));
+	
+	// First sync
+	verify_success(urlfilter->ProcessAddedSyncItem(sync_item, FALSE));
+	// Duplication (a crash can happen soon, CORE-37128)
+	verify_success(urlfilter->ProcessAddedSyncItem(sync_item, FALSE));
+	// Update test
+	
+	OpString guid;
+	FilterURLnode *node_to_update;
+
+	verify_success(sync_item->GetData(OpSyncItem::SYNC_KEY_ID, guid));
+	
+	node_to_update=urlfilter->FindNodeByID(guid.CStr());
+	
+	verify(node_to_update);
+	verify(node_to_update->Excluded());
+	verify(!node_to_update->GetURL()->Compare(JALLA));
+	
+	// update test
+	verify_success(sync_item->SetData(OpSyncItem::SYNC_KEY_CONTENT, JALLA2));
+	verify_success(urlfilter->ProcessAddedSyncItem(sync_item, TRUE));
+	verify(node_to_update->Excluded());
+	verify(node_to_update->GetURL()->Compare(JALLA));
+	verify(!node_to_update->GetURL()->Compare(JALLA2));
+	
+	sync_item->SetDataSyncItem(NULL);
+	g_sync_coordinator->ReleaseSyncItem(sync_item);
+}
+
+test("free object") require success "create object";
+{
+	OP_DELETE(urlfilter);
+	urlfilter = NULL;
+}

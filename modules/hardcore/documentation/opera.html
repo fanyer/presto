@@ -1,0 +1,242 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN" 
+          "http://www.w3.org/TR/html4/loose.dtd">
+<html>
+
+<head>
+<link rel=stylesheet href="../../coredoc/coredoc.css" />
+<title>Opera core object</title>
+<style type="text/css">
+  pre { border-left: 2px solid #ddd; }
+</style>
+</head>
+
+<body>
+
+<h1>Opera core object</h1>
+
+<h2>What purposes does the Opera core object have?</h2>
+
+This lists the primary purposes of the Opera core object:<br>
+
+<ul>
+	<li>Initialization of the modules</li>
+	<li>Destruction of the modules</li>
+	<li>Storage of the global variables</li>
+	<li>Scheduling of when to run Opera</li>
+</ul>
+
+
+<h2>How to initialize the Opera object</h2>
+
+How you create and destroy the global Opera object depends on if <b>FEATURE_STATIC_OPERA_OBJECT</b> is turned on.
+For static Opera you can do like this:
+
+<pre>
+	Opera::StaticInit();
+	g_opera->SetListener(some_listener);
+	TRAPD(status, g_opera->InitL());
+
+	if (OpStatus::IsSuccess(status))
+	{
+		...
+
+		loop:
+			g_opera->Run();
+
+		...
+	}
+
+	g_opera->Destroy();
+</pre>
+
+and if <b>FEATURE_STATIC_OPERA_OBJECT</b> is <b>NO</b>, yo do:
+
+<pre>
+	g_opera = new Opera();
+	g_opera->SetListener(some_listener);
+	TRAPD(status, g_opera->InitL());
+
+	if (OpStatus::IsSuccess(status))
+	{
+		...
+
+		loop:
+			g_opera->Run();
+
+		...
+	}
+
+	g_opera->Destroy();
+	delete g_opera;
+</pre>
+
+Note that the global Opera object should be destroyed the same way regardless of whether Opera::InitL()
+succeeded and Opera was actually run.
+
+<h2>How does a module add a module object to Opera?</h2>
+
+Each module can have its own space in the Opera core object. For the module xxx the member
+<code>g_opera->xxx_module</code> can be made available. Each module object has to implement the interface
+<code>OperaModule</code>, which more or less has the two functions <code>InitL</code>() and <code>Destroy()</code>.<br><br>
+
+The implementation of the <code>OperaModule</code> shall be put in a file called <b>xxx_module.h</b> in the root
+of the xxx-module. Since the module object may not always be enabled a define will have to
+be set, <b>XXX_MODULE_REQUIRED</b>, for the module object to be included. The name of the module object
+shall be the name of the module capitalized, underscores removed and following character capitalized.<br>
+<br>
+Example:<br>
+<br>
+<b>spatial_navigation</b> becomes <b>SpatialNavigationModule</b><br>
+<b>webforms</b> becomes <b>WebformsModule</b><br>
+
+<h2>How is a global variable added?</h2>
+
+The module objects will be publically available through the g_opera object. To be able
+to easily access a member of a module object a <code>#define</code> is the best thing to use.
+See the <a href="http://wiki/developerwiki/index.php/Modules/CodingStandards#Global_variable_naming_.5Bcore-2.5D">
+coding standard</a> on the subject of global variable naming.<br>
+<br>
+The variable can be initialized in the constructor of the module object, constructed
+in the <code>InitL()</code> function and finally destroyed in the <code>Destroy()</code> function.
+<b>Don't use the destructor to destroy the variables - use <code>Destroy()</code>.</b><br>
+
+<br>
+Example:<br>
+<br>
+The module foo gets a new global variable:
+
+<pre>
+class FooModule : public OperaModule
+{
+public:
+	...
+
+	Foo* foo;
+};
+
+#define g_foo g_opera->foo_module.foo
+</pre>
+
+<h2>Example of module object file</h2>
+
+In the following code, we assume that we have a module called xxx which is turned on if
+<b>FEATURE_XXX</b> is turned on, and is controlled by the define <b>XXX_SUPPORT</b>.<br>
+<br>
+File: <b>xxx_module.h</b>:
+
+<pre>
+/* -*- Mode: c++; tab-width: 4; indent-tabs-mode: t; c-basic-offset: 4 -*-
+**
+** Copyright (C) 1995-2005 Opera Software AS.  All rights reserved.
+**
+** This file is part of the Opera web browser.  It may not be distributed
+** under any circumstances.
+*/
+
+#ifndef XXX_MODULE_H
+#define XXX_MODULE_H
+
+#ifdef XXX_SUPPORT
+
+#include "modules/hardcore/opera/module.h"
+
+#define XXX_MODULE_REQUIRED
+
+class XxxHandler;
+
+class XxxModule : public OperaModule
+{
+public:
+	void InitL(const OperaInitInfo& info);
+	void Destroy();
+
+	XxxHandler* handler;
+};
+
+#define g_xxx_handler g_opera->xxx_module.handler;
+
+#endif // XXX_SUPPORT
+
+#endif // !XXX_MODULE_H
+</pre>
+<h2>How does the scheduling work?</h2>
+
+The Opera object has a <code>Run()</code>-function which is the most important
+function to be able to make Opera do something. Calling <code>Run()</code> will
+make Opera handle one internal message and then return again. The
+result of the call will be the time in milliseconds until the next
+time Opera wants to be called. The product can then set a platform
+timer event to wait for that time. If the return value is zero it means
+there are more messages which would like to be handled as soon as possible.
+It is important to know that Opera can return zero for a long period of time,
+so it may not be a good solution to always let Opera run if it returns zero.
+The platform must be able to provide user input and network input from time
+to time too.<br>
+<br>
+Since Opera sometimes is called from the platform interface layer, for example
+when receiving network input or keyboard input, it can happen that the time
+when Opera was scheduled to be run the next time is not valid anymore. If
+this happens, the <code>OnReschedulingNeeded()</code> function in the listener object
+will be called. This means the product must reset the timer for when Opera
+is to be run the next time.<br>
+<br>
+Here follows an example implementation, similar to that used on Windows
+in the WinGogi port:
+
+<pre>
+void
+ProductModule::OnReschedulingNeeded(int next_event)
+{
+	m_next_timer = next_event;
+	SetTimer(g_hwnd, 0, m_next_timer, NULL);
+}
+
+void
+ProductModule::MainLoop()
+{
+	// Main message loop:
+	MSG msg = {0};
+	while (true)
+	{
+		BOOL handle = FALSE;
+		if (m_next_timer == 0)
+		{
+			if (PeekMessage(&msg, NULL, 0, 0, PM_REMOVE))
+				handle = TRUE;
+			else
+			{
+				m_next_timer = g_opera->Run();
+				if (m_next_timer > 0)
+					SetTimer(g_hwnd, 0, m_next_timer, NULL);
+			}
+		}
+		else
+		{
+			if (!GetMessage(&msg, NULL, 0, 0))
+				break;
+			handle = TRUE;
+		}
+
+		if (handle)
+		{
+			if (msg.message == WM_QUIT)
+				break;
+
+			TranslateMessage(&msg);
+			DispatchMessage(&msg);
+		}
+	}
+}
+</pre>
+
+<code>PeekMessage()</code> looks at the Windows message queue and returns TRUE if there is
+a message available in the queue. <code>GetMessage()</code> blocks until a message is available
+in the message queue. Will return FALSE if the application is quitting. <code>TranslateMessage()</code>
+and <code>DispatchMessage()</code> are used to handle the message.<br>
+<br>
+This implementation will keep handling Windows messages until there are no available, then it
+will start running Opera. This makes sense if you want to make sure user input, network traffic etc
+is always taken care of as soon as possible.
+
+</body>
+</html>

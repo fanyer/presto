@@ -1,0 +1,443 @@
+/* -*- Mode: c++; tab-width: 4; indent-tabs-mode: t; c-basic-offset: 4; -*-
+ *
+ * Copyright (C) 2008-2011 Opera Software ASA.  All rights reserved.
+ *
+ * This file is part of the Opera web browser.
+ * It may not be distributed under any circumstances.
+ */
+group "thumbnails.auth";
+
+require SUPPORT_GENERATE_THUMBNAILS;
+
+include "modules/thumbnails/thumbnailmanager.h";
+include "modules/selftest/testutils.h";
+include "modules/dochand/winman.h";
+include "modules/windowcommander/src/WindowCommander.h";
+include "modules/windowcommander/OpWindowCommanderManager.h";
+
+global
+{
+	/**
+	 * This class can be used to load a url in a new window and generate a
+	 * thumbnail for the same url. The url is expected to cause an
+	 * authentication request (the test fails if not).
+	 *
+	 * Call Init() to initialise the test with a url.
+	 *
+	 * Call StartLoadDocumentInNewWindow() to first loaded the url in a new
+	 * window (see LoadDocument()). Loading the url shall generate an
+	 * authentication request (see OnAuthenticationRequired()). The
+	 * authentication request is never answered, but on receiving the
+	 * authentication request, a thumbnail request for the same url is started
+	 * (see LoadThumbnail()). Thus the authentication request is still active
+	 * when authentication is required for loading the thumbnail. The thumbnail
+	 * manager automatically cancels the authentication request (for the
+	 * thumbnail). The test passes when finally OnThumbnailReady() is called.
+	 *
+	 * Call StartRequestThumbnail() to request the thumbnail for the url without
+	 * loading it in a new window. The thumbnail manager is expected to cancel
+	 * the authentication request for the thumbnail. Thus an "Authentication
+	 * Required" page is displayed instead and a thumbnail is generated for that
+	 * page.
+	 */
+	class ThumbnailAuthTest
+		: public TestStep
+		, public NullLoadingListener
+		, public ThumbnailManagerListener
+	{
+		OpString m_url;			///< The url to load
+		URL m_thumbnail_url;	///< The corresponding url instance
+		/** Set to true if a thumbnail was requested. If the test fails before
+		 * we receive a result for the thumbnail request we cancel the
+		 * request. */
+		bool m_thumbnail_requested;
+
+		/** The WindowCommander of the new window in which the url is loaded.
+		 * This is 0 if no new window is created. */
+		WindowCommander* m_commander;
+
+		/** The m_commander's OpLoadingListener was set to this instance to
+		 * receive the authentication request. This is the original
+		 * OpLoadingListener which is restored at the end of the test.
+		 * This is 0 if this instance is not yet (or no longer) the
+		 * OpLoadingListener of m_commander. */
+		OpLoadingListener* m_save_loading_listener;
+
+		/** The callback that was received in the authentication request. */
+		OpAuthenticationCallback* m_auth_callback;
+
+		/**
+		 * Restores the m_commander's OpLoadingListener to the saved listener
+		 * instance.
+		 */
+		void RestoreLoadingListener()
+			{
+				if (m_commander && m_save_loading_listener)
+				{
+					m_commander->SetLoadingListener(m_save_loading_listener);
+					m_save_loading_listener = 0;
+				}
+			}
+
+		/** Closes the window that was opened with the url. */
+		void CloseWindow()
+			{
+				if (m_commander)
+				{
+					g_windowCommanderManager->GetUiWindowListener()->CloseUiWindow(m_commander);
+					m_commander = 0;
+				}
+			}
+
+		/**
+		 * Remove this instance as OpLoadingListener and
+		 * ThumbnailManagerListener. This method needs to be called when the
+		 * test is finished to avoid getting messages from a different test.
+		 */
+		void StopListening()
+			{
+				g_thumbnail_manager->RemoveListener(this);
+				if (m_thumbnail_requested)
+				{
+					g_thumbnail_manager->CancelThumbnail(m_thumbnail_url);
+					m_thumbnail_requested = false;
+				}
+				RestoreLoadingListener();
+				CloseWindow();
+			}
+
+		/**
+		 * Called when this test fails. This will stop listening to messages and
+		 * tell selftest the specified failure message.
+		 */
+		void TestFailed(const char* message, ...)
+			{
+				StopListening();
+
+				OpString8 failure_msg;
+				va_list args;
+				va_start(args, message);
+				OpStatus::Ignore(failure_msg.AppendVFormat(message, args));
+				va_end(args);
+				ST_failed(failure_msg.CStr());
+			}
+
+		/**
+		 * Called when this test passes. This will stop listening to messages
+		 * and tell selftest that this test passed.
+		 */
+		void TestPassed()
+			{
+				StopListening();
+				ST_passed();
+			}
+
+		/** Returns true if this instance is the OpLoadingListener of the
+		 * specified OpWindowCommander. If not, the test fails. */
+		bool VerifyCommander(OpWindowCommander* commander)
+			{
+				if (commander != m_commander)
+					TestFailed("received authentication request from wrong commander: this is %p, requested for %p", m_commander, commander);
+				return (commander == m_commander);
+			}
+
+		enum TestSteps
+		{
+			/** The first step is to load the url in a new window.
+			 * @see LoadDocument() */
+			TESTSTEP_LOAD_DOCUMENT = 0,
+			/** When we receive the authentication request, we start the second
+			 * step to load a thumbnail for the same url.
+			 * @see OnAuthenticationRequired(), LoadThumbnail() */
+			TESTSTEP_LOAD_THUMBNAIL = 1,
+			/** Test fails after a timeout, i.e. if it takes too long to load
+			 * the document or the thumbnail and none of the other
+			 * failure/success listener methods are called. */
+			TESTSTEP_TIMEOUT = 2
+		};
+
+	public:
+		ThumbnailAuthTest()
+			: m_thumbnail_requested(false)
+			, m_commander(0)
+			, m_save_loading_listener(0)
+			, m_auth_callback(0)
+			{}
+
+		~ThumbnailAuthTest() { StopListening(); }
+
+		/**
+		 * Initialises the TestStep instance.
+		 * @param url to load. The url is expected to require http
+		 *  authentication.
+		 * @return OpStatus::OK when the test was successfully started and an
+		 *  error code if the test could not be started. In case of an error the
+		 *  caller is expected to call ST_failed().
+		 */
+		OP_STATUS Init(const uni_char* url)
+			{
+				/* clear memory cache of thumbnails, so we get a new
+				 * authentication request: */
+				RETURN_IF_ERROR(g_thumbnail_manager->Purge());
+				RETURN_IF_ERROR(TestStep::Init());
+				RETURN_IF_ERROR(m_url.Set(url));
+				m_thumbnail_url = g_url_api->GetURL(m_url.CStr());
+
+				// Set the timeout to 5s
+				NextStep(TESTSTEP_TIMEOUT, 5000);
+				return OpStatus::OK;
+			}
+
+		/** Creates a new window in which the url that was specified on Init()
+		 * is loaded. The OpLoadingListener of the new window is set to this
+		 * instance, so we don't see a dialog for an authentication request.
+		 *
+		 * On receiving the authentication request the test is continued by
+		 * requesting a thumbnail for the same url.
+		 *
+		 * @return OpStatus::OK when the test was successfully started and an
+		 *  error code if the test could not be started. In case of an error the
+		 *  caller is expected to call ST_failed().
+		 */
+		OP_STATUS StartLoadDocumentInNewWindow()
+			{
+				BOOL3 open_in_new_window = YES;
+				BOOL3 open_in_background = MAYBE;
+				Window* window = g_windowManager->GetAWindow(TRUE, open_in_new_window, open_in_background);
+				RETURN_OOM_IF_NULL(window);
+				m_commander = window->GetWindowCommander();
+				m_save_loading_listener = m_commander->GetLoadingListener();
+				m_commander->SetLoadingListener(this);
+
+				/* Next test-stop: load the document */
+				NextStep(TESTSTEP_LOAD_DOCUMENT);
+				/* When loading has finished or we received the authentication
+				 * request, we continue with the next step. */
+				return OpStatus::OK;
+			}
+
+		/**
+		 * Start a test to only request a thumbnail for the url that was
+		 * specified in Init().
+		 */
+		OP_STATUS StartRequestThumbnail()
+			{
+				NextStep(TESTSTEP_LOAD_THUMBNAIL);
+				return OpStatus::OK;
+			}
+
+		/** Loads the url that was specified in Init() in the new window (which
+		 * was created by Init(). */
+		void LoadDocument()
+			{
+				OpWindowCommander::OpenURLOptions options;
+				options.entered_by_user = TRUE;
+				if (!m_commander->OpenURL(m_url.CStr(), options))
+					TestFailed("failed to load the url");
+			}
+
+		/** Requests a thumbnail for the url that was specified by Init(). */
+		virtual void LoadThumbnail()
+			{
+				if (OpStatus::IsError(g_thumbnail_manager->AddListener(this)))
+					TestFailed("Could not add a ThumbnailManagerListener");
+				else
+				{
+					if (OpStatus::IsError(g_thumbnail_manager->RequestThumbnail(m_thumbnail_url, TRUE, TRUE)))
+						TestFailed("Could not request a thumbnail");
+					else
+						m_thumbnail_requested = true;
+				}
+			}
+
+		/** @name Implementation of TestStep
+		 * @{ */
+
+		virtual void OnNextStep(unsigned int step)
+			{
+				switch (step) {
+				case TESTSTEP_LOAD_DOCUMENT: LoadDocument(); break;
+				case TESTSTEP_LOAD_THUMBNAIL: LoadThumbnail(); break;
+				case TESTSTEP_TIMEOUT: TestFailed("timeout"); break;
+				default:
+					TestFailed("unexpected step %d", step);
+				}
+			}
+
+		/** @} */
+
+		/**
+		 * If this instance received an authentication request, this method
+		 * cancels the request.
+		 */
+		void CancelAuthentication()
+			{
+				if (m_auth_callback)
+					m_auth_callback->CancelAuthentication();
+				m_auth_callback = 0;
+			}
+
+		/**
+		 * If this instance received an authentication request, this method
+		 * tries to authenticate with the specified credentials.
+		 */
+		void Authenticate(const uni_char* user_name, const uni_char* password)
+			{
+				if (m_auth_callback)
+					m_auth_callback->Authenticate(user_name, password);
+				m_auth_callback = 0;
+			}
+
+		/** @name Implementation of OpLoadingListener
+		 *
+		 * These listener methods are called as a result of loading the url in
+		 * the new window. The url is expected to require http authentication,
+		 * so a call to OnAuthenticationRequired() will start the next step (to
+		 * request a thumbnail for the same url). If the url is loaded without
+		 * an authentication request, the test fails (see OnLoadingFinished()).
+		 *
+		 * @see LoadDocument()
+		 *
+		 * @{ */
+
+		/** Instead of handling the authentication request we only store the
+		 * authentication request and start the next step to load the thumbnail
+		 * for the same url. */
+		virtual void OnAuthenticationRequired(OpWindowCommander* commander, OpAuthenticationCallback* callback)
+			{
+				if (VerifyCommander(commander))
+				{
+					/* Cancel any previous authentication request (if there is
+					 * any) we only ignore the current request. */
+					CancelAuthentication();
+					m_auth_callback = callback;
+					/* Now don't care any more about further OnLoadingFinished()
+					 * callbacks - when the thumbnail request cancels loading we
+					 * may get an OnLoadingFinished() status for the document
+					 * and we don't want to fail for that. */
+					RestoreLoadingListener();
+					NextStep(TESTSTEP_LOAD_THUMBNAIL);
+				}
+			}
+
+		/** Called when loading the url in the new window has finished. As we
+		 * expect to receive an authentication request (i.e. a call to
+		 * OnAuthenticationRequired()), a call to this method means the test has
+		 * failed. */
+		virtual void OnLoadingFinished(OpWindowCommander* commander, LoadingFinishStatus status)
+			{
+				if (VerifyCommander(commander))
+				{
+					switch (status) {
+					case OpLoadingListener::LOADING_SUCCESS:
+						TestFailed("Loading finished without authentication request");
+						break;
+
+					case OpLoadingListener::LOADING_COULDNT_CONNECT:
+						TestFailed("Error could not connect");
+						break;
+
+					case OpLoadingListener::LOADING_REDIRECT:
+					default:
+						break;
+					}
+				}
+			}
+
+		/** @} */ // Implementation of OpLoadingListener
+
+		/** @name Implementation of ThumbnailManagerListener
+		 *
+		 * These methods are called as a result of requesting a thumbnail for
+		 * the url. Also loading the url for the thumbnail requires http
+		 * authentication which is automatically cancelled by the thumbnail
+		 * manager. The test passes if OnThumbnailReady() is called.
+		 *
+		 * @see LoadThumbnail()
+		 *
+		 * @{ */
+
+		virtual void OnThumbnailRequestStarted(const URL& document_url, BOOL reload) {}
+
+		virtual void OnThumbnailReady(const URL& document_url, const Image &thumbnail, const uni_char* title, long preview_refresh)
+			{
+				if (document_url == m_thumbnail_url)
+				{
+					m_thumbnail_requested = false;
+					TestPassed();
+				}
+			}
+
+		virtual void OnThumbnailFailed(const URL& document_url, OpLoadingListener::LoadingFinishStatus status)
+			{
+				if (document_url == m_thumbnail_url)
+				{
+					m_thumbnail_requested = false;
+					TestPassed();
+/* TODO: Receiving a call to OnThumbnailFailed() should be a failure, but for
+ * some reasons the test "http-auth in new window + thumbnail" fails to generate
+ * a thumbnail (and thus this method is called) if the other test
+ * "request thumbnail with http-auth" is executed first.
+ * If this problem is fixed, this function call should be changed to fail again:
+					OpString8 url_str;
+					document_url.GetAttribute(URL::KName_Escaped, url_str);
+					TestFailed("expected to get a thumbnail for %s after thumbnail cancelled the authentication request.", url_str.CStr());
+ */
+				}
+			}
+
+		virtual void OnInvalidateThumbnails() {}
+
+		/** @} */ // Implementation of ThumbnailManagerListener
+	};
+}
+
+/**
+ * This selftest verifies that it is possible (without crash) to request a
+ * thumbnail for a url that requires basic http authentication. On requesting
+ * the thumbnail, the thumbnail manager will cancel the authentication
+ * request. Thus an "Authorization Required" page is displayed and a thumbnail
+ * of that page is generated.
+ */
+test("request thumbnail with http-auth")
+async;
+{
+	const uni_char* url = UNI_L("http://certo.opera.com/tfw/auth/basic/index.html");
+	ThumbnailAuthTest* test = OP_NEW(ThumbnailAuthTest, ());
+	if (!test)
+		ST_failed("Could not allocate ThumbnailAuthTest");
+	else if (OpStatus::IsError(test->Init(url)) ||
+			 OpStatus::IsError(test->StartRequestThumbnail()))
+	{
+		OP_DELETE(test);
+		ST_failed("Could not start ThumbnailAuthTest");
+	}
+	else
+		ST_delete_after_group(test);
+}
+
+/**
+ * This selftest verifies that it is possible (without crash) to
+ * - load a url that requires basic http authentication in a background window;
+ * - request a thumbnail for the same url.
+ * The thumbnail manager will cancel the authentication request. Thus an
+ * "Authentication Required" page is displayed and a thumbnail of that page is
+ * generated.
+ */
+test("http-auth in new window + thumbnail")
+async;
+{
+	const uni_char* url = UNI_L("http://certo.opera.com/tfw/auth/basic/index.html");
+	ThumbnailAuthTest* test = OP_NEW(ThumbnailAuthTest, ());
+	if (!test)
+		ST_failed("Could not allocate ThumbnailAuthTest");
+	else if (OpStatus::IsError(test->Init(url)) ||
+			 OpStatus::IsError(test->StartLoadDocumentInNewWindow()))
+	{
+		OP_DELETE(test);
+		ST_failed("Could not start ThumbnailAuthTest");
+	}
+	else
+		ST_delete_after_group(test);
+}
+

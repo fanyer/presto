@@ -1,0 +1,117 @@
+/* -*- Mode: c++; tab-width: 4; indent-tabs-mode: t; c-basic-offset: 4 -*-
+ *
+ * Copyright (C) 1995-2011 Opera Software AS.  All rights reserved.
+ *
+ * This file is part of the Opera web browser.
+ * It may not be distributed under any circumstances.
+ */
+
+group "hardcore.mem.oom";
+
+include "modules/windowcommander/OpWindowCommanderManager.h";
+include "modules/hardcore/timer/optimer.h";
+
+global {
+
+	enum OomCondition { TEST_OOM_NOTIFICATION, TEST_SOFT_OOM_NOTIFICATION, TEST_OOD_NOTIFICATION };
+
+	class TestOomListener : public OpOomListener, OpTimerListener
+	{
+	public:
+		void OnOomError() { RegisterResult(TEST_OOM_NOTIFICATION); }
+		void OnSoftOomError() { RegisterResult(TEST_SOFT_OOM_NOTIFICATION); }
+		void OnOodError() { RegisterResult(TEST_OOD_NOTIFICATION); }
+		void OnTimeOut(OpTimer* timer) { if (!m_got_res) ST_failed("No notification!"); };
+
+		void RegisterResult(OomCondition cond) { m_got_res = TRUE; m_timer.Stop(); cond == m_cond ? ST_passed() : ST_failed("Notification error!"); }
+		void StartTest(OomCondition cond) {
+			g_handle_oom_prevtime = 0;  // To avoid that the notifications get dropped simply because they are too close in time.
+			m_got_res = FALSE;
+			m_cond = cond;
+			m_timer.SetTimerListener(this);
+			m_timer.Start(1);
+		}
+
+		OpTimer m_timer;      // The notifications are triggered from the messages loop. The timer is used to ensure that there will be messages to be process.
+		BOOL m_got_res;       // Flag to indicate if we have processed a notification. If the notification is triggered by the timer message, then OnTimeout will be triggered as well, even if we stop the timer. This flag makes it not to trigger a fail in that case.
+		OomCondition m_cond;  // The OOM condition to be tested.
+	};
+
+
+	OpOomListener* old_oom_listener;
+	TestOomListener test_oom_listener;
+}
+
+setup {
+	old_oom_listener = g_windowCommanderManager->GetOomListener();
+	g_windowCommanderManager->SetOomListener(&test_oom_listener);
+}
+
+exit {
+	g_windowCommanderManager->SetOomListener(old_oom_listener);
+}
+
+test("OOM notification") async;
+{
+	test_oom_listener.StartTest(TEST_OOM_NOTIFICATION);
+	g_main_message_handler->PostOOMCondition(TRUE);
+}
+
+test("Soft OOM notification") async;
+{
+	test_oom_listener.StartTest(TEST_SOFT_OOM_NOTIFICATION);
+	g_main_message_handler->PostOOMCondition(FALSE);
+}
+
+test("OOD notification") async;
+{
+	test_oom_listener.StartTest(TEST_OOD_NOTIFICATION);
+	g_main_message_handler->PostOODCondition();
+}
+
+table RAMCacheSizesDesktop(UINT32 mem_MB, size_t doc_expected_KB, size_t fig_expected_KB)
+{
+	{3,   438,   307},
+	{15,  2194,  1536},
+	{20,  2925,  2048},
+	{32,  4681,  3276},
+	{64,  9362,  6553},
+	{127, 18578, 13004},
+	{200, 29257, 20480},
+	{512, 74898, 52428}
+}
+
+table RAMCacheSizesSmartphone(UINT32 mem_MB, size_t doc_expected_KB, size_t fig_expected_KB)
+{
+	{3,   200,   2000},
+	{15,  200,   2000},
+	{20,  805,   2483},
+	{32,  2621,  3932},
+	{64,  5242,  7864},
+	{127, 10403, 15605},
+	{128, 18724, 13107},
+	{200, 29257, 20480},
+	{512, 74898, 52428}
+}
+
+test("GetRAMCacheSizes")
+require PREFS_AUTOMATIC_RAMCACHE;
+{
+	extern void TestGetRAMCacheSizes(UINT32 available_mem, size_t& fig_cache_size, size_t& doc_cache_size);
+	size_t fig_cache_size, doc_cache_size;
+#if AUTOMATIC_RAM_CACHE_STRATEGY == 0
+	foreach (mem, doc, fig) from RAMCacheSizesDesktop
+	{
+		TestGetRAMCacheSizes(mem, fig_cache_size, doc_cache_size);
+		verify(doc_cache_size == doc);
+		verify(fig_cache_size == fig);
+	}
+#else
+	foreach (mem, doc, fig) from RAMCacheSizesSmartphone
+	{
+		TestGetRAMCacheSizes(mem, fig_cache_size, doc_cache_size);
+		verify(doc_cache_size == doc);
+		verify(fig_cache_size == fig);
+	}
+#endif
+}

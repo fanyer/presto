@@ -1,0 +1,1815 @@
+/* -*- mode: c++; tab-width: 4; indent-tabs-mode: t; c-basic-offset: 4 -*- */
+
+group "layout.box";
+
+require init;
+
+include "modules/style/src/css_values.h";
+include "modules/layout/box/box.h";
+include "modules/layout/box/tables.h";
+include "modules/layout/content/content.h";
+include "modules/dochand/docman.h";
+
+global
+{
+	RectList rect_list;
+}
+
+html
+{
+	//! <html><body>
+	//! </body></html>
+}
+test("BoxBasic")
+{
+	FramesDocument* doc = state.doc;
+	verify(doc != NULL);
+	verify(doc->GetDocRoot() != NULL);
+	Box* root_box = doc->GetDocRoot()->GetLayoutBox();
+	verify(root_box != NULL);
+	verify(root_box->IsAbsolutePositionedBox());
+}
+
+// Lacking a better way to check if a font exists, we test for it and
+// let other tests depend on the success of this one. That way we make
+// it easier for platforms to see the cause of failures relating to a
+// missing font.
+//
+// If this isn't enough, selftest must export a way of requiring a
+// certain font (check during run-time). The alternative is to remove
+// the follow tests depending on a certain font.
+
+test("AHEM")
+{
+	short font_number = styleManager->GetFontNumber(UNI_L("AHEM"));
+	verify(font_number != -1);
+}
+
+html
+{
+//! <!doctype html>
+//! <html><body style="margin:0px"><div style="width:50px;font-size:16px;line-height:16px;font-family:'AHEM'">
+//! <i id="inline">XXXXXXX XXXXXXX XXXXXXX XXXXXXX XXXXXXX XXXXXXX XXXXXXX</i>
+//! </div></body></html>
+}
+test("GetRectList") require success "AHEM";
+{
+	FramesDocument* doc = state.doc;
+	verify(doc != NULL);
+	verify(doc->GetDocRoot() != NULL);
+
+	HTML_Element* inline_element = find_element("i");
+	verify(inline_element);
+	verify(inline_element->Type() == Markup::HTE_I);
+
+	Box* inline_box = inline_element->GetLayoutBox();
+
+	inline_box->GetRectList(doc, CONTENT_BOX, rect_list);
+
+	verify(rect_list.Cardinal() == 7);
+
+	int i = 0;
+	RectListItem *iter = rect_list.First();
+	while (iter)
+	{
+		RECT &rect = iter->rect;
+
+		verify(rect.left == 0);
+		verify(rect.right == 112);
+
+		verify(rect.top == i * 16);
+		verify(rect.bottom == (i + 1) * 16);
+
+		iter = iter->Suc();
+		i++;
+	}
+
+	verify(i == 7);
+}
+finally
+{
+	rect_list.Clear();
+}
+
+html
+{
+	//! <html><body style="margin:0px"><div style="width:50px;font-size:16px;line-height:16px;font-family:'AHEM'">XXXXXXX XXXXXXX XXXXXX XXXXXXXX XXXXXXXX XXXXXXX XXXXXXXXX</div>
+	//! </body></html>
+}
+test("BoxGetRect_text") require success "AHEM";
+{
+	FramesDocument* doc = state.doc;
+	verify(doc != NULL);
+	verify(doc->GetDocRoot() != NULL);
+	Box* root_box = doc->GetDocRoot()->GetLayoutBox();
+	verify(root_box != NULL);
+	verify(root_box->IsAbsolutePositionedBox());
+	HTML_Element* body = doc->GetDocRoot()->FirstChild()->LastChild();
+	verify(body->Type() == Markup::HTE_BODY);
+	HTML_Element* text = body->FirstChild()->FirstChild();
+	verify(text->Type() == Markup::HTE_TEXT);
+
+	Box* text_box = text->GetLayoutBox();
+	verify(text_box->IsTextBox());
+
+	RECT rect;
+	text_box->GetRect(doc, CONTENT_BOX, rect, 0, -1);
+
+	// 7 words, each starts at x=0
+	// max width word is "XXXXXXXXX" -> 9 glyphs, from (0,0),
+
+	verify(rect.left == 0);
+	verify(rect.top == 0);
+	verify(rect.right == 144);		// 9 * 16 = 144
+	verify(rect.bottom == 112);		// 7 * 16 = 112
+
+	// First glyph in first word (chunk)
+	text_box->GetRect(doc, CONTENT_BOX, rect, 0, 1);
+
+	// "XXXXXXX" -> 7 glyphs, from (0,0),
+	verify(rect.left == 0);
+	verify(rect.top == 0);
+	verify(rect.right == 16);
+	verify(rect.bottom == 16);
+
+	// Second glyph in second word (chunk)
+	// "XXXXXXX" -> 7 glyphs, from (0,16) (wrapped),
+
+	text_box->GetRect(doc, CONTENT_BOX, rect, 9, 10);
+
+	verify(rect.left == 16);
+	verify(rect.top == 16);
+	verify(rect.right == 32);  // 2 * 16 = 33
+	verify(rect.bottom == 32); // 2 * 16 = 32
+
+	// Third word.
+	text_box->GetRect(doc, CONTENT_BOX, rect, 16, 24);
+
+	verify(rect.left == 0);
+	verify(rect.top == 32);
+	verify(rect.right == 96);  // 6 * 16 = 96
+	verify(rect.bottom == 64); // 4 * 16 = 64
+
+	// Third word including line break.
+	text_box->GetRect(doc, CONTENT_BOX, rect, 16, 25);
+
+	verify(rect.left == 0);
+	verify(rect.top == 32);
+	verify(rect.right == 96);  // 6 * 16 = 96
+	verify(rect.bottom == 64); // 4 * 16 = 64
+}
+
+html
+{
+	//! <html><body style="margin:0px"><div style="width:50px;font-size:16px;line-height:16px;font-family:'AHEM'">X    X</div>
+	//! </body></html>
+}
+test("BoxGetRect_text2") require success "AHEM";
+{
+	FramesDocument* doc = state.doc;
+	verify(doc != NULL);
+	verify(doc->GetDocRoot() != NULL);
+	Box* root_box = doc->GetDocRoot()->GetLayoutBox();
+	verify(root_box != NULL);
+	verify(root_box->IsAbsolutePositionedBox());
+	HTML_Element* body = doc->GetDocRoot()->FirstChild()->LastChild();
+	verify(body->Type() == Markup::HTE_BODY);
+	HTML_Element* text = body->FirstChild()->FirstChild();
+	verify(text->Type() == Markup::HTE_TEXT);
+
+	Box* text_box = text->GetLayoutBox();
+	verify(text_box->IsTextBox());
+
+	RECT rect;
+	text_box->GetRect(doc, CONTENT_BOX, rect, 0, -1);
+
+	// 2 words, with white-space inbetween
+	verify(rect.left == 0);
+	verify(rect.top == 0);
+	verify(rect.right == 48);  // 3 * 16
+	verify(rect.bottom == 16); // 16
+
+	// Check that you can match spaces in between chunks
+	text_box->GetRect(doc, CONTENT_BOX, rect, 1, 5);
+
+	verify(rect.left == 16);
+	verify(rect.top == 0);
+	verify(rect.right == 32);  // 2 * 16
+	verify(rect.bottom == 16);
+
+	text_box->GetRect(doc, CONTENT_BOX, rect, 0, 2);
+
+	verify(rect.left == 0);
+	verify(rect.top == 0);
+	verify(rect.right == 32);  // 2 * 16
+	verify(rect.bottom == 16); // 16
+
+	text_box->GetRect(doc, CONTENT_BOX, rect, 1, -1);
+
+	verify(rect.left == 16);   // 1 * 16
+	verify(rect.top == 0);
+	verify(rect.right == 48);  // 3 * 16
+	verify(rect.bottom == 16); // 16
+}
+
+html
+{
+	//! <html><body style="margin:0px"><div style="font-size:16px;line-height:16px;font-family:'AHEM'">XXXXXXX XXXXXXX XXXXXX</div>
+	//! </body></html>
+}
+test("BoxGetRect_text3") require success "AHEM";
+{
+	FramesDocument* doc = state.doc;
+	verify(doc != NULL);
+	verify(doc->GetDocRoot() != NULL);
+	Box* root_box = doc->GetDocRoot()->GetLayoutBox();
+	verify(root_box != NULL);
+	verify(root_box->IsAbsolutePositionedBox());
+	HTML_Element* body = doc->GetDocRoot()->FirstChild()->LastChild();
+	verify(body->Type() == Markup::HTE_BODY);
+	HTML_Element* text = body->FirstChild()->FirstChild();
+	verify(text->Type() == Markup::HTE_TEXT);
+
+	Box* text_box = text->GetLayoutBox();
+	verify(text_box->IsTextBox());
+
+	RECT rect;
+	text_box->GetRect(doc, CONTENT_BOX, rect, 0, -1);
+
+	// 3 words, each starts at x=0
+	verify(rect.left == 0);
+	verify(rect.top == 0);
+	verify(rect.right == 352); // 22 * 16 = 352
+	verify(rect.bottom == 16); // 1 * 16 = 16
+
+	// First word.
+	text_box->GetRect(doc, CONTENT_BOX, rect, 0, 7);
+
+	verify(rect.left == 0);
+	verify(rect.top == 0);
+	verify(rect.right == 112); // 7 * 16 = 112
+	verify(rect.bottom == 16);
+
+	// First word including trailing white space.
+	text_box->GetRect(doc, CONTENT_BOX, rect, 0, 8);
+
+	verify(rect.left == 0);
+	verify(rect.top == 0);
+	verify(rect.right == 128); // 8 * 16 = 128
+	verify(rect.bottom == 16);
+
+	// Second word.
+	text_box->GetRect(doc, CONTENT_BOX, rect, 8, 15);
+
+	verify(rect.left == 128);
+	verify(rect.top == 0);
+	verify(rect.right == 240); // 128 + 7 * 16 = 240
+	verify(rect.bottom == 16);
+
+	// Second word including leading white space.
+	text_box->GetRect(doc, CONTENT_BOX, rect, 7, 15);
+
+	verify(rect.left == 112);
+	verify(rect.top == 0);
+	verify(rect.right == 240); // 112 + 8 * 16 = 240
+	verify(rect.bottom == 16);
+
+	// Second word including leading and trailing white space.
+	text_box->GetRect(doc, CONTENT_BOX, rect, 7, 16);
+
+	verify(rect.left == 112);
+	verify(rect.top == 0);
+	verify(rect.right == 256); // 112 + 9 * 16 = 256
+	verify(rect.bottom == 16);
+
+	// Second word including trailing white space.
+	text_box->GetRect(doc, CONTENT_BOX, rect, 8, 16);
+
+	verify(rect.left == 128);
+	verify(rect.top == 0);
+	verify(rect.right == 256); // 112 + 9 * 16 = 256
+	verify(rect.bottom == 16);
+}
+
+html
+{
+	//! <html><body style="margin:0px"><div style="font-size:16px;line-height:16px;font-family:'AHEM'"><a>X X</a>X</div>
+	//! </body></html>
+}
+test("BoxGetRect_text4") require success "AHEM";
+{
+	FramesDocument* doc = state.doc;
+	verify(doc != NULL);
+	verify(doc->GetDocRoot() != NULL);
+	Box* root_box = doc->GetDocRoot()->GetLayoutBox();
+	verify(root_box != NULL);
+	verify(root_box->IsAbsolutePositionedBox());
+	HTML_Element* body = doc->GetDocRoot()->FirstChild()->LastChild();
+	verify(body->Type() == Markup::HTE_BODY);
+	HTML_Element* text = body->FirstChild()->FirstChild()->NextSibling();
+	verify(text->Type() == Markup::HTE_TEXT);
+
+	Box* text_box = text->GetLayoutBox();
+	verify(text_box->IsTextBox());
+
+	RECT rect;
+	verify(text_box->GetRect(doc, CONTENT_BOX, rect, 0, 0));
+
+	verify(rect.left == 48);
+	verify(rect.top == 0);
+	verify(rect.right == 48);
+	verify(rect.bottom == 16);
+}
+
+html
+{
+	//! <html><body style="margin:0px"><div style="width:128px;font-size:16px;line-height:16px;font-family:'AHEM'">
+	//! <bdo dir"rtl">X XX XXX XXXX XXX</bdo></div>
+	//! </body></html>
+}
+test("BoxGetRect_text_multiline") require success "AHEM";
+{
+	FramesDocument* doc = state.doc;
+	verify(doc != NULL);
+	verify(doc->GetDocRoot() != NULL);
+	Box* root_box = doc->GetDocRoot()->GetLayoutBox();
+	verify(root_box != NULL);
+	verify(root_box->IsAbsolutePositionedBox());
+	HTML_Element* bdo = find_element("bdo", 1);
+	HTML_Element* text = bdo->FirstChild();
+	verify(text->Type() == Markup::HTE_TEXT);
+
+	Box* text_box = text->GetLayoutBox();
+	verify(text_box->IsTextBox());
+
+	RECT rect;
+
+	// Everything.
+	text_box->GetRect(doc, CONTENT_BOX, rect, 0, -1);
+
+	verify(rect.left == 0);
+	verify(rect.top == 0);
+	verify(rect.right == 128);
+	verify(rect.bottom == 32);
+
+	// First line.
+	text_box->GetRect(doc, CONTENT_BOX, rect, 0, 8);
+
+	verify(rect.left == 0);
+	verify(rect.top == 0);
+	verify(rect.right == 128);
+	verify(rect.bottom == 16);
+
+	// Second line.
+	text_box->GetRect(doc, CONTENT_BOX, rect, 9, 17);
+
+	verify(rect.left == 0);
+	verify(rect.top == 16);
+	verify(rect.right == 128);
+	verify(rect.bottom == 32);
+
+	// Second line (alternative method).
+	text_box->GetRect(doc, CONTENT_BOX, rect, 9, -1);
+
+	verify(rect.left == 0);
+	verify(rect.top == 16);
+	verify(rect.right == 128);
+	verify(rect.bottom == 32);
+
+	// First word on first line.
+	text_box->GetRect(doc, CONTENT_BOX, rect, 0, 1);
+
+	verify(rect.left == 0);
+	verify(rect.top == 0);
+	verify(rect.right == 16);
+	verify(rect.bottom == 16);
+
+	// Last word on first line.
+	text_box->GetRect(doc, CONTENT_BOX, rect, 5, 8);
+
+	verify(rect.left == 80);   // 5 * 16
+	verify(rect.top == 0);
+	verify(rect.right == 128); // 8 * 16
+	verify(rect.bottom == 16);
+
+	// First word on second line.
+	text_box->GetRect(doc, CONTENT_BOX, rect, 9, 13);
+
+	verify(rect.left == 0);
+	verify(rect.top == 16);
+	verify(rect.right == 64);  // 4 * 16
+	verify(rect.bottom == 32); // 2 * 16
+
+	// Last word on second line.
+	text_box->GetRect(doc, CONTENT_BOX, rect, 14, 17);
+
+	verify(rect.left == 80);
+	verify(rect.top == 16);
+	verify(rect.right == 128); // 8 * 16
+	verify(rect.bottom == 32); // 2 * 16
+
+	// Only newline.
+	text_box->GetRect(doc, CONTENT_BOX, rect, 8, 9);
+
+	verify(rect.left == 0);
+	verify(rect.top == 0);
+	verify(rect.right == 128);
+	verify(rect.bottom == 32); // 2 * 16
+}
+
+html
+{
+	//! <html><body style="margin:0px"><div style="width:128px;font-size:16px;line-height:16px;font-family:'AHEM'">X XX XXX XXXX XXX</div>
+	//! </body></html>
+}
+test("BoxGetRect_text_nospan") require success "AHEM";
+{
+	FramesDocument* doc = state.doc;
+	verify(doc != NULL);
+	verify(doc->GetDocRoot() != NULL);
+	Box* root_box = doc->GetDocRoot()->GetLayoutBox();
+	verify(root_box != NULL);
+	verify(root_box->IsAbsolutePositionedBox());
+	HTML_Element* body = doc->GetDocRoot()->FirstChild()->LastChild();
+	verify(body->Type() == Markup::HTE_BODY);
+	HTML_Element* text = body->FirstChild()->FirstChild();
+	verify(text->Type() == Markup::HTE_TEXT);
+
+	Box* text_box = text->GetLayoutBox();
+	verify(text_box->IsTextBox());
+
+	RECT rect;
+
+	// First character on line.
+	text_box->GetRect(doc, CONTENT_BOX, rect, 0, 0);
+
+	verify(rect.left == 0);
+	verify(rect.top == 0);
+	verify(rect.right == 0);
+	verify(rect.bottom == 16);
+
+	text_box->GetRect(doc, CONTENT_BOX, rect, 9, 9);
+
+	verify(rect.left == 0);
+	verify(rect.top == 16);
+	verify(rect.right == 0);
+	verify(rect.bottom == 32);
+
+	// Last character on line.
+	text_box->GetRect(doc, CONTENT_BOX, rect, 7, 7);
+
+	verify(rect.left == 112);  // 7 * 16
+	verify(rect.top == 0);
+	verify(rect.right == 112); // 7 * 16
+	verify(rect.bottom == 16);
+
+	text_box->GetRect(doc, CONTENT_BOX, rect, 16, 16);
+
+	verify(rect.left == 112);  // 7 * 16
+	verify(rect.top == 16);
+	verify(rect.right == 112); // 7 * 16
+	verify(rect.bottom == 32);
+
+	// First character in word.
+	text_box->GetRect(doc, CONTENT_BOX, rect, 2, 2);
+
+	verify(rect.left == 32);
+	verify(rect.top == 0);
+	verify(rect.right == 32);
+	verify(rect.bottom == 16);
+
+	// Last character in word.
+	text_box->GetRect(doc, CONTENT_BOX, rect, 3, 3);
+
+	verify(rect.left == 48);   // 3 * 16
+	verify(rect.top == 0);
+	verify(rect.right == 48);  // 3 * 16
+	verify(rect.bottom == 16);
+
+	// Single space.
+	text_box->GetRect(doc, CONTENT_BOX, rect, 1, 1);
+
+	verify(rect.left == 16);
+	verify(rect.top == 0);
+	verify(rect.right == 16);
+	verify(rect.bottom == 16);
+
+	// Line break.
+	text_box->GetRect(doc, CONTENT_BOX, rect, 8, 8);
+
+	verify(rect.left == 128);  // 8 * 128
+	verify(rect.top == 0);
+	verify(rect.right == 128); // 8 * 128
+	verify(rect.bottom == 16);
+}
+
+html
+{
+	//! <html><body style="margin:0px"><div style="width:500px;direction:rtl;font-size:16px;line-height:16px;font-family:'AHEM'">
+	//! <bdo dir"rtl">XXX XX X</bdo></div>
+	//! </body></html>
+}
+test("BoxGetRect_rtltext") require success "AHEM";
+{
+	FramesDocument* doc = state.doc;
+	verify(doc != NULL);
+	verify(doc->GetDocRoot() != NULL);
+	Box* root_box = doc->GetDocRoot()->GetLayoutBox();
+	verify(root_box != NULL);
+	verify(root_box->IsAbsolutePositionedBox());
+	HTML_Element* bdo = find_element("bdo", 1);
+	HTML_Element* text = bdo->FirstChild();
+	verify(text->Type() == Markup::HTE_TEXT);
+
+	Box* text_box = text->GetLayoutBox();
+	verify(text_box->IsTextBox());
+
+	RECT rect;
+
+	// Everything.
+	text_box->GetRect(doc, CONTENT_BOX, rect, 0, -1);
+
+	verify(rect.left == 372);  // 500 - 8 * 16
+	verify(rect.top == 0);
+	verify(rect.right == 500);
+	verify(rect.bottom == 16);
+
+	// First word.
+	text_box->GetRect(doc, CONTENT_BOX, rect, 0, 3);
+
+	verify(rect.left == 452);  // 500 - 3 * 16
+	verify(rect.top == 0);
+	verify(rect.right == 500);
+	verify(rect.bottom == 16);
+
+	// First word including trailing white space.
+	text_box->GetRect(doc, CONTENT_BOX, rect, 0, 4);
+
+	verify(rect.left == 436);  // 500 - 4 * 16
+	verify(rect.top == 0);
+	verify(rect.right == 500);
+	verify(rect.bottom == 16);
+
+	// Second word.
+	text_box->GetRect(doc, CONTENT_BOX, rect, 4, 6);
+
+	verify(rect.left == 404);  // 500 - 6 * 16
+	verify(rect.top == 0);
+	verify(rect.right == 436); // 500 - 4 * 16
+	verify(rect.bottom == 16);
+
+	// Second word including leading white space.
+	text_box->GetRect(doc, CONTENT_BOX, rect, 4, 7);
+
+	verify(rect.left == 388);  // 500 - 7 * 16
+	verify(rect.top == 0);
+	verify(rect.right == 436); // 500 - 4 * 16
+	verify(rect.bottom == 16);
+
+	// Second word including leading and trailing white space.
+	text_box->GetRect(doc, CONTENT_BOX, rect, 3, 7);
+
+	verify(rect.left == 388);  // 500 - 7 * 16
+	verify(rect.top == 0);
+	verify(rect.right == 452); // 500 - 3 * 16
+	verify(rect.bottom == 16);
+
+	// Only white space.
+	text_box->GetRect(doc, CONTENT_BOX, rect, 4, 5);
+
+	verify(rect.left == 420);  // 500 - 5 * 16
+	verify(rect.top == 0);
+	verify(rect.right == 436); // 500 - 4 * 16
+	verify(rect.bottom == 16);
+}
+
+html
+{
+	//! <html><body style="margin:0px"><div style="width:128px;direction:rtl;font-size:16px;line-height:16px;font-family:'AHEM'">
+	//! <bdo dir"rtl">XXXX XXX XXX XX X</bdo></div>
+	//! </body></html>
+}
+test("BoxGetRect_rtltext_multiline") require success "AHEM";
+{
+	FramesDocument* doc = state.doc;
+	verify(doc != NULL);
+	verify(doc->GetDocRoot() != NULL);
+	Box* root_box = doc->GetDocRoot()->GetLayoutBox();
+	verify(root_box != NULL);
+	verify(root_box->IsAbsolutePositionedBox());
+	HTML_Element* bdo = find_element("bdo", 1);
+	HTML_Element* text = bdo->FirstChild();
+	verify(text->Type() == Markup::HTE_TEXT);
+
+	Box* text_box = text->GetLayoutBox();
+	verify(text_box->IsTextBox());
+
+	RECT rect;
+
+	// Everything.
+	text_box->GetRect(doc, CONTENT_BOX, rect, 0, -1);
+
+	verify(rect.left == 0);
+	verify(rect.top == 0);
+	verify(rect.right == 128);
+	verify(rect.bottom == 32);
+
+	// First line.
+	text_box->GetRect(doc, CONTENT_BOX, rect, 0, 8);
+
+	verify(rect.left == 0);
+	verify(rect.top == 0);
+	verify(rect.right == 128);
+	verify(rect.bottom == 16);
+
+	// Second line.
+	text_box->GetRect(doc, CONTENT_BOX, rect, 9, 17);
+
+	verify(rect.left == 0);
+	verify(rect.top == 16);
+	verify(rect.right == 128);
+	verify(rect.bottom == 32);
+
+	// Second line (alternative method).
+	text_box->GetRect(doc, CONTENT_BOX, rect, 9, -1);
+
+	verify(rect.left == 0);
+	verify(rect.top == 16);
+	verify(rect.right == 128);
+	verify(rect.bottom == 32);
+
+	// First word on first line.
+	text_box->GetRect(doc, CONTENT_BOX, rect, 0, 4);
+
+	verify(rect.left == 64);   // 128 - 4 * 16
+	verify(rect.top == 0);
+	verify(rect.right == 128);
+	verify(rect.bottom == 16);
+
+	// Last word on first line.
+	text_box->GetRect(doc, CONTENT_BOX, rect, 5, 8);
+
+	verify(rect.left == 0);
+	verify(rect.top == 0);
+	verify(rect.right == 48);  // 128 - 5 * 16
+	verify(rect.bottom == 16);
+
+	// First word on second line.
+	text_box->GetRect(doc, CONTENT_BOX, rect, 9, 12);
+
+	verify(rect.left == 80);   // 128 - 3 * 16
+	verify(rect.top == 16);
+	verify(rect.right == 128);
+	verify(rect.bottom == 32);
+
+	// Last word on second line.
+	text_box->GetRect(doc, CONTENT_BOX, rect, 13, 17);
+
+	verify(rect.left == 0);
+	verify(rect.top == 16);
+	verify(rect.right == 64);  // 128 - 4 * 16
+	verify(rect.bottom == 32);
+
+	// Only newline.
+	text_box->GetRect(doc, CONTENT_BOX, rect, 8, 9);
+
+	verify(rect.left == 0);
+	verify(rect.top == 0);
+	verify(rect.right == 128);
+	verify(rect.bottom == 32);
+}
+
+html
+{
+	//! <html><body style="margin:0px"><div style="width:128px;direction:rtl;font-size:16px;line-height:16px;font-family:'AHEM'">
+	//! <bdo dir"rtl">XXXX XXX XXX XX X</bdo></div>
+	//! </body></html>
+}
+test("BoxGetRect_rtltext_nospan") require success "AHEM";
+{
+	FramesDocument* doc = state.doc;
+	verify(doc != NULL);
+	verify(doc->GetDocRoot() != NULL);
+	Box* root_box = doc->GetDocRoot()->GetLayoutBox();
+	verify(root_box != NULL);
+	verify(root_box->IsAbsolutePositionedBox());
+	HTML_Element* bdo = find_element("bdo", 1);
+	HTML_Element* text = bdo->FirstChild();
+	verify(text->Type() == Markup::HTE_TEXT);
+
+	Box* text_box = text->GetLayoutBox();
+	verify(text_box->IsTextBox());
+
+	RECT rect;
+
+	// First character on line.
+	text_box->GetRect(doc, CONTENT_BOX, rect, 0, 0);
+
+	verify(rect.left == 128);
+	verify(rect.top == 0);
+	verify(rect.right == 128);
+	verify(rect.bottom == 16);
+
+	text_box->GetRect(doc, CONTENT_BOX, rect, 9, 9);
+
+	verify(rect.left == 128);
+	verify(rect.top == 16);
+	verify(rect.right == 128);
+	verify(rect.bottom == 32);
+
+	// Last character on line.
+	text_box->GetRect(doc, CONTENT_BOX, rect, 7, 7);
+
+	verify(rect.left == 16);
+	verify(rect.top == 0);
+	verify(rect.right == 16);
+	verify(rect.bottom == 16);
+
+	text_box->GetRect(doc, CONTENT_BOX, rect, 16, 16);
+
+	verify(rect.left == 16);
+	verify(rect.top == 16);
+	verify(rect.right == 16);
+	verify(rect.bottom == 32);
+
+	// First character in word.
+	text_box->GetRect(doc, CONTENT_BOX, rect, 14, 14);
+
+	verify(rect.left == 48);   // 128 - 5 * 16
+	verify(rect.top == 16);
+	verify(rect.right == 48);  // 128 - 5 * 16
+	verify(rect.bottom == 32);
+
+	// Last character in word.
+	text_box->GetRect(doc, CONTENT_BOX, rect, 15, 15);
+
+	verify(rect.left == 32);   // 128 - 6 * 16
+	verify(rect.top == 16);
+	verify(rect.right == 32);  // 128 - 6 * 16
+	verify(rect.bottom == 32);
+
+	// Single space.
+	text_box->GetRect(doc, CONTENT_BOX, rect, 16, 16);
+
+	verify(rect.left == 16);   // 128 - 7 * 16
+	verify(rect.top == 16);
+	verify(rect.right == 16);  // 128 - 7 * 16
+	verify(rect.bottom == 32);
+
+	// Line break.
+	text_box->GetRect(doc, CONTENT_BOX, rect, 8, 8);
+
+	verify(rect.left == 0);
+	verify(rect.top == 0);
+	verify(rect.right == 0);
+	verify(rect.bottom == 16);
+}
+
+// Test for bug #279478 (<html>.scrollHeight returns viewport height)
+
+html {
+//! <!doctype html>
+//! <html style="font-family: ahem; line-height: 1em; font-size: 16px; margin:0px; padding: 0px">
+//!  <body style="margin-top: 5px; padding: 0px; margin-bottom:10px;">
+//!       <div>XXX</div>
+//!  </body>
+//! </html>
+}
+test("SCROLL_BOX#1")
+{
+	HTML_Element *document_element = state.doc->GetLogicalDocument()->GetDocRoot();
+	verify(document_element != NULL);
+
+	Box* box = document_element->GetLayoutBox();
+	verify(box != NULL);
+
+	RECT scroll_rect;
+	verify(box->GetRect(state.doc, SCROLL_BOX, scroll_rect));
+
+	verify(scroll_rect.left == 0);
+	verify(scroll_rect.top == 0);
+
+	verify(scroll_rect.right == box->GetWidth());
+	verify(scroll_rect.bottom == state.doc->GetLayoutViewHeight());
+}
+
+// Test for bug #279298 (scrollHeight does not respect margin-bottom)
+
+html
+{
+//! <html style="font-family: ahem; line-height: 1em; font-size: 16px; margin:0px; padding: 0px">
+//!   <body style="margin-top: 5px; padding: 0px; margin-bottom:10px;">
+//!     X
+//!   </body>
+//! </html>
+}
+test("SCROLL_BOX#2")
+{
+	HTML_Element *document_element = state.doc->GetLogicalDocument()->GetDocRoot();
+	verify(document_element != NULL);
+
+	Box* box = document_element->GetLayoutBox();
+	verify(box != NULL);
+
+	RECT scroll_rect;
+	verify(box->GetRect(state.doc, SCROLL_BOX, scroll_rect));
+
+	verify(scroll_rect.left == 0);
+	verify(scroll_rect.top == 0);
+
+	verify(scroll_rect.right == box->GetWidth());
+	verify(scroll_rect.bottom == 31);
+}
+
+// Test for bug #300393
+
+html
+{
+//! <!DOCTYPE html>
+//! <html>
+//!	<head>
+//!		<style type="text/css">
+//!			html { width:100%; height: 100%; }
+//!			div { margin-top: 10000px; }
+//!		</style>
+//!	</head>
+//!	<body>
+//!		<div>test</div>
+//!	</body>
+//! </html>
+}
+test("SCROLL_BOX#3")
+{
+	HTML_Element *document_element = state.doc->GetLogicalDocument()->GetDocRoot();
+	verify(document_element != NULL);
+
+	Box* box = document_element->GetLayoutBox();
+	verify(box != NULL);
+
+	RECT scroll_rect;
+	verify(box->GetRect(state.doc, SCROLL_BOX, scroll_rect));
+
+	verify(scroll_rect.bottom >= 10000);
+}
+
+// Test for bug #250171
+
+html
+{
+//! <!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01//EN">
+//! <html><head>
+//!	<title> offset properties of relatively positioned block element nested in relatively positioned inline </title>
+//!	<style type="text/css">
+//!
+//!		div, span {margin: 0; padding: 0}
+//!
+//!		#parent {
+//!			position: relative;
+//!		}
+//!
+//!		#child{ position: relative; }
+//!	</style>
+//! </head>
+//! <body>
+//!
+//!	<span id="parent">
+//!		<div id="child"></div>
+//!	</span>
+//!
+//! </body></html>
+}
+test("OffsetParent#1")
+{
+	LogicalDocument *logdoc = state.doc->GetLogicalDocument();
+	verify(logdoc);
+
+	HTML_Element *document_element = logdoc->GetDocRoot();
+	verify(document_element != NULL);
+	verify(document_element->IsMatchingType(Markup::HTE_HTML, NS_HTML));
+
+	HTML_Element *parent = find_element("span", 1);
+	HTML_Element *child = find_element("div", 1);
+
+	Head props_list;
+	verify(LayoutProperties::CreateCascade(child, props_list, logdoc->GetHLDocProfile()));
+
+	LayoutProperties *offset_cascade =
+		((LayoutProperties *)props_list.Last())->FindOffsetParent(logdoc->GetHLDocProfile());
+
+	verify(offset_cascade);
+	verify(offset_cascade->html_element == parent);
+
+	props_list.Clear();
+}
+test("OffsetParent#2")
+{
+	LogicalDocument *logdoc = state.doc->GetLogicalDocument();
+	verify(logdoc);
+
+	HTML_Element *document_element = logdoc->GetDocRoot();
+	verify(document_element != NULL);
+	verify(document_element->IsMatchingType(Markup::HTE_HTML, NS_HTML));
+
+	HTML_Element *child = find_element("div", 1);
+
+	RECT child_rect;
+
+	Box *child_box = child->GetLayoutBox();
+	verify(child_box != NULL);
+	child_box->GetRect(state.doc, OFFSET_BOX, child_rect);
+
+	verify(child_rect.left == 0);
+	verify(child_rect.top == 0);
+}
+
+html
+{
+//! <!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01//EN">
+//! <html>
+//!	<head>
+//!		<style type="text/css">
+//! html, body {
+//!	margin: 0; padding: 0;
+//! }
+//! body > div {
+//!	overflow: auto;
+//!	height: 100px;
+//! }
+//! div div {
+//!	width: 200%;
+//!	height: 200px;
+//! }
+//!		</style>
+//!	</head>
+//!	<body>
+//!		<div><div id="scrolltome"><span>Testing...</span></div></div>
+//!	</body>
+//! </html>
+}
+test("OffsetParent#3")
+{
+	LogicalDocument *logdoc = state.doc->GetLogicalDocument();
+	verify(logdoc);
+
+	HTML_Element *document_element = logdoc->GetDocRoot();
+	verify(document_element != NULL);
+	verify(document_element->IsMatchingType(Markup::HTE_HTML, NS_HTML));
+
+	HTML_Element *scrollable = find_element("div", 1);
+	verify(scrollable);
+
+	Box *box = scrollable->GetLayoutBox();
+	verify(box);
+
+	Content *content = box->GetContent();
+	verify(content);
+
+	ScrollableContainer *scrollable_container = (ScrollableContainer *)content;
+	verify(scrollable_container);
+
+	// Reflow
+	OP_STATUS status;
+	verify(OpStatus::IsSuccess(status = state.doc->Reflow(FALSE)));
+
+	// Simulate scroll
+	scrollable_container->SetViewY(LayoutCoord(100), TRUE);
+
+	// Reflow
+	verify(OpStatus::IsSuccess(status = state.doc->Reflow(FALSE)));
+
+	// Check that the scrolling didn't affect the offset properties
+
+	HTML_Element *child = find_element("span", 1);
+
+	RECT child_rect;
+
+	Box *child_box = child->GetLayoutBox();
+	verify(child_box != NULL);
+	child_box->GetRect(state.doc, OFFSET_BOX, child_rect);
+
+	verify(child_rect.left == 0);
+	verify(child_rect.top == 0);
+}
+test("Scrollbars are the same size")
+{
+	// The code in ScrollableContainer::PaintScrollbars() assumes that
+	// a vertical scrollbar is as wide as a horizontal scrollbar is high
+	LogicalDocument *logdoc = state.doc->GetLogicalDocument();
+	verify(logdoc);
+
+	HTML_Element *document_element = logdoc->GetDocRoot();
+	verify(document_element != NULL);
+	verify(document_element->IsMatchingType(Markup::HTE_HTML, NS_HTML));
+
+	HTML_Element *scrollable = find_element("div", 1);
+	verify(scrollable);
+
+	Box *box = scrollable->GetLayoutBox();
+	verify(box);
+
+	Content *content = box->GetContent();
+	verify(content);
+
+	ScrollableContainer *scrollable_container = (ScrollableContainer *)content;
+	verify(scrollable_container);
+
+	verify(scrollable_container->GetHorizontalScrollbarWidth());
+	verify(scrollable_container->GetHorizontalScrollbarWidth() == scrollable_container->GetVerticalScrollbarWidth());
+}
+
+// Loosely based on test case from bug 317510
+
+html
+{
+//! <!doctype html>
+//! <title>getClientRects(): anonymous block boxes</title>
+//! <style>
+//!  body { margin:0 }
+//!  p { margin:10px; height:20px }
+//!  p + span { font:20px/1 Ahem }
+//!  div { width:20px; height:20px }
+//! </style>
+//! <p>(space)</p>
+//! <span id=x>A<div>A</div>A</span>
+}
+test("GetRectList_quirk#1")  require success "AHEM";
+{
+	LogicalDocument *logdoc = state.doc->GetLogicalDocument();
+	verify (logdoc);
+
+	HTML_Element *document_element = logdoc->GetDocRoot();
+	verify(document_element != NULL);
+	verify(document_element->IsMatchingType(Markup::HTE_HTML, NS_HTML));
+
+	HTML_Element *child = find_element("span", 1);
+	verify(child);
+
+	Box *child_box = child->GetLayoutBox();
+	verify(child_box != NULL);
+
+	RectList rect_list;
+	verify(child_box->GetRectList(state.doc, BORDER_BOX, rect_list));
+
+	verify(rect_list.Cardinal() == 3);
+
+	RectListItem *iter = rect_list.First();
+
+	/* The following tests are a bit verbose. The reason is two help
+	   selftest to generate good error messages in case they fail. */
+
+	RECT &r1 = iter->rect;
+	iter = iter->Suc();
+
+	verify(r1.left == 0);
+	verify(r1.top == 40);
+	verify(r1.right == 20);
+	verify(r1.bottom == 60);
+
+	RECT r2 = iter->rect;
+	iter = iter->Suc();
+
+	verify(r2.left == 0);
+	verify(r2.top == 60);
+	verify(r2.right == 20);
+	verify(r2.bottom == 80);
+
+	RECT r3 = iter->rect;
+	iter = iter->Suc();
+
+	verify(r3.left == 0);
+	verify(r3.top == 80);
+	verify(r3.right == 20);
+	verify(r3.bottom == 100);
+}
+finally
+{
+	rect_list.Clear();
+}
+
+// Loosely based on test case from bug 317501
+
+html
+{
+//! <!doctype html>
+//! <title>getClientRects(): display:table</title>
+//! <style>
+//!  body { margin:0 }
+//!  div { display:table; width:400px }
+//!  span { display:table-caption; height:20px }
+//! </style>
+//! <div><span>caption</span></div>
+}
+test("GetRectList_quirk#2")  require success "AHEM";
+{
+	LogicalDocument *logdoc = state.doc->GetLogicalDocument();
+	verify(logdoc);
+
+	HTML_Element *document_element = logdoc->GetDocRoot();
+	verify(document_element != NULL);
+	verify(document_element->IsMatchingType(Markup::HTE_HTML, NS_HTML));
+
+	HTML_Element *child = find_element("div", 1);
+	verify(child);
+
+	Box *child_box = child->GetLayoutBox();
+	verify(child_box != NULL);
+
+	RectList rect_list;
+	verify(child_box->GetRectList(state.doc, BORDER_BOX, rect_list));
+
+	verify(rect_list.Cardinal() == 2);
+
+	RectListItem *iter = rect_list.First();
+
+	/* The following tests are a bit verbose. The reason is to help
+	   selftest generate good error messages in case they fail. */
+
+	RECT &r1 = iter->rect;
+	iter = iter->Suc();
+
+	verify(r1.left == 0);
+	verify(r1.top == 20);
+	verify(r1.right == 400);
+	verify(r1.bottom == 20);
+
+	RECT r2 = iter->rect;
+	iter = iter->Suc();
+
+	verify(r2.left == 0);
+	verify(r2.top == 0);
+	verify(r2.right == 400);
+	verify(r2.bottom == 20);
+}
+finally
+{
+	rect_list.Clear();
+}
+
+html
+{
+//! <!doctype html>
+//! <html>
+//! <head>
+//! <title>GetRectList enclosing</title>
+//! <style>
+//!  body { margin:0 }
+//! </style>
+//! </head>
+//! <body>
+//! <div style="width:400px"><i>XXX<img style="width:50px;height:50px">XXX</i></div>
+//! <div style="width:400px;"><a>XXX<font>XXX<i>XXX</i>XXX</font>XXX</a></div>
+//! <div style="width:120px;font-size:16px;line-height:16px;font-family:'AHEM'"><span>XXX<span>XXX XXX</span>XXX</span></div>
+//! </body>
+//! </html>
+}
+test("GetRectList_enclosing")  require success "AHEM";
+{
+	// Image inside an inline
+
+	HTML_Element *child = find_element("i", 1);
+	verify(child);
+
+	Box *child_box = child->GetLayoutBox();
+	verify(child_box != NULL);
+
+	RectList rect_list;
+	verify(child_box->GetRectList(state.doc, ENCLOSING_BOX, rect_list));
+
+	verify(rect_list.Cardinal() == 2);
+
+	RectListItem* img = rect_list.First()->Suc();
+
+	RECT& img_rect = img->rect;
+
+	verify(img_rect.bottom - img_rect.top == 50);
+	verify(img_rect.right - img_rect.left == 50);
+
+	// nested inlines
+
+	rect_list.Clear();
+
+	child = find_element("a", 1);
+	verify(child);
+
+	child_box = child->GetLayoutBox();
+	verify(child_box != NULL);
+
+	verify(child_box->GetRectList(state.doc, ENCLOSING_BOX, rect_list));
+
+	verify(rect_list.Cardinal() == 3);
+
+	// wrapping inlines
+
+	rect_list.Clear();
+
+	child = find_element("span", 1);
+	verify(child);
+
+	child_box = child->GetLayoutBox();
+	verify(child_box != NULL);
+
+	verify(child_box->GetRectList(state.doc, ENCLOSING_BOX, rect_list));
+
+	verify(rect_list.Cardinal() == 4);
+}
+finally
+{
+	rect_list.Clear();
+}
+
+// See CORE-19750
+
+html
+{
+	//!<html><body>
+	//!<div style="position:absolute; left:50px; top:25px; width:10px; height:10px;"><table id="T"></table></div>
+	//!</body></html>
+}
+test("GetRectList table inside absolutely positioned") language ecmascript;
+{
+	var rects = document.getElementById('T').getClientRects();
+	verify(rects.length == 1);
+	verify(rects[0].top == 25);
+	verify(rects[0].left == 50);
+}
+
+html
+{
+//! <!doctype html>
+//! <html>
+//! <head>
+//! <title>overflow:hidden</title>
+//! </head>
+//! <body>
+//! <div id="container" style="position:absolute">
+//!
+//! <div id="a" style="overflow:hidden">
+//! <div id="b" style="position:absolute;"></div>
+//! <div id="c" style="position:relative;"></div>
+//! </div>
+//!
+//! <div id="d" style="overflow:hidden;position:relative">
+//! <div id="e" style="position:absolute;"></div>
+//! <div id="f" style="position:relative;"></div>
+//! <div id="n" style="position:fixed;"></div>
+//! </div>
+//!
+//! <div id="g" style="overflow:hidden;">
+//! <div id="h" style="position:absolute;"><div id="i" style="position:relative"><div id="ii" style="position:absolute"></div></div><div id="j"></div></div>
+//! <div id="k" style="position:relative;"><div id="l"></div><div id="m" style="position:absolute"></div></div>
+//! </div>
+//!
+//! </div>
+//! </body>
+//! </html>
+}
+table ClipAffectsTargetTable(const uni_char*, const uni_char*, BOOL)
+{
+	{ UNI_L("a"), UNI_L("b"), FALSE }
+	{ UNI_L("a"), UNI_L("c"), TRUE  }
+	{ UNI_L("d"), UNI_L("e"), TRUE  }
+	{ UNI_L("d"), UNI_L("f"), TRUE  }
+	{ UNI_L("d"), UNI_L("n"), FALSE }
+	{ UNI_L("g"), UNI_L("i"), FALSE }
+	{ UNI_L("g"), UNI_L("ii"), FALSE }
+	{ UNI_L("g"), UNI_L("j"), FALSE }
+	{ UNI_L("g"), UNI_L("l"), TRUE  }
+	{ UNI_L("g"), UNI_L("m"), TRUE }
+}
+test("GetClipAffectsTarget")
+{
+	FramesDocument* doc = state.doc;
+	verify (doc != NULL);
+
+	HTML_Element* doc_root = doc->GetDocRoot();
+	verify(doc_root != NULL);
+
+	iterate (outername, innername, clip_affects) from ClipAffectsTargetTable
+	{
+		HTML_Element* outer_elm = doc_root->GetElmById(outername);
+		HTML_Element* inner_elm = doc_root->GetElmById(innername);
+
+		Box* outer_box = outer_elm->GetLayoutBox();
+		verify(outer_box);
+
+		BOOL affects = outer_box->GetClipAffectsTarget(inner_elm);
+		verify (affects == clip_affects);
+	}
+}
+
+table HasSameClippingStackTable(const uni_char*, BOOL)
+{
+	{ UNI_L("b"), TRUE }
+	{ UNI_L("c"), FALSE }
+	{ UNI_L("d"), TRUE }
+	{ UNI_L("e"), TRUE }
+	{ UNI_L("g"), FALSE }
+	{ UNI_L("h"), TRUE }
+	{ UNI_L("i"), TRUE }
+	{ UNI_L("j"), TRUE }
+	{ UNI_L("k"), FALSE }
+	{ UNI_L("l"), TRUE }
+	{ UNI_L("m"), TRUE }
+	{ UNI_L("n"), FALSE }
+}
+subtest HasSameClippingStackTest(const char* start, const char* end)
+{
+	FramesDocument* doc = state.doc;
+	verify (doc != NULL);
+
+	HTML_Element* doc_root = doc->GetDocRoot();
+	verify(doc_root != NULL);
+
+	iterate (elm_id, has_same) from HasSameClippingStackTable
+	{
+		if (uni_strcmp(start, elm_id) <= 0 && uni_strcmp(elm_id, end) <= 0)
+		{
+			HTML_Element* elm = doc_root->GetElmById(elm_id);
+			verify(elm);
+
+			Box* box = elm->GetLayoutBox();
+			verify(box);
+			ZElement* z_element = box->GetLocalZElement();
+			verify(z_element);
+
+			BOOL same = z_element->HasSameClippingStack();
+			verify (same == has_same);
+		}
+	}
+}
+
+html
+{
+//! <!doctype html>
+//! <html>
+//! <body>
+//!		<div id="container" style="position:absolute;z-index:0">
+//!
+//!		<div style="overflow:hidden">
+//!			<div id="a" style="position:absolute">
+//!				<div id="b" style="position:relative"></div>
+//!			</div>
+//!			<div id="c" style="position:relative"></div>
+//!			<div style="overflow:hidden">
+//!				<div id="d" style="position:relative"></div>
+//!			</div>
+//!		</div>
+//!
+//!		<div id="e" style="position:absolute"></div>
+//!
+//!		</div>
+//! </body>
+//! </html>
+}
+test("HasSameClippingStack")
+{
+	// Starting from 'b', because can't call HasSameClippingStack on first Z Element
+	verify(HasSameClippingStackTest("b","e"));
+}
+
+html
+{
+//!<!doctype html>
+//!<html>
+//!<body>
+//!	<div id="container" style="position:absolute;z-index:0">
+//!		<div style="overflow:hidden">
+//!			<div id="f" style="position:relative"></div>
+//!			<div id="g" style="position:fixed"></div>
+//!			<div id="h" style="position:absolute"></div>
+//!		</div>
+//!		<div style="overflow:hidden">
+//!			<div id="i" style="position:relative">
+//!				<div id="j" style="position:absolute"></div>
+//!				<div id="k" style="position:fixed"></div>
+//!			</div>
+//!			<div id="l" style="position:fixed">
+//!				<div style="overflow:hidden">
+//!					<div id="m" style="position:relative">
+//!						<div id="n" style="position:fixed"></div>
+//!					</div>
+//!				</div>
+//!			</div>
+//!		</div>
+//!	</div>
+//!</body>
+//!</html>
+}
+test("HasSameClippingStack (with fixed positioned)")
+{
+	// Starting from 'g', because can't call HasSameClippingStack on first Z Element
+	verify(HasSameClippingStackTest("g","n"));
+}
+
+html
+{
+//! <!doctype html>
+//! <html>
+//!   <head>
+//!     <style> body { margin:0 } </style>
+//!   </head>
+//!   <body>
+//!     <div style="position: absolute; left: 200px;">
+//!       <table cellspacing="0" cellpadding="0">
+//!         <tbody id="mytablegroup">
+//!           <tr id="myfirsttablerow"><td width="50"><div style="height: 100px; background:blue"></td></tr>
+//!           <tr><td width="50"><div style="height: 100px; background:blue"></td></tr>
+//!         </tbody>
+//!       </table>
+//!     </div>
+//!   </body>
+//! </html>
+}
+test("getBoundingClientRect on table row") language ecmascript;
+{
+	var rect = document.getElementById('myfirsttablerow').getBoundingClientRect();
+	verify(rect.left == 200);
+	verify(rect.top == 0);
+	verify(rect.right == 250);
+	verify(rect.bottom == 100);
+}
+test("getBoundingClientRect on table group") language ecmascript;
+{
+	var rect = document.getElementById('mytablegroup').getBoundingClientRect();
+	verify(rect.left == 200);
+	verify(rect.top == 0);
+	verify(rect.right == 250);
+	verify(rect.bottom == 200);
+}
+
+// Test case based on the CORE-21796 bug.
+
+html
+{
+//! <!DOCTYPE HTML>
+//! <style>
+//! * { margin: 0; padding: 0; }
+//! #container { margin: 5px; }
+//! #rel { position: relative; }
+//! #abs { background: red; position: absolute; top: 0; left: 0; width: 50px; height: 50px; }
+//! #abs:hover { background: green; }
+//! </style>
+//! <div style="height: 20px;"></div>
+//! <div id="container"><span id="rel"><div id="abs"></div></span></div>
+}
+test("Box::GetRect for CORE-21796")
+{
+	FramesDocument* doc = state.doc;
+	verify(doc != NULL);
+	verify(doc->GetDocRoot() != NULL);
+
+	HTML_Element* abs_elm = find_element("div", 3);
+	verify(abs_elm);
+
+	Box* abs_box = abs_elm->GetLayoutBox();
+
+	RECT rect;
+	abs_box->GetRect(doc, BOUNDING_BOX, rect);
+	verify(rect.left == 5);
+	verify(rect.top == 25);
+	verify(rect.right == 55);
+	verify(rect.bottom == 75);
+}
+
+// (x, y, width, height)*3. First tuples are operands, third is expected result.
+table AbsUnionTests(int, int, int, int, int, int, int, int, int, int, int, int)
+{
+	{ 0, 0, 50, 100, 0, 20, 50, 60, 0, 0, 50, 100 }
+	{ 0, 20, 50, 60, 0, 0, 50, 100, 0, 0, 50, 100 }
+	{ 0, 0, 50, 50, 0, 0, 50, 100, 0, 0, 50, 100 }
+	{ 0, 0, 50, 100, 0, 0, 50, 50, 0, 0, 50, 100 }
+	{ 0, 50, 50, 50, 0, 0, 50, 100, 0, 0, 50, 100 }
+	{ 0, 0, 50, 100, 0, 50, 50, 50, 0, 0, 50, 100 }
+	{ 0, 0, 50, 80, 0, 20, 50, 80, 0, 0, 50, 100 }
+	{ 0, 20, 50, 80, 0, 0, 50, 80, 0, 0, 50, 100 }
+	{ 0, 0, 100, 50, 20, 0, 60, 50, 0, 0, 100, 50 }
+	{ 20, 0, 60, 50, 0, 0, 100, 50, 0, 0, 100, 50 }
+	{ 0, 0, 50, 50, 0, 0, 100, 50, 0, 0, 100, 50 }
+	{ 0, 0, 100, 50, 0, 0, 50, 50, 0, 0, 100, 50 }
+	{ 50, 0, 50, 50, 0, 0, 100, 50, 0, 0, 100, 50 }
+	{ 0, 0, 100, 50, 50, 0, 50, 50, 0, 0, 100, 50 }
+	{ 0, 0, 80, 50, 20, 0, 80, 50, 0, 0, 100, 50 }
+	{ 20, 0, 80, 50, 0, 0, 80, 50, 0, 0, 100, 50 }
+}
+test("AbsoluteBoundingBox::UnionWith")
+{
+	iterate (x1, y1, w1, h1, x2, y2, w2, h2, x_u, y_u, w_u, h_u) from AbsUnionTests
+	{
+		AbsoluteBoundingBox b1, b2, b_union;
+
+		b1.Set(LayoutCoord(x1), LayoutCoord(y1), LayoutCoord(w1), LayoutCoord(h1));
+		b2.Set(LayoutCoord(x2), LayoutCoord(y2), LayoutCoord(w2), LayoutCoord(h2));
+
+		b1.UnionWith(b2);
+
+		verify(b1.GetX() == x_u);
+		verify(b1.GetY() == y_u);
+		verify(b1.GetWidth() == w_u);
+		verify(b1.GetHeight() == h_u);
+	}
+}
+
+html
+{
+//! <!DOCTYPE html>
+//! <style>
+//!  table, tr, td { margin: 0; padding: 0; }
+//! </style>
+//! <table style="font-family: ahem; font-size: 10px; border-collapse: collapse;">
+//!  <tr>
+//!   <td style="font-size: 2em">X</td>
+//!   <td><span style="position: relative;"><div style="position: absolute; top: -10px">X</div>X</span>
+//!   </td>
+//!  </tr>
+//! </table>
+}
+test("Table cell bounding box") require success "AHEM";
+{
+	FramesDocument* doc = state.doc;
+	verify(doc != NULL);
+	verify(doc->GetDocRoot() != NULL);
+
+	// Reflow to make sure the table's been layed out properly
+	verify(OpStatus::IsSuccess(state.doc->Reflow(FALSE)));
+
+	HTML_Element* cell = find_element("td", 2);
+	verify(cell);
+
+	TableCellBox* box = (TableCellBox*) cell->GetLayoutBox();
+	verify(box);
+
+	AbsoluteBoundingBox bbox;
+	box->GetBoundingBox(bbox, TRUE);
+	verify(bbox.GetX() == 0);
+	verify(bbox.GetY() == -5);
+	verify(bbox.GetWidth() == 10);
+	verify(bbox.GetHeight() == 25);
+}
+
+html
+{
+//! <!doctype html>
+//! <html><body>
+//! <div style="position: fixed; top: 10px; left: 20px"></div>
+//! <div style="height: 20000px;"></div>
+//! </html></body>
+}
+test("offset properties of fixed positioned element in a scrolled document")
+{
+	HTML_Element* fixed_elm = find_element("div", 1);
+	verify(fixed_elm);
+
+	Box* fixed_box = fixed_elm->GetLayoutBox();
+
+	RECT rect;
+
+	// Verify un-scrolled offset properties
+
+	fixed_box->GetRect(state.doc, OFFSET_BOX, rect);
+
+	verify(rect.top == 10);
+	verify(rect.left == 20);
+
+	// Scroll document
+	OpRect new_view(0, 1000, 100, 100);
+	state.doc->RequestScrollIntoView(new_view, SCROLL_ALIGN_TOP, FALSE, VIEWPORT_CHANGE_REASON_SCRIPT_SCROLL);
+
+	// Verify that offset properties of the fixed positioned element hasn't changed.
+	fixed_box->GetRect(state.doc, OFFSET_BOX, rect);
+
+	verify(rect.top == 10);
+	verify(rect.left == 20);
+}
+
+html
+{
+//! <!DOCTYPE html>
+//! <html>
+//!  <body style="font-family: ahem; font-size: 20px; padding: 100px;">
+//!   <div style="padding-top: 7px;">X<div style="display:inline-block; position: relative; vertical-align:top;"><div style="position: absolute; top: -10px">X</div></div></div>
+//!  </body>
+//! </html>
+}
+test("Line bounding box - top aligned inline content #1")
+{
+	HTML_Element* elm = find_element("div", 1);
+	verify(elm);
+
+	Content_Box* box = (Content_Box *)elm->GetLayoutBox();
+
+	verify(box);
+
+	AbsoluteBoundingBox bbox;
+	box->GetBoundingBox(bbox, TRUE);
+
+	verify(bbox.GetY() == -3);
+	verify(bbox.GetHeight() == 30);
+
+	Container * container = box->GetContainer();
+	Line * line = container->GetLineAtVirtualPosition(0);
+
+	verify(line);
+
+	AbsoluteBoundingBox bounding_box;
+	line->GetBoundingBox(bounding_box);
+
+	verify(bounding_box.GetY() == -10);
+	verify(bounding_box.GetHeight() == 30);
+}
+
+html
+{
+//! <!DOCTYPE html>
+//! <html>
+//!  <body style="font-family: ahem; font-size: 20px;">
+//!   <div>X<div style="display:inline-block; position: relative; vertical-align:top;"><div style="position: absolute; top: 10px;">X</div></div></div>
+//!  </body>
+//! </html>
+}
+test("Line bounding box - top aligned inline content #2")
+{
+	HTML_Element* elm = find_element("div", 1);
+	verify(elm);
+
+	Content_Box* box = (Content_Box *)elm->GetLayoutBox();
+
+	verify(box);
+
+	AbsoluteBoundingBox bbox;
+	box->GetBoundingBox(bbox, TRUE);
+
+	verify(bbox.GetY() == 0);
+	verify(bbox.GetHeight() == 30);
+
+	Container * container = box->GetContainer();
+	Line * line = container->GetLineAtVirtualPosition(0);
+
+	verify(line);
+
+	AbsoluteBoundingBox bounding_box;
+	line->GetBoundingBox(bounding_box);
+
+	verify(bounding_box.GetY() == 0);
+	verify(bounding_box.GetHeight() == 30);
+}
+
+html
+{
+//! <!DOCTYPE html>
+//! <html>
+//!  <body style="font-family: ahem; font-size: 20px;">
+//!   <div style="padding-top: 7px;">X<div style="display:inline-block; position: relative; vertical-align:bottom;"><div style="position: absolute; top: -30px">X</div></div></div>
+//!  </body>
+//! </html>
+}
+test("Line bounding box - bottom aligned inline content #1")
+{
+	HTML_Element* elm = find_element("div", 1);
+	verify(elm);
+
+	Content_Box* box = (Content_Box *)elm->GetLayoutBox();
+
+	verify(box);
+
+	AbsoluteBoundingBox bbox;
+	box->GetBoundingBox(bbox, TRUE);
+
+	verify(bbox.GetY() == -3);
+	verify(bbox.GetHeight() == 30);
+
+	Container * container = box->GetContainer();
+	Line * line = container->GetLineAtVirtualPosition(0);
+
+	verify(line);
+
+	AbsoluteBoundingBox bounding_box;
+	line->GetBoundingBox(bounding_box);
+
+	verify(bounding_box.GetY() == -10);
+	verify(bounding_box.GetHeight() == 30);
+}
+
+language ecmascript;
+
+html
+{
+//! <!DOCTYPE html>
+//! <html>
+//! <body>
+//!  <div style="width: 100px; height: 100px;">
+//!   <div id="testme" style="height: 100px; overflow: auto; position: relative;">
+//!    <div style="height: 150px; position: absolute; width: 100%; background-color: lime;">
+//!    </div>
+//!   </div>
+//!  </div>
+//! </body>
+//! </html>
+}
+test("Containing block width for block box with scrollable content")
+{
+	verify(document.getElementById('testme').scrollWidth < 100);
+}
+
+html
+{
+//! <!DOCTYPE html>
+//! <html>
+//! <body>
+//!  <div style="width: 100px; height: 100px;">
+//!   <div id="testme" style="width: 100px; height: 100%; overflow: auto; position: relative;">
+//!    <div style="width: 150px; position: absolute; height: 100%;">
+//!    </div>
+//!   </div>
+//!  </div>
+//! </body>
+//! </html>
+}
+test("Containing block height for block box with scrollable content")
+{
+	verify(document.getElementById('testme').scrollHeight < 100);
+}
+
+html
+{
+//! <!DOCTYPE html>
+//! <html>
+//! <body>
+//!  <div style="width: 100px; height: 100px;">
+//!   <div id="testme" style="display:inline-block; width: 100px; height: 100%; overflow: scroll; position: relative;">
+//!    <div style="width: 150px; position: absolute; height: 100%;">
+//!    </div>
+//!   </div>
+//!  </div>
+//! </body>
+//! </html>
+}
+test("Containing block height for inline box with scrollable content")
+{
+	verify(document.getElementById('testme').scrollHeight < 100);
+}
+
+html
+{
+//! <!DOCTYPE html>
+//! <html>
+//! <body>
+//!  <div style="width: 100px; height: 100px;">
+//!   <div style="height: 100px; overflow: auto; position: relative;">
+//!    <div id="testme" style="width: 10px; height: 10px; position: absolute; background-color: lime; right:0;">
+//!    <div style="width: 10px; height: 150px;"></div>
+//!    </div>
+//!   </div>
+//!  </div>
+//! </body>
+//! </html>
+}
+test("Containing block calculation and scrollbars")
+{
+	verify(document.getElementById('testme').offsetLeft < 90);
+}
+
+html
+{
+//! <!DOCTYPE html>
+//! <style>
+//!   body {
+//!     margin: 0;
+//!     font: 20px/1 Ahem;
+//!   }
+//!   #ib {
+//!     display: inline-block;
+//!     width: 3em;
+//!   }
+//! </style>
+//! <div>XX<span id="ib">XXXXXX</span></div>
+}
+
+language C++;
+
+table InlineBlockWidths(const char*, BoxRectType, int)
+{
+	{ "BOUNDING_BOX", BOUNDING_BOX, 120 }
+	{ "ENCLOSING_BOX", ENCLOSING_BOX, 120 }
+	{ "CLIENT_BOX", CLIENT_BOX, 60 }
+	{ "CONTENT_BOX", CONTENT_BOX, 60 }
+	{ "OFFSET_BOX", OFFSET_BOX, 60 }
+	{ "SCROLL_BOX", SCROLL_BOX, 60 }
+	{ "BORDER_BOX", BORDER_BOX, 60 }
+	{ "PADDING_BOX", PADDING_BOX, 60 }
+}
+
+foreach (type_str, type, exp_width) from InlineBlockWidths
+{
+	test("Inline block with overflowing text - " + type_str) require success "AHEM";
+	{
+		HTML_Element* inline_block_elm = find_element("span", 1);
+		verify(inline_block_elm);
+
+		Box* inline_block_box = inline_block_elm->GetLayoutBox();
+		verify(inline_block_box);
+
+		RECT rect;
+		inline_block_box->GetRect(state.doc, type, rect);
+		verify(rect.right - rect.left == exp_width);
+	}
+}

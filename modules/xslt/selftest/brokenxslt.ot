@@ -1,0 +1,200 @@
+/* -*- Mode: c++; indent-tabs-mode: nil; c-file-style: "gnu" -*- */
+
+group "XSLT.BrokenCode";
+require XSLT_SUPPORT;
+
+include "modules/logdoc/optreecallback.h";
+include "modules/url/url2.h";
+include "modules/util/tempbuf.h";
+include "modules/xmlutils/xmlparser.h";
+include "modules/xmlutils/xmlserializer.h";
+include "modules/xmlutils/xmltokenhandler.h";
+include "modules/xmlutils/xmlutils.h";
+include "modules/xslt/xslt.h";
+include "modules/util/opfile/opfile.h";
+include "modules/doc/frm_doc.h";
+
+global
+{
+  class TestStringDataCollector
+    : public XSLT_Stylesheet::Transformation::StringDataCollector
+  {
+  public:
+    virtual OP_STATUS CollectStringData(const uni_char *string, unsigned string_length);
+    virtual OP_STATUS StringDataFinished() { return OpStatus::OK; }
+
+    const uni_char* GetResult() { return resulting_text.GetStorage(); }
+  private:
+    TempBuffer resulting_text;
+  };
+
+  /* virtual */ OP_STATUS
+  TestStringDataCollector::CollectStringData(const uni_char *string, unsigned string_length)
+  {
+    return resulting_text.Append(string, string_length);
+  }
+
+  BOOL
+  ReadFile (TempBuffer &buffer, const OpString &filename)
+  {
+    OpFile file;
+
+    if (OpStatus::IsError (file.Construct (filename.CStr ())))
+      return FALSE;
+
+    if (OpStatus::IsError (file.Open (OPFILE_READ | OPFILE_TEXT)))
+      return FALSE;
+
+    while (!file.Eof ())
+      {
+        OpString line;
+
+        if (OpStatus::IsError (file.ReadUTF8Line (line)))
+          return FALSE;
+
+        if (OpStatus::IsError (buffer.Append (line.CStr())))
+          return FALSE;
+
+        if (OpStatus::IsError (buffer.Append ("\n")))
+          return FALSE;
+      }
+
+    uni_char *storage = buffer.GetStorage(), *end = storage + buffer.Length ();
+
+    while (storage != end && XMLUtils::IsSpace (*--end))
+      *end = 0;
+
+    return TRUE;
+  }
+
+  class Callback
+    : public OpTreeCallback
+  {
+  public:
+    BOOL called;
+    HTML_Element *element;
+
+    Callback () : called (FALSE), element (NULL) {}
+
+    virtual OP_STATUS ElementFound (HTML_Element *input)
+    {
+      called = TRUE;
+      element = input;
+      return OpStatus::OK;
+    }
+
+    virtual OP_STATUS ElementNotFound ()
+    {
+      called = TRUE;
+      return OpStatus::OK;
+    }
+  };
+
+  class XSLT_StylesheetParser_Callback
+    : public XSLT_StylesheetParser::Callback
+  {
+  public:
+    virtual OP_STATUS LoadOtherStylesheet(URL stylesheet_url, XMLTokenHandler *token_handler, BOOL is_import)
+    {
+      return OpStatus::ERR;
+    }
+  };
+
+  class XSLT_StylesheetTransformation_Callback
+    : public XSLT_Stylesheet::Transformation::Callback
+  {
+  public:
+    virtual void ContinueTransformation(XSLT_Stylesheet::Transformation *transformation)
+    {
+    }
+    virtual OP_STATUS LoadDocument(URL document_url, XMLTokenHandler *token_handler)
+    {
+      return OpStatus::ERR;
+    }
+  };
+}
+
+table filenames (const char *) filelist "broken" name "*.transform";
+
+xml
+{
+  "<root>Dummy document</root>"
+}
+
+test ("Dummy test")
+{
+  /* Dummy test: multi tests can't wait for a document to finish loading; so
+     they are all skipped instead.  This dummy tests can wait for the document
+     to finish, and after it, the multi test will run correctly. */
+  verify (TRUE);
+}
+
+test ("Broken XSLT: $(stylesheetname8)")
+  multi filenames (stylesheetname8);
+{
+  OpString stylesheetname;
+
+  // verify(op_strstr(inputname8, "function10")); // Skip all tests not working on text
+
+  stylesheetname.Set (stylesheetname8);
+  TempBuffer stylesheetsrc;
+  verify (ReadFile (stylesheetsrc, stylesheetname));
+
+  URL url;
+
+  OpAutoPtr<XSLT_StylesheetParser_Callback> xsltparser_callback (OP_NEW (XSLT_StylesheetParser_Callback, ()));
+  verify (xsltparser_callback.get ());
+
+  XSLT_StylesheetParser *xsltparser;
+  verify (OpStatus::IsSuccess (XSLT_StylesheetParser::Make (xsltparser, xsltparser_callback.get ())));
+
+  XMLTokenHandler *tokenhandler1;
+  verify (OpStatus::IsSuccess (XMLLanguageParser::MakeTokenHandler (tokenhandler1, xsltparser, NULL)));
+
+  XMLParser *stylesheetparser;
+  verify (OpStatus::IsSuccess (XMLParser::Make (stylesheetparser, NULL, (MessageHandler *) NULL, tokenhandler1, url)));
+
+  verify (stylesheetparser->Parse (stylesheetsrc.GetStorage (), stylesheetsrc.Length (), FALSE) == OpStatus::OK);
+  BOOL transform_completed_without_error = FALSE;
+  if (!stylesheetparser->IsFailed())
+    {
+      if (stylesheetparser->IsFinished ())
+        {
+          XSLT_Stylesheet *stylesheet = NULL;
+          if (OpStatus::IsSuccess (xsltparser->GetStylesheet (stylesheet)))
+            {
+              verify(stylesheet);
+
+              XSLT_Stylesheet::Transformation* transform_in_progress;
+              XSLT_Stylesheet::Input transform_input;
+              verify (OpStatus::IsSuccess (state.doc->GetLogicalDocument ()->CreateXMLTreeAccessor (transform_input.tree, transform_input.node)));
+              XSLT_Stylesheet::OutputForm outputform = XSLT_Stylesheet::OUTPUT_STRINGDATA;
+              OP_STATUS status = stylesheet->StartTransformation (transform_in_progress, transform_input, outputform);
+              if (OpStatus::IsSuccess(status))
+                {
+                  XSLT_StylesheetTransformation_Callback transform_callback;
+                  transform_in_progress->SetCallback (&transform_callback);
+
+                  TestStringDataCollector result;
+                  transform_in_progress->SetStringDataCollector(&result, FALSE);
+                  XSLT_Stylesheet::Transformation::Status transform_status;
+                  while ((transform_status = transform_in_progress->Transform()) == XSLT_Stylesheet::Transformation::TRANSFORM_PAUSED)
+                    {
+                      // Just go on
+                    }
+                  transform_completed_without_error = (transform_status == XSLT_Stylesheet::Transformation::TRANSFORM_FINISHED);
+                  status = XSLT_Stylesheet::StopTransformation(transform_in_progress);
+                  OpStatus::Ignore(status);
+                }
+
+              LogicalDocument::FreeXMLTreeAccessor (transform_input.tree);
+              XSLT_Stylesheet::Free (stylesheet);
+            }
+        }
+    }
+
+  XSLT_StylesheetParser::Free (xsltparser);
+  OP_DELETE (stylesheetparser);
+  OP_DELETE (tokenhandler1);
+  verify (!transform_completed_without_error); // We are testing error handling after all
+}

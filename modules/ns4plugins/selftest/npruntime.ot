@@ -1,0 +1,593 @@
+/* -*- Mode: c++; tab-width: 4; indent-tabs-mode: t; c-basic-offset: 4 -*-
+ *
+ * Plugin tests for NPRuntime methods.
+ *
+ * Copyright (C) 2009-2010 Opera Software AS.  All rights reserved.
+ *
+ * This file is part of the Opera web browser.
+ * It may not be distributed under any circumstances.
+ */
+
+group "ns4plugins.npruntime";
+
+language c++;
+
+require _PLUGIN_SUPPORT_;
+require init;
+
+include "modules/prefs/prefsmanager/collections/pc_display.h";
+include "modules/viewers/viewers.h";
+
+/**
+ * Ensure that plugins are enabled.
+ */
+test("Plugins enabled")
+{
+	verify(g_pcdisplay->GetIntegerPref(PrefsCollectionDisplay::PluginsEnabled));
+	verify(g_pcdisplay->GetIntegerPref(PrefsCollectionDisplay::EnableOnDemandPlugin) == 0);
+}
+
+/**
+ * Ensure the test plugin is available.
+ */
+test("Test plugin installed")
+	require success "Plugins enabled";
+{
+	OpString16 mime_type;
+	mime_type.Set("application/x-vnd.opera-test-plugin");
+	verify(g_viewers->FindViewerByMimeType(mime_type) != 0);
+}
+
+/**
+ * Set current document, instantiating a test plugin object
+ * available for the following javascript tests.
+ */
+html {
+	//! <html>
+	//! <head>
+	//! <title> Plugin tests for NPRuntime methods </title>
+	//! </head>
+	//! <body>
+	//! <object id="plugin" type="application/x-vnd.opera-test-plugin"
+	//!   width="1" height="1" windowless="true">Fallback</object>
+	//! <script>window.plugin = document.getElementById("plugin");</script>
+	//! </body>
+	//! </html>
+}
+
+test("Test plugin scriptable object")
+	require success "Test plugin installed";
+	language ecmascript;
+{
+	verify(plugin.toString() == "[OperaTestPlugin]");
+}
+
+test("NPP_Invoke")
+	require success "Test plugin scriptable object";
+	language ecmascript;
+{
+	plugin.onHasMethod = function(obj, name) {
+		if (name == "invokeTestFunction")
+			return true;
+
+		/* Plugin will perform its own lookup when we return a non-boolean value. */
+		return undefined;
+	};
+
+	plugin.onInvoke = function(obj, name, num_arg, obj_arg) {
+		if (name == "invokeTestFunction") {
+			verify(name == "invokeTestFunction");
+			verify(num_arg == 29);
+			verify(obj_arg.val == 41);
+			return 37;
+		}
+	};
+
+	verify(plugin.invokeTestFunction(29, { val: 41 }) == 37);
+
+	plugin.onInvoke = undefined;
+	plugin.onHasMethod = undefined;
+}
+
+test("NPP_InvokeDefault")
+	require success "Test plugin scriptable object";
+	language ecmascript;
+{
+	plugin.onInvokeDefault = function(obj, num_arg, obj_arg) {
+		if (num_arg == 31 && obj_arg.val == 43)
+			return 1818;
+		return 301;
+	};
+
+	var obj = plugin.testCreateObject();
+
+	verify(obj(31, { val: 43 }) == 1818);
+	verify(obj(27) == 301);
+
+	plugin.testReleaseObject(obj);
+
+	plugin.onInvokeDefault = undefined;
+}
+
+test("NPP_HasProperty")
+	require success "Test plugin scriptable object";
+	language ecmascript;
+{
+	var property_queried = false;
+	var property_name = "hasPropertyTestProperty";
+
+	plugin.onHasProperty = function(obj, name) {
+		property_queried = property_name == name;
+	};
+
+	plugin[property_name] = true;
+	verify(property_name in plugin);
+	verify(property_queried);
+
+	plugin[property_name] = undefined;
+	plugin.onHasProperty = undefined;
+}
+
+test("NPP_GetProperty")
+	require success "Test plugin scriptable object";
+	language ecmascript;
+{
+	plugin.onHasProperty = function(obj, name) {
+		if (name == "something" || name == "anything")
+			return true;
+	};
+
+	plugin.onGetProperty = function(obj, name) {
+		if (name == "something")
+			return 17;
+		else
+			return 19;
+	};
+
+	plugin.something = 1;
+	verify(plugin.something == 17);
+	delete plugin.something;
+
+	plugin.anything = 1;
+	verify(plugin.anything == 19);
+	delete plugin.anything;
+
+	plugin.onHasProperty = undefined;
+	plugin.onGetProperty = undefined;
+}
+
+test("NPP_SetProperty")
+	require success "Test plugin scriptable object";
+	language ecmascript;
+{
+	var property_value = "not set";
+
+	plugin.onHasProperty = function(obj, name) {
+		switch(name)
+		{
+			case "an_object":
+			case "a_string":
+			case "a_number":
+			case "a_boolean":
+			case "an_undefined":
+			case "a_null":
+				return true;
+			case "neither_property_nor_method":
+			case "plugin_method":
+				return false;
+		}
+	}
+
+	plugin.onHasMethod = function(obj, name) {
+		switch(name)
+		{
+			case "neither_property_nor_method":
+				return false;
+			case "plugin_method":
+				return true;
+		}
+	}
+
+	plugin.onSetProperty = function(obj, name, value) {
+		if (name == "an_object")
+			property_value = value.val;
+		else if (name == "a_string")
+			property_value = value.length;
+		else if (name == "a_number")
+			property_value = value + 2;
+		else if (name == "a_boolean")
+			property_value = !value;
+		else if (name == "an_undefined")
+			property_value = undefined;
+		else if (name == "a_null")
+			property_value = null;
+		else if (name == "neither_property_nor_method" || name == "plugin_method")
+			property_value = 'fail';
+
+		return "unhandled case";
+	};
+
+	plugin.an_object = { val: 435 };
+	verify(property_value == 435);
+
+	plugin.a_string = "hello bridge";
+	verify(property_value == 12);
+
+	plugin.a_number = 329;
+	verify(property_value == 329 + 2);
+
+	plugin.a_boolean = false;
+	verify(property_value == true);
+
+	plugin.an_undefined = "lala";
+	verify(property_value == undefined);
+
+	plugin.a_null = 234;
+	verify(property_value == null);
+
+	/* Plugin does not handle this property so value should be stored in dom node. */
+	property_value = undefined;
+	plugin.neither_property_nor_method = "foo";
+	verify(property_value === undefined);
+	verify(plugin.neither_property_nor_method == "foo");
+
+	/* Trying to overwrite plugin method should throw exception. */
+	var exception = false;
+	property_value = undefined;
+	try {
+		plugin.plugin_method = 1;
+	} catch (e) {
+		exception = true;
+	}
+	verify(property_value === undefined);
+	verify(exception);
+
+	plugin.onHasProperty = undefined;
+	plugin.onHasMethod = undefined;
+	plugin.onSetProperty = undefined;
+}
+
+test("NPP_RemoveProperty")
+	require success "Test plugin scriptable object";
+	language ecmascript;
+{
+	property_removed = false;
+
+	plugin.onHasProperty = function(obj, name) {
+		if (name == "removePropertyTestProperty")
+			return true;
+
+		/* Plugin will perform its own lookup when we return a non-boolean value. */
+		return undefined;
+	};
+
+	plugin.onRemoveProperty = function(obj, name) {
+		property_removed = true;
+	};
+
+	/*
+		* Use a secondary object to test removeproperty, since Opera does not
+		* seem to call the function when we delete properties on the plugin object.
+		*/
+	var obj = plugin.testCreateObject();
+
+	delete obj.removePropertyTestProperty;
+	verify(property_removed);
+
+	plugin.testReleaseObject(obj);
+
+	plugin.onRemoveProperty = undefined;
+	plugin.onHasProperty = undefined;
+}
+
+test("NPN_Invoke")
+	require success "Test plugin scriptable object";
+	language ecmascript;
+{
+	function f(a_undefined, a_null, a_bool, a_int, a_double, a_string, a_obj) {
+		var ret = 0;
+		if (a_undefined == undefined) ret += 2;
+		if (a_null == null) ret += 3;
+		if (a_bool == true) ret += 5;
+		if (a_int == 37) ret += 7;
+		if (a_double > 3.13 && a_double < 3.15) ret += 11;
+		if (a_string == "correct") ret += 13;
+		return ret + a_obj.val;
+	};
+
+	/* Test all types in, number out. */
+	verify(plugin.testInvoke({ func: f }, "func", undefined, null, true, 37, 3.14, "correct", { val: 17 }) == 58);
+
+	/* Test object out. */
+	verify(plugin.testInvoke({ func: function() { return { val: 3 } } }, "func").val == 3);
+}
+
+test("NPN_Invoke (Invalid parameters)")
+	require success "Test plugin scriptable object";
+	language ecmascript;
+{
+	/* NPN_Invoke(instance, NULL, <string>, ...). */
+	verify(!plugin.testInvoke(null, "func"));
+
+	/* NPN_Invoke(instance, <object>, NULL, ...). */
+	verify(!plugin.testInvoke({}, null));
+
+	/* NPN_Invoke(instance, NULL, NULL, ...). */
+	verify(!plugin.testInvoke(null, null));
+}
+
+test("NPN_InvokeDefault")
+	require success "Test plugin scriptable object";
+	language ecmascript;
+{
+	function f(a_undefined, a_null, a_bool, a_int, a_double, a_string, a_obj) {
+		var ret = 2;
+		if (a_undefined == undefined) ret += 3;
+		if (a_null == null) ret += 5;
+		if (a_bool == true) ret += 7;
+		if (a_int == 37) ret += 11;
+		if (a_double > 3.13 && a_double < 3.15) ret += 13;
+		if (a_string == "correct") ret += 17;
+		return ret + a_obj.val;
+	};
+
+	/* Test all types in, number out. */
+	verify(plugin.testInvokeDefault(f, undefined, null, true, 37, 3.14, "correct", { val: 19 }) == 77);
+
+	/* Test object out. */
+	verify(plugin.testInvokeDefault(function() { return { val: 5 } }).val == 5);
+}
+
+test("NPN_InvokeDefault (Invalid parameters)")
+	require success "Test plugin scriptable object";
+	language ecmascript;
+{
+	/* NPN_InvokeDefault(instance, NULL, ...). */
+	verify(!plugin.testInvokeDefault(null));
+}
+
+test("NPN_Evaluate")
+	require success "Test plugin scriptable object";
+	language ecmascript;
+{
+	verify(plugin.testEvaluate("(function(){ return undefined; })()") == undefined);
+	verify(plugin.testEvaluate("(function(){ return null; })()") == null);
+	verify(plugin.testEvaluate("(function(){ return true && false; })()") == false);
+	verify(plugin.testEvaluate("(function(){ return 1 + 2 + 3 + 4 + 5; })()") == 15);
+	verify(plugin.testEvaluate("(function(){ return \"pass\"; })()") == "pass");
+	verify(plugin.testEvaluate("(function(){ return { val: 7 }; })()").val == 7);
+}
+
+test("NPN_Evaluate (Invalid parameters)")
+	require success "Test plugin scriptable object";
+	language ecmascript;
+{
+	/* NPN_Evaluate(instance, window, NULL, result); */
+	verify(!plugin.testEvaluate(null));
+
+	/* NPN_Evaluate(instance, window, "2 + 2", NULL); */
+	verify(!plugin.testEvaluate("2 + 2", null));
+
+	/* NPN_Evaluate(instance, window, NULL, NULL); */
+	verify(!plugin.testEvaluate(null, null));
+}
+
+test("NPN_GetProperty")
+	require success "Test plugin scriptable object";
+	language ecmascript;
+{
+	verify(plugin.testGetProperty({ prop: 11 }, "no_prop") == undefined);
+	verify(plugin.testGetProperty({ prop: null }, "prop") == null);
+	verify(plugin.testGetProperty({ prop: true }, "prop") == true);
+	verify(plugin.testGetProperty({ prop: 11 }, "prop") == 11);
+	verify(Math.abs(plugin.testGetProperty({ prop: 2.718 }, "prop") - 2.718) < 0.1);
+}
+
+test("NPN_GetProperty (Invalid parameters)")
+	require success "Test plugin scriptable object";
+	language ecmascript;
+{
+	/* NPN_GetProperty(instance, NULL, <string>, result); */
+	verify(!plugin.testGetProperty(null, "prop"));
+
+	/* NPN_GetProperty(instance, <object>, NULL, result); */
+	verify(!plugin.testGetProperty({ prop: 11 }, null));
+
+	/* NPN_GetProperty(instance, NULL, NULL, result); */
+	verify(!plugin.testGetProperty(null, null));
+
+	/* NPN_GetProperty(instance, <object>, <string>, NULL); */
+	verify(!plugin.testGetProperty({ prop: 11 }, "prop", null));
+}
+
+test("NPN_SetProperty")
+	require success "Test plugin scriptable object";
+	language ecmascript;
+{
+	var result = 0;
+	var obj = { prop: 13 };
+
+	plugin.testSetProperty(obj, "prop", undefined);
+	verify(obj.prop == undefined);
+
+	plugin.testSetProperty(obj, "prop", null);
+	verify(obj.prop == null);
+
+	plugin.testSetProperty(obj, "prop", 17);
+	verify(obj.prop == 17);
+
+	plugin.testSetProperty(obj, "prop", "pass");
+	verify(obj.prop == "pass");
+
+	var sub_obj = { orange: 23 };
+	plugin.testSetProperty(obj, "prop", sub_obj);
+	verify(obj.prop.orange == 23);
+}
+
+test("NPN_SetProperty (Invalid parameters)")
+	require success "Test plugin scriptable object";
+	language ecmascript;
+{
+	/* NPN_SetProperty(instance, NULL, <string>, <value>); */
+	verify(!plugin.testSetProperty(null, "prop", 9));
+
+	/* NPN_SetProperty(instance, <object>, NULL, <value>); */
+	verify(!plugin.testSetProperty({ prop: 11 }, null, 9));
+
+	/* NPN_SetProperty(instance, NULL, NULL, <value>); */
+	verify(!plugin.testSetProperty(null, null, 9));
+}
+
+test("NPN_RemoveProperty")
+	require success "Test plugin scriptable object";
+	language ecmascript;
+{
+	var obj = { prop: 13 };
+	plugin.testRemoveProperty(obj, "prop");
+	verify(obj.prop == undefined);
+}
+
+test("NPN_RemoveProperty (Invalid parameters)")
+	require success "Test plugin scriptable object";
+	language ecmascript;
+{
+	/* NPN_RemoveProperty(instance, NULL, <string>); */
+	verify(!plugin.testRemoveProperty(null, "prop"));
+
+	/* NPN_RemoveProperty(instance, <object>, NULL); */
+	verify(!plugin.testRemoveProperty({ prop: 11 }, null));
+
+	/* NPN_RemoveProperty(instance, NULL, NULL); */
+	verify(!plugin.testRemoveProperty(null, null));
+}
+
+test("NPN_HasProperty")
+	require success "Test plugin scriptable object";
+	language ecmascript;
+{
+	var obj = { prop: 13 };
+	verify(plugin.testHasProperty(obj, "prop"));
+	verify(!plugin.testHasProperty(obj, "prop2"));
+}
+
+test("NPN_HasProperty (Invalid parameters)")
+	require success "Test plugin scriptable object";
+	language ecmascript;
+{
+	/* NPN_HasProperty(instance, NULL, <string>); */
+	verify(!plugin.testHasProperty(null, "prop"));
+
+	/* NPN_HasProperty(instance, <object>, NULL); */
+	verify(!plugin.testHasProperty({ prop: 11 }, null));
+
+	/* NPN_HasProperty(instance, NULL, NULL); */
+	verify(!plugin.testHasProperty(null, null));
+}
+
+test("NPN_HasMethod")
+	require success "Test plugin scriptable object";
+	language ecmascript;
+{
+	var obj = { method: function() { return 3; } };
+	verify(plugin.testHasMethod(obj, "method"));
+	verify(!plugin.testHasMethod(obj, "method2"));
+}
+
+test("NPN_HasMethod (Invalid parameters)")
+	require success "Test plugin scriptable object";
+	language ecmascript;
+{
+	/* NPN_HasMethod(instance, NULL, <string>); */
+	verify(!plugin.testHasMethod(null, "method"));
+
+	/* NPN_HasMethod(instance, <object>, NULL); */
+	verify(!plugin.testHasMethod({ method: function () { return 3; } }, null));
+
+	/* NPN_HasMethod(instance, NULL, NULL); */
+	verify(!plugin.testHasMethod(null, null));
+}
+
+test("NPN_Enumerate")
+	require success "Test plugin scriptable object";
+	language ecmascript;
+{
+	var obj = { a: 1, b: 2, c: 3, d: 4, e: 5 };
+	verify(plugin.testEnumerate(obj).toString() == "a,b,c,d,e");
+}
+
+test("NPN_Construct")
+	require success "Test plugin scriptable object";
+	language ecmascript;
+{
+	/* Set 'magicMark' property on all array instances. */
+	Array.prototype.magicMark = 1729;
+
+	/* Construct an Array instance. */
+	var obj = plugin.testConstruct(Array);
+
+	/* Verify that it is indeed an Array by checking the 'magicMark.' */
+	verify(obj.magicMark == 1729);
+
+	delete Array.prototype.magicMark;
+}
+
+test("NPN_SetException")
+	require success "Test plugin scriptable object";
+	language ecmascript;
+{
+	var string = "this town is what you might call sarturially challenged";
+	var exception_string = "expected exception.";
+
+	try {
+		plugin.testSetException(string);
+	} catch (e) {
+		exception_string = e.toString();
+	};
+
+	verify(exception_string.match("Error"));
+	verify(exception_string.match(string));
+}
+
+test("CORE-35493 Set indexed property on external object")
+	require success "Test plugin scriptable object";
+	language ecmascript;
+{
+	var property_set = false;
+	var external_obj = plugin.testCreateObject();
+
+	plugin.onHasProperty = function(obj, name) {
+		if (obj == external_obj && name === 0)
+			return true;
+	}
+
+	plugin.onSetProperty = function(obj, name, value) {
+		if (obj == external_obj && name === 0 && value == "foo")
+		{
+			property_set = true;
+			return true;
+		}
+	}
+
+	plugin.onGetProperty = function(obj, name) {
+		if (obj == external_obj && name === 0)
+			return 'foo';
+	}
+
+	external_obj[0] = "foo";
+
+	verify(property_set);
+	verify(external_obj[0] == "foo");
+
+	plugin.testReleaseObject(external_obj);
+	property_set = undefined;
+	plugin.onHasProperty = undefined;
+	plugin.onSetProperty = undefined;
+	plugin.onGetProperty = undefined;
+}
+
+test("Removal of self")
+	require success "Test plugin scriptable object";
+	language ecmascript;
+{
+	plugin.testEvaluate("document.body.removeChild(plugin);");
+}

@@ -1,0 +1,225 @@
+/* -*- mode: c++; tab-width: 4 -*-
+**
+** Copyright (C) 2009 Opera Software AS.  All rights reserved.
+**
+** This file is part of the Opera web browser.  It may not be distributed
+** under any circumstances.
+**
+** Test for Protocol Buffer messages and proxy access.
+**
+** Jan Borsodi
+*/
+
+group "protobuf.protocolbuffer_message";
+
+require init;
+require PROTOBUF_SUPPORT;
+
+language c++;
+
+include "modules/util/adt/bytebuffer.h";
+
+include "modules/protobuf/src/protobuf_utils.h";
+include "modules/protobuf/src/protobuf.h";
+include "modules/protobuf/src/protobuf_message.h";
+include "modules/scope/src/scope_test_service.h";
+
+
+global
+{
+	OtScopeTestService_SI::Descriptors g_descriptors;
+}
+
+test("Accessing basic types")
+{
+	// Get
+	OtScopeTestService_SI::IntAccess msg;
+	msg.SetA(0xcafebabe);
+	msg.SetB(0x89abcdef);
+	msg.SetC(0x7fffffff);
+	msg.SetD(TRUE);
+	msg.SetE(FALSE);
+	OpProtobufInstanceProxy instance(OtScopeTestService_SI::IntAccess::GetMessageDescriptor(&g_descriptors), &msg);
+
+	INT32 *a_ptr = instance.FieldPtrINT32(0);
+	int a = *a_ptr;
+	verify(a == (int)0xcafebabe);
+
+	UINT32 *b_ptr = instance.FieldPtrUINT32(1);
+	unsigned int b = *b_ptr;
+	verify(b == (unsigned int)0x89abcdef);
+
+	INT32 *c_ptr = instance.FieldPtrINT32(2);
+	signed int c = *c_ptr;
+	verify(c == (int)0x7fffffff);
+
+	BOOL *d_ptr = instance.FieldPtrBOOL(3);
+	BOOL d = *d_ptr;
+	verify(d == TRUE);
+
+	BOOL *e_ptr = instance.FieldPtrBOOL(4);
+	BOOL e = *e_ptr;
+	verify(e == FALSE);
+
+	// Set
+	msg.SetA(0);
+	msg.SetB(0);
+	msg.SetC(0);
+	msg.SetD(FALSE);
+	msg.SetE(TRUE);
+
+	*a_ptr = 0xcafebabe;
+	verify(msg.GetA() == (int)0xcafebabe);
+
+	*b_ptr = 0x89abcdef;
+	verify(msg.GetB() == 0x89abcdef);
+
+	*c_ptr = 0x7fffffff;
+	verify(msg.GetC() == (int)0x7fffffff);
+
+	*d_ptr = TRUE;
+	verify(msg.GetD() == TRUE);
+
+	*e_ptr = FALSE;
+	verify(msg.GetE() == FALSE);
+}
+
+test("Accessing 64bit")
+	require OP_PROTOBUF_64BIT_SUPPORT;
+{
+	// TODO: This must be converted to use messages defined in OtScopeTestService_SI when 64bit support is enabled
+	struct Message
+	{
+		Message(INT64 a = 0, UINT64 b = 0) : a(a), b(b) {}
+		INT64  a;
+		UINT64 b;
+		mutable int encoded_size_;
+	};
+
+	OpAutoArray<OpProtobufField> fields( OP_NEWA(OpProtobufField, 2) );
+	verify(fields.get() != NULL);
+	fields[0] = OpProtobufField(OpProtobufFormat::Int64,  1, UNI_L("a"));
+	fields[1] = OpProtobufField(OpProtobufFormat::Uint64, 2, UNI_L("b"));
+	OpAutoArray<int> offsets( OP_NEWA(int, 2) );
+	verify(offsets.get());
+	offsets[0] = OP_PROTO_OFFSETOF(Message, a);
+	offsets[1] = OP_PROTO_OFFSETOF(Message, b);
+	OpProtobufMessage message_type(/*internal_id*/1, /*parent_id*/0,
+								   2, fields.get(), offsets.get(), -1, OP_PROTO_OFFSETOF(Message, encoded_size_),
+								   "Message");
+	fields.release();
+	offsets.release();
+
+	INT64 value_a = OP_INT64(-0x3501454121524111); // 0xcafebabedeadbeef
+	UINT64 value_b = OP_UINT64(0x7fffffffffffffff);
+	// Get
+	Message msg(value_a, value_b);
+	OpProtobufInstanceProxy instance(&message_type, &msg);
+
+	INT64 a = *instance.FieldPtrINT64(0);
+	verify(a == value_a);
+
+	UINT64 b = *instance.FieldPtrUINT64(1);
+	verify(b == value_b);
+
+	// Set
+	msg = Message(0, 0);
+
+	*instance.FieldPtrINT64(0) = value_a;
+	verify(msg.a == value_a);
+
+	*instance.FieldPtrUINT64(1) = value_b;
+	verify(msg.b == value_b);
+}
+
+test("Accessing floating point")
+{
+	// Get
+	float  in_a = 3.14f;
+	double in_b = 1310.77;
+	OtScopeTestService_SI::FloatAccess msg;
+	msg.SetA(in_a);
+	msg.SetB(in_b);
+	OpProtobufInstanceProxy instance(OtScopeTestService_SI::FloatAccess::GetMessageDescriptor(&g_descriptors), &msg);
+
+	float *a_ptr = instance.FieldPtrFloat(0);
+	float a = *a_ptr;
+	verify(a == in_a);
+
+	double *b_ptr = instance.FieldPtrDouble(1);
+	double b = *b_ptr;
+	verify(b == in_b);
+
+	// Set
+	msg.SetA(0.0);
+	msg.SetB(0.0);
+
+	*a_ptr = 3.14f;
+	verify(msg.GetA() == a);
+
+	*b_ptr = 1310.77;
+	verify(msg.GetB() == b);
+}
+
+test("Accessing Bytes")
+{
+	unsigned char bytes[4] = {0xca, 0xfe, 0xba, 0xbe};
+	unsigned char tmp[4]; // ARRAY OK 2009-05-05 jhoff
+
+	// Get
+	OtScopeTestService_SI::BytesAccess msg;
+	msg.SetA((const char *)bytes, 4);
+	OpProtobufInstanceProxy instance(OtScopeTestService_SI::BytesAccess::GetMessageDescriptor(&g_descriptors), &msg);
+	
+	ByteBuffer *a = instance.FieldPtrByteBuffer(0);
+	verify(a->Length() == 4);
+	a->Extract(0, 4, (char *)tmp);
+	verify(tmp[0] == 0xca);
+	verify(tmp[1] == 0xfe);
+	verify(tmp[2] == 0xba);
+	verify(tmp[3] == 0xbe);
+
+	// Set
+	msg.GetARef().Clear();
+	
+	a->Clear();
+	a->AppendBytes((const char *)bytes, 4);
+	verify(msg.GetA().Length() == 4);
+	msg.GetA().Extract(0, 4, (char *)tmp);
+	verify(tmp[0] == 0xca);
+	verify(tmp[1] == 0xfe);
+	verify(tmp[2] == 0xba);
+	verify(tmp[3] == 0xbe);
+}
+
+test("Accessing String")
+{
+	const uni_char *tmp;
+
+	// Get
+	OtScopeTestService_SI::StringAccess msg;
+	verify(OpStatus::IsSuccess(msg.SetA("cafe")));
+	OpProtobufInstanceProxy instance(OtScopeTestService_SI::StringAccess::GetMessageDescriptor(&g_descriptors), &msg);
+	
+	OpString *a = instance.FieldPtrOpString(0);
+	verify(a->Length() == 4);
+	tmp = a->DataPtr();
+	verify(tmp != NULL);
+	verify(tmp[0] == 'c');
+	verify(tmp[1] == 'a');
+	verify(tmp[2] == 'f');
+	verify(tmp[3] == 'e');
+
+	// Set
+	msg.GetARef().Empty();
+
+	a->Empty();
+	verify(OpStatus::IsSuccess(a->Set("cafe")));
+	verify(msg.GetA().Length() == 4);
+	tmp = msg.GetA().DataPtr();
+	verify(tmp != NULL);
+	verify(tmp[0] == 'c');
+	verify(tmp[1] == 'a');
+	verify(tmp[2] == 'f');
+	verify(tmp[3] == 'e');
+}

@@ -1,0 +1,1961 @@
+/* -*- Mode: c++; tab-width: 4; indent-tabs-mode: t; c-basic-offset: 4;  -*-
+ *
+ * Copyright (C) 2008-2011 Opera Software AS.  All rights reserved.
+ *
+ * This file is part of the Opera web browser.
+ * It may not be distributed under any circumstances.
+ */
+group "upnp";
+require UPNP_SUPPORT;
+
+include "core/pch.h";
+include "modules/upnp/upnp_upnp.h";
+include "modules/upnp/upnp_port_opening.h";
+include "modules/pi/network/OpSocketAddress.h";
+include "modules/webserver/webserver-api.h";
+include "modules/hardcore/timer/optimer.h";
+include "modules/url/url_socket_wrapper.h";
+include "modules/prefs/prefsmanager/collections/pc_tools.h";
+
+global
+{
+	#define TEST_MEX_0 "UDPTest onw way"
+	#define TEST_MEX "UDPTest"
+	#define TEST_MEX2 "UDPTest 2"
+	#define TEST_MEX3 "UDPTest 3"
+	#define TEST_MEX_M "UDPTest Multicast"
+	#define TEST_MEX_M2 "UDPTest Multicast 2"
+	#define TEST_MEX_M3 "UDPTest Multicast 3"
+	#define TEST_MEX_PI "Async hello!"
+
+	#define ASYNC_VERIFY(expr) do { if (!(expr)) { ST_failed(#expr, __FILE__, __LINE__); } } while (0)
+
+	class TimeOutObj: public OpTimerListener
+	{
+	private:
+		OpTimer timer;
+		BOOL fail;
+		
+		void OnTimeOut(OpTimer* timer) { fail=TRUE; ST_failed("TimeOut!"); }
+	
+	public:
+		TimeOutObj(UINT ms) { fail=FALSE; timer.SetTimerListener(this); timer.Start(ms); }
+		~TimeOutObj() { timer.Stop(); }
+	};
+	
+	class CPAcceptAll: public UPnPLogic
+	{
+	public:
+		CPAcceptAll(UPnP *upnp_father): UPnPLogic(upnp_father, "urn:opera-com:device:OperaUnite:1") {  }
+		virtual OP_STATUS HandlerFailed(UPnPXH_Auto *child, const char *mex) { return OpStatus::OK; }
+		/*virtual BOOL AcceptSearchTarget(const OpStringC8 &search_target) { return TRUE; }*/
+		virtual UPnPXH_Auto *CreateNewDescriptionObject() { return OP_NEW(UPnPXH_DescriptionGeneric, ()); }
+		virtual void OnNewDevice(UPnPDevice *device) { };
+		virtual void OnRemoveDevice(UPnPDevice *device) { };
+	};
+	
+	// Test class that accept only the specified port
+    class TestAcceptNumber:public UPnPPortListener
+    {
+    protected:
+		int refused;
+		int accepted;
+		int success;
+		int failure;
+		UINT16 port_wanted;
+		
+    public:
+		TestAcceptNumber(UINT16 port) { refused=0; accepted=0; success=0; failure=0; port_wanted=port; }
+		
+    	OP_STATUS Failure(UPnP *upnp, UPnPDevice *device, UPnPLogic *logic) { failure++; return OpStatus::OK; }
+    	OP_STATUS Success(UPnP *upnp, UPnPDevice *device, UPnPLogic *logic, UINT16 internal_port, UINT16 external_port)  { success++; if(external_port<port_wanted) { ST_failed("Wrong port: %d is not acceptable (must be >=%d)", external_port, port_wanted); } return OpStatus::OK; }
+		OP_STATUS PortClosed(UPnP *upnp, UPnPDevice *device, UPnPLogic *logic, UINT16 port, BOOL success) { return OpStatus::OK; }
+		OP_STATUS ArePortsAcceptable(UPnP *upnp, UPnPDevice *device, UPnPLogic *logic, UINT16 internal_port, UINT16 external_port, BOOL &ports_acceptable)
+		{ 
+			// Enable also the following port, useful to test in an environemtn where the wanted port is already taken
+			if(internal_port>=port_wanted)
+			{
+				ports_acceptable=TRUE;
+				accepted++;
+			}
+			else
+				ports_acceptable=FALSE;
+			
+			return OpStatus::OK;
+		};
+		OP_STATUS PortsRefused(UPnP *upnp, UPnPDevice *device, UPnPLogic *logic, UINT16 internal_port, UINT16 external_port) { refused++; return OpStatus::OK; };
+		
+		int GetRefused() { return refused; }
+		int GetAccepted() { return accepted; }
+		int GetFailure() { return failure; }
+		int GetSuccess() { return success; }
+    };
+    
+    // Test class, used for SelfTests
+    class UPnPListenerTest:public UPnPPortListener
+    {
+		BOOL reverse;
+		TimeOutObj *time;
+    public:
+    	UPnPListenerTest(TimeOutObj *timeout) { reverse=FALSE; time=timeout; }
+    	~UPnPListenerTest() { OP_DELETE(time); }
+    	
+    	void SetTimeout(TimeOutObj *timeout) { OP_DELETE(time); time=timeout; }
+    	
+    	OP_STATUS Failure(UPnP *upnp, UPnPDevice *device, UPnPLogic *logic);
+    	OP_STATUS Success(UPnP *upnp, UPnPDevice *device, UPnPLogic *logic, UINT16 internal_port, UINT16 external_port);
+		OP_STATUS ArePortsAcceptable(UPnP *upnp, UPnPDevice *device, UPnPLogic *logic, UINT16 internal_port, UINT16 external_port, BOOL &ports_acceptable) { ports_acceptable=TRUE; return OpStatus::OK; };
+		OP_STATUS PortsRefused(UPnP *upnp, UPnPDevice *device, UPnPLogic *logic, UINT16 internal_port, UINT16 external_port) { return OpStatus::OK; };
+		OP_STATUS PortClosed(UPnP *upnp, UPnPDevice *device, UPnPLogic *logic, UINT16 port, BOOL success) { return OpStatus::OK; }
+		
+		void SetReverse(BOOL b) { reverse=b; }
+    };
+    
+    class UDPReceiver: public OpUdpSocketListener
+    {
+		TimeOutObj *time;
+		OpString8 exp;
+		int num_times; // Number of times that the message has to be received
+		int num_received; // Number of times that has been received a correct message
+		int total_received; // Number of times that has been received a message
+		OpUdpSocket *socket2; // Socket used to send the answer back
+		
+	public:
+		UDPReceiver(const char *expected, TimeOutObj *timeout, OpUdpSocket *sk2) { SetExpected(expected, 1); time=timeout; socket2=sk2; }
+		~UDPReceiver() { OP_DELETE(time); }
+		
+		void SetTimeOut(TimeOutObj *timeout) { OP_DELETE(time); time=timeout; }
+		OP_STATUS SetExpected(const char *expected, int times) { OP_ASSERT(times>=1 && times<=3); num_times=times; num_received=0; total_received=0; return exp.Set(expected); }
+		virtual void OnSocketDataReady(OpUdpSocket* socket)
+		{
+			char buf[100]; /* ARRAY OK 2009-06-09 lucav */
+			OpSocketAddress *addr=NULL;  // Temporary socket address
+			UINT len;
+			OP_NETWORK_STATUS ons;
+			
+			total_received++;
+			
+			if(OpStatus::IsError(OpSocketAddress::Create(&addr)))
+			{
+				ST_failed("Socket address creation error");
+				OP_DELETE(addr);
+			
+				return;	
+			}
+			
+			if(OpStatus::IsError(ons=socket->Receive((void *)buf, 100, addr, &len)))
+			{
+				ST_failed("Error %d on UDP receive from port %d", (int)ons, (addr)?addr->Port():-1);
+				OP_DELETE(addr);
+				
+				return;
+			}
+				
+			if(len==0)
+			{
+				output("Skipping a 0 bytes message!\n");
+				OP_DELETE(addr);
+				
+				return;
+			}
+			buf[len < 100 ? len : 99] = '\0';
+				
+			if((UINT)len!=(UINT)exp.Length() || exp.Compare(buf))
+			{
+				ST_failed("UDP message %d is %s instead of %s", total_received, buf, exp.CStr());
+				OP_DELETE(addr);
+				
+				return;
+			}
+			else
+			{
+				OpString addr_str;
+				OpString8 addr_str8;
+				
+				addr->ToString(&addr_str);
+				addr_str8.Set(addr_str.CStr());
+				
+				output("Message %d - '%s' received from %s:%d\n", total_received, buf, addr_str8.CStr(), addr->Port());
+				
+				num_received++;
+				
+				if(num_received==num_times)
+				{
+					ST_passed();
+					OP_DELETE(time);
+					time=NULL;
+				}
+				else
+				{
+					if(socket2)
+					{
+						OP_ASSERT(num_times==3 && num_received<3);
+						
+						if(num_received==1)
+							socket->Send(buf, len, addr); // Resend the message, first time from the first socket
+						else
+							socket2->Send(buf, len, addr); // Resend the message from the second socket
+					}
+					else
+						socket->Send(buf, len, addr); // Resend the message
+				}
+			}
+				
+			OP_DELETE(addr);
+		}
+    };
+
+    OP_STATUS UPnPListenerTest::Failure(UPnP *upnp, UPnPDevice *device, UPnPLogic *logic)
+    {
+		OP_DELETE(time);
+		time=NULL;
+		
+		if(reverse)
+		{
+			output("Failing as planned.\n");
+			
+			ST_passed();
+			return OpStatus::OK;
+		}
+		
+    #ifdef UPNP_LOG
+    	if(upnp && device)
+    		upnp->Log(UNI_L("UPnPListenerTest::Failure()"), UNI_L("Router %s - Manufacturer: %s, Model name: %s, Model Number: %s"), device->GetCurrentDescriptionURL()->CStr(), device->GetManufacturer()->CStr(), device->GetModelName()->CStr(), device->GetModelNumber()->CStr());
+    #endif
+    		
+		OpString8 ops;
+		
+		ops.Set("No ports to open");
+		if(logic->GetLastError())
+		{
+			ops.Append(" - ");
+			ops.Append(logic->GetLastError());
+		}
+		ST_failed(ops.CStr());
+    	
+    	return OpStatus::OK;
+    }
+
+    OP_STATUS UPnPListenerTest::Success(UPnP *upnp, UPnPDevice *device, UPnPLogic *logic, UINT16 internal_port, UINT16 external_port)
+    {
+		OP_DELETE(time);
+		time=NULL;
+		
+		if(reverse)
+		{
+			ST_failed("NOT Failing as planned...");
+			
+			return OpStatus::OK;
+		}
+		
+		if(!device)
+		{
+			ST_failed("NULL Device");
+			
+			return OpStatus::ERR_NULL_POINTER;
+		}
+		
+	#ifdef UPNP_LOG
+    	if(upnp && device)
+    		upnp->Log(UNI_L("UPnPListenerTest::Success()"), UNI_L("Router %s - Manufacturer: %s, Model name: %s, Model Number: %s"), device->GetCurrentDescriptionURL()->CStr(), device->GetManufacturer()->CStr(), device->GetModelName()->CStr(), device->GetModelNumber()->CStr());
+    #endif
+    		
+    	OpString8 str;
+    	OpString8 str1;
+    	
+    	str.Append("\nFound device ");
+    	str1.Set(device->GetManufacturer()->CStr());
+    	str.Append(str1);
+    	str.Append(" - ");
+    	str1.Set(device->GetModelName()->CStr());
+    	str.Append(str1);
+    	str.Append("\n");
+    		
+    	output(str.CStr());
+    	output("Ports opened: %d / %d\n", internal_port, external_port);
+    	
+    	ST_passed();
+    	
+    	return OpStatus::OK;
+    }
+    
+#ifdef UPNP_ANTI_SPOOF
+    // The address is NOT supposed to be spoofed
+    class UPnPSpoofBase: public SpoofListener
+    {
+    protected:
+		UPnP *upnp;
+		OpHostResolver *ohr_spoof;	///< Host resolver used for the anti spoofing
+		
+	public:
+		UPnPSpoofBase(UPnP *ptr, OpSocketAddress *addr)
+		{
+			upnp=ptr;
+			UPnPSpoofCheckOHRListener *spoof_listener=OP_NEW(UPnPSpoofCheckOHRListener, ());
+				
+			if(spoof_listener)
+			{
+				spoof_listener->SetData(this, addr);
+				upnp_spoof_lsn=spoof_listener;
+			}
+			SocketWrapper::CreateHostResolver(&ohr_spoof, upnp_spoof_lsn);
+		} 
+		virtual ~UPnPSpoofBase() { OP_DELETE(ohr_spoof); }
+		virtual OpHostResolver *GetSpoofResolver() { return ohr_spoof; }
+    };
+    
+    class UPnPSpoofIsWrong: public UPnPSpoofBase
+	{
+	public:
+		UPnPSpoofIsWrong(UPnP *ptr, OpSocketAddress *addr): UPnPSpoofBase(ptr, addr) { }
+		
+		void OnAddressSpoofed() { ST_failed("Address spoofed!"); OP_DELETE(upnp); upnp = NULL; OP_DELETE(this); }
+		virtual void OnAddressLegit(OpSocketAddress *legit_address) { ST_passed();  OP_DELETE(upnp); upnp = NULL; OP_DELETE(this); };
+		void OnError(OP_STATUS error) { ST_failed("Error, probably during host resolving"); }
+	};
+	
+	// The address IS supposed to be spoofed
+    class UPnPSpoofIsRight: public UPnPSpoofBase
+	{
+	public:
+		UPnPSpoofIsRight(UPnP *ptr, OpSocketAddress *addr): UPnPSpoofBase(ptr, addr) { }
+		
+		void OnAddressSpoofed() { ST_passed(); OP_DELETE(upnp); upnp = NULL; OP_DELETE(this); }
+		virtual void OnAddressLegit(OpSocketAddress *legit_address) { ST_failed("Address NOT spoofed!"); OP_DELETE(upnp); upnp = NULL; OP_DELETE(this);  };
+		void OnError(OP_STATUS error) { ST_failed("Error, probably during host resolving"); }
+	};
+#endif
+
+	void TestSpoof(const char *router_url, const char* router_ip, BOOL spoof_required)
+	{
+		OpString str;
+	
+		str.Set(router_ip);
+		TestSpoof(router_url, str.CStr(), spoof_required);
+	}
+	
+	void TestSpoof(const char *router_url, const uni_char* router_ip, BOOL spoof_required)
+	{
+	#ifdef UPNP_ANTI_SPOOF
+		OpSocketAddress *sock;
+	
+		if(!OpStatus::IsSuccess(OpSocketAddress::Create(&sock)))
+		{
+			ST_failed("SocketAddress not created");
+			
+			return;
+		}
+		if(!router_ip || !OpStatus::IsSuccess(sock->FromString(router_ip)))
+		{
+			OP_DELETE(sock);
+			ST_failed("Address not set");
+			
+			return;
+		}
+		
+		UPnP *upnp=OP_NEW(UPnP, (FALSE));
+		SpoofListener *listener=(spoof_required)?(SpoofListener *)OP_NEW(UPnPSpoofIsRight, (upnp, sock)):(SpoofListener *)OP_NEW(UPnPSpoofIsWrong, (upnp, sock));
+		
+		if(!OpStatus::IsSuccess(upnp->CheckIfAddressIsSpoofed(router_url, sock, listener)))
+		{
+			OP_DELETE(sock);
+			OP_DELETE(listener);
+			OP_DELETE(upnp);
+			upnp = NULL;
+			ST_failed("Error during spoofing check");
+			
+			return;
+		}
+		
+		OP_DELETE(sock);
+	#endif
+	}
+	
+	class TestResolver: public OpHostResolverListener
+	{
+		OpSocketAddress *osa;
+		OpString8 *host_address;
+		
+	public:
+		TestResolver(OpSocketAddress *addr, OpString8 *host) { osa=addr; host_address=host; }
+		
+		virtual void OnHostResolved(OpHostResolver* host_resolver)
+		{
+			OpString8 str8;
+			OpString str;
+			
+			for(UINT32 i=0; i<host_resolver->GetAddressCount(); i++)
+			{
+				host_resolver->GetAddress(osa, i);
+				
+				osa->ToString(&str);
+				str8.Set(str.CStr());
+				
+				if(str[0]=='0' && str[1]=='.')
+					continue;
+				if(str.Compare("127.0.0.1"))
+					break;
+			}
+			
+			host_address->Set(str.CStr());
+			
+			if(!host_address->Compare("127.0.0.1"))
+				ST_failed("127.0.0.1 name is not acceptable!");
+	
+			if(!host_address->Compare("::1"))
+				ST_failed("::1 name is not acceptable!");
+		
+			output("LocalHost address: ");
+			output(str8.CStr());
+			output("\n");
+			ST_passed();
+		}
+		
+		virtual void OnHostResolverError(OpHostResolver* host_resolver, OpHostResolver::Error error)
+		{
+			ST_failed("Host Resolution error");
+		}
+	};
+	
+#ifdef UPNP_SERVICE_DISCOVERY
+	class MSearchTest: public UPnPServicesProvider
+	{
+	public:
+		virtual void OnSearchRequestAccepted(OpStringC8 search_target, OpSocketAddress *addr) { ST_passed(); }
+		virtual UINT32 GetNumberOfServices() { return 0; }
+		virtual OP_STATUS RetrieveService(int index, UPnPService *&service) { return OpStatus::OK; }
+		virtual const char* GetDeviceTypeString() { return UPNP_DISCOVERY_OPERA_SEARCH_TYPE; }
+
+		MSearchTest():UPnPServicesProvider(0) {}
+		OP_STATUS Construct()
+		{
+			RETURN_IF_ERROR(UPnPServicesProvider::Construct());
+			
+			RETURN_IF_ERROR(SetAttributeValue(DEVICE_TYPE, GetDeviceTypeString()));
+			RETURN_IF_ERROR(SetAttributeName(FRIENDLY_NAME, "Opera Unite Selftest"));
+			RETURN_IF_ERROR(SetAttributeName(MANUFACTURER, "Opera Software ASA"));
+			RETURN_IF_ERROR(SetAttributeName(MANUFACTURER_URL, "http://www.opera.com"));
+			RETURN_IF_ERROR(SetAttributeName(MODEL_DESCRIPTION, ""));
+			RETURN_IF_ERROR(SetAttributeName(MODEL_NAME, "Opera Unite Selftest"));
+			RETURN_IF_ERROR(SetAttributeName(UDN, "unite-selftest"));
+			
+			return OpStatus::OK;
+		}
+	};
+
+#endif
+
+	OP_STATUS GetDeviceList(UPnP *upnp, OpString8 &dev_desc8, const uni_char* type)
+	{
+		OpString dev_desc;
+		dev_desc.AppendFormat(UNI_L("\nDevices detected: %d\n"), upnp->GetNumberOfDevices());
+		int num=0;
+		
+		for(UINT32 i=0; i<upnp->GetNumberOfDevices(); i++)
+		{
+			UPnPDevice *dev=upnp->GetDevice(i);
+			UPnPServicesProvider *prov=dev->GetProvider();
+			
+			if(prov && (!type || (prov->GetDeviceType() && !uni_strcmp(type, prov->GetDeviceType()))))
+			{
+				num++;
+				OpString trust;
+				
+				if(dev->GetTrust()==TRUST_ERROR)
+					RETURN_IF_ERROR(trust.Set("SPOOFED"));
+				else if(dev->GetTrust()==TRUST_UNTRUSTED)
+					RETURN_IF_ERROR(trust.Set("UNTRUSTED"));
+				else if(dev->GetTrust()==TRUST_UNKNOWN)
+					RETURN_IF_ERROR(trust.Set("UNKNOWN"));
+				else if(dev->GetTrust()==TRUST_PRIVATE_KEY)
+					RETURN_IF_ERROR(trust.Set("PRIVATE_KEY"));
+				else if(dev->GetTrust()==TRUST_CERTIFICATE)
+					RETURN_IF_ERROR(trust.Set("CERTIFICATE"));
+				else
+					RETURN_IF_ERROR(trust.Set("??? TRUST ???"));
+					
+				RETURN_IF_ERROR(dev_desc.AppendFormat(UNI_L("\n*** DEVICE %d [%d]) is %s[%s] - Type: %s***\n"), i, num, dev->GetUSN()->CStr(), trust.CStr(), type));
+				
+				for(int j=0; j<prov->GetAttributesCount(); j++)
+				{
+					NameValue *nv=prov->GetAttribute(j);
+					
+					if(nv)
+						RETURN_IF_ERROR(dev_desc.AppendFormat(UNI_L("   %s: %s\n"), nv->GetName().CStr(), nv->GetValue().CStr()));
+				}
+				
+				RETURN_IF_ERROR(dev_desc.AppendFormat(UNI_L("   * %d Services:\n"), prov->GetNumberOfServices()));
+				
+				
+				for(UINT32 k=0; k<prov->GetNumberOfServices(); k++)
+				{
+					UPnPService *srv;
+					
+					if(OpStatus::IsSuccess(prov->RetrieveService(k, srv)))
+					{
+						NameValue *nv_type=srv->GetAttribute(UPnPService::SERVICE_TYPE);
+						NameValue *nv_url=srv->GetAttribute(UPnPService::CONTROL_URL);
+						
+						RETURN_IF_ERROR(dev_desc.AppendFormat(UNI_L("      %s:%s\n"), nv_type?nv_type->GetValue().CStr():UNI_L(""), nv_url?nv_url->GetValue().CStr():UNI_L("")));
+					}
+				}
+			}
+			else
+			{
+				RETURN_IF_ERROR(dev_desc.AppendFormat(UNI_L("\n*** DEVICE %d SKIPPED - prov: %s - type: %s != %s***\n"), i, prov?UNI_L("yes"):UNI_L("no"), type, (prov)?prov->GetDeviceType():NULL));
+			}
+		}
+		return dev_desc8.Set(dev_desc.CStr());
+	}
+	
+	/// Mock NetworkCard, used to test a crash
+	class MockNetworkCard: public NetworkCard
+	{
+	public:
+		MockNetworkCard()
+		{
+			SocketWrapper::CreateUDPSocket(&socket_uni, NULL, SocketWrapper::NO_WRAPPERS, NULL);
+			OpSocketAddress::Create(&address);
+			
+			socket_multi=socket_uni;
+		}
+		~MockNetworkCard() { socket_multi=NULL; }
+	};
+	
+	class MockUPnPXH_Auto: public UPnPXH_Auto
+	{
+	public:
+		virtual const uni_char *GetActionName() { return UNI_L("Mock Test"); }
+		virtual const char* GetDescription() { return "Mock Test"; }
+	};
+
+	UPnP *prior_upnp = NULL; // Save what g_upnp used to be, to restore at end.
+	UPnP *upnp=NULL;
+	UPnPPortOpening *port_cp=NULL;
+	CPAcceptAll *all_cp=NULL;
+	UPnPListenerTest *listener=NULL;
+    TestAcceptNumber *refuse_all=NULL;
+    TestAcceptNumber *accept_third=NULL;
+    TestResolver *ohr_listener=NULL;
+    OpHostResolver *ohr=NULL;
+    OpSocketAddress *osa=NULL;
+    OpString host;
+    OpString8 *host_address=NULL;
+#ifndef PI_NETWORK_INTERFACE_MANAGER
+	OpString8 *host_name;
+#endif
+	OpUdpSocket *srv_sk=NULL;
+	OpUdpSocket *srv_sk2=NULL;
+	OpUdpSocket *cli_sk=NULL;
+	OpUdpSocket *pi_socket1=NULL;
+	OpUdpSocket *pi_socket2=NULL;
+	OpSocketAddress *addr_1901=NULL;
+	OpSocketAddress *addr_32701=NULL;
+	OpSocketAddress *addr_1902=NULL;
+	OpSocketAddress *addr_auto=NULL;
+	OpSocketAddress *addr_multicast=NULL;
+	OpSocketAddress *pi_datagram_address=NULL;
+	OpSocketAddress *pi_bind_address=NULL;
+	UDPReceiver *rcv1=NULL;
+
+#ifdef UPNP_SERVICE_DISCOVERY
+	MSearchTest *msrc=NULL;
+#endif
+#ifdef PI_NETWORK_INTERFACE_MANAGER
+	OpNetworkInterfaceManager *nic_man;
+#endif
+
+	OP_STATUS SetupSockets(const char *mex, int num_times, BOOL multicast, BOOL two_sockets)
+	{
+		OpString host16;
+	
+		host16.Set(host_address->CStr());
+		
+		OP_DELETE(cli_sk);
+		OP_DELETE(srv_sk);
+		OP_DELETE(srv_sk2);
+		OP_DELETE(addr_1901);
+		OP_DELETE(addr_1902);
+		OP_DELETE(addr_32701);
+		OP_DELETE(addr_auto);
+		OP_DELETE(addr_multicast);
+		OP_DELETE(pi_socket1);
+		OP_DELETE(pi_socket2);
+		OP_DELETE(pi_datagram_address);
+		OP_DELETE(pi_bind_address);
+		OP_DELETE(rcv1);
+		
+		cli_sk=NULL;
+		srv_sk=NULL;
+		srv_sk2=NULL;
+		pi_socket1=NULL;
+		pi_socket2=NULL;
+		addr_1901=NULL;
+		addr_1902=NULL;
+		addr_32701=NULL;
+		addr_auto=NULL;
+		addr_multicast=NULL;
+		pi_datagram_address=NULL;
+		pi_bind_address=NULL;
+		
+		rcv1=OP_NEW(UDPReceiver, (mex, NULL, (two_sockets)?srv_sk2:NULL));
+		
+		if(	rcv1 && !host16.IsEmpty() &&
+			OpStatus::IsSuccess(SocketWrapper::CreateUDPSocket(&srv_sk2, rcv1, SocketWrapper::NO_WRAPPERS)) &&
+			OpStatus::IsSuccess(OpSocketAddress::Create(&addr_1901)) &&
+			OpStatus::IsSuccess(addr_1901->FromString(host16.CStr())) &&
+			OpStatus::IsSuccess(OpSocketAddress::Create(&addr_1902)) &&
+			OpStatus::IsSuccess(addr_1902->FromString(host16.CStr())) &&
+			OpStatus::IsSuccess(OpSocketAddress::Create(&addr_32701)) &&
+			OpStatus::IsSuccess(addr_32701->FromString(host16.CStr())) &&
+			OpStatus::IsSuccess(OpSocketAddress::Create(&addr_multicast)) &&
+			OpStatus::IsSuccess(addr_multicast->FromString(UNI_L("224.1.1.1"))) &&
+			OpStatus::IsSuccess(OpSocketAddress::Create(&addr_auto)) &&
+			OpStatus::IsSuccess(addr_auto->FromString(host16.CStr())))
+		{
+			addr_1901->SetPort(1901);
+			addr_1902->SetPort(1902);
+			addr_32701->SetPort(32701);
+			addr_auto->SetPort(0);
+			addr_multicast->SetPort(0x4f72);
+			
+			if(rcv1 && OpStatus::IsSuccess(SocketWrapper::CreateUDPSocket(&srv_sk, rcv1, SocketWrapper::NO_WRAPPERS, (multicast)?addr_1901:NULL)))
+			{
+				rcv1->SetTimeOut(OP_NEW(TimeOutObj, (3000)));
+				rcv1->SetExpected(mex, num_times);
+		
+				OP_STATUS ops;
+				
+				if(multicast)
+					ops=srv_sk->Bind(addr_multicast, OpUdpSocket::MULTICAST);
+				else
+					ops=srv_sk->Bind(addr_32701);
+					
+				if(OpStatus::IsSuccess(ops))
+				{
+					//output("Server socket bound to port %d\n", 32701);
+					if(OpStatus::IsSuccess(SocketWrapper::CreateUDPSocket(&cli_sk, rcv1, SocketWrapper::NO_WRAPPERS)))
+					{
+						//output("Client Socket creates\n");
+						
+						return OpStatus::OK;
+					}
+					else
+						ST_failed("Error on UDP client socket create");
+				}
+				else
+					ST_failed("Error on Bind()");
+			}
+			else
+				ST_failed("Error on UDP server socket create");
+		}
+		else
+			ST_failed("Error on UDP socket address create");
+			
+		return OpStatus::ERR;
+	}
+}
+
+setup
+{
+	// Temporarily replace g_upnp, to avoid dependencies with other tests
+	prior_upnp = g_upnp;
+	upnp = g_upnp = OP_NEW(UPnP, (TRUE));
+
+#ifdef PI_NETWORK_INTERFACE_MANAGER
+	nic_man=NULL;
+	OpNetworkInterfaceManager::Create(&nic_man, NULL);
+#else
+	host_name=OP_NEW(OpString8, ());
+#endif
+	listener=OP_NEW(UPnPListenerTest, (NULL));
+	refuse_all=OP_NEW(TestAcceptNumber, (0));
+	accept_third=OP_NEW(TestAcceptNumber, (17000+2));
+	host_address=OP_NEW(OpString8, ());
+
+#ifdef UPNP_SERVICE_DISCOVERY
+	msrc=OP_NEW(MSearchTest, ());
+#endif
+
+	srv_sk=NULL;
+	srv_sk2=NULL;
+	cli_sk=NULL;
+	pi_socket1=NULL;
+	pi_socket2=NULL;
+	addr_1901=NULL;
+	addr_1902=NULL;
+	addr_32701=NULL;
+	addr_auto=NULL;
+	rcv1=NULL;
+	addr_multicast=NULL;
+	pi_datagram_address=NULL;
+	pi_bind_address=NULL;
+}
+
+exit
+{
+	if (port_cp)
+		port_cp->RemoveListener(listener);
+#ifdef PI_NETWORK_INTERFACE_MANAGER
+	OP_DELETE(nic_man);
+#endif
+#ifdef WEBSERVER_SUPPORT
+	g_dragonflywebserver->Stop();
+#endif //WEBSERVER_SUPPORT
+#ifdef UPNP_SERVICE_DISCOVERY
+	upnp->RemoveServicesProvider(msrc);
+#endif
+	
+	OP_DELETE(listener);
+	OP_DELETE(refuse_all);
+	if (port_cp)
+		OpStatus::Ignore(port_cp->RemoveListener(accept_third));
+	OP_DELETE(port_cp);
+	OP_DELETE(accept_third);
+	OP_DELETE(ohr);
+	OP_DELETE(osa);
+	OP_DELETE(host_address);
+
+#ifndef PI_NETWORK_INTERFACE_MANAGER
+	OP_DELETE(host_name);
+#endif
+	OP_DELETE(upnp);
+	g_upnp = prior_upnp;
+	OP_DELETE(ohr_listener);
+	
+	OP_DELETE(srv_sk);
+	OP_DELETE(srv_sk2);
+	OP_DELETE(cli_sk);
+	OP_DELETE(pi_socket1);
+	OP_DELETE(pi_socket2);
+	OP_DELETE(addr_1901);
+	OP_DELETE(addr_1902);
+	OP_DELETE(addr_32701);
+	OP_DELETE(addr_auto);
+	OP_DELETE(addr_multicast);
+	OP_DELETE(rcv1);
+	OP_DELETE(pi_datagram_address);
+	OP_DELETE(pi_bind_address);
+	
+#ifdef UPNP_SERVICE_DISCOVERY
+	OP_DELETE(msrc);
+#endif
+}
+
+test("Check APIs")
+{
+	#ifdef PI_NETWORK_INTERFACE_MANAGER
+		output("PI_NETWORK_INTERFACE_MANAGER is defined!\n");
+	#else
+		output("PI_NETWORK_INTERFACE_MANAGER is OFF!\n");
+	#endif
+	
+	#ifdef API_PI_NETWORK_INTERFACE_MANAGER
+		output("API_PI_NETWORK_INTERFACE_MANAGER is defined!\n");
+	#else
+		output("API_PI_NETWORK_INTERFACE_MANAGER is OFF!\n");
+	#endif
+	
+		output("PI_CAP_OPSOCKETADDRESS_NETTYPE is defined!\n");
+}
+
+test("Get IP") async;
+{
+	if(!upnp)
+	{
+		ST_failed("No UPNP object!");
+		return 0;
+	}
+	
+	if(OpStatus::IsError(OpSocketAddress::Create(&osa)))
+	{
+		ST_failed("No Socket Address created: OOM?");
+		return 0;
+	}
+	ohr_listener=OP_NEW(TestResolver, (osa, host_address));
+	if(!ohr_listener)
+	{
+		ST_failed("OOM");
+		return 0;
+	}
+	if(OpStatus::IsError(SocketWrapper::CreateHostResolver(&ohr, ohr_listener)))
+	{
+		ST_failed("No Host Resolver");
+		return 0;
+	}
+		
+	OpString8 host8;
+	
+#ifdef PI_NETWORK_INTERFACE_MANAGER
+		BOOL ok=FALSE;
+		OpString addr16;
+		
+		if(OpStatus::IsSuccess(nic_man->BeginEnumeration()))
+		{
+			while (OpNetworkInterface *nic = nic_man->GetNextInterface())
+			{
+				if (OpStatus::IsSuccess(nic->GetAddress(osa)))
+				{
+					addr16.Empty();
+					if (OpStatus::IsSuccess(osa->ToString(&addr16)))
+					{
+						if (!addr16.IsEmpty() && addr16.Compare("127.0.0.1") != 0)
+						{
+							ok = TRUE;
+						}
+					}
+				}
+				if (ok)
+					break;
+			}
+		}
+
+		nic_man->EndEnumeration();
+
+		host_address->Set(addr16);
+		if(ok)
+			ST_passed();
+		else
+		{
+			ST_failed("Impossible to the the IP from ");
+			return 0;
+		}
+#else
+	OpHostResolver::Error err;
+	if(OpStatus::IsError(ohr->GetLocalHostName(&host, &err)))
+	{
+		ST_failed("GetLocalname() error");
+		return 0;
+	}
+		
+	host8.Set(host.CStr());
+	host_name->Set(host.CStr());
+	output("Local host name: %s\n", host8.CStr());
+	
+	if(host.IsEmpty())
+	{
+		ST_failed("No host name!");
+		return 0;
+	}
+		
+	if(!host.CompareI(UNI_L("localhost")))
+	{
+		ST_failed("LocalHost name is not acceptable!");
+		return 0;
+	}
+		
+	if(!UPnP::IsIPSuitable(&host))
+	{
+		ST_failed("%s name is not acceptable!", host.CStr());
+		return 0;
+	}
+	
+	if(host.IsEmpty() || OpStatus::IsError(ohr->Resolve(host.CStr())))
+	{
+		ST_failed("No Host Resolution");
+		return 0;
+	}
+#endif
+}
+
+test("False Start UPnP Service discovery")
+require UPNP_SERVICE_DISCOVERY;
+{
+	verify(!g_upnp->IsDiscoveryStarted());
+	verify(!g_upnp->IsPortBound());
+	g_upnp->StartUPnPDiscovery();
+	verify(!g_upnp->IsDiscoveryStarted());
+	verify(!g_upnp->IsPortBound());
+}
+
+// Give time to the UPnP process to start
+test("wait a bit")
+	async;
+	language ecmascript;
+{
+	setTimeout("ST_passed()", 2000);
+}
+
+test("Retest bounding")
+{
+	verify(!g_upnp->IsPortBound());
+	verify(!g_upnp->IsDiscoveryStarted());
+}
+
+test("Proper UPnP setup")
+{
+	UPnP::CreatePortOpeningObject(upnp, port_cp, 17000, 17010);
+	verify(port_cp);
+	if(!OpStatus::IsSuccess(port_cp->AddListener(listener)))
+		ST_failed("Impossible to add a listener!");
+		
+	if(!OpStatus::IsSuccess(port_cp->AddListener(accept_third)))
+		ST_failed("Impossible to add a listener!");
+	all_cp=OP_NEW(CPAcceptAll, (upnp));
+	
+	upnp->AddLogic(all_cp);
+}
+
+test("TRUE Start UPnP Service discovery")
+require UPNP_SERVICE_DISCOVERY;
+{
+	g_upnp->StartUPnPDiscovery();
+	verify(g_upnp->IsDiscoveryStarted());
+	
+	// Nothing can be said about bounding
+}
+
+// Give time to the UPnP process to start
+test("wait a bit more")
+	async;
+	language ecmascript;
+{
+	setTimeout("ST_passed()", 2000);
+}
+
+test("Retest bounding again")
+{
+	verify(g_upnp->IsPortBound());
+	verify(g_upnp->IsDiscoveryStarted());
+}
+
+test("IsIPSuitable")
+{
+	// Test loopback IPv4
+	OpString loop4_1;
+	OpString loop4_2;
+	OpString loop4_3;
+	
+	loop4_1.Set("127.0.0.1");
+	loop4_2.Set("127.0.0.2");
+	loop4_3.Set("127.240.0.2");
+	
+	// Test loopback IPv6
+	OpString loop6_1;
+	OpString loop6_2;
+	
+	loop6_1.Set("::1");
+	loop6_2.Set("0:0:0:0:0:0:0:1");
+	
+	// Strange IPv4 addresses
+	OpString zero4;
+	
+	zero4.Set("0.1.2.3");
+	
+	// Generic IPv4
+	OpString legit4;
+	
+	legit4.Set("10.20.30.40");
+	
+	// Generic IPv6
+	OpString legit6;
+	
+	legit6.Set("2:3:4:5:6:7:8:9");
+	
+	verify(!UPnP::IsIPSuitable(&loop4_1));
+	verify(!UPnP::IsIPSuitable(&loop4_2));
+	verify(!UPnP::IsIPSuitable(&loop4_3));
+	
+	verify(!UPnP::IsIPSuitable(&loop6_1));
+	verify(!UPnP::IsIPSuitable(&loop6_2));
+	
+	verify(!UPnP::IsIPSuitable(&zero4));
+	
+	verify(UPnP::IsIPSuitable(&legit4));
+	
+	verify(!UPnP::IsIPSuitable(&legit6));
+}
+
+test("anti spoofing 1") async; require UPNP_ANTI_SPOOF;
+{
+	TestSpoof("http://127.0.0.1", UNI_L("127.0.0.1"), FALSE);
+}
+
+test("anti spoofing 2") async; require UPNP_ANTI_SPOOF;
+{
+	TestSpoof("http://127.0.0.1/test/upnp/spoofing", UNI_L("127.0.0.1"), FALSE);
+}
+
+test("anti spoofing 3") async; require UPNP_ANTI_SPOOF;
+require success "Get IP";
+{
+	TestSpoof("http://127.0.0.2", UNI_L("127.0.0.1"), TRUE);
+}
+
+test("anti spoofing 4") async; require UPNP_ANTI_SPOOF;
+{
+	TestSpoof("http://localhost/test/upnp/spoofing", UNI_L("127.0.0.1"), FALSE);
+}
+
+test("anti spoofing 5") async; require UPNP_ANTI_SPOOF;
+{
+	output("\nThis test could fail if the IP address of opera.com changes... it has already happened...\n");
+	TestSpoof("http://www.opera.com", UNI_L("195.189.143.147"), FALSE);
+}
+
+test("anti spoofing 6") async; require UPNP_ANTI_SPOOF;
+{
+	TestSpoof("http://www.opera.com", UNI_L("195.189.143.134"), TRUE);
+}
+
+test("anti spoofing 7") async; require UPNP_ANTI_SPOOF;
+require success "Get IP";
+{
+	OpString8 str;
+	
+	str.AppendFormat("http://%s/test", host_address->CStr());
+	
+	TestSpoof(str.CStr(), host_address->CStr(), FALSE);
+}
+
+test("anti spoofing 8") async; require UPNP_ANTI_SPOOF;
+require undefined PI_NETWORK_INTERFACE_MANAGER;
+require success "Get IP";
+{
+	OpString8 str;
+	
+	str.AppendFormat("http://%s/test", host_name->CStr());
+	
+	TestSpoof(str.CStr(), host_address->CStr(), FALSE);
+}
+
+test("anti spoofing 9") async; require UPNP_ANTI_SPOOF;
+require success "Get IP";
+{
+	OpString8 str;
+	
+	str.AppendFormat("http://%s/test", host_address->CStr());
+	
+	TestSpoof(str.CStr(), "127.0.0.1", TRUE);
+}
+
+test("anti spoofing 10") async; require UPNP_ANTI_SPOOF;
+require undefined PI_NETWORK_INTERFACE_MANAGER;
+require success "Get IP";
+{
+	OpString8 str;
+	
+	str.AppendFormat("http://%s/test", host_name->CStr());
+	
+	TestSpoof(str.CStr(), "127.0.0.1", TRUE);
+}
+
+test("Obj Single-User Single References test")
+disabled;
+{
+	char *buf_single=OP_NEWA(char, (100));
+	ReferenceObject<char> *obj_single=OP_NEW(ReferenceObjectSingle<char>, (buf_single));
+	ReferenceUserSingle<char> *user_single=OP_NEW(ReferenceUserSingle<char>, (FALSE, FALSE));
+	
+	verify(user_single->FindReference(obj_single)<0);
+	verify(!user_single->GetPointer());
+	verify(!user_single->HasPointerEverBeenSet());
+	
+	// Add obj_single
+	verify(!obj_single->FindReferenceUser(user_single));
+	user_single->AddReference(obj_single);
+	verify(obj_single->FindReferenceUser(user_single));
+	verify(user_single->FindReference(obj_single)==0);
+	verify(user_single->GetPointer());
+	verify(user_single->HasPointerEverBeenSet());
+	
+	// Delete the object ==> remove the reference
+	OP_DELETE(obj_single);
+	verify(user_single->FindReference(obj_single)<0);
+	verify(!user_single->GetPointer());
+	verify(user_single->HasPointerEverBeenSet());
+	
+	// Add obj_single
+	obj_single=OP_NEW(ReferenceObjectSingle<char>, (buf_single));
+	
+	verify(!obj_single->FindReferenceUser(user_single));
+	user_single->AddReference(obj_single);
+	verify(obj_single->FindReferenceUser(user_single));
+	verify(user_single->FindReference(obj_single)==0);
+	
+	// Delete the user ==> remove the referencies
+	OP_DELETE(user_single);
+	
+	verify(!obj_single->FindReferenceUser(user_single));
+	
+	// New list
+	user_single=OP_NEW(ReferenceUserSingle<char>, (TRUE, TRUE));
+	
+	// Add obj_single
+	verify(!obj_single->FindReferenceUser(user_single));
+	user_single->AddReference(obj_single);
+	verify(obj_single->FindReferenceUser(user_single));
+	verify(user_single->FindReference(obj_single)==0);
+	
+	// Delete the list ==> remove the referencies
+	OP_DELETE(user_single);
+	
+	// The mem leak check will ensure that the objects and the pointers have been deleted
+}
+
+test("Obj List-User Single References test")
+disabled;
+{
+	char *buf_single=OP_NEWA(char, (100));
+	ReferenceObject<char> *obj_list=OP_NEW(ReferenceObjectList<char>, (buf_single));
+	ReferenceUserSingle<char> *user_single=OP_NEW(ReferenceUserSingle<char>, (FALSE, FALSE));
+	ReferenceUserSingle<char> *user_single2=OP_NEW(ReferenceUserSingle<char>, (FALSE, FALSE));
+	ReferenceUserSingle<char> *user_single3=OP_NEW(ReferenceUserSingle<char>, (FALSE, FALSE));
+	
+	verify(user_single->FindReference(obj_list)<0);
+	verify(user_single2->FindReference(obj_list)<0);
+	verify(user_single3->FindReference(obj_list)<0);
+	
+	// Add obj_list to user 1
+	verify(!obj_list->FindReferenceUser(user_single));
+	user_single->AddReference(obj_list);
+	verify(obj_list->FindReferenceUser(user_single));
+	verify(user_single->FindReference(obj_list)==0);
+	
+	// Add obj_list to user 2
+	verify(!obj_list->FindReferenceUser(user_single2));
+	user_single2->AddReference(obj_list);
+	verify(obj_list->FindReferenceUser(user_single2));
+	verify(user_single2->FindReference(obj_list)==0);
+	
+	// Add obj_list to user 3
+	verify(!obj_list->FindReferenceUser(user_single3));
+	user_single3->AddReference(obj_list);
+	verify(obj_list->FindReferenceUser(user_single3));
+	verify(user_single3->FindReference(obj_list)==0);
+	
+	// Delete the user ==> remove the referencies
+	OP_DELETE(user_single);
+	
+	verify(!obj_list->FindReferenceUser(user_single));
+	verify(obj_list->FindReferenceUser(user_single2));
+	verify(obj_list->FindReferenceUser(user_single3));
+	
+	// Delete the user ==> remove the referencies
+	OP_DELETE(user_single3);
+	
+	verify(!obj_list->FindReferenceUser(user_single));
+	verify(obj_list->FindReferenceUser(user_single2));
+	verify(!obj_list->FindReferenceUser(user_single3));
+	
+	// New list3
+	user_single=OP_NEW(ReferenceUserSingle<char>, (TRUE, TRUE));
+	user_single3=OP_NEW(ReferenceUserSingle<char>, (TRUE, TRUE));
+	
+	// Delete the object ==> remove the reference
+	OP_DELETE(obj_list);
+	
+	verify(user_single->FindReference(obj_list)<0);
+	verify(user_single2->FindReference(obj_list)<0);
+	verify(user_single3->FindReference(obj_list)<0);
+	
+	// Add obj_list
+	obj_list=OP_NEW(ReferenceObjectSingle<char>, (buf_single));
+	
+	verify(!obj_list->FindReferenceUser(user_single));
+	user_single->AddReference(obj_list);
+	verify(obj_list->FindReferenceUser(user_single));
+	verify(user_single->FindReference(obj_list)==0);
+	
+	// Delete the list ==> remove the referencies
+	OP_DELETE(user_single);
+	
+	// The mem leak check will ensure that the objects and the pointers have been deleted
+}
+
+test("Obj Single-User List References test")
+{
+	char *buf1=OP_NEW(char, ());
+	char *buf2=OP_NEW(char, ());
+	char *buf3=OP_NEW(char, ());
+	ReferenceObject<char> *obj1=OP_NEW(ReferenceObjectSingle<char>, (buf1));
+	ReferenceObject<char> *obj2=OP_NEW(ReferenceObjectSingle<char>, (buf2));
+	ReferenceObject<char> *obj3=OP_NEW(ReferenceObjectSingle<char>, (buf3));
+	ReferenceUserList<char> *list=OP_NEW(ReferenceUserList<char>, (FALSE, FALSE));
+	
+	verify(list->GetCount()==0);
+	verify(!list->GetPointer(0));
+	verify(!list->HasPointerEverBeenSet());
+	
+	// Add obj 1
+	verify(!obj1->FindReferenceUser(list));
+	list->AddReference(obj1);
+	verify(obj1->FindReferenceUser(list));
+	verify(list->GetCount()==1);
+	verify(list->FindReference(obj1)==0);
+	verify(list->GetPointer(0));
+	verify(list->HasPointerEverBeenSet());
+	
+	// Add obj 2
+	verify(!obj2->FindReferenceUser(list));
+	list->AddReference(obj2);
+	verify(obj2->FindReferenceUser(list));
+	verify(list->GetCount()==2);
+	verify(list->FindReference(obj2)==1);
+	
+	// Add obj 3
+	verify(!obj3->FindReferenceUser(list));
+	list->AddReference(obj3);
+	verify(obj3->FindReferenceUser(list));
+	verify(list->GetCount()==3);
+	verify(list->FindReference(obj3)==2);
+	
+	// Check pointers
+	verify(list->GetReferenceByPointer(buf1)==obj1);
+	verify(list->GetReferenceByPointer(buf2)==obj2);
+	verify(list->GetReferenceByPointer(buf3)==obj3);
+	
+	// Remove obj 3
+	verify(list->RemoveReference(obj3));
+	verify(!obj3->FindReferenceUser(list));
+	verify(list->GetCount()==2);
+	verify(list->FindReference(obj3)<0);
+	
+	// Delete the list ==> remove the referencies
+	OP_DELETE(list);
+	
+	verify(!obj1->FindReferenceUser(list));
+	verify(!obj2->FindReferenceUser(list));
+	verify(!obj3->FindReferenceUser(list));
+	
+	// New list
+	list=OP_NEW(ReferenceUserList<char>, (TRUE, TRUE));
+	verify(!list->GetPointer(0));
+	verify(!list->HasPointerEverBeenSet());
+	
+	// Add obj3
+	list->AddReference(obj3);
+	verify(obj3->FindReferenceUser(list));
+	verify(list->GetCount()==1);
+	verify(list->FindReference(obj3)==0);
+	verify(list->GetPointer(0));
+	verify(list->HasPointerEverBeenSet());
+	
+	// Delete the object ==> remove the reference
+	OP_DELETE(obj3);
+	OP_DELETE(buf3);
+	verify(!list->GetPointer(0));
+	verify(list->HasPointerEverBeenSet());
+	
+	verify(list->GetCount()==0);
+	
+	// Add obj 1
+	verify(!obj1->FindReferenceUser(list));
+	list->AddReference(obj1);
+	verify(obj1->FindReferenceUser(list));
+	verify(list->GetCount()==1);
+	verify(list->FindReference(obj1)==0);
+	
+	// Add obj 2
+	verify(!obj2->FindReferenceUser(list));
+	list->AddReference(obj2);
+	verify(obj2->FindReferenceUser(list));
+	verify(list->GetCount()==2);
+	verify(list->FindReference(obj2)==1);
+	
+	// Delete the list ==> remove the referencies
+	OP_DELETE(list);
+	
+	// The mem leak check will ensure that the objects and the pointers have been deleted
+}
+
+test("Obj List- UserList References test")
+{
+	char *buf1=OP_NEW(char, ());
+	char *buf2=OP_NEW(char, ());
+	char *buf3=OP_NEW(char, ());
+	char buf4[100]; /* ARRAY OK 2009-07-29 lucav */
+	ReferenceObject<char> *obj1=OP_NEW(ReferenceObjectList<char>, (buf1));
+	ReferenceObject<char> *obj2=OP_NEW(ReferenceObjectList<char>, (buf2));
+	ReferenceObject<char> *obj3=OP_NEW(ReferenceObjectList<char>, (buf3));
+	ReferenceUserList<char> *list=OP_NEW(ReferenceUserList<char>, (FALSE, FALSE));
+	ReferenceUserList<char> *list2=OP_NEW(ReferenceUserList<char>, (FALSE, FALSE));
+	ReferenceUserList<char> *list3=OP_NEW(ReferenceUserList<char>, (FALSE, FALSE));
+	ReferenceObjectList<char> obj_not_used(buf4);  // Used to test that the destructor works even with 0 elements
+	
+	verify(list->GetCount()==0);
+	
+	// Add obj 1
+	verify(!obj1->FindReferenceUser(list));
+	list->AddReference(obj1);
+	verify(obj1->FindReferenceUser(list));
+	verify(list->GetCount()==1);
+	verify(list->FindReference(obj1)==0);
+	
+	// Add obj 2
+	verify(!obj2->FindReferenceUser(list));
+	list->AddReference(obj2);
+	verify(obj2->FindReferenceUser(list));
+	verify(list->GetCount()==2);
+	verify(list->FindReference(obj2)==1);
+	
+	// Add obj 3
+	verify(!obj3->FindReferenceUser(list));
+	list->AddReference(obj3);
+	verify(obj3->FindReferenceUser(list));
+	verify(list->GetCount()==3);
+	verify(list->FindReference(obj3)==2);
+	
+	// Check pointers
+	verify(list->GetReferenceByPointer(buf1)==obj1);
+	verify(list->GetReferenceByPointer(buf2)==obj2);
+	verify(list->GetReferenceByPointer(buf3)==obj3);
+	
+	// Remove obj 3
+	verify(list->RemoveReference(obj3));
+	verify(!obj3->FindReferenceUser(list));
+	verify(list->GetCount()==2);
+	verify(list->FindReference(obj3)<0);
+	
+	// Delete the list ==> remove the referencies
+	OP_DELETE(list);
+	
+	verify(!obj1->FindReferenceUser(list));
+	verify(!obj2->FindReferenceUser(list));
+	verify(!obj3->FindReferenceUser(list));
+	
+	// New list
+	list=OP_NEW(ReferenceUserList<char>, (TRUE, TRUE));
+	
+	// Add obj3
+	list->AddReference(obj3);
+	verify(obj3->FindReferenceUser(list));
+	verify(list->GetCount()==1);
+	verify(list->FindReference(obj3)==0);
+	
+	// Delete the object ==> remove the reference
+	OP_DELETE(obj3);
+	OP_DELETE(buf3);
+	
+	verify(list->GetCount()==0);
+	
+	// Add obj 1
+	verify(!obj1->FindReferenceUser(list));
+	list->AddReference(obj1);
+	verify(obj1->FindReferenceUser(list));
+	verify(list->GetCount()==1);
+	verify(list->FindReference(obj1)==0);
+	
+	// Add obj 2
+	verify(!obj2->FindReferenceUser(list));
+	list->AddReference(obj2);
+	verify(obj2->FindReferenceUser(list));
+	verify(list->GetCount()==2);
+	verify(list->FindReference(obj2)==1);
+	
+	// Add two references to obj1
+	verify(obj1->FindReferenceUser(list));
+	verify(!obj1->FindReferenceUser(list2));
+	verify(!obj1->FindReferenceUser(list3));
+	list2->AddReference(obj1);
+	verify(obj1->FindReferenceUser(list2));
+	list3->AddReference(obj1);
+	verify(obj1->FindReferenceUser(list));
+	verify(obj1->FindReferenceUser(list3));
+	verify(list->GetCount()==2);
+	verify(list->FindReference(obj1)==0);
+	verify(list2->GetCount()==1);
+	verify(list2->FindReference(obj1)==0);
+	verify(list3->GetCount()==1);
+	verify(list3->FindReference(obj1)==0);
+	
+	// Delete the list ==> remove the referencies
+	OP_DELETE(list3);
+	
+	verify(obj1->FindReferenceUser(list));
+	verify(obj1->FindReferenceUser(list2));
+	verify(!obj1->FindReferenceUser(list3));
+	
+	// Delete the list ==> remove the referencies
+	OP_DELETE(list2);
+	
+	verify(obj1->FindReferenceUser(list));
+	verify(!obj1->FindReferenceUser(list2));
+	verify(!obj1->FindReferenceUser(list3));
+	
+	// Delete the list ==> remove the referencies and delete the objects
+	OP_DELETE(list);
+	
+	// The mem leak check will ensure that the objects and the pointers have been deleted
+}
+
+
+test("Crash - Device-UPnPXH_Auto")
+{
+	MockNetworkCard mnc;
+	UPnPDevice *dev=OP_NEW(UPnPDevice, (&mnc));
+	MockUPnPXH_Auto xh;
+	
+	xh.SetUPnP(g_upnp, dev, NULL);
+	verify(xh.GetDevice()==dev);
+	
+	OP_DELETE(dev);
+	
+	 // If !=NULL, it should crash in the following code...
+	if(xh.GetDevice()!=NULL)
+	{
+		verify(xh.GetDevice()==dev);
+		
+		ST_failed("Crash possible after deleting an UPnPDevice ");
+	}
+}
+
+test("Check Normal Duplicates")
+{
+	MockNetworkCard mnc;
+	UPnPDevice dev1(&mnc);  // reference
+	UPnPDevice dev2(&mnc);  // dupplicated
+	UPnPDevice dev3(&mnc);  // same usn, different description URL
+	UPnPDevice dev4(&mnc);  // same description URL, different usn
+	UPnPDevice dev5(&mnc);  // different description, different usn
+	const uni_char *usn1=UNI_L("uns1");
+	const uni_char *usn2=UNI_L("uns2");
+	OpString descr1;
+	OpString descr2;
+	
+	descr1.Set("descr1");
+	descr2.Set("descr2");
+	
+	dev1.SetUSN(usn1);
+	dev1.SetCurrentDescriptionURL(descr1, FALSE);
+	
+	dev2.SetUSN(usn1);
+	dev2.SetCurrentDescriptionURL(descr1, FALSE);
+	
+	dev3.SetUSN(usn1);
+	dev3.SetCurrentDescriptionURL(descr2, FALSE);
+	
+	dev4.SetUSN(usn2);
+	dev4.SetCurrentDescriptionURL(descr1, FALSE);
+	
+	dev5.SetUSN(usn2);
+	dev5.SetCurrentDescriptionURL(descr2, FALSE);
+	
+	verify(dev1.IsSameDevice(&dev1));
+	verify(dev1.IsSameDevice(&dev2));
+	verify(dev1.IsSameDevice(&dev3));
+	verify(dev1.IsSameDevice(&dev4));
+	verify(!dev1.IsSameDevice(&dev5));
+	
+	verify(dev2.IsSameDevice(&dev1));
+	verify(dev2.IsSameDevice(&dev2));
+	verify(dev2.IsSameDevice(&dev3));
+	verify(dev2.IsSameDevice(&dev4));
+	verify(!dev2.IsSameDevice(&dev5));
+	
+	verify(dev3.IsSameDevice(&dev1));
+	verify(dev3.IsSameDevice(&dev2));
+	verify(dev3.IsSameDevice(&dev3));
+	verify(!dev3.IsSameDevice(&dev4));
+	verify(dev3.IsSameDevice(&dev5));
+	
+	verify(dev4.IsSameDevice(&dev1));
+	verify(dev4.IsSameDevice(&dev2));
+	verify(!dev4.IsSameDevice(&dev3));
+	verify(dev4.IsSameDevice(&dev4));
+	verify(dev4.IsSameDevice(&dev5));
+	
+	verify(!dev5.IsSameDevice(&dev1));
+	verify(!dev5.IsSameDevice(&dev2));
+	verify(dev5.IsSameDevice(&dev3));
+	verify(dev5.IsSameDevice(&dev4));
+	verify(dev5.IsSameDevice(&dev5));
+}
+
+/*test("Refuses ports") async;
+{
+	if(!listener)
+		ST_failed("No listener");
+		
+	listener->SetReverse(TRUE);
+
+    if(!OpStatus::IsSuccess(port_cp->AddListener(listener)))
+		ST_failed("Impossible to add a listener!");
+		
+	if(!OpStatus::IsSuccess(port_cp->AddListener(refuse_all)))
+		ST_failed("Impossible to add a listener!");
+		
+	if(!OpStatus::IsSuccess(port_cp->StartPortOpening()))
+		ST_failed("Impossible to start the UPnP discovery process!");
+}*/
+
+test("UDP Unicast Unbound test one way")
+async;
+require success "Get IP";
+{
+	if(OpStatus::IsSuccess(SetupSockets(TEST_MEX_0, 1, FALSE, FALSE)))
+	{
+		// Unicast unbound socket to Unicast bound
+		if(OpStatus::IsError(cli_sk->Send(TEST_MEX_0, op_strlen(TEST_MEX_0), addr_32701)))
+		{
+			ST_failed("Error on Unicast send");
+		}
+	}
+}
+
+test("UDP Unicast Unbound test")
+async;
+require success "Get IP";
+{
+	if(OpStatus::IsSuccess(SetupSockets(TEST_MEX, 2, FALSE, FALSE)))
+	{
+		// Unicast unbound socket to Unicast bound
+		if(OpStatus::IsError(cli_sk->Send(TEST_MEX, op_strlen(TEST_MEX), addr_32701)))
+		{
+			ST_failed("Error on Unicast send");
+		}
+	}
+}
+
+test("UDP Unicast Unbound test 2 sockets")
+async;
+require success "Get IP";
+{
+	if(OpStatus::IsSuccess(SetupSockets(TEST_MEX, 3, FALSE, TRUE)))
+	{
+		// Unicast unbound socket to Unicast bound
+		if(OpStatus::IsError(cli_sk->Send(TEST_MEX, op_strlen(TEST_MEX), addr_32701)))
+		{
+			ST_failed("Error on Unicast send");
+		}
+	}
+}
+
+
+test("UDP Unicast Auto Bound test")
+async;
+require success "Get IP";
+{
+	if(OpStatus::IsSuccess(SetupSockets(TEST_MEX2, 2, FALSE, FALSE)))
+	{
+		if(OpStatus::IsSuccess(cli_sk->Bind(addr_auto)))
+		{
+			// Unicast unbound socket to Unicast bound
+			if(OpStatus::IsError(cli_sk->Send(TEST_MEX2, op_strlen(TEST_MEX2), addr_32701)))
+			{
+				ST_failed("Error on Unicast send");
+			}
+		}
+		else
+			ST_failed("Error on Bound to auto port");
+	}
+}
+
+test("UDP Unicast Auto Bound test 2 sockets")
+async;
+require success "Get IP";
+{
+	if(OpStatus::IsSuccess(SetupSockets(TEST_MEX2, 3, FALSE, TRUE)))
+	{
+		if(OpStatus::IsSuccess(cli_sk->Bind(addr_auto)))
+		{
+			// Unicast unbound socket to Unicast bound
+			if(OpStatus::IsError(cli_sk->Send(TEST_MEX2, op_strlen(TEST_MEX2), addr_32701)))
+			{
+				ST_failed("Error on Unicast send");
+			}
+		}
+		else
+			ST_failed("Error on Bound to auto port");
+	}
+}
+
+test("UDP Unicast Explicit 1902 Bound test")
+async;
+require success "Get IP";
+{
+	if(OpStatus::IsSuccess(SetupSockets(TEST_MEX3, 2, FALSE, FALSE)))
+	{
+		if(OpStatus::IsSuccess(cli_sk->Bind(addr_1902)))
+		{
+			// Unicast unbound socket to Unicast bound
+			if(OpStatus::IsError(cli_sk->Send(TEST_MEX3, op_strlen(TEST_MEX3), addr_32701)))
+			{
+				ST_failed("Error on Unicast send");
+			}
+		}
+		else
+			ST_failed("Error on Bound to port 1902");
+	}
+}
+
+test("UDP Unicast Explicit 1902 Bound test 2 sockets")
+async;
+require success "Get IP";
+{
+	if(OpStatus::IsSuccess(SetupSockets(TEST_MEX3, 3, FALSE, TRUE)))
+	{
+		if(OpStatus::IsSuccess(cli_sk->Bind(addr_1902)))
+		{
+			// Unicast unbound socket to Unicast bound
+			if(OpStatus::IsError(cli_sk->Send(TEST_MEX3, op_strlen(TEST_MEX3), addr_32701)))
+			{
+				ST_failed("Error on Unicast send");
+			}
+		}
+		else
+			ST_failed("Error on Bound to port 1902");
+	}
+}
+
+test("UDP Multicast Unbound test")
+async;
+require success "Get IP";
+{
+	if(OpStatus::IsSuccess(SetupSockets(TEST_MEX_M, 2, TRUE, FALSE)))
+	{
+		if(OpStatus::IsError(cli_sk->Send(TEST_MEX_M, op_strlen(TEST_MEX_M), addr_multicast, OpUdpSocket::MULTICAST)))
+			ST_failed("Error on Broadcast send");
+	}
+}
+
+test("UDP Multicast Unbound test 2 sockets")
+async;
+require success "Get IP";
+{
+	if(OpStatus::IsSuccess(SetupSockets(TEST_MEX_M, 3, TRUE, TRUE)))
+	{
+		if(OpStatus::IsError(cli_sk->Send(TEST_MEX_M, op_strlen(TEST_MEX_M), addr_multicast, OpUdpSocket::MULTICAST)))
+			ST_failed("Error on Broadcast send");
+	}
+}
+
+test("UDP Multicast Auto Bound test")
+async;
+require success "Get IP";
+{
+	if(OpStatus::IsSuccess(SetupSockets(TEST_MEX_M2, 2, TRUE, FALSE)))
+	{
+		if(OpStatus::IsSuccess(cli_sk->Bind(addr_auto)))
+		{
+			// Unicast unbound socket to Unicast bound
+			if(OpStatus::IsError(cli_sk->Send(TEST_MEX_M2, op_strlen(TEST_MEX_M2), addr_multicast, OpUdpSocket::MULTICAST)))
+			{
+				ST_failed("Error on Unicast send");
+			}
+		}
+		else
+			ST_failed("Error on Bound to auto port");
+	}
+}
+
+test("UDP Multicast Auto Bound test 2 sockets")
+async;
+require success "Get IP";
+{
+	if(OpStatus::IsSuccess(SetupSockets(TEST_MEX_M2, 3, TRUE, TRUE)))
+	{
+		if(OpStatus::IsSuccess(cli_sk->Bind(addr_auto)))
+		{
+			// Unicast unbound socket to Unicast bound
+			if(OpStatus::IsError(cli_sk->Send(TEST_MEX_M2, op_strlen(TEST_MEX_M2), addr_multicast, OpUdpSocket::MULTICAST)))
+			{
+				ST_failed("Error on Unicast send");
+			}
+		}
+		else
+			ST_failed("Error on Bound to auto port");
+	}
+}
+
+test("UDP Multicast Explicit 1902 Bound test")
+async;
+require success "Get IP";
+{
+	if(OpStatus::IsSuccess(SetupSockets(TEST_MEX_M3, 2, TRUE, FALSE)))
+	{
+		if(OpStatus::IsSuccess(cli_sk->Bind(addr_1902)))
+		{
+			// Unicast unbound socket to Unicast bound
+			if(OpStatus::IsError(cli_sk->Send(TEST_MEX_M3, op_strlen(TEST_MEX_M3), addr_multicast, OpUdpSocket::MULTICAST)))
+			{
+				ST_failed("Error on Unicast send");
+			}
+		}
+		else
+			ST_failed("Error on Bound to port 1902");
+	}
+}
+
+test("UDP Multicast Explicit 1902 Bound test 2 sockets")
+async;
+require success "Get IP";
+{
+	if(OpStatus::IsSuccess(SetupSockets(TEST_MEX_M3, 3, TRUE, TRUE)))
+	{
+		if(OpStatus::IsSuccess(cli_sk->Bind(addr_1902)))
+		{
+			// Unicast unbound socket to Unicast bound
+			if(OpStatus::IsError(cli_sk->Send(TEST_MEX_M3, op_strlen(TEST_MEX_M3), addr_multicast, OpUdpSocket::MULTICAST)))
+			{
+				ST_failed("Error on Unicast send");
+			}
+		}
+		else
+			ST_failed("Error on Bound to port 1902");
+	}
+}
+
+test("Porting Interface test simulation")
+async;
+require success "Get IP";
+{
+	if(OpStatus::IsError(SetupSockets(TEST_MEX_PI, 1, TRUE, FALSE)))
+	{
+		ST_failed("Socket setup creation error");
+	}
+	else
+	{
+		ASYNC_VERIFY(OpStatus::IsSuccess(SocketWrapper::CreateUDPSocket(&pi_socket1, rcv1, SocketWrapper::ALLOW_CONNECTION_WRAPPER)));
+		ASYNC_VERIFY(OpStatus::IsSuccess(SocketWrapper::CreateUDPSocket(&pi_socket2, rcv1, SocketWrapper::ALLOW_CONNECTION_WRAPPER)));
+		
+		ASYNC_VERIFY(OpStatus::IsSuccess(OpSocketAddress::Create(&pi_datagram_address)));
+
+		ASYNC_VERIFY(OpStatus::IsSuccess(OpSocketAddress::Create(&pi_bind_address)));
+		ASYNC_VERIFY(OpStatus::IsSuccess(pi_bind_address->FromString(UNI_L("224.1.1.1"))));
+		pi_bind_address->SetPort(1903);
+
+		// Bind socket1
+
+		ASYNC_VERIFY(OpStatus::IsSuccess(pi_socket1->Bind(pi_bind_address, OpUdpSocket::MULTICAST)));
+
+		// Send to the bound address on socket2
+
+		ASYNC_VERIFY(OpStatus::IsSuccess(pi_socket2->Send(TEST_MEX_PI, op_strlen(TEST_MEX_PI), pi_bind_address, OpUdpSocket::MULTICAST)));
+
+		// test continues in OnSocketDataReady().
+	}
+}
+
+test("Cleaning")
+{
+	OP_DELETE(srv_sk);
+	OP_DELETE(srv_sk2);
+	OP_DELETE(cli_sk);
+	OP_DELETE(rcv1);
+	
+	srv_sk=NULL;
+	srv_sk2=NULL;
+	cli_sk=NULL;
+	rcv1=NULL;
+}
+
+
+test("Device List at the beginning")
+{
+	if(!upnp)
+		ST_failed("No UPNP object!");
+	OpString8 dev_desc8;
+		
+	GetDeviceList(upnp, dev_desc8, NULL);
+	output(dev_desc8.CStr());
+}
+
+test("upnp MiniSelfTest") async; // this test will run asynchronously
+{
+	listener->SetTimeout(OP_NEW(TimeOutObj, (5000)));
+	
+	if(!upnp)
+		ST_failed("No UPNP object!");
+		
+	if(!port_cp)
+		ST_failed("No UPNP port_cp object!");
+		
+	upnp->AddLogic(port_cp);
+
+#ifdef _DEBUG
+	// Embedded duplication test...
+	UINT num = upnp->GetNumberOfDevices();
+	if (num > 0)
+	{
+		// One duplicate
+		if(OpStatus::IsError(upnp->DebugDuplicateDevice(0, 1, FALSE)))
+			ST_failed("Duplication error 1");
+		if(upnp->GetNumberOfDevices()!=num+1)
+			ST_failed("Duplication error 2");
+			
+		output("Performed an artificial duplication...\n");
+	}
+	else
+		output("No devices to duplicate...\n");
+#endif
+		
+#ifdef UPNP_SERVICE_DISCOVERY
+	upnp->RemoveServicesProvider(msrc);
+#endif
+		
+	if(!listener)
+		ST_failed("No listener");
+		
+	//if(!OpStatus::IsSuccess(port_cp->RemoveListener(refuse_all)))
+	//	ST_failed("Impossible to add a listener!");
+		
+	listener->SetReverse(FALSE);
+
+    if(!OpStatus::IsSuccess(port_cp->StartPortOpening()))
+		ST_failed("Impossible to start the UPnP discovery process!");
+}
+
+test("M-SEARCH wait")
+require UPNP_SERVICE_DISCOVERY;
+disabled;
+async;
+{
+	if(!upnp)
+		ST_failed("No UPNP object!");
+		
+	if(!OpStatus::IsSuccess(msrc->Construct()))
+		ST_failed("Construct failed");
+		
+	upnp->RemoveLogic(port_cp);
+	upnp->AddServicesProvider(msrc, TRUE);
+
+	upnp->StartUPnPDiscovery();
+}
+
+test("Device List at the end")
+{
+	if(!upnp)
+		ST_failed("No UPNP object!");
+	OpString8 dev_desc8;
+		
+	GetDeviceList(upnp, dev_desc8, NULL);
+	output(dev_desc8.CStr());
+}
+
+test("Device List - Unite Only")
+{
+	if(!upnp)
+		ST_failed("No UPNP object!");
+	OpString8 dev_desc8;
+		
+	GetDeviceList(upnp, dev_desc8, UNI_L("urn:opera-com:device:OperaUnite:1"));
+	output(dev_desc8.CStr());
+}
+
+test("Discovered devices - result in the Error Console")
+language ecmascript;
+require UPNP_SERVICE_DISCOVERY;
+require WEBSERVER_SUPPORT;
+{
+	var devices=opera.nearbyDevices;
+	var list="\nDevice List (upnp_upnp.ot):\n";
+	
+	for(var i=0; i<devices.length; i++)
+	{
+		var dev=devices[i];
+		
+		list+=i+": " +dev.uniteUser+"."+dev.uniteDeviceName+": " + dev.name + " (" + dev.description + ") - URL: " + dev.url + "\n";
+		list+="      Services: " + dev.services.length + " - status: " + dev.status + "\n";
+		if(dev.ONLINE!=1)
+			ST_failed("dev.ONLINE is " + dev.ONLINE, "upnp_upnp.ot", 0);
+			
+		if(dev.OFFLINE!=0)
+			ST_failed("dev.OFFLINE is " + dev.OFFLINE, "upnp_upnp.ot", 0);
+			
+		if(dev.status!=1)
+			ST_failed("dev.status is " + dev.status, "upnp_upnp.ot", 0);
+			
+		/*try { dev.ONLINE="fail"; ST_failed("dev.ONLINE is not readonly: " + dev.ONLINE + "!", 'upnp_upnp.ot', 0); } catch(e) { }
+		try { dev.OFFLINE="fail"; ST_failed("dev.OFFLINE is not readonly: " + dev.OFFLINE + "!", 'upnp_upnp.ot', 0); } catch(e) { }
+		try { dev.status="fail"; ST_failed("dev.status is not readonly: " + dev.status + "!", 'upnp_upnp.ot', 0); } catch(e) { }*/
+			
+		for(var j=0; j<dev.services.length; j++)
+		{
+			list+="          " + dev.services[j].name + " ==> " + dev.services[j].url + "\n";
+			
+			if(dev.services[j].ONLINE!=1)
+				ST_failed("service.ONLINE is " + dev.services[j].ONLINE, "upnp_upnp.ot", 0);
+				
+			if(dev.services[j].OFFLINE!=0)
+				ST_failed("service.OFFLINE is " + dev.services[j].OFFLINE, "upnp_upnp.ot", 0);
+				
+			if(dev.services[j].status!=1)
+				ST_failed("service.status is " + dev.services[j].status, "upnp_upnp.ot", 0);
+				
+			/*try { dev.services[j].ONLINE="fail"; ST_failed("service.ONLINE is not readonly!", 'upnp_upnp.ot', 0); } catch(e) { }
+			try { dev.services[j].OFFLINE="fail"; ST_failed("service.OFFLINE is not readonly!", 'upnp_upnp.ot', 0); } catch(e) { }
+			try { dev.services[j].status="fail"; ST_failed("service.status is not readonly!", 'upnp_upnp.ot', 0); } catch(e) { }*/
+		}
+		
+	}
+	
+	opera.postError(list);
+}
+
+test("Delete devices")
+require _DEBUG;
+{
+	UINT num=(upnp)?upnp->GetNumberOfDevices():0;
+	
+	output("Found %d devices\n", num);
+	
+	if(num>0)
+	{
+		UPnPDevice *dev0=upnp->GetDevice(0);
+		UPnPDevice *dev1=NULL;
+		
+		verify(dev0!=NULL);
+		// One duplicate, generic deduplication
+		verify(OpStatus::IsSuccess(upnp->DebugDuplicateDevice(0, 1, FALSE)));
+		verify(upnp->GetNumberOfDevices()==num+1);
+		dev1=upnp->GetDevice(num);
+		verify(OpStatus::IsSuccess(upnp->DeleteDeviceDuplicates(NULL)));
+		verify(upnp->GetNumberOfDevices()==num);
+		verify(upnp->GetDevice(num-1)==dev1);  // It could change...
+		
+		// One duplicate, deduplication with keep
+		dev0=upnp->GetDevice(0);
+		verify(OpStatus::IsSuccess(upnp->DebugDuplicateDevice(0, 1, FALSE)));
+		verify(upnp->GetNumberOfDevices()==num+1);
+		dev1=upnp->GetDevice(num);
+		verify(OpStatus::IsSuccess(upnp->DeleteDeviceDuplicates(dev0)));
+		verify(upnp->GetNumberOfDevices()==num);
+		verify(upnp->GetDevice(0)==dev0);
+		
+		// 3 duplicates
+		verify(OpStatus::IsSuccess(upnp->DebugDuplicateDevice(0, 3, FALSE)));		
+		verify(upnp->GetNumberOfDevices()==num+3);		
+		verify(OpStatus::IsSuccess(upnp->DeleteDeviceDuplicates(dev0)));		
+		verify(upnp->GetNumberOfDevices()==num);
+		verify(upnp->GetDevice(0)==dev0);
+		
+		// Clean to avoid an ASSERT because the object is not "real" (no provider)
+		OP_DELETE(dev0);
+	}
+	else
+		output("No devices to duplicate...");
+}
+
+group "dragonfly_upnp";
+
+test("Dragonfly start UPnP")
+require WEBSERVER_SUPPORT;
+require SCOPE_SUPPORT;
+{
+	if(!g_dragonflywebserver->IsRunning())
+	{
+		WebserverListeningMode mode = WEBSERVER_LISTEN_DEFAULT;
+		mode |= WEBSERVER_LISTEN_UPNP_DISCOVERY;
+		mode |= WEBSERVER_LISTEN_DIRECT;
+		unsigned int port = g_pctools->GetIntegerPref(PrefsCollectionTools::UPnPWebserverPort);
+
+		OpString ip;
+		RETURN_IF_ERROR(g_op_system_info->GetSystemIp(ip));
+
+		OpString dragonflyaddress;
+		RETURN_IF_ERROR(dragonflyaddress.AppendFormat(UNI_L("http://%s:%d"), ip.CStr(), 1234));
+		g_dragonflywebserver->SetAlwaysListenToAllNetworks(TRUE);
+
+		RETURN_IF_ERROR(g_dragonflywebserver->StartUPnPServer(mode, port, UPNP_DISCOVERY_DRAGONFLY_SEARCH_TYPE, NULL, dragonflyaddress.CStr()));
+	}
+
+	verify(g_dragonflywebserver->IsRunning());
+}
+
+test("Dragonfly find nearbyDragonflies - result in the Error Console")
+	language ecmascript;
+{
+	var devices=opera.nearbyDragonflies;
+	opera.postError("found " + devices.length + " debugger(s) on the local network");
+}

@@ -1,0 +1,315 @@
+/* -*- Mode: c++; tab-width: 4; indent-tabs-mode: t; c-basic-offset: 4 -*-
+**
+** Copyright (C) 2004-2009 Opera Software ASA.  All rights reserved.
+**
+** This file is part of the Opera web browser.  It may not be distributed
+** under any circumstances.
+**
+** Peter Krefting
+*/
+
+group "prefsfile.ini.cascade.standard";
+require PREFSFILE_CASCADE;
+require undefined HAVE_NO_OPMEMFILE;
+require PREFS_HAS_PREFSFILE;
+
+include "modules/prefsfile/prefsfile.h";
+include "modules/prefsfile/prefssection.h";
+include "modules/util/opfile/opmemfile.h";
+include "modules/util/opstrlst.h";
+
+// -- Global variables ---------------------------------------------------
+
+global
+{
+	PrefsFile *pfp;
+	OpMemFile *lofp, *gofp, *fofp;
+}
+
+setup
+{
+	pfp = NULL;
+	lofp = NULL;
+	gofp = NULL;
+	fofp = NULL;
+
+	/* Create file objects to test prefsfile's three-way mode */
+	static const unsigned char localini[] =
+		//!Opera Preferences version 2.0
+		//!
+		//![Section1]
+		//!Key1=LocalValue1
+		//!Key2=LocalValue2
+		//!
+		//![Section2]
+		//!Key1=LocalValue1
+		//!Key2=LocalValue2
+		//!
+		//![Section3]
+		//!Key1=LocalValue1
+		//!Key2=LocalValue2
+	;
+
+	static const unsigned char globalini[] =
+		//!Opera Preferences version 2.0
+		//!
+		//![Section1]
+		//!Key1=GlobalValue1
+		//!Key2=GlobalValue2
+		//!Key3=GlobalValue3
+		//!
+		//![Section2]
+		//!Key1=GlobalValue1
+		//!Key2=GlobalValue2
+		//!Key3=GlobalValue3
+		//!
+		//![Section4]
+		//!Key1=GlobalValue1
+		//!Key2=GlobalValue2
+		//!Key3=GlobalValue3
+	;
+
+	static const unsigned char fixedini[] =
+		//!Opera Preferences version 2.0
+		//!
+		//![Section1]
+		//!Key1=FixedValue1
+		//!
+		//![Section5]
+		//!Key1=FixedValue1
+	;
+
+	lofp = OpMemFile::Create(localini, long(sizeof localini));
+	gofp = OpMemFile::Create(globalini, long(sizeof globalini));
+	fofp = OpMemFile::Create(fixedini, long(sizeof fixedini));
+}
+
+// -- Tests --------------------------------------------------------------
+
+test("Setup")
+{
+	pfp = OP_NEW(PrefsFile, (PREFS_INI));
+	TRAPD(rc, pfp->ConstructL());
+	verify(OpStatus::IsSuccess(rc));
+
+	TRAP(rc, pfp->SetFileL(lofp));
+	verify(OpStatus::IsSuccess(rc));
+
+	OpFileDescriptor *ldp = pfp->GetFile();
+	verify(ldp != NULL);
+	
+	TRAP(rc, pfp->SetGlobalFileL(gofp));
+	verify(OpStatus::IsSuccess(rc));
+
+#ifdef PREFSFILE_GETGLOBALFILE
+	OpFileDescriptor *gdp = pfp->GetGlobalFile();
+	verify(gdp != NULL);
+	verify(gdp != ldp);
+#endif
+
+	TRAP(rc, pfp->SetGlobalFixedFileL(fofp));
+	verify(OpStatus::IsSuccess(rc));
+
+#ifdef PREFSFILE_GETFIXEDFILE
+	OpFileDescriptor *fdp = pfp->GetGlobalFixedFile();
+	verify(fdp != NULL);
+	verify(fdp != gdp);
+	verify(fdp != ldp);
+#endif
+
+	TRAP(rc, pfp->LoadAllL());
+	verify(OpStatus::IsSuccess(rc));
+}
+
+table prefsdata(const uni_char *, const uni_char *, const uni_char *)
+{
+	{ UNI_L("Section1"), UNI_L("Key1"), UNI_L("FixedValue1") },
+	{ UNI_L("Section1"), UNI_L("Key2"), UNI_L("LocalValue2") },
+	{ UNI_L("Section1"), UNI_L("Key3"), UNI_L("GlobalValue3") },
+
+	{ UNI_L("Section2"), UNI_L("Key1"), UNI_L("LocalValue1") },
+	{ UNI_L("Section2"), UNI_L("Key2"), UNI_L("LocalValue2") },
+	{ UNI_L("Section2"), UNI_L("Key3"), UNI_L("GlobalValue3") },
+
+	{ UNI_L("Section3"), UNI_L("Key1"), UNI_L("LocalValue1") },
+	{ UNI_L("Section3"), UNI_L("Key2"), UNI_L("LocalValue2") },
+
+	{ UNI_L("Section4"), UNI_L("Key1"), UNI_L("GlobalValue1") },
+	{ UNI_L("Section4"), UNI_L("Key2"), UNI_L("GlobalValue2") },
+	{ UNI_L("Section4"), UNI_L("Key3"), UNI_L("GlobalValue3") },
+
+	{ UNI_L("Section5"), UNI_L("Key1"), UNI_L("FixedValue1") },
+}
+
+test("Checking cascade (individual read)")
+	require success "Setup";
+{
+	OpStringC s;
+	OP_STATUS rc;
+
+	iterate(section, key, value) from prefsdata
+	{
+		TRAP(rc, s = pfp->ReadStringL(section, key));
+		verify(OpStatus::IsSuccess(rc));
+		verify(s.Compare(value) == 0);
+	}
+}
+
+test("Checking cascade (section read)")
+	require success "Setup";
+{
+	OpStringC s;
+	OP_STATUS rc;
+	const uni_char *last_section = UNI_L("");
+	int entries_left = 0;
+	PrefsSection *sec = NULL;
+
+	iterate(section, key, value) from prefsdata
+	{
+		if (uni_strcmp(section, last_section) != 0)
+		{
+			// Entering a new section. Make sure we got all entries in the
+			// last one.
+			verify(!entries_left);
+
+			// Read the section using ReadSectionL().
+			OP_DELETE(sec);
+			sec = NULL;
+			TRAP(rc, sec = pfp->ReadSectionL(section));
+			verify(sec != NULL);
+			last_section = section;
+
+			// Remember the number of entries.
+			entries_left = sec->Number();
+		}
+
+		// Check that this entry matches one read.
+		const uni_char *data = sec->Get(key);
+		verify(data != NULL);
+		verify(uni_strcmp(data, value) == 0);
+		-- entries_left;
+	}
+
+	verify(!entries_left);
+}
+finally
+{
+	OP_DELETE(sec);
+}
+
+test("Checking cascade (read all sections)")
+	require success "Setup";
+	require USE_UTIL_OPSTRING_LIST;
+	require PREFS_READ_ALL_SECTIONS;
+{
+	OpString_list sections;
+	TRAPD(rc, pfp->ReadAllSectionsL(sections));
+	verify(OpStatus::IsSuccess(rc));
+	verify(sections.Count() == 5);
+
+	iterate(section, key, value) from prefsdata
+	{
+		bool found = false;
+		for (unsigned long i = 0; i < sections.Count() && !found; ++ i)
+		{
+			if (sections[i].CompareI(section) == 0)
+				found = true;
+		}
+		verify(found);
+	}
+}
+
+test("Allowed to change flag (key)")
+	require success "Setup";
+{
+	OP_STATUS rc;
+
+	iterate(section, key, value) from prefsdata
+	{
+		BOOL expected = uni_strncmp(value, UNI_L("Fixed"), 5) == 0;
+		OP_MEMORY_VAR BOOL allowed = FALSE;
+		TRAP(rc, allowed = pfp->AllowedToChangeL(section, key));
+		verify(OpStatus::IsSuccess(rc));
+		verify(expected ? !allowed : allowed);
+	}
+}
+
+test("Allowed to change flag (section)")
+	require success "Setup";
+{
+	verify(!pfp->AllowedToChangeL(UNI_L("Section1")));
+	verify( pfp->AllowedToChangeL(UNI_L("Section2")));
+	verify( pfp->AllowedToChangeL(UNI_L("Section3")));
+	verify( pfp->AllowedToChangeL(UNI_L("Section4")));
+	verify(!pfp->AllowedToChangeL(UNI_L("Section5")));
+}
+
+test("Check for local key")
+	require success "Setup";
+	require PREFSFILE_WRITE_GLOBAL;
+{
+	verify( pfp->IsKeyLocal(UNI_L("Section1"), UNI_L("Key1")));
+	verify( pfp->IsKeyLocal(      "Section1",        "Key2" ));
+	verify(!pfp->IsKeyLocal(UNI_L("Section1"), UNI_L("Key3")));
+	verify(!pfp->IsKeyLocal(      "Section2",        "Key3" ));
+}
+
+test("Check for local section")
+	require success "Setup";
+	require PREFSFILE_WRITE_GLOBAL;
+{
+	verify( pfp->IsSectionLocal(UNI_L("Section1")));
+	verify( pfp->IsSectionLocal(UNI_L("Section2")));
+	verify( pfp->IsSectionLocal(UNI_L("Section3")));
+	verify(!pfp->IsSectionLocal(UNI_L("Section4")));
+	verify(!pfp->IsSectionLocal(UNI_L("Section5")));
+}
+
+test("Block on delete key")
+	require success "Setup";
+{
+	OP_STATUS rc;
+	OP_MEMORY_VAR BOOL deleted = FALSE;
+
+	iterate(section, key, value) from prefsdata
+	{
+		if (uni_strncmp(value, UNI_L("Fixed"), 5) == 0)
+		{
+			// Fixed key
+			verify(pfp->IsKey(section, key));
+			TRAP(rc, deleted = pfp->DeleteKeyL(section, key));
+			verify(!deleted);
+			verify(pfp->IsKey(section, key));
+		}
+	}
+}
+
+test("Block on delete section")
+	require success "Setup";
+{
+	OP_STATUS rc;
+	OP_MEMORY_VAR BOOL deleted = FALSE;
+
+	// Delete section with fixed or global keys should fail
+	// Section4 is only in global
+	verify(pfp->IsSection(UNI_L("Section4")));
+	TRAP(rc, deleted = pfp->DeleteSectionL(UNI_L("Section4")));
+	verify(!deleted);
+	verify(pfp->IsSection(UNI_L("Section4")));
+
+	// Section5 is only in fixed
+	verify(pfp->IsSection(UNI_L("Section5")));
+	TRAP(rc, deleted = pfp->DeleteSectionL(UNI_L("Section5")));
+	verify(!deleted);
+	verify(pfp->IsSection(UNI_L("Section5")));
+}
+
+// -- Global cleanup -----------------------------------------------------
+
+exit
+{
+	OP_DELETE(pfp);
+	OP_DELETE(lofp);
+	OP_DELETE(gofp);
+	OP_DELETE(fofp);
+}

@@ -1,0 +1,309 @@
+/* -*- Mode: c++; tab-width: 4; indent-tabs-mode: t; c-basic-offset: 4 -*-
+**
+** Copyright (C) 2004-2012 Opera Software ASA.  All rights reserved.
+**
+** This file is part of the Opera web browser.
+** It may not be distributed under any circumstances.
+**
+** Anders Oredsson
+*/
+
+group "encodings.utility.guessencodingfromcontextandconvertstring";
+require initialization;
+
+include "modules/encodings/utility/createinputconverter.h";
+include "modules/util/opstring.h";
+include "modules/encodings/utility/opstring-encodings.h";
+include "modules/dochand/win.h";
+include "modules/dochand/winman.h";
+include "modules/url/url_sn.h";
+
+// -- Global variables ---------------------------------------------------
+
+global
+{
+	const char encoding_GBK[]			= "GBK";// {0x47,0x42,0x4B,0x00};
+	const char encoding_utf_8[]			= "utf-8";// {0x75,0x74,0x66,0x2D,0x38,0x00};
+	const char encoding_UTF_8[]			= "UTF-8";// {0x55,0x54,0x46,0x2D,0x38,0x00};
+	const char encoding_ISO_8859_1[]	= "iso-8859-1";// {0x69,0x73,0x6F,0x2D,0x38,0x38,0x35,0x39,0x2D,0x31,0x00};
+	const char encoding_WIN_1252[]		= "windows-1252";
+	const char encoding_EMPTY[]			= "\0";//{0x00};
+	const char* encoding_NULL			= NULL;
+	const char hostname_opera[]			= "ssl.opera.com";// {0x73,0x73,0x6C,0x2E,0x6F,0x70,0x65,0x72,0x61,0x2E,0x63,0x6F,0x6D,0x00};
+
+
+
+	Window *w;
+
+	/**
+	 * Helper method to make it simpler to test
+	 * our guessEncodingFromUrlAndConvertString with
+	 * less test code.
+	 *
+	 * We simply wrap strings and stuff
+	 */
+	OP_STATUS testGuessEncodingFromUrlAndConvertString(
+		const char* original_suggested_input_cstr,
+		const char* original_suggested_input_charset_cstr,
+		const char* document_charset,
+		Window*		window,
+		const char* url_hostname,
+		const char* referrer_url_charset,
+		const char* default_encoding,
+		const char* system_encoding,
+		OpString&	result_string)
+	{
+		OpString8	original_suggested_input;
+		OpString8	original_suggested_input_charset;
+		original_suggested_input.SetL(original_suggested_input_cstr);
+		original_suggested_input_charset.SetL(original_suggested_input_charset_cstr);
+
+		OP_STATUS op_err;
+		ServerName* serverName = ServerName::Create(url_hostname, op_err);
+
+		OP_STATUS result = guessEncodingFromContextAndConvertString(
+			&original_suggested_input,
+			&original_suggested_input_charset,
+			document_charset,
+			window,
+			serverName,
+			referrer_url_charset,
+			default_encoding,
+			system_encoding,
+			result_string);
+
+		OP_DELETE(serverName);
+		return result;
+	};
+
+	/**
+	 * Helper that encodes the string correctly (since we know),
+	 * and then returns true if the result string and the correctly encoded are
+	 * the same!
+	 */
+	BOOL compareWithEncoding(const char* original_suggested_input_cstr, const char* correct_encoding, OpString& result_string)
+	{
+		OpString8 original_suggested_input;
+		original_suggested_input.SetL(original_suggested_input_cstr);
+		OpString correct_encoding_result_string;
+		SetFromEncoding(&correct_encoding_result_string, correct_encoding, original_suggested_input.CStr(), original_suggested_input.Length());
+		return correct_encoding_result_string.Compare(result_string) == 0;
+	};
+
+}
+
+setup
+{
+	// Need a window to test the "force encoding" parameter
+	w = g_windowManager->GetAWindow(FALSE, YES, YES, 100, 200);
+	if (!w)
+	{
+		// Could not create a window, probably because we are running in
+		// single window mode. Just overwrite whatever the first window
+		// is.
+		w = g_windowManager->FirstWindow();
+	}
+}
+
+// -- Tests --------------------------------------------------------------
+
+/**
+ * Subtest that test if encoded correctly, and if not tries to
+ * figure out how it realy was encoded.
+ */
+subtest analyzeResult(const char* input_cstr, const char* correct_encoding, OpString& result_string)
+{
+	verify(!result_string.IsEmpty());
+	BOOL result_correct = compareWithEncoding(input_cstr, correct_encoding, result_string);
+	if(result_correct){
+		verify(TRUE);
+	} else {
+		verify(!compareWithEncoding(input_cstr, encoding_UTF_8, result_string), "wrongly encoded as UTF-8");
+		verify(!compareWithEncoding(input_cstr, encoding_GBK, result_string), "wrongly encoded as GBK");
+		verify(!compareWithEncoding(input_cstr, encoding_ISO_8859_1, result_string), "wrongly encoded as ISO-8859-1");
+		verify(false, "wrongly encoded as UNKNOWN");
+	}
+}
+
+test("tc1 : UTF8 Stream, GBK Charset : Chinese system")
+{
+	// input
+	const char		org_input[]		= "\xE4\xB8\x9B\xE6\x9E\x97\xE5\xA4\xA7\xE5\x8F\x8D\xE6\x94\xBB\x2E\x74\x78\x74";
+	const char*		org_charset		= encoding_NULL;
+	const char*		doc_charset		= encoding_GBK;
+	const char*		force_encoding	= encoding_GBK;
+	const char*		hostname		= hostname_opera;
+	const char*		ref_charset		= encoding_utf_8;
+	const char*		def_encoding	= encoding_ISO_8859_1;
+	const char*		sys_encoding	= encoding_EMPTY;
+	OpString		result_string;
+
+	// run and verify status
+	w->SetForceEncoding(force_encoding,false);
+	verify_success(testGuessEncodingFromUrlAndConvertString(org_input,org_charset,doc_charset,w,hostname,ref_charset,def_encoding,sys_encoding,result_string));
+
+	// verify output
+	const char* correct_encoding = encoding_utf_8;
+	verify(analyzeResult(org_input,correct_encoding,result_string));
+}
+
+test("tc2 : UTF8 Stream, UTF8 Charset : Chinese system")
+{
+	// input
+	const char		org_input[]		= "\xE4\xB8\x9B\xE6\x9E\x97\xE5\xA4\xA7\xE5\x8F\x8D\xE6\x94\xBB\x2E\x74\x78\x74";
+	const char*		org_charset		= encoding_NULL;
+	const char*		doc_charset		= encoding_UTF_8;
+	const char*		force_encoding	= encoding_GBK;
+	const char*		hostname		= hostname_opera;
+	const char*		ref_charset		= encoding_utf_8;
+	const char*		def_encoding	= encoding_ISO_8859_1;
+	const char*		sys_encoding	= encoding_EMPTY;
+	OpString		result_string;
+
+	// run and verify status
+	w->SetForceEncoding(force_encoding,false);
+	verify_success(testGuessEncodingFromUrlAndConvertString(org_input,org_charset,doc_charset,w,hostname,ref_charset,def_encoding,sys_encoding,result_string));
+
+	// verify output
+	const char* correct_encoding = encoding_utf_8;
+	verify(analyzeResult(org_input,correct_encoding,result_string));
+}
+
+test("tc3 : GBK Stream, UTF8 Charset : Chinese system")
+{
+	// input
+	const char		org_input[]		= "\xB4\xD4\xC1\xD6\xB4\xF3\xB7\xB4\xB9\xA5\x2E\x74\x78\x74";
+	const char*		org_charset		= encoding_NULL;
+	const char*		doc_charset		= encoding_UTF_8;
+	const char*		force_encoding	= encoding_GBK;
+	const char*		hostname		= hostname_opera;
+	const char*		ref_charset		= encoding_utf_8;
+	const char*		def_encoding	= encoding_ISO_8859_1;
+	const char*		sys_encoding	= encoding_EMPTY;
+	OpString		result_string;
+
+	// run and verify status
+	w->SetForceEncoding(force_encoding,false);
+	verify_success(testGuessEncodingFromUrlAndConvertString(org_input,org_charset,doc_charset,w,hostname,ref_charset,def_encoding,sys_encoding,result_string));
+
+	// verify output
+	const char* correct_encoding = encoding_GBK;
+	verify(analyzeResult(org_input,correct_encoding,result_string));
+}
+
+test("tc4 : GBK Stream, GBK Charset : Chinese system")
+{
+	// input
+	const char		org_input[]		= "\xB4\xD4\xC1\xD6\xB4\xF3\xB7\xB4\xB9\xA5\x2E\x74\x78\x74";
+	const char*		org_charset		= encoding_NULL;
+	const char*		doc_charset		= encoding_GBK;
+	const char*		force_encoding	= encoding_GBK;
+	const char*		hostname		= hostname_opera;
+	const char*		ref_charset		= encoding_utf_8;
+	const char*		def_encoding	= encoding_ISO_8859_1;
+	const char*		sys_encoding	= encoding_EMPTY;
+	OpString		result_string;
+
+	// run and verify status
+	w->SetForceEncoding(force_encoding,false);
+	verify_success(testGuessEncodingFromUrlAndConvertString(org_input,org_charset,doc_charset,w,hostname,ref_charset,def_encoding,sys_encoding,result_string));
+
+	// verify output
+	const char* correct_encoding = encoding_GBK;
+	verify(analyzeResult(org_input,correct_encoding,result_string));
+}
+
+test("tc5 : UTF8 Stream, GBK Charset : English system")
+{
+	// input
+	const char		org_input[]		= "\xE4\xB8\x9B\xE6\x9E\x97\xE5\xA4\xA7\xE5\x8F\x8D\xE6\x94\xBB\x2E\x74\x78\x74";
+	const char*		org_charset		= encoding_NULL;
+	const char*		doc_charset		= encoding_GBK;
+	const char*		force_encoding	= encoding_EMPTY;
+	const char*		hostname		= hostname_opera;
+	const char*		ref_charset		= encoding_utf_8;
+	const char*		def_encoding	= encoding_ISO_8859_1;
+	const char*		sys_encoding	= encoding_WIN_1252;
+	OpString		result_string;
+
+	// run and verify status
+	w->SetForceEncoding(force_encoding,false);
+	verify_success(testGuessEncodingFromUrlAndConvertString(org_input,org_charset,doc_charset,w,hostname,ref_charset,def_encoding,sys_encoding,result_string));
+
+	// verify output
+	const char* correct_encoding = encoding_utf_8;
+	verify(analyzeResult(org_input,correct_encoding,result_string));
+}
+
+test("tc6 : UTF8 Stream, UTF8 Charset : English system")
+{
+	// input
+	const char		org_input[]		= "\xE4\xB8\x9B\xE6\x9E\x97\xE5\xA4\xA7\xE5\x8F\x8D\xE6\x94\xBB\x2E\x74\x78\x74";
+	const char*		org_charset		= encoding_NULL;
+	const char*		doc_charset		= encoding_UTF_8;
+	const char*		force_encoding	= encoding_EMPTY;
+	const char*		hostname		= hostname_opera;
+	const char*		ref_charset		= encoding_utf_8;
+	const char*		def_encoding	= encoding_ISO_8859_1;
+	const char*		sys_encoding	= encoding_WIN_1252;
+	OpString		result_string;
+
+	// run and verify status
+	w->SetForceEncoding(force_encoding,false);
+	verify_success(testGuessEncodingFromUrlAndConvertString(org_input,org_charset,doc_charset,w,hostname,ref_charset,def_encoding,sys_encoding,result_string));
+
+	// verify output
+	const char* correct_encoding = encoding_utf_8;
+	verify(analyzeResult(org_input,correct_encoding,result_string));
+}
+
+test("tc7 : GBK Stream, UTF8 Charset : English system")
+	require NO_BROWSER_CAN_GUESS_CHINESE_IF_ENGLISH_CHARSET_ON_ENGLISH_SYSTEM;
+{
+	// input
+	const char		org_input[]		= "\xB4\xD4\xC1\xD6\xB4\xF3\xB7\xB4\xB9\xA5\x2E\x74\x78\x74";
+	const char*		org_charset		= encoding_NULL;
+	const char*		doc_charset		= encoding_UTF_8;
+	const char*		force_encoding	= encoding_EMPTY;
+	const char*		hostname		= hostname_opera;
+	const char*		ref_charset		= encoding_utf_8;
+	const char*		def_encoding	= encoding_ISO_8859_1;
+	const char*		sys_encoding	= encoding_WIN_1252;
+	OpString		result_string;
+
+	// run and verify status
+	w->SetForceEncoding(force_encoding,false);
+	verify_success(testGuessEncodingFromUrlAndConvertString(org_input,org_charset,doc_charset,w,hostname,ref_charset,def_encoding,sys_encoding,result_string));
+
+	// verify output
+	const char* correct_encoding = encoding_GBK;
+	verify(analyzeResult(org_input,correct_encoding,result_string));
+}
+
+test("tc8 : GBK Stream, GBK Charset : English system")
+{
+	// input
+	const char		org_input[]		= "\xB4\xD4\xC1\xD6\xB4\xF3\xB7\xB4\xB9\xA5\x2E\x74\x78\x74";
+	const char*		org_charset		= encoding_NULL;
+	const char*		doc_charset		= encoding_GBK;
+	const char*		force_encoding	= encoding_EMPTY;
+	const char*		hostname		= hostname_opera;
+	const char*		ref_charset		= encoding_utf_8;
+	const char*		def_encoding	= encoding_ISO_8859_1;
+	const char*		sys_encoding	= encoding_WIN_1252;
+	OpString		result_string;
+
+	// run and verify status
+	w->SetForceEncoding(force_encoding,false);
+	verify_success(testGuessEncodingFromUrlAndConvertString(org_input,org_charset,doc_charset,w,hostname,ref_charset,def_encoding,sys_encoding,result_string));
+
+	// verify output
+	const char* correct_encoding = encoding_GBK;
+	verify(analyzeResult(org_input,correct_encoding,result_string));
+}
+
+// -- Global cleanup -----------------------------------------------------
+
+exit
+{
+}

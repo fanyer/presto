@@ -1,0 +1,259 @@
+/* -*- Mode: c++; tab-width: 4; indent-tabs-mode: t; c-basic-offset: 4 -*-
+ *
+ * Copyright (C) 1995-2011 Opera Software AS.  All rights reserved.
+ *
+ * This file is part of the Opera web browser.	It may not be distributed
+ * under any circumstances.
+ *
+ * @author Arjan van Leeuwen (arjanl)
+ */
+
+group "quick.DesktopWindowCollection";
+
+include "adjunct/quick/models/DesktopWindowCollection.h";
+
+include "adjunct/quick/models/DesktopGroupModelItem.h";
+include "adjunct/quick/windows/DesktopGadget.h";
+include "adjunct/quick/windows/PanelDesktopWindow.h";
+include "adjunct/quick_toolkit/windows/DesktopWindow.h";
+include "adjunct/quick_toolkit/widgets/OpWorkspace.h";
+
+global
+{
+	struct CollectionListener : public DesktopWindowCollection::Listener
+	{
+		virtual void OnDesktopWindowAdded(DesktopWindow* window) { m_added = window; }
+		virtual void OnDesktopWindowRemoved(DesktopWindow* window) { m_removed = window; }
+		virtual void OnDocumentWindowUrlAltered(DocumentDesktopWindow* document_window, const OpStringC& url) { m_altered = document_window; }
+		virtual void OnCollectionItemMoved(DesktopWindowCollectionItem* item, DesktopWindowCollectionItem* old_parent, DesktopWindowCollectionItem* old_previous) {}
+
+		CollectionListener() : m_added(0), m_removed(0), m_altered(0) {}
+		DesktopWindow* m_added;
+		DesktopWindow* m_removed;
+		DocumentDesktopWindow* m_altered;
+	};
+
+	enum WindowConstants {
+		WINDOW_ID_TEST = 0xf00d,
+	};
+
+	struct MockDesktopWindow : public DesktopWindow
+	{
+		virtual Type GetType() { return WINDOW_TYPE_TEST; }
+		virtual INT32 GetID() { return WINDOW_ID_TEST; }
+		virtual OpWorkspace* GetWorkspace() { return &m_workspace; }
+		virtual void Close(BOOL immediately, BOOL user_initiated, BOOL force) { m_closed = TRUE; }
+
+		MockDesktopWindow() : m_closed(FALSE) {}
+		BOOL m_closed;
+		OpWorkspace m_workspace;
+	};
+
+	struct MockBrowserWindow : public MockDesktopWindow
+	{
+		virtual Type GetType() { return WINDOW_TYPE_BROWSER; }
+	};
+}
+
+test("Adding a window")
+{
+	CollectionListener listener;
+	DesktopWindowCollection collection;
+	MockDesktopWindow window;
+	verify_success(collection.AddListener(&listener));
+
+	verify(collection.GetCount() == 0);
+	verify_success(collection.AddDesktopWindow(&window, NULL));
+
+	verify(collection.GetCount() == 1);
+	verify(collection.GetDesktopWindowByID(WINDOW_ID_TEST) == &window);
+	verify(collection.GetDesktopWindowByType(OpTypedObject::WINDOW_TYPE_TEST) == &window);
+	verify(listener.m_added == &window);
+}
+
+test("Close window by type")
+	require success "Adding a window";
+{
+	DesktopWindowCollection collection;
+	MockDesktopWindow window;
+	verify_success(collection.AddDesktopWindow(&window, NULL));
+
+	collection.CloseDesktopWindowsByType(OpTypedObject::WINDOW_TYPE_TEST);
+
+	verify(window.m_closed);
+}
+
+test("Get workspace from browser window")
+	require success "Adding a window";
+{
+	DesktopWindowCollection collection;
+	MockBrowserWindow window, window2;
+	verify_success(collection.AddDesktopWindow(&window, NULL));
+
+	verify(collection.GetWorkspace() == &window.m_workspace);
+
+	// Shouldn't work with more than one browserwindow
+	verify_success(collection.AddDesktopWindow(&window2, NULL));
+
+	verify(!collection.GetWorkspace());
+}
+
+test("Get desktop windows according to type")
+	require success "Adding a window";
+{
+	DesktopWindowCollection collection;
+	MockBrowserWindow browserwindow;
+	MockDesktopWindow window1, window2;
+
+	verify_success(collection.AddDesktopWindow(&browserwindow, NULL));
+	verify_success(collection.AddDesktopWindow(&window1, NULL));
+	verify_success(collection.AddDesktopWindow(&window2, NULL));
+
+	OpVector<DesktopWindow> windows;
+	verify_success(collection.GetDesktopWindows(OpTypedObject::WINDOW_TYPE_TEST, windows));
+
+	verify(windows.GetCount() == 2);
+	verify(windows.Find(&window1) >= 0);
+	verify(windows.Find(&window2) >= 0);
+}
+
+test("Reordering windows")
+	require success "Adding a window";
+{
+	DesktopWindowCollection collection;
+	MockBrowserWindow browserwindow;
+	MockDesktopWindow window1, window2;
+
+	verify_success(collection.AddDesktopWindow(&browserwindow, NULL));
+	verify_success(collection.AddDesktopWindow(&window1, NULL));
+	verify_success(collection.AddDesktopWindow(&window2, NULL));
+
+	collection.ReorderByItem(window1.GetModelItem(), &browserwindow.GetModelItem(), NULL);
+
+	verify(window1.GetModelItem().GetParentItem() == &browserwindow.GetModelItem());
+
+	collection.ReorderByItem(window2.GetModelItem(), &browserwindow.GetModelItem(), &window1.GetModelItem());
+
+	verify(window2.GetModelItem().GetParentItem() == &browserwindow.GetModelItem());
+	verify(window2.GetModelItem().GetPreviousItem() == &window1.GetModelItem());
+}
+
+test("Create a group out of two windows")
+	require success "Reordering windows";
+{
+	DesktopWindowCollection collection;
+	MockBrowserWindow browserwindow;
+	MockDesktopWindow window1, window2;
+
+	verify_success(collection.AddDesktopWindow(&browserwindow, NULL));
+	verify_success(collection.AddDesktopWindow(&window1, NULL));
+	verify_success(collection.AddDesktopWindow(&window2, NULL));
+	collection.ReorderByItem(window1.GetModelItem(), &browserwindow.GetModelItem(), NULL);
+	collection.ReorderByItem(window2.GetModelItem(), &browserwindow.GetModelItem(), &window1.GetModelItem());
+
+	DesktopGroupModelItem* group = collection.CreateGroup(window1.GetModelItem(), window2.GetModelItem());
+
+	verify(group);
+	verify(group->GetParentItem() == &browserwindow.GetModelItem());
+	verify(group->GetChildItem() == &window1.GetModelItem());
+	verify(group->GetLastChildItem() == &window2.GetModelItem());
+}
+
+test("Ungroup windows")
+	require success "Create a group out of two windows";
+{
+	DesktopWindowCollection collection;
+	MockBrowserWindow browserwindow;
+	MockDesktopWindow window1, window2;
+
+	verify_success(collection.AddDesktopWindow(&browserwindow, NULL));
+	verify_success(collection.AddDesktopWindow(&window1, NULL));
+	verify_success(collection.AddDesktopWindow(&window2, NULL));
+	collection.ReorderByItem(window1.GetModelItem(), &browserwindow.GetModelItem(), NULL);
+	collection.ReorderByItem(window2.GetModelItem(), &browserwindow.GetModelItem(), &window1.GetModelItem());
+	DesktopGroupModelItem* group = collection.CreateGroup(window1.GetModelItem(), window2.GetModelItem());
+
+	verify(group);
+	collection.UnGroup(group);
+
+	verify(browserwindow.GetModelItem().GetChildCount() == 2);
+	verify(browserwindow.GetModelItem().GetChildItem() == &window1.GetModelItem());
+	verify(browserwindow.GetModelItem().GetLastChildItem() == &window2.GetModelItem());
+}
+
+test("GetCurrentInputWindow() returns something")
+{
+	DesktopWindow* current_window = g_application->GetDesktopWindowCollection().GetCurrentInputWindow();
+	verify(current_window);
+}
+
+test("Parent/child, ungrouped windows")
+{
+	DesktopWindowCollection collection;
+	MockDesktopWindow window1, window2, window3, window4;
+	OpVector<DesktopWindow> children;
+
+	verify_success(collection.AddDesktopWindow(&window1, NULL));
+
+	verify(window1.GetModelItem().CountDescendants(OpTypedObject::WINDOW_TYPE_TEST) == 0);
+	children.Empty();
+	verify_success(window1.GetModelItem().GetDescendants(children));
+	verify(children.GetCount() == 0);
+
+	verify_success(collection.AddDesktopWindow(&window2, &window1));
+
+	verify(window1.GetModelItem().CountDescendants(OpTypedObject::WINDOW_TYPE_TEST) == 1);
+	children.Empty();
+	verify_success(window1.GetModelItem().GetDescendants(children));
+	verify(children.GetCount() == 1);
+	verify(children.Get(0) == &window2);
+
+	verify_success(collection.AddDesktopWindow(&window3, &window2));
+
+	verify(window2.GetModelItem().CountDescendants(OpTypedObject::WINDOW_TYPE_TEST) == 1);
+	children.Empty();
+	verify_success(window2.GetModelItem().GetDescendants(children));
+	verify(children.GetCount() == 1);
+	verify(children.Get(0) == &window3);
+
+	verify_success(collection.AddDesktopWindow(&window4, &window1));
+
+	verify(window1.GetModelItem().CountDescendants(OpTypedObject::WINDOW_TYPE_TEST) == 3);
+	children.Empty();
+	verify_success(window1.GetModelItem().GetDescendants(children));
+	verify(children.GetCount() == 3);
+	verify(children.Get(0) == &window2);
+	verify(children.Get(1) == &window3);
+	verify(children.Get(2) == &window4);
+}
+
+test("IsAncestorOf() works")
+{
+	DesktopWindowCollection collection;
+	MockDesktopWindow window1, window2, window3, window4;
+
+	verify_success(collection.AddDesktopWindow(&window1, NULL));
+
+	verify(!window1.GetModelItem().IsAncestorOf(window1.GetModelItem()));
+	verify(!window1.GetModelItem().IsAncestorOf(window2.GetModelItem()));
+
+	verify_success(collection.AddDesktopWindow(&window2, &window1));
+
+	verify( window1.GetModelItem().IsAncestorOf(window2.GetModelItem()));
+	verify(!window2.GetModelItem().IsAncestorOf(window1.GetModelItem()));
+
+	verify_success(collection.AddDesktopWindow(&window3, &window1));
+
+	verify( window1.GetModelItem().IsAncestorOf(window2.GetModelItem()));
+	verify( window1.GetModelItem().IsAncestorOf(window3.GetModelItem()));
+	verify(!window2.GetModelItem().IsAncestorOf(window1.GetModelItem()));
+	verify(!window3.GetModelItem().IsAncestorOf(window1.GetModelItem()));
+	verify(!window2.GetModelItem().IsAncestorOf(window3.GetModelItem()));
+	verify(!window3.GetModelItem().IsAncestorOf(window2.GetModelItem()));
+
+	verify_success(collection.AddDesktopWindow(&window4, NULL));
+
+	verify(!window4.GetModelItem().IsAncestorOf(window1.GetModelItem()));
+	verify(!window4.GetModelItem().IsAncestorOf(window2.GetModelItem()));
+	verify(!window4.GetModelItem().IsAncestorOf(window3.GetModelItem()));
+}

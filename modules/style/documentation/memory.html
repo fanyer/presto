@@ -1,0 +1,232 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01//EN">
+<html lang="en" dir="ltr">
+<head>
+ <meta http-equiv="Content-Type" content="text/html;charset=iso-8859-1">
+ <title>Style Module Memory Documentation</title>
+ <link rev="made" href="mailto:rune@opera.com">
+ <link rel="stylesheet" href="../../coredoc/coredoc.css" type="text/css" media="all">
+ <link rel="contents" href="../../coredoc/index.html" type="text/html" title="Core API">
+ <style type="text/css">
+  pre { border-left: 2px solid #ddd; }
+ </style>
+</head>
+
+<body>
+<h1>Style Module Memory Documentation</h1>
+
+<h2>Used OOM policies</h2>
+<p>
+The CSSManager interface methods leave when OOM
+occurs. SaveCSSWithInline(L) has two versions. One that leaves and one
+returning OP_STATUS. The CSS parser leaves, but is trapped before it
+reaches other modules through methods in the CSS class. RaiseCondition
+is never used within the style module.
+</p>
+
+<h2>Who is handling OOM?</h2>
+<p>
+An OOM situation during parsing of a style sheet needs to be handled
+by the module calling
+CSS::Load/LoadHtmlStyleAttr/LoadDOMStyleValue. The CSS object may
+represent a partially loaded style sheet, so the best thing is
+probably to delete the CSS object. The OOM failure is returned as an
+OP_STATUS and is handled by the logdoc and dom modules.
+</p>
+
+<h2>Description of flow</h2>
+<h3>Loading style</h3>
+<p>
+The CSS class has three entry points for parsing style. Load is called
+from HTML_Element::LoadStyle (logdoc) for parsing full stylesheets,
+where the HTML_Element is a LINK or STYLE element referring to the
+style source. Imported stylesheets are loaded through dummy LINK
+elements.
+</p>
+<p>
+LoadHtmlStyleAttr is used when parsing an html style attribute string
+(logdoc), and LoadDOMStyleValue is called from the dom module via
+SetProperty. The two latter produces a CSS_property_list object, while
+the former produces a CSS object.
+</p>
+
+<h3>CSSCollection</h3>
+<p>
+Only GetProperties and GetPageProperties are interesting when it comes
+to memory handling. They can fail if allocating new CSS_Elm objects for
+the selected properties fail. CSS_Elm are used as container elements
+for CSS_decl objects which are selected for a given html element
+during layout/display.
+</p>
+
+<h3>CSS Save</h3>
+<p>
+SaveCSSWithInline, which returns an OP_STATUS, is called from
+SaveHtmlWithInline (logdoc) as a part of saving a document locally.
+</p>
+
+<h3>Local stylesheets</h3>
+<p>
+Local stylesheets like user stylesheets, style for wml, mail, etc. Is
+loaded at startup and kept in memory until Opera exits. Some of them might be
+replaced by a reload during execution of Opera if preference settings
+change.
+</p>
+
+<h2>Heap memory usage</h2>
+<p>
+Heap memory usage is depending on the size of the stylesheets. The
+source code is stored in the HTML_Element as an ATTR_SRC_LIST, even
+after it is parsed and kept there until the element is deleted or
+changed via DOM. This is not really done in the style module, but
+still worth mentioning. The parsed style sheet is stored in various
+objects for representing selectors, rulesets, and declarations. All
+kept alive and referenced via CSS class objects. The CSS objects are
+kept alive by the document to which it belongs via HLDocProfile.
+</p>
+<p>
+Additionally, the CSSManager contains CSS objects for the various
+loaded user stylesheets. They are loaded at startup and lives for the
+entire lifetime of the browser.
+</p>
+
+<h2>Stack memory usage</h2>
+<p>
+CSS_Ruleset::Match is called recursively. Max call depth depends on
+the number of simple selectors combined in a selector.
+</p>
+
+<h3>Bison parser</h3>
+<p>
+There is one recursive rule in the grammar which is not
+left-recursive. That is the rule for selector which is a combination
+of simple selectors. So a very long list of combined simple selectors
+will use a proportional amount of stack space:
+</p>
+<p>
+<code>
+DIV > DIV > DIV > DIV > DIV > DIV > ...
+</code>
+<p>
+All other rules use left recursion, so the stack usage will be
+shallow. YYINITDEPTH defaults to 200, but could of course be set to
+something else if required.
+</p>
+
+<h2>Static memory usage</h2>
+<p>
+<ul>
+<li>A global CSSManager object (g_cssManager)</li>
+<li>Various bison state machine jump tables</li>
+<li>String tables for CSS identifiers (properties, values, media
+types, media features, pseudo)</li>
+</ul>
+</p>
+
+<h2>Caching and freeing memory</h2>
+<p>
+The parsed style information is stored with the document. If deleting
+the style information (CSS objects) without deleting the document is
+desired, deleting them is the responsibility of the document code
+(logdoc module).
+</p>
+
+<h2>Freeing memory on exit</h2>
+<p>
+The CSSManager object containing the local stylesheets is deleted in
+the Terminate function of initcore. All other non-static memory
+allocated via the style module is deleted with their respective
+document.
+</p>
+
+<h2>Temp buffers</h2>
+
+<h3>Current use of MemoryManager temporary buffers</h3>
+<p>
+FormatCssValueL and FormatCssNumberL uses GetTempBuf2k() to format
+numbers, colors, and keywords.
+</p>
+<p>
+Used a couple of places in the grammar in css_grammar.y to temporarily
+get the namespace URI and name for adding a namespace and retrieving
+the namespace idx.
+</p>
+<p>
+GetMediaTypeString uses GetTempBuf() tempbuffer to return a media
+string from a media type bit set.
+</p>
+<p>
+HTML_Element attributes are copied into GetTempBuf2() to get tokenized
+for matching attribute selectors.
+</p>
+
+<h3>Safety</h3>
+<p>
+FormatCssValueL and FormatCssNumberL use the tempbuffer to convert
+numbers to strings using system functions and they copy the result
+into a non-shared growable heap-buffer right away. So they won't be
+overwritten. I have not checked whether the code calling into this
+part of the style module (dom) is depending on temp buffers.
+</p>
+<p>
+The attribute matching code is safe, because it is only using string
+comparison and tokenization calls on the tempbuffer before it's
+finished using the buffer.
+</p>
+<p>
+GetMediaTypeString is not safe, because it is returned and used
+virtually everywhere. One interesting part is that GetMediaTypeString
+is used to retrieve the html element attribute value used for
+attribute selector matching. So in the case of matching the media
+attribute, the attribute is first generated into the GetTempBuf buffer
+and then copied into the GetTempBuf2 buffer to be tokenized.
+</p>
+
+<h3>Rewrite</h3>
+<p>
+The tempbuffer use in FormatCssValueL and FormatCssNumberL can
+easily be rewritten to use fixed size stack allocated strings, because
+the maximum size needed for converting a number to a string is
+relatively small and well known.
+</p>
+<p>
+GetMediaTypeString is trickier because the string is returned upwards
+with all the other attribute strings which are not supposed to be
+freed by the caller.
+</p>
+
+<h2>Memory tuning</h2>
+<p>
+CSS_Buffer class uses less inlining when LIMITED_FOOTPRINT_DEVICE is defined.
+</p>
+
+<h2>Tests</h2>
+<p>
+None.
+</p>
+
+<h2>Coverage</h2>
+<p>
+<ul>
+<li><a href="http://www.richinstyle.com">RichInStyle</a></li>
+<li>Opera's DOM CSS tests</li>
+<li>Save with images as (page with linked CSS)</li>
+</ul>
+</p>
+
+<h2>Design choices</h2>
+<p>
+CSS_Buffer class was designed to use the buffers from the DataSrcElm
+objects to avoid duplicating the source. This has probably increased
+the footprint a bit to handle strings across buffer boundaries
+etc. Other design choices has been to minimize memory use by using
+limited-size bitfields for storing pseudo elements/classes, and
+integer types with low min/max values.
+</p>
+
+<h2>Suggestions of improvements</h2>
+<p>
+None.
+</p>
+
+</body>
+</html>

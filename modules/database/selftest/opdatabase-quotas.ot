@@ -1,0 +1,879 @@
+/* -*- Mode: c++; tab-width: 4; indent-tabs-mode: t; c-basic-offset: 4 -*-
+ *
+ * Copyright (C) 2009-2011 Opera Software ASA.  All rights reserved.
+ *
+ * This file is part of the Opera web browser.
+ * It may not be distributed under any circumstances.
+ */
+
+group "database.opdatabase.quotas";
+
+require init;
+require SUPPORT_DATABASE_INTERNAL;
+
+language c++;
+
+include "modules/database/opdatabase.h";
+include "modules/hardcore/timer/optimer.h";
+include "modules/dochand/win.h";
+include "modules/doc/frm_doc.h";
+include "modules/windowcommander/src/WindowCommander.h";
+
+global
+{
+	OP_STATUS status;
+
+	// Need to override the normal document listener not to trigger
+	// a dialog for the quota exceeded handling.
+	class QuotaTestDocListener : public NullDocumentListener
+	{
+	public:
+		QuotaTestDocListener() : m_listener(NULL), m_handling(PS_Policy::KQuotaDeny) {}
+
+		void SetUserReply(PS_Policy::QuotaHandling user_handling) { m_handling = user_handling; }
+		/**
+		 * Returns FALSE if it failed to setup the listener !!
+		 */
+		BOOL ReplaceListener()
+		{
+			if (m_listener != this)
+			{
+				if (g_selftest.utils->doc)
+				{
+					OpDocumentListener *candidate = g_selftest.utils->doc->GetWindow()->GetWindowCommander()->GetDocumentListener();
+					if (candidate != this)
+					{
+						m_listener = candidate;
+						g_selftest.utils->doc->GetWindow()->GetWindowCommander()->SetDocumentListener(this);
+					}
+					return TRUE;
+				}
+				return FALSE;
+			}
+			return TRUE;
+		}
+		~QuotaTestDocListener() { ResetListener(); }
+		void	ResetListener()
+		{
+			if (m_listener != this && g_selftest.utils != NULL && g_selftest.utils->GetWindow() != NULL &&
+				g_selftest.utils->GetWindow()->GetWindowCommander() != NULL &&
+				g_selftest.utils->GetWindow()->GetWindowCommander()->GetDocumentListener() == this)
+			{
+				g_selftest.utils->GetWindow()->GetWindowCommander()->SetDocumentListener(m_listener);
+			}
+			m_listener = NULL;
+		}
+
+		void OnIncreaseQuota(OpWindowCommander* commander, const uni_char* db_name, const uni_char* db_domain, const uni_char* db_type, OpFileLength current_quota_size, OpFileLength quota_hint, QuotaCallback *callback)
+		{
+			if (m_handling == PS_Policy::KQuotaDeny)
+				callback->OnQuotaReply(FALSE, 0);
+			else
+				callback->OnQuotaReply(TRUE, m_handling == PS_Policy::KQuotaAskUser ? quota_hint : 0);
+		}
+
+	private:
+		OpDocumentListener*	m_listener;
+		PS_Policy::QuotaHandling	m_handling;
+	};
+
+#undef SQL_WRAP
+#define SQL_WRAP(s) SqlText(SqlText::CONST_16BIT, UNI_L(s), sizeof(s) - 1)
+
+#undef SELFTEST_URLCTXID
+#define SELFTEST_URLCTXID 0
+#undef WEBDB_SELFTEST_ORIGIN
+#define WEBDB_SELFTEST_ORIGIN UNI_L("http://opera.selftest")
+
+	//each instance stores the status of a single test
+	class TestStatus;
+	List<TestStatus> all_status;
+	class TestStatusLinkBase : public ListElement<TestStatusLinkBase>
+	{
+	public:
+		TestStatus *test_status;
+		TestStatusLinkBase(TestStatus* _test_status) : test_status(_test_status) {}
+		~TestStatusLinkBase() {}
+	};
+	class TestStatus: public ListElement<TestStatus>, public OpTimer, public OpTimerListener
+	{
+		unsigned m_flags;
+		enum TestStatusFlags {IS_RUNNING=1,CAN_DELETE=2,BEGIN_DELETED=4};
+		BOOL GetFlag(unsigned flag) const{return (m_flags&flag)!=0;}
+		void SetFlag(unsigned flag) {m_flags|=flag;}
+		void UnsetFlag(unsigned flag) {m_flags&=~flag;}
+
+		List<TestStatusLinkBase> callbacks;
+		TestStatus* test_status;
+	public:
+		WSD_Database* m_db;
+		SqlTransaction* m_transaction;
+		PS_Manager* ps_manager;
+
+		TestStatus(List<TestStatus>* h)
+			: m_flags(IS_RUNNING), test_status(this), m_db(NULL), m_transaction(NULL), ps_manager(NULL) {
+			Into(h);
+			SetTimerListener(this);
+		//	Start(2000); // Start the timer.
+		}
+		static TestStatus* Create(List<TestStatus>* h)
+		{
+			return OP_NEW(TestStatus, (h));
+		}
+		~TestStatus() {
+			OP_ASSERT(!GetFlag(BEGIN_DELETED));
+			SetFlag(BEGIN_DELETED);
+			Out();
+			Passed();
+			TestStatusLinkBase *n = callbacks.First(), *m;
+			while(n != NULL) {
+				m = n->Suc();
+				n->test_status = NULL;
+				n->Out();
+				OP_DELETE(n);
+				n = m;
+			}
+			OP_DELETE(ps_manager);
+			ps_manager = NULL;
+		}
+
+		virtual void OnTimeOut(OpTimer* timer) { OpStatus::Ignore(OnTimeOut()); }
+		OP_STATUS OnTimeOut();
+
+		void Finish() {
+			UnsetFlag(IS_RUNNING);
+			if (m_transaction != NULL) {
+				SqlTransaction *transaction = m_transaction;
+				m_transaction = NULL;
+				OpStatus::Ignore(transaction->Release());
+			}
+			if (m_db != NULL) {
+				WSD_Database *db = m_db;
+				m_db = NULL;
+				OpStatus::Ignore(db->Release());
+			}
+		}
+		BOOL IsTestRunning() const{
+			return GetFlag(IS_RUNNING);
+		}
+		void AddCallback(TestStatusLinkBase *callback) {
+			callback->Into(&callbacks);
+			callback->test_status = this;
+		}
+		void RemoveCallback(TestStatusLinkBase *callback) {
+			callback->test_status = NULL;
+			callback->Out();
+			if (!HasRunningCallbacks() && GetFlag(CAN_DELETE) )
+				if (!GetFlag(BEGIN_DELETED))
+					OP_DELETE(this);
+		}
+		BOOL HasRunningCallbacks() const{return callbacks.First() != NULL;}
+		unsigned NumberOfRunningCallbacks() const{return callbacks.Cardinal();}
+		void SetCanDelete(BOOL force) {
+			SetFlag(CAN_DELETE);
+			if (!IsTestRunning() || !HasRunningCallbacks() || force)
+				if (!GetFlag(BEGIN_DELETED))
+					OP_DELETE(this);
+		}
+		void Passed()
+		{
+			if (IsTestRunning())
+			{
+				Finish();
+				ST_passed();
+			}
+		}
+	};
+	void DeleteAllStatus(BOOL force)
+	{
+		TestStatus* n = (TestStatus*)all_status.First();
+		while(n != NULL)
+		{
+			TestStatus *m = (TestStatus*)n->Suc();
+			n->Out();
+			n->SetCanDelete(force);
+			n = m;
+		}
+		OP_ASSERT(all_status.First() == NULL);
+	}
+
+	static BOOL _verify(BOOL b, unsigned line_number, const char *msg, TestStatus *test_status) {
+		if(!b && test_status != NULL && test_status->IsTestRunning()) {
+			test_status->Finish();
+			char buf[1000]={0}; /* ARRAY OK 2009-05-20 joaoe */
+			op_snprintf(buf,999,"\b\b\b%d: %s should be true", line_number, msg);
+			ST_failed(buf);
+		}
+		return b;
+	}
+
+	static BOOL _verify(const void* p, unsigned line_number, const char *msg, TestStatus *test_status) {
+		return _verify(p != NULL, line_number, msg, test_status);
+	}
+
+	static void IgnorePtr(const void*p) { }
+	static void IgnorePtr(int p) { }
+
+#undef verify
+#define verify(b) do{ \
+	if(!_verify(b,__LINE__,#b,test_status)) {return OpStatus::ERR;} }while(0)
+
+#undef verifyl
+#define verifyl(b) do{ \
+	if(!_verify(b,0,       #b,test_status)) {return OpStatus::ERR;} }while(0)
+
+	OP_STATUS TestStatus::OnTimeOut()
+	{
+		verify(!"Test timed out");
+		return OpStatus::OK;
+	}
+
+//callback section common to success and error callbacks
+#undef CALLBACK_SECTION_START
+#define CALLBACK_SECTION_START(type, argument) \
+	class type : public SqlStatement::Callback, public TestStatusLinkBase { \
+		OP_STATUS status; \
+	public: \
+		type(TestStatus *_test_status) : TestStatusLinkBase(_test_status) { \
+			test_status->AddCallback(this);\
+		} \
+		virtual ~type() {}\
+		virtual void Discard() { \
+			if (test_status != NULL) { \
+				TestStatus* _test_status = test_status; \
+				if (_test_status->NumberOfRunningCallbacks()<=1) { \
+					_test_status->Passed(); \
+				} \
+				_test_status->RemoveCallback(this);\
+				test_status = NULL; \
+			} \
+			OP_DELETE(static_cast<TestStatusLinkBase*>(this)); \
+		} \
+		virtual BOOL RequiresCaching() const{ return FALSE; } \
+		virtual OP_STATUS HandleCallback(SqlResultSet* result_set) { \
+			status = OpStatus::OK;\
+			if (test_status != NULL && test_status->IsTestRunning()) \
+				status = HandleCallbackCustom(result_set); \
+			OP_DELETE(result_set); \
+			return status; \
+		} \
+		virtual Window*	GetWindow() { return g_selftest.utils->GetWindow(); } \
+		virtual OpFileLength GetPreferredSize() { return 32000; } \
+		const uni_char* GetDisplayName() { return NULL; } \
+		virtual OP_STATUS HandleError(OP_STATUS error, const uni_char* error_message, BOOL is_fatal) { \
+			DB_DBG(("Error code: %d %S\n", error, error_message)) \
+			OP_DELETEA(const_cast<uni_char*>(error_message)); \
+			verify(!"Error callback called"); \
+			return OpStatus::ERR; \
+		} \
+		OP_STATUS HandleCallbackCustom(SqlResultSet* result_set) {\
+			PS_Manager*& ps_manager = test_status->ps_manager; \
+			WSD_Database*& db = test_status->m_db; \
+			SqlTransaction*& transaction = test_status->m_transaction;\
+			if (transaction == NULL) return OpStatus::ERR; \
+			IgnorePtr(ps_manager); \
+			IgnorePtr(db);\
+			IgnorePtr(transaction);
+			//dbg_printf(#type "::HandleCallbackCustom(%d,%x)\n",argument,argument);
+
+#undef CALLBACK_SECTION_END
+#define CALLBACK_SECTION_END(type) return OpStatus::OK;}};
+
+//error callback section
+#undef CALLBACK_ERROR_SECTION_START
+#define CALLBACK_ERROR_SECTION_START(type, argument) \
+	class type : public SqlStatement::Callback, public TestStatusLinkBase { \
+		OP_STATUS status; \
+	public: \
+		type(TestStatus *_test_status) : TestStatusLinkBase(_test_status) { \
+			test_status->AddCallback(this);\
+		} \
+		virtual ~type() {}\
+		virtual void Discard() { \
+			if (test_status != NULL) { \
+				TestStatus* _test_status = test_status; \
+				if (_test_status->NumberOfRunningCallbacks()<=1) { \
+					_test_status->Passed(); \
+				} \
+				_test_status->RemoveCallback(this);\
+				test_status = NULL; \
+			} \
+			OP_DELETE(static_cast<TestStatusLinkBase*>(this)); \
+		} \
+		virtual BOOL RequiresCaching() const{ return FALSE; } \
+		virtual OP_STATUS HandleCallback(SqlResultSet* result_set) { \
+			verify(!"Error callback should have been called instead"); \
+			OP_DELETE(result_set); \
+			return status; \
+		} \
+		virtual Window*	GetWindow() { return g_selftest.utils->GetWindow(); } \
+		virtual OpFileLength GetPreferredSize() { return 32000; } \
+		const uni_char* GetDisplayName() { return NULL; } \
+		virtual OP_STATUS HandleError(OP_STATUS error, const uni_char* error_message, BOOL is_fatal) { \
+			status = OpStatus::OK;\
+			if (test_status != NULL && test_status->IsTestRunning()) \
+				status = HandleErrorCustom(error, error_message); \
+			OP_DELETEA(const_cast<uni_char*>(error_message)); \
+			return status; \
+		} \
+		OP_STATUS HandleErrorCustom(OP_STATUS argument, const uni_char* error_message) { \
+			PS_Manager*& ps_manager = test_status->ps_manager; \
+			WSD_Database*& db = test_status->m_db; \
+			SqlTransaction*& transaction = test_status->m_transaction;\
+			if (transaction == NULL) return OpStatus::ERR; \
+			IgnorePtr(ps_manager); \
+			IgnorePtr(db);\
+			IgnorePtr(transaction);
+			//dbg_printf(#type "::HandleCallbackCustom(%d,%x)\n",argument,argument);
+
+#define CALLBACK_ERROR_SECTION_END(type) CALLBACK_SECTION_END(type)
+
+#define CALLBACK_OBJECT_DECL(type, var_name) \
+	type* var_name = OP_NEW(type, (test_status)); \
+	verify(var_name != NULL);
+
+//Generic class to handle all errors
+CALLBACK_ERROR_SECTION_START(SqlErrorCallbackFailed,error_code)
+
+	output("Error code: %d, %s\n", error_code, error_message);
+	verify(!"Error callback called");
+
+CALLBACK_ERROR_SECTION_END(SqlErrorCallbackFailed)
+
+#undef ASYNC_TEST_START
+#define ASYNC_TEST_START \
+	class ASYNC_TEST_WRAP_TEMP{\
+	public:\
+		static OP_STATUS do_test(List<TestStatus>* all_status, PS_Policy* test_case_policy_1, QuotaTestDocListener& test_listener) { \
+			TestStatus* test_status = TestStatus::Create(all_status); \
+			verifyl(test_status != NULL); \
+			verifyl(OpStatus::IsSuccess(do_test_wrapper(all_status, test_case_policy_1, test_listener, test_status))); \
+			return OpStatus::OK; \
+		} \
+		static OP_STATUS do_test_wrapper(List<TestStatus>* all_status, PS_Policy* test_case_policy_1,\
+				QuotaTestDocListener& test_listener, TestStatus *test_status) { \
+			OP_STATUS status = OpStatus::OK;\
+			OpStatus::Ignore(status);\
+			PS_Manager*& ps_manager = test_status->ps_manager; \
+			WSD_Database*& db = test_status->m_db; \
+			SqlTransaction*& transaction = test_status->m_transaction; \
+			ps_manager = PS_Manager::NewForSelfTest(); \
+			if (ps_manager == NULL) verifyl(!"OOM"); \
+			PS_Object* ps_obj; \
+			status = ps_manager->GetObject(PS_ObjectTypes::KWebDatabases,WEBDB_SELFTEST_ORIGIN,UNI_L("name"),TRUE,SELFTEST_URLCTXID,&ps_obj); \
+			verifyl(OpStatus::IsSuccess(status)); \
+			db = static_cast<WSD_Database*>(ps_obj); \
+			transaction = db->CreateTransactionAsync(FALSE); \
+			verifyl(transaction != NULL); \
+			IgnorePtr(ps_manager); \
+			IgnorePtr(db); \
+			IgnorePtr(transaction);
+
+#undef ASYNC_TEST_END
+#define ASYNC_TEST_END \
+			db->Release(); \
+			db = NULL; \
+			return OpStatus::OK;}}; \
+	OpStatus::Ignore(ASYNC_TEST_WRAP_TEMP::do_test(&all_status,&test_case_policy_1,test_listener));
+
+	class OpTestcasePolicy_1 : public OpDefaultGlobalPolicy
+	{
+	public:
+		OpTestcasePolicy_1(PS_Policy* parent = NULL) : OpDefaultGlobalPolicy(parent), m_origin_quota(8*1024){}
+		virtual ~OpTestcasePolicy_1() {}
+
+		virtual OpFileLength GetAttribute(SecAttrUint64 attr, URL_CONTEXT_ID context_id, const uni_char* domain = NULL, const Window* window = NULL) const
+		{
+			switch(attr) {
+			case KGlobalQuota:
+				return 32*1024;
+			case KOriginQuota:
+				return m_origin_quota;
+			}
+			return OpDefaultGlobalPolicy::GetAttribute(attr, context_id, domain, window);
+		}
+		virtual unsigned GetAttribute(SecAttrUint attr, URL_CONTEXT_ID context_id, const uni_char* domain = NULL, const Window* window = NULL) const
+		{
+			switch(attr) {
+			case KQueryExecutionTimeout:
+				return 1000;
+			case KOriginExceededHandling:
+				return PS_Policy::KQuotaAskUser;
+			}
+			return OpDefaultGlobalPolicy::GetAttribute(attr, context_id, domain, window);
+		}
+		virtual OP_STATUS SetAttribute(SecAttrUint64 attr, URL_CONTEXT_ID context_id, OpFileLength new_value, const uni_char* domain = NULL, const Window* window = NULL)
+		{
+			if (attr == KOriginQuota)
+				m_origin_quota = new_value;
+			return OpStatus::OK;
+		}
+		virtual OP_STATUS SetAttribute(SecAttrUint attr, URL_CONTEXT_ID context_id, unsigned new_value, const uni_char* domain = NULL, const Window* window = NULL)
+		{
+			return OpStatus::OK;
+		}
+
+	private:
+		OpFileLength m_origin_quota;
+	};
+
+	OpTestcasePolicy_1 test_case_policy_1;
+
+	// replace the normal OpDocumentListener with a special one for tests
+	QuotaTestDocListener test_listener;
+
+	OP_STATUS GetDatabase(PS_Manager* ps_manager, const uni_char* name, WSD_Database** db)
+	{
+		PS_Object* ps_obj;
+		RETURN_IF_ERROR(ps_manager->GetObject(PS_ObjectTypes::KWebDatabases, WEBDB_SELFTEST_ORIGIN, name,TRUE,SELFTEST_URLCTXID,&ps_obj));
+		*db = static_cast<WSD_Database*>(ps_obj);
+		return OpStatus::OK;
+	}
+}
+
+setup
+{
+	DATABASE_MODULE_ADD_CONTEXT(0, OPFILE_PERSISTENT_STORAGE_FOLDER);
+}
+
+test("Test single database sync")
+{
+	PS_Manager *ps_manager = NULL;
+	WSD_Database* db = NULL;
+	SqlTransaction* transaction = NULL;
+	SqlValueList *params;
+
+	verify_not_oom(ps_manager = PS_Manager::NewForSelfTest());
+
+	verify_success(GetDatabase(ps_manager, UNI_L("name"), &db));
+	verify(db != NULL);
+
+	//this function purges the datafile, if any, synchronously
+	ps_manager->DeleteObject(db->GetType(), db->GetOrigin(), db->GetName(),
+			db->IsPersistent(), db->GetUrlContextId());
+
+	transaction = db->CreateTransactionSync(FALSE);
+	verify(transaction != NULL);
+
+	db->SetPolicy(&test_case_policy_1);
+
+	// create the table
+	verify(OpStatus::IsSuccess(transaction->ExecuteSql(SQL_WRAP("create table t (id INTEGER PRIMARY KEY, data);"))));
+
+	// insert a row
+	const static unsigned str_len = 16*1024;
+	uni_char big_str[str_len + 1]; /* ARRAY OK 2009-05-20 joaoe */
+	for(unsigned k=0; k < str_len ; k++)
+		big_str[k] = op_rand() % 26 + 'a';
+	big_str[str_len] = 0;
+
+	verify_not_oom(params = SqlValueList::Make(1));
+	OpAutoPtr<SqlValueList> params_ptr(params);
+
+	verify_success(params->values[0].SetString(big_str, str_len));
+
+	params_ptr.release();
+
+	status = transaction->ExecuteSql(SQL_WRAP("insert into t (data) values (?);"), params);
+
+	verify(PS_Status::ERR_QUOTA_EXCEEDED == status);
+
+	status = transaction->Release();
+	transaction = NULL;
+	verify(OpStatus::IsSuccess(status));
+
+	status = db->Release();
+	db = NULL;
+	verify(OpStatus::IsSuccess(status));
+}
+finally
+{
+	//SqlStatment::DELETE_SqlValueArray(params);
+	if (transaction != NULL)
+		OpStatus::Ignore(transaction->Release());
+	transaction = NULL;
+	if (db != NULL)
+		OpStatus::Ignore(db->Release());
+	db = NULL;
+	OP_DELETE(ps_manager);
+}
+
+test("Test single database async, user does not want to increase") async;
+{
+
+	ASYNC_TEST_START;
+
+	test_listener.SetUserReply(PS_Policy::KQuotaDeny);
+	verify(test_listener.ReplaceListener());
+
+	//Create table callback
+	CALLBACK_SECTION_START(SqlCallback_1,result_set)
+
+		verify(result_set);
+
+		//last callback
+		CALLBACK_ERROR_SECTION_START(SqlErrorCallbackFailed_2, error_code)
+
+			verify(error_code == PS_Status::ERR_QUOTA_EXCEEDED);
+
+		CALLBACK_ERROR_SECTION_END(SqlErrorCallbackFailed_2)
+
+		const static unsigned str_len = 16*1024;
+		uni_char big_str[str_len + 1]; /* ARRAY OK 2009-05-20 joaoe */
+		for(unsigned k=0;k<str_len;k++)
+			big_str[k] = op_rand()%26+'a';
+		big_str[str_len] = 0;
+
+		CALLBACK_OBJECT_DECL(SqlErrorCallbackFailed_2, cb2);
+
+		SqlValueList *params;
+
+		verify(params = SqlValueList::Make(1));
+		OpAutoPtr<SqlValueList> params_ptr(params);
+
+		verify(OpStatus::IsSuccess(params->values[0].SetString(big_str, str_len)));
+
+		params_ptr.release();
+
+		//queue 1st insert
+		verify(OpStatus::IsSuccess(transaction->ExecuteSql(SQL_WRAP("insert into t (data) values (?);"), params, cb2)));
+
+	CALLBACK_SECTION_END(SqlCallback_1)
+	CALLBACK_OBJECT_DECL(SqlCallback_1, cb1);
+
+	db->SetPolicy(test_case_policy_1);
+
+	// create the table
+	verify(OpStatus::IsSuccess(transaction->ExecuteSql(SQL_WRAP("create table t (data TEXT);"), NULL, cb1)));
+
+	ASYNC_TEST_END;
+}
+
+test("Test origin database sync")
+{
+	PS_Manager *ps_manager = NULL;
+
+	WSD_Database* db_1 = NULL;
+	SqlTransaction* transaction_1 = NULL;
+
+	WSD_Database* db_2 = NULL;
+	SqlTransaction* transaction_2 = NULL;
+
+	SqlValueList *params = NULL;
+
+	verify_not_oom(ps_manager = PS_Manager::NewForSelfTest());
+
+	verify(OpStatus::IsSuccess(GetDatabase(ps_manager, UNI_L("name1"), &db_1)));
+	verify(db_1 != NULL);
+	transaction_1 = db_1->CreateTransactionSync(FALSE);
+	verify(transaction_1 != NULL);
+
+	verify(OpStatus::IsSuccess(GetDatabase(ps_manager, UNI_L("name2"), &db_2)));
+	verify(db_2 != NULL);
+	transaction_2 = db_2->CreateTransactionSync(FALSE);
+	verify(transaction_2 != NULL);
+
+	verify(db_2!=db_1);
+
+	db_1->SetPolicy(&test_case_policy_1);
+	db_2->SetPolicy(&test_case_policy_1);
+
+	OpFileLength file_size, available_size, new_file_size;
+
+	// create the table
+	verify(OpStatus::IsSuccess(transaction_1->ExecuteSql(SQL_WRAP("create table t (id INTEGER PRIMARY KEY, data);"))));
+
+	verify(OpStatus::IsSuccess(transaction_1->GetSize(&file_size)));
+	verify(OpStatus::IsSuccess(transaction_1->CalculateAvailableDataSize(&available_size)));
+
+	//first transaction - it has all the space available to itself
+	verify(available_size == MIN(
+			test_case_policy_1.GetAttribute(PS_Policy::KOriginQuota, SELFTEST_URLCTXID),
+			test_case_policy_1.GetAttribute(PS_Policy::KGlobalQuota, SELFTEST_URLCTXID)));
+
+	const static unsigned str_len = 8*1024;
+	uni_char big_str[str_len + 1]; /* ARRAY OK 2009-05-20 joaoe */
+	for(unsigned k=0;k<str_len;k++)
+		big_str[k] = op_rand()%26+'a';
+	big_str[str_len] = 0;
+
+	const static unsigned str_len_inserted_1 = 2*1024;
+	{
+		verify(params = SqlValueList::Make(1));
+		OpAutoPtr<SqlValueList> params_ptr(params);
+
+		verify_success(params->values[0].SetString(big_str, str_len_inserted_1));
+
+		params_ptr.release();
+
+		status = transaction_1->ExecuteSql(SQL_WRAP("insert into t (data) values (?);"), params);
+	}
+
+	verify(PS_Status::ERR_QUOTA_EXCEEDED != status);
+	verify(OpStatus::IsSuccess(status));
+
+	verify(OpStatus::IsSuccess(transaction_1->GetSize(&new_file_size)));
+	verify(OpStatus::IsSuccess(transaction_1->CalculateAvailableDataSize(&available_size)));
+
+	//because the insert failed the size must be the same
+	verify(new_file_size > str_len_inserted_1);
+	verify(new_file_size > file_size);
+	verify(available_size <= test_case_policy_1.GetAttribute(PS_Policy::KOriginQuota, SELFTEST_URLCTXID));
+	verify(available_size <= test_case_policy_1.GetAttribute(PS_Policy::KGlobalQuota, SELFTEST_URLCTXID));
+
+	verify(OpStatus::IsSuccess(transaction_2->ExecuteSql(SQL_WRAP("create table t (id INTEGER PRIMARY KEY, data);"))));
+
+	verify(OpStatus::IsSuccess(transaction_2->GetSize(&file_size)));
+	verify(OpStatus::IsSuccess(transaction_2->CalculateAvailableDataSize(&available_size)));
+
+	//second transaction.. unlike the previous one, there is less space available
+	verify(available_size < MIN(
+			test_case_policy_1.GetAttribute(PS_Policy::KOriginQuota, SELFTEST_URLCTXID),
+			test_case_policy_1.GetAttribute(PS_Policy::KGlobalQuota, SELFTEST_URLCTXID)));
+
+	const static unsigned str_len_inserted_2 = 4*1024;
+	{
+		verify(params = SqlValueList::Make(1));
+		OpAutoPtr<SqlValueList> params_ptr(params);
+
+		verify_success(params->values[0].SetString(big_str, str_len_inserted_2));
+
+		params_ptr.release();
+
+		status = transaction_2->ExecuteSql(SQL_WRAP("insert into t (data) values (?);"), params);
+	}
+	verify(PS_Status::ERR_QUOTA_EXCEEDED == status);
+
+	verify(OpStatus::IsSuccess(transaction_2->GetSize(&new_file_size)));
+	verify(OpStatus::IsSuccess(transaction_2->CalculateAvailableDataSize(&available_size)));
+
+	//check last inserted string
+	verify(file_size == new_file_size);
+	verify(available_size <= test_case_policy_1.GetAttribute(PS_Policy::KOriginQuota, SELFTEST_URLCTXID));
+	verify(available_size <= test_case_policy_1.GetAttribute(PS_Policy::KGlobalQuota, SELFTEST_URLCTXID));
+
+	status = transaction_1->Release();
+	transaction_1 = NULL;
+	verify(OpStatus::IsSuccess(status));
+
+	status = db_1->Release();
+	db_1 = NULL;
+	verify(OpStatus::IsSuccess(status));
+
+	status = transaction_2->Release();
+	transaction_2 = NULL;
+	verify(OpStatus::IsSuccess(status));
+
+	status = db_2->Release();
+	db_2 = NULL;
+	verify(OpStatus::IsSuccess(status));
+}
+finally
+{
+	if (transaction_1 != NULL)
+		OpStatus::Ignore(transaction_1->Release());
+	transaction_1 = NULL;
+	if (db_1 != NULL)
+		OpStatus::Ignore(db_1->Release());
+	db_1 = NULL;
+	if (transaction_2 != NULL)
+		OpStatus::Ignore(transaction_2->Release());
+	transaction_2 = NULL;
+	if (db_2 != NULL)
+		OpStatus::Ignore(db_2->Release());
+	db_2 = NULL;
+	OP_DELETE(ps_manager);
+}
+
+
+
+test("Test global database sync")
+{
+	PS_Manager *ps_manager = NULL;
+
+	WSD_Database* db_1 = NULL;
+	SqlTransaction* transaction_1 = NULL;
+
+	WSD_Database* db_2 = NULL;
+	SqlTransaction* transaction_2 = NULL;
+
+	SqlValueList *params = NULL;
+
+	verify_not_oom(ps_manager = PS_Manager::NewForSelfTest());
+
+	verify(OpStatus::IsSuccess(GetDatabase(ps_manager, UNI_L("name1"), &db_1)));
+	verify(db_1 != NULL);
+	transaction_1 = db_1->CreateTransactionSync(FALSE);
+	verify(transaction_1 != NULL);
+
+	verify(OpStatus::IsSuccess(GetDatabase(ps_manager, UNI_L("name2"), &db_2)));
+	verify(db_2 != NULL);
+	transaction_2 = db_2->CreateTransactionSync(FALSE);
+	verify(transaction_2 != NULL);
+
+	verify(db_2!=db_1);
+
+	db_1->SetPolicy(&test_case_policy_1);
+	db_2->SetPolicy(&test_case_policy_1);
+
+	OpFileLength file_size, available_size, new_file_size;
+
+	// create the table
+	verify(OpStatus::IsSuccess(transaction_1->ExecuteSql(SQL_WRAP("create table t (id INTEGER PRIMARY KEY, data);"))));
+
+	verify(OpStatus::IsSuccess(transaction_1->GetSize(&file_size)));
+	verify(OpStatus::IsSuccess(transaction_1->CalculateAvailableDataSize(&available_size)));
+
+	//first transaction - it has all the space available to itself
+	verify(available_size == MIN(
+			test_case_policy_1.GetAttribute(PS_Policy::KOriginQuota, SELFTEST_URLCTXID),
+			test_case_policy_1.GetAttribute(PS_Policy::KGlobalQuota, SELFTEST_URLCTXID)));
+
+	const static unsigned str_len = 8*1024;
+	uni_char big_str[str_len + 1]; /* ARRAY OK 2009-05-20 joaoe */
+	for(unsigned k=0;k<str_len;k++)
+		big_str[k] = op_rand()%26+'a';
+	big_str[str_len] = 0;
+
+	const static unsigned str_len_inserted_1 = 2*1024;
+	{
+		verify(params = SqlValueList::Make(1));
+		OpAutoPtr<SqlValueList> params_ptr(params);
+
+		verify_success(params->values[0].SetString(big_str, str_len_inserted_1));
+
+		params_ptr.release();
+
+		status = transaction_1->ExecuteSql(SQL_WRAP("insert into t (data) values (?);"), params);
+	}
+	verify(PS_Status::ERR_QUOTA_EXCEEDED != status);
+	verify(OpStatus::IsSuccess(status));
+
+	verify(OpStatus::IsSuccess(transaction_1->GetSize(&new_file_size)));
+	verify(OpStatus::IsSuccess(transaction_1->CalculateAvailableDataSize(&available_size)));
+
+	//because the insert failed the size must be the same
+	verify(new_file_size > str_len_inserted_1);
+	verify(new_file_size > file_size);
+	verify(available_size <= test_case_policy_1.GetAttribute(PS_Policy::KOriginQuota, SELFTEST_URLCTXID));
+	verify(available_size <= test_case_policy_1.GetAttribute(PS_Policy::KGlobalQuota, SELFTEST_URLCTXID));
+
+	verify(OpStatus::IsSuccess(transaction_2->ExecuteSql(SQL_WRAP("create table t (id INTEGER PRIMARY KEY, data);"))));
+
+	verify(OpStatus::IsSuccess(transaction_2->GetSize(&file_size)));
+	verify(OpStatus::IsSuccess(transaction_2->CalculateAvailableDataSize(&available_size)));
+
+	//second transaction.. unlike the previous one, there is less space available
+	verify(available_size < MIN(
+			test_case_policy_1.GetAttribute(PS_Policy::KOriginQuota, SELFTEST_URLCTXID),
+			test_case_policy_1.GetAttribute(PS_Policy::KGlobalQuota, SELFTEST_URLCTXID)));
+
+	const static unsigned str_len_inserted_2 = 4*1024;
+	{
+		verify(params = SqlValueList::Make(1));
+		OpAutoPtr<SqlValueList> params_ptr(params);
+
+		verify_success(params->values[0].SetString(big_str, str_len_inserted_2));
+
+		params_ptr.release();
+
+		status = transaction_2->ExecuteSql(SQL_WRAP("insert into t (data) values (?);"), params);
+	}
+	verify(PS_Status::ERR_QUOTA_EXCEEDED == status);
+
+	verify(OpStatus::IsSuccess(transaction_2->GetSize(&new_file_size)));
+	verify(OpStatus::IsSuccess(transaction_2->CalculateAvailableDataSize(&available_size)));
+
+	//check last inserted string
+	verify(file_size == new_file_size);
+	verify(available_size <= test_case_policy_1.GetAttribute(PS_Policy::KOriginQuota, SELFTEST_URLCTXID));
+	verify(available_size <= test_case_policy_1.GetAttribute(PS_Policy::KGlobalQuota, SELFTEST_URLCTXID));
+
+	status = transaction_1->Release();
+	transaction_1 = NULL;
+	verify(OpStatus::IsSuccess(status));
+
+	status = db_1->Release();
+	db_1 = NULL;
+	verify(OpStatus::IsSuccess(status));
+
+	status = transaction_2->Release();
+	transaction_2 = NULL;
+	verify(OpStatus::IsSuccess(status));
+
+	status = db_2->Release();
+	db_2 = NULL;
+	verify(OpStatus::IsSuccess(status));
+}
+finally
+{
+	if (transaction_1 != NULL)
+		OpStatus::Ignore(transaction_1->Release());
+	transaction_1 = NULL;
+	if (db_1 != NULL)
+		OpStatus::Ignore(db_1->Release());
+	db_1 = NULL;
+	if (transaction_2 != NULL)
+		OpStatus::Ignore(transaction_2->Release());
+	transaction_2 = NULL;
+	if (db_2 != NULL)
+		OpStatus::Ignore(db_2->Release());
+	db_2 = NULL;
+	OP_DELETE(ps_manager);
+}
+
+test("Test single database async, user wants to increase") async;
+{
+	ASYNC_TEST_START;
+
+	test_listener.SetUserReply(PS_Policy::KQuotaAskUser);
+	verify(test_listener.ReplaceListener());
+
+	//Create table callback
+	CALLBACK_SECTION_START(SqlCallback_1,result_set)
+
+		verify(result_set);
+
+		CALLBACK_SECTION_START(SqlCallback_2,result_set)
+
+			verify(result_set);
+
+		CALLBACK_SECTION_END(SqlCallback_2)
+
+		const static unsigned str_len = 12*1024;
+		uni_char big_str[str_len + 1]; /* ARRAY OK 2009-05-20 joaoe */
+		for(unsigned k=0;k<str_len;k++)
+			big_str[k] = op_rand()%26+'a';
+		big_str[str_len] = 0;
+
+		CALLBACK_OBJECT_DECL(SqlCallback_2,cb2);
+
+		SqlValueList *params;
+
+		verify(params = SqlValueList::Make(1));
+		OpAutoPtr<SqlValueList> params_ptr(params);
+
+		verify(OpStatus::IsSuccess(params->values[0].SetString(big_str, str_len)));
+
+		params_ptr.release();
+
+		//queue 1st insert
+		verify(OpStatus::IsSuccess(transaction->ExecuteSql(SQL_WRAP("insert into t (data) values (?);"), params, cb2)));
+
+	CALLBACK_SECTION_END(SqlCallback_1)
+	CALLBACK_OBJECT_DECL(SqlCallback_1,cb1);
+
+	db->SetPolicy(test_case_policy_1);
+
+	// create the table
+	verify(OpStatus::IsSuccess(transaction->ExecuteSql(SQL_WRAP("create table t (data TEXT);"), NULL, cb1)));
+
+	ASYNC_TEST_END;
+}
+
+exit
+{
+	test_listener.ResetListener();
+	//TRAP(status,ps_manager->DumpIndexL(UNI_L("Exit")));
+	DeleteAllStatus(!OpDbUtils::IsOperaRunning());
+}

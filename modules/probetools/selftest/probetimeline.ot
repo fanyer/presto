@@ -1,0 +1,1120 @@
+/* -*- Mode: c++; tab-width: 4; indent-tabs-mode: t; c-basic-offset: 4 -*-
+**
+** Copyright (C) 2011 Opera Software AS.  All rights reserved.
+**
+** This file is part of the Opera web browser.  It may not be distributed
+** under any circumstances.
+*/
+
+group "probetools.probetimeline";
+
+require SCOPE_PROFILER;
+
+include "modules/probetools/probetimeline.h";
+
+global
+{
+	/**
+	 * Test timer.
+	 */
+	class TestTimer
+		: public OpProbeTimeline::Timer
+	{
+	public:
+		TestTimer() : m_ms(0){ }
+		virtual double GetTime() { return (double)m_ms; }
+		void Spend(unsigned ms) { m_ms += ms; }
+	private:
+		unsigned m_ms;
+	};
+
+	class Timeline
+		: public OpProbeTimeline
+	{
+	public:
+		~Timeline() { ResetTimer(); }
+		OP_STATUS Init() { return Construct(&m_timer); }
+		void Spend(unsigned ms) { m_timer.Spend(ms); }
+		TestTimer &GetTestTimer() { return m_timer; }
+	private:
+		TestTimer m_timer;
+	};
+
+	class Probe
+	{
+	public:
+
+		OP_STATUS Report(Timeline *timeline, unsigned key)
+		{
+			const void *k = reinterpret_cast<void*>(key);
+
+			OpPropertyProbe::Activator<1> act(prop_probe);
+			RETURN_IF_ERROR(act.Activate(timeline, PROBE_EVENT_GENERIC, k));
+
+			timeline->Spend(1);
+			act.AddInteger("key", key);
+
+			return OpStatus::OK;
+		}
+
+		OpPropertyProbe prop_probe;
+	};
+
+	class GenericEvent
+		: public OpProbeTimeline::Event
+	{
+	public:
+		GenericEvent() : OpProbeTimeline::Event(PROBE_EVENT_GENERIC) {}
+
+		// Event
+		virtual unsigned GetPropertyCount() const { return 0; }
+		virtual const OpProbeTimeline::Property *GetProperties() const { return NULL; }
+		virtual const OpProbeTimeline::Property *GetProperty(const char *name) const { return NULL; }
+		virtual const OpProbeTimeline::Property *GetProperty(unsigned index) const { return NULL; }
+		virtual void AddProperty(const OpProbeTimeline::Property & prop) { }
+	};
+
+	unsigned GetKey(OpProbeTimeline::Event *e) const
+	{
+		const OpProbeTimeline::Property *p = e->GetProperty("key");
+
+		return p ? p->GetInteger() : 0;
+	}
+}
+
+test("OpProbeTimeline: basic construction")
+{
+	Timeline tl;
+	verify(OpStatus::IsSuccess(tl.Init()));
+}
+
+test("OpProbeTimeline: root probe")
+{
+	Timeline tl;
+	tl.Spend(1);
+
+	verify(OpStatus::IsSuccess(tl.Init()));
+	verify(tl.GetRoot()->GetStart() == 1);
+	verify(tl.GetRoot()->GetEnd() == 1);
+	verify(tl.GetRoot()->FirstChild() == NULL);
+	verify(tl.GetRoot()->LastChild() == NULL);
+}
+
+test("OpProbeTimeline: one probe")
+{
+	Timeline tl;
+
+	tl.Spend(1);
+
+	verify(OpStatus::IsSuccess(tl.Init()));
+
+	tl.Spend(1);
+
+	// Activate a probe.
+	{
+		Probe probe;
+		probe.Report(&tl, 1); // 1 Tick overhead.
+
+		tl.Spend(1);
+	}
+
+	OpProbeTimeline::Event *root = tl.GetRoot();
+
+	verify(root->GetStart() == 1);
+	verify(root->GetEnd() == 4);
+	verify(root->CountChildren() == 1);
+}
+
+test("OpProbeTimeline: one probe, multiple activations")
+{
+	Timeline tl;
+	verify(OpStatus::IsSuccess(tl.Init()));
+
+	for (unsigned i = 0; i < 100; ++i)
+	{
+		Probe probe;
+		probe.Report(&tl, 1); // 1 Tick overhead.
+
+		tl.Spend(2);
+	}
+
+	OpProbeTimeline::Event *root = tl.GetRoot();
+
+	verify(root->GetStart() == 0);
+	verify(root->GetEnd() == 300);
+	verify(root->CountChildren() == 1);
+
+	OpProbeTimeline::Event *child = root->FirstChild();
+	verify(child->GetStart() == 0);
+	verify(child->GetEnd() == 300);
+	verify(child->GetOverhead() == 100);
+	verify(child->GetTime() == 200);
+	verify(child->CountChildren() == 0);
+	verify(child->FirstChild() == NULL);
+	verify(child->LastChild() == NULL);
+	verify(child->GetHits() == 100);
+}
+
+test("OpProbeTimeline: multiple sibling probes")
+{
+	Timeline tl;
+	verify(OpStatus::IsSuccess(tl.Init()));
+
+	unsigned max = 10;
+
+	for (unsigned i = 0; i < max; ++i)
+	{
+		Probe probe;
+		probe.Report(&tl, i+1); // 1 Tick overhead.
+
+		tl.Spend(2);
+	}
+
+	OpProbeTimeline::Event *root = tl.GetRoot();
+
+	verify(root->GetStart() == 0);
+	verify(root->GetEnd() == 3*max);
+	verify(root->CountChildren() == max);
+
+	OpProbeTimeline::Event *child = root->FirstChild();
+	unsigned i = 0;
+
+	while (child)
+	{
+		verify(child->GetStart() == 3*i);
+		verify(child->GetEnd() == 3*(i+1));
+		verify(child->GetOverhead() == 1);
+		verify(child->GetTime() == 2);
+		verify(child->GetHits() == 1);
+
+		child = child->Suc();
+		++i;
+	}
+}
+
+
+test("OpProbeTimeline: deep probe chain")
+{
+	Timeline tl;
+	verify(OpStatus::IsSuccess(tl.Init()));
+
+	{
+		Probe probe;
+		probe.Report(&tl, 1);
+
+		tl.Spend(2);
+
+		{
+			Probe probe;
+			probe.Report(&tl, 2);
+
+			tl.Spend(2);
+
+			{
+				Probe probe;
+				probe.Report(&tl, 3);
+
+				tl.Spend(2);
+
+				{
+					Probe probe;
+					probe.Report(&tl, 4);
+
+					tl.Spend(2);
+
+					{
+						Probe probe;
+						probe.Report(&tl, 5);
+
+						tl.Spend(2);
+						tl.Spend(2);
+					}
+
+					tl.Spend(2);
+				}
+
+				tl.Spend(2);
+			}
+
+			tl.Spend(2);
+		}
+
+		tl.Spend(2);
+	}
+
+	OpProbeTimeline::Event *root = tl.GetRoot();
+
+	unsigned num = 5;
+
+	verify(root->GetStart() == 0);
+	verify(root->GetEnd() == 4.0*(double)num + (double)num);
+	verify(root->CountChildren() == 1);
+
+	OpProbeTimeline::Event *child = root->FirstChild();
+	unsigned i = 0;
+
+	while (child)
+	{
+		verify(child->GetStart() == (3.0 * (double)i));
+		verify(child->GetEnd() == (5.0*(double)num - 2.0*(double)i));
+		verify(child->GetOverhead() == 1);
+		verify(child->GetTime() == 4);
+		verify(child->GetHits() == 1);
+
+		child = child->FirstChild();
+		++i;
+	}
+
+	verify(i == num);
+}
+
+test("OpProbeTimeline: deep probe tree")
+{
+	Timeline tl;
+	verify(OpStatus::IsSuccess(tl.Init()));
+
+	unsigned children = 3;
+	unsigned id = 0;
+
+	for (unsigned i = 0; i < children; ++i)
+	{
+		Probe probe;
+		probe.Report(&tl, ++id);
+
+		tl.Spend(2);
+
+		for (unsigned j = 0; j < children; ++j)
+		{
+			Probe probe;
+			probe.Report(&tl, ++id);
+
+			tl.Spend(2);
+
+			for (unsigned k = 0; k < children; ++k)
+			{
+				Probe probe;
+				probe.Report(&tl, ++id);
+
+				tl.Spend(2);
+
+				for (unsigned l = 0; l < children; ++l)
+				{
+					Probe probe;
+					probe.Report(&tl, ++id);
+
+					tl.Spend(2);
+
+					for (unsigned m = 0; m < children; ++m)
+					{
+						Probe probe;
+						probe.Report(&tl, ++id);
+
+						tl.Spend(2);
+						tl.Spend(2);
+					}
+
+					tl.Spend(2);
+				}
+
+				tl.Spend(2);
+			}
+
+			tl.Spend(2);
+		}
+
+		tl.Spend(2);
+	}
+
+	// Aggregate time information on events.
+	while (!tl.IsAggregationFinished())
+		tl.Aggregate();
+
+	OpProbeTimeline::Event *e = tl.GetRoot();
+
+	const int max = 5;
+	int size = 0;
+	OpProbeTimeline::Event *stack[max];
+
+	verify(e->GetStart() == 0.0);
+	verify(e->GetEnd() == 1815.0);
+
+	e = e->FirstChild();
+	verify(e != NULL);
+
+	double start = 0.0;
+
+	while (e)
+	{
+		double s = static_cast<double>(size);
+
+		// Number of total events in this subtree is a geometric series, and
+		// can therefore be calculated directly.
+		double events = (1.0 - op_pow(3.0, 5.0 - s)) / -2.0;
+
+		// The size of the interval.
+		double interval = 5.0 * events;
+
+		// Aggregated values.
+		double agg_time = 4.0 * events;
+		double agg_overhead = events; // overhead == 1.0
+
+		verify(e->GetStart() == start + 3.0 * s);
+		verify(e->GetEnd() == e->GetStart() + interval);
+		verify(e->GetTime() == 4.0);
+		verify(e->GetOverhead() == 1.0);
+		verify(e->GetAggregatedTime() == agg_time);
+		verify(e->GetAggregatedOverhead() == agg_overhead);
+
+		if (e->FirstChild())
+		{
+			stack[size++] = e;
+			e = e->FirstChild();
+			continue;
+		}
+		else
+			while (e->Suc() == NULL && size > 0)
+			{
+				e = stack[--size];
+				start += 5.0;
+			}
+
+		e = e->Suc();
+		start += 5.0;
+	}
+}
+
+test("OpProbeTimeline: recursion")
+{
+	Timeline tl;
+	verify(OpStatus::IsSuccess(tl.Init()));
+
+	// By using the same key on each activation, we can
+	// pretend to be recursing.
+	{
+		Probe probe;
+		probe.Report(&tl, 1);
+
+		tl.Spend(2);
+
+		{
+			Probe probe;
+			probe.Report(&tl, 1);
+
+			tl.Spend(2);
+
+			{
+				Probe probe;
+				probe.Report(&tl, 1);
+
+				tl.Spend(2);
+			}
+		}
+	}
+
+	// Aggregate time information on events.
+	while (!tl.IsAggregationFinished())
+		tl.Aggregate();
+
+	OpProbeTimeline::Event *root = tl.GetRoot();
+	verify(root != NULL);
+
+	verify(root->GetStart() == 0);
+	verify(root->GetEnd() == 9.0);
+	verify(root->GetTime() == 0);
+	verify(root->GetOverhead() == 0);
+	verify(root->GetAggregatedTime() == 6.0);
+	verify(root->GetAggregatedOverhead() == 3.0);
+
+	OpProbeTimeline::Event *child = root->FirstChild();
+	verify(child != NULL);
+
+	verify(child->GetHits() == 1);
+	verify(child->GetStart() == 0.0);
+	verify(child->GetEnd() == 9.0);
+	verify(child->GetTime() == 2.0);
+	verify(child->GetOverhead() == 1.0);
+	verify(child->GetAggregatedTime() == 6.0);
+	verify(child->GetAggregatedOverhead() == 3.0);
+
+	child = child->FirstChild();
+	verify(child != NULL);
+
+	verify(child->GetHits() == 1);
+	verify(child->GetStart() == 3.0);
+	verify(child->GetEnd() == 9.0);
+	verify(child->GetTime() == 2.0);
+	verify(child->GetOverhead() == 1.0);
+	verify(child->GetAggregatedTime() == 4.0);
+	verify(child->GetAggregatedOverhead() == 2.0);
+
+	child = child->FirstChild();
+	verify(child != NULL);
+
+	verify(child->GetHits() == 1);
+	verify(child->GetStart() == 6.0);
+	verify(child->GetEnd() == 9.0);
+	verify(child->GetTime() == 2.0);
+	verify(child->GetOverhead() == 1.0);
+	verify(child->GetAggregatedTime() == 2.0);
+	verify(child->GetAggregatedOverhead() == 1.0);
+}
+
+
+test("OpProbeTimeline: indirect recursion")
+{
+	Timeline tl;
+	verify(OpStatus::IsSuccess(tl.Init()));
+
+	{
+		Probe probe;
+		probe.Report(&tl, 1);
+
+		tl.Spend(2);
+
+		Probe probe2;
+		probe2.Report(&tl, 2);
+		tl.Spend(2);
+
+		{
+			Probe probe;
+			probe.Report(&tl, 1);
+
+			tl.Spend(2);
+
+			Probe probe2;
+			probe2.Report(&tl, 3);
+			tl.Spend(2);
+
+			{
+				Probe probe;
+				probe.Report(&tl, 1);
+
+				tl.Spend(2);
+
+				Probe probe2;
+				probe2.Report(&tl, 4);
+				tl.Spend(2);
+			}
+		}
+	}
+
+	// Aggregate time information on events.
+	while (!tl.IsAggregationFinished())
+		tl.Aggregate();
+
+	OpProbeTimeline::Event *root = tl.GetRoot();
+	verify(root != NULL);
+
+	verify(root->GetStart() == 0);
+	verify(root->GetEnd() == 18.0);
+	verify(root->GetTime() == 0);
+	verify(root->GetOverhead() == 0);
+	verify(root->GetAggregatedTime() == 12.0);
+	verify(root->GetAggregatedOverhead() == 6.0);
+
+	OpProbeTimeline::Event *child = root->FirstChild();
+
+	for (unsigned i = 0; i < 6; ++i)
+	{
+		verify(child != NULL);
+		verify(child->GetHits() == 1);
+		verify(child->GetStart() == i*3.0);
+		verify(child->GetEnd() == 18.0);
+		verify(child->GetTime() == 2.0);
+		verify(child->GetOverhead() == 1.0);
+		verify(child->GetAggregatedTime() == 12.0 - i*2.0);
+		verify(child->GetAggregatedOverhead() == 6.0 - i);
+
+		child = child->FirstChild();
+	}
+}
+
+test("OpProbeTimeline::Stack: Push/Pop")
+{
+	OpProbeTimeline::Stack stack;
+
+	GenericEvent e[8];
+
+	for (unsigned i = 0; i < 8; ++i)
+		verify(OpStatus::IsSuccess(stack.Push(e + i)));
+
+	// (Popping last item not allowed).
+	for (unsigned i = 7; i > 0; --i)
+	{
+		verify(stack.GetTop() == e + i);
+		verify(stack.Pop() == e + i);
+	}
+}
+
+test("OpProbeTimeline::Stack: Push across alloc boundary")
+{
+	OpProbeTimeline::Stack stack;
+
+	GenericEvent e[64];
+
+	for (unsigned i = 0; i < 64; ++i)
+		verify(OpStatus::IsSuccess(stack.Push(e + i)));
+
+	// (Popping last item not allowed).
+	for (unsigned i = 63; i > 0; --i)
+	{
+		verify(stack.GetTop() == e + i);
+		verify(stack.Pop() == e + i);
+	}
+}
+
+test("OpProbeTimeline::Stack: GetIndex")
+{
+	OpProbeTimeline::Stack stack;
+
+	GenericEvent e[8];
+
+	for (unsigned i = 0; i < 8; ++i)
+		verify(OpStatus::IsSuccess(stack.Push(e + i)));
+
+	for (unsigned i = 0; i < 8; ++i)
+		verify(OpStatus::IsSuccess(stack.GetIndex(i) == e + i));
+
+	// Negative indices.
+
+	for (int i = -1; i > -8; --i)
+		verify(OpStatus::IsSuccess(stack.GetIndex(i) == e - i));
+}
+
+
+test("OpProbeTimeline::Iterator: empty timeline")
+{
+	Timeline tl;
+	verify(OpStatus::IsSuccess(tl.Init()));
+
+	OpProbeTimeline::Iterator i(&tl);
+
+	while (i.Next())
+	{
+		// Should not happen.
+		verify(FALSE);
+	}
+
+	verify(OpStatus::IsSuccess(i.GetStatus()));
+}
+
+test("OpProbeTimeline::Iterator: multiple children")
+{
+	Timeline tl;
+	verify(OpStatus::IsSuccess(tl.Init()));
+
+	unsigned num = 10;
+
+	for (unsigned i = 0; i < num; ++i)
+	{
+		Probe probe;
+		probe.Report(&tl, i+1);
+	}
+
+	OpProbeTimeline::Iterator i(&tl);
+	unsigned key = 0;
+
+	while (i.Next())
+	{
+		verify(i.GetParent() == tl.GetRoot());
+
+		verify(++key == GetKey(i.GetEvent()));
+	}
+
+	verify(OpStatus::IsSuccess(i.GetStatus()));
+}
+
+test("OpProbeTimeline::Iterator: child chain")
+{
+	Timeline tl;
+	verify(OpStatus::IsSuccess(tl.Init()));
+
+	{
+		Probe probe;
+		probe.Report(&tl, 1);
+
+		{
+			Probe probe;
+			probe.Report(&tl, 2);
+
+			{
+				Probe probe;
+				probe.Report(&tl, 3);
+			}
+		}
+	}
+
+	OpProbeTimeline::Iterator i(&tl);
+
+	OpProbeTimeline::Event *e1, *e2, *e3;
+
+	verify(i.Next());
+	e1 = i.GetEvent();
+	verify(GetKey(e1) == 1);
+	verify(i.GetParent() == tl.GetRoot());
+
+	verify(i.Next());
+	e2 = i.GetEvent();
+	verify(GetKey(e2) == 2);
+	verify(i.GetParent() == e1);
+
+	verify(i.Next());
+	e3 = i.GetEvent();
+	verify(GetKey(e3) == 3);
+	verify(i.GetParent() == e2);
+
+	verify(i.Next() == FALSE);
+
+	verify(OpStatus::IsSuccess(i.GetStatus()));
+}
+
+
+test("OpProbeTimeline::Iterator: big tree")
+{
+	Timeline tl;
+	verify(OpStatus::IsSuccess(tl.Init()));
+
+	unsigned children = 3;
+	unsigned id = 0;
+
+	for (unsigned i = 0; i < children; ++i)
+	{
+		Probe probe;
+		probe.Report(&tl, ++id);
+
+		tl.Spend(2);
+
+		for (unsigned j = 0; j < children; ++j)
+		{
+			Probe probe;
+			probe.Report(&tl, ++id);
+
+			tl.Spend(2);
+
+			for (unsigned k = 0; k < children; ++k)
+			{
+				Probe probe;
+				probe.Report(&tl, ++id);
+
+				tl.Spend(2);
+
+				for (unsigned l = 0; l < children; ++l)
+				{
+					Probe probe;
+					probe.Report(&tl, ++id);
+
+					tl.Spend(2);
+
+					for (unsigned m = 0; m < children; ++m)
+					{
+						Probe probe;
+						probe.Report(&tl, ++id);
+
+						tl.Spend(2);
+						tl.Spend(2);
+					}
+
+					tl.Spend(2);
+				}
+
+				tl.Spend(2);
+			}
+
+			tl.Spend(2);
+		}
+
+		tl.Spend(2);
+	}
+
+	id = 0;
+
+	OpProbeTimeline::Iterator i(&tl);
+
+	while (i.Next())
+		verify(GetKey(i.GetEvent()) == ++id);
+
+	verify(OpStatus::IsSuccess(i.GetStatus()));
+}
+
+test("OpProbeTimeline::Iterator: max depth")
+{
+	Timeline tl;
+	verify(OpStatus::IsSuccess(tl.Init()));
+
+	unsigned children = 3;
+	unsigned id = 0;
+
+	for (unsigned i = 0; i < children; ++i)
+	{
+		Probe probe;
+		probe.Report(&tl, ++id);
+
+		tl.Spend(2);
+
+		for (unsigned j = 0; j < children; ++j)
+		{
+			Probe probe;
+			probe.Report(&tl, ++id);
+
+			tl.Spend(2);
+
+			for (unsigned k = 0; k < children; ++k)
+			{
+				Probe probe;
+				probe.Report(&tl, ++id);
+
+				tl.Spend(2);
+				tl.Spend(2);
+			}
+
+			tl.Spend(2);
+		}
+
+		tl.Spend(2);
+	}
+
+	OpProbeTimeline::Iterator i(&tl, 2);
+
+	const unsigned length = 12;
+	const unsigned ids[] = { 1, 2, 6, 10, 14, 15, 19, 23, 27, 28, 32, 36 };
+
+	unsigned index = 0;
+
+	while (i.Next())
+		verify(GetKey(i.GetEvent()) == ids[index++]);
+
+	verify(index == length);
+}
+
+test("OpProbeTimeline::Iterator: max depth boundary")
+{
+	Timeline tl;
+	verify(OpStatus::IsSuccess(tl.Init()));
+
+	unsigned children = 3;
+	unsigned id = 0;
+
+	for (unsigned i = 0; i < children; ++i)
+	{
+		Probe probe;
+		probe.Report(&tl, ++id);
+
+		tl.Spend(2);
+
+		for (unsigned j = 0; j < children; ++j)
+		{
+			Probe probe;
+			probe.Report(&tl, ++id);
+
+			tl.Spend(2);
+
+			for (unsigned k = 0; k < children; ++k)
+			{
+				Probe probe;
+				probe.Report(&tl, ++id);
+
+				tl.Spend(2);
+				tl.Spend(2);
+			}
+
+			tl.Spend(2);
+		}
+
+		tl.Spend(2);
+	}
+
+	OpProbeTimeline::Iterator i(&tl, 3);
+
+	id = 0;
+
+	while (i.Next())
+		verify(GetKey(i.GetEvent()) == ++id);
+
+	verify(id == 39);
+}
+
+test("OpProbeTimeline::Iterator: subtree")
+{
+	Timeline tl;
+	verify(OpStatus::IsSuccess(tl.Init()));
+
+	unsigned children = 3;
+	unsigned id = 0;
+
+	for (unsigned i = 0; i < children; ++i)
+	{
+		Probe probe;
+		probe.Report(&tl, ++id);
+
+		tl.Spend(2);
+
+		for (unsigned j = 0; j < children; ++j)
+		{
+			Probe probe;
+			probe.Report(&tl, ++id);
+
+			tl.Spend(2);
+
+			for (unsigned k = 0; k < children; ++k)
+			{
+				Probe probe;
+				probe.Report(&tl, ++id);
+
+				tl.Spend(2);
+				tl.Spend(2);
+			}
+
+			tl.Spend(2);
+		}
+
+		tl.Spend(2);
+	}
+
+	OpProbeTimeline::Event *e = tl.GetRoot();
+	verify(e != NULL);
+
+	e = e->FirstChild();
+	verify(e != NULL);
+
+	e = e->Suc();
+	verify(e != NULL);
+
+	id = 14;
+
+	OpProbeTimeline::Iterator i(e);
+
+	while (i.Next())
+		verify(GetKey(i.GetEvent()) == ++id);
+
+	verify(id == 26);
+}
+
+test("OpProbeTimeline::Iterator: smaller subtree")
+{
+	Timeline tl;
+	verify(OpStatus::IsSuccess(tl.Init()));
+
+	unsigned children = 3;
+	unsigned id = 0;
+
+	for (unsigned i = 0; i < children; ++i)
+	{
+		Probe probe;
+		probe.Report(&tl, ++id);
+
+		tl.Spend(2);
+
+		for (unsigned j = 0; j < children; ++j)
+		{
+			Probe probe;
+			probe.Report(&tl, ++id);
+
+			tl.Spend(2);
+
+			for (unsigned k = 0; k < children; ++k)
+			{
+				Probe probe;
+				probe.Report(&tl, ++id);
+
+				tl.Spend(2);
+				tl.Spend(2);
+			}
+
+			tl.Spend(2);
+		}
+
+		tl.Spend(2);
+	}
+
+	OpProbeTimeline::Event *e = tl.GetRoot();
+	verify(e != NULL);
+
+	e = e->FirstChild();
+	verify(e != NULL);
+
+	e = e->Suc();
+	verify(e != NULL);
+
+	e = e->FirstChild();
+	verify(e != NULL);
+
+	id = 15;
+
+	OpProbeTimeline::Iterator i(e);
+
+	while (i.Next())
+		verify(GetKey(i.GetEvent()) == ++id);
+
+	verify(id == 18);
+}
+
+test("OpPropertyProbe<1>")
+{
+	Timeline tl;
+	verify(OpStatus::IsSuccess(tl.Init()));
+
+	{
+		OpPropertyProbe probe;
+
+		OpPropertyProbe::Activator<1> act(probe);
+		verify(OpStatus::IsSuccess(act.Activate(&tl, PROBE_EVENT_GENERIC, reinterpret_cast<void*>(1))));
+
+		verify(OpStatus::IsSuccess(act.AddString("test", UNI_L("Attack ships off the shoulder of Orion."))));
+	}
+
+	OpProbeTimeline::Event *e = tl.GetRoot();
+	verify(e != NULL);
+
+	e = e->FirstChild();
+	verify(e != NULL);
+
+	verify(e->GetPropertyCount() == 1);
+
+	const OpProbeTimeline::Property *p = e->GetProperty("test");
+	verify(p != NULL);
+	verify(p->GetType() == OpProbeTimeline::PROPERTY_STRING);
+	verify(p->GetString() != NULL);
+	verify(uni_str_eq(p->GetString(), "Attack ships off the shoulder of Orion."));
+}
+
+test("OpPropertyProbe<3>")
+{
+	Timeline tl;
+	verify(OpStatus::IsSuccess(tl.Init()));
+
+	{
+		OpPropertyProbe probe;
+		OpPropertyProbe::Activator<3> act(probe);
+		verify(OpStatus::IsSuccess(act.Activate(&tl, PROBE_EVENT_GENERIC, reinterpret_cast<void*>(1))));
+
+		verify(OpStatus::IsSuccess(act.AddString("test", UNI_L("Orion"))));
+		act.AddInteger("leet", 1337);
+		verify(OpStatus::IsSuccess(act.AddString("foo", UNI_L("Tannhauser Gate"))));
+	}
+
+	OpProbeTimeline::Event *e = tl.GetRoot();
+	verify(e != NULL);
+
+	e = e->FirstChild();
+	verify(e != NULL);
+
+	verify(e->GetPropertyCount() == 3);
+
+	const OpProbeTimeline::Property *p = e->GetProperty("test");
+	verify(p != NULL);
+	verify(p->GetType() == OpProbeTimeline::PROPERTY_STRING);
+	verify(p->GetString() != NULL);
+	verify(uni_str_eq(p->GetString(), "Orion"));
+
+	p = e->GetProperty("leet");
+	verify(p != NULL);
+	verify(p->GetType() == OpProbeTimeline::PROPERTY_INTEGER);
+	verify(p->GetInteger() == 1337);
+
+	p = e->GetProperty("foo");
+	verify(p != NULL);
+	verify(p->GetType() == OpProbeTimeline::PROPERTY_STRING);
+	verify(uni_str_eq(p->GetString(), "Tannhauser Gate"));
+}
+
+test("OpPropertyProbe<1> Add too many properties")
+{
+	Timeline tl;
+	verify(OpStatus::IsSuccess(tl.Init()));
+
+	{
+		OpPropertyProbe probe;
+		OpPropertyProbe::Activator<1> act(probe);
+		verify(OpStatus::IsSuccess(act.Activate(&tl, PROBE_EVENT_GENERIC, reinterpret_cast<void*>(1))));
+
+		verify(OpStatus::IsSuccess(act.AddString("test", UNI_L("Attack ships off the shoulder of Orion."))));
+		verify(OpStatus::IsSuccess(act.AddString("nonexistent", UNI_L("This should not be added (silently)."))));
+		verify(OpStatus::IsSuccess(act.AddString("nonexistent2", UNI_L("This should also not be added (silently)."))));
+	}
+
+	OpProbeTimeline::Event *e = tl.GetRoot();
+	verify(e != NULL);
+
+	e = e->FirstChild();
+	verify(e != NULL);
+
+	verify(e->GetPropertyCount() == 1);
+
+	const OpProbeTimeline::Property *p = e->GetProperty("test");
+	verify(p != NULL);
+	verify(p->GetType() == OpProbeTimeline::PROPERTY_STRING);
+	verify(p->GetString() != NULL);
+	verify(uni_str_eq(p->GetString(), "Attack ships off the shoulder of Orion."));
+
+	verify(e->GetProperty("nonexistent") == NULL);
+	verify(e->GetProperty("nonexistent2") == NULL);
+}
+
+test("OpTypeProbe")
+{
+	Timeline tl;
+	verify(OpStatus::IsSuccess(tl.Init()));
+
+	{
+		OpTypeProbe probe;
+		verify(OpStatus::IsSuccess(probe.Activate(&tl, PROBE_EVENT_GENERIC, reinterpret_cast<void*>(1))));
+	}
+
+	OpProbeTimeline::Event *e = tl.GetRoot();
+	verify(e != NULL);
+
+	e = e->FirstChild();
+	verify(e != NULL);
+
+	verify(e->GetType() == PROBE_EVENT_GENERIC);
+}
+
+test("StringPool")
+{
+	Timeline tl;
+	verify(OpStatus::IsSuccess(tl.Init()));
+
+	const uni_char *orig1 = UNI_L("Why was there bacon in my soap?");
+	const uni_char *orig2 = UNI_L("You're after my bees!");
+	const char *orig3 = "Too stinky!";
+
+	// Get internalized versions.
+	const uni_char *str1;
+	const uni_char *str2;
+	const uni_char *str3;
+
+	verify(OpStatus::IsSuccess(tl.GetString(orig1, str1)));
+	verify(OpStatus::IsSuccess(tl.GetString(orig2, str2)));
+	verify(OpStatus::IsSuccess(tl.GetString(orig3, str3)));
+
+	// These should not be equal to their originals.
+	verify(orig1 != str1);
+	verify(orig2 != str2);
+	verify(orig3 != (const char*)str3);
+
+	// Do it again, and verify that the same pointer is retuned.
+	const uni_char *_str1;
+	const uni_char *_str2;
+	const uni_char *_str3;
+
+	verify(OpStatus::IsSuccess(tl.GetString(orig1, _str1)));
+	verify(OpStatus::IsSuccess(tl.GetString(orig2, _str2)));
+	verify(OpStatus::IsSuccess(tl.GetString(orig3, _str3)));
+
+	verify(str1 == _str1);
+	verify(str2 == _str2);
+	verify(str3 == _str3);
+
+	// And again, with different input values.
+	const uni_char *__str1;
+	const uni_char *__str2;
+	const uni_char *__str3;
+
+	verify(OpStatus::IsSuccess(tl.GetString(str1, __str1)));
+	verify(OpStatus::IsSuccess(tl.GetString(str2, __str2)));
+	verify(OpStatus::IsSuccess(tl.GetString(str3, __str3)));
+
+	verify(str1 == __str1);
+	verify(str2 == __str2);
+	verify(str3 == __str3);
+}

@@ -1,0 +1,480 @@
+/* -*- Mode: c++; tab-width: 4; indent-tabs-mode: t; c-basic-offset: 4; -*-
+**
+** Copyright (C) 2007 Opera Software ASA.  All rights reserved.
+**
+** This file is part of the Opera web browser.  It may not be distributed
+** under any circumstances.
+**
+** Frode Gill
+*/
+
+group "searchmanager.searchmanager";
+require initialization;
+require SEARCH_ENGINES;
+require USERDEFINED_SEARCHES;
+require undefined DESKTOP_UTIL_SEARCH_ENGINES;
+
+include "modules/searchmanager/searchmanager.h";
+include "modules/prefs/prefsmanager/collections/pc_core.h";
+include "modules/util/opfile/opmemfile.h";
+
+global
+{
+	SearchElement* g_st_search_element;
+	SearchManager* g_st_search_manager;
+	BOOL element_controlled_by_manager;
+
+	int separator_id;
+}
+
+setup
+{
+	g_st_search_element = NULL;
+	g_st_search_manager = NULL;
+	element_controlled_by_manager = FALSE;
+	separator_id = 0;
+}
+
+exit
+{
+	if (!element_controlled_by_manager)
+		OP_DELETE(g_st_search_element);
+
+	OP_DELETE(g_st_search_manager);
+}
+
+test("Setup Manager")
+{
+	g_st_search_manager = OP_NEW(SearchManager, ());
+	verify(g_st_search_manager);
+}
+
+test("Setup Element")
+{
+	g_st_search_element = OP_NEW(SearchElement, ());
+	verify(g_st_search_element);
+
+	verify(g_st_search_element->BelongsInUserfile() == FALSE);
+	verify(g_st_search_element->IsChangedThisSession() == FALSE);
+	verify(g_st_search_element->IsSeparator() == FALSE);
+
+	verify(g_st_search_element->Construct(UNI_L("n&ame"), UNI_L("url://%s/%i"), UNI_L("key"), SEARCH_TYPE_UNDEFINED,
+	       UNI_L("description %s"), TRUE, UNI_L("post_query://%s"),
+	       UNI_L("utf-8"), UNI_L("http://www.opera.com/favicon.ico")) == OpStatus::OK);
+
+	//Constructs NOT reading from file, should
+	// * not set ID until adding search to list
+	// * count as user-defined searches
+	// * be considered a change
+	verify(g_st_search_element->GetId() == 0);
+	verify(g_st_search_element->BelongsInUserfile() == TRUE);
+	verify(g_st_search_element->IsChangedThisSession() == TRUE);
+	verify(g_st_search_element->IsSeparator() == FALSE);
+}
+
+test("GUID")
+require success "Setup Element";
+{
+	OpString teststring;
+	verify(g_st_search_element->GetLinkGUID(teststring) == OpStatus::OK);
+	verify(teststring.Compare(UNI_L("")) == 0);
+}
+
+test("Name")
+require success "GUID";
+{
+	OpString teststring;
+	verify(g_st_search_element->GetName(teststring, FALSE) == OpStatus::OK);
+	verify(teststring.Compare(UNI_L("n&ame")) == 0);
+	verify(g_st_search_element->GetName(teststring, TRUE) == OpStatus::OK);
+	verify(teststring.Compare(UNI_L("name")) == 0);
+
+	verify(g_st_search_element->SetName(UNI_L("&Google")) == OpStatus::OK);
+	verify(g_st_search_element->GetName(teststring, TRUE) == OpStatus::OK);
+	verify(teststring.Compare(UNI_L("Google")) == 0);
+}
+
+test("Description")
+require success "Name";
+{
+	OpString teststring;
+	verify(g_st_search_element->GetDescription(teststring, FALSE) == OpStatus::OK);
+	verify(teststring.Compare(UNI_L("description &Google")) == 0);
+	verify(g_st_search_element->GetDescription(teststring, TRUE) == OpStatus::OK);
+	verify(teststring.Compare(UNI_L("description Google")) == 0);
+
+	verify(g_st_search_element->SetDescription(UNI_L("Search with %s?")) == OpStatus::OK);
+	verify(g_st_search_element->GetDescription(teststring, TRUE) == OpStatus::OK);
+	verify(teststring.Compare(UNI_L("Search with Google?")) == 0);
+}
+
+test("Url")
+require success "Description";
+{
+	OpString teststring;
+	verify(g_st_search_element->GetURL(teststring) == OpStatus::OK);
+	verify(teststring.Compare(UNI_L("url://%s/%i")) == 0);
+	
+	verify(g_st_search_element->SetURL(UNI_L("http://www.google.com/search?hl=en&q=%s&num=%i&btnG=Google+Search")) == OpStatus::OK);
+	verify(g_st_search_element->GetURL(teststring) == OpStatus::OK);
+	verify(teststring.Compare(UNI_L("http://www.google.com/search?hl=en&q=%s&num=%i&btnG=Google+Search")) == 0);
+}
+
+test("Key")
+require success "Url";
+{
+	OpString teststring;
+	verify(g_st_search_element->GetKey(teststring) == OpStatus::OK);
+	verify(teststring.Compare(UNI_L("key")) == 0);
+
+	verify(g_st_search_element->SetKey(UNI_L("g")) == OpStatus::OK);
+	verify(g_st_search_element->GetKey(teststring) == OpStatus::OK);
+	verify(teststring.Compare(UNI_L("g")) == 0);
+}
+
+test("IsPost")
+require success "Key";
+{
+	verify(g_st_search_element->IsPost() == TRUE);
+
+	g_st_search_element->SetIsPost(FALSE);
+	verify(g_st_search_element->IsPost() == FALSE);
+}
+
+test("PostQuery")
+require success "IsPost";
+{
+	OpString teststring;
+	verify(g_st_search_element->GetPostQuery(teststring) == OpStatus::OK);
+	verify(teststring.Compare(UNI_L("post_query://%s")) == 0);
+
+	verify(g_st_search_element->SetPostQuery(UNI_L("")) == OpStatus::OK);
+	verify(g_st_search_element->GetPostQuery(teststring) == OpStatus::OK);
+	verify(teststring.IsEmpty());
+}
+
+test("Charset")
+require success "PostQuery";
+{
+	OpString teststring;
+	unsigned short charset_id = g_st_search_element->GetCharsetId();
+	verify(charset_id != 0);
+	verify(g_st_search_element->GetCharset(teststring) == OpStatus::OK);
+	verify(teststring.CompareI(UNI_L("utf-8")) == 0);
+
+	g_st_search_element->SetCharset(UNI_L("iso-8859-1"));
+	verify(g_st_search_element->GetCharsetId() != charset_id);
+	verify(g_st_search_element->GetCharset(teststring) == OpStatus::OK);
+	verify(teststring.CompareI(UNI_L("iso-8859-1")) == 0);
+
+	g_st_search_element->SetCharsetId(charset_id);
+	verify(g_st_search_element->GetCharset(teststring) == OpStatus::OK);
+	verify(teststring.CompareI(UNI_L("utf-8")) == 0);
+}
+
+test("SearchType")
+require success "Charset";
+{
+	verify(g_st_search_element->GetType() == SEARCH_TYPE_UNDEFINED);
+
+	g_st_search_element->SetType(SEARCH_TYPE_SEARCH);
+	verify(g_st_search_element->GetType() == SEARCH_TYPE_SEARCH);
+}
+
+test("IconUrl")
+require success "SearchType";
+{
+	OpString teststring;
+	verify(g_st_search_element->GetIconURL(teststring) == OpStatus::OK);
+	verify(teststring.Compare(UNI_L("http://www.opera.com/favicon.ico")) == 0);
+
+	verify(g_st_search_element->SetIconURL(UNI_L("http://www.google.com/favicon.ico")) == OpStatus::OK);
+	verify(g_st_search_element->GetIconURL(teststring) == OpStatus::OK);
+	verify(teststring.Compare(UNI_L("http://www.google.com/favicon.ico")) == 0);
+}
+
+test("MakeSearch")
+require success "IconUrl";
+{
+	OpString test_url;
+	OpString test_post_query;
+	OpString correct_result;
+	int hits = g_pccore->GetIntegerPref(PrefsCollectionCore::PreferredNumberOfHits);
+	if (hits == 0)
+		hits = 10;
+
+	verify(correct_result.AppendFormat(UNI_L("http://www.google.com/search?hl=en&q=g%%C3%%B8%%C3%%B8gle&num=%i&btnG=Google+Search"), hits) == OpStatus::OK);
+
+	verify(g_st_search_element->MakeSearchString(test_url, test_post_query, UNI_L("g\x00F8\x00F8gle")) == OpStatus::OK);
+	verify(test_url.Compare(correct_result) == 0);
+	verify(test_post_query.IsEmpty());
+}
+
+test("Version")
+require success "MakeSearch";
+{
+	verify(g_st_search_element->GetVersion() == 0);
+}
+
+test("Deleted")
+require success "Version";
+{
+	verify(g_st_search_element->IsDeleted() == FALSE);
+
+	g_st_search_element->SetIsDeleted(TRUE);
+	verify(g_st_search_element->IsDeleted() == TRUE);
+
+	g_st_search_element->SetIsDeleted(FALSE);
+	verify(g_st_search_element->IsDeleted() == FALSE);
+}
+
+
+test("LoadL") leakcheck;
+require success "Setup Manager";
+require undefined HAVE_NO_OPMEMFILE;
+{
+	static const unsigned char search_ini_filecontent[] =
+		"Opera Preferences version 2.0\n"
+		"\n"
+		"[Version]\n"
+		"File Version=10\n"
+		"\n"
+		"[Ordering]\n"
+		"Lycos\n"
+		"Yahoo\n"
+		"\n"
+		"[Defaults]\n"
+		"Type 1=Lycos\n"
+		"Type 2=Yahoo\n"
+		"\n"
+		"[Lycos]\n"
+		"ID=1\n"
+		"Version=0\n"
+		"Deleted=0\n"
+		"Is Separator=0\n"
+		"GUID=\n"
+		"Name ID=0\n"
+		"Name=&Lycos\n"
+		"Description ID=0\n"
+		"Description=\n"
+		"URL=http://search.lycos.com/?query=%s&x=0&y=0\n"
+		"Key=l\n"
+		"Is post=0\n"
+		"Post Query=\n"
+		"Type=1\n"
+		"Icon URL=\n"
+		"OpenSearch URL=\n"
+		"Encoding=utf-8\n"
+		"\n"
+		"[Yahoo]\n"
+		"ID=2\n"
+		"Name=Y&ahoo\n"
+		"URL=http://search.yahoo.com/search?p=%s&n=%i&fr=yfp-t-501&toggle=1&cop=mss&ei=UTF-8\n"
+		"Key=y\n"
+		"Type=1\n";
+
+
+	OpMemFile* search_ini_memfile = OpMemFile::Create(search_ini_filecontent, static_cast<long>(sizeof search_ini_filecontent));
+	OpMemFile* usersearch_ini_memfile = OpMemFile::Create(NULL, 0);
+	verify(g_st_search_manager->LoadL(search_ini_memfile, usersearch_ini_memfile) == OpStatus::OK);
+
+	verify(g_st_search_manager->GetSearchEnginesCount(TRUE, TRUE) == 2);
+}
+
+test("AssignIdAndAddSearch")
+require success "LoadL";
+{
+	verify(g_st_search_manager->AssignIdAndAddSearch(g_st_search_element) == OpStatus::OK);
+	element_controlled_by_manager = TRUE;
+	verify(g_st_search_manager->GetSearchEnginesCount(TRUE, TRUE) == 3);
+	verify(g_st_search_element->GetId() == FIRST_USERDEFINED_SEARCH_ID);
+}
+
+test("ConstructSeparator")
+require success "AssignIdAndAddSearch";
+{
+	SearchElement* search_separator_element = OP_NEW(SearchElement, ());
+	verify(search_separator_element);
+
+	verify(search_separator_element->ConstructSeparator() == OpStatus::OK);
+	verify(search_separator_element->IsSeparator() == TRUE);
+
+	verify(g_st_search_manager->AssignIdAndAddSearch(search_separator_element) == OpStatus::OK);
+	verify(g_st_search_manager->GetSearchEnginesCount(TRUE, TRUE) == 4);
+	verify(g_st_search_manager->GetSearchEnginesCount(TRUE, FALSE) == 3);
+	separator_id = search_separator_element->GetId();
+	verify(separator_id == (FIRST_USERDEFINED_SEARCH_ID+1));
+}
+
+test("GetSearchesByType") leakcheck;
+require success "ConstructSeparator";
+{
+	OpINT32Vector result_vector;
+	verify(g_st_search_manager->GetSearchesByType(SEARCH_TYPE_UNDEFINED, result_vector, TRUE) == OpStatus::OK); //Returns ALL searches
+	verify(result_vector.GetCount() == 4);
+	verify(result_vector.Get(0) == 1);
+	verify(result_vector.Get(1) == 2);
+	verify(result_vector.Get(2) == FIRST_USERDEFINED_SEARCH_ID);
+	verify(result_vector.Get(3) == (FIRST_USERDEFINED_SEARCH_ID+1));
+}
+
+test("GetSearchById")
+require success "GetSearchesByType";
+{
+	SearchElement* search_separator_element = g_st_search_manager->GetSearchById(separator_id);
+	verify(search_separator_element);
+	verify(search_separator_element->GetId() == separator_id);
+}
+
+test("MoveBefore") leakcheck;
+require success "GetSearchById";
+{
+	verify(g_st_search_manager->MoveBefore(separator_id, g_st_search_element->GetId()) == OpStatus::OK);
+
+	OpINT32Vector result_vector;
+	verify(g_st_search_manager->GetSearchesByType(SEARCH_TYPE_UNDEFINED, result_vector, TRUE) == OpStatus::OK); //Returns ALL searches
+	verify(result_vector.GetCount() == 4);
+	verify(result_vector.Get(0) == 1);
+	verify(result_vector.Get(1) == 2);
+	verify(result_vector.Get(2) == (FIRST_USERDEFINED_SEARCH_ID+1));
+	verify(result_vector.Get(3) == FIRST_USERDEFINED_SEARCH_ID);
+}
+
+test("MoveAfter") leakcheck;
+require success "MoveBefore";
+{
+	verify(g_st_search_manager->MoveAfter(1, 2) == OpStatus::OK);
+
+	OpINT32Vector result_vector;
+	verify(g_st_search_manager->GetSearchesByType(SEARCH_TYPE_UNDEFINED, result_vector, TRUE) == OpStatus::OK); //Returns ALL searches
+	verify(result_vector.GetCount() == 4);
+	verify(result_vector.Get(0) == 2);
+	verify(result_vector.Get(1) == 1);
+	verify(result_vector.Get(2) == (FIRST_USERDEFINED_SEARCH_ID+1));
+	verify(result_vector.Get(3) == FIRST_USERDEFINED_SEARCH_ID);
+}
+
+test("GetSearchByKey")
+require success "MoveAfter";
+{
+	SearchElement* lycos = g_st_search_manager->GetSearchByKey(UNI_L("l"), TRUE);
+	verify(lycos != NULL);
+	verify(lycos->GetId() == 1);
+}
+
+test("MarkSearchDeleted")
+require success "GetSearchByKey";
+{
+	verify(g_st_search_manager->MarkSearchDeleted(1) == OpStatus::OK);
+	verify(g_st_search_manager->GetSearchEnginesCount(TRUE, TRUE) == 4);
+	verify(g_st_search_manager->GetSearchEnginesCount(FALSE, TRUE) == 3);
+}
+
+test("GetDefaultSearch")
+require success "MarkSearchDeleted";
+{
+	verify(g_st_search_manager->GetDefaultSearchId(-1) == 0);
+	verify(g_st_search_manager->GetDefaultSearchId(0) == 1);
+	verify(g_st_search_manager->GetDefaultSearchId(1) == 2);
+	verify(g_st_search_manager->GetDefaultSearchId(DEFAULT_SEARCH_PRESET_COUNT) == 0);
+
+	SearchElement* lycos = g_st_search_manager->GetDefaultSearch(0, FALSE);
+	verify(lycos == NULL);
+	lycos = g_st_search_manager->GetDefaultSearch(0, TRUE);
+	verify(lycos != NULL);
+	verify(lycos->GetId() == 1);
+}
+
+test("SetDefaultSearchId")
+require success "GetDefaultSearch";
+{
+	verify(g_st_search_manager->GetDefaultSearchId(0) != FIRST_USERDEFINED_SEARCH_ID);
+	g_st_search_manager->SetDefaultSearchId(0, FIRST_USERDEFINED_SEARCH_ID);
+	verify(g_st_search_manager->GetDefaultSearchId(0) == FIRST_USERDEFINED_SEARCH_ID);
+}
+
+test("GetSearchByURL")
+require success "SetDefaultSearchId";
+{
+	SearchElement* dummy = g_st_search_manager->GetSearchByURL(UNI_L("http://www.dummy.com/"), TRUE);
+	verify(dummy == NULL);
+
+	SearchElement* google = g_st_search_manager->GetSearchByURL(UNI_L("http://www.google.com/search?hl=en&q=%s&num=%i&btnG=Google+Search"), TRUE);
+	verify(google != NULL);
+	verify(google->GetId() == FIRST_USERDEFINED_SEARCH_ID);
+
+	SearchElement* lycos = g_st_search_manager->GetSearchByURL(UNI_L("http://search.lycos.com/?query=%s&x=0&y=0"), FALSE);
+	verify(lycos == NULL);
+	lycos = g_st_search_manager->GetSearchByURL(UNI_L("http://search.lycos.com/?query=%s&x=0&y=0"), TRUE);
+	verify(lycos != NULL);
+	verify(lycos->GetId() == 1);
+}
+
+test("WriteL") leakcheck;
+require success "GetSearchByURL";
+{
+	OpString8 written_file_content;
+	verify(g_st_search_manager->WriteL(written_file_content) == OpStatus::OK);
+
+	static const char expected_filecontent[] =
+		"\xEF\xBB\xBFOpera Preferences version 2.1\n"
+		"; Do not edit this file while Opera is running\n"
+		"; This file is stored in UTF-8 encoding\n"
+		"\n"
+		"[Version]\n"
+		"File Version=10\n"
+		"\n"
+		"[Ordering]\n"
+		"Yahoo=\n"
+		"Lycos=\n"
+		"---------- 2=\n"
+		"Userdefined 1=\n"
+		"\n"
+		"[Defaults]\n"
+		"Type 1=Userdefined 1\n"
+		"Type 2=Yahoo\n"
+		"\n"
+		"[Lycos]\n"
+		"ID=1\n"
+		"Deleted=1\n"
+		"Version=0\n"
+		"GUID=\n"
+		"Name ID=0\n"
+		"Name=&Lycos\n"
+		"Description ID=0\n"
+		"Description=\n"
+		"URL=http://search.lycos.com/?query=%s&x=0&y=0\n"
+		"Key=l\n"
+		"Is Post=0\n"
+		"Post Query=\n"
+		"Encoding=utf-8\n"
+		"Type=1\n"
+		"Icon URL=\n"
+		"OpenSearch URL=\n"
+		"\n"
+		"[---------- 2]\n"
+		"ID=1000001\n"
+		"Deleted=0\n"
+		"Version=0\n"
+		"Is Separator=1\n"
+		"\n"
+		"[Userdefined 1]\n"
+		"ID=1000000\n"
+		"Deleted=0\n"
+		"Version=0\n"
+		"GUID\n"
+		"Name ID=0\n"
+		"Name=&Google\n"
+		"Description ID=0\n"
+		"Description=Search with %s?\n"
+		"URL=http://www.google.com/search?hl=en&q=%s&num=%i&btnG=Google+Search\n"
+		"Key=g\n"
+		"Is Post=0\n"
+		"Post Query=\n"
+		"Encoding=utf-8\n"
+		"Type=1\n"
+		"Icon URL=http://www.google.com/favicon.ico\n"
+		"OpenSearch URL=\n";
+
+	verify(written_file_content.Compare(expected_filecontent) == 0);
+}

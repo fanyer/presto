@@ -1,0 +1,516 @@
+/* -*- Mode: c++; tab-width: 4; indent-tabs-mode: t; c-basic-offset: 4 -*-
+ *
+ * Copyright (C) 2009 Opera Software AS.  All rights reserved.
+ *
+ * This file is part of the Opera web browser.
+ * It may not be distributed under any circumstances.
+ */
+
+group "database.webstorage.events";
+
+require init;
+require OPSTORAGE_SUPPORT;
+
+language c++;
+
+include "modules/database/opstorage.h";
+include "modules/database/opdatabase.h";
+include "modules/database/opdatabasemanager.h";
+include "modules/hardcore/timer/optimer.h";
+
+global
+{
+#undef SELFTEST_URLCTXID
+#define SELFTEST_URLCTXID 0
+
+	class OpStorageEventListenerImpl;
+	class CheckWSOCb;
+
+	//-- can't use inherited Link because of ambiguity
+	struct OpStorageEventListenerImplLink : public ListElement<OpStorageEventListenerImplLink>
+	{
+		OpStorageEventListenerImplLink(OpStorageEventListenerImpl* i) : m_listener(i) {}
+		OpStorageEventListenerImpl* m_listener;
+	};
+
+	//each instance stores the status of a single test
+	class TestStatus;
+	List<TestStatus> all_status;
+	class TestStatus: public ListElement<TestStatus>, public OpTimer, public OpTimerListener
+	{
+		unsigned m_flags;
+		enum TestStatusFlags {IS_RUNNING=1,CAN_DELETE=2};
+		BOOL GetFlag(unsigned flag) const{return (m_flags&flag)!=0;}
+		void SetFlag(unsigned flag) {m_flags|=flag;}
+		void UnsetFlag(unsigned flag) {m_flags&=~flag;}
+
+		List<OpStorageEventListenerImplLink> callbacks;
+		TestStatus* test_status;
+	public:
+		CheckWSOCb* m_check_cb;
+		OpStorage* m_arg1;
+		OpStorage* m_arg2;
+		OpStorage* m_arg3;
+		OpStorage* m_arg4;
+
+		TestStatus(List<TestStatus>* h) : m_flags(IS_RUNNING), test_status(this),
+			m_check_cb(NULL), m_arg1(NULL), m_arg2(NULL),
+			m_arg3(NULL), m_arg4(NULL) {
+			Into(h);
+			SetTimerListener(this);
+			Start(2000); // Start the timer.
+		}
+		static TestStatus* Create(List<TestStatus>* h)
+		{
+			return OP_NEW(TestStatus, (h));
+		}
+		~TestStatus() {
+			PreDelete();
+			Out();
+			Finish();
+
+			OpStorageEventListenerImplLink* ptr = callbacks.First();
+			while(ptr != NULL) {
+				OP_ASSERT(ptr->m_listener);
+				OP_ASSERT(ptr->m_listener->HasExpired());
+				OpStorageEventListenerImplLink* next_ptr = ptr->Suc();
+				ptr->Out();
+				OP_DELETE(ptr->m_listener);
+				ptr = next_ptr;
+			}
+
+			OP_DELETE(m_check_cb);
+		}
+		void PreDelete(OpStorage*& arg) {
+			if (arg != NULL)
+			{
+				OpStorage* arg_copy = arg;
+				arg = NULL;
+				arg_copy->CancelAll();
+				arg_copy->Release();
+			}
+		}
+		void PreDelete() {
+			PreDelete(m_arg1);
+			PreDelete(m_arg2);
+			PreDelete(m_arg3);
+			PreDelete(m_arg4);
+		}
+		virtual void OnTimeOut(OpTimer* timer) { OpStatus::Ignore(OnTimeOut()); }
+		OP_STATUS OnTimeOut();
+
+		void Finish() {
+			SetFlag(CAN_DELETE);
+			UnsetFlag(IS_RUNNING);
+			SetHasExpired();
+		}
+		BOOL IsTestRunning() const{
+			return GetFlag(IS_RUNNING);
+		}
+		void AddCallback(OpStorageEventListenerImplLink *callback) {
+			callback->Into(&callbacks);
+		}
+		void RemoveCallback(OpStorageEventListenerImplLink *callback) {
+			OP_ASSERT(callback->m_listener);
+			callback->m_listener->SetHasExpired();
+			if (!HasRunningCallbacks() && GetFlag(CAN_DELETE) )
+				OP_DELETE(this);
+		}
+		void SetHasExpired() {
+			OpStorageEventListenerImplLink* ptr = static_cast<OpStorageEventListenerImplLink*>(callbacks.First());
+			while(ptr != NULL) {
+				ptr->m_listener->SetHasExpired();
+				ptr = static_cast<OpStorageEventListenerImplLink*>(ptr->Suc());
+			}
+		}
+		BOOL HasRunningCallbacks() const{
+			return NumberOfRunningCallbacks()!=0;
+		}
+		unsigned NumberOfRunningCallbacks() const{
+			unsigned n = 0;
+			OpStorageEventListenerImplLink* ptr = static_cast<OpStorageEventListenerImplLink*>(callbacks.First());
+			while(ptr != NULL) {
+				if (!ptr->m_listener->HasExpired())
+					n++;
+				ptr = static_cast<OpStorageEventListenerImplLink*>(ptr->Suc());
+			}
+			return n;
+		}
+		void CheckTestStatus() const{
+			if(IsTestRunning() && !HasRunningCallbacks())
+				ST_passed();
+		}
+		void SetCanDelete() {
+			SetFlag(CAN_DELETE);
+			if (!HasRunningCallbacks())
+				OP_DELETE(this);
+		}
+	};
+	void PreDeleteAllStatus()
+	{
+		TestStatus* n = (TestStatus*)all_status.First();
+		while(n != NULL)
+		{
+			TestStatus *m = (TestStatus*)n->Suc();
+			n->PreDelete();
+			n = m;
+		}
+	}
+	void DeleteAllStatus()
+	{
+		TestStatus* n = (TestStatus*)all_status.First();
+		while(n != NULL)
+		{
+			TestStatus *m = (TestStatus*)n->Suc();
+			n->Out();
+			n->SetCanDelete();
+			n = m;
+		}
+		OP_ASSERT(all_status.First() == NULL);
+	}
+
+	static BOOL _verify(BOOL b, unsigned line_number, const char *msg, TestStatus* test_status) {
+		if(!b && test_status != NULL && test_status->IsTestRunning()) {
+			test_status->Finish();
+			char buf[1000]={0}; /* ARRAY OK 2009-04-16 joaoe */
+			op_snprintf(buf,999,"\b\b\b%d: %s should be true", line_number, msg);
+			ST_failed(buf);
+		}
+		return b;
+	}
+
+	static BOOL _verify(const void* p, unsigned line_number, const char *msg, TestStatus *test_status) {
+		return _verify(p != NULL, line_number, msg, test_status);
+	}
+
+	static void IgnorePtr(const void*p) { }
+	static void IgnorePtr(int p) { }
+
+#undef verify
+#define verify(b) do{ \
+	if(!_verify(b,__LINE__,#b, test_status)) {return OpStatus::ERR;} }while(0)
+
+#undef verifyl
+#define verifyl(b) do{ \
+	if(!_verify(b,0       ,#b, test_status)) {return OpStatus::ERR;} }while(0)
+
+	OP_STATUS TestStatus::OnTimeOut()
+	{
+		verify(!"Test timed out");
+		return OpStatus::OK;
+	}
+
+	class CheckWSOCb : public WebStorageOperationCallback
+	{
+	public:
+		TestStatus *test_status;
+		CheckWSOCb(TestStatus *_test_status) : test_status(_test_status) {}
+		virtual ~CheckWSOCb() {}
+		static CheckWSOCb* Create(TestStatus* ts)
+		{
+			return OP_NEW(CheckWSOCb, (ts));
+		}
+		virtual OP_STATUS HandleOperation(const WebStorageOperation* result)
+		{
+			verify(result);
+			verify(!result->IsError());
+			return OpStatus::OK;
+		}
+		virtual Window* GetWindow() { return NULL; }
+		virtual void Discard() {}
+	};
+
+#undef ASYNC_TEST_START
+#define ASYNC_TEST_START \
+	class ASYNC_TEST_WRAP_TEMP{\
+	public:\
+		static OP_STATUS do_test(List<TestStatus> *all_status, OpStorageManager* storage_manager) { \
+			OP_STATUS status = OpStatus::OK;\
+			OpStatus::Ignore(status); \
+			TestStatus* test_status = TestStatus::Create(all_status); \
+			verifyl(test_status != NULL); \
+			test_status->m_check_cb = CheckWSOCb::Create(test_status); \
+			verifyl(test_status->m_check_cb != NULL); \
+			CheckWSOCb*& check_cb = test_status->m_check_cb; \
+			OpStorage*& ls_1 = test_status->m_arg1; \
+			OpStorage*& ls_2 = test_status->m_arg2; \
+			OpStorage*& ls_3 = test_status->m_arg3; \
+			OpStorage*& ls_4 = test_status->m_arg4; \
+			IgnorePtr(check_cb); \
+			IgnorePtr(ls_1); \
+			IgnorePtr(ls_2); \
+			IgnorePtr(ls_3); \
+			IgnorePtr(ls_4);
+
+#undef ASYNC_TEST_END
+#define ASYNC_TEST_END \
+			return OpStatus::OK; \
+		} \
+	}; \
+	OpStatus::Ignore(ASYNC_TEST_WRAP_TEMP::do_test(&all_status, storage_manager));
+
+//callback object for events
+class OpStorageEventListenerImpl : public OpStorageEventListener
+{
+public:
+	OpStorageEventListenerImplLink m_link_elem;
+	//--
+	const char* derived_name;
+	int number_of_calls;
+	int number_of_calls_limit;
+	TestStatus *test_status;
+	OP_STATUS status;
+
+	OpStorageEventListenerImpl(TestStatus *_test_status, int _number_of_calls_limit) :
+		m_link_elem(this), number_of_calls(0), number_of_calls_limit(_number_of_calls_limit),
+		test_status(_test_status)
+	{
+		test_status->AddCallback(&m_link_elem);
+	}
+	~OpStorageEventListenerImpl() {}
+
+	BOOL HasExpired() const{ return number_of_calls>=number_of_calls_limit; }
+	void SetHasExpired() { number_of_calls=number_of_calls_limit+1; }
+	virtual BOOL HasListeners() { return TRUE; }
+	virtual OP_STATUS HandleEvent(OpStorageValueChangedEvent* event) {
+		status = OpStatus::OK;
+		if (test_status->IsTestRunning())
+			status = HandleEventCustom(event);
+		number_of_calls++;
+		event->Release();
+		test_status->CheckTestStatus();
+		return status;
+	}
+	virtual OP_STATUS HandleEventCustom(OpStorageValueChangedEvent* event) = 0;
+};
+
+#define LISTENER_SECTION_START_VALUECHANGE(type, event_obj) \
+	class type : public OpStorageEventListenerImpl{ \
+	public: \
+		type(TestStatus *_test_status, unsigned _number_of_calls_limit) :\
+			OpStorageEventListenerImpl(_test_status, _number_of_calls_limit) {} \
+		~type() {} \
+		virtual OP_STATUS HandleEventCustom \
+			 (OpStorageValueChangedEvent* event_obj) { \
+			CheckWSOCb*& check_cb = test_status->m_check_cb; \
+			OpStorage*& ls_1 = test_status->m_arg1; \
+			OpStorage*& ls_2 = test_status->m_arg2; \
+			OpStorage*& ls_3 = test_status->m_arg3; \
+			OpStorage*& ls_4 = test_status->m_arg4; \
+			IgnorePtr(check_cb); \
+			IgnorePtr(ls_1); \
+			IgnorePtr(ls_2); \
+			IgnorePtr(ls_3); \
+			IgnorePtr(ls_4); \
+			if (HasExpired()) { \
+				verify(!"Listener already called the allowed number of times"); \
+			}
+			//dbg_printf(#type "::OpStorageEventListenerImpl(%d,%p,%p,%d,%d,%d)\n",number_of_calls,ls_1,ls_2,event_obj->GetType(), event_obj->IsClearEvent(), event_obj->GetRefCount());
+
+#define LISTENER_SECTION_END_VALUECHANGE(type) \
+			return OpStatus::OK; \
+		}\
+	}
+
+#define LISTENER_OBJECT_DECL(type, var_name, arg) \
+	type* var_name = OP_NEW(type, (test_status, arg)); \
+	verify(var_name != NULL);
+
+#define LS_DB_NAME UNI_L("LocalStorage")
+#define LS_DB_NAME_SZ 12
+
+	OpStorageManager *storage_manager;
+}
+
+setup
+{
+	DATABASE_MODULE_ADD_CONTEXT(0, OPFILE_PERSISTENT_STORAGE_FOLDER);
+}
+
+test("Setup")
+{
+	storage_manager = OpStorageManager::CreateForSelfTest();
+	verify_not_oom(storage_manager);
+}
+
+test("Events test")
+	async;
+	require success "Setup";
+{
+	ASYNC_TEST_START;
+
+	verify(OpStatus::IsSuccess(storage_manager->GetStorage(WEB_STORAGE_LOCAL, SELFTEST_URLCTXID, UNI_L("a"),TRUE,&ls_1)));
+	verify(OpStatus::IsSuccess(WEBSTORAGE_CLEAR_ALL(ls_1, check_cb)));
+
+	verify(OpStatus::IsSuccess(storage_manager->GetStorage(WEB_STORAGE_LOCAL, SELFTEST_URLCTXID, UNI_L("a"),TRUE,&ls_2)));
+	verify(OpStatus::IsSuccess(WEBSTORAGE_CLEAR_ALL(ls_2, check_cb)));
+
+	verify(OpStatus::IsSuccess(storage_manager->GetStorage(WEB_STORAGE_LOCAL, SELFTEST_URLCTXID, UNI_L("b"),TRUE,&ls_3)));
+	verify(OpStatus::IsSuccess(WEBSTORAGE_CLEAR_ALL(ls_3, check_cb)));
+
+	verify(OpStatus::IsSuccess(storage_manager->GetStorage(WEB_STORAGE_LOCAL, SELFTEST_URLCTXID, UNI_L("a"),FALSE,&ls_4)));
+	verify(OpStatus::IsSuccess(WEBSTORAGE_CLEAR_ALL(ls_4, check_cb)));
+
+	LISTENER_SECTION_START_VALUECHANGE(OpStorageEventListenerImpl_1, event)
+
+		switch(number_of_calls)
+		{
+		case 0:
+		case 1:
+		case 2:
+			verify(!event->IsClearEvent());
+			verify(event->m_event_data != NULL);
+			break;
+		case 3:
+			verify(!event->IsClearEvent());
+			verify(event->m_event_data != NULL);
+
+			verify(event->m_event_data->m_key_length == 3 && 0 == uni_strncmp(event->m_event_data->m_key,UNI_L("abc"),event->m_event_data->m_key_length));
+			verify(event->m_event_data->m_old_value_length == 0 && event->m_event_data->m_old_value == NULL);
+			verify(event->m_event_data->m_new_value_length == 2 && 0 == uni_strncmp(event->m_event_data->m_new_value,UNI_L("zc"),event->m_event_data->m_new_value_length));
+			{
+				WebStorageValueTemp k1(event->m_event_data->m_key, event->m_event_data->m_key_length);
+				verify(OpStatus::IsSuccess(ls_2->SetItem(&k1, NULL, NULL)));
+				//this one should not create the event
+				verify(OpStatus::IsSuccess(ls_2->SetItem(&k1, NULL, NULL)));
+			}
+			break;
+
+		case 4:
+			verify(!event->IsClearEvent());
+			verify(event->m_event_data != NULL);
+
+			//called because of the RemoveItem above
+			verify(event->m_event_data->m_key_length == 3 && 0 == uni_strncmp(event->m_event_data->m_key,UNI_L("abc"),event->m_event_data->m_key_length));
+			verify(event->m_event_data->m_old_value_length == 2 && 0 == uni_strncmp(event->m_event_data->m_old_value,UNI_L("zc"),event->m_event_data->m_old_value_length));
+			verify(event->m_event_data->m_new_value_length == 0 && event->m_event_data->m_new_value == NULL);
+
+			verify(OpStatus::IsSuccess(ls_1->Clear(static_cast<WebStorageOperationCallback*>(NULL))));
+
+			break;
+
+		case 5:
+			verify(event->IsClearEvent());
+			verify(event->m_event_data == NULL);
+			break;
+		}
+	LISTENER_SECTION_END_VALUECHANGE(OpStorageEventListenerImpl_1);
+	LISTENER_OBJECT_DECL(OpStorageEventListenerImpl_1, list_1, 6);
+
+	LISTENER_SECTION_START_VALUECHANGE(OpStorageEventListenerImpl_2, event)
+
+		switch(number_of_calls)
+		{
+		case 0:
+			verify(!event->IsClearEvent());
+			verify(event->m_event_data != NULL);
+
+			verify(event->m_event_data->m_key_length == 1 && 0 == uni_strncmp(event->m_event_data->m_key,UNI_L("a"),event->m_event_data->m_key_length));
+			verify(event->m_event_data->m_old_value_length == 0 && event->m_event_data->m_old_value == NULL);
+			verify(event->m_event_data->m_new_value_length == 1 && 0 == uni_strncmp(event->m_event_data->m_new_value,UNI_L("b"),event->m_event_data->m_new_value_length));
+
+			break;
+
+		case 1:
+			verify(!event->IsClearEvent());
+			verify(event->m_event_data != NULL);
+
+			verify(event->m_event_data->m_key_length == 1 && 0 == uni_strncmp(event->m_event_data->m_key,UNI_L("b"),event->m_event_data->m_key_length));
+			verify(event->m_event_data->m_old_value_length == 0 && event->m_event_data->m_old_value == NULL);
+			verify(event->m_event_data->m_new_value_length == 1 && 0 == uni_strncmp(event->m_event_data->m_new_value,UNI_L("c"),event->m_event_data->m_new_value_length));
+
+			break;
+
+		case 2:
+			verify(!event->IsClearEvent());
+			verify(event->m_event_data != NULL);
+
+			verify(event->m_event_data->m_key_length == 1 && 0 == uni_strncmp(event->m_event_data->m_key,UNI_L("b"),event->m_event_data->m_key_length));
+			verify(event->m_event_data->m_old_value_length == 1 && 0 == uni_strncmp(event->m_event_data->m_old_value,UNI_L("c"),event->m_event_data->m_old_value_length));
+			verify(event->m_event_data->m_new_value_length == 1 && 0 == uni_strncmp(event->m_event_data->m_new_value,UNI_L("d"),event->m_event_data->m_new_value_length));
+			{
+				WebStorageValueTemp k1(UNI_L("abc"),3);
+				WebStorageValueTemp v1(UNI_L("zc"),2);
+				verify(OpStatus::IsSuccess(ls_2->SetItem(&k1, &v1, NULL)));
+			}
+			break;
+		case 3:
+		case 4:
+
+			verify(!event->IsClearEvent());
+			verify(event->m_event_data != NULL);
+			break;
+
+		case 5:
+			verify(event->IsClearEvent());
+			verify(event->m_event_data == NULL);
+			break;
+		};
+	LISTENER_SECTION_END_VALUECHANGE(OpStorageEventListenerImpl_2);
+
+	LISTENER_SECTION_START_VALUECHANGE(OpStorageEventListenerImpl_2a, event)
+
+		switch(number_of_calls)
+		{
+		case 0:
+		case 1:
+		case 2:
+			verify(!event->IsClearEvent());
+			verify(event->m_event_data != NULL);
+
+			break;
+		case 3:
+		case 4:
+			verify(!event->IsClearEvent());
+			verify(event->m_event_data != NULL);
+			break;
+
+		case 5:
+			verify(event->IsClearEvent());
+			verify(event->m_event_data == NULL);
+
+			break;
+		};
+	LISTENER_SECTION_END_VALUECHANGE(OpStorageEventListenerImpl_2a);
+
+	LISTENER_SECTION_START_VALUECHANGE(OpStorageEventListenerImpl_DontCallMe, event)
+		//nothing to do....
+	LISTENER_SECTION_END_VALUECHANGE(OpStorageEventListenerImpl_DontCallMe);
+
+	LISTENER_OBJECT_DECL(OpStorageEventListenerImpl_2, list_2, 6);
+	LISTENER_OBJECT_DECL(OpStorageEventListenerImpl_2a, list_2a, 6);
+	LISTENER_OBJECT_DECL(OpStorageEventListenerImpl_DontCallMe, list_bad_3, 0);
+	LISTENER_OBJECT_DECL(OpStorageEventListenerImpl_DontCallMe, list_bad_4, 0);
+
+	storage_manager->AddStorageEventListener(ls_1->GetType(), SELFTEST_URLCTXID, ls_1->GetOrigin(), TRUE, list_1);
+
+	storage_manager->AddStorageEventListener(ls_2->GetType(), SELFTEST_URLCTXID, ls_2->GetOrigin(), TRUE, list_2);
+	storage_manager->AddStorageEventListener(ls_2->GetType(), SELFTEST_URLCTXID, ls_2->GetOrigin(), TRUE, list_2a);
+
+	storage_manager->AddStorageEventListener(ls_3->GetType(), SELFTEST_URLCTXID, ls_3->GetOrigin(), TRUE, list_bad_3);
+
+	storage_manager->AddStorageEventListener(ls_4->GetType(), SELFTEST_URLCTXID, ls_4->GetOrigin(), FALSE, list_bad_4);
+
+	WebStorageValueTemp k1(UNI_L("a"),1), v1(UNI_L("b"),1);
+	WebStorageValueTemp k2(UNI_L("b"),1), v2(UNI_L("c"),1);
+	WebStorageValueTemp k3(UNI_L("b"),1), v3(UNI_L("d"),1);
+
+	verify(OpStatus::IsSuccess(ls_1->SetItem(&k1, &v1, check_cb)));
+	//this one should not invoke storage because the value is the same
+	verify(OpStatus::IsSuccess(ls_1->SetItem(&k1, &v1, check_cb)));
+	verify(OpStatus::IsSuccess(ls_1->SetItem(&k2, &v2, check_cb)));
+	verify(OpStatus::IsSuccess(ls_1->SetItem(&k3, &v3, check_cb)));
+
+	ASYNC_TEST_END;
+}
+
+exit
+{
+	PreDeleteAllStatus();
+	if(storage_manager != NULL)
+	{
+		OP_ASSERT(storage_manager->GetRefCount() == 1);
+		storage_manager->Release();
+	}
+	DeleteAllStatus();
+}

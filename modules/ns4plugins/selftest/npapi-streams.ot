@@ -1,0 +1,1860 @@
+/* -*- Mode: c++; tab-width: 4; indent-tabs-mode: t; c-basic-offset: 4 -*-
+ *
+ * Plugin tests for NPAPI's stream methods.
+ *
+ * Copyright (C) 2009-2011 Opera Software AS.  All rights reserved.
+ *
+ * This file is part of the Opera web browser.
+ * It may not be distributed under any circumstances.
+ */
+
+group "ns4plugins.npapi.streams";
+
+language c++;
+
+require _PLUGIN_SUPPORT_;
+require SOCKET_LISTEN_SUPPORT;
+require init;
+
+include <stdio.h>;
+
+include "modules/doc/frm_doc.h";
+include "modules/pi/network/OpSocket.h";
+include "modules/prefs/prefsmanager/collections/pc_display.h";
+include "modules/viewers/viewers.h";
+include "modules/url/url_socket_wrapper.h";
+
+global
+{
+	/**
+	 * Log to Output window in VS.
+	 */
+	static void Log(const char* fmt, ...)
+	{
+		//char buf[4096]; // ARRAY OK terjes 2010-09-20
+		//va_list ap;
+
+		//va_start(ap, fmt);
+		//op_vsprintf(buf, fmt, ap);
+		//::OutputDebugStringA(buf);
+		//va_end(ap);
+	}
+
+	/**
+	* Minimal web server for use with stream tests.
+	*/
+	class Server
+	{
+	public:
+		Server() : socket(0), address(0), running(FALSE) {}
+
+		/**
+		 * Start web server. Must be matched with a call to End, even if this call fails.
+		 */
+		BOOL Start()
+		{
+			if (OpStatus::IsError(SocketWrapper::CreateTCPSocket(&socket, &socket_listener, SocketWrapper::NO_WRAPPERS)))
+				return FALSE;
+
+			socket_listener.SetListeningSocket(socket);
+
+			if (OpStatus::IsError(OpSocketAddress::Create(&address)))
+				return FALSE;
+
+			address->FromString(UNI_L("127.0.0.1"));
+			address->SetPort(7192);
+			if (!address->IsValid())
+				return FALSE;
+
+			if (OpStatus::IsError(socket->Listen(address, 5)))
+				return FALSE;
+
+			running = TRUE;
+			return TRUE;
+		}
+
+		/**
+		 * Release resources acquired by server.
+		 */
+		void End()
+		{
+			OP_DELETE(socket);
+			socket = 0;
+
+			OP_DELETE(address);
+			address = 0;
+
+			running = FALSE;
+		}
+
+		BOOL IsRunning() { return running; }
+
+	 private:
+		struct Client
+		{
+			enum RequestType { Unknown, Get, Post };
+
+			Client(OpSocket* socket) : socket(socket), used(0), streamed(0), handled(FALSE), type(Unknown), content_start(0), queued_bytes(0) {}
+			~Client() { OP_DELETE(socket); }
+
+			RequestType GetType()
+			{
+				if (type == Unknown)
+					type = op_strncmp(buffer, "GET", 3) ? Post : Get;
+
+				return type;
+			}
+
+			char* GetURIStart()
+			{
+				return buffer + (GetType() == Get ? 4 : 5);
+			}
+
+			char* GetContentStart()
+			{
+				if (!content_start)
+					if ((content_start = op_strstr(buffer, "\r\n\r\n")) != NULL)
+						content_start += 4;
+
+				return content_start;
+			}
+
+			char* GetHeader(const char* header)
+			{
+				if (char* p = op_strstr(buffer, header))
+					if ((p = op_strchr(p, ':')) != NULL)
+					{
+						while (op_isspace(*++p))
+							;
+
+						return p;
+					}
+
+				return 0;
+			}
+
+			BOOL ProcessHTTPRequest()
+			{
+				if (GetContentStart())
+				{
+					const char* status = "200 OK";
+					const char* content = "Magic plugin content.\r\n";
+
+					/* Close socket without replying if network error is requested. */
+					if (!op_strncmp(GetURIStart(), "/error", 6))
+						return handled = TRUE;
+
+					/* Return bad request on POST with missing magic content. */
+					if (GetType() == Post)
+					{
+						if (char* content_type = GetHeader("Content-Type"))
+						{
+							const char* expected_content_type = "application/x-www-form-urlencoded";
+							const char* expected_content = "plugin-key=magic-plugin-value";
+							size_t expected_content_len = op_strlen(expected_content);
+
+							if (!op_strncmp(GetURIStart(), "/post-url-multipart", 19))
+								expected_content_type = "multipart/form-data";
+
+							if (!op_strncmp(GetURIStart(), "/post-url-nullbyte", 18))
+								/* Note that the content length of this data is
+								   the same as the already calculated one. */
+								expected_content = "plugin-key=magic\0plugin\0value";
+
+							if (op_strncmp(content_type, expected_content_type, op_strlen(expected_content_type)))
+							{
+								Log("Unexpected content type!\n");
+								status = "400 Bad Request";
+								content = "Unexpected content type\r\n";
+							}
+							else if (op_memcmp(GetContentStart(), expected_content, expected_content_len))
+							{
+								Log("Bad magic content (was: %s)!\n", GetContentStart());
+								status = "400 Bad Request";
+								content = "Bad magic content\r\n";
+							}
+						}
+						else
+						{
+							Log("No content type set!\n");
+							status = "400 Bad Request";
+							content = "Missing content type header\r\n";
+						}
+					}
+
+					char buf[8192]; // ARRAY OK terjes 2010-09-20
+
+					/* Handle request read by faking a long stream. */
+					if (!op_strncmp(GetURIStart(), "/request-read", 13))
+					{
+						content = "Magically streamed plugin content.\r\n";
+
+						if (char* request = op_strstr(buffer, "Range: bytes="))
+						{
+							if (op_sscanf(request, "Range: bytes=%d", &streamed) > 0)
+								status = "206 Partial Content";
+							else
+								status = "400 Bad Request";
+						}
+
+						const char* headers_fmt = "HTTP/1.1 %s\r\n"
+							"X-Plugin-Test-Header: Plugin-Magic\r\n"
+							"Content-Type: text/x-vnd.opera-test-plugin\r\n"
+							"Accept-ranges: bytes\r\n"
+							"Date: Wed, 29 Sep 2010 15:00:00 GMT\r\n"
+							"ETag: 1\r\n"
+							"Content-Location: /request-read-normal\r\n"
+							"Server: ns4plugins-stream-selftest-webserver\r\n"
+							"Content-Length: %d\r\n"
+							"Content-Range: bytes %d-%d/%d\r\n"
+							"\r\n"
+							"%s";
+
+						int content_length = op_strlen(content);
+						int total_length = 1024 * 1024* 1024;
+						op_sprintf(buf, headers_fmt, status, total_length, streamed, streamed + content_length - 1, total_length, content);
+						Send(buf, op_strlen(buf));
+						streamed += content_length;
+
+						Log("Sent: %s\n\n", buf);
+
+						used = 0;
+						return handled = FALSE;
+					}
+					/* Normal request, simply fire off a short reply. */
+					else
+					{
+						const char* headers_fmt = "HTTP/1.1 %s\r\n"
+							"X-Plugin-Test-Header: Plugin-Magic\r\n"
+							"Content-Type: text/x-vnd.opera-test-plugin\r\n"
+							"Connection: close\r\n"
+							"Server: ns4plugins-stream-selftest-webserver\r\n"
+							"Content-Length: %d\r\n"
+							"\r\n"
+							"%s";
+
+						op_sprintf(buf, headers_fmt, status, op_strlen(content), content);
+						Send(buf, op_strlen(buf));
+
+						return handled = TRUE;
+					}
+				}
+
+				return FALSE;
+			}
+
+			void Send(const void* data, UINT length)
+			{
+				if (OpStatus::IsError(socket->Send(data, length)))
+					ST_failed("OpSocket::Send failed.");
+				queued_bytes += length;
+			}
+
+			OpSocket* socket;
+			char buffer[16384]; // ARRAY OK terjes 2010-09-20
+			int used;
+			int streamed;
+			BOOL handled;
+			RequestType type;
+			char* content_start;
+			int queued_bytes; // Number of bytes sent using OpSocket::Send(), but not acknowledged as actually sent via OnSocketDataSent().
+		};
+
+		class SocketListener : public OpSocketListener
+		{
+		public:
+			~SocketListener()
+			{
+				for (unsigned int i = 0; i < clients.GetCount(); i++)
+				{
+					Client* client = clients.Get(i);
+					client->socket->Close();
+					OP_DELETE(client);
+				}
+			}
+
+			void SetListeningSocket(OpSocket* socket)
+			{
+				Log("SetListeningSocket(%p)\n", socket);
+				listening_socket = socket;
+			}
+
+			/**
+			 * Don't care.
+			 */
+			void OnSocketConnected(OpSocket* socket) { Log("OnSocketConnected(%p)\n", socket); }
+			void OnSocketConnectError(OpSocket* socket, OpSocket::Error error) { Log("OnSocketConnectError(%p, %d)\n", socket, error); }
+			void OnSocketCloseError(OpSocket* socket, OpSocket::Error error) { Log("OnSocketCloseError(%p, %d)\n", socket, error); }
+
+			/**
+			 * Handle sent data.
+			 */
+			void OnSocketDataSent(OpSocket* socket, UINT n)
+			{
+				if (Client* client = GetClient(socket))
+				{
+					client->queued_bytes -= n;
+					if (client->handled && client->queued_bytes == 0)
+						OnSocketClosed(client->socket);
+				}
+			}
+
+			/**
+			 * Process incoming data.
+			 */
+			void OnSocketDataReady(OpSocket* socket)
+			{
+				Log("OnSocketDataReady(%p)\n", socket);
+
+				if (Client* client = GetClient(socket))
+				{
+					if (client->handled)
+					{
+						Log("Closing already handled client.\n");
+						OnSocketClosed(client->socket);
+						return;
+					}
+
+					unsigned int bytes_read;
+					if (OpStatus::IsError(socket->Recv(client->buffer + client->used, sizeof(client->buffer) - client->used - 1, &bytes_read)))
+						return;
+
+					client->used += bytes_read;
+					Log("Read %d bytes, current total is %d.\n", bytes_read, client->used);
+					client->buffer[client->used] = 0;
+					Log("Contents of read buffer: %s\n", client->buffer);
+
+					if (client->used == 16384)
+					{
+						ST_failed("Server received request that exceeded internal limit.");
+						OnSocketClosed(client->socket);
+						return;
+					}
+
+					client->ProcessHTTPRequest();
+
+					Log("Client handled = %d\n", client->handled);
+					if (client->handled && client->queued_bytes == 0)
+						OnSocketClosed(client->socket);
+				}
+				else
+				{
+					socket->Close();
+				}
+			}
+
+			/**
+			 * Remove client structure from list.
+			 */
+			void OnSocketClosed(OpSocket* socket)
+			{
+				Log("OnSocketClosed(%p)\n", socket);
+
+				if (Client* client = GetClient(socket))
+				{
+					clients.RemoveByItem(client);
+					OP_DELETE(client);
+				}
+			}
+
+			/**
+			 * Create client socket bound to this listener and accept request.
+			 */
+			void OnSocketConnectionRequest(OpSocket* socket)
+			{
+				Log("OnSocketConnectionRequest(%p)\n", socket);
+
+				if (socket == listening_socket)
+				{
+					OpSocket* client_socket;
+					if (OpStatus::IsError(SocketWrapper::CreateTCPSocket(&client_socket, this, SocketWrapper::NO_WRAPPERS)))
+						ST_failed("SocketWrapper::CreateTCPSocket failed.");
+
+					if (OpStatus::IsError(listening_socket->Accept(client_socket)))
+						ST_failed("OpSocket::Accept failed.");
+
+					if (Client* client = OP_NEW(Client, (client_socket)))
+					{
+						Log("Accepted and added new client (%p).\n", client_socket);
+						clients.Add(client);
+					}
+				}
+			}
+
+			void OnSocketListenError(OpSocket* socket, OpSocket::Error error)
+			{
+				if (socket == listening_socket)
+					ST_failed("Socket listen error.");
+			}
+
+			void OnSocketReceiveError(OpSocket* socket, OpSocket::Error error)
+			{
+				Log("OnSocketReceiveError(%p, %d)\n", socket, error);
+				ST_failed("Socket receive error.");
+			}
+
+			void OnSocketSendError(OpSocket* socket, OpSocket::Error error)
+			{
+				Log("OnSocketSendError(%p, %d)\n", socket, error);
+				ST_failed("Socket send error.");
+			}
+
+		protected:
+			/**
+			 * Look up client structure based on socket.
+			 */
+			Client* GetClient(const OpSocket* socket)
+			{
+				for (unsigned int i = 0; i < clients.GetCount(); i++)
+					if (socket == clients.Get(i)->socket)
+						return clients.Get(i);
+
+				return 0;
+			}
+
+			OpSocket* listening_socket;
+			OpVector<Client> clients;
+		} socket_listener;
+
+		OpSocket* socket;
+		OpSocketAddress* address;
+		BOOL running;
+	} server;
+}
+
+/**
+ * Start web server before all tests.
+ */
+setup
+{
+	server.Start();
+}
+
+/**
+ * End web server after all tests.
+ */
+exit
+{
+	server.End();
+}
+
+/**
+ * Ensure web server is accessible.
+ */
+test("Server running")
+{
+	verify(server.IsRunning());
+}
+
+/**
+ * Ensure that plugins are enabled.
+ */
+test("Plugins enabled")
+{
+	verify(g_pcdisplay->GetIntegerPref(PrefsCollectionDisplay::PluginsEnabled));
+	verify(g_pcdisplay->GetIntegerPref(PrefsCollectionDisplay::EnableOnDemandPlugin) == 0);
+}
+
+/**
+ * Ensure the test plugin is available.
+ */
+test("Test plugin installed")
+	require success "Plugins enabled";
+{
+	OpString16 mime_type;
+	mime_type.Set("application/x-vnd.opera-test-plugin");
+	verify(g_viewers->FindViewerByMimeType(mime_type) != 0);
+}
+
+/**
+ * Set current document, instantiating a test plugin object
+ * available for the following javascript tests.
+ */
+html {
+	//! <html>
+	//! <head>
+	//! <title> Plugin tests for NPAPI's stream methods </title>
+	//! </head>
+	//! <body>
+	//! <object id="plugin" type="application/x-vnd.opera-test-plugin"
+	//!   width="1" height="1">Fallback</object>
+	//! <script>window.plugin = document.getElementById("plugin");</script>
+	//! </body>
+	//! </html>
+}
+
+test("Test plugin scriptable object")
+	require success "Test plugin installed";
+	language ecmascript;
+{
+	verify(plugin.toString() == "[OperaTestPlugin]");
+}
+
+test("NPN_GetURL")
+	async;
+	language ecmascript;
+	require success "Server running";
+	require success "Test plugin scriptable object";
+{
+	var url = "http://127.0.0.1:7192/get-url";
+	var new_stream = false;
+	var write_ready = false;
+	var content = '';
+	var destroy_stream = false;
+	var write_limit = 0;
+
+	var finalize = function() {
+		plugin.onNewStream = undefined;
+		plugin.onWriteReady = undefined;
+		plugin.onWrite = undefined;
+		plugin.onDestroyStream = undefined;
+
+		verify(new_stream);
+		verify(write_ready);
+		verify(content == "Magic plugin content.\r\n");
+		verify(destroy_stream);
+
+		ST_passed();
+	};
+
+	plugin.onNewStream = function(mimetype, stream, seekable, initial_stype) {
+		new_stream = true;
+		verify(stream.url == url);
+		verify(mimetype == "text/x-vnd.opera-test-plugin");
+		verify(stream.headers.match(/X-Plugin-Test-Header: Plugin-Magic/));
+		verify(stream.headers.match(/200 OK/));
+		return 1 /* NP_NORMAL */;
+	};
+
+	plugin.onWriteReady = function(stream) {
+		write_ready = true;
+		/* Alternate between 0 and 7 to test write limit adherence. */
+		write_limit ^= 7;
+		return write_limit;
+	};
+
+	plugin.onWrite = function(stream, offset, data) {
+		verify(data.length <= write_limit);
+		verify(offset == content.length);
+
+		for (var i = 0; i < data.length; i++)
+			content += String.fromCharCode(data[i]);
+	};
+
+	plugin.onDestroyStream = function(stream, reason) {
+		verify(stream.url == url);
+		verify(stream.end == content.length);
+		verify(reason == 0 /* NPRES_DONE */);
+		destroy_stream = true;
+
+		finalize();
+	};
+
+	verify(plugin.testGetURL(url, null) == true);
+
+	setTimeout(finalize, 6000);
+}
+
+test("NPN_GetURL (javascript)")
+	async;
+	language ecmascript;
+	require success "Server running";
+	require success "Test plugin scriptable object";
+{
+	var url = "javascript:(function(){return 'Magic scripted plugin content.';})();";
+	var new_stream = false;
+	var write_ready = false;
+	var content = '';
+	var destroy_stream = false;
+	var write_limit = 3;
+
+	var finalize = function() {
+		plugin.onNewStream = undefined;
+		plugin.onWriteReady = undefined;
+		plugin.onWrite = undefined;
+		plugin.onDestroyStream = undefined;
+
+		verify(new_stream);
+		verify(write_ready);
+		verify(content == "Magic scripted plugin content.");
+		verify(destroy_stream);
+
+		ST_passed();
+	};
+
+	plugin.onNewStream = function(mimetype, stream, seekable, initial_stype) {
+		new_stream = true;
+		verify(stream.url == url);
+		return 1 /* NP_NORMAL */;
+	};
+
+	plugin.onWriteReady = function(stream) {
+		write_ready = true;
+		return write_limit;
+	};
+
+	plugin.onWrite = function(stream, offset, data) {
+		verify(data.length <= write_limit);
+		verify(offset == content.length);
+
+		for (var i = 0; i < data.length; i++)
+			content += String.fromCharCode(data[i]);
+	};
+
+	plugin.onDestroyStream = function(stream, reason) {
+		verify(stream.url == url);
+		verify(stream.end == content.length);
+		verify(reason == 0 /* NPRES_DONE */);
+		destroy_stream = true;
+
+		finalize();
+	};
+
+	verify(plugin.testGetURL(url, null) == true);
+
+	setTimeout(finalize, 6000);
+}
+
+test("NPN_GetURLNotify")
+	async;
+	language ecmascript;
+	require success "Server running";
+	require success "Test plugin scriptable object";
+{
+	var url = "http://127.0.0.1:7192/get-url-notify";
+	var url_notify_done = false;
+
+	var finalize = function() {
+		plugin.onURLNotify = undefined;
+		verify(url_notify_done);
+		ST_passed();
+	};
+
+	plugin.onURLNotify = function(notify_url, reason, data) {
+		verify(notify_url == url);
+		verify(data() == notify_url);
+		verify(reason == 0 /* NPRES_DONE */);
+		url_notify_done = true;
+
+		finalize();
+	};
+
+	verify(plugin.testGetURLNotify(url, null, function() { return url; }) == true);
+
+	setTimeout(finalize, 3000);
+}
+
+/**
+ * The purpose of the following test is to verify that we receive a notify (and opera destroys
+ * its internal stream object) regardless of the value we return from NPP_DestroyStream.
+ */
+test("NPN_GetURLNotify (failed destroystream)")
+	async;
+	language ecmascript;
+	require success "Server running";
+	require success "Test plugin scriptable object";
+{
+	var url = "http://127.0.0.1:7192/get-url-notify";
+	var url_notify_done = false;
+
+	var finalize = function() {
+		plugin.onURLNotify = undefined;
+		verify(url_notify_done);
+		ST_passed();
+	};
+
+	plugin.onURLNotify = function(notify_url, reason, data) {
+		verify(notify_url == url);
+		verify(data() == notify_url);
+		verify(reason == 0);
+		url_notify_done = true;
+
+		finalize();
+	};
+
+	plugin.onDestroyStream = function(stream) {
+		return 1 /* NPERR_GENERIC_ERROR */;
+	}
+
+	verify(plugin.testGetURLNotify(url, null, function() { return url; }) == true);
+
+	setTimeout(finalize, 3000);
+}
+test("NPN_GetURLNotify (network error)")
+	async;
+	language ecmascript;
+	require success "Server running";
+	require success "Test plugin scriptable object";
+{
+	var url = "http://127.0.0.1:7192/error-get-url-notify";
+	var url_notify_network_err = false;
+
+	var finalize = function() {
+		plugin.onURLNotify = undefined;
+		verify(url_notify_network_err);
+		ST_passed();
+	};
+
+	plugin.onURLNotify = function(notify_url, reason, data) {
+		verify(notify_url == url);
+		verify(data() == notify_url);
+		verify(reason == 1 /* NPRES_NETWORK_ERR */);
+		url_notify_network_err = true;
+
+		finalize();
+	};
+
+	verify(plugin.testGetURLNotify(url, null, function() { return url; }) == true);
+
+	setTimeout(finalize, 3000);
+}
+
+test("NPN_GetURLNotify (user break)")
+	async;
+	language ecmascript;
+	require success "Server running";
+	require success "Test plugin scriptable object";
+{
+	var url = "http://127.0.0.1:7192/get-url-notify";
+	var url_notify_user_break = false;
+
+	var finalize = function() {
+		plugin.onNewStream = undefined;
+		plugin.onURLNotify = undefined;
+		verify(url_notify_user_break);
+		ST_passed();
+	};
+
+	plugin.onURLNotify = function(notify_url, reason, data) {
+		verify(notify_url == url);
+		verify(data() == notify_url);
+		verify(reason == 2);
+		url_notify_user_break = true;
+		finalize();
+	};
+
+	plugin.onNewStream = function(mimetype, stream, seekable, initial_stype) {
+		verify(stream.url == url);
+		verify(mimetype == "text/x-vnd.opera-test-plugin");
+		plugin.testDestroyStream(stream, 2 /* NPRES_USER_BREAK */);
+		return 1 /* NP_NORMAL */;
+	};
+
+	verify(plugin.testGetURLNotify(url, null, function() { return url; }) == true);
+
+	setTimeout(finalize, 3000);
+}
+
+test("NPN_PostURL")
+	async;
+	language ecmascript;
+	require success "Server running";
+	require success "Test plugin scriptable object";
+{
+	var content_type = "Content-Type: application/x-www-form-urlencoded\r\n";
+	var content = content_type + "\r\nplugin-key=magic-plugin-value";
+	var url = "http://127.0.0.1:7192/post-url";
+	var new_stream = false;
+
+	var finalize = function() {
+		plugin.onNewStream = undefined;
+
+		verify(new_stream);
+		ST_passed();
+	};
+
+	plugin.onNewStream = function(mimetype, stream, seekable, initial_stype) {
+		new_stream = true;
+		verify(stream.url == url);
+		verify(mimetype == "text/x-vnd.opera-test-plugin");
+		verify(stream.headers.match(/200 OK/));
+		finalize();
+		return 1 /* NP_NORMAL */;
+	};
+
+	verify(plugin.testPostURL(url, null, content, false) == true);
+
+	setTimeout(finalize, 3000);
+}
+
+test("NPN_PostURL (multipart)")
+	async;
+	language ecmascript;
+	require success "Server running";
+	require success "Test plugin scriptable object";
+{
+	var content_type = "Content-Type: multipart/form-data\r\n";
+	var content = content_type + "\r\nplugin-key=magic-plugin-value";
+	var url = "http://127.0.0.1:7192/post-url-multipart";
+	var new_stream = false;
+
+	var finalize = function() {
+		plugin.onNewStream = undefined;
+
+		verify(new_stream);
+		ST_passed();
+	};
+
+	plugin.onNewStream = function(mimetype, stream, seekable, initial_stype) {
+		new_stream = true;
+		verify(stream.url == url);
+		verify(mimetype == "text/x-vnd.opera-test-plugin");
+		verify(stream.headers.match(/200 OK/));
+		finalize();
+		return 1 /* NP_NORMAL */;
+	};
+
+	verify(plugin.testPostURL(url, null, content, false) == true);
+
+	setTimeout(finalize, 3000);
+}
+
+test("NPN_PostURL (file data + embedded NULL byte)")
+	async;
+	language ecmascript;
+	require success "Server running";
+	require success "Test plugin scriptable object";
+{
+	var url = "http://127.0.0.1:7192/post-url-nullbyte";
+	var content_type = "Content-Type: application/x-www-form-urlencoded\r\n";
+	var content = "data:text/plain," + encodeURIComponent(content_type + "\r\nplugin-key=magic\0plugin\0value");
+	var new_stream = false;
+
+	var finalize = function() {
+		plugin.onNewStream = undefined;
+		verify(new_stream);
+		ST_passed();
+	};
+
+	plugin.onNewStream = function(mimetype, stream, seekable, initial_stype) {
+		new_stream = true;
+		verify(stream.url == url);
+		verify(mimetype == "text/x-vnd.opera-test-plugin");
+		verify(stream.headers.match(/200 OK/));
+		finalize();
+		return 1 /* NP_NORMAL */;
+	};
+
+	verify(plugin.testPostURL(url, null, content, true) == true);
+
+	setTimeout(finalize, 3000);
+}
+
+test("NPN_PostURLNotify")
+	async;
+	language ecmascript;
+	require success "Server running";
+	require success "Test plugin scriptable object";
+{
+	var url = "http://127.0.0.1:7192/post-url-notify";
+	var content_type = "Content-Type: application/x-www-form-urlencoded\r\n";
+	var content = content_type + "\r\nplugin-key=magic-plugin-value";
+	var notify_received = false;
+	var stream_created = false;
+
+	var finalize = function() {
+		plugin.onURLNotify = undefined;
+		plugin.onNewStream = undefined;
+
+		verify(notify_received);
+		verify(stream_created);
+		ST_passed();
+	};
+
+	plugin.onNewStream = function(mimetype, stream, seekable, initial_stype) {
+		stream_created = true;
+		verify(mimetype == "text/x-vnd.opera-test-plugin");
+		verify(stream.url == url);
+		verify(stream.headers.match(/200 OK/));
+		return 1 /* NP_NORMAL */;
+	};
+
+	plugin.onURLNotify = function(notify_url, reason, data) {
+		notify_received = true;
+		verify(notify_url == url);
+		verify(data() == notify_url);
+		verify(reason == 0 /* NPRES_DONE */);
+
+		finalize();
+	};
+
+	verify(plugin.testPostURLNotify(url, null, content, false, function() { return url; }) == true);
+
+	setTimeout(finalize, 3000);
+}
+
+test("NPN_PostURLNotify (failure)")
+	async;
+	language ecmascript;
+	require success "Server running";
+	require success "Test plugin scriptable object";
+{
+	var url = "http://127.0.0.1:7192/post-url-notify";
+	var content_type = "Content-Type: application/x-www-form-urlencoded\r\n";
+	var content = content_type + "\r\nplugin-key=invalid-plugin-value";
+	var notify_received = false;
+
+	var finalize = function() {
+		plugin.onURLNotify = undefined;
+		plugin.onNewStream = undefined;
+
+		verify(notify_received);
+		ST_passed();
+	};
+
+	plugin.onNewStream = function(mimetype, stream, seekable, initial_stype) {
+		verify(stream.url == url);
+		verify(mimetype == "text/x-vnd.opera-test-plugin");
+		verify(!stream.headers.match(/200 OK/));
+		return 1 /* NP_NORMAL */;
+	};
+
+	plugin.onURLNotify = function(notify_url, reason, data) {
+		notify_received = true;
+		verify(data() == notify_url);
+		verify(reason == 1 /* NPRES_NETWORK_ERR */);
+		finalize();
+	};
+
+	verify(plugin.testPostURLNotify(url, null, content, false, function() { return url; }) == true);
+
+	setTimeout(finalize, 3000);
+}
+
+test("NPN_PostURLNotify (file data + embedded NULL byte)")
+	async;
+	language ecmascript;
+	require success "Server running";
+	require success "Test plugin scriptable object";
+{
+	var url = "http://127.0.0.1:7192/post-url-nullbyte";
+	var content_type = "Content-Type: application/x-www-form-urlencoded\r\n";
+	var content = "data:text/plain," + encodeURIComponent(content_type + "\r\nplugin-key=magic\0plugin\0value");
+	var notify_received = false;
+
+	var finalize = function() {
+		plugin.onURLNotify = undefined;
+		plugin.onNewStream = undefined;
+
+		verify(notify_received);
+		ST_passed();
+	};
+
+	plugin.onNewStream = function(mimetype, stream, seekable, initial_stype) {
+		verify(stream.url == url);
+		verify(mimetype == "text/x-vnd.opera-test-plugin");
+		verify(stream.headers.match(/200 OK/));
+		return 1 /* NP_NORMAL */;
+	};
+
+	plugin.onURLNotify = function(notify_url, reason, data) {
+		notify_received = true;
+		verify(data() == notify_url);
+		verify(reason == 0 /* NPRES_DONE */);
+		finalize();
+	};
+
+	verify(plugin.testPostURLNotify(url, null, content, true, function() { return url; }) == true);
+
+	setTimeout(finalize, 3000);
+}
+
+test("NPN_RequestRead")
+	async;
+	disabled; /* This test does not work in Firefox (the standard.) Write a better one. */
+	language ecmascript;
+	require success "Server running";
+	require success "Test plugin scriptable object";
+{
+	var url = "http://127.0.0.1:7192/request-read-normal";
+	var new_stream = false;
+	var seek_done = false;
+	var seek_success = false;
+	var seek_position = 1024 * 1024 * 512;
+
+	var finalize = function() {
+		plugin.onNewStream = undefined;
+		plugin.onWriteReady = undefined;
+		plugin.onWrite = undefined;
+
+		verify(new_stream);
+		verify(seek_done);
+		verify(seek_success);
+		ST_passed();
+	};
+
+	var seek = function(stream) {
+		/* This call shall change the stream to mode NP_SEEK. */
+		plugin.testRequestRead(stream, seek_position, seek_position);
+
+		seek_done = true;
+	};
+
+	plugin.onNewStream = function(mimetype, stream, seekable, initial_stype) {
+		new_stream = true;
+		verify(stream.url == url);
+
+		setTimeout(function() { seek(stream); }, 10);
+
+		return 1 /* NP_NORMAL */;
+	};
+
+	plugin.onWriteReady = function() {
+		return seek_done ? 16 : 0;
+	};
+
+	plugin.onWrite = function(stream, offset, data) {
+		if (offset >= seek_position) {
+			seek_success = true;
+			finalize();
+		}
+	};
+
+	verify(plugin.testGetURL(url) == true);
+	setTimeout(finalize, 3000);
+}
+
+test("NPN_RequestRead (direct)")
+	async;
+	disabled; /* This test does not work in Firefox (the standard.) Write a better one. */
+	language ecmascript;
+	require success "Server running";
+	require success "Test plugin scriptable object";
+{
+	var url = "http://127.0.0.1:7192/request-read-direct";
+	var new_stream = false;
+	var seek_success = false;
+	var seek_position = 1024 * 1024 * 512;
+
+	var finalize = function() {
+		plugin.onNewStream = undefined;
+		plugin.onWriteReady = undefined;
+		plugin.onWrite = undefined;
+
+		verify(new_stream);
+		verify(seek_success);
+		ST_passed();
+	};
+
+	plugin.onNewStream = function(mimetype, stream, seekable, initial_stype) {
+		new_stream = true;
+
+		verify(stream.url == url);
+		verify(mimetype == "text/x-vnd.opera-test-plugin");
+		verify(stream.headers.match(/200 OK/));
+
+		plugin.testRequestRead(stream, seek_position, seek_position);
+
+		return 2 /* NP_SEEK */;
+	};
+
+	plugin.onWriteReady = function() {
+		return 16;
+	};
+
+	plugin.onWrite = function(stream, offset, data) {
+		if (offset >= seek_position) {
+			seek_success = true;
+			finalize();
+		}
+	};
+
+	verify(plugin.testGetURL(url) == true);
+	setTimeout(finalize, 3000);
+}
+
+test("NPN_RequestRead (NP_SEEK crash)")
+	async;
+	language ecmascript;
+	require success "Server running";
+	require success "Test plugin scriptable object";
+{
+	var url = "http://127.0.0.1:7192/request-read-seek";
+	var seek_stream;
+	var seek_position = 1024 * 1024 * 512;
+
+	var finalize = function() {
+		plugin.onNewStream = undefined;
+		verify(seek_stream);
+		ST_passed();
+	};
+
+	var seek = function() {
+		/* As of 2010-09-23, this crashes Opera. Note the limited
+		   support requiring that we pass a 0-size interval. */
+		plugin.testRequestRead(seek_stream, seek_position, seek_position);
+
+		/* We're happy not to crash. The tests above verify content. */
+		finalize();
+	};
+
+	plugin.onNewStream = function(mimetype, stream, seekable, initial_stype) {
+		verify(stream.url == url);
+		verify(mimetype == "text/x-vnd.opera-test-plugin");
+		verify(stream.headers.match(/200 OK/));
+
+		/* Schedule seek. */
+		seek_stream = stream;
+		setTimeout(seek, 10);
+
+		return 2 /* NP_SEEK. */
+	};
+
+	verify(plugin.testGetURL(url) == true);
+	setTimeout(finalize, 3000);
+}
+
+/**
+ * Set current document, instantiating a test plugin object
+ * available for the following javascript tests.
+ */
+html {
+	//! <html>
+	//! <head>
+	//! <title> Plugin tests for NPAPI's stream methods </title>
+	//! </head>
+	//! <body>
+	//! <object id="plugin" type="application/x-vnd.opera-test-plugin"
+	//!   width="1" height="1" windowless="true">Fallback</object>
+	//! <script>window.plugin = document.getElementById("plugin");</script>
+	//! </body>
+	//! </html>
+}
+
+test("NPN_GetURL (windowless)")
+	async;
+	language ecmascript;
+	require success "Server running";
+	require success "Test plugin scriptable object";
+{
+	var url = "http://127.0.0.1:7192/get-url";
+	var new_stream = false;
+	var write_ready = false;
+	var content = '';
+	var destroy_stream = false;
+	var write_limit = 0;
+
+	var finalize = function() {
+		plugin.onNewStream = undefined;
+		plugin.onWriteReady = undefined;
+		plugin.onWrite = undefined;
+		plugin.onDestroyStream = undefined;
+
+		verify(new_stream);
+		verify(write_ready);
+		verify(content == "Magic plugin content.\r\n");
+		verify(destroy_stream);
+
+		ST_passed();
+	};
+
+	plugin.onNewStream = function(mimetype, stream, seekable, initial_stype) {
+		new_stream = true;
+		verify(stream.url == url);
+		verify(mimetype == "text/x-vnd.opera-test-plugin");
+		verify(stream.headers.match(/X-Plugin-Test-Header: Plugin-Magic/));
+		verify(stream.headers.match(/200 OK/));
+		return 1 /* NP_NORMAL */;
+	};
+
+	plugin.onWriteReady = function(stream) {
+		write_ready = true;
+		/* Alternate between 0 and 7 to test write limit adherence. */
+		write_limit ^= 7;
+		return write_limit;
+	};
+
+	plugin.onWrite = function(stream, offset, data) {
+		verify(data.length <= write_limit);
+		verify(offset == content.length);
+
+		for (var i = 0; i < data.length; i++)
+			content += String.fromCharCode(data[i]);
+	};
+
+	plugin.onDestroyStream = function(stream, reason) {
+		verify(stream.url == url);
+		verify(stream.end == content.length);
+		verify(reason == 0 /* NPRES_DONE */);
+		destroy_stream = true;
+
+		finalize();
+	};
+
+	ST_paint(); // Bump windowless plugin into RUNNING mode.
+	verify(plugin.testGetURL(url, null) == true);
+
+	setTimeout(finalize, 6000);
+}
+
+test("NPN_GetURL (javascript, windowless)")
+	async;
+	language ecmascript;
+	require success "Server running";
+	require success "Test plugin scriptable object";
+{
+	var url = "javascript:(function(){return 'Magic scripted plugin content.';})();";
+	var new_stream = false;
+	var write_ready = false;
+	var content = '';
+	var destroy_stream = false;
+	var write_limit = 3;
+
+	var finalize = function() {
+		plugin.onNewStream = undefined;
+		plugin.onWriteReady = undefined;
+		plugin.onWrite = undefined;
+		plugin.onDestroyStream = undefined;
+
+		verify(new_stream);
+		verify(write_ready);
+		verify(content == "Magic scripted plugin content.");
+		verify(destroy_stream);
+
+		ST_passed();
+	};
+
+	plugin.onNewStream = function(mimetype, stream, seekable, initial_stype) {
+		new_stream = true;
+		verify(stream.url == url);
+		return 1 /* NP_NORMAL */;
+	};
+
+	plugin.onWriteReady = function(stream) {
+		write_ready = true;
+		return write_limit;
+	};
+
+	plugin.onWrite = function(stream, offset, data) {
+		verify(data.length <= write_limit);
+		verify(offset == content.length);
+
+		for (var i = 0; i < data.length; i++)
+			content += String.fromCharCode(data[i]);
+	};
+
+	plugin.onDestroyStream = function(stream, reason) {
+		verify(stream.url == url);
+		verify(stream.end == content.length);
+		verify(reason == 0 /* NPRES_DONE */);
+		destroy_stream = true;
+
+		finalize();
+	};
+
+	verify(plugin.testGetURL(url, null) == true);
+
+	setTimeout(finalize, 6000);
+}
+
+test("NPN_GetURLNotify (windowless)")
+	async;
+	language ecmascript;
+	require success "Server running";
+	require success "Test plugin scriptable object";
+{
+	var url = "http://127.0.0.1:7192/get-url-notify";
+	var url_notify_done = false;
+
+	var finalize = function() {
+		plugin.onURLNotify = undefined;
+		verify(url_notify_done);
+		ST_passed();
+	};
+
+	plugin.onURLNotify = function(notify_url, reason, data) {
+		verify(notify_url == url);
+		verify(data() == notify_url);
+		verify(reason == 0 /* NPRES_DONE */);
+		url_notify_done = true;
+
+		finalize();
+	};
+
+	verify(plugin.testGetURLNotify(url, null, function() { return url; }) == true);
+
+	setTimeout(finalize, 3000);
+}
+
+/**
+ * The purpose of the following test is to verify that we receive a notify (and opera destroys
+ * its internal stream object) regardless of the value we return from NPP_DestroyStream.
+ */
+test("NPN_GetURLNotify (failed destroystream, windowless)")
+	async;
+	language ecmascript;
+	require success "Server running";
+	require success "Test plugin scriptable object";
+{
+	var url = "http://127.0.0.1:7192/get-url-notify";
+	var url_notify_done = false;
+
+	var finalize = function() {
+		plugin.onURLNotify = undefined;
+		verify(url_notify_done);
+		ST_passed();
+	};
+
+	plugin.onURLNotify = function(notify_url, reason, data) {
+		verify(notify_url == url);
+		verify(data() == notify_url);
+		verify(reason == 0);
+		url_notify_done = true;
+
+		finalize();
+	};
+
+	plugin.onDestroyStream = function(stream) {
+		return 1 /* NPERR_GENERIC_ERROR */;
+	}
+
+	verify(plugin.testGetURLNotify(url, null, function() { return url; }) == true);
+
+	setTimeout(finalize, 3000);
+}
+test("NPN_GetURLNotify (network error, windowless)")
+	async;
+	language ecmascript;
+	require success "Server running";
+	require success "Test plugin scriptable object";
+{
+	var url = "http://127.0.0.1:7192/error-get-url-notify";
+	var url_notify_network_err = false;
+
+	var finalize = function() {
+		plugin.onURLNotify = undefined;
+		verify(url_notify_network_err);
+		ST_passed();
+	};
+
+	plugin.onURLNotify = function(notify_url, reason, data) {
+		verify(notify_url == url);
+		verify(data() == notify_url);
+		verify(reason == 1 /* NPRES_NETWORK_ERR */);
+		url_notify_network_err = true;
+
+		finalize();
+	};
+
+	verify(plugin.testGetURLNotify(url, null, function() { return url; }) == true);
+
+	setTimeout(finalize, 3000);
+}
+
+test("NPN_GetURLNotify (user break, windowless)")
+	async;
+	language ecmascript;
+	require success "Server running";
+	require success "Test plugin scriptable object";
+{
+	var url = "http://127.0.0.1:7192/get-url-notify";
+	var url_notify_user_break = false;
+
+	var finalize = function() {
+		plugin.onNewStream = undefined;
+		plugin.onURLNotify = undefined;
+		verify(url_notify_user_break);
+		ST_passed();
+	};
+
+	plugin.onURLNotify = function(notify_url, reason, data) {
+		verify(notify_url == url);
+		verify(data() == notify_url);
+		verify(reason == 2);
+		url_notify_user_break = true;
+		finalize();
+	};
+
+	plugin.onNewStream = function(mimetype, stream, seekable, initial_stype) {
+		verify(stream.url == url);
+		verify(mimetype == "text/x-vnd.opera-test-plugin");
+		plugin.testDestroyStream(stream, 2 /* NPRES_USER_BREAK */);
+		return 1 /* NP_NORMAL */;
+	};
+
+	verify(plugin.testGetURLNotify(url, null, function() { return url; }) == true);
+
+	setTimeout(finalize, 3000);
+}
+
+test("NPN_PostURL (windowless)")
+	async;
+	language ecmascript;
+	require success "Server running";
+	require success "Test plugin scriptable object";
+{
+	var content_type = "Content-Type: application/x-www-form-urlencoded\r\n";
+	var content = content_type + "\r\nplugin-key=magic-plugin-value";
+	var url = "http://127.0.0.1:7192/post-url";
+	var new_stream = false;
+
+	var finalize = function() {
+		plugin.onNewStream = undefined;
+
+		verify(new_stream);
+		ST_passed();
+	};
+
+	plugin.onNewStream = function(mimetype, stream, seekable, initial_stype) {
+		new_stream = true;
+		verify(stream.url == url);
+		verify(mimetype == "text/x-vnd.opera-test-plugin");
+		verify(stream.headers.match(/200 OK/));
+		finalize();
+		return 1 /* NP_NORMAL */;
+	};
+
+	verify(plugin.testPostURL(url, null, content, false) == true);
+
+	setTimeout(finalize, 3000);
+}
+
+test("NPN_PostURL (windowless, multipart)")
+	async;
+	language ecmascript;
+	require success "Server running";
+	require success "Test plugin scriptable object";
+{
+	var content_type = "Content-Type: multipart/form-data\r\n";
+	var content = content_type + "\r\nplugin-key=magic-plugin-value";
+	var url = "http://127.0.0.1:7192/post-url-multipart";
+	var new_stream = false;
+
+	var finalize = function() {
+		plugin.onNewStream = undefined;
+
+		verify(new_stream);
+		ST_passed();
+	};
+
+	plugin.onNewStream = function(mimetype, stream, seekable, initial_stype) {
+		new_stream = true;
+		verify(stream.url == url);
+		verify(mimetype == "text/x-vnd.opera-test-plugin");
+		verify(stream.headers.match(/200 OK/));
+		finalize();
+		return 1 /* NP_NORMAL */;
+	};
+
+	verify(plugin.testPostURL(url, null, content, false) == true);
+
+	setTimeout(finalize, 3000);
+}
+
+test("NPN_PostURLNotify (windowless)")
+	async;
+	language ecmascript;
+	require success "Server running";
+	require success "Test plugin scriptable object";
+{
+	var url = "http://127.0.0.1:7192/post-url-notify";
+	var content_type = "Content-Type: application/x-www-form-urlencoded\r\n";
+	var content = content_type + "\r\nplugin-key=magic-plugin-value";
+	var notify_received = false;
+	var stream_created = false;
+
+	var finalize = function() {
+		plugin.onURLNotify = undefined;
+		plugin.onNewStream = undefined;
+
+		verify(notify_received);
+		verify(stream_created);
+		ST_passed();
+	};
+
+	plugin.onNewStream = function(mimetype, stream, seekable, initial_stype) {
+		stream_created = true;
+		verify(mimetype == "text/x-vnd.opera-test-plugin");
+		verify(stream.url == url);
+		verify(stream.headers.match(/200 OK/));
+		return 1 /* NP_NORMAL */;
+	};
+
+	plugin.onURLNotify = function(notify_url, reason, data) {
+		notify_received = true;
+		verify(notify_url == url);
+		verify(data() == notify_url);
+		verify(reason == 0 /* NPRES_DONE */);
+
+		finalize();
+	};
+
+	verify(plugin.testPostURLNotify(url, null, content, false, function() { return url; }) == true);
+
+	setTimeout(finalize, 3000);
+}
+
+test("NPN_PostURLNotify (failure, windowless)")
+	async;
+	language ecmascript;
+	require success "Server running";
+	require success "Test plugin scriptable object";
+{
+	var url = "http://127.0.0.1:7192/post-url-notify";
+	var content_type = "Content-Type: application/x-www-form-urlencoded\r\n";
+	var content = content_type + "\r\nplugin-key=invalid-plugin-value";
+	var notify_received = false;
+
+	var finalize = function() {
+		plugin.onURLNotify = undefined;
+		plugin.onNewStream = undefined;
+
+		verify(notify_received);
+		ST_passed();
+	};
+
+	plugin.onNewStream = function(mimetype, stream, seekable, initial_stype) {
+		verify(stream.url == url);
+		verify(mimetype == "text/x-vnd.opera-test-plugin");
+		verify(!stream.headers.match(/200 OK/));
+		return 1 /* NP_NORMAL */;
+	};
+
+	plugin.onURLNotify = function(notify_url, reason, data) {
+		notify_received = true;
+		verify(data() == notify_url);
+		verify(reason == 1 /* NPRES_NETWORK_ERR */);
+		finalize();
+	};
+
+	verify(plugin.testPostURLNotify(url, null, content, false, function() { return url; }) == true);
+
+	setTimeout(finalize, 3000);
+}
+
+test("NPN_RequestRead (windowless)")
+	async;
+	disabled; /* This test does not work in Firefox (the standard.) Write a better one. */
+	language ecmascript;
+	require success "Server running";
+	require success "Test plugin scriptable object";
+{
+	var url = "http://127.0.0.1:7192/request-read-normal";
+	var new_stream = false;
+	var seek_done = false;
+	var seek_success = false;
+	var seek_position = 1024 * 1024 * 512;
+
+	var finalize = function() {
+		plugin.onNewStream = undefined;
+		plugin.onWriteReady = undefined;
+		plugin.onWrite = undefined;
+
+		verify(new_stream);
+		verify(seek_done);
+		verify(seek_success);
+		ST_passed();
+	};
+
+	var seek = function(stream) {
+		/* This call shall change the stream to mode NP_SEEK. */
+		plugin.testRequestRead(stream, seek_position, seek_position);
+
+		seek_done = true;
+	};
+
+	plugin.onNewStream = function(mimetype, stream, seekable, initial_stype) {
+		new_stream = true;
+		verify(stream.url == url);
+
+		setTimeout(function() { seek(stream); }, 10);
+
+		return 1 /* NP_NORMAL */;
+	};
+
+	plugin.onWriteReady = function() {
+		return seek_done ? 16 : 0;
+	};
+
+	plugin.onWrite = function(stream, offset, data) {
+		if (offset >= seek_position) {
+			seek_success = true;
+			finalize();
+		}
+	};
+
+	verify(plugin.testGetURL(url) == true);
+	setTimeout(finalize, 3000);
+}
+
+test("NPN_RequestRead (direct, windowless)")
+	async;
+	disabled; /* This test does not work in Firefox (the standard.) Write a better one. */
+	language ecmascript;
+	require success "Server running";
+	require success "Test plugin scriptable object";
+{
+	var url = "http://127.0.0.1:7192/request-read-direct";
+	var new_stream = false;
+	var seek_success = false;
+	var seek_position = 1024 * 1024 * 512;
+
+	var finalize = function() {
+		plugin.onNewStream = undefined;
+		plugin.onWriteReady = undefined;
+		plugin.onWrite = undefined;
+
+		verify(new_stream);
+		verify(seek_success);
+		ST_passed();
+	};
+
+	plugin.onNewStream = function(mimetype, stream, seekable, initial_stype) {
+		new_stream = true;
+
+		verify(stream.url == url);
+		verify(mimetype == "text/x-vnd.opera-test-plugin");
+		verify(stream.headers.match(/200 OK/));
+
+		plugin.testRequestRead(stream, seek_position, seek_position);
+
+		return 2 /* NP_SEEK */;
+	};
+
+	plugin.onWriteReady = function() {
+		return 16;
+	};
+
+	plugin.onWrite = function(stream, offset, data) {
+		if (offset >= seek_position) {
+			seek_success = true;
+			finalize();
+		}
+	};
+
+	verify(plugin.testGetURL(url) == true);
+	setTimeout(finalize, 3000);
+}
+
+test("NPN_RequestRead (NP_SEEK crash, windowless)")
+	async;
+	language ecmascript;
+	require success "Server running";
+	require success "Test plugin scriptable object";
+{
+	var url = "http://127.0.0.1:7192/request-read-seek";
+	var seek_stream;
+	var seek_position = 1024 * 1024 * 512;
+
+	var finalize = function() {
+		plugin.onNewStream = undefined;
+		verify(seek_stream);
+		ST_passed();
+	};
+
+	var seek = function() {
+		/* As of 2010-09-23, this crashes Opera. Note the limited
+		   support requiring that we pass a 0-size interval. */
+		plugin.testRequestRead(seek_stream, seek_position, seek_position);
+
+		/* We're happy not to crash. The tests above verify content. */
+		finalize();
+	};
+
+	plugin.onNewStream = function(mimetype, stream, seekable, initial_stype) {
+		verify(stream.url == url);
+		verify(mimetype == "text/x-vnd.opera-test-plugin");
+		verify(stream.headers.match(/200 OK/));
+
+		/* Schedule seek. */
+		seek_stream = stream;
+		setTimeout(seek, 10);
+
+		return 2 /* NP_SEEK. */
+	};
+
+	verify(plugin.testGetURL(url) == true);
+	setTimeout(finalize, 3000);
+}
+
+test("initialization of NPP_NewStream(..., stype) out parameter")
+	async;
+	language ecmascript;
+	require success "Server running";
+	require success "Test plugin scriptable object";
+{
+	var url = "http://127.0.0.1:7192/get-url";
+	var new_stream = false;
+
+	plugin.onNewStream = function(mimetype, stream, seekable, initial_stype) {
+		new_stream = true;
+		var NP_NORMAL = 1
+		verify(initial_stype == NP_NORMAL);
+		verify(stream.url == url);
+		verify(mimetype == "text/x-vnd.opera-test-plugin");
+		verify(stream.headers.match(/X-Plugin-Test-Header: Plugin-Magic/));
+		verify(stream.headers.match(/200 OK/));
+		return 1 /* NP_NORMAL */;
+	};
+
+	// NPN_GetURL() will trigger NPP_NewStream()
+	verify(plugin.testGetURL(url, null) == true);
+
+	var finalize = function() {
+		plugin.onNewStream = undefined;
+		verify(new_stream);
+		ST_passed();
+	};
+	setTimeout(finalize, 3000);
+}
+
+test("Javascript URL escaping for NPN_GetURL()")
+	async;
+	language ecmascript;
+	require success "Test plugin scriptable object";
+{
+	s = "";
+	var destroyed = false;
+	var notified = false;
+
+	plugin.onDestroyStream = function() {
+		destroyed = true;
+	};
+
+	plugin.onURLNotify = function() {
+		notified = true;
+		finalize();
+	};
+
+	var finalize = function() {
+		plugin.onDestroyStream = undefined;
+		plugin.onURLNotify = undefined;
+
+		verify(destroyed);
+		verify(!notified);
+		verify(s == "foo bar");
+		ST_passed();
+	};
+
+	/* The url should become unescaped so that the contents of s is set to "foo bar". */
+	verify(plugin.testGetURL("javascript:s = 'foo%20bar'", null));
+	setTimeout(finalize, 2000);
+}
+
+test("Javascript URL escaping for NPN_GetURL() with url target")
+	async;
+	language ecmascript;
+	require success "Test plugin scriptable object";
+{
+	s = "";
+	var destroyed = false;
+	var notified = false;
+
+	plugin.onDestroyStream = function() {
+		destroyed = true;
+	};
+
+	plugin.onURLNotify = function() {
+		notified = true;
+		finalize();
+	};
+
+	var finalize = function() {
+		plugin.onDestroyStream = undefined;
+		plugin.onURLNotify = undefined;
+
+		verify(!destroyed);
+		verify(!notified);
+		verify(s == "foo bar");
+		ST_passed();
+	};
+
+	verify(plugin.testGetURL("javascript:s = 'foo%20bar'", "_self"));
+	setTimeout(finalize, 2000);
+}
+
+test("Javascript URL escaping for NPN_PostURL()")
+	async;
+	language ecmascript;
+	require success "Test plugin scriptable object";
+{
+	s = "";
+	var destroyed = false;
+	var notified = false;
+
+	plugin.onDestroyStream = function() {
+		destroyed = true;
+	};
+
+	plugin.onURLNotify = function() {
+		notified = true;
+		finalize();
+	};
+
+	var finalize = function() {
+		plugin.onDestroyStream = undefined;
+		plugin.onURLNotify = undefined;
+
+		verify(destroyed);
+		verify(!notified);
+		verify(s == "foo bar");
+		ST_passed();
+	};
+
+	verify(plugin.testPostURL("javascript:s = 'foo%20bar'", null, "", false));
+	setTimeout(finalize, 2000);
+}
+
+test("Javascript URL escaping for NPN_GetURLNotify()")
+	async;
+	language ecmascript;
+	require success "Test plugin scriptable object";
+{
+	s = "";
+	var destroyed = false;
+	var notified = false;
+
+	plugin.onDestroyStream = function() {
+		destroyed = true;
+	};
+
+	plugin.onURLNotify = function() {
+		notified = true;
+		finalize();
+	};
+
+	var finalize = function() {
+		plugin.onDestroyStream = undefined;
+		plugin.onURLNotify = undefined;
+
+		verify(destroyed);
+		verify(notified);
+		verify(s == "foo bar");
+		ST_passed();
+	};
+
+	verify(plugin.testGetURLNotify("javascript:s = 'foo%20bar'"));
+	setTimeout(finalize, 2000);
+}
+
+test("Javascript URL escaping for NPN_PostURLNotify()")
+	async;
+	language ecmascript;
+	require success "Test plugin scriptable object";
+{
+	s = "";
+	var destroyed = false;
+	var notified = false;
+
+	plugin.onDestroyStream = function() {
+		destroyed = true;
+	};
+
+	plugin.onURLNotify = function() {
+		notified = true;
+		finalize();
+	};
+
+	var finalize = function() {
+		plugin.onDestroyStream = undefined;
+		plugin.onURLNotify = undefined;
+
+		verify(destroyed);
+		verify(notified);
+		verify(s == "foo bar");
+		ST_passed();
+	};
+
+	verify(plugin.testPostURLNotify("javascript:s = 'foo%20bar'", null, "", false));
+	setTimeout(finalize, 2000);
+}

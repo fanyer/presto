@@ -1,0 +1,746 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01//EN">
+<html lang="en" dir="ltr">
+<head>
+ <meta http-equiv="Content-Type" content="text/html;charset=iso-8859-1">
+ <title>Elements inserted by the layout engine</title>
+ <link rev="made" href="mailto:mstensho@opera.com">
+ <link rel="stylesheet" href="../../coredoc/coredoc.css" type="text/css" media="all">
+ <link rel="contents" href="../../coredoc/index.html" type="text/html" title="Core API">
+ <style>
+   .ref { background:#ffd; border:1px dashed black; padding:1px; line-height:1.7em; }
+ </style>
+</head>
+
+<body>
+ <h1>Elements inserted by the layout engine</h1>
+ <p>
+  Copyright © 1995-2010 Opera Software AS. All rights reserved.
+  This file is part of the Opera web browser. It may not be distributed
+  under any circumstances.
+  <br>
+ </p>
+
+ <h2>Introduction</h2>
+
+ <p>In some situations the layout engine needs to insert HTML elements
+   on its own. There are several categories, including the following:</p>
+
+ <ul>
+   <li><a href="http://www.w3.org/TR/CSS21/tables.html#anonymous-boxes">anonymous
+   table boxes</a></li>
+
+   <li>the
+   '<a href="http://www.w3.org/TR/CSS21/generate.html#propdef-content">content</a>'
+   property (which are normally specified
+   on <a href="http://www.w3.org/TR/CSS21/generate.html#before-after-content">::before
+   and ::after pseudo elements</a>, but in Opera (as specified in CSS
+   3) we also support it on any other element)</li>
+
+   <li>the ::first-letter pseudo element</li>
+
+   <li>the ::first-line pseudo element (not documented here)</li>
+
+   <li>Links with ALT text for AREA elements inside MAP elements (not
+   documented here)</li>
+</ul>
+
+ <p>A layout box for a child element is created when and if
+ Box::LayoutChildren() decides to. It then calls
+ LayoutProperties::CreateChildLayoutBox(). This method will call
+ CreateLayoutBox() on the child, and this method will cause necessary
+ elements to be inserted by the layout engine.</p>
+
+ <p>Elements inserted by the layout engine will have their
+ HE_InsertType set to HE_INSERTED_BY_LAYOUT (see
+ HTML_Element::GetInserted()).</p>
+
+ <h2>Anonymous table elements</h2>
+
+ <div class="ref">
+   Spec: <a href="http://www.w3.org/TR/CSS21/tables.html#anonymous-boxes">17.2.1
+   Anonymous table objects</a><br>
+
+   Code: LayoutProperties::CheckAndInsertMissingTableElement()<br>
+ </div>
+
+ <h3>Insertion rules</h3>
+
+ <p>A TableCellBox (display:table-cell) requires a TableRowBox
+ (display:table-row) as parent. A TableRowBox requires a
+ TableRowGroupBox (display:table-row-group, table-header-group or
+ table-footer-group) as parent. A TableRowGroupBox requires
+ TableContent (display:table or inline-table) as parent. A
+ TableColGroupBox (display:table-column or table-column-group) also
+ requires TableContent as parent. This is pretty much in accordance
+ with the spec, although it's somewhat stricter, in that the spec
+ doesn't require a table-row-group between a (inline-)table and a
+ table-row, while Opera requires this in order to work. This is just
+ an implementation detail that cannot be observed from the outside
+ (via scripts or whatever).</p>
+
+ <p><small>(Note: the above paragraph ought to say something about
+ TableCaptionBox as well, but we're currently too buggy (see
+ bug <a href="https://bugs.opera.com/browse/CORE-26668">CORE-26668</a>)</small></p>
+
+ <p>Furthermore, a non-table* box as child of a table* box that isn't
+ a TableCellBox or a TableCaptionBox requires a TableCellBox
+ (display:table-cell) as parent.</p>
+
+ <p>When we lay out a document that has a structure that doesn't
+ fulfill these requirements, we need to create and insert elements
+ (and create layout boxes for them) to correct the structure. When an
+ element E is reparented under a new element I, consecutive siblings
+ og E may also be moved under I. Consecutive siblings with the same
+ display type as E (or with no layout at all, e.g. display:none) will
+ always be reparented under I. In addition, if E is not a table* box,
+ any consecutive that also isn't a table* box will be reparented under
+ I.</p>
+
+ <h3>Implementation</h3>
+
+ <h4>Inserting a parent</h4>
+
+ <p>LayoutProperties::CreateLayoutBox() calls CreateBox() which calls
+ CheckAndInsertMissingTableElement() if the display type is relevant
+ (table-cell, table-row, table-row-group, table-header-group,
+ table-footer-group, table-column,
+ table-column-group). CheckAndInsertMissingTableElement() will check
+ if the element E needs a different parent I, and if so, create and
+ insert the parent I. Then move <b>all</b> consecutive siblings (with
+ the exception of any ::after pseudo-element) under I. The spec says
+ that only the consecutive siblings with the same display type as E
+ should be moved, but at this point in the code we cannot tell the
+ siblings' display type (the cascade hasn't been calculated for them
+ yet). Therefore we move all of them down. If it later turns out that
+ they don't belong down there, they will be moved back up. When
+ CheckAndInsertMissingTableElement() has inserted a parent I, it
+ returns INSERTED_PARENT. This return value informs the caller (in
+ this case it ultimately means Box::LayoutChildren()) about the fact
+ that the child it just attempted to lay out got a parent inserted,
+ which means that before it can lay out that child, it needs to lay
+ out the parent I (and that parent's siblings, if
+ CheckAndInsertMissingTableElement() didn't move them all down under
+ I).</p>
+
+ <p>This procedure will be repeated if there are several missing table
+ elements in the structure.</p>
+
+ <p>Example 1:</p>
+
+ <xmp>
+   <div id="table" style="display:table;">
+     <div id="cell" style="display:table-cell;"></div>
+   </div>
+ </xmp>
+
+ <p>The layout box for 'table' will be created and laid out
+ normally. No correction will happen at this point. When attempting to
+ create a box for 'cell', CheckAndInsertMissingTableElements() will
+ insert a table-row parent of 'cell':</p>
+
+ <xmp>
+   <div id="table" style="display:table;">
+     <tr HE_INSERTED_BY_LAYOUT id="row" style="display:table-row;">
+       <div id="cell" style="display:table-cell;"></div>
+     </tr>
+   </div>
+ </xmp>
+
+ <p>... and return INSERTED_PARENT. No box
+ created. Box::LayoutChildren() will have the wits to go to the
+ child's parent before it continues, and attempt to create a layout
+ box for that one instead. I.e. it will try to lay out
+ 'row'. CheckAndInsertMissingTableElements() will insert a
+ table-row-group parent of row':</p>
+
+ <xmp>
+   <div id="table" style="display:table;">
+     <tbody HE_INSERTED_BY_LAYOUT id="row-group" style="display:table-row-group;">
+       <tr HE_INSERTED_BY_LAYOUT id="row" style="display:table-row;">
+	 <div id="cell" style="display:table-cell;"></div>
+       </tr>
+     </tbody>
+   </div>
+ </xmp>
+
+ <p>... and return INSERTED_PARENT. No box
+ created. Box::LayoutChildren() will have the wits to go to the
+ child's parent before it continues, and attempt to create a layout
+ box for that one instead. I.e. it will try to lay out
+ 'row-group'. This time there will be no new element inserted and
+ layout will proceed without any further insertions from here.</p>
+
+ <p>Example 2:</p>
+
+ <xmp>
+   <div id="row" style="display:table-row;"></div>
+ </xmp>
+
+ <p>'row' needs a row-group parent:</p>
+
+ <xmp>
+   <tbody HE_INSERTED_BY_LAYOUT id="row-group" style="display:table-row-group;">
+     <div id="row" style="display:table-row;"></div>
+   </tbody>
+ </xmp>
+
+ <p>'row-group' needs a table parent:</p>
+
+ <xmp>
+   <table HE_INSERTED_BY_LAYOUT id="table" style="display:table;">
+     <tbody HE_INSERTED_BY_LAYOUT id="row-group" style="display:table-row-group;">
+       <div id="row" style="display:table-row;"></div>
+     </tbody>
+   </table>
+ </xmp>
+
+ <p>... and we're good to go. Note that no table-cell was inserted, as
+ there is no content that requires it.</p>
+
+ <h4>Promoting children that didn't belong under the parent after all</h4>
+
+ <p>As mentioned in the previous paragraph,
+ LayoutProperties::CheckAndInsertMissingTableElement() has no way of
+ determining that consecutive siblings of an element E (that just got
+ a parent I inserted) have the same display type as E, and will
+ therefore typically move <b>all</b> consecutive siblings of E under
+ I. It is not until we try to lay out such a sibling S that we can
+ tell what display type it has. LayoutProperties::CreateLayoutBox()
+ calls CheckAndInsertMissingTableElement() when the element isn't a
+ table-cell or table-caption and the parent is TableContent,
+ TableRowGroupBox or TableRowBox. This is the code that takes care of
+ inserting a child when necessary, but it will also detect incorrect
+ reparenting done as described in the previous paragraph here. If
+ CheckAndInsertMissingTableElement() finds incorrect reparenting of
+ element S, it will promote it and all its consecutive siblings to
+ siblings of I, and return ELEMENT_MOVED_UP. The caller (in this case
+ it ultimately means Box::LayoutChildren()) will then know that the
+ child it tried to lay out has been moved up in the hierarchy, along
+ with its consecutive siblings. This means that Box::LayoutChildren()
+ can return and have the parent's Box::LayoutChildren() process the
+ new children it just got.</p>
+
+ <p>Example:</p>
+
+ <xmp>
+   <div id="row" style="display:table-row;"></div>
+   <div id="block"></div>
+ </xmp>
+
+ <p>'row' needs a row-group parent:</p>
+
+ <xmp>
+   <tbody HE_INSERTED_BY_LAYOUT id="row-group" style="display:table-row-group;">
+     <div id="row" style="display:table-row;"></div>
+     <div id="block"></div>
+   </tbody>
+ </xmp>
+
+ <p>'row-group' needs a table parent:</p>
+
+ <xmp>
+   <table HE_INSERTED_BY_LAYOUT id="table" style="display:table;">
+     <tbody HE_INSERTED_BY_LAYOUT id="row-group" style="display:table-row-group;">
+       <div id="row" style="display:table-row;"></div>
+       <div id="block"></div>
+     </tbody>
+   </table>
+ </xmp>
+
+ <p>We can now lay out 'table', 'row-group' and 'row' without any
+ further tree changes. When reaching 'block', however,
+ CheckAndInsertMissingTableElement() has to detect the situation that
+ 'block' has an inserted table-row-group parent. It doesn't fit there,
+ so we have to promote it:</p>
+
+ <xmp>
+   <table HE_INSERTED_BY_LAYOUT id="table" style="display:table;">
+     <tbody HE_INSERTED_BY_LAYOUT id="row-group" style="display:table-row-group;">
+       <div id="row" style="display:table-row;"></div>
+     </tbody>
+     <div id="block"></div>
+   </table>
+ </xmp>
+
+ <p>Box::LayoutChildren on the row-group can now finish - it suddenly
+ has no more children, as 'block' was promoted. Return to the parent's
+ (table) LayoutChildren(), which will try to lay out
+ 'block'. CheckAndInsertMissingTableElement() will see that 'block'
+ has a layout-inserted table parent. It doesn't fit there
+ either. Promote it again:</p>
+
+ <xmp>
+   <table HE_INSERTED_BY_LAYOUT id="table" style="display:table;">
+     <tbody HE_INSERTED_BY_LAYOUT id="row-group" style="display:table-row-group;">
+       <div id="row" style="display:table-row;"></div>
+     </tbody>
+   </table>
+   <div id="block"></div>
+ </xmp>
+
+ <p>Box::LayoutChildren on the table can now finish - it suddenly has
+ no more children, as 'block' was promoted. Return to the parent's
+ (whatever that is; it's not shown in this example) LayoutChildren(),
+ which will try to lay out 'block'. This time everything is okay, and
+ no further tree modifications are necessary.</p>
+
+ <h4>Inserting a table-cell</h4>
+
+ <p>LayoutProperties::CreateLayoutBox() calls
+ CheckAndInsertMissingTableElement() when the element isn't a
+ table-cell or table-caption and the parent is TableContent,
+ TableRowGroupBox or TableRowBox.</p>
+
+ <p>If a non-table* element E is inside of a table structure, but E is
+ no table-* element and its parent isn't table-cell or table-caption,
+ E needs a table-cell parent inserted.
+ CheckAndInsertMissingTableElement() will take care of this.</p>
+
+ <p>Example 3:</p>
+
+ <xmp>
+   <div id="row-group" style="display:table-row-group;">
+     HEST
+   </div>
+ </xmp>
+
+ <p>Try to lay out 'row-group'. It needs a table parent:</p>
+
+ <xmp>
+   <table HE_INSERTED_BY_LAYOUT id="table" style="display:table;">
+     <div id="row-group" style="display:table-row-group;">
+       HEST
+     </div>
+   </table>
+ </xmp>
+
+ <p>Try to lay out 'table'. OK. Try to lay out 'row-group'. OK. Try to
+ lay out text node 'HEST'. It needs a table-cell parent, because its
+ current parent is either table, table-row-group or table-row
+ (i.e. it's inside of a table structure, but the structure is
+ incomplete), and this parent is a real DOM element:</p>
+
+ <xmp>
+   <table HE_INSERTED_BY_LAYOUT id="table" style="display:table;">
+     <div id="row-group" style="display:table-row-group;">
+       <td HE_INSERTED_BY_LAYOUT id="cell" style="display:table-cell;">
+	 HEST
+       </td>
+     </div>
+   </table>
+ </xmp>
+
+ <p>Try to lay out 'cell'. It needs a table-row parent:</p>
+
+ <xmp>
+   <table HE_INSERTED_BY_LAYOUT id="table" style="display:table;">
+     <div id="row-group" style="display:table-row-group;">
+       <tr HE_INSERTED_BY_LAYOUT id="row" style="display:table-row;">
+	 <td HE_INSERTED_BY_LAYOUT id="cell" style="display:table-cell;">
+	   HEST
+	 </td>
+       </tr>
+     </div>
+   </table>
+ </xmp>
+
+ <p>Try to lay out 'row'. OK. Try to lay out 'cell'. OK. Try to lay
+ out text node 'HEST'. OK.</p>
+
+ <h2>Generated content</h2>
+
+ <div class="ref">
+   Spec: <a href="http://www.w3.org/TR/CSS21/generate.html#before-after-content">12.1
+   The :before and :after pseudo-elements</a><br>
+
+   Spec: <a href="http://www.w3.org/TR/CSS21/generate.html#content">12.2
+   The 'content' property</a><br> Code:
+
+   LayoutProperties::AddGeneratedContent()<br>
+
+   Code: LayoutProperties::CreatePseudoElement()<br>
+
+   Code: LayoutProperties::CreatePseudoReplacedElement()<br>
+ </div>
+
+ <h3>::before and ::after</h3>
+
+ <p>The layout engine finds out if an element should have a ::before
+ or ::after element associated with it, by calling HTML_Element's
+ HasBefore() or HasAfter(). It does this during creation of the DOM
+ element's layout box, in LayoutProperties::CreateLayoutBox().</p>
+
+ <p>We will add a ::before pseudo-element as the first child of a DOM
+ element on which the ::before selector matches, and an ::after
+ pseudo-element as the last child of said DOM element.</p>
+
+ <p>The following piece of HTML:</p>
+
+ <xmp>
+   <style>#elm::before, #elm::after { content:"xxx" }</style>
+   <div id="elm"> HEST </div>
+ </xmp>
+
+ <p>would result in the following tree for layout:</p>
+
+ <xmp>
+   <div id="elm">
+     <div::before HE_INSERTED_BY_LAYOUT>xxx</div::before>
+     HEST
+     <div::after HE_INSERTED_BY_LAYOUT>xxx</div::after>
+   </div>
+ </xmp>
+
+ <p>LayoutProperties::CreateLayoutBox() calls CreatePseudoElement() to
+ create a child that represents the ::before or ::after
+ pseudo-element. When CreateLayoutBox() eventually is called on these
+ children, it calls AddGeneratedContent(), which will process the
+ 'content' property and add child elements as needed. In the example
+ above, it just needs to add a Markup::HTE_TEXT HTML_Element that holds the
+ text 'xxx', one for ::before and one for ::after.</p>
+
+ <h3>Specifying the 'content' property directly on a DOM element</h3>
+
+ <p>In Opera (like CSS3 suggests), the 'content' property is supported
+ on every element, not just ::before and ::after pseudo-elements. When
+ the 'content' property is specified on an element, it means that no
+ child DOM elements should get layout boxes.</p>
+
+ <p>LayoutProperties::CreateLayoutBox() calls AddGeneratedContent() to
+ process the 'content' property and insert appropriate child
+ elements. These elements will be inserted after any DOM children that
+ the element may have, but before the ::after pseudo-element, if it
+ has one.</p>
+
+ <p>As previously mentioned, when there are elements inserted under a
+ DOM element because of the 'content' property, the children of that
+ DOM element should not get layout boxes. We let the computed value of
+ the 'display' property for these DOM children be 'none'. There's code
+ in HTMLayoutProperties::GetCssProperties() to achieve that.</p>
+
+ <p>The following piece of HTML:</p>
+
+ <xmp>
+   <style>
+     #elm::before, #elm::after { content:"xxx" }
+     #elm { content:"sau" }
+   </style>
+   <div id="elm"><span>HEST</span></div>
+ </xmp>
+
+ <p>would result in the following tree for layout:</p>
+
+ <xmp>
+   <div id="elm">
+     <div::before HE_INSERTED_BY_LAYOUT>xxx</div::before>
+     <span style="display:none;">HEST</span>
+     <div HE_INSERTED_BY_LAYOUT style="display:inline;">sau</div>
+     <div::after HE_INSERTED_BY_LAYOUT>xxx</div::after>
+   </div>
+ </xmp>
+
+ <h3>Replaced content with ::before and ::after</h3>
+
+ <p>For replaced content there's some extra complexity. The CSS 2.1
+ spec doesn't define it properly (in fact, it explicitly says that it
+ does not "fully define the interaction of :before and :after with
+ replaced elements (such as IMG in HTML)"). Since ::before and ::after
+ are implemented as first and last child of the DOM element, it
+ becomes problematic for replaced content, since such elements cannot
+ really have children, at least not as far as the layout engine is
+ concerned.</p>
+
+ <p>We solve this by creating a "pseudo" element that holds the actual
+ ReplacedContent, which will be a child of the actual DOM
+ element. Then we add any ::before element as the first child of the
+ DOM element, and any ::after element as the last child.</p>
+
+ <p>The following piece of HTML:</p>
+
+ <xmp>
+   <style>#elm::before, #elm::after { content:"xxx" }</style>
+   <input id="elm">
+ </xmp>
+
+ <p>would result in the following tree for layout:</p>
+
+ <xmp>
+   <input id="elm">
+     <input::before HE_INSERTED_BY_LAYOUT>xxx</input::before>
+     <input id="inner" HE_INSERTED_BY_LAYOUT>
+     <input::after HE_INSERTED_BY_LAYOUT>xxx</input::after>
+   </input>
+ </xmp>
+
+ <p>The outer INPUT 'elm' is the DOM node. It will get a
+ ShrinkToFitContainer as content, and whatever Box type the properties
+ dictate (in this example it will be InlineBlockBox). The
+ ShrinkToFitContainer will make room for the ::before and ::after
+ elements beside the actual replaced content, when necessary. The
+ inner INPUT 'inner' holds the layout box for the actual replaced
+ content, in this example an InlineBlockBox with
+ InputFieldContent.</p>
+
+ <h2>::first-letter</h2>
+
+  <div class="ref">
+   Spec: <a href="http://www.w3.org/TR/CSS21/selector.html#first-letter">5.12.2
+     The :first-letter pseudo-element</a><br>
+   Code: LayoutProperties::CreateTextBox()<br>
+  </div>
+
+  <p>LayoutProperties::CreateLayoutBox() calls CreateBox(), which
+  calls CreateTextBox(). A pseudo-element for the first letter will be
+  created here, and under it, a text node. These will even get their
+  own layout boxes and be laid out before CreatBox() returns.</p>
+
+  <p>This piece of HTML:</p>
+
+  <xmp>
+    <style>div::first-letter { font-size:2em; }</style>
+    <div>hest</div>
+  </xmp>
+
+  <p>would result in a layout tree like this:</p>
+
+  <xmp>
+    <div>
+      <div::first-letter HE_INSERTED_BY_LAYOUT style="display:inline; font-size:2em;">h</div::first-letter>hest
+    </div>
+  </xmp>
+
+  <p>Note that the whole word 'hest' is still intact as a DOM text
+  node. We have special code that makes sure that the layout box for
+  the text DOM node starts at the second character when it follows a
+  ::first-letter pseudo-element.</p>
+
+ <h2>Recreation of layout boxes</h2>
+ <div class="ref">
+   Code: LayoutProperties::RemoveElementsInsertedByLayout()<br>
+   Code: HTML_Element::MarkExtraDirty()<br>
+ </div>
+
+ <h3>Extra dirty elements near layout-inserted elements</h3>
+
+ <p>When any box needs to be recreated (because the 'display' property
+ changes, for instance), it is marked extra dirty, by calling
+ HTML_Element::MarkExtraDirty(). This will cause the layout box of
+ that element, and any layout boxes of descendants of that element, to
+ be deleted and recreated (although that will happen lazily, in the
+ next reflow pass).</p>
+
+ <p>If the element, or the element's parent, that is marked extra
+ dirty is inserted by layout, we also mark the contiguous chain of
+ ancestors that are inserted by layout extra dirty. We also mark the
+ non-inserted parent of such a chain extra dirty.</p>
+
+ <p>This is something that we should try to improve (there are
+ performance issues because of this, although on the brighter side,
+ the code gets "simpler" - or at least less insanely complicated), but
+ currently there are a few situations where it's necessary to mark the
+ non-inserted parent of layout-inserted elements extra dirty. For
+ instance, if a ::before selector on a DOM element is added after the
+ DOM element has been laid out, the only way for the layout engine to
+ create and insert the pseudo-element is by recreating the layout box
+ of the DOM element. currently necessary for ::before, ::after and
+ ::first-letter pseudo-elements, since these pseudo-elements are
+ inserted as part of creating the layout box for the parent DOM
+ element. Example:</p>
+
+ <xmp>
+   <style>.x::before { content:"HEST"; }</style>
+   <div></div>
+ </xmp>
+
+ <p>If we later set class="x" on the DIV element, there are currently
+ no other ways of creating its ::before pseudo-element than to
+ recreate the layout box of the DIV DOM element.</p>
+
+ <h3>Layout-inserted table elements</h3>
+
+ <p>Adding or removing DOM nodes, or changing their CSS properties
+ (most notably the 'display' property, may have interesting effects on
+ nearby layout-inserted table elements. The most interesting effects
+ are probably when such a change causes a layout-inserted table to be
+ split into two tables, or when two tables are joined into one.</p>
+
+ <xmp>
+   <div style="display:table-cell;">xxx</div>
+   <div style="display:table-cell;">xxx</div>
+ </xmp>
+
+ <p>This piece of HTML will cause the layout engine to wrap the two
+ table-cell elements inside of one layout-inserted table-row element,
+ which will be child of a layout-inserted table-row-group, which will
+ be child of a layout-inserted table. Layout will see a tree like
+ this:</p>
+
+ <xmp>
+   <table HE_INSERTED_BY_LAYOUT id="table" style="display:table;">
+     <tbody HE_INSERTED_BY_LAYOUT id="row-group" style="display:table-row-group;">
+       <tr HE_INSERTED_BY_LAYOUT id="row" style="display:table-row;">
+	 <div style="display:table-cell;">xxx</div>
+	 <div style="display:table-cell;">xxx</div>
+       </tr>
+     </tbody>
+   </table>
+ </xmp>
+
+ <p>If we now, via a script, insert an IMG element between the two
+ table-cell elements (let's be even more specific: we insert it before
+ the second DIV element using insertBefore()), we end up with a DOM
+ tree looking a lot like this:</p>
+
+ <xmp>
+   <div style="display:table-cell;">xxx</div>
+   <img src="hest.jpg">
+   <div style="display:table-cell;">xxx</div>
+ </xmp>
+
+ <p>That will affect the layout-inserted table structure
+ drastically. The two table cells are no longer adjacent sibling
+ boxes, and will live in two different tables. Layout will see
+ this:</p>
+
+ <xmp>
+   <table HE_INSERTED_BY_LAYOUT id="table" style="display:table;">
+     <tbody HE_INSERTED_BY_LAYOUT id="row-group" style="display:table-row-group;">
+       <tr HE_INSERTED_BY_LAYOUT id="row" style="display:table-row;">
+	 <div style="display:table-cell;">xxx</div>
+       </tr>
+     </tbody>
+   </table>
+   <img src="hest.jpg">
+   <table HE_INSERTED_BY_LAYOUT id="table" style="display:table;">
+     <tbody HE_INSERTED_BY_LAYOUT id="row-group" style="display:table-row-group;">
+       <tr HE_INSERTED_BY_LAYOUT id="row" style="display:table-row;">
+	 <div style="display:table-cell;">xxx</div>
+       </tr>
+     </tbody>
+   </table>
+ </xmp>
+
+ <p>One table suddenly became two. Fancy-schmancy, huh?</p>
+
+ <p>If we remove the IMG element again, the two tables should be
+ joined back into one, and we will have the same layout tree as
+ initially.</p>
+
+ <p>There's some special code to handle split and join
+ situations. Let's take a closer look at what's going on here.</p>
+
+ <p>The need for a split isn't detected per se in this particular
+ case. Inserting an IMG beside the second table-cell DIV will mark the
+ IMG extra dirty (as always when inserting an element). Since its
+ parent is also inserted by layout (the table-row), it will also be
+ marked extra dirty. The same happens to the table-row-group and the
+ table. Since we also mark the parent of a layout-inserted element, we
+ actually end up marking the DIVs' parent (whatever that is) extra
+ dirty. In this case it's completely unnecessary, but since we don't
+ differentiate between layout-inserted table-completion elements and
+ ::first-letter, ::before and ::after pseudo-elements, we mark the
+ parent extra dirty as well. Box::LayoutChildren() calls
+ LayoutProperties::RemoveElementsInsertedByLayout() on every extra
+ dirty child, which removes any children inserted by layout (and it
+ will do this recursively). It will also remove the child itself (and
+ continue layout on the first non-inserted child), if the child itself
+ is inserted by layout. Laying out the the DIVs' DOM parent (let's
+ pretend it's the BODY element), which is extra dirty, will remove all
+ layout-inserted elements in this document. We will then rely on
+ LayoutProperties::CheckAndInsertMissingTableElement() inserting the
+ necessary structure "on top of" and invisible to the DOM.</p>
+
+ <p>The (potential) need for a table join is in this case discovered
+ when removing the IMG element, in HTML_Element::Remove(), which
+ discovers that the IMG element has a layout box, and its preceding
+ layout box is inserted by layout and its a table structural element
+ (it's a TABLE in this case). When this is the case, the preceding
+ layout-inserted layout box is marked extra dirty, since it may be
+ that the consecutive sibling of the element removed (the IMG) now
+ suddenly belongs in the same table as its preceding sibling. At this
+ point it's pretty hard to tell if a join is really going to happen,
+ but we just have to be prepared for that possibility. Then, during
+ reflow, Box::LayoutChildren() will remove layout-inserted elements
+ that have extra dirty parents or are extra dirty
+ themselves. CheckAndInsertMissingTableElement() will then find the
+ first DIV, rebuild a table element structure (table-row,
+ table-row-group, table) around it, and include all its siblings in
+ this table structure as well.</p>
+
+ <p>Let's give a slightly different example, where we change the
+ display type instead of inserting/removing a DOM element. We start
+ with this DOM tree:</div>
+
+ <xmp>
+   <div style="display:table-cell;">xxx</div>
+   <img style="display:none;" src="hest.jpg">
+   <div style="display:table-cell;">xxx</div>
+ </xmp>
+
+ <p>The layout tree will then look like this:</p>
+
+ <xmp>
+   <table HE_INSERTED_BY_LAYOUT id="table" style="display:table;">
+     <tbody HE_INSERTED_BY_LAYOUT id="row-group" style="display:table-row-group;">
+       <tr HE_INSERTED_BY_LAYOUT id="row" style="display:table-row;">
+	 <div style="display:table-cell;">xxx</div>
+	 <img style="display:none;" src="hest.jpg">
+	 <div style="display:table-cell;">xxx</div>
+       </tr>
+     </tbody>
+   </table>
+ </xmp>
+
+ <p>Changing IMG's display type from 'none' to 'inline' will give us a
+ layout tree with two tables, identical to the one in the previous
+ example:</p>
+
+ <xmp>
+   <table HE_INSERTED_BY_LAYOUT id="table" style="display:table;">
+     <tbody HE_INSERTED_BY_LAYOUT id="row-group" style="display:table-row-group;">
+       <tr HE_INSERTED_BY_LAYOUT id="row" style="display:table-row;">
+	 <div style="display:table-cell;">xxx</div>
+       </tr>
+     </tbody>
+   </table>
+   <img style="display:inline;" src="hest.jpg">
+   <table HE_INSERTED_BY_LAYOUT id="table" style="display:table;">
+     <tbody HE_INSERTED_BY_LAYOUT id="row-group" style="display:table-row-group;">
+       <tr HE_INSERTED_BY_LAYOUT id="row" style="display:table-row;">
+	 <div style="display:table-cell;">xxx</div>
+       </tr>
+     </tbody>
+   </table>
+ </xmp>
+
+ <p>How we discover the need for split and join is quite different in
+ this example, though.</p>
+
+ <p>The need for a table split is detected when we try to create a
+ layout box for the IMG, and discover, in
+ LayoutProperties::CheckAndInsertMissingTableElement(), that an inline
+ box created by IMG cannot be a child of the layout-inserted table-row
+ - which means that the IMG element and all its siblings must be moved
+ upwards in the tree. It will do so and return ELEMENT_MOVED_UP. At
+ the point of creating a layout box for the second table-cell, we
+ realize that we need to wrap it inside of <b>another</b> table
+ structure.</p>
+
+ <p>The need for the table join is discovered by
+ Box::LayoutChildren(). By changing the display type on the IMG
+ element, it gets marked extra dirty. When Box::LayoutChildren()
+ reaches the first layout-inserted table (it's still a sibling of the
+ IMG that was just marked extra dirty, so it will be visited during
+ reflow), Box::LayoutChildren() will see that it's a layout-inserted
+ table element. It will then look ahead on its consecutive siblings
+ and see that there is no non-extra-dirty layout box between the
+ layout-inserted table element and the next extra dirty element (the
+ IMG). Could it be that the extra dirty element (the IMG) and its
+ consecutive siblings suddenly belongs under the first layout-inserted
+ table? Who knows - we haven't calculated the cascade for it yet. So
+ we have to set the first table element (which wasn't dirty at all)
+ extra dirty, to re-run the CheckAndInsertMissingTableElement()
+ machinery.</p>
+
+</body>
+</html>

@@ -1,0 +1,213 @@
+group "util.ZipCache";
+require UTIL_ZIP_CACHE;
+
+include "modules/util/zipload.h";
+include "modules/pi/OpSystemInfo.h";
+
+test ("Check OpZipCache Add/Get/Search")
+{
+	ZipCache zip_cache;
+	OpZip* zip1 = NULL;
+	OpZip* zip2 = NULL;
+
+	zip1 = OP_NEW(OpZip, ());
+	zip2 = OP_NEW(OpZip, ());
+
+	OpAutoPtr<OpZip> zip1_ap(zip1);
+	OpAutoPtr<OpZip> zip2_ap(zip2);
+
+	verify(zip1);
+	verify(zip2);
+
+	OpString zip_path1, zip_path2;
+	verify_success(zip_path1.AppendFormat(UNI_L("C:%stest%sdir%szipfile1.zip"), UNI_L(PATHSEP), UNI_L(PATHSEP), UNI_L(PATHSEP)));
+	verify_success(zip_path2.AppendFormat(UNI_L("%ssomeother%sdir2%szipfile2.zip"), UNI_L(PATHSEP), UNI_L(PATHSEP), UNI_L(PATHSEP)));
+
+	verify_success(zip_cache.Add(zip_path1.CStr(), zip1));
+	zip1_ap.release();
+	verify_success(zip_cache.Add(zip_path2.CStr(), zip2));
+	zip2_ap.release();
+
+	OpZip* retrieved;
+	verify_success(zip_cache.GetData(zip_path1.CStr(), &retrieved));
+	verify(retrieved == zip1);
+	verify_success(zip_cache.GetData(zip_path2.CStr(), &retrieved));
+	verify(retrieved == zip2);
+
+	size_t key_len;
+	verify_status(zip_cache.SearchData(zip_path1.CStr(), key_len, &retrieved), OpStatus::ERR);
+	verify_status(zip_cache.SearchData(zip_path2.CStr(), key_len, &retrieved), OpStatus::ERR);
+
+	verify_success(zip_path1.AppendFormat(UNI_L("%s"), UNI_L(PATHSEP)));
+	verify_success(zip_path2.AppendFormat(UNI_L("%s"), UNI_L(PATHSEP)));
+	verify_success(zip_cache.SearchData(zip_path1.CStr(), key_len, &retrieved));
+	verify(retrieved == zip1);
+	verify_success(zip_cache.SearchData(zip_path2.CStr(), key_len, &retrieved));
+	verify(retrieved == zip2);
+
+	verify_success(zip_path1.AppendFormat(UNI_L("dir_in_zip%sfile.txt"), UNI_L(PATHSEP)));
+	verify_success(zip_path2.AppendFormat(UNI_L("dir_in_other_zip%more dirs%ssotherfile.txt"), UNI_L(PATHSEP), UNI_L(PATHSEP)));
+	verify_success(zip_cache.SearchData(zip_path1.CStr(), key_len, &retrieved));
+	verify(retrieved == zip1);
+	verify_success(zip_cache.SearchData(zip_path2.CStr(), key_len, &retrieved));
+	verify(retrieved == zip2);
+
+	verify_status(zip_cache.SearchData(UNI_L("not_in_cache"), key_len, &retrieved), OpStatus::ERR);
+	verify_status(zip_cache.GetData(UNI_L("not_in_cache"), &retrieved), OpStatus::ERR);
+}
+
+// This test roughly checks if TWEAK_UTIL_ZIP_CACHE_LINEAR_SEARCH_THRESHOLD is correctly set.
+// The best resulting speedup is 0, which means that the value of threshold is set in such
+// a way, that we switch to hash table lookup at optimal size of the cache.
+// Note: The performance of the search depends not only on size of the cache but also on the
+// input data so the results of this test are not 100% accurate, but should be enough to detect
+// a seriously suboptimal value.
+// If this test fails use "Helper for finding optimal value for TWEAK_UTIL_ZIP_CACHE_LINEAR_SEARCH_THRESHOLD"
+// to find optimal value.
+test ("Check search performance settings")
+{
+	ZipCache zip_cache;
+	OpString zip_path, zip_search_path;
+	int i;
+	for (i = 0; i < UTIL_ZIP_CACHE_LINEAR_SEARCH_THRESHOLD; ++i)
+	{
+		zip_path.Empty();
+		verify_success(zip_path.AppendFormat(UNI_L("C:%sProgram Files%sOpera11%sdata%szipfile%d.zip"), UNI_L(PATHSEP), UNI_L(PATHSEP), UNI_L(PATHSEP), UNI_L(PATHSEP), i));
+		OpZip* zip = OP_NEW(OpZip, ());
+		verify(zip);
+
+		OpAutoPtr<OpZip> zip_ap(zip);
+		verify_success(zip_cache.Add(zip_path.CStr(), zip));
+		zip_ap.release();
+	}
+
+	zip_cache.SetLookupMethod(ZipCache::LOOKUP_HASH);
+	double start = g_op_time_info->GetRuntimeMS();
+
+	for (i = 0; i < 10000; ++i)
+	{
+		zip_search_path.Empty();
+		verify_success(zip_search_path.AppendFormat(UNI_L("C:%sProgram Files%sOpera11%sdata%szipfile%d.zip%sdirectory1%sdirectory2%sfile"), UNI_L(PATHSEP), UNI_L(PATHSEP), UNI_L(PATHSEP), UNI_L(PATHSEP), i % UTIL_ZIP_CACHE_LINEAR_SEARCH_THRESHOLD, UNI_L(PATHSEP), UNI_L(PATHSEP), UNI_L(PATHSEP)));
+		OpZip* retrieved;
+		size_t key_len;
+		verify_success(zip_cache.SearchData(zip_search_path.CStr(), key_len, &retrieved));
+	}
+	double delta_hash = g_op_time_info->GetRuntimeMS() - start;
+
+	zip_cache.SetLookupMethod(ZipCache::LOOKUP_LINEAR);
+	start = g_op_time_info->GetRuntimeMS();
+	for (i = 0; i < 10000; ++i)
+	{
+		zip_search_path.Empty();
+		verify_success(zip_search_path.AppendFormat(UNI_L("C:%sProgram Files%sOpera11%sdata%szipfile%d.zip%sdirectory1%sdirectory2%sfile"), UNI_L(PATHSEP), UNI_L(PATHSEP), UNI_L(PATHSEP), UNI_L(PATHSEP), i % UTIL_ZIP_CACHE_LINEAR_SEARCH_THRESHOLD, UNI_L(PATHSEP), UNI_L(PATHSEP), UNI_L(PATHSEP)));
+		OpZip* retrieved;
+		size_t key_len;
+		verify_success(zip_cache.SearchData(zip_search_path.CStr(), key_len, &retrieved));
+	}
+	double delta_linear = g_op_time_info->GetRuntimeMS() - start;
+
+	double speedup = ((delta_linear - delta_hash) / delta_linear) * 100; // %
+	output("for UTIL_ZIP_CACHE_LINEAR_SEARCH_THRESHOLD = %d: speedup = %f%%\n", UTIL_ZIP_CACHE_LINEAR_SEARCH_THRESHOLD, speedup);
+	double speedup_threshold = 20; // %
+	if (op_fabs(speedup) > speedup_threshold)
+	{
+		if (speedup > 0)
+			output("The value of speedup is %f%% which seems too high. Probably the value of TWEAK_UTIL_ZIP_CACHE_LINEAR_SEARCH_THRESHOLD is too high.", speedup);
+		else
+			output("The value of speedup is %f%% which seems too much of performance regression. Probably the value of TWEAK_UTIL_ZIP_CACHE_LINEAR_SEARCH_THRESHOLD is too low.", speedup );
+	}
+	verify(op_fabs(speedup) < speedup_threshold);
+}
+
+// This test is meant to help finding optimal value of
+// TWEAK_UTIL_ZIP_CACHE_LINEAR_SEARCH_THRESHOLD for the platform
+// if "Check search performance settings" fails.
+// As is is time consuming and doesnt provide simple pass/fail it is disabled.
+test ("Helper for finding optimal value for TWEAK_UTIL_ZIP_CACHE_LINEAR_SEARCH_THRESHOLD")
+	disabled;
+{
+	ZipCache zip_cache;
+	OpString zip_path, zip_search_path;
+	int i,a;
+	for (a = 0; a < 100; ++a)
+	{
+		zip_path.Empty();
+		verify_success(zip_path.AppendFormat(UNI_L("C:%sProgram Files%sOpera11%sdata%szipfile%d.zip"), UNI_L(PATHSEP), UNI_L(PATHSEP), UNI_L(PATHSEP), UNI_L(PATHSEP), a));
+		OpZip* zip = OP_NEW(OpZip, ());
+		verify(zip);
+
+		OpAutoPtr<OpZip> zip_ap(zip);
+		verify_success(zip_cache.Add(zip_path.CStr(), zip));
+		zip_ap.release();
+
+		zip_cache.SetLookupMethod(ZipCache::LOOKUP_HASH);
+		double start = g_op_time_info->GetRuntimeMS();
+
+		for (i = 0; i < 10000; ++i)
+		{
+			zip_search_path.Empty();
+			verify_success(zip_search_path.AppendFormat(UNI_L("C:%sProgram Files%sOpera11%sdata%szipfile%d.zip%sdirectory1%sdirectory2%sfile"), UNI_L(PATHSEP), UNI_L(PATHSEP), UNI_L(PATHSEP), UNI_L(PATHSEP), i % (a + 1), UNI_L(PATHSEP), UNI_L(PATHSEP), UNI_L(PATHSEP)));
+			OpZip* retrieved;
+			size_t key_len;
+			verify_success(zip_cache.SearchData(zip_search_path.CStr(), key_len, &retrieved));
+		}
+		double delta_hash = g_op_time_info->GetRuntimeMS() - start;
+
+		zip_cache.SetLookupMethod(ZipCache::LOOKUP_LINEAR);
+		start = g_op_time_info->GetRuntimeMS();
+		for (i = 0; i < 10000; ++i)
+		{
+			zip_search_path.Empty();
+			verify_success(zip_search_path.AppendFormat(UNI_L("C:%sProgram Files%sOpera11%sdata%szipfile%d.zip%sdirectory1%sdirectory2%sfile"), UNI_L(PATHSEP), UNI_L(PATHSEP), UNI_L(PATHSEP), UNI_L(PATHSEP), i % (a + 1), UNI_L(PATHSEP), UNI_L(PATHSEP), UNI_L(PATHSEP)));
+			OpZip* retrieved;
+			size_t key_len;
+			verify_success(zip_cache.SearchData(zip_search_path.CStr(), key_len, &retrieved));
+		}
+		double delta_linear = g_op_time_info->GetRuntimeMS() - start;
+
+		double speedup = ((delta_linear - delta_hash) / delta_linear) * 100; // %
+		output("for i = %d: speedup = %f%%\n", a, speedup);
+	}
+}
+
+test ("Check IsZipFile")
+	file uni zip_path "test.zip";
+	file uni zip_path2 "utf-8.zip";
+	file uni not_a_zip_path "not_a_zip.zip";
+{
+	ZipCache zip_cache;
+	OpZip* zip = NULL;
+	verify(!zip_cache.IsZipFile(not_a_zip_path, &zip));
+	verify(zip == NULL);
+	verify(!zip_cache.IsZipFile(UNI_L("not_a_zip_path"), &zip));
+	verify(zip == NULL);
+	verify(zip_cache.IsZipFile(zip_path, &zip));
+	verify(zip);
+	OpZip* zip2 = NULL;
+	verify(zip_cache.IsZipFile(zip_path, &zip2));
+	verify(zip2 == zip);
+	verify(zip_cache.IsZipFile(zip_path, NULL));
+	verify(zip_cache.IsZipFile(zip_path2, NULL));
+	verify(zip_cache.IsZipFile(zip_path2, &zip2));
+	verify(zip2);
+	verify(zip2 != zip);
+}
+
+test ("ZipCache::FlushIfUnused")
+	file uni zip_path "test.zip";
+{
+	ZipCache zip_cache;
+	OpZip* zip = OP_NEW(OpZip, (0));
+	verify(zip);
+	
+	OpAutoPtr<OpZip> zip_ap(zip);
+	verify_success(zip->Open(zip_path, TRUE));
+	verify_success(zip_cache.Add(zip_path, zip));
+	zip_ap.release();
+	
+	OpZip* zip2 = NULL;
+	verify_success(zip_cache.GetData(zip_path, &zip2));
+	verify(zip == zip2);
+	zip_cache.FlushIfUnused(zip);
+	verify_status(OpStatus::ERR, zip_cache.GetData(zip_path, &zip2));
+}

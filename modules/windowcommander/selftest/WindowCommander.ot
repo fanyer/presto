@@ -1,0 +1,1572 @@
+/* -*- Mode: c++; tab-width: 4; indent-tabs-mode: t; c-basic-offset: 4; -*-
+**
+** Copyright (C) 2002-2012 Opera Software ASA.  All rights reserved.
+**
+** This file is part of the Opera web browser.  It may not be distributed
+** under any circumstances.
+*/
+
+group "windowcommander.WindowCommander";
+
+include "modules/windowcommander/wic_globals.h";
+include "modules/windowcommander/OpWindowCommander.h";
+include "modules/windowcommander/OpWindowCommanderManager.h";
+include "modules/windowcommander/src/WindowCommander.h";
+include "modules/pi/OpBitmap.h";
+include "modules/pi/OpWindow.h";
+include "modules/pi/system/OpLowLevelFile.h";
+include "modules/dochand/win.h";
+include "modules/dochand/winman.h";
+include "modules/doc/frm_doc.h";
+include "modules/dochand/viewportcontroller.h";
+include "modules/selftest/src/doc_st_utils.h";
+
+// This does not work unless opera is initialized. Thus, let's force
+// initialization.
+require initialization;
+
+
+global
+{
+#define TEST_PAGE_1 "http://www.opera.com/"
+#define TEST_PAGE_2 "http://basun.sunet.se/"
+
+	//
+	// Different type of tests used in async windowcommander callbacks
+	//
+	public:
+	enum TestType {
+		TEST_NONE,
+		TEST_PAGE_TITLE,
+		TEST_PAGE_URL,
+		TEST_PAGE_RESPONSE
+	};
+
+	class TestResult
+	{
+	public:
+		TestResult()
+			: int_value(0) {}
+
+		BOOL Verify(int value)
+		{
+			BOOL pass = (value == int_value);
+			if (pass)
+				ST_passed();
+			else
+				ST_failed("error test type: %d", test_type);
+
+			return pass;
+		}
+
+		BOOL Verify(const uni_char* value)
+		{
+			if (!value || !string_value.CStr())
+			{
+				ST_failed("no values to verify");
+				return FALSE;
+			}
+
+			BOOL pass = (uni_strcmp(value, string_value.CStr()) == 0);
+
+			if (pass)
+				ST_passed();
+			else
+				ST_failed("error test type: %d", test_type);
+
+			return pass;
+		}
+	public:
+		TestType test_type;
+		int int_value;
+		OpString string_value;
+	};
+
+	private:
+	//
+	// windowcommander listeners, used for testing
+	//
+	class TestOpLoadingListener : public OpLoadingListener
+	{
+	private:
+		TestResult* expectedResult;
+	public:
+		TestOpLoadingListener(TestResult* result) : expectedResult(result) {}
+
+		void OnLoadingFinished(OpWindowCommander* commander, LoadingFinishStatus status)
+		{
+			if (status != LOADING_SUCCESS && status != LOADING_UNKNOWN)
+			{
+				ST_failed("loading failure");
+				return;
+			}
+
+
+			switch (expectedResult->test_type)
+			{
+			case TEST_NONE:
+				ST_passed();
+				break;
+
+			case TEST_PAGE_URL:
+				expectedResult->Verify(commander->GetCurrentURL(FALSE));
+				break;
+
+			case TEST_PAGE_TITLE:
+				expectedResult->Verify(commander->GetCurrentTitle());
+				break;
+
+			case TEST_PAGE_RESPONSE:
+				expectedResult->Verify(commander->GetCurrentHttpResponseCode());
+				break;
+
+			default:
+				break;
+			}
+		}
+
+#ifdef URL_MOVED_EVENT
+		void OnUrlMoved(OpWindowCommander* commander, const uni_char* url) {}
+#endif // URL_MOVED_EVENT
+		void OnUrlChanged(OpWindowCommander* commander, const uni_char* url) {}
+		void OnStartLoading(OpWindowCommander* commander) {}
+		void OnLoadingProgress(OpWindowCommander* commander, const LoadingInformation* info) {}
+		void OnRedirect(OpWindowCommander* commander) {}
+		void OnAuthenticationRequired(OpWindowCommander* commander, OpAuthenticationCallback* callback) {}
+		void OnAuthenticationCancelled(OpWindowCommander* commander, URL_ID authid) {}
+		void OnStartUploading(OpWindowCommander* commander) {}
+		void OnUploadingFinished(OpWindowCommander* commander, LoadingFinishStatus status) {}
+		BOOL OnLoadingFailed(OpWindowCommander* commander, int msg_id, const uni_char* url) { return FALSE; }
+#ifdef EMBROWSER_SUPPORT
+		void OnUndisplay(OpWindowCommander* commander) {}
+		void OnLoadingCreated(OpWindowCommander* commander) {}
+#endif // EMBROWSER_SUPPORT
+		void OnXmlParseFailure(OpWindowCommander* commander) {}
+#ifdef DOC_SEARCH_SUGGESTIONS_SUPPORT
+		void OnSearchSuggestionsRequested(OpWindowCommander* commander, const uni_char* url, OpSearchSuggestionsCallback* callback) {}
+#endif
+#ifdef XML_AIT_SUPPORT
+		OP_STATUS OnAITDocument(OpWindowCommander* commander, AITData* ait_data) { return OpStatus::OK; }
+#endif // XML_AIT_SUPPORT
+	};
+
+	class TestOpDocumentListener : public NullDocumentListener
+	{
+	private:
+		TestResult* expectedResult;
+
+	public:
+		TestOpDocumentListener(TestResult* result) : expectedResult(result) {}
+
+		void OnTitleChanged(OpWindowCommander* commander, const uni_char* title)
+		{
+			if (expectedResult->test_type == TEST_PAGE_TITLE)
+			{
+				if (!expectedResult->Verify(title))
+					ST_failed("wrong page title");
+			}
+		}
+
+		void OnGetInnerSize(OpWindowCommander* commander, UINT32* width, UINT32* height)
+		{
+			commander->GetOpWindow()->GetInnerSize(width, height);
+		}
+#ifdef DOM_FULLSCREEN_MODE
+		OP_STATUS OnJSFullScreenRequest(OpWindowCommander* commander, BOOL enable_fullscreen)
+		{
+			++expectedResult->int_value;
+			return OpStatus::OK;
+		}
+#endif // DOM_FULLSCREEN_MODE
+	};
+
+#ifdef DOM_TO_PLATFORM_MESSAGES
+	class TestOpPlatformMessageListener : public OpPlatformMessageListener
+	{
+	public:
+		void OnMessage(OpWindowCommander* wic, PlatformMessageContext *context, const uni_char *message, const uni_char *url)
+		{
+			if (message && !uni_strcmp(UNI_L("wic-selftest"), message))
+				ST_passed();
+			else
+				ST_failed("Platform message error");
+		};
+	};
+	TestOpPlatformMessageListener* platformMessageListener;
+#endif // DOM_TO_PLATFORM_MESSAGES
+
+#if defined NEARBY_INTERACTIVE_ITEM_DETECTION && defined CSS_TRANSFORMS
+	class NearbyItemDetectionSTUtil
+	{
+	public:
+		static BOOL InteractiveItemInfoHasRect(const Head& item_list, InteractiveItemInfo::Type type, const OpRect& rect)
+		{
+			InteractiveItemInfo* iter = static_cast<InteractiveItemInfo*>(item_list.First());
+
+			while (iter)
+			{
+				if (iter->GetType() == type)
+				{
+					const InteractiveItemInfo::ItemRect* rect_array = iter->GetRects();
+					int rect_count = iter->GetNumberOfRects();
+
+					for (int i=0; i < rect_count; i++)
+						if (st_rects_equal(rect, rect_array[i].rect))
+							return TRUE;
+				}
+
+				iter = iter->Suc();
+			}
+
+			return FALSE;
+		}
+
+		static BOOL InteractiveItemHasTransformedRect(const Head& item_list, InteractiveItemInfo::Type type)
+		{
+			InteractiveItemInfo* iter = static_cast<InteractiveItemInfo*>(item_list.First());
+
+			while (iter)
+			{
+				if (iter->GetType() == type)
+				{
+					const InteractiveItemInfo::ItemRect* rect_array = iter->GetRects();
+					int rect_count = iter->GetNumberOfRects();
+
+					for (int i=0; i < rect_count; i++)
+						if (rect_array[i].affine_pos)
+							return TRUE;
+				}
+
+				iter = iter->Suc();
+			}
+
+			return FALSE;
+		}
+	};
+#endif // NEARBY_INTERACTIVE_ITEM_DETECTION && CSS_TRANSFORMS
+
+	OpWindowCommander* commander;
+	OpWindow* opWindow;
+
+	TestOpDocumentListener* documentListener;
+	TestOpLoadingListener* loadingListener;
+
+	TestResult* testResult;
+}
+
+setup
+{
+	commander = NULL;
+	opWindow = NULL;
+
+	testResult = OP_NEW(TestResult, ());
+	documentListener = OP_NEW(TestOpDocumentListener, (testResult));
+	loadingListener = OP_NEW(TestOpLoadingListener, (testResult));
+}
+
+exit
+{
+	OP_DELETE(testResult);
+	OP_DELETE(documentListener);
+	OP_DELETE(loadingListener);
+}
+
+test("NUM_ENCODINGS")
+{
+	verify(wic_charsets_SIZE == OpWindowCommander::NUM_ENCODINGS);
+}
+
+// Table of encodings known to WindowCommander
+table wic_encodings
+{
+	// enum name sans ENCODING_, IANA label, enum label
+	{ "UTF8", "utf-8", ENCODING_UTF8 },
+	{ "USASCII", "us-ascii", ENCODING_USASCII },
+	{ "ISO8859_1", "iso-8859-1", ENCODING_ISO8859_1 },
+	{ "ISO8859_2", "iso-8859-2", ENCODING_ISO8859_2 },
+	{ "ISO8859_3", "iso-8859-3", ENCODING_ISO8859_3 },
+	{ "ISO8859_4", "iso-8859-4", ENCODING_ISO8859_4 },
+	{ "ISO8859_5", "iso-8859-5", ENCODING_ISO8859_5 },
+	{ "ISO8859_6", "iso-8859-6", ENCODING_ISO8859_6 },
+	{ "ISO8859_7", "iso-8859-7", ENCODING_ISO8859_7 },
+	{ "ISO8859_8", "iso-8859-8", ENCODING_ISO8859_8 },
+	{ "ISO8859_9", "iso-8859-9", ENCODING_ISO8859_9 },
+	{ "ISO8859_10", "iso-8859-10", ENCODING_ISO8859_10 },
+	{ "ISO8859_11", "iso-8859-11", ENCODING_ISO8859_11 },
+	{ "ISO8859_13", "iso-8859-13", ENCODING_ISO8859_13 },
+	{ "ISO8859_14", "iso-8859-14", ENCODING_ISO8859_14 },
+	{ "ISO8859_15", "iso-8859-15", ENCODING_ISO8859_15 },
+	{ "ISO8859_16", "iso-8859-16", ENCODING_ISO8859_16 },
+	{ "KOI8_R", "koi8-r", ENCODING_KOI8_R },
+	{ "KOI8_U", "koi8-u", ENCODING_KOI8_U },
+	{ "CP_1250", "windows-1250", ENCODING_CP_1250 },
+	{ "CP_1251", "windows-1251", ENCODING_CP_1251 },
+	{ "CP_1252", "windows-1252", ENCODING_CP_1252 },
+	{ "CP_1253", "windows-1253", ENCODING_CP_1253 },
+	{ "CP_1254", "windows-1254", ENCODING_CP_1254 },
+	{ "CP_1255", "windows-1255", ENCODING_CP_1255 },
+	{ "CP_1256", "windows-1256", ENCODING_CP_1256 },
+	{ "CP_1257", "windows-1257", ENCODING_CP_1257 },
+	{ "CP_1258", "windows-1258", ENCODING_CP_1258 },
+	{ "SHIFTJIS", "shift_jis", ENCODING_SHIFTJIS },
+	{ "ISO2022_JP", "iso-2022-jp", ENCODING_ISO2022_JP },
+	{ "ISO2022_JP_1", "iso-2022-jp-1", ENCODING_ISO2022_JP_1 },
+	{ "ISO2022_CN", "iso-2022-cn", ENCODING_ISO2022_CN },
+	{ "ISO2022_KR", "iso-2022-kr", ENCODING_ISO2022_KR },
+	{ "BIG5", "big5", ENCODING_BIG5 },
+	{ "BIG5_HKSCS", "big5-hkscs", ENCODING_BIG5_HKSCS },
+	{ "EUC_JP", "euc-jp", ENCODING_EUC_JP },
+	{ "GB2312", "gb2312", ENCODING_GB2312 },
+	{ "VISCII", "viscii", ENCODING_VISCII },
+	{ "EUC_KR", "euc-kr", ENCODING_EUC_KR },
+	{ "HZ_GB2312", "hz-gb-2312", ENCODING_HZ_GB2312 },
+	{ "GBK", "gbk", ENCODING_GBK },
+	{ "EUC_TW", "euc-tw", ENCODING_EUC_TW },
+	{ "IBM866", "ibm866", ENCODING_IBM866 },
+	{ "WINDOWS_874", "windows-874", ENCODING_WINDOWS_874 },
+	{ "GB18030", "gb18030", ENCODING_GB18030 },
+	{ "MACROMAN", "macintosh", ENCODING_MACROMAN },
+	{ "MAC_CE", "x-mac-ce",	ENCODING_MAC_CE },
+	{ "MAC_CYRILLIC", "x-mac-cyrillic", ENCODING_MAC_CYRILLIC },
+	{ "MAC_GREEK", "x-mac-greek", ENCODING_MAC_GREEK },
+	{ "MAC_TURKISH", "x-mac-turkish", ENCODING_MAC_TURKISH },
+	{ "X_USER_DEFINED", "x-user-defined", ENCODING_X_USER_DEFINED },
+}
+
+foreach (wic_name, iana_name, enum_name) from wic_encodings
+{
+	html
+	{
+		"<!DOCTYPE html>"
+		"<html>"
+		"<head>"
+		"<meta http-equiv=\"Content-Type\" content=\"text/html;charset=" iana_name "\">"
+		"<title>Test</title>"
+		"</head>"
+		"<body>"
+		"<p>Test " iana_name "</p>"
+		"</body>"
+		"</html>"
+	}
+
+	test("Encoding mapping: " wic_name)
+	{
+		state.doc->GetHLDocProfile()->SetCharacterSet(iana_name);
+		verify(state.doc->GetWindow()->GetWindowCommander()->GetEncoding() == OpWindowCommander::enum_name);
+	}
+}
+
+test("core creates a window")
+{
+	BOOL3 ignore = MAYBE;
+	Window* win = g_windowManager->GetAWindow(FALSE, ignore, ignore, 100, 200);
+	verify(win);
+	opWindow = const_cast<OpWindow*>(win->GetOpWindow());
+	commander = (OpWindowCommander*)win->GetWindowCommander();
+	verify(commander);
+	verify(commander->GetCurrentHistoryPos() == 0);
+	verify(commander->GetOpWindow());
+	verify(commander->GetURLType() == DocumentURLType_Unknown);
+	verify(commander->GetWindowId() == win->Id());
+}
+
+test("setup wic listeners")
+	require success "core creates a window";
+{
+	commander->SetDocumentListener(documentListener);
+	commander->SetLoadingListener(loadingListener);
+#ifdef _POPUP_MENU_SUPPORT_
+	commander->SetMenuListener(0);
+#endif
+	commander->SetLinkListener(0);
+#ifdef ACCESS_KEYS_SUPPORT
+	commander->SetAccessKeyListener(0);
+#endif
+#ifdef _PRINT_SUPPORT_
+	commander->SetPrintingListener(0);
+#endif
+	commander->SetErrorListener(0);
+#if defined (_SSL_SUPPORT_) && defined (_NATIVE_SSL_SUPPORT_)
+	commander->SetSSLListener(0);
+#endif
+#ifdef _ASK_COOKIE
+	commander->SetCookieListener(0);
+#endif
+}
+
+/**
+	Basic tests of loading pages and history navigation
+*/
+
+test("open page 1")
+	async;
+	require success "core creates a window";
+{
+	OpString page;
+	page.Set(TEST_PAGE_1);
+
+	testResult->test_type = TEST_PAGE_URL;
+	testResult->string_value.Set(TEST_PAGE_1);
+
+	OpWindowCommander::OpenURLOptions options;
+	options.entered_by_user = TRUE;
+	if (!commander->OpenURL(page.CStr(), options))
+		ST_failed("open url failed");
+}
+
+test("IsIntranet page 1")
+	require success "open page 1";
+{
+	verify(!commander->IsIntranet());
+}
+
+test("ExecuteES")
+	require success "open page 1";
+	require HAS_ATVEF_SUPPORT;
+{
+	verify(OpStatus::IsSuccess(commander->ExecuteES(UNI_L("function foo() { }"))));
+}
+
+test("GetURLType") require success "open page 1";
+{
+	verify(commander->GetURLType() == DocumentURLType_HTTP);
+}
+
+test("open page 2")
+	async;
+	require success "open page 1";
+{
+	OpString page;
+	page.Set(TEST_PAGE_2);
+
+	testResult->test_type = TEST_PAGE_URL;
+	testResult->string_value.Set(TEST_PAGE_2);
+
+	if (uni_strcmp(commander->GetCurrentURL(FALSE), UNI_L(TEST_PAGE_1)))
+		ST_failed("unexpected current URL");
+	else
+		if (!uni_strstr(commander->GetCurrentTitle(), "Opera"))
+			ST_failed("'Opera' not found in www.opera.com page title");
+		else
+			if (commander->GetCurrentHistoryPos() != 1)
+				ST_failed("Unexpeced history position");
+			else
+			{
+				OpWindowCommander::OpenURLOptions options;
+				options.entered_by_user = TRUE;
+				if (!commander->OpenURL(page.CStr(), options))
+					ST_failed("open url failed");
+			}
+}
+
+test("IsIntranet page 2")
+	require success "open page 2";
+{
+	verify(!commander->IsIntranet());
+}
+
+test("reload page 2")
+	 async;
+	 require success "open page 2";
+{
+	testResult->test_type = TEST_PAGE_URL;
+	testResult->string_value.Set(TEST_PAGE_2);
+
+	commander->Reload();
+}
+
+test("back to page 1")
+	async;
+	require success "reload page 2";
+{
+	testResult->test_type = TEST_PAGE_URL;
+	testResult->string_value.Set(TEST_PAGE_1);
+
+	if (!commander->HasPrevious())
+		ST_failed("Expected previous");
+	else
+		if (commander->HasNext())
+			ST_failed("Didn't expect next");
+		else
+			if (commander->GetCurrentHistoryPos() != 2)
+				ST_failed("Unexpeced history position");
+			else
+				commander->Previous();
+}
+
+test("forward to page 2")
+	async;
+	require success "back to page 1";
+{
+	testResult->test_type = TEST_PAGE_URL;
+	testResult->string_value.Set(TEST_PAGE_2);
+
+	if (commander->HasPrevious())
+		ST_failed("Didn't expect previous");
+	else
+		if (!commander->HasNext())
+			ST_failed("Expected next");
+		else
+			if (commander->GetCurrentHistoryPos() != 1)
+				ST_failed("Unexpeced history position");
+			else
+				commander->Next();
+}
+
+test("GetHistoryInformation")
+	require success "forward to page 2";
+{
+	HistoryInformation history;
+
+	verify(commander->GetHistoryInformation(1, &history));
+	verify(history.number == 1);
+	verify(!uni_strcmp(history.url, UNI_L(TEST_PAGE_1)));
+	verify(uni_strstr(history.title, "Opera"));
+
+	verify(commander->GetHistoryInformation(2, &history));
+	verify(history.number == 2);
+	verify(!uni_strcmp(history.url, UNI_L(TEST_PAGE_2)));
+	verify(uni_strstr(history.title, "Swedish"));
+
+	verify(!commander->GetHistoryInformation(3, &history));
+}
+
+test("load in same history entry")
+	async;
+	require success "GetHistoryInformation";
+{
+	OpString page;
+	page.Set(TEST_PAGE_1);
+
+	testResult->test_type = TEST_PAGE_URL;
+	testResult->string_value.Set(TEST_PAGE_1);
+
+	OpWindowCommander::OpenURLOptions options;
+	options.entered_by_user = TRUE;
+	options.replace_prev_history_entry = TRUE;
+	if (!commander->OpenURL(page.CStr(), options))
+		ST_failed("open url failed");
+}
+
+test("load in same history entry 2")
+	async;
+	require success "load in same history entry";
+{
+	// back should now bring us directly back to the first page 1 (and not to page 2)
+	testResult->test_type = TEST_PAGE_URL;
+	testResult->string_value.Set(TEST_PAGE_1);
+
+	commander->Previous();
+}
+
+test("follow url")
+	async;
+	require success "load in same history entry 2";
+{
+	testResult->test_type = TEST_PAGE_URL;
+	testResult->string_value.Set(TEST_PAGE_1);
+
+	// Should probably check return value as well (if I only knew what it meant).
+	OpWindowCommander::OpenURLOptions options;
+	commander->FollowURL(UNI_L(TEST_PAGE_1), UNI_L("http://my.opera.com/"), options);
+}
+
+test("http response code")
+	async;
+{
+	OpString page;
+	page.Set(TEST_PAGE_1);
+
+	testResult->test_type = TEST_PAGE_RESPONSE;
+	testResult->int_value = 200;
+
+	OpWindowCommander::OpenURLOptions options;
+	options.entered_by_user = TRUE;
+	if (!commander->OpenURL(page.CStr(), options))
+		ST_failed("open url failed");
+}
+
+test("follow url with context id")
+	async;
+	require success "load in same history entry 2";
+{
+	testResult->test_type = TEST_PAGE_URL;
+	testResult->string_value.Set(TEST_PAGE_1);
+
+	OpWindowCommander::OpenURLOptions options; //we use default context id
+	commander->FollowURL(UNI_L(TEST_PAGE_1), UNI_L("http://my.opera.com/"), options);
+}
+
+test("misc")
+	require success "core creates a window";
+{
+	// Stuff difficult to test properly, but let's make sure that it doesn't crash. ;)
+
+	OpString url;
+	OpString title;
+
+	commander->Stop();
+
+#ifndef HAS_NOTEXTSELECTION
+# ifdef USE_OP_CLIPBOARD
+	commander->Paste();
+	commander->Cut();
+	commander->Copy();
+# endif // USE_OP_CLIPBOARD
+#endif // !HAS_NOTEXTSELECTION
+
+	verify(commander->HasCurrentElement() || !commander->HasCurrentElement()); // :-P
+	verify(commander->GetSecurityMode() == OpDocumentListener::NO_SECURITY);
+
+#ifdef USE_OP_CLIPBOARD
+	verify(!commander->CopyImageToClipboard(UNI_L("opera:blank")));
+#endif
+	verify(!commander->ShowCurrentImage());
+	commander->Focus();
+
+#ifdef CONTENT_MAGIC
+	commander->EnableContentMagicIndicator(TRUE, 7, 7);
+	commander->EnableContentMagicIndicator(TRUE, -1, -1);
+	commander->EnableContentMagicIndicator(FALSE, 666, 666);
+#endif
+
+	commander->GetSelectedLinkInfo(url, title);
+	verify(url.IsEmpty());
+	verify(title.IsEmpty());
+
+	commander->SetVisibleOnScreen(FALSE);
+	commander->SetVisibleOnScreen(TRUE);
+
+	commander->SetDrawHighlightRects(FALSE);
+	commander->SetDrawHighlightRects(TRUE);
+
+//	commander->Navigate(90); // implemented as OP_ASSERT(FALSE) :-P
+
+#ifdef HISTORY_SUPPORT
+	commander->DisableGlobalHistory();
+#endif // HISTORY_SUPPORT
+}
+
+table LayoutModes (OpWindowCommander::LayoutMode)
+{
+	{ OpWindowCommander::NORMAL },
+	{ OpWindowCommander::SSR },
+	{ OpWindowCommander::CSSR },
+	{ OpWindowCommander::AMSR },
+	{ OpWindowCommander::MSR },
+	{ OpWindowCommander::ERA }
+};
+
+foreach (mode) from LayoutModes
+{
+	test("change layout mode")
+		require success "core creates a window";
+	{
+		commander->SetLayoutMode(mode);
+		verify(commander->GetLayoutMode() == mode);
+	}
+	finally
+	{
+		commander->SetLayoutMode(OpWindowCommander::NORMAL);
+	}
+}
+
+test("smart frames")
+	require success "change layout mode";
+{
+	verify(!commander->GetSmartFramesMode());
+	commander->SetSmartFramesMode(TRUE);
+	verify(commander->GetSmartFramesMode());
+	commander->SetSmartFramesMode(FALSE);
+	verify(!commander->GetSmartFramesMode());
+}
+
+test("zoom")
+	require success "change layout mode";
+{
+	verify(!commander->GetTrueZoom());
+	verify(commander->GetScale() == 100);
+
+	commander->SetTrueZoom(TRUE);
+	verify(commander->GetTrueZoom());
+	verify(commander->GetScale() == 100);
+
+	commander->SetScale(280);
+	verify(commander->GetTrueZoom());
+	verify(commander->GetScale() == 280);
+
+	commander->SetTrueZoom(FALSE);
+	verify(!commander->GetTrueZoom());
+	verify(commander->GetScale() == 280);
+
+	commander->SetScale(100);
+	verify(!commander->GetTrueZoom());
+	verify(commander->GetScale() == 100);
+}
+
+table ImageModes (OpDocumentListener::ImageDisplayMode)
+{
+	{ OpDocumentListener::NO_IMAGES },
+	{ OpDocumentListener::LOADED_IMAGES },
+	{ OpDocumentListener::ALL_IMAGES }
+};
+
+foreach (mode) from ImageModes
+{
+	test("image modes")
+		require success "change layout mode";
+	{
+		commander->SetImageMode(mode);
+		verify(commander->GetImageMode() == mode);
+	}
+	finally
+	{
+		commander->SetImageMode(OpDocumentListener::ALL_IMAGES);
+	}
+}
+
+table CssModes (OpDocumentListener::CssDisplayMode)
+{
+	{ OpDocumentListener::CSS_AUTHOR_MODE },
+	{ OpDocumentListener::CSS_USER_MODE }
+};
+foreach (mode) from CssModes
+{
+	test("css modes")
+		require success "change layout mode";
+	{
+		commander->SetCssMode(mode);
+		verify(commander->GetCssMode() == mode);
+	}
+	finally
+	{
+		commander->SetCssMode(OpDocumentListener::CSS_AUTHOR_MODE);
+	}
+}
+
+test("toggle scrollbars")
+	require success "change layout mode";
+{
+	commander->SetShowScrollbars(FALSE);
+	commander->SetShowScrollbars(TRUE);
+}
+
+test("shortcut icon")
+	require success "change layout mode";
+	require SHORTCUT_ICON_SUPPORT;
+{
+	OpBitmap* icon = 0;
+	const uni_char* icon_url;
+
+	verify(commander->HasDocumentIcon());
+	verify(OpStatus::IsSuccess(commander->GetDocumentIcon(&icon)));
+	verify(OpStatus::IsSuccess(commander->GetDocumentIconURL(&icon_url)));
+	verify(!uni_strnicmp(icon_url, UNI_L("http://"), 7));
+}
+finally
+{
+	OP_DELETE(icon);
+}
+
+test("force encoding")
+	require success "change layout mode";
+{
+	// This test has to be run after the "shortcut icon" test since this
+	// test will reset the icon as a side effect.
+
+	//"No encoding" and ENCODING_AUTOMATIC is now overrided by the encoding of
+	//"frm_doc->GetHLDocProfile()->GetCharacterSet()"
+
+	//Get encoding when not forced
+	OpWindowCommander::Encoding org_e = commander->GetEncoding();
+
+	//Try to force encoding to ENCODING_AUTOMATIC, will be overrided
+	commander->ForceEncoding(OpWindowCommander::ENCODING_AUTOMATIC);
+	verify(commander->GetEncoding() == org_e);
+	verify(commander->GetEncoding() != OpWindowCommander::ENCODING_AUTOMATIC);
+
+	//Normal forced encoding
+	commander->ForceEncoding(OpWindowCommander::ENCODING_GB2312);
+	verify(commander->GetEncoding() == OpWindowCommander::ENCODING_GB2312);
+
+}
+
+test("link element")
+	require success "change layout mode";
+	require LINK_SUPPORT;
+{
+	LinkElementInfo info;
+
+	verify(commander->GetLinkElementCount() > 0);
+	verify(commander->GetLinkElementInfo(0, &info));
+}
+
+test("alternate css")
+	require success "change layout mode";
+{
+	CssInformation info;
+
+	// This test would look less silly if we test on a page that actually has alternate style sheets.
+
+	verify(!commander->GetAlternateCssInformation(1, &info));
+	verify(!commander->GetAlternateCssInformation(0, &info));
+	commander->SetAlternateCss(UNI_L("foo"));
+}
+
+test("access key mode")
+	require success "change layout mode";
+	require ACCESS_KEYS_SUPPORT;
+{
+	commander->SetAccessKeyMode(TRUE);
+	verify(commander->GetAccessKeyMode());
+	commander->SetAccessKeyMode(FALSE);
+	verify(!commander->GetAccessKeyMode());
+}
+
+test("scripting control")
+	require success "change layout mode";
+{
+	commander->SetScriptingDisabled(TRUE);
+	verify(commander->GetScriptingDisabled());
+	commander->SetScriptingDisabled(FALSE);
+	verify(!commander->GetScriptingDisabled());
+
+	commander->SetScriptingPaused(TRUE);
+	verify(commander->GetScriptingPaused());
+	commander->SetScriptingPaused(FALSE);
+	verify(!commander->GetScriptingPaused());
+}
+
+
+html {
+//!  <html>opera</html>
+}
+test("text search and selection")
+	require init;
+	require undefined HAS_NO_SEARCHTEXT;
+{
+	uni_char* selected_text = NULL;
+	OpWindowCommander* commander = state.doc->GetWindow()->GetWindowCommander();
+	verify(!commander->HasSelectedText());
+	selected_text = commander->GetSelectedText();
+	verify_string(selected_text, "");
+	OP_DELETEA(selected_text);
+	selected_text = NULL;
+
+	OpWindowCommander::SearchInfo info;
+	verify(commander->Search(UNI_L("opera"), info) == OpWindowCommander::SEARCH_FOUND);
+	commander->ResetSearchPosition();
+	verify(commander->Search(UNI_L("hesthesthesthesthesthesthesthest"), info) == OpWindowCommander::SEARCH_NOT_FOUND);
+
+	OpVector<OpRect> all;
+	OpVector<OpRect> active;
+	if (commander->GetSearchMatchRectangles(all, active))
+	{
+		verify(active.GetCount() > 0 && all.GetCount() >= active.GetCount());
+	}
+
+	verify(commander->HasSelectedText());
+	selected_text = commander->GetSelectedText();
+	verify_string(selected_text, "opera");
+	commander->ClearSelection();
+}
+finally
+{
+	OP_DELETEA(selected_text);
+}
+
+test("save document")
+	require success "change layout mode";
+	require SAVE_SUPPORT;
+{
+	OpLowLevelFile* file = NULL;
+	OpFileLength file_length;
+	OpString foldername;
+	OpString filename;
+	OpString suggested_filename;
+
+	// Test GetSuggestedFileName().
+
+	/* Note that we using the result in SaveDocument() is problematic, since
+	   core may suggest file names containing characters that are illegal path
+	   characters for a given platform. */
+
+	verify(OpStatus::IsSuccess(commander->GetSuggestedFileName(FALSE, &suggested_filename)));
+	verify(suggested_filename.HasContent());
+	suggested_filename.Empty();
+
+	verify(OpStatus::IsSuccess(commander->GetSuggestedFileName(TRUE, &suggested_filename)));
+	verify(suggested_filename.HasContent());
+	suggested_filename.Empty();
+
+	// Test GetDocumentType().
+
+	verify(commander->GetDocumentType(FALSE) == OpWindowCommander::DOC_HTML);
+
+	verify(commander->GetDocumentType(TRUE) == OpWindowCommander::DOC_HTML);
+
+	// Create temporary directory.
+
+	verify(OpStatus::IsSuccess(g_folder_manager->GetFolderPath(OPFILE_SELFTEST_DATA_FOLDER, foldername)));
+	verify(OpStatus::IsSuccess(foldername.AppendFormat(UNI_L("modules%cwindowcommander%cselftest%cdump%c"), PATHSEPCHAR, PATHSEPCHAR, PATHSEPCHAR, PATHSEPCHAR)));
+
+	// Test SaveDocument().
+
+	// OpWindowCommander::SAVE_ONLY_DOCUMENT
+	filename.Empty();
+	verify(OpStatus::IsSuccess(filename.AppendFormat(UNI_L("%s/document-top.html"), foldername.CStr())));
+	verify(OpStatus::IsSuccess(commander->SaveDocument(filename.CStr(), OpWindowCommander::SAVE_ONLY_DOCUMENT, FALSE)));
+	OP_DELETE(file);
+	verify(OpStatus::IsSuccess(OpLowLevelFile::Create(&file, filename.CStr())));
+	verify(OpStatus::IsSuccess(file->GetFileLength(&file_length)));
+	verify(file_length > 0);
+
+	// OpWindowCommander::SAVE_ONLY_DOCUMENT, focused frame only
+	filename.Empty();
+	verify(OpStatus::IsSuccess(filename.AppendFormat(UNI_L("%s/document-frame.html"), foldername.CStr())));
+	verify(OpStatus::IsSuccess(commander->SaveDocument(filename.CStr(), OpWindowCommander::SAVE_ONLY_DOCUMENT, TRUE)));
+	OP_DELETE(file);
+	verify(OpStatus::IsSuccess(OpLowLevelFile::Create(&file, filename.CStr())));
+	verify(OpStatus::IsSuccess(file->GetFileLength(&file_length)));
+	verify(file_length > 0);
+
+	// OpWindowCommander::SAVE_DOCUMENT_AND_INLINES
+#if 1 // may trigger memory leak - bug 361931
+	filename.Empty();
+	verify(OpStatus::IsSuccess(filename.AppendFormat(UNI_L("%s/with-inlines.html"), foldername.CStr())));
+	verify(OpStatus::IsSuccess(commander->SaveDocument(filename.CStr(), OpWindowCommander::SAVE_DOCUMENT_AND_INLINES, TRUE)));
+	OP_DELETE(file);
+	verify(OpStatus::IsSuccess(OpLowLevelFile::Create(&file, filename.CStr())));
+	verify(OpStatus::IsSuccess(file->GetFileLength(&file_length)));
+	verify(file_length > 0);
+#endif
+}
+finally
+{
+	OP_DELETE(file);
+}
+
+test("save document as mhtml")
+require success "change layout mode";
+require SAVE_SUPPORT;
+require MHTML_ARCHIVE_SAVE_SUPPORT;
+{
+	OpLowLevelFile* file = NULL;
+	OpFileLength file_length;
+	OpString foldername;
+	OpString filename;
+	OpString suggested_filename;
+
+	// Test GetSuggestedFileName().
+
+	/* Note that we using the result in SaveDocument() is problematic, since
+	   core may suggest file names containing characters that are illegal path
+	   characters for a given platform. */
+
+	verify(OpStatus::IsSuccess(commander->GetSuggestedFileName(FALSE, &suggested_filename)));
+	verify(suggested_filename.HasContent());
+	suggested_filename.Empty();
+
+	verify(OpStatus::IsSuccess(commander->GetSuggestedFileName(TRUE, &suggested_filename)));
+	verify(suggested_filename.HasContent());
+	suggested_filename.Empty();
+
+	// Test GetDocumentType().
+
+	verify(commander->GetDocumentType(FALSE) == OpWindowCommander::DOC_HTML);
+	verify(commander->GetDocumentType(TRUE) == OpWindowCommander::DOC_HTML);
+
+	// Create temporary directory.
+
+	verify(OpStatus::IsSuccess(g_folder_manager->GetFolderPath(OPFILE_SELFTEST_DATA_FOLDER, foldername)));
+	verify(OpStatus::IsSuccess(foldername.AppendFormat(UNI_L("modules%cwindowcommander%cselftest%cdump%c"), PATHSEPCHAR, PATHSEPCHAR, PATHSEPCHAR, PATHSEPCHAR)));
+
+	// Test SaveDocument().
+	filename.Empty();
+	verify(OpStatus::IsSuccess(filename.AppendFormat(UNI_L("%s/mhtml-archive.mhtml"), foldername.CStr())));
+	verify(OpStatus::IsSuccess(commander->SaveDocument(filename.CStr(), OpWindowCommander::SAVE_AS_MHTML, FALSE)));
+	OP_DELETE(file);
+	verify(OpStatus::IsSuccess(OpLowLevelFile::Create(&file, filename.CStr())));
+	verify(OpStatus::IsSuccess(file->GetFileLength(&file_length)));
+	verify(file_length > 0);
+}
+finally
+{
+	OP_DELETE(file);
+}
+
+test("save document as text")
+require success "change layout mode";
+require SAVE_SUPPORT;
+require WIC_SAVE_DOCUMENT_AS_TEXT_SUPPORT;
+{
+	OpLowLevelFile* file = NULL;
+	OpFileLength file_length;
+	OpString foldername;
+	OpString filename;
+	OpString suggested_filename;
+
+	// Test GetSuggestedFileName().
+
+	/* Note that we using the result in SaveDocument() is problematic, since
+	   core may suggest file names containing characters that are illegal path
+	   characters for a given platform. */
+
+	verify(OpStatus::IsSuccess(commander->GetSuggestedFileName(FALSE, &suggested_filename)));
+	verify(suggested_filename.HasContent());
+	suggested_filename.Empty();
+
+	verify(OpStatus::IsSuccess(commander->GetSuggestedFileName(TRUE, &suggested_filename)));
+	verify(suggested_filename.HasContent());
+	suggested_filename.Empty();
+
+	// Test GetDocumentType().
+	verify(commander->GetDocumentType(FALSE) == OpWindowCommander::DOC_HTML);
+	verify(commander->GetDocumentType(TRUE) == OpWindowCommander::DOC_HTML);
+
+	// Create temporary directory.
+
+	verify(OpStatus::IsSuccess(g_folder_manager->GetFolderPath(OPFILE_SELFTEST_DATA_FOLDER, foldername)));
+	verify(OpStatus::IsSuccess(foldername.AppendFormat(UNI_L("modules%cwindowcommander%cselftest%cdump%c"), PATHSEPCHAR, PATHSEPCHAR, PATHSEPCHAR, PATHSEPCHAR)));
+
+	// Test SaveDocument().
+	filename.Empty();
+	verify(OpStatus::IsSuccess(filename.AppendFormat(UNI_L("%s/plain-text.txt"), foldername.CStr())));
+	verify(OpStatus::IsSuccess(commander->SaveDocument(filename.CStr(), OpWindowCommander::SAVE_AS_TEXT, FALSE)));
+	OP_DELETE(file);
+	verify(OpStatus::IsSuccess(OpLowLevelFile::Create(&file, filename)));
+	verify(OpStatus::IsSuccess(file->GetFileLength(&file_length)));
+	verify(file_length > 0);
+}
+finally
+{
+	OP_DELETE(file);
+}
+
+test("privacy mode")
+	require success "change layout mode";
+{
+	verify(!commander->GetPrivacyMode());
+	commander->SetPrivacyMode(TRUE);
+	verify(commander->GetPrivacyMode());
+	commander->SetPrivacyMode(FALSE);
+	verify(!commander->GetPrivacyMode());
+}
+
+test("text scale")
+	require success "change layout mode";
+{
+	verify(commander->GetTextScale() == 100);
+	commander->SetTextScale(200);
+	verify(commander->GetTextScale() == 200);
+	commander->SetTextScale(100);
+	verify(commander->GetTextScale() == 100);
+}
+
+test("platform message listener setup")
+	require success "core creates a window";
+	require DOM_TO_PLATFORM_MESSAGES;
+{
+	platformMessageListener = OP_NEW(TestOpPlatformMessageListener, ());
+	verify(platformMessageListener != NULL);
+	commander->SetPlatformMessageListener(platformMessageListener);
+}
+
+test("send platform message")
+	require success "platform message listener setup";
+	require DOM_TO_PLATFORM_MESSAGES;
+	async;
+{
+	platformMessageListener->OnMessage(commander, NULL, UNI_L("wic-selftest"), UNI_L("fake"));
+}
+
+test("platform message listener shutdown")
+	require success "platform message listener setup";
+	require DOM_TO_PLATFORM_MESSAGES;
+{
+	OP_DELETE(platformMessageListener);
+	platformMessageListener = NULL;
+	commander->SetPlatformMessageListener(NULL);
+}
+
+/**
+	Basic tests of that we get results from new API stuff
+*/
+
+//GetCaretRect, setup + call + verify : PATCH CORE-25892
+test("get caret rect setup")
+	async;
+	require success "core creates a window";
+	require undefined HAS_NOTEXTSELECTION;
+	require KEYBOARD_SELECTION_SUPPORT;
+{
+	OpString page;
+	page.Set(TEST_PAGE_1);
+	testResult->test_type = TEST_PAGE_URL;
+	testResult->string_value.Set(TEST_PAGE_1);
+	OpWindowCommander::OpenURLOptions options;
+	options.entered_by_user = TRUE;
+	if (!commander->OpenURL(page.CStr(), options))
+		ST_failed("open url failed");
+}
+test("get caret rect call + verify")
+	require success "get caret rect setup";
+	require undefined HAS_NOTEXTSELECTION;
+	require KEYBOARD_SELECTION_SUPPORT;
+{
+	OpRect r;
+
+	// Should fail since nothing is selected
+	verify(!OpStatus::IsSuccess(commander->GetCaretRect(r)));
+
+	// Try to select something
+	verify(OpStatus::IsSuccess(commander->SetKeyboardSelectable(TRUE)));
+
+	// Should work
+	verify(OpStatus::IsSuccess(commander->GetCaretRect(r)));
+	verify(!r.IsEmpty());
+
+	// Try to deselect something
+	verify(OpStatus::IsSuccess(commander->SetKeyboardSelectable(FALSE)));
+
+	// Should fail since nothing is selected
+	verify(!OpStatus::IsSuccess(commander->GetCaretRect(r)));
+}
+
+//GetCurrentContentSize, setup + call + verify : PATCH CORE-22708
+test("get current content size setup")
+	async;
+	require success "core creates a window";
+{
+	OpString page;
+	page.Set(TEST_PAGE_1);
+	testResult->test_type = TEST_PAGE_URL;
+	testResult->string_value.Set(TEST_PAGE_1);
+	OpWindowCommander::OpenURLOptions options;
+	options.entered_by_user = TRUE;
+	if (!commander->OpenURL(page.CStr(), options))
+		ST_failed("open url failed");
+}
+test("get current content size call + verify")
+	require success "get current content size setup";
+{
+	OpFileLength size = 9999;
+	verify(OpStatus::IsSuccess(commander->GetCurrentContentSize(size,FALSE)));
+	verify(size > 0);
+	verify(size != 9999);
+}
+
+//IsInlineFeed, setup + call + verify : PATCH CORE-22708
+test("is inline feed setup")
+	async;
+	require success "core creates a window";
+{
+	OpString page;
+	page.Set(TEST_PAGE_1);
+	testResult->test_type = TEST_PAGE_URL;
+	testResult->string_value.Set(TEST_PAGE_1);
+	OpWindowCommander::OpenURLOptions options;
+	options.entered_by_user = TRUE;
+	if (!commander->OpenURL(page.CStr(), options))
+		ST_failed("open url failed");
+}
+test("is inline feed call + verify")
+	require success "is inline feed setup";
+	require WEBFEEDS_DISPLAY_SUPPORT;
+{
+	verify(!commander->IsInlineFeed());
+}
+
+//GetOriginalURLForMHTML, setup + call + verify : PATCH CORE-22708
+test("get original url for mhtml setup")
+	async;
+	require success "core creates a window";
+	require SAVE_SUPPORT && MHTML_ARCHIVE_REDIRECT_SUPPORT;
+{
+	OpString page;
+	page.Set(TEST_PAGE_1);
+	testResult->test_type = TEST_PAGE_URL;
+	testResult->string_value.Set(TEST_PAGE_1);
+	OpWindowCommander::OpenURLOptions options;
+	options.entered_by_user = TRUE;
+	if (!commander->OpenURL(page.CStr(), options))
+		ST_failed("open url failed");
+}
+test("get original url for mhtml call + verify")
+	require success "get original url for mhtml setup";
+	require SAVE_SUPPORT && MHTML_ARCHIVE_REDIRECT_SUPPORT;
+{
+	OpString aString;
+	verify(!OpStatus::IsSuccess(commander->GetOriginalURLForMHTML(aString)));
+
+	//Should fail since this isnt a MHTML. Real functionallity should
+	//be tested as part of MHTML
+}
+
+/**
+	Close the windows
+*/
+test("close the window")
+	require success "core creates a window";
+{
+	g_windowCommanderManager->GetUiWindowListener()->CloseUiWindow(commander);
+}
+
+html
+{
+	//! <link rel="stylesheet" href="a.css">1
+	//! <link rel="stylesheet alternate" href="a.css">+ 1 = 2
+	//! <link rel="start icon" href="a.icon">+ 2 = 4
+	//! <link rel="alternate up" href="a.css">+ 2 = 6
+	//! <link rel="foo bar" href="a.css">+ 1 = 7 (unknowns are grouped as other)
+	//! <link rel="section subsection tomato" href="a.css">+ 3 = 10
+	//! <link rel="section" href="a.css">+ 1 = 11
+	//! <link rel="foo1 foo2 foo3 alternate foo4 stylesheet foo5 foo6 foo7" href="a.css">+ 2 = 13
+}
+
+test("link info")
+	require LINK_SUPPORT;
+{
+	WindowCommander* wc = state.doc->GetWindow()->GetWindowCommander();
+	verify(wc);
+
+	unsigned int count = wc->GetLinkElementCount();
+	verify(count == 13);
+
+	LinkElementInfo info;
+	verify(wc->GetLinkElementInfo(0, &info));
+	verify(info.kind == LinkElementInfo::OP_LINK_ELT_STYLESHEET);
+
+	verify(wc->GetLinkElementInfo(1, &info));
+	verify(info.kind == LinkElementInfo::OP_LINK_ELT_ALTERNATE_STYLESHEET);
+	verify(info.rel);
+	verify(uni_stristr(info.rel, UNI_L("alternate")));
+	verify(uni_stristr(info.rel, UNI_L("STYLESHEET")));
+
+	verify(wc->GetLinkElementInfo(2, &info));
+	verify(info.kind == LinkElementInfo::OP_LINK_ELT_START);
+	verify(wc->GetLinkElementInfo(3, &info));
+	verify(info.kind == LinkElementInfo::OP_LINK_ELT_ICON);
+
+	verify(wc->GetLinkElementInfo(4, &info));
+	verify(info.kind == LinkElementInfo::OP_LINK_ELT_ALTERNATE);
+	verify(wc->GetLinkElementInfo(5, &info));
+	verify(info.kind == LinkElementInfo::OP_LINK_ELT_UP);
+
+	verify(wc->GetLinkElementInfo(6, &info));
+	verify(info.kind == LinkElementInfo::OP_LINK_ELT_OTHER);
+	verify(info.rel);
+	verify(uni_str_eq(info.rel, UNI_L("foo bar")));
+
+	verify(wc->GetLinkElementInfo(7, &info));
+	verify(info.kind == LinkElementInfo::OP_LINK_ELT_SECTION);
+	verify(wc->GetLinkElementInfo(8, &info));
+	verify(info.kind == LinkElementInfo::OP_LINK_ELT_SUBSECTION);
+	verify(wc->GetLinkElementInfo(9, &info));
+	verify(info.kind == LinkElementInfo::OP_LINK_ELT_OTHER);
+
+	verify(wc->GetLinkElementInfo(10, &info));
+	verify(info.kind == LinkElementInfo::OP_LINK_ELT_SECTION);
+
+	verify(wc->GetLinkElementInfo(11, &info));
+	verify(info.kind == LinkElementInfo::OP_LINK_ELT_ALTERNATE_STYLESHEET);
+	verify(info.rel);
+	verify(uni_stristr(info.rel, "alternate"));
+	verify(uni_stristr(info.rel, "STYLESHEET"));
+	verify(wc->GetLinkElementInfo(12, &info));
+	verify(info.kind == LinkElementInfo::OP_LINK_ELT_OTHER);
+
+	verify(!wc->GetLinkElementInfo(13, &info));
+}
+
+test("IsIntranet setup")
+{
+	WindowCommander* wc = state.doc->GetWindow()->GetWindowCommander();
+	verify(wc);
+	verify(wc->OpenURL(UNI_L("http://localhost/"), FALSE));
+}
+
+test("IsIntranet")
+	require success "IsIntranet setup";
+{
+	WindowCommander* wc = state.doc->GetWindow()->GetWindowCommander();
+	verify(wc);
+	verify(wc->IsIntranet());
+}
+
+html
+{
+//!<!DOCTYPE html>
+//!<html>
+//!<head>
+//!<style>
+//!*
+//!{
+//!	margin:0;padding:0;
+//!}
+//!
+//!</style>
+//!</head>
+//!<body>
+//!
+//!<a href="#">LINK</a>
+//!
+//!</body>
+//!
+//!</html>
+}
+test("nearby interactive item detection basic")
+	require NEARBY_INTERACTIVE_ITEM_DETECTION;
+{
+	AutoDeleteList<InteractiveItemInfo> item_list;
+	OpRect search_rect(0, 0, 50, 50),
+		   fake_viewport_rect(0, 0, 200, 200),
+		   old_viewport_rect;
+	int negative_overflow = state.doc->NegativeOverflow();
+	ViewportController* viewCtrl = state.doc->GetWindow()->GetViewportController();
+	WindowCommander* wc = state.doc->GetWindow()->GetWindowCommander();
+
+	verify(wc);
+	verify(negative_overflow == 0); // shouldn't be any for that doc
+
+	old_viewport_rect = state.doc->GetVisualViewport();
+	// Fake visual viewport size
+	viewCtrl->LockVisualViewportSize(FALSE);
+	viewCtrl->SetVisualViewport(fake_viewport_rect);
+
+	OP_STATUS status = wc->FindNearbyInteractiveItems(search_rect, item_list);
+	verify(OpStatus::IsSuccess(status));
+
+	// Hit the anchor
+	verify(item_list.Cardinal() == 1);
+
+	viewCtrl->SetVisualViewport(old_viewport_rect);
+	viewCtrl->LockVisualViewportSize(TRUE);
+
+	item_list.Clear();
+	state.doc->GetWindow()->DocManager()->UnloadCurrentDoc();
+
+	status = wc->FindNearbyInteractiveItems(search_rect, item_list);
+	verify(status == OpStatus::ERR_NULL_POINTER);
+	verify(item_list.Cardinal() == 0);
+}
+
+html
+{
+//!<!DOCTYPE html>
+//!<html>
+//!<head>
+//!<style>
+//!*
+//!{
+//!	margin:0;padding:0;
+//!}
+//!
+//!a
+//!{
+//!	display:block;
+//!	width:50px;
+//!	height:50px;
+//!	background-color:blue;
+//!	transform-origin:top left;
+//!	transform: translate(50px,50px) rotate(-45deg);
+//!}
+//!</style>
+//!</head>
+//!<body>
+//!
+//!<a href="#"></a>
+//!
+//!</body>
+//!
+//!</html>
+}
+test("nearby interactive item detection transform rects")
+	require NEARBY_INTERACTIVE_ITEM_DETECTION;
+	require CSS_TRANSFORMS;
+{
+	AutoDeleteList<InteractiveItemInfo> item_list;
+	OpRect search_rect(0, 0, 200, 200),
+		   fake_viewport_rect(0, 0, 200, 200),
+		   old_viewport_rect;
+	int negative_overflow = state.doc->NegativeOverflow();
+	ViewportController* viewCtrl = state.doc->GetWindow()->GetViewportController();
+	WindowCommander* wc = state.doc->GetWindow()->GetWindowCommander();
+
+	verify(wc);
+	verify(negative_overflow == 0); // shouldn't be any for that doc
+
+	old_viewport_rect = state.doc->GetVisualViewport();
+	// Fake visual viewport size
+	viewCtrl->LockVisualViewportSize(FALSE);
+	viewCtrl->SetVisualViewport(fake_viewport_rect);
+
+	OP_STATUS status = wc->FindNearbyInteractiveItems(search_rect, item_list, FALSE);
+	verify(OpStatus::IsSuccess(status));
+
+	verify(item_list.Cardinal() == 1);
+	verify(NearbyItemDetectionSTUtil::InteractiveItemInfoHasRect(item_list, InteractiveItemInfo::INTERACTIVE_ITEM_TYPE_ANCHOR, OpRect(0, 0, 50, 50)));
+	verify(NearbyItemDetectionSTUtil::InteractiveItemHasTransformedRect(item_list, InteractiveItemInfo::INTERACTIVE_ITEM_TYPE_ANCHOR) == TRUE);
+
+	item_list.Clear();
+
+	status = wc->FindNearbyInteractiveItems(search_rect, item_list, TRUE);
+	verify(OpStatus::IsSuccess(status));
+
+	verify(item_list.Cardinal() == 1);
+	verify(NearbyItemDetectionSTUtil::InteractiveItemInfoHasRect(item_list, InteractiveItemInfo::INTERACTIVE_ITEM_TYPE_ANCHOR, OpRect(50, 14, 71, 71)));
+	verify(NearbyItemDetectionSTUtil::InteractiveItemHasTransformedRect(item_list, InteractiveItemInfo::INTERACTIVE_ITEM_TYPE_ANCHOR) == FALSE);
+
+	viewCtrl->SetVisualViewport(old_viewport_rect);
+	viewCtrl->LockVisualViewportSize(TRUE);
+}
+
+html
+{
+//! <html>
+//! <head>
+//!	<style>
+//!		@media all and (view-mode:minimized)
+//!		{
+//!			#test1 { width:100 }
+//!		}
+//!		
+//!		@media all and (view-mode:fullscreen)
+//!		{
+//!			#test2 { width:100 }
+//!		}	
+//!	</style>
+//! </head>
+//! <body>
+//!	<div id='test1'></div>
+//!	<div id='test2'></div>
+//!	</body>
+//! </html>
+}
+
+test("Test WindowCommander::IsDocumentSupportingViewMode")
+{
+	WindowCommander* wc = state.doc->GetWindow()->GetWindowCommander();
+	verify(wc);
+
+	verify(wc->IsDocumentSupportingViewMode(WINDOW_VIEW_MODE_MINIMIZED));
+	verify(wc->IsDocumentSupportingViewMode(WINDOW_VIEW_MODE_FULLSCREEN));
+	verify(!wc->IsDocumentSupportingViewMode(WINDOW_VIEW_MODE_FLOATING));
+	verify(!wc->IsDocumentSupportingViewMode(WINDOW_VIEW_MODE_WINDOWED));
+	verify(!wc->IsDocumentSupportingViewMode(WINDOW_VIEW_MODE_MAXIMIZED));
+}
+
+html
+{
+	//!<!DOCTYPE html>
+	//!<html>
+	//!<body>Hello, please!
+	//!</body>
+	//!</html>
+}
+test("select text")
+	require undefined HAS_NOTEXTSELECTION;
+{
+	ViewportController* viewCtrl = state.doc->GetWindow()->GetViewportController();
+	WindowCommander* wc = state.doc->GetWindow()->GetWindowCommander();
+
+	verify(wc);
+
+	OpRect layout_viewport = viewCtrl->GetLayoutViewport();
+	verify(!layout_viewport.IsEmpty());
+
+	// First make sure that nothing is selected
+
+	wc->ClearSelection();
+	verify(!wc->HasSelectedText());
+
+	/* Then walk diagonally from bottom right to top left corner of layout
+	   viewport. There should hopefully be something to select. The selection
+	   code in core seems to have a lot of problems - one of them being that
+	   we can't start the selection from 0,0. */
+
+	OpRect search_area(layout_viewport);
+
+	search_area.x = 10;
+	search_area.y = 10;
+
+	BOOL got_selection = FALSE;
+
+	for (int x = search_area.width - 1; x > 1; x--)
+	{
+		wc->SelectTextStart(search_area.TopLeft());
+		wc->SelectTextEnd(OpPoint(search_area.x + x,
+								  search_area.y + x * search_area.height / search_area.width));
+
+		if (wc->HasSelectedText())
+		{
+			got_selection = TRUE;
+			break;
+		}
+	}
+
+	verify(got_selection);
+}
+
+html
+{
+	//!<!DOCTYPE html>
+	//!<html>
+	//!<body>Hello, please!
+	//!</body>
+	//!</html>
+}
+test("select text")
+	require undefined HAS_NOTEXTSELECTION;
+{
+	ViewportController* viewCtrl = state.doc->GetWindow()->GetViewportController();
+	WindowCommander* wc = state.doc->GetWindow()->GetWindowCommander();
+
+	verify(wc);
+
+	OpRect layout_viewport = viewCtrl->GetLayoutViewport();
+	verify(!layout_viewport.IsEmpty());
+
+	// First make sure that nothing is selected
+
+	wc->ClearSelection();
+	verify(!wc->HasSelectedText());
+
+	/* Then walk diagonally from bottom right to top left corner of layout
+	   viewport. There should hopefully be something to select. The selection
+	   code in core seems to have a lot of problems - one of them being that
+	   we can't start the selection from 0,0. */
+
+	OpRect search_area(layout_viewport);
+
+	search_area.x = 10;
+	search_area.y = 10;
+
+	BOOL got_selection = FALSE;
+
+	for (int x = search_area.width - 1; x > 1; x--)
+	{
+		wc->SelectTextStart(search_area.TopLeft());
+		wc->SelectTextEnd(OpPoint(search_area.x + x,
+								  search_area.y + x * search_area.height / search_area.width));
+
+		if (wc->HasSelectedText())
+		{
+			got_selection = TRUE;
+			break;
+		}
+	}
+
+	verify(got_selection);
+}
+
+test("Verify that calling OpWindowCommander's fullscreen API does not cause any notifications to the platform")
+require DOM_FULLSCREEN_MODE;
+{
+	testResult->int_value = 0;
+	WindowCommander* wc = state.doc->GetWindow()->GetWindowCommander();
+	wc->SetDocumentFullscreenState(OpWindowCommander::FULLSCREEN_PROJECTION);
+	wc->SetDocumentFullscreenState(OpWindowCommander::FULLSCREEN_NORMAL);
+	wc->SetDocumentFullscreenState(OpWindowCommander::FULLSCREEN_NONE);
+	verify(testResult->int_value == 0);
+}

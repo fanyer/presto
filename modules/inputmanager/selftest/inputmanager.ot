@@ -1,0 +1,162 @@
+/* -*- Mode: c++; tab-width: 4; indent-tabs-mode: t; c-basic-offset: 4 -*-
+**
+** Copyright (C) 2008-2011 Opera Software ASA.  All rights reserved.
+**
+** This file is part of the Opera web browser.  It may not be distributed
+** under any circumstances.
+**
+** Marcus Cromnow
+*/
+
+group "inputmanager.inputmanager";
+
+require PREFS_HAS_PREFSFILE;
+require ACTION_DELETE_ENABLED;
+require ACTION_BACK_ENABLED;
+require ACTION_FORWARD_ENABLED;
+
+include "modules/inputmanager/inputmanager.h";
+include "modules/inputmanager/inputcontext.h";
+include "modules/util/opfile/opmemfile.h";
+include "modules/prefsfile/prefssection.h";
+include "modules/prefsfile/prefsfile.h";
+include "modules/prefs/prefsmanager/collections/pc_core.h";
+
+global
+{
+	typedef char ini_key_ptr;
+
+	class TestContext : public OpInputContext
+	{
+		const char*	GetInputContextName()
+		{
+			return "test";
+		}
+	} m_test_context;
+}
+
+
+// Set a special shortcut context section in g_input_manager. Used by the GetShortcutFromString test
+subtest SetSpecialSection(const ini_key_ptr* context, const unsigned char* data, size_t data_size)
+	require OPMEMFILE_SUPPORT;
+{
+	PrefsFile* input_ini = NULL;
+	OpFileDescriptor* input_ini_file = OpMemFile::Create(data, data_size);
+
+	verify (input_ini_file);
+	OpAutoPtr<PrefsFile> new_input_ini( OP_NEW_L(PrefsFile,(PREFS_INI)) );
+	verify_trap(new_input_ini->ConstructL());
+	verify_trap(new_input_ini->SetFileL(input_ini_file));
+	verify_trap(new_input_ini->LoadAllL());
+
+	input_ini = new_input_ini.release();
+	verify(input_ini);
+
+	verify(input_ini->IsSection(context));
+	verify_trap(g_input_manager->AddSpecialKeyboardSection(context, input_ini->ReadSectionL(context)));
+}
+finally
+{
+	OP_DELETE(input_ini);
+	OP_DELETE(input_ini_file);
+}
+
+table GetShortcutStringFromAction_Data(OpInputAction::Action, const char*)
+{
+//		action							result
+	{	OpInputAction::ACTION_FORWARD,	"" },
+	{	OpInputAction::ACTION_BACK,		"d" },
+	{	OpInputAction::ACTION_DELETE,	"ctrl+q, ctrl+alt+a" }
+}
+
+test ("GetShortcutStringFromAction")
+	require OPMEMFILE_SUPPORT;
+{
+	const unsigned char input[] = "[test]\nq ctrl,a ctrl alt=Delete\nd=Back";
+
+	verify(SetSpecialSection("test", input, sizeof(input)));
+
+	iterate (a, res) from GetShortcutStringFromAction_Data
+	{
+		OpInputAction action(a);
+		OpString result;
+
+		verify (OpStatus::IsSuccess(g_input_manager->GetShortcutStringFromAction(&action, result, &m_test_context)));
+		verify (result.CompareI(res) == 0);
+	}
+}
+
+test("SetMousePosition")
+require MOUSE_SUPPORT;
+{
+	const int save_gesture_enabled = g_pccore->GetIntegerPref(PrefsCollectionCore::EnableGesture);
+	const int save_threshold = g_pccore->GetIntegerPref(PrefsCollectionCore::GestureThreshold);
+
+	OpInputManager input_manager;
+	verify_success(input_manager.Construct());
+
+	// enable gestures and ensure a threshold of at least 2 pixels
+	// (otherwise we cannot test to move the mouse less than the
+	// threshold)
+	int threshold = save_threshold;
+#ifdef PREFS_WRITE
+	if (!save_gesture_enabled)
+		verify_trap(g_pccore->WriteIntegerL(PrefsCollectionCore::EnableGesture, TRUE));
+	if (save_threshold < 2)
+	{
+		verify_trap(g_pccore->WriteIntegerL(PrefsCollectionCore::GestureThreshold, 5));
+		threshold = 5;
+	}
+#else
+	verify(save_gesture_enabled && (save_threshold == 5), "Could not set up the required preferences");
+#endif
+
+	// The initial mouse position is (0,0):
+	verify(OpPoint(0,0) == input_manager.GetMousePosition());
+	// Now start a gesture:
+	verify(!input_manager.InvokeKeyDown(input_manager.GetGestureButton(), NULL, 0, NULL, 0, FALSE, OpKey::LOCATION_STANDARD, TRUE));
+	// First move less than the threshold: the gesture mouse-position
+	// should not be saved:
+	input_manager.SetMousePosition(OpPoint(threshold-1, 0));
+	verify(input_manager.IsGestureRecognizing());
+	// Now move pass the threshold value: the gesture mouse position
+	// is changed:
+	input_manager.SetMousePosition(OpPoint(threshold, 0));
+}
+finally
+{
+#ifdef PREFS_WRITE
+	// Restore preferences
+	OP_STATUS err;
+	if (!save_gesture_enabled)
+		TRAP(err, g_pccore->WriteIntegerL(PrefsCollectionCore::EnableGesture, save_gesture_enabled));
+	if (save_threshold < 2)
+		TRAP(err, g_pccore->WriteIntegerL(PrefsCollectionCore::GestureThreshold, save_threshold));
+#endif
+}
+
+test("Testing ResetInput")
+{
+	OpInputManager input_manager;
+   	input_manager.InvokeKeyDown(OP_KEY_Z, SHIFTKEY_NONE);
+	verify(input_manager.IsKeyDown(OP_KEY_Z));
+	input_manager.ResetInput();
+ 	verify(!input_manager.IsKeyDown(OP_KEY_Z));
+}
+
+test("Testing InvokeKeyUp")
+{
+	OpInputManager input_manager;
+	input_manager.InvokeKeyDown(OP_KEY_Z, SHIFTKEY_NONE);
+	verify(input_manager.IsKeyDown(OP_KEY_Z));
+	input_manager.InvokeKeyUp(OP_KEY_Z, SHIFTKEY_NONE);
+	verify(!input_manager.IsKeyDown(OP_KEY_Z));
+}
+
+test("Testing Set/Get/HasTouchInputState")
+{
+	OpInputManager input_manager;
+	input_manager.SetTouchInputState(TOUCH_INPUT_INERTIA);
+	verify(input_manager.GetTouchInputState() & TOUCH_INPUT_INERTIA);
+	verify(input_manager.GetTouchInputState() == TOUCH_INPUT_INERTIA);
+}

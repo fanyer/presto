@@ -1,0 +1,362 @@
+/* -*- Mode: c++; tab-width: 4; indent-tabs-mode: t; c-basic-offset: 4 -*-
+**
+** Copyright (C) 2011 Opera Software ASA.  All rights reserved.
+**
+** This file is part of the Opera web browser.  It may not be distributed
+** under any circumstances.
+*/
+
+group "security_manager.cors.utilities";
+require init;
+require CORS_SUPPORT;
+
+language c++;
+
+include "modules/security_manager/src/cors/cors_request.h";
+include "modules/security_manager/src/cors/cors_utilities.h";
+
+include "modules/url/url2.h";
+include "modules/url/url_man.h";
+include "modules/url/url_ds.h";
+include "modules/url/tools/url_util.h";
+include "modules/formats/hdsplit.h";
+
+global
+{
+	URL test_url;
+	OpCrossOrigin_Request *request = NULL;
+	const uni_char *origin_url_str = NULL;
+	const uni_char *request_url_str = NULL;
+	URL origin_url;
+	URL request_url;
+}
+
+table header_list (const char*, const char*)
+{
+	{"Origin", "http://www.example.com"},
+	{"Access-Control-Request-Method",	"GET"},
+	{"Access-Control-Request-Method",	"PUT"},
+	{"Access-Control-Request-Headers",	""},
+}
+
+table header_list_values (const char*, const char*)
+{
+	{"Origin",	"http://www.example.com"},
+	{"Access-Control-Request-Method",	"GET\r\nPUT"},
+	{"Access-Control-Request-Headers",	""},
+}
+
+setup
+{
+	test_url = g_url_api->GetURL("data:text/html,", (const char *)NULL, TRUE);
+	test_url.SetAttribute(URL::KHTTPSpecialMethodStr, "GET");
+
+	/* Broken way of doing things, manually injecting response headers in
+	   order to test. Just don't know any better. :-) */
+	iterate (header, h_value) from header_list
+	{
+		URL_Custom_Header header_item;
+		header_item.name.Set(header);
+		header_item.value.Set(h_value);
+		test_url.SetAttribute(URL::KAddHTTPHeader, &header_item);
+		if(!test_url.GetRep()->GetDataStorage()->GetHTTPProtocolDataNoAlloc()->recvinfo.all_headers)
+			test_url.GetRep()->GetDataStorage()->GetHTTPProtocolDataNoAlloc()->recvinfo.all_headers = OP_NEW(HeaderList, ());
+
+		HeaderEntry *new_item(OP_NEW(HeaderEntry, ()));
+		new_item->ConstructFromNameAndValueL(*test_url.GetRep()->GetDataStorage()->GetHTTPProtocolDataNoAlloc()->recvinfo.all_headers, header, h_value, op_strlen(h_value));
+	}
+
+	origin_url_str = UNI_L("http://www.a.com");
+	request_url_str = UNI_L("http://www.b.com");
+	origin_url = g_url_api->GetURL("http://www.a.com/path/somewhere/foo.txt", static_cast<const char *>(NULL), TRUE);
+	request_url = g_url_api->GetURL("http://www.b.com/", static_cast<const char *>(NULL), TRUE);
+}
+
+test("IsSimpleMethod")
+	language c++;
+{
+	foreach (METHOD, RESULT) from
+	{
+		{ "GET", TRUE }
+		{ "POST", TRUE }
+		{ "HEAD", TRUE }
+		{ "DELETE", FALSE }
+		{ " 	 ", FALSE }
+		{ "", FALSE }
+		{ "get", FALSE }
+		{ "GETx", FALSE }
+		{ "POSTy", FALSE }
+		{ "X-C", FALSE }
+	}
+	{
+		{
+			OpString method_str;
+			if (METHOD)
+				verify_success(method_str.Set(METHOD));
+			verify(OpCrossOrigin_Utilities::IsSimpleMethod(method_str.CStr()) == RESULT);
+		}
+	}
+}
+
+test("IsSimpleRequestHeader")
+	language c++;
+{
+	foreach (NAME, VALUE, RESULT) from
+	{
+		{ "Accept", "", TRUE }
+		{ "ACcept", "dont-care", TRUE }
+		{ "accept-language", "", TRUE }
+		{ "content-languagE", "", TRUE }
+		{ "content-languages", "", FALSE }
+		{ "content-language ", "", FALSE }
+		{ "Content-type", "", FALSE }
+		{ "Content-type", "text/plain;charset=us-ascii", TRUE }
+		{ "Content-type", "text/plain", TRUE }
+		{ "Content-type", "text/plainest", FALSE }
+		{ "Content-type", "application/x-www-form-urlencoded", TRUE }
+		{ "Content-type", "multipart/form-data", TRUE }
+		{ "Content-type", "application/javascript", FALSE }
+		{ "	 ", "", FALSE }
+		{ "", "", FALSE }
+	}
+	{
+		{
+			OpString name_str;
+			verify_success(name_str.Set(NAME));
+			verify(OpCrossOrigin_Utilities::IsSimpleRequestHeader(name_str.CStr(), VALUE, FALSE) == RESULT);
+		}
+	}
+}
+
+test("IsSimpleResponseHeader")
+	language c++;
+{
+	OpString name_str;
+	foreach (NAME, RESULT) from
+	{
+		{ "Cache-CONTROL", TRUE }
+		{ "Vary", FALSE }
+		{ "Content-Language", TRUE }
+		{ "Expires", TRUE }
+		{ "Expires2", FALSE }
+		{ "Last-Modified", TRUE }
+		{ "Pragma", TRUE }
+		{ "ACcept", FALSE }
+		{ "accept-language", FALSE }
+		{ "content-language", TRUE }
+		{ "", FALSE }
+	}
+	{
+		verify_success(name_str.Set(NAME));
+		verify(OpCrossOrigin_Utilities::IsSimpleResponseHeader(name_str.CStr()) == RESULT);
+	}
+}
+
+test("IsEqualASCIICaseInsensitive")
+	language c++;
+{
+	foreach (STR1, STR2, LEN2, RESULT) from
+	{
+		{"a", "b", 1, FALSE}
+		{"a", "a", 1, TRUE}
+		{"a", "A", 1, TRUE}
+		{"11 a", "11 A", 4, TRUE}
+		{"11 ax", "11 Ay", 4, TRUE}
+		{"", "ab", 2, FALSE}
+		{"a", "abc", 1, TRUE}
+		{"", "abc", 0, TRUE}
+		{"A", "abc", 1, TRUE}
+		{"a", "", 0, TRUE}
+		{"\xC3\x98\x6C\x65\x6E", "\xC3\xB8\x6C\x65\x6E", 4, FALSE}
+		{"a\xC3\x98\x6C\x65\x6E", "A\xC3\xB8\x6C\x65\x6E", 5, FALSE}
+		{"a\xC3\x98\x6C\x65\x6E", "A\xC3\x98\x6C\x65\x6E", 5, TRUE}
+	}
+	{
+		{
+			OpString str1;
+			verify_success(str1.SetFromUTF8(STR1));
+			OpString str2;
+			verify_success(str2.SetFromUTF8(STR2));
+			verify(OpCrossOrigin_Utilities::IsEqualASCIICaseInsensitive(str1.CStr(), str2.CStr(), LEN2) == RESULT);
+		}
+	}
+}
+
+test("CompareASCIICaseInsensitive")
+	language c++;
+{
+	foreach (STR1, STR2, LEN2, RESULT) from
+	{
+		{"a", "b", 1, -1}
+		{"a", "a", 1, 0}
+		{"a", "A", 1, 0}
+		{"11 a", "11 A", 4, 0}
+		{"11 ax", "11 Ay", 4, 0}
+		{"", "ab", 2, -1}
+		{"a", "abc", 1, 0}
+		{"", "abc", 0, 0}
+		{"A", "abc", 1, 0}
+		{"a", "", 0, 0}
+		{"\xC3\x98\x6C\x65\x6E", "\xC3\xB8\x6C\x65\x6E", 4, -1}
+		{"\xC3\xB8\x6C\x65\x6E", "\xC3\x98\x6C\x65\x6E", 4, 1}
+		{"a\xC3\x98\x6C\x65\x6E", "A\xC3\xB8\x6C\x65\x6E", 5, -1}
+		{"a\xC3\x98\x6C\x65\x6E", "A\xC3\x98\x6C\x65\x6E", 5, 0}
+	}
+	{
+		{
+			OpString str1;
+			verify_success(str1.SetFromUTF8(STR1));
+			OpString str2;
+			verify_success(str2.SetFromUTF8(STR2));
+			verify(OpCrossOrigin_Utilities::CompareASCIICaseInsensitive(str1.CStr(), str2.CStr(), LEN2) == RESULT);
+		}
+	}
+}
+
+test("HasFieldValue")
+	language c++;
+{
+	foreach (STR1, STR2, LEN1, RESULT) from
+	{
+		{UNI_L("GET"), UNI_L("GET"), 3, TRUE}
+		{UNI_L("  GET"), UNI_L("GET"), 3, TRUE}
+		{UNI_L("  GET  "), UNI_L("GET"), 3, TRUE}
+		{UNI_L("  GET  "), UNI_L("GET"), 3, TRUE}
+		{UNI_L("  GET  \r\n	"), UNI_L("GET"), 3, TRUE}
+	}
+	{
+		verify(OpCrossOrigin_Utilities::HasFieldValue(STR1, STR2, LEN1) == RESULT);
+	}
+	foreach (STR1, STR2, LEN1, RESULT) from
+	{
+		{"GET", "GET", 3, TRUE}
+		{"	GET", "GET", 3, TRUE}
+		{"	GET  ", "GET", 3, TRUE}
+		{"	GET		 ", "GET", 3, TRUE}
+		{"	GET \r\n ", "GET", 3, TRUE}
+	}
+	{
+		{
+			OpString str1;
+			verify_success(str1.SetFromUTF8(STR1));
+			OpString str2;
+			verify_success(str2.SetFromUTF8(STR2));
+			verify(OpCrossOrigin_Utilities::HasFieldValue(str1.CStr(), str2.CStr(), LEN1) == RESULT);
+		}
+	}
+}
+
+test("HasSingleFieldValue")
+	language c++;
+{
+	verify(OpCrossOrigin_Utilities::HasSingleFieldValue(UNI_L("http://www.example.com/"), FALSE));
+	verify(OpCrossOrigin_Utilities::HasSingleFieldValue(UNI_L("	 http://www.example.com/  "), FALSE));
+	verify(!OpCrossOrigin_Utilities::HasSingleFieldValue(UNI_L("  http://www.example.com/, "), TRUE));
+	verify(OpCrossOrigin_Utilities::HasSingleFieldValue(UNI_L("	 http://www.example.com/, "), FALSE));
+	verify(OpCrossOrigin_Utilities::HasSingleFieldValue(UNI_L("	 A "), FALSE));
+	verify(!OpCrossOrigin_Utilities::HasSingleFieldValue(UNI_L("  A, B "), TRUE));
+	verify(!OpCrossOrigin_Utilities::HasSingleFieldValue(UNI_L("  A B "), TRUE));
+}
+
+test("GetHeaderValue")
+	language c++;
+{
+	iterate (header, value) from header_list_values
+	{
+		OpString str;
+		verify_success(OpCrossOrigin_Utilities::GetHeaderValue(test_url, header, str));
+		verify(str.CStr() != NULL && uni_strcmp(str.CStr(), value) == 0);
+	}
+}
+
+table method_list_table (const char*, BOOL, unsigned, BOOL)
+{
+	{"GET", TRUE, 1, TRUE}
+	{"POST", TRUE , 1, FALSE}
+	{"POST,POST,GET", TRUE, 3, TRUE}
+	{"POST,POST,GET", TRUE, 3, TRUE}
+	{"POST,POST,GET, POST, GET", TRUE, 5, TRUE}
+	{"POST, DELETE", TRUE, 2, FALSE}
+	{"POST, DELETE,", TRUE, 2, FALSE}
+	{"POST, GET,", TRUE, 2, TRUE}
+	{"get", TRUE, 1, FALSE}
+	{"g e t", FALSE, 0, FALSE}
+	{" GET", TRUE, 1, TRUE}
+	{"GET ", TRUE, 1, TRUE}
+	{" GET ", TRUE, 1, TRUE}
+	{"POST,,POST,GET", TRUE, 3, TRUE}
+	{"GET,,", TRUE, 1, TRUE}
+	{"GET,G:E:T,,", FALSE, 0, FALSE}
+}
+
+test("ParseAndMatchMethodList")
+	language c++;
+{
+	const uni_char *method = UNI_L("GET");
+	BOOL with_credentials = FALSE;
+	BOOL is_anon = FALSE;
+	verify_success(OpCrossOrigin_Request::Make(request, origin_url, request_url, method, with_credentials, is_anon));
+	iterate (input, is_success, methods_count, result) from method_list_table
+	{
+		OpString str;
+		verify_success(str.Set(input));
+		OpAutoVector<OpString> methods;
+		BOOL matched = FALSE;
+		OP_STATUS status = OpCrossOrigin_Utilities::ParseAndMatchMethodList(*request, str.CStr(), methods, matched, FALSE);
+		verify(methods_count == methods.GetCount());
+		verify(matched == result);
+		if (is_success)
+			verify_success(status);
+		else
+			verify(OpStatus::IsError(status));
+	}
+}
+finally
+{
+	OP_DELETE(request);
+	request = NULL;
+}
+
+table header_list_table (const char*, BOOL, unsigned, const char*, BOOL)
+{
+	{"Accept, Origin", TRUE, 2, "Origin", TRUE}
+	{"X-Foo, X-Bar", TRUE , 2, "X-Foo", TRUE}
+	{"X-Foo, X-Bar", TRUE , 2, "X-Foot", FALSE}
+	{"X-Foo, X-Bar", TRUE , 2, "X-Fo", FALSE}
+	{"X-Foo,, X-Bar,,", TRUE , 2, "X-Foo", TRUE}
+	{"X-Foo,  , X-Bar ,, X-Foo", TRUE , 3, "X-Bar", TRUE}
+	{"X-Foo X-Bar,,", FALSE , 0, "", FALSE}
+	{"X-Foo X-Bar,,", FALSE , 0, "X-Foo", FALSE}
+	{",,,,X-Foo,X-Bar,,,,,,,,,,,,,,,,,,,,", TRUE, 2, "X-Bar", TRUE}
+}
+
+test("ParseAndMatchHeaderList")
+	language c++;
+{
+	const uni_char *method = UNI_L("GET");
+	BOOL with_credentials = FALSE;
+	BOOL is_anon = FALSE;
+	verify_success(OpCrossOrigin_Request::Make(request, origin_url, request_url, method, with_credentials, is_anon));
+	iterate (input, is_success, headers_count, hdr, result) from header_list_table
+	{
+		request->ClearHeaders();
+		OpString input_str;
+		verify_success(input_str.Set(input));
+		verify_success(request->AddHeader(hdr));
+
+		OpAutoVector<OpString> headers;
+		BOOL matched = FALSE;
+		OP_STATUS status = OpCrossOrigin_Utilities::ParseAndMatchHeaderList(*request, input_str.CStr(), headers, matched);
+		verify(headers_count == headers.GetCount());
+		verify(matched == result);
+		if (is_success)
+			verify_success(status);
+		else
+			verify(OpStatus::IsError(status));
+	}
+}
+finally
+{
+	OP_DELETE(request);
+	request = NULL;
+}

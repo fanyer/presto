@@ -1,0 +1,391 @@
+/* -*- Mode: c++; tab-width: 4; indent-tabs-mode: t; c-basic-offset: 4 -*-
+**
+** Copyright (C) 2003-2012 Opera Software ASA.  All rights reserved.
+**
+** This file is part of the Opera web browser.  It may not be distributed
+** under any circumstances.
+**
+** Peter Krefting
+*/
+
+group "encodings.utility.charsetmanager";
+require initialization; // Read from file
+
+include "modules/encodings/utility/charsetnames.h";
+
+// -- Global variables ---------------------------------------------------
+
+global
+{
+	unsigned short iso_8859_1_id = 0;
+	unsigned short bogus_id = 0;
+
+	// Create local copies of encoding tags to circumvent Visual Studio's
+	// optimizations.
+	char iso_8859_1_string[11]; /* ARRAY OK 2011-11-09 peter */
+	char iso_8859_2_string[11]; /* ARRAY OK 2011-11-09 peter */
+	char latin1_string[7];      /* ARRAY OK 2011-11-09 peter */
+}
+
+setup
+{
+	op_strcpy(iso_8859_1_string, "iso-8859-1");
+	op_strcpy(iso_8859_2_string, "iso-8859-2");
+	op_strcpy(latin1_string, "latin1");
+}
+
+// -- GetCharsetNames ----------------------------------------------------
+
+test("CharsetManager::GetCharsetNames()")
+	require ENCODINGS_HAVE_TABLE_DRIVEN;
+{
+	const char *const *names = g_charsetManager->GetCharsetNames();
+	verify(names != NULL); // There is a list
+	verify(*names != NULL); // The list is non-empty
+}
+
+// -- GetCharsetIDL ------------------------------------------------------
+
+test("Checking CharsetManager::GetCharsetIDL() consistency")
+{
+	verify(g_charsetManager->GetCharsetIDL(NULL) == 0);
+
+	iso_8859_1_id = g_charsetManager->GetCharsetIDL(iso_8859_1_string);
+	verify(iso_8859_1_id != 0);
+	g_charsetManager->IncrementCharsetIDReference(iso_8859_1_id);
+	verify(g_charsetManager->GetCharsetIDL(iso_8859_1_string) == iso_8859_1_id);
+}
+
+test("Checking CharsetManager::GetCharsetIDL() uniqueness")
+	require success "Checking CharsetManager::GetCharsetIDL() consistency";
+{
+	unsigned short iso_8859_2_id = g_charsetManager->GetCharsetIDL(iso_8859_2_string);
+	verify(iso_8859_2_id != 0);
+	verify(iso_8859_2_id != iso_8859_1_id);
+}
+
+test("Checking CharsetManager::GetCharsetIDL() creating a new entry")
+{
+	bogus_id = g_charsetManager->GetCharsetIDL("x-bogus");
+	verify(bogus_id != 0);
+	g_charsetManager->IncrementCharsetIDReference(bogus_id);
+	verify(bogus_id != iso_8859_1_id);
+}
+
+// -- GetCharsetFromID ---------------------------------------------------
+
+test("CharsetManager::GetCharsetFromID() pre-existing entry")
+	require success "Checking CharsetManager::GetCharsetIDL() consistency";
+{
+	const char *iso_8859_1 = g_charsetManager->GetCharsetFromID(iso_8859_1_id);
+	verify(iso_8859_1 != NULL);
+	verify_string(iso_8859_1, iso_8859_1_string);
+}
+
+test("CharsetManager::GetCharsetFromID() created entry")
+	require success "Checking CharsetManager::GetCharsetIDL() creating a new entry";
+{
+	const char *x_bogus = g_charsetManager->GetCharsetFromID(bogus_id);
+	verify(x_bogus != NULL);
+	verify_string(x_bogus, "x-bogus");
+}
+
+// -- GetCanonicalCharsetFromId ------------------------------------------
+
+test("CharsetManager::GetCanonicalCharsetFromID() pre-existing entry")
+	require success "Checking CharsetManager::GetCharsetIDL() consistency";
+{
+	const char *iso_8859_1 = g_charsetManager->GetCanonicalCharsetFromID(iso_8859_1_id);
+	verify(iso_8859_1 != NULL);
+	verify_string(iso_8859_1, iso_8859_1_string);
+}
+
+test("CharsetManager::GetCanonicalCharsetFromID() created entry")
+	require success "Checking CharsetManager::GetCharsetIDL() creating a new entry";
+{
+	const char *x_bogus = g_charsetManager->GetCanonicalCharsetFromID(bogus_id);
+	verify(x_bogus == NULL);
+}
+
+// -- Stress test, filling the charset table with bogus data -------------
+test("Stress testing CharsetManager table")
+	require success "Checking CharsetManager::GetCharsetIDL() consistency";
+{
+	char x_bogus[16]; /* ARRAY OK 2011-11-09 peter */
+	bool used_entries[ENCODINGS_CHARSET_CACHE_SIZE + 1];
+	op_memset(used_entries, 0, sizeof used_entries);
+	unsigned int new_id = 0;
+	unsigned int latin1_id_2 = 0;
+
+	// Fill the table with bogus charset tags
+	unsigned int added_ids = 0;
+	unsigned int lowest_id = ENCODINGS_CHARSET_CACHE_SIZE;
+	for (unsigned int i = 0; i < ENCODINGS_CHARSET_CACHE_SIZE; i ++)
+	{
+		op_snprintf(x_bogus, sizeof x_bogus, "x-bogus-%u", i);
+		unsigned int id = g_charsetManager->GetCharsetIDL(x_bogus);
+		if (id == 0)
+		{
+			added_ids = i;
+			break;
+		}
+
+		// Remember this id
+		if (id < lowest_id)
+		{
+			// Remember the lowest used id
+			lowest_id = id;
+		}
+		verify(!used_entries[id]);
+		used_entries[id] = true;
+		g_charsetManager->IncrementCharsetIDReference(id);
+	}
+
+	// Make sure all the bogus tags refer to numbers we used
+	for (unsigned int j = 0; j < added_ids; j ++)
+	{
+		op_snprintf(x_bogus, sizeof x_bogus, "x-bogus-%u", j);
+		unsigned int id = g_charsetManager->GetCharsetIDL(x_bogus);
+		verify(id != 0);
+		verify(used_entries[id]);
+	}
+
+	for (unsigned int k = 0; k < ENCODINGS_CHARSET_CACHE_SIZE; k ++)
+	{
+		if (used_entries[k])
+		{
+			const char *charset = g_charsetManager->GetCharsetFromID(k);
+			verify(op_strncmp(charset, "x-bogus-", 8) == 0);
+			verify(NULL == g_charsetManager->GetCanonicalCharsetFromID(k));
+		}
+	}
+
+	// Try adding a tag that has a canonical form, and check that we get
+	// the id for the canonical form already in the table (iso-8859-1 is
+	// always in the table due to the earlier tests). However, as it might
+	// have been in the list already (for example by cache initialization),
+	// this test isn't 100% reliable.
+	unsigned int latin1_id = g_charsetManager->GetCharsetIDL(latin1_string);
+	if (latin1_id != iso_8859_1_id)
+	{
+		// Ok, didn't get what we expected, check that what we got is valid.
+		const char *tag = g_charsetManager->GetCharsetFromID(latin1_id);
+		verify(tag);
+		verify_string(tag, latin1_string);
+	}
+
+	// Try adding a tag that doesn't have a canonical form. This should
+	// fail.
+	verify(0 == g_charsetManager->GetCharsetIDL("x-bogus-unregisterable"));
+
+	// Decrement all references and make sure we can add new ones.
+	for (unsigned int l = 0; l < added_ids; l ++)
+	{
+		op_snprintf(x_bogus, sizeof x_bogus, "x-bogus-%u", l);
+		unsigned int id = g_charsetManager->GetCharsetIDL(x_bogus);
+		g_charsetManager->DecrementCharsetIDReference(id);
+	}
+
+	new_id = g_charsetManager->GetCharsetIDL("x-bogus-new");
+	verify(new_id != 0);
+	g_charsetManager->IncrementCharsetIDReference(new_id);
+
+	// Try re-adding "latin1", this should now give us a new id
+	latin1_id_2 = g_charsetManager->GetCharsetIDL(latin1_string);
+	verify(latin1_id_2 != iso_8859_1_id);
+	g_charsetManager->IncrementCharsetIDReference(latin1_id_2);
+
+	unsigned int latin1_id_3 = g_charsetManager->GetCharsetIDL(latin1_string);
+	verify(latin1_id_2 == latin1_id_3);
+}
+finally
+{
+	// Clean up
+	g_charsetManager->DecrementCharsetIDReference(new_id);
+	g_charsetManager->DecrementCharsetIDReference(latin1_id_2);
+}
+
+// -- GetCanonicalCharsetName --------------------------------------------
+
+subtest testname(const char *test, const char *match)
+{
+	const char *canonical = g_charsetManager->GetCanonicalCharsetName(test);
+	if (match)
+	{
+		verify(canonical);
+		verify_string(canonical, match);
+	}
+	else
+	{
+		verify(!canonical);
+	}
+}
+
+table canonical(const char *, const char *)
+{
+	{ "iso-8859-1", "iso-8859-1" },
+	{ "big5", "big5" },
+	{ "iso-2022-kr", "iso-2022-kr" },
+	{ "euc-cn", "gbk" },
+	{ "cp51932", "euc-jp" },
+	{ "cp50220", "iso-2022-jp" },
+	{ "iso-8559-1", NULL },
+	{ "", NULL },
+	{ NULL, NULL },
+}
+
+test("CharsetManager::GetCanonicalCharsetName: canonical form")
+{
+	iterate(test, match) from canonical
+	{
+		verify(testname(test, match));
+	}
+}
+
+
+table xprefix(const char *, const char *)
+{
+	{ "x-shift_jis", NULL },
+	{ "x-gbk", "gbk" },
+	{ "x-sjis", "shift_jis" },
+	{ "x-mac-ce", "x-mac-ce" },
+	{ "x-mac-cyrillic", "x-mac-cyrillic" },
+	{ "x-mac-greek", "x-mac-greek" },
+	{ "x-mac-turkish", "x-mac-turkish" },
+	{ "x-x-big5", "big5" },
+	{ "x-cp1250", "windows-1250" },
+	{ "x-cp1251", "windows-1251" },
+	{ "x-euc-jp", "euc-jp" },
+	{ "x-bogus", NULL },
+}
+
+test("CharsetManager::GetCanonicalCharsetName: x- prefix")
+{
+	iterate(test, match) from xprefix
+	{
+		verify(testname(test, match));
+	}
+}
+
+
+table nodashes(const char *, const char *)
+{
+	{ "iso88591", "iso-8859-1" },
+	{ "extendedunixcodepackedformatforjapanese", NULL },
+	{ "csiso646basic1983", "us-ascii" },
+	{ "ksc5601", "euc-kr" },
+	{ "csiso2022kr", "iso-2022-kr" },
+	{ "shiftjis", NULL },
+}
+
+test("CharsetManager::GetCanonicalCharsetName: compact")
+{
+	iterate(test, match) from nodashes
+	{
+		verify(testname(test, match));
+	}
+}
+
+
+table charsetsuffix(const char *, const char *)
+{
+	{ "GB2312_CHARSET", "gbk" },
+	{ "UTF8_CHARSET", "utf-8" },
+	{ "SHIFT_JIS_CHARSET", "shift_jis" },
+	{ "BOGUS_CHARSET", NULL },
+}
+
+test("CharsetManager::GetCanonicalCharsetName: charset suffix")
+{
+	iterate(test, match) from charsetsuffix
+	{
+		verify(testname(test, match));
+	}
+}
+
+
+table unicodeversion(const char *, const char *)
+{
+	{ "unicode-1-1-utf-7", "utf-7" },
+	{ "unicode-2-0-utf-8", "utf-8" },
+	{ "unicode-9-0-utf-48", NULL },
+	{ "unicode-1-1-", NULL }, // DSK-140341
+	{ "unicode-1-1", "utf-16" }, // See charsets.py
+}
+
+test("CharsetManager::GetCanonicalCharsetName: unicode version")
+{
+	iterate(test, match) from unicodeversion
+	{
+		verify(testname(test, match));
+	}
+}
+
+table firefoxonly(const char *, const char *)
+{
+	{ "5601", NULL }, // "euc-kr" 
+	{ "csueckr", NULL }, // "euc-kr"
+	{ "zh_tw-big5", NULL }, // "big5"
+	{ "zh_cn.euc", NULL }, // "big5"
+	{ "gb_2312", NULL }, // "gbk"
+	{ "sun_eu_greek", NULL }, // "iso-8859-7"
+	{ "ansi-1251", NULL }, // "windows-1251"
+	{ "x-cp1253", "windows-1253" }, // "windows-1253"
+	{ "x-cp1254", "windows-1254" }, // "windows-1254"
+	{ "x-cp1255", "windows-1255" }, // "windows-1255"
+	{ "x-cp1256", "windows-1256" }, // "windows-1256"
+}
+
+test("CharsetManager::GetCanonicalCharsetName: Firefox-only aliases")
+{
+	// These are not supported by MSIE and might not be meaningful to
+	// support
+	iterate(test, match) from firefoxonly
+	{
+		verify(testname(test, match));
+	}
+}
+// -- GetCharsetNameFromMIBenum ------------------------------------------
+
+table mibs(int, const char *)
+{
+	{ 3, "us-ascii" },
+	{ 38, "euc-kr" },
+	{ 113, "gbk" },
+	{ 1012, "utf-7" },
+	{ 2101, "big5-hkscs" },
+	{ 99999, NULL },
+}
+
+test("CharsetManager::GetCharsetNameFromMIBenum")
+	require ENCODINGS_HAVE_MIB_SUPPORT;
+{
+	iterate(test, match) from mibs
+	{
+		const char *found = g_charsetManager->GetCharsetNameFromMIBenum(test);
+		if (match)
+		{
+			verify(found != NULL);
+			verify_string(found, match);
+		}
+		else
+		{
+			verify(found == NULL);
+		}
+
+	}
+}
+
+// -- Global cleanup -----------------------------------------------------
+
+exit
+{
+	if (iso_8859_1_id != 0)
+	{
+		g_charsetManager->DecrementCharsetIDReference(iso_8859_1_id);
+	}
+	if (bogus_id != 0)
+	{
+		g_charsetManager->DecrementCharsetIDReference(bogus_id);
+	}
+}

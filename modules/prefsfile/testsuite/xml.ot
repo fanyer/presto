@@ -1,0 +1,539 @@
+/* -*- Mode: c++; tab-width: 4; indent-tabs-mode: t; c-basic-offset: 4 -*-
+**
+** Copyright (C) 2003-2007 Opera Software ASA.  All rights reserved.
+**
+** This file is part of the Opera web browser.  It may not be distributed
+** under any circumstances.
+**
+** Peter Karlsson
+*/
+
+group "prefsfile.xml";
+require PREFS_HAS_PREFSFILE;
+require PREFS_HAS_XML;
+require undefined HAVE_NO_OPMEMFILE;
+
+include "modules/prefsfile/prefsfile.h";
+include "modules/prefsfile/prefssection.h";
+include "modules/util/excepts.h";
+include "modules/util/opfile/opmemfile.h";
+include "modules/util/opstrlst.h";
+
+// -- Global variables ---------------------------------------------------
+
+global
+{
+	PrefsFile *pfp;
+	OpMemFile *ofp;
+}
+
+setup
+{
+	pfp = NULL;
+	ofp = NULL;
+
+	/* Create a file object */
+	static const unsigned char xml[] =
+		//!<?xml version="1.0" encoding="utf-8"?>
+		//!<preferences>
+		 //!<section id="Section1">
+		  //!<value id="Key1">Value1</value>
+		  //!<value id="Key2">Value2</value>
+		 //!</section>
+		 //!<section id="Section2">
+		  //!<value id="Key1">Value1</value>
+		  //!<value id="Key2">Value2</value>
+		  //!<value id="[Key3]" null="yes"></value>
+		 //!</section>
+		 //!<section id="Section1">
+		  //!<value id="Key3">Out of place</value>
+		 //!</section>
+		 //!<section id="Section3">
+		   "<value id=\"\xCE\xB1\">\xCF\x89</value>\n"
+		   "<value id=\"r\xC3\xA4ksm\xC3\xB6rg\xC3\xA5s\" null=\"yes\"/>\n"
+		 //!</section>
+		//!</preferences>
+		;
+
+	ofp = OpMemFile::Create(xml, long(sizeof xml) - 1);
+}
+
+// -- Tests --------------------------------------------------------------
+
+test("PrefsFile::ConstructL")
+{
+	pfp = OP_NEW(PrefsFile, (PREFS_XML));
+	TRAPD(rc, pfp->ConstructL());
+	verify(OpStatus::IsSuccess(rc));
+}
+
+test("PrefsFile::SetFileL")
+	require success "PrefsFile::ConstructL";
+{
+	TRAPD(rc, pfp->SetFileL(ofp));
+	verify(OpStatus::IsSuccess(rc));
+
+	OpFileDescriptor *dp = pfp->GetFile();
+	verify(dp != NULL);
+}
+
+test("PrefsFile::LoadAllL")
+	require success "PrefsFile::SetFileL";
+{
+	TRAPD(rc, pfp->LoadAllL());
+	verify(OpStatus::IsSuccess(rc));
+}
+
+
+table prefsdata(const uni_char *, const uni_char *, const uni_char *)
+{
+	{ UNI_L("Section1"), UNI_L("Key1"), UNI_L("Value1") },
+	{ UNI_L("Section1"), UNI_L("Key2"), UNI_L("Value2") },
+	{ UNI_L("Section1"), UNI_L("Key3"), UNI_L("Out of place"), },
+	{ UNI_L("Section2"), UNI_L("Key1"), UNI_L("Value1") },
+	{ UNI_L("Section2"), UNI_L("Key2"), UNI_L("Value2") },
+	{ UNI_L("Section2"), UNI_L("[Key3]"), NULL },
+	{ UNI_L("Section3"), UNI_L("\x03B1"), UNI_L("\x03C9") },
+	{ UNI_L("Section3"), UNI_L("r\xE4ksm\xF6rg\xE5s"), NULL },
+}
+
+test("PrefsFile::ReadStringL (OpStringC, uni_char key)")
+	require success "PrefsFile::LoadAllL";
+{
+	OpStringC s;
+	OP_STATUS rc;
+
+	iterate(section, key, value) from prefsdata
+	{
+		TRAP(rc, s = pfp->ReadStringL(section, key));
+//output("section=%s key=%s want='%s' rc=%d", ST_down(section), ST_down(key), value ? ST_down(value) : "null", rc);
+//output(" got='%s'\n", s.CStr() ? ST_down(s.CStr()) : "null");
+		verify(OpStatus::IsSuccess(rc));
+		verify(s.Compare(value) == 0);
+	}
+}
+
+test("PrefsFile::ReadStringL (OpString, uni_char key)")
+	require success "PrefsFile::LoadAllL";
+{
+	OpString s;
+	OP_STATUS rc;
+
+	iterate(section, key, value) from prefsdata
+	{
+		TRAP(rc, pfp->ReadStringL(section, key, s));
+		verify(OpStatus::IsSuccess(rc));
+		verify(s.Compare(value) == 0);
+	}
+}
+
+test("PrefsFile::ReadStringL (OpStringC, ASCII key)")
+	require success "PrefsFile::LoadAllL";
+{
+	OpStringC s;
+
+	iterate(section, key, value) from prefsdata
+	{
+		if (!uni_str_eq(section, "Section3")) // Section3 has non-ASCII keys
+		{
+			const char *section8 = ST_down(section);
+			const char *key8     = ST_down(key);
+			TRAPD(rc, s = pfp->ReadStringL(section8, key8));
+			verify(OpStatus::IsSuccess(rc));
+			verify(s.Compare(value) == 0);
+		}
+	}
+}
+
+test("PrefsFile::ReadStringL (OpString, ASCII key)")
+	require success "PrefsFile::LoadAllL";
+{
+	OpString s;
+
+	iterate(section, key, value) from prefsdata
+	{
+		if (!uni_str_eq(section, "Section3")) // Section3 has non-ASCII keys
+		{
+			const char *section8 = ST_down(section);
+			const char *key8     = ST_down(key);
+			TRAPD(rc, pfp->ReadStringL(section8, key8, s));
+			verify(OpStatus::IsSuccess(rc));
+			verify(s.Compare(value) == 0);
+		}
+	}
+}
+
+test("PrefsFile::IsSection")
+{
+	iterate(section, key, value) from prefsdata
+	{
+		verify(pfp->IsSection(section));
+	}
+}
+
+test("PrefsFile::IsKey")
+	require success "PrefsFile::LoadAllL";
+{
+	iterate(section, key, value) from prefsdata
+	{
+		verify(pfp->IsKey(section, key));
+	}
+}
+
+test("PrefsFile::ReadSectionL")
+{
+	PrefsSection *psection = NULL;
+
+	/* Read section */
+	TRAPD(rc, psection = pfp->ReadSectionL(UNI_L("Section1")));
+	verify(OpStatus::IsSuccess(rc));
+	verify(psection);
+
+	/* Check that all keys and values are there */
+	verify(psection->Number() == 3);
+	iterate(section, key, value) from prefsdata
+	{
+		if (uni_strcmp(section, UNI_L("Section1")) == 0)
+		{
+			const uni_char *isvalue = psection->Get(key);
+			verify(isvalue);
+			verify(uni_strcmp(isvalue, value) == 0);
+		}
+	}
+}
+finally
+{
+	OP_DELETE(psection);
+}
+
+test("PrefsSection::GetKeyListL")
+	require defined USE_UTIL_OPSTRING_LIST;
+{
+	PrefsSection * OP_MEMORY_VAR psection = NULL;
+	OpString_list * OP_MEMORY_VAR keylist = NULL;
+
+	/* Read section */
+	TRAPD(rc, psection = pfp->ReadSectionL(UNI_L("Section1")));
+	verify(OpStatus::IsSuccess(rc));
+
+	/* Get key list */
+	TRAP(rc, keylist = psection->GetKeyListL());
+	verify(OpStatus::IsSuccess(rc));
+	verify(keylist);
+
+	/* Check that all keys are there */
+	verify(keylist->Count() == 3);
+	iterate(section, key, value) from prefsdata
+	{
+		if (uni_strcmp(section, UNI_L("Section1")) == 0)
+		{
+			BOOL found = FALSE;
+			for (unsigned int i = 0; i < keylist->Count(); ++ i)
+			{
+				if (keylist->Item(i).Compare(key) == 0)
+					found = TRUE;
+			}
+			verify(found);
+		}
+	}
+}
+finally
+{
+	OP_DELETE(keylist);
+	OP_DELETE(psection);
+}
+
+
+table newstrings(const uni_char *, const uni_char *, const uni_char *)
+{
+	{ UNI_L("NewSection1"), UNI_L("Key1"), UNI_L("Value1") },
+	{ UNI_L("NewSection1"), UNI_L("Key2"), UNI_L("Value2") },
+	{ UNI_L("NewSection2"), UNI_L("Key1"), UNI_L("Value1") },
+	{ UNI_L("NewSection2"), UNI_L("Key2"), UNI_L("Value2") },
+}
+
+test("PrefsFile::WriteStringL")
+	require success "PrefsFile::ConstructL";
+	require PREFSFILE_WRITE;
+{
+	iterate(section, key, value) from newstrings
+	{
+		OP_MEMORY_VAR OP_STATUS rc1 = OpStatus::OK;
+		TRAPD(rc2, rc1 = pfp->WriteStringL(section, key, value));
+		verify(OpStatus::IsSuccess(rc2));
+		verify(OpStatus::IsSuccess(rc1));
+	}
+}
+
+test("PrefsFile::ReadStringL (new entries)")
+	require success "PrefsFile::WriteStringL";
+{
+	OpString s;
+
+	iterate(section, key, value) from newstrings
+	{
+		TRAPD(rc, pfp->ReadStringL(section, key, s));
+		verify(OpStatus::IsSuccess(rc));
+		verify(s.Compare(value) == 0);
+	}
+}
+
+test("PrefsFile::DeleteKeyL")
+	require success "PrefsFile::WriteStringL";
+{
+	OpString s;
+
+	iterate(section, key, value) from newstrings
+	{
+		// Make sure the key is there
+		verify(pfp->IsKey(section, key));
+
+		// Now delete it
+		OP_MEMORY_VAR BOOL deleted = FALSE;
+		TRAPD(rc, deleted = pfp->DeleteKeyL(section, key));
+		verify(OpStatus::IsSuccess(rc));
+		verify(deleted);
+
+		// Make sure it is gone
+		verify(!pfp->IsKey(section, key));
+	}
+}
+
+
+table newstrings8(const char *, const char *, const uni_char *)
+{
+	{ "NewSection1", "Key1", UNI_L("Value1") },
+	{ "NewSection1", "Key2", UNI_L("Value2") },
+	{ "NewSection2", "Key1", UNI_L("Value1") },
+	{ "NewSection2", "Key2", UNI_L("Value2") },
+}
+
+test("PrefsFile::WriteStringL ASCII API")
+	require success "PrefsFile::ConstructL";
+	require PREFSFILE_WRITE;
+{
+	iterate(section, key, value) from newstrings8
+	{
+		OP_MEMORY_VAR OP_STATUS rc1 = OpStatus::OK;
+		TRAPD(rc2, rc1 = pfp->WriteStringL(section, key, value));
+		verify(OpStatus::IsSuccess(rc2));
+		verify(OpStatus::IsSuccess(rc1));
+	}
+}
+
+test("PrefsFile::ReadStringL (new entries) ASCII API")
+	require success "PrefsFile::WriteStringL";
+{
+	OpString s;
+
+	iterate(section, key, value) from newstrings8
+	{
+		TRAPD(rc, pfp->ReadStringL(section, key, s));
+		verify(OpStatus::IsSuccess(rc));
+		verify(s.Compare(value) == 0);
+	}
+}
+
+test("PrefsFile::DeleteKeyL ASCII API")
+	require success "PrefsFile::WriteStringL";
+{
+	OpString s;
+
+	iterate(section, key, value) from newstrings8
+	{
+		// Make sure the key is there
+		verify(pfp->IsKey(section, key));
+
+		// Now delete it
+		OP_MEMORY_VAR BOOL deleted = FALSE;
+		TRAPD(rc, deleted = pfp->DeleteKeyL(section, key));
+		verify(OpStatus::IsSuccess(rc));
+		verify(deleted);
+
+		// Make sure it is gone
+		verify(!pfp->IsKey(section, key));
+	}
+}
+
+
+test("PrefsFile::DeleteSectionL")
+	require success "PrefsFile::ConstructL";
+	require PREFSFILE_WRITE;
+{
+	// Add some data
+	iterate(section, key, value) from newstrings
+	{
+		OP_MEMORY_VAR OP_STATUS rc1 = OpStatus::OK;
+		TRAPD(rc2, rc1 = pfp->WriteStringL(section, key, value));
+		verify(OpStatus::IsSuccess(rc2));
+		verify(OpStatus::IsSuccess(rc1));
+	}
+
+	// Delete the new sections
+	const uni_char *previous = NULL;
+	iterate(section, key, value) from newstrings
+	{
+		if (!previous || uni_strcmp(previous, section))
+		{
+			// Delete the section
+			OP_MEMORY_VAR BOOL deleted = FALSE;
+			TRAPD(rc, deleted = pfp->DeleteSectionL(section));
+			verify(OpStatus::IsSuccess(rc));
+			verify(deleted);
+		}
+		previous = section;
+	}
+
+	// Make sure it's gone
+	iterate(section, key, value) from newstrings
+	{
+		verify(!pfp->IsSection(section));
+	}
+}
+
+test("PrefsFile::ClearSectionL")
+	require success "PrefsFile::ConstructL";
+	require PREFSFILE_WRITE;
+{
+	// Add some data
+	iterate(section, key, value) from newstrings
+	{
+		OP_MEMORY_VAR OP_STATUS rc1 = OpStatus::OK;
+		TRAPD(rc2, rc1 = pfp->WriteStringL(section, key, value));
+		verify(OpStatus::IsSuccess(rc2));
+		verify(OpStatus::IsSuccess(rc1));
+	}
+
+	// Clear the new sections
+	const uni_char *previous = NULL;
+	iterate(section, key, value) from newstrings
+	{
+		if (!previous || uni_strcmp(previous, section))
+		{
+			// Clear the section
+			OP_MEMORY_VAR BOOL cleared = FALSE;
+			TRAPD(rc, cleared = pfp->ClearSectionL(section));
+			verify(OpStatus::IsSuccess(rc));
+			verify(cleared);
+		}
+		previous = section;
+	}
+
+	// Make sure it's gone
+	iterate(section, key, value) from newstrings
+	{
+		verify(!pfp->IsKey(section, key));
+	}
+}
+
+
+table newints(const uni_char *, const uni_char *, int)
+{
+	{ UNI_L("NewSection1"), UNI_L("Key1"), 42 },
+	{ UNI_L("NewSection1"), UNI_L("Key2"), 4711 },
+	{ UNI_L("NewSection2"), UNI_L("Key1"), 4711 },
+	{ UNI_L("NewSection2"), UNI_L("Key2"), 42 },
+}
+
+test("PrefsFile::WriteIntL")
+	require success "PrefsFile::ConstructL";
+	require PREFSFILE_WRITE;
+{
+	iterate(section, key, value) from newints
+	{
+		OP_MEMORY_VAR OP_STATUS rc1 = OpStatus::OK;
+		TRAPD(rc2, rc1 = pfp->WriteIntL(section, key, value));
+		verify(OpStatus::IsSuccess(rc2));
+		verify(OpStatus::IsSuccess(rc1));
+	}
+}
+
+test("PrefsFile::ReadIntL (new entries)")
+	require success "PrefsFile::WriteIntL";
+{
+	OP_MEMORY_VAR int x = -1;
+
+	iterate(section, key, value) from newints
+	{
+		TRAPD(rc, x = pfp->ReadIntL(section, key, -1));
+		verify(OpStatus::IsSuccess(rc));
+		verify(x == value);
+	}
+}
+
+
+table newints8(const char *, const char *, int)
+{
+	{ "NewSection1", "Key3", 42 },
+	{ "NewSection1", "Key4", 4711 },
+	{ "NewSection2", "Key3", 4711 },
+	{ "NewSection2", "Key4", 42 },
+}
+
+test("PrefsFile::WriteIntL ASCII API")
+	require success "PrefsFile::ConstructL";
+	require PREFSFILE_WRITE;
+{
+	iterate(section, key, value) from newints8
+	{
+		OP_MEMORY_VAR OP_STATUS rc1 = OpStatus::OK;
+		TRAPD(rc2, rc1 = pfp->WriteIntL(section, key, value));
+		verify(OpStatus::IsSuccess(rc2));
+		verify(OpStatus::IsSuccess(rc1));
+	}
+}
+
+test("PrefsFile::ReadIntL (new entries) ASCII API")
+	require success "PrefsFile::WriteIntL";
+{
+	OP_MEMORY_VAR int x = -1;
+
+	iterate(section, key, value) from newints8
+	{
+		TRAPD(rc, x = pfp->ReadIntL(section, key, -1));
+		verify(OpStatus::IsSuccess(rc));
+		verify(x == value);
+	}
+}
+
+test("PrefsFile::ReadAllSectionsL")
+	require USE_UTIL_OPSTRING_LIST;
+	require PREFS_READ_ALL_SECTIONS;
+	require success "PrefsFile::WriteIntL";
+{
+	OpString_list sections;
+	TRAPD(rc, pfp->ReadAllSectionsL(sections));
+	verify(OpStatus::IsSuccess(rc));
+	verify(sections.Count() == 5);
+
+	iterate(section, key, value) from newints
+	{
+		bool found = false;
+		for (unsigned long i = 0; i < sections.Count() && !found; ++ i)
+		{
+			if (sections[i].CompareI(section) == 0)
+				found = true;
+		}
+		verify(found);
+	}
+
+	iterate(section, key, value) from prefsdata
+	{
+		bool found = false;
+		for (unsigned long i = 0; i < sections.Count() && !found; ++ i)
+		{
+			if (sections[i].CompareI(section) == 0)
+				found = true;
+		}
+		verify(found);
+	}
+}
+
+// -- Global cleanup -----------------------------------------------------
+
+exit
+{
+	if (pfp) pfp->Reset();
+	OP_DELETE(pfp);
+	OP_DELETE(ofp);
+}

@@ -1,0 +1,6608 @@
+/* -*- mode: c++; tab-width: 4; c-basic-offset: 4 -*- */
+
+group "layout.list_item";
+
+require init;
+
+include "modules/layout/box/box.h";
+include "modules/logdoc/htm_elm.h";
+include "modules/logdoc/src/textdata.h";
+include "modules/doc/frm_doc.h";
+include "modules/selftest/src/doc_st_utils.h";
+
+global
+{
+	// Gets the marker rect from layout, empty in case of any error.
+	OpRect GetRectOfMarker(FramesDocument* doc, const char* id)
+	{
+		HTML_Element* root = doc->GetLogicalDocument() ? doc->GetLogicalDocument()->GetRoot() : NULL;
+		if (!root)
+			return OpRect();
+		OpString string;
+		if (OpStatus::IsMemoryError(string.SetFromUTF8(id)))
+			return OpRect();
+
+		HTML_Element* list_item = root->GetElmById(string);
+		if (!list_item)
+			return OpRect();
+		HTML_Element* marker = list_item->FirstChild();
+		if (!marker)
+			return OpRect();
+		if (!marker->GetIsListMarkerPseudoElement())
+			return OpRect();
+		Box* marker_box = marker->GetLayoutBox();
+		if (!marker_box)
+			return OpRect();
+
+		RECT rect;
+		if (!marker_box->GetBBox(doc, BORDER_BOX, rect))
+			return OpRect();
+
+		return OpRect(&rect);
+	}
+
+	short font_number;
+
+	int ComputeBaseline(FramesDocument *doc, int font_size)
+	{
+		VisualDevice* vd = doc->GetVisualDevice();
+		vd->SetFont(font_number);
+		vd->SetFontSize(font_size);
+		short font_ascent, dummy;
+		vd->GetFontMetrics(font_ascent, dummy, dummy, dummy);
+		return font_ascent;
+	}
+
+	OpRect ComposeExpectedOutsideMarkerRect(FramesDocument *doc, int font_size, int principal_x, int principal_y, int v_offset,
+											int principal_width)
+	{
+		int marker_base_y = principal_y + v_offset;
+		int baseline = ComputeBaseline(doc, font_size);
+		OpRect result;
+
+		result.height = MULT_BY_MARKER_OFFSET_RATIO(font_size);
+		result.y = marker_base_y + baseline - result.height;
+		result.width = MULT_BY_MARKER_WIDTH_RATIO(font_size);
+		result.x = - result.width - MARKER_INNER_OFFSET;
+
+		// rtl case
+		if (principal_width > 0)
+			result.x = principal_width - result.x - result.width;
+
+		result.x += principal_x;
+
+		return result;
+	}
+
+	OpRect ComposeExpectedInsideMarkerRect(FramesDocument *doc, int font_size, int principal_x, int principal_y, int top_border_padding,
+										   int line_left, int line_right, int used_space, int text_indent, CSSValue text_align, BOOL rtl)
+	{
+		int marker_base_y = principal_y + top_border_padding;
+		int baseline = ComputeBaseline(doc, font_size);
+		OpRect result;
+
+		result.height = MULT_BY_MARKER_OFFSET_RATIO(font_size);
+		result.y = marker_base_y + baseline - result.height;
+		result.width = MULT_BY_MARKER_WIDTH_RATIO(font_size);
+
+		// Compute the horizontal position
+		int line_width = line_right - line_left - text_indent;
+		int used_space_with_marker = used_space + result.width + MARKER_INNER_OFFSET;
+		int space_left = line_width - used_space_with_marker;
+
+		if (rtl)
+		{
+			int marker_right = line_right - text_indent;
+			switch (text_align)
+			{
+			case CSS_VALUE_left:
+				marker_right -= space_left;
+				break;
+			case CSS_VALUE_center:
+				marker_right -= space_left / 2;
+				break;
+			case CSS_VALUE_right:
+				break;
+			}
+
+			result.x = marker_right - result.width;
+		}
+		else // ltr
+		{
+			int marker_left = line_left + text_indent;
+			switch (text_align)
+			{
+			case CSS_VALUE_left:
+				break;
+			case CSS_VALUE_center:
+				marker_left += space_left / 2;
+				break;
+			case CSS_VALUE_right:
+				marker_left += space_left;
+				break;
+			}
+
+			result.x = marker_left;
+		}
+
+		result.x += principal_x;
+
+		return result;
+	}
+
+	BOOL CheckAfterMarkerElementRect(FramesDocument* doc, RECT expected, BOOL y_only = FALSE, BOOL check_all_rects = FALSE)
+	{
+		HTML_Element* root = doc->GetLogicalDocument() ? doc->GetLogicalDocument()->GetRoot() : NULL;
+		if (!root)
+			return FALSE;
+
+		HTML_Element* element = root->GetElmById(UNI_L("test_box"));
+		if (!element)
+			return FALSE;
+
+		Box* element_box = element->GetLayoutBox();
+		if (!element_box)
+			return FALSE;
+
+		RectList rect_list;
+		if (!element_box->GetRectList(doc, BORDER_BOX, rect_list))
+			return FALSE;
+
+		if (!check_all_rects)
+		{
+			if (rect_list.Cardinal() != 1)
+			{
+				rect_list.Clear();
+				return FALSE;
+			}
+		}
+
+		BOOL res = FALSE;
+		RECT real;
+		RectListItem* rect_item = rect_list.First();
+
+		while (rect_item)
+		{
+			real = rect_item->rect;
+			res = real.top == expected.top && real.bottom == expected.bottom &&
+							  (y_only || (real.left == expected.left && real.right == expected.right));
+			if (res)
+				break;
+
+			rect_item = rect_item->Suc();
+		}
+
+		rect_list.Clear();
+		return res;
+	}
+
+	OpRect ComposeExpectedImageMarkerRect(FramesDocument *doc, int font_size, int principal_x, int principal_y, int principal_width
+										  , int marker_size)
+	{
+
+		OpRect result;
+
+		result.y = principal_y;
+		result.width = marker_size;
+		result.height = marker_size;
+		result.x = principal_width ? principal_x + principal_width - marker_size : principal_x;
+
+		if (marker_size < font_size)
+		{
+			int baseline = ComputeBaseline(doc, font_size);
+			result.y += baseline - marker_size;
+		}
+
+		return result;
+	}
+
+	BOOL CheckNumberStringOfListItem(FramesDocument* doc, const char* list_elm_id, const char* number_string)
+	{
+		HTML_Element* root = doc->GetLogicalDocument() ? doc->GetLogicalDocument()->GetRoot() : NULL;
+		if (!root)
+			return FALSE;
+
+		OpString string;
+		if (OpStatus::IsMemoryError(string.SetFromUTF8(list_elm_id)))
+			return FALSE;
+
+		HTML_Element* list_item = root->GetElmById(string);
+		if (!list_item)
+			return FALSE;
+
+		HTML_Element* marker = list_item->FirstChild();
+		if (!marker)
+			return FALSE;
+		if (!marker->GetIsListMarkerPseudoElement())
+			return FALSE;
+
+		HTML_Element* text_node = marker->FirstChild();
+		if (!text_node)
+			return FALSE;
+		if (text_node->Type() != Markup::HTE_TEXT)
+			return FALSE;
+
+		TextData* text_data = text_node->GetTextData();
+		if (!text_data)
+			return FALSE;
+
+		uni_char* number = text_data->GetText();
+		if (!number)
+			return FALSE;
+
+#ifdef SUPPORT_TEXT_DIRECTION
+		size_t length = uni_strlen(number);
+		if (length < 2)
+			return FALSE;
+
+		if (op_strlen(number_string) != length - 2)
+			return FALSE;
+
+		// Compare only to the number part without unicode direction control chars.
+		return uni_strncmp(number + 1, number_string, length - 2) == 0;
+#else // !SUPPORT_TEXT_DIRECTION
+		return uni_strcmp(number, number_string) == 0;
+#endif // SUPPORT_TEXT_DIRECTION
+	}
+
+	BOOL HasFirstLetterElementAfterMarker(FramesDocument* doc)
+	{
+		HTML_Element* root = doc->GetLogicalDocument() ? doc->GetLogicalDocument()->GetRoot() : NULL;
+		if (!root)
+			return FALSE;
+
+		HTML_Element* list_item = root->GetElmById(UNI_L("list_item"));
+		if (!list_item)
+			return FALSE;
+
+		HTML_Element* marker = list_item->FirstChild();
+		if (!marker)
+			return FALSE;
+		if (!marker->GetIsListMarkerPseudoElement())
+			return FALSE;
+
+		HTML_Element* first_letter_elm = marker->Suc();
+		if (!first_letter_elm)
+			return FALSE;
+		if (!first_letter_elm->GetIsFirstLetterPseudoElement())
+			return FALSE;
+
+		return TRUE;
+	}
+}
+
+test("PRECONDITION: Font check")
+{
+	font_number = styleManager->GetFontNumber(UNI_L("AHEM"));
+	verify(font_number != -1);
+}
+
+html
+{
+//!<!DOCTYPE html>
+//!<html>
+//!<head>
+//!
+//!<style>
+//!
+//!*
+//!{
+//!	margin:0;padding:0;
+//!	font-size:20px;
+//!	font-family:'AHEM';
+//!}
+//!
+//!ul, ol
+//!{
+//!	padding-left:40px;
+//! list-style-type:disc;
+//!}
+//!
+//!li
+//!{
+//!	list-style-position:outside;
+//!	display:list-item;
+//!}
+//!</style>
+//!</head>
+//!
+//!<body>
+//!
+//!<ul>
+//!<li id="list_item"></li>
+//!</ul>
+//!
+//!</body>
+//!
+//!</html>
+}
+test("outside marker of standard block")
+	require success "PRECONDITION: Font check";
+{
+	FramesDocument* doc = state.doc;
+	OpRect rect = GetRectOfMarker(doc, "list_item");
+	OpRect expected = ComposeExpectedOutsideMarkerRect(doc, 20, 40, 0, 0, 0);
+
+	verify(rects_equal_with_error(rect, expected, 0));
+}
+
+html
+{
+//!<!DOCTYPE html>
+//!<html>
+//!<head>
+//!
+//!<style>
+//!
+//!*
+//!{
+//!	margin:0;padding:0;
+//!	font-size:20px;
+//!	font-family:'AHEM';
+//!}
+//!
+//!ul, ol
+//!{
+//!	padding-left:40px;
+//! list-style-type:disc;
+//!}
+//!
+//!li
+//!{
+//!	list-style-position:inside;
+//!	display:list-item;
+//! width:100px;
+//!}
+//!
+//!</style>
+//!</head>
+//!
+//!<body>
+//!
+//!<ul>
+//!<li id="list_item"></li>
+//!</ul>
+//!
+//!</body>
+//!
+//!</html>
+}
+test("inside marker of standard block")
+	require success "PRECONDITION: Font check";
+{
+	FramesDocument* doc = state.doc;
+	OpRect rect = GetRectOfMarker(doc, "list_item");
+	OpRect expected = ComposeExpectedInsideMarkerRect(doc, 20, 40, 0, 0, 0, 100, 0, 0, CSS_VALUE_left, FALSE);
+
+	verify(rects_equal_with_error(rect, expected, 0));
+}
+
+html
+{
+//!<!DOCTYPE html>
+//!<html>
+//!<head>
+//!
+//!<style>
+//!
+//!*
+//!{
+//!	margin:0;padding:0;
+//!	font-size:20px;
+//!	font-family:'AHEM';
+//!}
+//!
+//!ul, ol
+//!{
+//!	padding-left:40px;
+//! list-style-type:disc;
+//!}
+//!
+//!li
+//!{
+//!	list-style-position:outside;
+//!	width:100px;
+//!	float:left;
+//!	display:list-item;
+//!}
+//!
+//!</style>
+//!</head>
+//!
+//!<body>
+//!
+//!<ul>
+//!<li id="list_item"></li>X
+//!</ul>
+//!
+//!</body>
+//!
+//!</html>
+}
+test("outside marker of float")
+	require success "PRECONDITION: Font check";
+{
+	FramesDocument* doc = state.doc;
+	OpRect rect = GetRectOfMarker(doc, "list_item");
+	OpRect expected = ComposeExpectedOutsideMarkerRect(doc, 20, 40, 0, 0, 0);
+
+	verify(rects_equal_with_error(rect, expected, 0));
+}
+
+html
+{
+//!<!DOCTYPE html>
+//!<html>
+//!<head>
+//!
+//!<style>
+//!
+//!*
+//!{
+//!	margin:0;padding:0;
+//!	font-size:20px;
+//!	font-family:'AHEM';
+//!}
+//!
+//!ul, ol
+//!{
+//!	padding-left:40px;
+//! list-style-type:disc;
+//!}
+//!
+//!li
+//!{
+//!	list-style-position:inside;
+//!	width:100px;
+//!	float:left;
+//!	display:list-item;
+//!}
+//!
+//!</style>
+//!</head>
+//!
+//!<body>
+//!
+//!<ul>
+//!<li id="list_item"></li>X
+//!</ul>
+//!
+//!</body>
+//!
+//!</html>
+}
+test("inside marker of float")
+	require success "PRECONDITION: Font check";
+{
+	FramesDocument* doc = state.doc;
+	OpRect rect = GetRectOfMarker(doc, "list_item");
+	OpRect expected = ComposeExpectedInsideMarkerRect(doc, 20, 40, 0, 0, 0, 100, 0, 0, CSS_VALUE_left, FALSE);
+
+	verify(rects_equal_with_error(rect, expected, 0));
+}
+
+html
+{
+//!<!DOCTYPE html>
+//!<html>
+//!<head>
+//!
+//!<style>
+//!
+//!*
+//!{
+//!	margin:0;padding:0;
+//!	font-size:20px;
+//!	font-family:'AHEM';
+//!}
+//!
+//!ul, ol
+//!{
+//!	padding-left:40px;
+//! list-style-type:disc;
+//!}
+//!
+//!li
+//!{
+//!	list-style-position:outside;
+//!	width:100px;
+//!	display:list-item;
+//!	position:absolute;
+//!	left:50px;
+//!	top:50px;
+//!}
+//!
+//!</style>
+//!</head>
+//!
+//!<body>
+//!
+//!<ul>
+//!<li id="list_item"></li>X
+//!</ul>
+//!
+//!</body>
+//!
+//!</html>
+}
+test("outside marker of absolute positioned")
+	require success "PRECONDITION: Font check";
+{
+	FramesDocument* doc = state.doc;
+	OpRect rect = GetRectOfMarker(doc, "list_item");
+	OpRect expected = ComposeExpectedOutsideMarkerRect(doc, 20, 50, 50, 0, 0);
+
+	verify(rects_equal_with_error(rect, expected, 0));
+}
+
+html
+{
+//!<!DOCTYPE html>
+//!<html>
+//!<head>
+//!
+//!<style>
+//!
+//!*
+//!{
+//!	margin:0;padding:0;
+//!	font-size:20px;
+//!	font-family:'AHEM';
+//!}
+//!
+//!ul, ol
+//!{
+//!	padding-left:40px;
+//! list-style-type:disc;
+//!}
+//!
+//!li
+//!{
+//!	list-style-position:inside;
+//!	width:100px;
+//!	position:absolute;
+//!	left:50px;
+//!	top:50px;
+//!	display:list-item;
+//!}
+//!
+//!</style>
+//!</head>
+//!
+//!<body>
+//!
+//!<ul>
+//!<li id="list_item"></li>X
+//!</ul>
+//!
+//!</body>
+//!
+//!</html>
+}
+test("inside marker of absolute positioned")
+	require success "PRECONDITION: Font check";
+{
+	FramesDocument* doc = state.doc;
+	OpRect rect = GetRectOfMarker(doc, "list_item");
+	OpRect expected = ComposeExpectedInsideMarkerRect(doc, 20, 50, 50, 0, 0, 100, 0, 0, CSS_VALUE_left, FALSE);
+
+	verify(rects_equal_with_error(rect, expected, 0));
+}
+
+html
+{
+//!<!DOCTYPE html>
+//!<html>
+//!<head>
+//!
+//!<style>
+//!
+//!*
+//!{
+//!	margin:0;padding:0;
+//!	font-size:20px;
+//!	font-family:'AHEM';
+//!}
+//!
+//!ul, ol
+//!{
+//!	padding-left:40px;
+//!}
+//!
+//!li
+//!{
+//!	width:93px;
+//!	list-style-position:outside;
+//!	border-left: solid 2px;
+//!	padding-left: 5px;
+//!}
+//!
+//!</style>
+//!</head>
+//!
+//!<body>
+//!
+//!<ul>
+//!<li id="list_item"></li>
+//!</ul>
+//!
+//!</body>
+//!
+//!</html>
+}
+test("horizontal edge border and padding, outside")
+	require success "PRECONDITION: Font check";
+{
+	FramesDocument* doc = state.doc;
+	OpRect rect = GetRectOfMarker(doc, "list_item");
+	OpRect expected = ComposeExpectedOutsideMarkerRect(doc, 20, 40, 0, 0, 0);
+
+	verify(rects_equal_with_error(rect, expected, 0));
+}
+
+html
+{
+//!<!DOCTYPE html>
+//!<html>
+//!<head>
+//!
+//!<style>
+//!
+//!*
+//!{
+//!	margin:0;padding:0;
+//!	font-size:20px;
+//!	font-family:'AHEM';
+//!}
+//!
+//!ul, ol
+//!{
+//!	padding-left:40px;
+//!}
+//!
+//!li
+//!{
+//!	width:93px;
+//!	list-style-position:inside;
+//!	border-left: solid 2px;
+//!	padding-left: 5px;
+//!}
+//!
+//!</style>
+//!</head>
+//!
+//!<body>
+//!
+//!<ul>
+//!<li id="list_item"></li>
+//!</ul>
+//!
+//!</body>
+//!
+//!</html>
+}
+test("horizontal edge border and padding, inside")
+	require success "PRECONDITION: Font check";
+{
+	FramesDocument* doc = state.doc;
+	OpRect rect = GetRectOfMarker(doc, "list_item");
+	OpRect expected = ComposeExpectedInsideMarkerRect(doc, 20, 40, 0, 0, 7, 100, 0, 0, CSS_VALUE_left, FALSE);
+
+	verify(rects_equal_with_error(rect, expected, 0));
+}
+
+/*	Advance reflow position tests. The three below test whether the reflow position inside the list
+	item element and its container advances correctly in the presence of outside markers, because
+	they require some special treatment in case of no other content on the outside markers' line. */
+
+html
+{
+//!<!DOCTYPE html>
+//!<html>
+//!<head>
+//!
+//!<style>
+//!*
+//!{
+//!	margin:0;padding:0;
+//!	font-size:20px;
+//!	font-family:'AHEM';
+//!}
+//!
+//!ul, ol
+//!{
+//!	padding-left:40px;
+//!	list-style-type:disc;
+//!}
+//!
+//!li
+//!{
+//!	display:list-item;
+//!	list-style-position:outside;
+//!}
+//!
+//!div
+//!{
+//!	display:block;
+//!	width:100px;
+//!	height:50px;
+//!	background-color:lime;
+//!}
+//!
+//!</style>
+//!</head>
+//!
+//!<body>
+//!<ul>
+//!<li id="list_item1"><div></div></li>
+//!<li id="list_item2"></li>
+//!</ul>
+//!</body>
+//!
+//!</html>
+}
+test("advance reflow position: block height > marker height")
+	require success "PRECONDITION: Font check";
+{
+	FramesDocument* doc = state.doc;
+	OpRect rect1 = GetRectOfMarker(doc, "list_item1");
+	OpRect expected1 = ComposeExpectedOutsideMarkerRect(doc, 20, 40, 0, 0, 0);
+	OpRect rect2 = GetRectOfMarker(doc, "list_item2");
+	OpRect expected2 = ComposeExpectedOutsideMarkerRect(doc, 20, 40, 50, 0, 0);
+
+	verify(rects_equal_with_error(rect1, expected1, 0));
+	verify(rects_equal_with_error(rect2, expected2, 0));
+}
+
+html
+{
+//!<!DOCTYPE html>
+//!<html>
+//!<head>
+//!
+//!<style>
+//!*
+//!{
+//!	margin:0;padding:0;
+//!	font-size:20px;
+//!	font-family:'AHEM';
+//!}
+//!
+//!ul, ol
+//!{
+//!	padding-left:40px;
+//!	list-style-type:disc;
+//!}
+//!
+//!li
+//!{
+//!	display:list-item;
+//!	list-style-position:outside;
+//!}
+//!
+//!div
+//!{
+//!	display:block;
+//!	width:100px;
+//!	height:10px;
+//!	background-color:lime;
+//!}
+//!
+//!</style>
+//!</head>
+//!
+//!<body>
+//!<ul>
+//!<li id="list_item1"><div></div></li>
+//!<li id="list_item2"></li>
+//!</ul>
+//!</body>
+//!
+//!</html>
+}
+test("advance reflow position: block height < marker height")
+	require success "PRECONDITION: Font check";
+{
+	FramesDocument* doc = state.doc;
+	OpRect rect1 = GetRectOfMarker(doc, "list_item1");
+	OpRect expected1 = ComposeExpectedOutsideMarkerRect(doc, 20, 40, 0, 0, 0);
+	OpRect rect2 = GetRectOfMarker(doc, "list_item2");
+	OpRect expected2 = ComposeExpectedOutsideMarkerRect(doc, 20, 40, 20, 0, 0);
+
+	verify(rects_equal_with_error(rect1, expected1, 0));
+	verify(rects_equal_with_error(rect2, expected2, 0));
+}
+
+html
+{
+//!<!DOCTYPE html>
+//!<html>
+//!<head>
+//!
+//!<style>
+//!*
+//!{
+//!	margin:0;padding:0;
+//!	font-size:20px;
+//!	font-family:'AHEM';
+//!}
+//!
+//!ul, ol
+//!{
+//!	padding-left:40px;
+//!	list-style-type:disc;
+//!}
+//!
+//!li
+//!{
+//!	display:list-item;
+//!	list-style-position:outside;
+//!}
+//!
+//!div
+//!{
+//!	display:block;
+//!	width:100px;
+//!	height:50px;
+//!	background-color:lime;
+//!}
+//!
+//!</style>
+//!</head>
+//!
+//!<body>
+//!<ul>
+//!<li id="list_item1">X<div></div></li>
+//!<li id="list_item2"></li>
+//!</ul>
+//!</body>
+//!
+//!</html>
+}
+test("advance reflow position: block after line")
+	require success "PRECONDITION: Font check";
+{
+	FramesDocument* doc = state.doc;
+	OpRect rect1 = GetRectOfMarker(doc, "list_item1");
+	OpRect expected1 = ComposeExpectedOutsideMarkerRect(doc, 20, 40, 0, 0, 0);
+	OpRect rect2 = GetRectOfMarker(doc, "list_item2");
+	OpRect expected2 = ComposeExpectedOutsideMarkerRect(doc, 20, 40, 70, 0, 0);
+
+	verify(rects_equal_with_error(rect1, expected1, 0));
+	verify(rects_equal_with_error(rect2, expected2, 0));
+}
+
+html
+{
+//!<!DOCTYPE html>
+//!<html>
+//!<head>
+//!
+//!<style>
+//!*
+//!{
+//!	margin:0;padding:0;
+//!	font-size:20px;
+//!	font-family:'AHEM';
+//!	text-align:left;
+//!}
+//!
+//!ul, ol
+//!{
+//!	padding-left:40px;
+//!	list-style-type:disc;
+//!}
+//!
+//!li
+//!{
+//!	width:100px;
+//!	display:list-item;
+//!	list-style-position:outside;
+//!}
+//!
+//!</style>
+//!</head>
+//!
+//!<body>
+//!<ul>
+//!<li id="list_item">XX</li>
+//!</ul>
+//!</body>
+//!
+//!</html>
+}
+test("text_align: outside, ltr, left")
+	require success "PRECONDITION: Font check";
+{
+	FramesDocument* doc = state.doc;
+	OpRect rect = GetRectOfMarker(doc, "list_item");
+	OpRect expected = ComposeExpectedOutsideMarkerRect(doc, 20, 40, 0, 0, 0);
+
+	verify(rects_equal_with_error(rect, expected, 0));
+}
+
+html
+{
+//!<!DOCTYPE html>
+//!<html>
+//!<head>
+//!
+//!<style>
+//!*
+//!{
+//!	margin:0;padding:0;
+//!	font-size:20px;
+//!	font-family:'AHEM';
+//!	text-align:right;
+//!}
+//!
+//!ul, ol
+//!{
+//!	padding-left:40px;
+//!	list-style-type:disc;
+//!}
+//!
+//!li
+//!{
+//!	width:100px;
+//!	display:list-item;
+//!	list-style-position:outside;
+//!}
+//!
+//!</style>
+//!</head>
+//!
+//!<body>
+//!<ul>
+//!<li id="list_item">XX</li>
+//!</ul>
+//!</body>
+//!
+//!</html>
+}
+test("text_align: outside, ltr, right")
+	require success "PRECONDITION: Font check";
+{
+	FramesDocument* doc = state.doc;
+	OpRect rect = GetRectOfMarker(doc, "list_item");
+	OpRect expected = ComposeExpectedOutsideMarkerRect(doc, 20, 40, 0, 0, 0);
+
+	verify(rects_equal_with_error(rect, expected, 0));
+}
+
+html
+{
+//!<!DOCTYPE html>
+//!<html>
+//!<head>
+//!
+//!<style>
+//!*
+//!{
+//!	margin:0;padding:0;
+//!	font-size:20px;
+//!	font-family:'AHEM';
+//!	text-align:center;
+//!}
+//!
+//!ul, ol
+//!{
+//!	padding-left:40px;
+//!	list-style-type:disc;
+//!}
+//!
+//!li
+//!{
+//!	width:100px;
+//!	display:list-item;
+//!	list-style-position:outside;
+//!}
+//!
+//!</style>
+//!</head>
+//!
+//!<body>
+//!<ul>
+//!<li id="list_item">XX</li>
+//!</ul>
+//!</body>
+//!
+//!</html>
+}
+test("text_align: outside, ltr, center")
+	require success "PRECONDITION: Font check";
+{
+	FramesDocument* doc = state.doc;
+	OpRect rect = GetRectOfMarker(doc, "list_item");
+	OpRect expected = ComposeExpectedOutsideMarkerRect(doc, 20, 40, 0, 0, 0);
+
+	verify(rects_equal_with_error(rect, expected, 0));
+}
+
+html
+{
+//!<!DOCTYPE html>
+//!<html>
+//!<head>
+//!
+//!<style>
+//!*
+//!{
+//!	margin:0;padding:0;
+//!	font-size:20px;
+//!	font-family:'AHEM';
+//!	text-align:left;
+//!}
+//!
+//!ul, ol
+//!{
+//!	padding-left:40px;
+//!	list-style-type:disc;
+//!}
+//!
+//!li
+//!{
+//!	width:100px;
+//!	display:list-item;
+//!	list-style-position:outside;
+//!	direction:rtl;
+//!}
+//!
+//!</style>
+//!</head>
+//!
+//!<body>
+//!<ul>
+//!<li id="list_item">XX</li>
+//!</ul>
+//!</body>
+//!
+//!</html>
+}
+test("text_align: outside, rtl, left")
+	require success "PRECONDITION: Font check";
+	require SUPPORT_TEXT_DIRECTION;
+{
+	FramesDocument* doc = state.doc;
+	OpRect rect = GetRectOfMarker(doc, "list_item");
+	OpRect expected = ComposeExpectedOutsideMarkerRect(doc, 20, 40, 0, 0, 100);
+
+	verify(rects_equal_with_error(rect, expected, 0));
+}
+
+html
+{
+//!<!DOCTYPE html>
+//!<html>
+//!<head>
+//!
+//!<style>
+//!*
+//!{
+//!	margin:0;padding:0;
+//!	font-size:20px;
+//!	font-family:'AHEM';
+//!	text-align:right;
+//!}
+//!
+//!ul, ol
+//!{
+//!	padding-left:40px;
+//!	list-style-type:disc;
+//!}
+//!
+//!li
+//!{
+//!	width:100px;
+//!	display:list-item;
+//!	list-style-position:outside;
+//!	direction:rtl;
+//!}
+//!
+//!</style>
+//!</head>
+//!
+//!<body>
+//!<ul>
+//!<li id="list_item">XX</li>
+//!</ul>
+//!</body>
+//!
+//!</html>
+}
+test("text_align: outside, rtl, right")
+	require success "PRECONDITION: Font check";
+	require SUPPORT_TEXT_DIRECTION;
+{
+	FramesDocument* doc = state.doc;
+	OpRect rect = GetRectOfMarker(doc, "list_item");
+	OpRect expected = ComposeExpectedOutsideMarkerRect(doc, 20, 40, 0, 0, 100);
+
+	verify(rects_equal_with_error(rect, expected, 0));
+}
+
+html
+{
+//!<!DOCTYPE html>
+//!<html>
+//!<head>
+//!
+//!<style>
+//!*
+//!{
+//!	margin:0;padding:0;
+//!	font-size:20px;
+//!	font-family:'AHEM';
+//!	text-align:center;
+//!}
+//!
+//!ul, ol
+//!{
+//!	padding-left:40px;
+//!	list-style-type:disc;
+//!}
+//!
+//!li
+//!{
+//!	width:100px;
+//!	display:list-item;
+//!	list-style-position:outside;
+//!	direction:rtl;
+//!}
+//!
+//!</style>
+//!</head>
+//!
+//!<body>
+//!<ul>
+//!<li id="list_item">XX</li>
+//!</ul>
+//!</body>
+//!
+//!</html>
+}
+test("text_align: outside, rtl, center")
+	require success "PRECONDITION: Font check";
+	require SUPPORT_TEXT_DIRECTION;
+{
+	FramesDocument* doc = state.doc;
+	OpRect rect = GetRectOfMarker(doc, "list_item");
+	OpRect expected = ComposeExpectedOutsideMarkerRect(doc, 20, 40, 0, 0, 100);
+
+	verify(rects_equal_with_error(rect, expected, 0));
+}
+
+html
+{
+//!<!DOCTYPE html>
+//!<html>
+//!<head>
+//!
+//!<style>
+//!*
+//!{
+//!	margin:0;padding:0;
+//!	font-size:20px;
+//!	font-family:'AHEM';
+//!	text-align:left;
+//!}
+//!
+//!ul, ol
+//!{
+//!	padding-left:40px;
+//!	list-style-type:disc;
+//!}
+//!
+//!li
+//!{
+//!	width:100px;
+//!	display:list-item;
+//!	list-style-position:inside;
+//!}
+//!
+//!</style>
+//!</head>
+//!
+//!<body>
+//!<ul>
+//!<li id="list_item">XX</li>
+//!</ul>
+//!</body>
+//!
+//!</html>
+}
+test("text_align: inside, ltr, left")
+	require success "PRECONDITION: Font check";
+{
+	FramesDocument* doc = state.doc;
+	OpRect rect = GetRectOfMarker(doc, "list_item");
+	OpRect expected = ComposeExpectedInsideMarkerRect(doc, 20, 40, 0, 0, 0, 100, 40, 0, CSS_VALUE_left, FALSE);
+
+	verify(rects_equal_with_error(rect, expected, 0));
+}
+
+html
+{
+//!<!DOCTYPE html>
+//!<html>
+//!<head>
+//!
+//!<style>
+//!*
+//!{
+//!	margin:0;padding:0;
+//!	font-size:20px;
+//!	font-family:'AHEM';
+//!	text-align:right;
+//!}
+//!
+//!ul, ol
+//!{
+//!	padding-left:40px;
+//!	list-style-type:disc;
+//!}
+//!
+//!li
+//!{
+//!	width:100px;
+//!	display:list-item;
+//!	list-style-position:inside;
+//!}
+//!
+//!</style>
+//!</head>
+//!
+//!<body>
+//!<ul>
+//!<li id="list_item">XX</li>
+//!</ul>
+//!</body>
+//!
+//!</html>
+}
+test("text_align: inside, ltr, right")
+	require success "PRECONDITION: Font check";
+{
+	FramesDocument* doc = state.doc;
+	OpRect rect = GetRectOfMarker(doc, "list_item");
+	OpRect expected = ComposeExpectedInsideMarkerRect(doc, 20, 40, 0, 0, 0, 100, 40, 0, CSS_VALUE_right, FALSE);
+
+	verify(rects_equal_with_error(rect, expected, 0));
+}
+
+html
+{
+//!<!DOCTYPE html>
+//!<html>
+//!<head>
+//!
+//!<style>
+//!*
+//!{
+//!	margin:0;padding:0;
+//!	font-size:20px;
+//!	font-family:'AHEM';
+//!	text-align:center;
+//!}
+//!
+//!ul, ol
+//!{
+//!	padding-left:40px;
+//!	list-style-type:disc;
+//!}
+//!
+//!li
+//!{
+//!	width:100px;
+//!	display:list-item;
+//!	list-style-position:inside;
+//!}
+//!
+//!</style>
+//!</head>
+//!
+//!<body>
+//!<ul>
+//!<li id="list_item">XX</li>
+//!</ul>
+//!</body>
+//!
+//!</html>
+}
+test("text_align: inside, ltr, center")
+	require success "PRECONDITION: Font check";
+{
+	FramesDocument* doc = state.doc;
+	OpRect rect = GetRectOfMarker(doc, "list_item");
+	OpRect expected = ComposeExpectedInsideMarkerRect(doc, 20, 40, 0, 0, 0, 100, 40, 0, CSS_VALUE_center, FALSE);
+
+	verify(rects_equal_with_error(rect, expected, 0));
+}
+
+html
+{
+//!<!DOCTYPE html>
+//!<html>
+//!<head>
+//!
+//!<style>
+//!*
+//!{
+//!	margin:0;padding:0;
+//!	font-size:20px;
+//!	font-family:'AHEM';
+//!	text-align:left;
+//!}
+//!
+//!ul, ol
+//!{
+//!	padding-left:40px;
+//!	list-style-type:disc;
+//!}
+//!
+//!li
+//!{
+//!	width:100px;
+//!	display:list-item;
+//!	list-style-position:inside;
+//!	direction:rtl;
+//!}
+//!
+//!</style>
+//!</head>
+//!
+//!<body>
+//!<ul>
+//!<li id="list_item">XX</li>
+//!</ul>
+//!</body>
+//!
+//!</html>
+}
+test("text_align: inside, rtl, left")
+	require success "PRECONDITION: Font check";
+	require SUPPORT_TEXT_DIRECTION;
+{
+	FramesDocument* doc = state.doc;
+	OpRect rect = GetRectOfMarker(doc, "list_item");
+	OpRect expected = ComposeExpectedInsideMarkerRect(doc, 20, 40, 0, 0, 0, 100, 40, 0, CSS_VALUE_left, TRUE);
+
+	verify(rects_equal_with_error(rect, expected, 0));
+}
+
+html
+{
+//!<!DOCTYPE html>
+//!<html>
+//!<head>
+//!
+//!<style>
+//!*
+//!{
+//!	margin:0;padding:0;
+//!	font-size:20px;
+//!	font-family:'AHEM';
+//!	text-align:right;
+//!}
+//!
+//!ul, ol
+//!{
+//!	padding-left:40px;
+//!	list-style-type:disc;
+//!}
+//!
+//!li
+//!{
+//!	width:100px;
+//!	display:list-item;
+//!	list-style-position:inside;
+//!	direction:rtl;
+//!}
+//!
+//!</style>
+//!</head>
+//!
+//!<body>
+//!<ul>
+//!<li id="list_item">XX</li>
+//!</ul>
+//!</body>
+//!
+//!</html>
+}
+test("text_align: inside, rtl, right")
+	require success "PRECONDITION: Font check";
+	require SUPPORT_TEXT_DIRECTION;
+{
+	FramesDocument* doc = state.doc;
+	OpRect rect = GetRectOfMarker(doc, "list_item");
+	OpRect expected = ComposeExpectedInsideMarkerRect(doc, 20, 40, 0, 0, 0, 100, 40, 0, CSS_VALUE_right, TRUE);
+
+	verify(rects_equal_with_error(rect, expected, 0));
+}
+
+html
+{
+//!<!DOCTYPE html>
+//!<html>
+//!<head>
+//!
+//!<style>
+//!*
+//!{
+//!	margin:0;padding:0;
+//!	font-size:20px;
+//!	font-family:'AHEM';
+//!	text-align:center;
+//!}
+//!
+//!ul, ol
+//!{
+//!	padding-left:40px;
+//!	list-style-type:disc;
+//!}
+//!
+//!li
+//!{
+//!	width:100px;
+//!	display:list-item;
+//!	list-style-position:inside;
+//!	direction:rtl;
+//!}
+//!
+//!</style>
+//!</head>
+//!
+//!<body>
+//!<ul>
+//!<li id="list_item">XX</li>
+//!</ul>
+//!</body>
+//!
+//!</html>
+}
+test("text_align: inside, rtl, center")
+	require success "PRECONDITION: Font check";
+	require SUPPORT_TEXT_DIRECTION;
+{
+	FramesDocument* doc = state.doc;
+	OpRect rect = GetRectOfMarker(doc, "list_item");
+	OpRect expected = ComposeExpectedInsideMarkerRect(doc, 20, 40, 0, 0, 0, 100, 40, 0, CSS_VALUE_center, TRUE);
+
+	verify(rects_equal_with_error(rect, expected, 0));
+}
+
+html
+{
+//!<!DOCTYPE html>
+//!<html>
+//!<head>
+//!
+//!<style>
+//!*
+//!{
+//!	margin:0;padding:0;
+//!	font-size:20px;
+//!	font-family:'AHEM';
+//!	text-indent:20px;
+//!}
+//!
+//!ul, ol
+//!{
+//!	padding-left:40px;
+//!	list-style-type:disc;
+//!}
+//!
+//!li
+//!{
+//!	width:100px;
+//!	display:list-item;
+//!	list-style-position:outside;
+//!	direction:ltr;
+//!}
+//!
+//!</style>
+//!</head>
+//!
+//!<body>
+//!<ul>
+//!<li id="list_item">XX</li>
+//!</ul>
+//!</body>
+//!
+//!</html>
+}
+test("text_indent: outside, ltr")
+	require success "PRECONDITION: Font check";
+{
+	FramesDocument* doc = state.doc;
+	OpRect rect = GetRectOfMarker(doc, "list_item");
+	OpRect expected = ComposeExpectedOutsideMarkerRect(doc, 20, 40, 0, 0, 0);
+
+	verify(rects_equal_with_error(rect, expected, 0));
+}
+
+html
+{
+//!<!DOCTYPE html>
+//!<html>
+//!<head>
+//!
+//!<style>
+//!*
+//!{
+//!	margin:0;padding:0;
+//!	font-size:20px;
+//!	font-family:'AHEM';
+//!	text-indent:20px;
+//!}
+//!
+//!ul, ol
+//!{
+//!	padding-left:40px;
+//!	list-style-type:disc;
+//!}
+//!
+//!li
+//!{
+//!	width:100px;
+//!	display:list-item;
+//!	list-style-position:outside;
+//!	direction:rtl;
+//!}
+//!
+//!</style>
+//!</head>
+//!
+//!<body>
+//!<ul>
+//!<li id="list_item">XX</li>
+//!</ul>
+//!</body>
+//!
+//!</html>
+}
+test("text_indent: outside, rtl")
+	require success "PRECONDITION: Font check";
+	require SUPPORT_TEXT_DIRECTION;
+{
+	FramesDocument* doc = state.doc;
+	OpRect rect = GetRectOfMarker(doc, "list_item");
+	OpRect expected = ComposeExpectedOutsideMarkerRect(doc, 20, 40, 0, 0, 100);
+
+	verify(rects_equal_with_error(rect, expected, 0));
+}
+
+html
+{
+//!<!DOCTYPE html>
+//!<html>
+//!<head>
+//!
+//!<style>
+//!*
+//!{
+//!	margin:0;padding:0;
+//!	font-size:20px;
+//!	font-family:'AHEM';
+//!	text-indent:20px;
+//!}
+//!
+//!ul, ol
+//!{
+//!	padding-left:40px;
+//!	list-style-type:disc;
+//!}
+//!
+//!li
+//!{
+//!	width:100px;
+//!	display:list-item;
+//!	list-style-position:inside;
+//!	direction:ltr;
+//!}
+//!
+//!</style>
+//!</head>
+//!
+//!<body>
+//!<ul>
+//!<li id="list_item">XX</li>
+//!</ul>
+//!</body>
+//!
+//!</html>
+}
+test("text_indent: inside, ltr")
+	require success "PRECONDITION: Font check";
+{
+	FramesDocument* doc = state.doc;
+	OpRect rect = GetRectOfMarker(doc, "list_item");
+	OpRect expected = ComposeExpectedInsideMarkerRect(doc, 20, 40, 0, 0, 0, 100, 40, 20, CSS_VALUE_left, FALSE);
+
+	verify(rects_equal_with_error(rect, expected, 0));
+}
+
+html
+{
+//!<!DOCTYPE html>
+//!<html>
+//!<head>
+//!
+//!<style>
+//!*
+//!{
+//!	margin:0;padding:0;
+//!	font-size:20px;
+//!	font-family:'AHEM';
+//!	text-indent:20px;
+//!}
+//!
+//!ul, ol
+//!{
+//!	padding-left:40px;
+//!	list-style-type:disc;
+//!}
+//!
+//!li
+//!{
+//!	width:100px;
+//!	display:list-item;
+//!	list-style-position:inside;
+//!	direction:rtl;
+//!}
+//!
+//!</style>
+//!</head>
+//!
+//!<body>
+//!<ul>
+//!<li id="list_item">XX</li>
+//!</ul>
+//!</body>
+//!
+//!</html>
+}
+test("text_indent: inside, rtl")
+	require success "PRECONDITION: Font check";
+	require SUPPORT_TEXT_DIRECTION;
+{
+	FramesDocument* doc = state.doc;
+	OpRect rect = GetRectOfMarker(doc, "list_item");
+	OpRect expected = ComposeExpectedInsideMarkerRect(doc, 20, 40, 0, 0, 0, 100, 40, 20, CSS_VALUE_right, TRUE);
+
+	verify(rects_equal_with_error(rect, expected, 0));
+}
+
+
+/* Tests about 'flexible' marker. Flexible marker is the outside marker that is the only element
+   in its line. Such marker can be then vertically aligned with the first line in descendant content
+   (baseline to baseline). */
+
+html
+{
+//!<!DOCTYPE html>
+//!<html>
+//!<head>
+//!
+//!<style>
+//!*
+//!{
+//!	margin:0;padding:0;
+//!	font-size:20px;
+//!	font-family:'AHEM';
+//!}
+//!
+//!ul, ol
+//!{
+//!	padding-left:40px;
+//!	list-style-type:disc;
+//!}
+//!
+//!li
+//!{
+//!	display:list-item;
+//!	width:100px;
+//!	list-style-position:outside;
+//!}
+//!
+//!div
+//!{
+//!	width:100px;
+//!	height:40px;
+//!	background-color:lime;
+//!	padding-top:10px;
+//!}
+//!
+//!</style>
+//!</head>
+//!
+//!<body>
+//!<ul>
+//!<li id="list_item"><div>XXX</div>X</li>
+//!</ul>
+//!</body>
+//!
+//!</html>
+}
+test("flexible marker: block child with padding")
+	require success "PRECONDITION: Font check";
+{
+	FramesDocument* doc = state.doc;
+	OpRect rect = GetRectOfMarker(doc, "list_item");
+	OpRect expected = ComposeExpectedOutsideMarkerRect(doc, 20, 40, 0, 10, 0);
+
+	verify(rects_equal_with_error(rect, expected, 0));
+}
+
+html
+{
+//!<!DOCTYPE html>
+//!<html>
+//!<head>
+//!
+//!<style>
+//!*
+//!{
+//!	margin:0;padding:0;
+//!	font-size:20px;
+//!	font-family:'AHEM';
+//!}
+//!
+//!ul, ol
+//!{
+//!	padding-left:40px;
+//!	list-style-type:disc;
+//!}
+//!
+//!li
+//!{
+//!	display:list-item;
+//!	width:100px;
+//!	list-style-position:outside;
+//!}
+//!
+//!div
+//!{
+//!	width:100px;
+//!	height:40px;
+//!	background-color:lime;
+//!	padding-top:10px;
+//!}
+//!
+//!</style>
+//!</head>
+//!
+//!<body>
+//!<ul>
+//!<li id="list_item"><br /><div>XXX</div></li>
+//!</ul>
+//!</body>
+//!
+//!</html>
+}
+test("flexible marker: br first in list item")
+	require success "PRECONDITION: Font check";
+{
+	FramesDocument* doc = state.doc;
+	OpRect rect = GetRectOfMarker(doc, "list_item");
+	OpRect expected = ComposeExpectedOutsideMarkerRect(doc, 20, 40, 0, 0, 0);
+
+	verify(rects_equal_with_error(rect, expected, 0));
+}
+
+html
+{
+//!<!DOCTYPE html>
+//!<html>
+//!<head>
+//!
+//!<style>
+//!*
+//!{
+//!	margin:0;padding:0;
+//!	font-size:20px;
+//!	font-family:'AHEM';
+//!}
+//!
+//!ul, ol
+//!{
+//!	padding-left:40px;
+//!	list-style-type:disc;
+//!}
+//!
+//!li
+//!{
+//!	display:list-item;
+//!	width:100px;
+//!	list-style-position:outside;
+//!}
+//!
+//!div
+//!{
+//!	width:100px;
+//!	height:40px;
+//!	background-color:lime;
+//!	padding-top:10px;
+//!}
+//!
+//!</style>
+//!</head>
+//!
+//!<body>
+//!<ul>
+//!<li id="list_item"><div><br />XXX</div></li>
+//!</ul>
+//!</body>
+//!
+//!</html>
+}
+test("flexible marker: br in block child")
+	require success "PRECONDITION: Font check";
+	disabled;
+	/* The test currently fails. Because the <br> is inside the child div, which has padding,
+	   that padding should influence the marker position, but it doesn't. That is a bug */
+{
+	FramesDocument* doc = state.doc;
+	OpRect rect = GetRectOfMarker(doc, "list_item");
+	OpRect expected = ComposeExpectedOutsideMarkerRect(doc, 20, 40, 0, 10, 0, 0);
+
+	verify(rects_equal_with_error(rect, expected, 0));
+}
+
+html
+{
+//!<!DOCTYPE html>
+//!<html>
+//!<head>
+//!
+//!<style>
+//!*
+//!{
+//!	margin:0;padding:0;
+//!	font-size:20px;
+//!	font-family:'AHEM';
+//!}
+//!
+//!ul, ol
+//!{
+//!	padding-left:40px;
+//!	list-style-type:disc;
+//!}
+//!
+//!li
+//!{
+//!	display:list-item;
+//!	width:100px;
+//!	list-style-position:outside;
+//!}
+//!
+//!div
+//!{
+//!	width:100px;
+//!	height:50px;
+//!	background-color:lime;
+//!	position:relative;
+//!	left:50px;
+//!	top:20px;
+//!}
+//!
+//!</style>
+//!</head>
+//!
+//!<body>
+//!<ul>
+//!<li id="list_item"><div>XXX</div>X</li>
+//!</ul>
+//!</body>
+//!
+//!</html>
+}
+test("flexible marker: rel. pos block child")
+	require success "PRECONDITION: Font check";
+{
+	FramesDocument* doc = state.doc;
+	OpRect rect = GetRectOfMarker(doc, "list_item");
+	OpRect expected = ComposeExpectedOutsideMarkerRect(doc, 20, 40, 0, 20, 0);
+
+	verify(rects_equal_with_error(rect, expected, 0));
+}
+
+html
+{
+//!<!DOCTYPE html>
+//!<html>
+//!<head>
+//!
+//!<style>
+//!*
+//!{
+//!	margin:0;padding:0;
+//!	font-size:20px;
+//!	font-family:'AHEM';
+//!}
+//!
+//!body
+//!{
+//!	padding-top:20px;
+//!}
+//!
+//!ul, ol
+//!{
+//!	padding-left:40px;
+//!	list-style-type:disc;
+//!}
+//!
+//!li
+//!{
+//!	display:list-item;
+//!	list-style-position:outside;
+//!}
+//!
+//!#list_item_1
+//!{
+//!	padding-top:5px;
+//!}
+//!
+//!div
+//!{
+//!	width:40px;
+//!	height:20px;
+//!	background-color:lime;
+//!	margin-top:-20px;
+//!}
+//!
+//!</style>
+//!</head>
+//!
+//!<body>
+//!<ul>
+//!<li id="list_item_1"><div>X</div></li>
+//!<li id="list_item_2"></li>
+//!</ul>
+//!</body>
+//!
+//!</html>
+}
+test("flexible marker: pull up")
+	require success "PRECONDITION: Font check";
+	/* Tests the behavior when a flexible outside marker is pulled up.
+	   First: Don't allow the marker to be above the principal box'es
+	   top edge.
+	   Second: After any adjustment to a flexible marker, such that it
+	   is pulled up (here it is pulled up by 5px, because initially
+	   the marker is affected be #list_item_1 top padding), it should
+	   affect the final height of a list item container. */
+{
+	FramesDocument* doc = state.doc;
+
+	OpRect rect1 = GetRectOfMarker(doc, "list_item_1");
+	OpRect expected1 = ComposeExpectedOutsideMarkerRect(doc, 20, 40, 20, 0, 0);
+
+	verify(rects_equal_with_error(rect1, expected1, 0));
+
+	OpRect rect2 = GetRectOfMarker(doc, "list_item_2");
+	OpRect expected2 = ComposeExpectedOutsideMarkerRect(doc, 20, 40, 40, 0, 0);
+
+	verify(rects_equal_with_error(rect2, expected2, 0));
+}
+
+html
+{
+//!<!DOCTYPE html>
+//!<html>
+//!<head>
+//!
+//!<style>
+//!*
+//!{
+//!	margin:0;padding:0;
+//!	font-size:20px;
+//!	font-family:'AHEM';
+//!}
+//!
+//!ul, ol
+//!{
+//!	padding-left:40px;
+//!	list-style-type:disc;
+//!}
+//!
+//!li
+//!{
+//!	display:list-item;
+//!	width:100px;
+//!	list-style-position:outside;
+//!}
+//!
+//!div
+//!{
+//!	width:100px;
+//!	height:50px;
+//!	background-color:lime;
+//!}
+//!
+//!</style>
+//!</head>
+//!
+//!<body>
+//!<ul>
+//!<li id="list_item"><div></div>XXX</li>
+//!</ul>
+//!</body>
+//!
+//!</html>
+}
+test("flexible marker: empty block, a line after")
+	require success "PRECONDITION: Font check";
+{
+	FramesDocument* doc = state.doc;
+	OpRect rect = GetRectOfMarker(doc, "list_item");
+	OpRect expected = ComposeExpectedOutsideMarkerRect(doc, 20, 40, 0, 50, 0);
+
+	verify(rects_equal_with_error(rect, expected, 0));
+}
+
+html
+{
+//!<!DOCTYPE html>
+//!<html>
+//!<head>
+//!
+//!<style>
+//!*
+//!{
+//!	margin:0;padding:0;
+//!	font-size:20px;
+//!	font-family:'AHEM';
+//!}
+//!
+//!ul, ol
+//!{
+//!	padding-left:40px;
+//!	list-style-type:disc;
+//!}
+//!
+//!li
+//!{
+//!	display:list-item;
+//!	width:100px;
+//!	list-style-position:outside;
+//!}
+//!
+//!</style>
+//!</head>
+//!
+//!<body>
+//!<ul>
+//!<li id="list_item">
+//!<table><tr><td>XX</td></tr></table>
+//!<div>XXX</div>
+//!</li>
+//!</ul>
+//!</body>
+//!
+//!</html>
+}
+test("flexible marker: stop on block level table")
+	require success "PRECONDITION: Font check";
+{
+	FramesDocument* doc = state.doc;
+	OpRect rect = GetRectOfMarker(doc, "list_item");
+	OpRect expected = ComposeExpectedOutsideMarkerRect(doc, 20, 40, 0, 0, 0);
+
+	verify(rects_equal_with_error(rect, expected, 0));
+}
+
+html
+{
+//!<!DOCTYPE html>
+//!<html>
+//!<head>
+//!
+//!<style>
+//!*
+//!{
+//!	margin:0;padding:0;
+//!	font-size:20px;
+//!	font-family:'AHEM';
+//!}
+//!
+//!ul, ol
+//!{
+//!	padding-left:40px;
+//!	list-style-type:disc;
+//!}
+//!
+//!li
+//!{
+//!	display:list-item;
+//!	width:100px;
+//!	list-style-position:outside;
+//!}
+//!
+//!div
+//!{
+//!	width:100px;
+//!	height:50px;
+//!	background-color:lime;
+//!	position:absolute;
+//!	left:50px;
+//!	top:20px;
+//!}
+//!
+//!span
+//!{
+//!	display:block;
+//!	padding-top:10px;
+//!}
+//!
+//!</style>
+//!</head>
+//!
+//!<body>
+//!<ul>
+//!<li id="list_item"><div>XX</div><span>X</span></li>
+//!</ul>
+//!</body>
+//!
+//!</html>
+}
+test("flexible marker: skip absolute positioned")
+	require success "PRECONDITION: Font check";
+{
+	FramesDocument* doc = state.doc;
+	OpRect rect = GetRectOfMarker(doc, "list_item");
+	OpRect expected = ComposeExpectedOutsideMarkerRect(doc, 20, 40, 0, 10, 0);
+
+	verify(rects_equal_with_error(rect, expected, 0));
+}
+
+html
+{
+//!<!DOCTYPE html>
+//!<html>
+//!<head>
+//!
+//!<style>
+//!*
+//!{
+//!	margin:0;padding:0;
+//!	font-size:20px;
+//!	font-family:'AHEM';
+//!}
+//!
+//!ul, ol
+//!{
+//!	padding-left:40px;
+//!	list-style-type:disc;
+//!}
+//!
+//!li
+//!{
+//!	display:list-item;
+//!	width:100px;
+//!	list-style-position:outside;
+//!}
+//!
+//!div
+//!{
+//!	width:100px;
+//!	height:50px;
+//!	background-color:lime;
+//!	transform:translate(50px,0px);
+//!}
+//!
+//!span
+//!{
+//!	display:block;
+//!}
+//!
+//!</style>
+//!</head>
+//!
+//!<body>
+//!<ul>
+//!<li id="list_item"><div>XX</div><span>X</span></li>
+//!</ul>
+//!</body>
+//!
+//!</html>
+}
+test("flexible marker: skip transformed")
+	require success "PRECONDITION: Font check";
+	require CSS_TRANSFORMS;
+{
+	FramesDocument* doc = state.doc;
+	OpRect rect = GetRectOfMarker(doc, "list_item");
+	OpRect expected = ComposeExpectedOutsideMarkerRect(doc, 20, 40, 0, 50, 0);
+
+	verify(rects_equal_with_error(rect, expected, 0));
+}
+
+html
+{
+//!<!DOCTYPE html>
+//!<html>
+//!<head>
+//!
+//!<style>
+//!*
+//!{
+//!	margin:0;padding:0;
+//!	font-size:20px;
+//!	font-family:'AHEM';
+//!}
+//!
+//!ul, ol
+//!{
+//!	padding-left:40px;
+//!	list-style-type:disc;
+//!}
+//!
+//!li
+//!{
+//!	display:list-item;
+//!	width:100px;
+//!	list-style-position:outside;
+//!}
+//!
+//!#nested_li
+//!{
+//!	list-style-position:inside;
+//!	padding-top:10px;
+//!}
+//!
+//!div
+//!{
+//!	width:100px;
+//!	height:40px;
+//!	background-color:lime;
+//!}
+//!
+//!</style>
+//!</head>
+//!
+//!<body>
+//!<ul>
+//!<li id="list_item"><ul><li id="nested_li"></li></ul><div>XX</div></li>
+//!</ul>
+//!</body>
+//!
+//!</html>
+}
+test("flexible marker: nested inside list item")
+	require success "PRECONDITION: Font check";
+{
+	FramesDocument* doc = state.doc;
+	OpRect rect = GetRectOfMarker(doc, "list_item");
+	OpRect expected = ComposeExpectedOutsideMarkerRect(doc, 20, 40, 0, 10, 0);
+
+	verify(rects_equal_with_error(rect, expected, 0));
+}
+
+html
+{
+//!<!DOCTYPE html>
+//!<html>
+//!<head>
+//!
+//!<style>
+//!*
+//!{
+//!	margin:0;padding:0;
+//!	font-size:20px;
+//!	font-family:'AHEM';
+//!}
+//!
+//!ul, ol
+//!{
+//!	padding-left:40px;
+//!	list-style-type:disc;
+//!}
+//!
+//!li
+//!{
+//!	display:list-item;
+//!	width:100px;
+//!	list-style-position:outside;
+//!}
+//!
+//!#nested_li
+//!{
+//!	padding-top:10px;
+//!}
+//!
+//!div
+//!{
+//!	width:100px;
+//!	height:40px;
+//!	background-color:lime;
+//!}
+//!
+//!</style>
+//!</head>
+//!
+//!<body>
+//!<ul>
+//!<li id="list_item"><ul><li id="nested_li"></li></ul><div>XX</div></li>
+//!</ul>
+//!</body>
+//!
+//!</html>
+}
+test("flexible marker: nested outside list item")
+	require success "PRECONDITION: Font check";
+{
+	FramesDocument* doc = state.doc;
+	OpRect rect = GetRectOfMarker(doc, "list_item");
+	OpRect expected = ComposeExpectedOutsideMarkerRect(doc, 20, 40, 0, 30, 0);
+
+	verify(rects_equal_with_error(rect, expected, 0));
+}
+
+html
+{
+//!<!DOCTYPE html>
+//!<html>
+//!<head>
+//!
+//!<style>
+//!*
+//!{
+//!	margin:0;padding:0;
+//!	font-size:20px;
+//!	font-family:'AHEM';
+//!}
+//!
+//!ul, ol
+//!{
+//!	padding-left:40px;
+//!	list-style-type:disc;
+//!}
+//!
+//!li
+//!{
+//!	display:list-item;
+//!	width:100px;
+//!	list-style-position:outside;
+//!}
+//!
+//!#nested_li
+//!{
+//!	padding-top:10px;
+//!}
+//!
+//!#most_nested_li
+//!{
+//!	border-top:solid 5px;
+//!}
+//!
+//!div
+//!{
+//!	width:100px;
+//!	height:20px;
+//!	background-color:lime;
+//!}
+//!
+//!</style>
+//!</head>
+//!
+//!<body>
+//!<ul>
+//!<li id="list_item">
+//!	<div></div>
+//!	<ul>
+//!		<li id="nested_li">
+//!			<ul>
+//!			<div></div>
+//!				<li id="most_nested_li">X</li>
+//!				<li>X</li>
+//!			</ul>
+//!		</li>
+//!		<li>X</li>
+//!	</ul>
+//!</li>
+//!</ul>
+//!</body>
+//!
+//!</html>
+}
+test("flexible marker: two level nesting")
+	require success "PRECONDITION: Font check";
+{
+	FramesDocument* doc = state.doc;
+	OpRect rect1 = GetRectOfMarker(doc, "list_item");
+	OpRect expected1 = ComposeExpectedOutsideMarkerRect(doc, 20, 40, 0, 55, 0);
+
+	OpRect rect2 = GetRectOfMarker(doc, "nested_li");
+	OpRect expected2 = ComposeExpectedOutsideMarkerRect(doc, 20, 80, 20, 35, 0);
+
+	OpRect rect3 = GetRectOfMarker(doc, "most_nested_li");
+	OpRect expected3 = ComposeExpectedOutsideMarkerRect(doc, 20, 120, 50, 5, 0);
+
+	verify(rects_equal_with_error(rect1, expected1, 0));
+	verify(rects_equal_with_error(rect2, expected2, 0));
+	verify(rects_equal_with_error(rect3, expected3, 0));
+}
+
+/* Tests about floats interacting with list items. */
+
+html
+{
+//!<!DOCTYPE html>
+//!<html>
+//!<head>
+//!
+//!<style>
+//!*
+//!{
+//!	margin:0;padding:0;
+//!	font-size:20px;
+//!	font-family:'AHEM';
+//!}
+//!
+//!ul, ol
+//!{
+//!	padding-left:40px;
+//!	list-style-type:disc;
+//!}
+//!
+//!li
+//!{
+//!	width:100px;
+//!	display:list-item;
+//!	list-style-position:inside;
+//!	direction:ltr;
+//!}
+//!
+//!div
+//!{
+//!	width:20px;
+//!	height:20px;
+//!	float:left;
+//!	background-color:lime;
+//!}
+//!
+//!</style>
+//!</head>
+//!
+//!<body>
+//!
+//!<ul>
+//!<li id="list_item"><div></div>XX</li>
+//!</ul>
+//!
+//!</body>
+//!
+//!</html>
+}
+test("markers and floats: left, inside, ltr")
+	require success "PRECONDITION: Font check";
+{
+	FramesDocument* doc = state.doc;
+	OpRect rect = GetRectOfMarker(doc, "list_item");
+	OpRect expected = ComposeExpectedInsideMarkerRect(doc, 20, 40, 0, 0, 20, 100, 40, 0, CSS_VALUE_left, FALSE);
+
+	verify(rects_equal_with_error(rect, expected, 0));
+}
+
+html
+{
+//!<!DOCTYPE html>
+//!<html>
+//!<head>
+//!
+//!<style>
+//!*
+//!{
+//!	margin:0;padding:0;
+//!	font-size:20px;
+//!	font-family:'AHEM';
+//!}
+//!
+//!ul, ol
+//!{
+//!	padding-left:40px;
+//!	list-style-type:disc;
+//!}
+//!
+//!li
+//!{
+//!	width:100px;
+//!	display:list-item;
+//!	list-style-position:inside;
+//!	direction:rtl;
+//!}
+//!
+//!div
+//!{
+//!	width:20px;
+//!	height:20px;
+//!	float:left;
+//!	background-color:lime;
+//!}
+//!
+//!</style>
+//!</head>
+//!
+//!<body>
+//!
+//!<ul>
+//!<li id="list_item"><div></div>XX</li>
+//!</ul>
+//!
+//!</body>
+//!
+//!</html>
+}
+test("markers and floats: left, inside, rtl")
+	require success "PRECONDITION: Font check";
+	require SUPPORT_TEXT_DIRECTION;
+{
+	FramesDocument* doc = state.doc;
+	OpRect rect = GetRectOfMarker(doc, "list_item");
+	OpRect expected = ComposeExpectedInsideMarkerRect(doc, 20, 40, 0, 0, 20, 100, 40, 0, CSS_VALUE_right, TRUE);
+
+	verify(rects_equal_with_error(rect, expected, 0));
+}
+
+html
+{
+//!<!DOCTYPE html>
+//!<html>
+//!<head>
+//!
+//!<style>
+//!*
+//!{
+//!	margin:0;padding:0;
+//!	font-size:20px;
+//!	font-family:'AHEM';
+//!}
+//!
+//!ul, ol
+//!{
+//!	padding-left:40px;
+//!	list-style-type:disc;
+//!}
+//!
+//!li
+//!{
+//!	width:100px;
+//!	display:list-item;
+//!	list-style-position:outside;
+//!	direction:ltr;
+//!}
+//!
+//!div
+//!{
+//!	width:20px;
+//!	height:20px;
+//!	float:left;
+//!	background-color:lime;
+//!}
+//!
+//!</style>
+//!</head>
+//!
+//!<body>
+//!
+//!<ul>
+//!<li id="list_item"><div></div><span id="test_box">X</span>X</li>
+//!</ul>
+//!
+//!</body>
+//!
+//!</html>
+}
+test("markers and floats: left, outside, ltr")
+	require success "PRECONDITION: Font check";
+{
+	FramesDocument* doc = state.doc;
+	OpRect rect = GetRectOfMarker(doc, "list_item");
+	OpRect expected = ComposeExpectedOutsideMarkerRect(doc, 20, 40, 0, 0, 0);
+
+	verify(rects_equal_with_error(rect, expected, 0));
+
+	RECT expected1 = {60,0,80,20};
+	verify(CheckAfterMarkerElementRect(state.doc, expected1));
+}
+
+html
+{
+//!<!DOCTYPE html>
+//!<html>
+//!<head>
+//!
+//!<style>
+//!*
+//!{
+//!	margin:0;padding:0;
+//!	font-size:20px;
+//!	font-family:'AHEM';
+//!}
+//!
+//!ul, ol
+//!{
+//!	padding-left:40px;
+//!	list-style-type:disc;
+//!}
+//!
+//!li
+//!{
+//!	width:100px;
+//!	display:list-item;
+//!	list-style-position:outside;
+//!	direction:rtl;
+//!}
+//!
+//!div
+//!{
+//!	width:20px;
+//!	height:20px;
+//!	float:left;
+//!	background-color:lime;
+//!}
+//!
+//!</style>
+//!</head>
+//!
+//!<body>
+//!
+//!<ul>
+//!<li id="list_item"><div></div>X<span id="test_box">X</span></li>
+//!</ul>
+//!
+//!</body>
+//!
+//!</html>
+}
+test("markers and floats: left, outside, rtl")
+	require success "PRECONDITION: Font check";
+	require SUPPORT_TEXT_DIRECTION;
+{
+	FramesDocument* doc = state.doc;
+	OpRect rect = GetRectOfMarker(doc, "list_item");
+	OpRect expected = ComposeExpectedOutsideMarkerRect(doc, 20, 40, 0, 0, 100);
+
+	verify(rects_equal_with_error(rect, expected, 0));
+
+	RECT expected1 = {120,0,140,20};
+	verify(CheckAfterMarkerElementRect(state.doc, expected1));
+}
+
+html
+{
+//!<!DOCTYPE html>
+//!<html>
+//!<head>
+//!
+//!<style>
+//!*
+//!{
+//!	margin:0;padding:0;
+//!	font-size:20px;
+//!	font-family:'AHEM';
+//!}
+//!
+//!ul, ol
+//!{
+//!	padding-left:40px;
+//!	list-style-type:disc;
+//!}
+//!
+//!li
+//!{
+//!	width:100px;
+//!	display:list-item;
+//!	list-style-position:inside;
+//!	direction:ltr;
+//!}
+//!
+//!div
+//!{
+//!	width:20px;
+//!	height:20px;
+//!	float:right;
+//!	background-color:lime;
+//!}
+//!
+//!</style>
+//!</head>
+//!
+//!<body>
+//!
+//!<ul>
+//!<li id="list_item"><div></div>XX</li>
+//!</ul>
+//!
+//!</body>
+//!
+//!</html>
+}
+test("markers and floats: right, inside, ltr")
+	require success "PRECONDITION: Font check";
+{
+	FramesDocument* doc = state.doc;
+	OpRect rect = GetRectOfMarker(doc, "list_item");
+	OpRect expected = ComposeExpectedInsideMarkerRect(doc, 20, 40, 0, 0, 0, 80, 40, 0, CSS_VALUE_left, FALSE);
+
+	verify(rects_equal_with_error(rect, expected, 0));
+}
+
+html
+{
+//!<!DOCTYPE html>
+//!<html>
+//!<head>
+//!
+//!<style>
+//!*
+//!{
+//!	margin:0;padding:0;
+//!	font-size:20px;
+//!	font-family:'AHEM';
+//!}
+//!
+//!ul, ol
+//!{
+//!	padding-left:40px;
+//!	list-style-type:disc;
+//!}
+//!
+//!li
+//!{
+//!	width:100px;
+//!	display:list-item;
+//!	list-style-position:inside;
+//!	direction:rtl;
+//!}
+//!
+//!div
+//!{
+//!	width:20px;
+//!	height:20px;
+//!	float:right;
+//!	background-color:lime;
+//!}
+//!
+//!</style>
+//!</head>
+//!
+//!<body>
+//!
+//!<ul>
+//!<li id="list_item"><div></div>XX</li>
+//!</ul>
+//!
+//!</body>
+//!
+//!</html>
+}
+test("markers and floats: right, inside, rtl")
+	require success "PRECONDITION: Font check";
+	require SUPPORT_TEXT_DIRECTION;
+{
+	FramesDocument* doc = state.doc;
+	OpRect rect = GetRectOfMarker(doc, "list_item");
+	OpRect expected = ComposeExpectedInsideMarkerRect(doc, 20, 40, 0, 0, 0, 80, 40, 0, CSS_VALUE_right, TRUE);
+
+	verify(rects_equal_with_error(rect, expected, 0));
+}
+
+html
+{
+//!<!DOCTYPE html>
+//!<html>
+//!<head>
+//!
+//!<style>
+//!*
+//!{
+//!	margin:0;padding:0;
+//!	font-size:20px;
+//!	font-family:'AHEM';
+//!}
+//!
+//!ul, ol
+//!{
+//!	padding-left:40px;
+//!	list-style-type:disc;
+//!}
+//!
+//!li
+//!{
+//!	width:100px;
+//!	display:list-item;
+//!	list-style-position:outside;
+//!	direction:ltr;
+//!}
+//!
+//!div
+//!{
+//!	width:20px;
+//!	height:20px;
+//!	float:right;
+//!	background-color:lime;
+//!}
+//!
+//!</style>
+//!</head>
+//!
+//!<body>
+//!
+//!<ul>
+//!<li id="list_item"><div></div><span id="test_box">X</span>X</li>
+//!</ul>
+//!
+//!</body>
+//!
+//!</html>
+}
+test("markers and floats: right, outside, ltr")
+	require success "PRECONDITION: Font check";
+{
+	FramesDocument* doc = state.doc;
+	OpRect rect = GetRectOfMarker(doc, "list_item");
+	OpRect expected = ComposeExpectedOutsideMarkerRect(doc, 20, 40, 0, 0, 0);
+
+	verify(rects_equal_with_error(rect, expected, 0));
+
+	RECT expected1 = {40,0,60,20};
+	verify(CheckAfterMarkerElementRect(state.doc, expected1));
+}
+
+html
+{
+//!<!DOCTYPE html>
+//!<html>
+//!<head>
+//!
+//!<style>
+//!*
+//!{
+//!	margin:0;padding:0;
+//!	font-size:20px;
+//!	font-family:'AHEM';
+//!}
+//!
+//!ul, ol
+//!{
+//!	padding-left:40px;
+//!	list-style-type:disc;
+//!}
+//!
+//!li
+//!{
+//!	width:100px;
+//!	display:list-item;
+//!	list-style-position:outside;
+//!	direction:rtl;
+//!}
+//!
+//!div
+//!{
+//!	width:20px;
+//!	height:20px;
+//!	float:right;
+//!	background-color:lime;
+//!}
+//!
+//!</style>
+//!</head>
+//!
+//!<body>
+//!
+//!<ul>
+//!<li id="list_item"><div></div>X<span id="test_box">X</span></li>
+//!</ul>
+//!
+//!</body>
+//!
+//!</html>
+}
+test("markers and floats: right, outside, rtl")
+	require success "PRECONDITION: Font check";
+	require SUPPORT_TEXT_DIRECTION;
+{
+	FramesDocument* doc = state.doc;
+	OpRect rect = GetRectOfMarker(doc, "list_item");
+	OpRect expected = ComposeExpectedOutsideMarkerRect(doc, 20, 40, 0, 0, 100);
+
+	verify(rects_equal_with_error(rect, expected, 0));
+
+	RECT expected1 = {100,0,120,20};
+	verify(CheckAfterMarkerElementRect(state.doc, expected1));
+}
+
+html
+{
+//!<!DOCTYPE html>
+//!<html>
+//!<head>
+//!
+//!<style>
+//!*
+//!{
+//!	margin:0;padding:0;
+//!	font-size:20px;
+//!	font-family:'AHEM';
+//!}
+//!
+//!ul, ol
+//!{
+//!	padding-left:40px;
+//!	list-style-type:disc;
+//!}
+//!
+//!li
+//!{
+//!	display:list-item;
+//!	list-style-position:outside;
+//!	direction:ltr;
+//!	width:100px;
+//!}
+//!
+//!div
+//!{
+//!	width:20px;
+//!	height:20px;
+//!	float:left;
+//!	background-color:lime;
+//!}
+//!
+//!div.right
+//!{
+//!	float:right;
+//!	background-color:yellow;
+//!}
+//!
+//!
+//!</style>
+//!</head>
+//!
+//!<body>
+//!
+//!<ul>
+//!<li id="list_item"><div class="right"></div><div></div><div></div></li>
+//!</ul>
+//!
+//!</body>
+//!
+//!</html>
+}
+test("markers and floats: many floats, marker still outside, ltr")
+	require success "PRECONDITION: Font check";
+{
+	FramesDocument* doc = state.doc;
+	OpRect rect = GetRectOfMarker(doc, "list_item");
+	OpRect expected = ComposeExpectedOutsideMarkerRect(doc, 20, 40, 0, 0, 0);
+
+	verify(rects_equal_with_error(rect, expected, 0));
+}
+
+html
+{
+//!<!DOCTYPE html>
+//!<html>
+//!<head>
+//!
+//!<style>
+//!*
+//!{
+//!	margin:0;padding:0;
+//!	font-size:20px;
+//!	font-family:'AHEM';
+//!}
+//!
+//!ul, ol
+//!{
+//!	padding-left:40px;
+//!	list-style-type:disc;
+//!}
+//!
+//!li
+//!{
+//!	display:list-item;
+//!	list-style-position:outside;
+//!	direction:rtl;
+//!	width:100px;
+//!}
+//!
+//!div
+//!{
+//!	width:20px;
+//!	height:20px;
+//!	float:right;
+//!	background-color:lime;
+//!}
+//!
+//!div.left
+//!{
+//!	float:left;
+//!	background-color:yellow;
+//!}
+//!
+//!
+//!</style>
+//!</head>
+//!
+//!<body>
+//!
+//!<ul>
+//!<li id="list_item"><div class="left"></div><div></div><div></div></li>
+//!</ul>
+//!
+//!</body>
+//!
+//!</html>
+}
+test("markers and floats: many floats, marker still outside, rtl")
+	require success "PRECONDITION: Font check";
+	require SUPPORT_TEXT_DIRECTION;
+{
+	FramesDocument* doc = state.doc;
+	OpRect rect = GetRectOfMarker(doc, "list_item");
+	OpRect expected = ComposeExpectedOutsideMarkerRect(doc, 20, 40, 0, 0, 100);
+
+	verify(rects_equal_with_error(rect, expected, 0));
+}
+
+/*	Eight below tests check the behavior of outside marker alignment
+	in case of the float already using up space and the first line being in
+	some block child of list item. */
+
+html
+{
+//!<!DOCTYPE html>
+//!<html>
+//!<head>
+//!
+//!<style>
+//!*
+//!{
+//!	margin:0;padding:0;
+//!	font-size:20px;
+//!	font-family:'AHEM';
+//!}
+//!
+//!ul, ol
+//!{
+//!	list-style-type:disc;
+//!	padding-left:40px;
+//!	width:40px;
+//!}
+//!
+//!li
+//!{
+//!	width:30px;
+//!	display:list-item;
+//!	list-style-position:outside;
+//!	direction:ltr;
+//!	border-left:solid 5px;
+//!	padding-left:5px;
+//!}
+//!
+//!div
+//!{
+//!	width:20px;
+//!	height:20px;
+//!	float:left;
+//!	background-color:lime;
+//!}
+//!
+//!</style>
+//!</head>
+//!
+//!<body>
+//!
+//!<ul>
+//!<div></div>
+//!<li id="list_item"><p>XX</p></li>
+//!</ul>
+//!
+//!</body>
+//!
+//!</html>
+}
+test("existing float influence: ltr, same side, pushed below")
+	require success "PRECONDITION: Font check";
+{
+	FramesDocument* doc = state.doc;
+	OpRect rect = GetRectOfMarker(doc, "list_item");
+	OpRect expected = ComposeExpectedOutsideMarkerRect(doc, 20, 40, 0, 20, 0);
+
+	verify(rects_equal_with_error(rect, expected, 0));
+}
+
+html
+{
+//!<!DOCTYPE html>
+//!<html>
+//!<head>
+//!
+//!<style>
+//!*
+//!{
+//!	margin:0;padding:0;
+//!	font-size:20px;
+//!	font-family:'AHEM';
+//!}
+//!
+//!ul, ol
+//!{
+//!	list-style-type:disc;
+//!	padding-left:40px;
+//!	width:40px;
+//!}
+//!
+//!li
+//!{
+//!	width:30px;
+//!	display:list-item;
+//!	list-style-position:outside;
+//!	direction:ltr;
+//!	border-left:solid 5px;
+//!	padding-left:5px;
+//!}
+//!
+//!div
+//!{
+//!	width:20px;
+//!	height:20px;
+//!	float:left;
+//!	background-color:lime;
+//!}
+//!
+//!</style>
+//!</head>
+//!
+//!<body>
+//!
+//!<ul>
+//!<div></div>
+//!<li id="list_item"><p>X</p></li>
+//!</ul>
+//!
+//!</body>
+//!
+//!</html>
+}
+test("existing float influence: ltr, same side, beside float")
+	require success "PRECONDITION: Font check";
+{
+	FramesDocument* doc = state.doc;
+	OpRect rect = GetRectOfMarker(doc, "list_item");
+	OpRect expected = ComposeExpectedOutsideMarkerRect(doc, 20, 40, 0, 0, 0);
+
+	verify(rects_equal_with_error(rect, expected, 0));
+}
+
+html
+{
+//!<!DOCTYPE html>
+//!<html>
+//!<head>
+//!
+//!<style>
+//!*
+//!{
+//!	margin:0;padding:0;
+//!	font-size:20px;
+//!	font-family:'AHEM';
+//!}
+//!
+//!ul, ol
+//!{
+//!	list-style-type:disc;
+//!	padding-left:40px;
+//!	width:40px;
+//!}
+//!
+//!li
+//!{
+//!	width:40px;
+//!	display:list-item;
+//!	list-style-position:outside;
+//!	direction:ltr;
+//!}
+//!
+//!div
+//!{
+//!	width:20px;
+//!	height:20px;
+//!	float:right;
+//!	background-color:lime;
+//!}
+//!
+//!</style>
+//!</head>
+//!
+//!<body>
+//!
+//!<ul>
+//!<div></div>
+//!<li id="list_item"><p>XX</p></li>
+//!</ul>
+//!
+//!</body>
+//!
+//!</html>
+}
+test("existing float influence: ltr, opposite side, pushed below")
+	require success "PRECONDITION: Font check";
+{
+	FramesDocument* doc = state.doc;
+	OpRect rect = GetRectOfMarker(doc, "list_item");
+	OpRect expected = ComposeExpectedOutsideMarkerRect(doc, 20, 40, 0, 20, 0);
+
+	verify(rects_equal_with_error(rect, expected, 0));
+}
+
+html
+{
+//!<!DOCTYPE html>
+//!<html>
+//!<head>
+//!
+//!<style>
+//!*
+//!{
+//!	margin:0;padding:0;
+//!	font-size:20px;
+//!	font-family:'AHEM';
+//!}
+//!
+//!ul, ol
+//!{
+//!	list-style-type:disc;
+//!	padding-left:40px;
+//!	width:40px;
+//!}
+//!
+//!li
+//!{
+//!	width:40px;
+//!	display:list-item;
+//!	list-style-position:outside;
+//!	direction:ltr;
+//!}
+//!
+//!div
+//!{
+//!	width:20px;
+//!	height:20px;
+//!	float:right;
+//!	background-color:lime;
+//!}
+//!
+//!</style>
+//!</head>
+//!
+//!<body>
+//!
+//!<ul>
+//!<div></div>
+//!<li id="list_item"><p>X</p></li>
+//!</ul>
+//!
+//!</body>
+//!
+//!</html>
+}
+test("existing float influence: ltr, opposite side, beside float")
+	require success "PRECONDITION: Font check";
+{
+	FramesDocument* doc = state.doc;
+	OpRect rect = GetRectOfMarker(doc, "list_item");
+	OpRect expected = ComposeExpectedOutsideMarkerRect(doc, 20, 40, 0, 0, 0);
+
+	verify(rects_equal_with_error(rect, expected, 0));
+}
+
+html
+{
+//!<!DOCTYPE html>
+//!<html>
+//!<head>
+//!
+//!<style>
+//!*
+//!{
+//!	margin:0;padding:0;
+//!	font-size:20px;
+//!	font-family:'AHEM';
+//!}
+//!
+//!ul, ol
+//!{
+//!	list-style-type:disc;
+//!	padding-left:40px;
+//!	width:40px;
+//!}
+//!
+//!li
+//!{
+//!	width:30px;
+//!	display:list-item;
+//!	list-style-position:outside;
+//!	direction:rtl;
+//!	border-right:solid 5px;
+//!	padding-right:5px;
+//!}
+//!
+//!div
+//!{
+//!	width:20px;
+//!	height:20px;
+//!	float:right;
+//!	background-color:lime;
+//!}
+//!
+//!</style>
+//!</head>
+//!
+//!<body>
+//!
+//!<ul>
+//!<div></div>
+//!<li id="list_item"><p>XX</p></li>
+//!</ul>
+//!
+//!</body>
+//!
+//!</html>
+}
+test("existing float influence: rtl, same side, pushed below")
+	require success "PRECONDITION: Font check";
+	require SUPPORT_TEXT_DIRECTION;
+{
+	FramesDocument* doc = state.doc;
+	OpRect rect = GetRectOfMarker(doc, "list_item");
+	OpRect expected = ComposeExpectedOutsideMarkerRect(doc, 20, 40, 0, 20, 40);
+
+	verify(rects_equal_with_error(rect, expected, 0));
+}
+
+html
+{
+//!<!DOCTYPE html>
+//!<html>
+//!<head>
+//!
+//!<style>
+//!*
+//!{
+//!	margin:0;padding:0;
+//!	font-size:20px;
+//!	font-family:'AHEM';
+//!}
+//!
+//!ul, ol
+//!{
+//!	list-style-type:disc;
+//!	padding-left:40px;
+//!	width:40px;
+//!}
+//!
+//!li
+//!{
+//!	width:30px;
+//!	display:list-item;
+//!	list-style-position:outside;
+//!	direction:rtl;
+//!	border-right:solid 5px;
+//!	padding-right:5px;
+//!}
+//!
+//!div
+//!{
+//!	width:20px;
+//!	height:20px;
+//!	float:right;
+//!	background-color:lime;
+//!}
+//!
+//!</style>
+//!</head>
+//!
+//!<body>
+//!
+//!<ul>
+//!<div></div>
+//!<li id="list_item"><p>X</p></li>
+//!</ul>
+//!
+//!</body>
+//!
+//!</html>
+}
+test("existing float influence: rtl, same side, beside float")
+	require success "PRECONDITION: Font check";
+	require SUPPORT_TEXT_DIRECTION;
+{
+	FramesDocument* doc = state.doc;
+	OpRect rect = GetRectOfMarker(doc, "list_item");
+	OpRect expected = ComposeExpectedOutsideMarkerRect(doc, 20, 40, 0, 0, 40);
+
+	verify(rects_equal_with_error(rect, expected, 0));
+}
+
+html
+{
+//!<!DOCTYPE html>
+//!<html>
+//!<head>
+//!
+//!<style>
+//!*
+//!{
+//!	margin:0;padding:0;
+//!	font-size:20px;
+//!	font-family:'AHEM';
+//!}
+//!
+//!ul, ol
+//!{
+//!	list-style-type:disc;
+//!	padding-left:40px;
+//!	width:40px;
+//!}
+//!
+//!li
+//!{
+//!	width:40px;
+//!	display:list-item;
+//!	list-style-position:outside;
+//!	direction:rtl;
+//!}
+//!
+//!div
+//!{
+//!	width:20px;
+//!	height:20px;
+//!	float:left;
+//!	background-color:lime;
+//!}
+//!
+//!</style>
+//!</head>
+//!
+//!<body>
+//!
+//!<ul>
+//!<div></div>
+//!<li id="list_item"><p>XX</p></li>
+//!</ul>
+//!
+//!</body>
+//!
+//!</html>
+}
+test("existing float influence: rtl, opposite side, pushed below")
+	require success "PRECONDITION: Font check";
+	require SUPPORT_TEXT_DIRECTION;
+{
+	FramesDocument* doc = state.doc;
+	OpRect rect = GetRectOfMarker(doc, "list_item");
+	OpRect expected = ComposeExpectedOutsideMarkerRect(doc, 20, 40, 0, 20, 40);
+
+	verify(rects_equal_with_error(rect, expected, 0));
+}
+
+html
+{
+//!<!DOCTYPE html>
+//!<html>
+//!<head>
+//!
+//!<style>
+//!*
+//!{
+//!	margin:0;padding:0;
+//!	font-size:20px;
+//!	font-family:'AHEM';
+//!}
+//!
+//!ul, ol
+//!{
+//!	list-style-type:disc;
+//!	padding-left:40px;
+//!	width:40px;
+//!}
+//!
+//!li
+//!{
+//!	width:40px;
+//!	display:list-item;
+//!	list-style-position:outside;
+//!	direction:rtl;
+//!}
+//!
+//!div
+//!{
+//!	width:20px;
+//!	height:20px;
+//!	float:left;
+//!	background-color:lime;
+//!}
+//!
+//!</style>
+//!</head>
+//!
+//!<body>
+//!
+//!<ul>
+//!<div></div>
+//!<li id="list_item"><p>X</p></li>
+//!</ul>
+//!
+//!</body>
+//!
+//!</html>
+}
+test("existing float influence: rtl, opposite side, beside float")
+	require success "PRECONDITION: Font check";
+	require SUPPORT_TEXT_DIRECTION;
+{
+	FramesDocument* doc = state.doc;
+	OpRect rect = GetRectOfMarker(doc, "list_item");
+	OpRect expected = ComposeExpectedOutsideMarkerRect(doc, 20, 40, 0, 0, 40);
+
+	verify(rects_equal_with_error(rect, expected, 0));
+}
+
+/*	The four below test the outside marker position and a follow up content
+	in case of some extra properties that influence horizontal offsets
+	(padding, border of adjacent principal box'es horizontal edge and text-indent). */
+
+html
+{
+//!<!DOCTYPE html>
+//!<html>
+//!<head>
+//!
+//!<style>
+//!*
+//!{
+//!	margin:0;padding:0;
+//!	font-size:20px;
+//!	font-family:'AHEM';
+//!}
+//!
+//!ul, ol
+//!{
+//!	padding-left:40px;
+//!	list-style-type:disc;
+//!}
+//!
+//!li
+//!{
+//!	width:100px;
+//!	display:list-item;
+//!	list-style-position:outside;
+//!	direction:ltr;
+//!	padding-left:5px;
+//!	border-left:solid 5px;
+//!	text-indent:5px;
+//!}
+//!
+//!div
+//!{
+//!	width:20px;
+//!	height:20px;
+//!	float:left;
+//!	background-color:lime;
+//!}
+//!
+//!</style>
+//!</head>
+//!
+//!<body>
+//!
+//!<ul>
+//!<li id="list_item"><div></div><span id="test_box">X</span></li>
+//!</ul>
+//!
+//!</body>
+//!
+//!</html>
+}
+test("markers and floats: props of principal box, ltr")
+	require success "PRECONDITION: Font check";
+{
+	FramesDocument* doc = state.doc;
+	OpRect rect = GetRectOfMarker(doc, "list_item");
+	OpRect expected = ComposeExpectedOutsideMarkerRect(doc, 20, 40, 0, 0, 0);
+
+	verify(rects_equal_with_error(rect, expected, 0));
+
+	RECT expected1 = {75,0,95,20};
+	verify(CheckAfterMarkerElementRect(state.doc, expected1));
+}
+
+html
+{
+//!<!DOCTYPE html>
+//!<html>
+//!<head>
+//!
+//!<style>
+//!*
+//!{
+//!	margin:0;padding:0;
+//!	font-size:20px;
+//!	font-family:'AHEM';
+//!}
+//!
+//!ul, ol
+//!{
+//!	padding-left:40px;
+//!	list-style-type:disc;
+//!}
+//!
+//!li
+//!{
+//!	width:100px;
+//!	display:list-item;
+//!	list-style-position:outside;
+//!	direction:rtl;
+//!	padding-right:5px;
+//!	border-right:solid 5px;
+//!	text-indent:5px;
+//!}
+//!
+//!div
+//!{
+//!	width:20px;
+//!	height:20px;
+//!	float:right;
+//!	background-color:lime;
+//!}
+//!
+//!</style>
+//!</head>
+//!
+//!<body>
+//!
+//!<ul>
+//!<li id="list_item"><div></div><span id="test_box">X</span></li>
+//!</ul>
+//!
+//!</body>
+//!
+//!</html>
+}
+test("markers and floats: props of principal box, rtl")
+	require success "PRECONDITION: Font check";
+	require SUPPORT_TEXT_DIRECTION;
+{
+	FramesDocument* doc = state.doc;
+	OpRect rect = GetRectOfMarker(doc, "list_item");
+	OpRect expected = ComposeExpectedOutsideMarkerRect(doc, 20, 40, 0, 0, 110);
+
+	verify(rects_equal_with_error(rect, expected, 0));
+
+	RECT expected1 = {95,0,115,20};
+	verify(CheckAfterMarkerElementRect(state.doc, expected1, FALSE, TRUE));
+}
+
+html
+{
+//!<!DOCTYPE html>
+//!<html>
+//!<head>
+//!
+//!<style>
+//!*
+//!{
+//!	margin:0;padding:0;
+//!	font-size:20px;
+//!	font-family:'AHEM';
+//!}
+//!
+//!ul, ol
+//!{
+//!	padding-left:40px;
+//!	list-style-type:disc;
+//!}
+//!
+//!li
+//!{
+//!	width:100px;
+//!	display:list-item;
+//!	list-style-position:outside;
+//!	direction:ltr;
+//!	padding-left:5px;
+//!	border-left:solid 5px;
+//!	text-indent:5px;
+//!}
+//!
+//!div
+//!{
+//!	width:20px;
+//!	height:20px;
+//!	float:left;
+//!	background-color:lime;
+//!}
+//!
+//!</style>
+//!</head>
+//!
+//!<body>
+//!
+//!<ul>
+//!<li id="list_item"><div></div></li>
+//!</ul>
+//!
+//!</body>
+//!
+//!</html>
+}
+test("markers and floats: props of principal box, ltr, just marker")
+	require success "PRECONDITION: Font check";
+{
+	FramesDocument* doc = state.doc;
+	OpRect rect = GetRectOfMarker(doc, "list_item");
+	OpRect expected = ComposeExpectedOutsideMarkerRect(doc, 20, 40, 0, 0, 0);
+
+	verify(rects_equal_with_error(rect, expected, 0));
+}
+
+html
+{
+//!<!DOCTYPE html>
+//!<html>
+//!<head>
+//!
+//!<style>
+//!*
+//!{
+//!	margin:0;padding:0;
+//!	font-size:20px;
+//!	font-family:'AHEM';
+//!}
+//!
+//!ul, ol
+//!{
+//!	padding-left:40px;
+//!	list-style-type:disc;
+//!}
+//!
+//!li
+//!{
+//!	width:100px;
+//!	display:list-item;
+//!	list-style-position:outside;
+//!	direction:rtl;
+//!	padding-right:5px;
+//!	border-right:solid 5px;
+//!	text-indent:5px;
+//!}
+//!
+//!div
+//!{
+//!	width:20px;
+//!	height:20px;
+//!	float:right;
+//!	background-color:lime;
+//!}
+//!
+//!</style>
+//!</head>
+//!
+//!<body>
+//!
+//!<ul>
+//!<li id="list_item"><div></div></li>
+//!</ul>
+//!
+//!</body>
+//!
+//!</html>
+}
+test("markers and floats: props of principal box, rtl, just marker")
+	require success "PRECONDITION: Font check";
+	require SUPPORT_TEXT_DIRECTION;
+{
+	FramesDocument* doc = state.doc;
+	OpRect rect = GetRectOfMarker(doc, "list_item");
+	OpRect expected = ComposeExpectedOutsideMarkerRect(doc, 20, 40, 0, 0, 110);
+
+	verify(rects_equal_with_error(rect, expected, 0));
+}
+
+html
+{
+//!<!DOCTYPE html>
+//!<html>
+//!<head>
+//!
+//!<style>
+//!*
+//!{
+//!	margin:0;padding:0;
+//!	font-size:20px;
+//!	font-family:'AHEM';
+//!}
+//!
+//!ul, ol
+//!{
+//!	padding-left:40px;
+//!	list-style-type:disc;
+//!}
+//!
+//!li
+//!{
+//!	display:list-item;
+//!	list-style-position:outside;
+//!	width:100px;
+//!}
+//!
+//!ul.nested
+//!{
+//!	padding-top:20px;
+//!}
+//!
+//!li.nested
+//!{
+//!	list-style-position:outside;
+//!}
+//!
+//!</style>
+//!</head>
+//!
+//!<body>
+//!
+//!<ul>
+//!<li id="first_outer">
+//!	<ul class="nested">
+//!	<li id="first_nested" class="nested"></li>
+//!	<li class="nested"></li>
+//!	</ul>
+//!</li>
+//!<li id="second_outer">X</li>
+//!</ul>
+//!
+//!</body>
+//!
+//!</html>
+}
+test("outer and nested list: outside, outside")
+	require success "PRECONDITION: Font check";
+{
+	FramesDocument* doc = state.doc;
+	OpRect rect1 = GetRectOfMarker(doc, "first_outer");
+	OpRect expected1 = ComposeExpectedOutsideMarkerRect(doc, 20, 40, 0, 20, 0);
+	OpRect rect2 = GetRectOfMarker(doc, "second_outer");
+	OpRect expected2 = ComposeExpectedOutsideMarkerRect(doc, 20, 40, 60, 0, 0);
+	OpRect rect3 = GetRectOfMarker(doc, "first_nested");
+	OpRect expected3 = ComposeExpectedOutsideMarkerRect(doc, 20, 80, 20, 0, 0);
+
+	verify(rects_equal_with_error(rect1, expected1, 0));
+	verify(rects_equal_with_error(rect2, expected2, 0));
+	verify(rects_equal_with_error(rect3, expected3, 0));
+}
+
+html
+{
+//!<!DOCTYPE html>
+//!<html>
+//!<head>
+//!
+//!<style>
+//!*
+//!{
+//!	margin:0;padding:0;
+//!	font-size:20px;
+//!	font-family:'AHEM';
+//!}
+//!
+//!ul, ol
+//!{
+//!	padding-left:40px;
+//!	list-style-type:disc;
+//!}
+//!
+//!li
+//!{
+//!	display:list-item;
+//!	list-style-position:outside;
+//!	width:100px;
+//!}
+//!
+//!ul.nested
+//!{
+//!	padding-top:20px;
+//!}
+//!
+//!li.nested
+//!{
+//!	list-style-position:inside;
+//!}
+//!
+//!</style>
+//!</head>
+//!
+//!<body>
+//!
+//!<ul>
+//!<li id="first_outer">
+//!	<ul class="nested">
+//!	<li id="first_nested" class="nested"></li>
+//!	<li class="nested"></li>
+//!	</ul>
+//!</li>
+//!<li id="second_outer">X</li>
+//!</ul>
+//!
+//!</body>
+//!
+//!</html>
+}
+test("outer and nested list: outside, inside")
+	require success "PRECONDITION: Font check";
+{
+	FramesDocument* doc = state.doc;
+	OpRect rect1 = GetRectOfMarker(doc, "first_outer");
+	OpRect expected1 = ComposeExpectedOutsideMarkerRect(doc, 20, 40, 0, 20, 0);
+	OpRect rect2 = GetRectOfMarker(doc, "second_outer");
+	OpRect expected2 = ComposeExpectedOutsideMarkerRect(doc, 20, 40, 60, 0, 0);
+	OpRect rect3 = GetRectOfMarker(doc, "first_nested");
+	OpRect expected3 = ComposeExpectedInsideMarkerRect(doc, 20, 80, 20, 0, 0, 100, 0, 0, CSS_VALUE_left, FALSE);
+
+	verify(rects_equal_with_error(rect1, expected1, 0));
+	verify(rects_equal_with_error(rect2, expected2, 0));
+	verify(rects_equal_with_error(rect3, expected3, 0));
+}
+
+html
+{
+//!<!DOCTYPE html>
+//!<html>
+//!<head>
+//!
+//!<style>
+//!*
+//!{
+//!	margin:0;padding:0;
+//!	font-size:20px;
+//!	font-family:'AHEM';
+//!}
+//!
+//!ul, ol
+//!{
+//!	padding-left:40px;
+//!	list-style-type:disc;
+//!}
+//!
+//!li
+//!{
+//!	display:list-item;
+//!	list-style-position:inside;
+//!	width:100px;
+//!}
+//!
+//!ul.nested
+//!{
+//!	padding-top:20px;
+//!}
+//!
+//!li.nested
+//!{
+//!	list-style-position:outside;
+//!}
+//!
+//!</style>
+//!</head>
+//!
+//!<body>
+//!
+//!<ul>
+//!<li id="first_outer">
+//!	<ul class="nested">
+//!	<li id="first_nested" class="nested"></li>
+//!	<li class="nested"></li>
+//!	</ul>
+//!</li>
+//!<li id="second_outer">X</li>
+//!</ul>
+//!
+//!</body>
+//!
+//!</html>
+}
+test("outer and nested list: inside, outside")
+	require success "PRECONDITION: Font check";
+{
+	FramesDocument* doc = state.doc;
+	OpRect rect1 = GetRectOfMarker(doc, "first_outer");
+	OpRect expected1 = ComposeExpectedInsideMarkerRect(doc, 20, 40, 0, 0, 0, 100, 0, 0, CSS_VALUE_left, FALSE);
+	OpRect rect2 = GetRectOfMarker(doc, "second_outer");
+	OpRect expected2 = ComposeExpectedInsideMarkerRect(doc, 20, 40, 80, 0, 0, 100, 0, 0, CSS_VALUE_left, FALSE);
+	OpRect rect3 = GetRectOfMarker(doc, "first_nested");
+	OpRect expected3 = ComposeExpectedOutsideMarkerRect(doc, 20, 80, 40, 0, 0);
+
+	verify(rects_equal_with_error(rect1, expected1, 0));
+	verify(rects_equal_with_error(rect2, expected2, 0));
+	verify(rects_equal_with_error(rect3, expected3, 0));
+}
+
+html
+{
+//!<!DOCTYPE html>
+//!<html>
+//!<head>
+//!
+//!<style>
+//!*
+//!{
+//!	margin:0;padding:0;
+//!	font-size:20px;
+//!	font-family:'AHEM';
+//!}
+//!
+//!ul, ol
+//!{
+//!	padding-left:40px;
+//!	list-style-type:disc;
+//!}
+//!
+//!li
+//!{
+//!	display:list-item;
+//!	list-style-position:inside;
+//!	width:100px;
+//!}
+//!
+//!ul.nested
+//!{
+//!	padding-top:20px;
+//!}
+//!
+//!li.nested
+//!{
+//!	list-style-position:inside;
+//!}
+//!
+//!</style>
+//!</head>
+//!
+//!<body>
+//!
+//!<ul>
+//!<li id="first_outer">
+//!	<ul class="nested">
+//!	<li id="first_nested" class="nested"></li>
+//!	<li class="nested"></li>
+//!	</ul>
+//!</li>
+//!<li id="second_outer">X</li>
+//!</ul>
+//!
+//!</body>
+//!
+//!</html>
+}
+test("outer and nested list: inside, inside")
+	require success "PRECONDITION: Font check";
+{
+	FramesDocument* doc = state.doc;
+	OpRect rect1 = GetRectOfMarker(doc, "first_outer");
+	OpRect expected1 = ComposeExpectedInsideMarkerRect(doc, 20, 40, 0, 0, 0, 100, 0, 0, CSS_VALUE_left, FALSE);
+	OpRect rect2 = GetRectOfMarker(doc, "second_outer");
+	OpRect expected2 = ComposeExpectedInsideMarkerRect(doc, 20, 40, 80, 0, 0, 100, 0, 0, CSS_VALUE_left, FALSE);
+	OpRect rect3 = GetRectOfMarker(doc, "first_nested");
+	OpRect expected3 = ComposeExpectedInsideMarkerRect(doc, 20, 80, 40, 0, 0, 100, 0, 0, CSS_VALUE_left, FALSE);
+
+	verify(rects_equal_with_error(rect1, expected1, 0));
+	verify(rects_equal_with_error(rect2, expected2, 0));
+	verify(rects_equal_with_error(rect3, expected3, 0));
+}
+
+html
+{
+//!<!DOCTYPE html>
+//!<html>
+//!<head>
+//!
+//!<style>
+//!*
+//!{
+//!	margin:0;padding:0;
+//!	font-size:20px;
+//!	font-family:'AHEM';
+//!}
+//!
+//!ul, ol
+//!{
+//!	padding-left:40px;
+//!	list-style-type:disc;
+//!}
+//!
+//!li
+//!{
+//!	display:list-item;
+//!	list-style-position:outside;
+//!	width:100px;
+//!	white-space:normal;
+//!}
+//!
+//!</style>
+//!</head>
+//!
+//!<body>
+//!<ul>
+//!<li> <span id="test_box">X</span></li>
+//!</ul>
+//!
+//!</body>
+//!
+//!</html>
+}
+test("remove leading whitespaces in case of outside marker - disc")
+	require success "PRECONDITION: Font check";
+{
+	RECT expected = {40,0,60,20};
+	verify(CheckAfterMarkerElementRect(state.doc, expected));
+}
+
+html
+{
+//!<!DOCTYPE html>
+//!<html>
+//!<head>
+//!
+//!<style>
+//!*
+//!{
+//!	margin:0;padding:0;
+//!	font-size:20px;
+//!	font-family:'AHEM';
+//!}
+//!
+//!ul, ol
+//!{
+//!	padding-left:40px;
+//!	list-style-type:decimal;
+//!}
+//!
+//!li
+//!{
+//!	display:list-item;
+//!	list-style-position:outside;
+//!	width:100px;
+//!	white-space:normal;
+//!}
+//!
+//!</style>
+//!</head>
+//!
+//!<body>
+//!<ul>
+//!<li> <span id="test_box">X</span></li>
+//!</ul>
+//!
+//!</body>
+//!
+//!</html>
+}
+test("remove leading whitespaces in case of outside marker - decimal")
+	require success "PRECONDITION: Font check";
+{
+	RECT expected = {40,0,60,20};
+	verify(CheckAfterMarkerElementRect(state.doc, expected));
+}
+
+html
+{
+//!<!DOCTYPE html>
+//!<html>
+//!<head>
+//!
+//!<style>
+//!*
+//!{
+//!	margin:0;padding:0;
+//!	font-size:20px;
+//!	font-family:'AHEM';
+//!}
+//!
+//!ul, ol
+//!{
+//!	padding-left:40px;
+//!	list-style-type:disc;
+//!}
+//!
+//!li
+//!{
+//!	display:list-item;
+//!	list-style-position:outside;
+//!	width:100px;
+//!	white-space:pre;
+//!}
+//!
+//!</style>
+//!</head>
+//!
+//!<body>
+//!<ul>
+//!<li> <span id="test_box">X</span></li>
+//!</ul>
+//!
+//!</body>
+//!
+//!</html>
+}
+test("outside marker and white-space:pre, keep leading whitespaces")
+	require success "PRECONDITION: Font check";
+{
+	RECT expected = {60,0,80,20};
+	verify(CheckAfterMarkerElementRect(state.doc, expected));
+}
+
+html
+{
+//!<!DOCTYPE html>
+//!<html>
+//!<head>
+//!
+//!<style>
+//!*
+//!{
+//!	margin:0;padding:0;
+//!	font-size:20px;
+//!	font-family:'AHEM';
+//!}
+//!
+//!li
+//!{
+//!	display:list-item;
+//!	float:left;
+//!	list-style-position:inside;
+//!}
+//!
+//!</style>
+//!</head>
+//!
+//!<body>
+//!
+//!<li><span id="test_box">X</span></li>
+//!
+//!</body>
+//!
+//!</html>
+}
+test("list item with outside marker being shrink to fit container")
+	require success "PRECONDITION: Font check";
+	// Prevent first word wrap
+{
+	RECT expected = {0,0,0,20};
+	verify(CheckAfterMarkerElementRect(state.doc, expected, TRUE));
+}
+
+html
+{
+//!<!DOCTYPE html>
+//!<html>
+//!<head>
+//!
+//!<style>
+//!*
+//!{
+//!	margin:0;padding:0;
+//!	font-size:20px;
+//!	font-family:'AHEM';
+//!}
+//!
+//!ul, ol
+//!{
+//!	padding-left:40px;
+//!	list-style-type:disc;
+//!}
+//!
+//!li
+//!{
+//!	display:list-item;
+//!	list-style-position:outside;
+//!	width:100px;
+//!	white-space:normal;
+//!}
+//!
+//!</style>
+//!</head>
+//!
+//!<body>
+//!<ul>
+//!<li><span id="test_box">XXXXXXX</span></li>
+//!</ul>
+//!
+//!</body>
+//!
+//!</html>
+}
+test("long first word after outside marker (disc) - prevent wrap")
+	require success "PRECONDITION: Font check";
+{
+	RECT expected = {40,0,180,20};
+	verify(CheckAfterMarkerElementRect(state.doc, expected));
+}
+
+
+html
+{
+//!<!DOCTYPE html>
+//!<html>
+//!<head>
+//!
+//!<style>
+//!*
+//!{
+//!	margin:0;padding:0;
+//!	font-size:20px;
+//!	font-family:'AHEM';
+//!}
+//!
+//!ul, ol
+//!{
+//!	padding-left:40px;
+//!	list-style-type:decimal;
+//!}
+//!
+//!li
+//!{
+//!	display:list-item;
+//!	list-style-position:outside;
+//!	width:100px;
+//!	white-space:normal;
+//!}
+//!
+//!</style>
+//!</head>
+//!
+//!<body>
+//!<ul>
+//!<li><span id="test_box">XXXXXXX</span></li>
+//!</ul>
+//!
+//!</body>
+//!
+//!</html>
+}
+test("long first word after outside marker (number) - prevent wrap")
+	require success "PRECONDITION: Font check";
+{
+	RECT expected = {40,0,180,20};
+	verify(CheckAfterMarkerElementRect(state.doc, expected));
+}
+
+html
+{
+//!<!DOCTYPE html>
+//!<html>
+//!<head>
+//!
+//!<style>
+//!*
+//!{
+//!	margin:0;padding:0;
+//!	font-size:30px;
+//!	font-family:'AHEM';
+//!}
+//!
+//!ul, ol
+//!{
+//!	padding-left:40px;
+//!	list-style-type:disc;
+//!	list-style-image:url("data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAoAAAAKCAYAAACNMs+9AAAAAXNSR0IArs4c6QAAAARnQU1BAACxjwv8YQUAAAAJcEhZcwAADsQAAA7EAZUrDhsAAAAdSURBVChTY2RoYPjPQARgIkINWMmoQrwhRXTwAAByJgGTF7LYIgAAAABJRU5ErkJggg==");
+//!}
+//!
+//!li
+//!{
+//!	display:list-item;
+//!	width:100px;
+//!	list-style-position:inside;
+//!	background-color:yellow;
+//!}
+//!
+//!</style>
+//!</head>
+//!
+//!<body>
+//!<ul>
+//!<li id="list_item"></li>
+//!</ul>
+//!</body>
+//!
+//!</html>
+}
+test("image markers: ltr, smaller than font, image")
+	require success "PRECONDITION: Font check";
+{
+	FramesDocument* doc = state.doc;
+	OpRect rect = GetRectOfMarker(doc, "list_item");
+	OpRect expected = ComposeExpectedImageMarkerRect(doc, 30, 40, 0, 0, 10);
+
+	verify(rects_equal_with_error(rect, expected, 0));
+}
+
+html
+{
+//!<!DOCTYPE html>
+//!<html>
+//!<head>
+//!
+//!<style>
+//!*
+//!{
+//!	margin:0;padding:0;
+//!	font-size:30px;
+//!	font-family:'AHEM';
+//!}
+//!
+//!ul, ol
+//!{
+//!	padding-left:40px;
+//!	list-style-type:disc;
+//!	list-style-image:url(data:image/svg+xml;base64,PD94bWwgdmVyc2lvbj0iMS4wIiBzdGFuZGFsb25lPSJubyI/Pg0KPCFET0NUWVBFIHN2ZyBQVUJMSUMgIi0vL1czQy8vRFREIFNWRyAxLjEvL0VOIiANCiJodHRwOi8vd3d3LnczLm9yZy9HcmFwaGljcy9TVkcvMS4xL0RURC9zdmcxMS5kdGQiPg0KDQo8c3ZnIHdpZHRoPSIxMCIgaGVpZ2h0PSIxMCIgdmVyc2lvbj0iMS4xIg0KeG1sbnM9Imh0dHA6Ly93d3cudzMub3JnLzIwMDAvc3ZnIj4NCg0KPHJlY3Qgd2lkdGg9IjEwIiBoZWlnaHQ9IjEwIg0Kc3R5bGU9ImZpbGw6cmdiKDAsMjU1LDApO3N0cm9rZS13aWR0aDoxOw0Kc3Ryb2tlOnJnYigwLDAsMCkiLz4NCg0KPC9zdmc+);
+//!}
+//!
+//!li
+//!{
+//!	display:list-item;
+//!	width:100px;
+//!	list-style-position:inside;
+//!	background-color:yellow;
+//!}
+//!
+//!</style>
+//!</head>
+//!
+//!<body>
+//!<ul>
+//!<li id="list_item"></li>
+//!</ul>
+//!</body>
+//!
+//!</html>
+}
+test("wait until svg ready 1") async;
+	require success "PRECONDITION: Font check";
+	require SVG_SUPPORT;
+{
+	if (!state.doc)
+		ST_failed("There is no document!");
+	else
+		WaitUntilSVGReadyObj::WaitUntilSVGReady("list_item");
+}
+test("image markers: ltr, smaller than font, svg")
+	require success "wait until svg ready 1";
+{
+	FramesDocument* doc = state.doc;
+	OpRect rect = GetRectOfMarker(doc, "list_item");
+	OpRect expected = ComposeExpectedImageMarkerRect(doc, 30, 40, 0, 0, 10);
+
+	verify(rects_equal_with_error(rect, expected, 0));
+}
+
+html
+{
+//!<!DOCTYPE html>
+//!<html>
+//!<head>
+//!
+//!<style>
+//!*
+//!{
+//!	margin:0;padding:0;
+//!	font-size:30px;
+//!	font-family:'AHEM';
+//!}
+//!
+//!ul, ol
+//!{
+//!	padding-left:40px;
+//!	list-style-type:disc;
+//!	list-style-image:url("data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAACgAAAAoCAYAAACM/rhtAAAAAXNSR0IArs4c6QAAAARnQU1BAACxjwv8YQUAAAAJcEhZcwAADsQAAA7EAZUrDhsAAABeSURBVFhH7dKxDcAwDAQxxZNn8wTwCteooPsDBPqfeeebxe8svu2e5sD6QwQJVoHa2yDBKlB7GyRYBWpvgwSrQO1tkGAVqL0NEqwCtbdBglWg9jZIsArU3gYJVoHa/6erAc8b0tpmAAAAAElFTkSuQmCC");
+//!}
+//!
+//!li
+//!{
+//!	display:list-item;
+//!	width:100px;
+//!	list-style-position:inside;
+//!	background-color:yellow;
+//!}
+//!
+//!</style>
+//!</head>
+//!
+//!<body>
+//!<ul>
+//!<li id="list_item"></li>
+//!</ul>
+//!</body>
+//!
+//!</html>
+}
+test("image markers: ltr, bigger than font, image")
+	require success "PRECONDITION: Font check";
+{
+	FramesDocument* doc = state.doc;
+	OpRect rect = GetRectOfMarker(doc, "list_item");
+	OpRect expected = ComposeExpectedImageMarkerRect(doc, 30, 40, 0, 0, 40);
+
+	verify(rects_equal_with_error(rect, expected, 0));
+}
+
+html
+{
+//!<!DOCTYPE html>
+//!<html>
+//!<head>
+//!
+//!<style>
+//!*
+//!{
+//!	margin:0;padding:0;
+//!	font-size:30px;
+//!	font-family:'AHEM';
+//!}
+//!
+//!ul, ol
+//!{
+//!	padding-left:40px;
+//!	list-style-type:disc;
+//!	list-style-image:url(data:image/svg+xml;base64,PD94bWwgdmVyc2lvbj0iMS4wIiBzdGFuZGFsb25lPSJubyI/Pg0KPCFET0NUWVBFIHN2ZyBQVUJMSUMgIi0vL1czQy8vRFREIFNWRyAxLjEvL0VOIiANCiJodHRwOi8vd3d3LnczLm9yZy9HcmFwaGljcy9TVkcvMS4xL0RURC9zdmcxMS5kdGQiPg0KDQo8c3ZnIHdpZHRoPSI0MCIgaGVpZ2h0PSI0MCIgdmVyc2lvbj0iMS4xIg0KeG1sbnM9Imh0dHA6Ly93d3cudzMub3JnLzIwMDAvc3ZnIj4NCg0KPHJlY3Qgd2lkdGg9IjQwIiBoZWlnaHQ9IjQwIg0Kc3R5bGU9ImZpbGw6cmdiKDAsMjU1LDApO3N0cm9rZS13aWR0aDoxOw0Kc3Ryb2tlOnJnYigwLDAsMCkiLz4NCg0KPC9zdmc+);
+//!}
+//!
+//!li
+//!{
+//!	display:list-item;
+//!	width:100px;
+//!	list-style-position:inside;
+//!	background-color:yellow;
+//!}
+//!
+//!</style>
+//!</head>
+//!
+//!<body>
+//!<ul>
+//!<li id="list_item"></li>
+//!</ul>
+//!</body>
+//!
+//!</html>
+}
+test("wait until svg ready 2") async;
+	require success "PRECONDITION: Font check";
+	require SVG_SUPPORT;
+{
+	if (!state.doc)
+		ST_failed("There is no document!");
+	else
+		WaitUntilSVGReadyObj::WaitUntilSVGReady("list_item");
+}
+test("image markers: ltr, bigger than font, svg")
+	require success "wait until svg ready 2";
+{
+	FramesDocument* doc = state.doc;
+	OpRect rect = GetRectOfMarker(doc, "list_item");
+	OpRect expected = ComposeExpectedImageMarkerRect(doc, 30, 40, 0, 0, 40);
+
+	verify(rects_equal_with_error(rect, expected, 0));
+}
+
+html
+{
+//!<!DOCTYPE html>
+//!<html>
+//!<head>
+//!
+//!<style>
+//!*
+//!{
+//!	margin:0;padding:0;
+//!	font-size:30px;
+//!	font-family:'AHEM';
+//!}
+//!
+//!ul, ol
+//!{
+//!	padding-left:40px;
+//!	list-style-type:disc;
+//!	list-style-image:url("data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAoAAAAKCAYAAACNMs+9AAAAAXNSR0IArs4c6QAAAARnQU1BAACxjwv8YQUAAAAJcEhZcwAADsQAAA7EAZUrDhsAAAAdSURBVChTY2RoYPjPQARgIkINWMmoQrwhRXTwAAByJgGTF7LYIgAAAABJRU5ErkJggg==");
+//!}
+//!
+//!li
+//!{
+//!	display:list-item;
+//!	width:100px;
+//!	list-style-position:inside;
+//!	background-color:yellow;
+//!	direction:rtl;
+//!}
+//!
+//!</style>
+//!</head>
+//!
+//!<body>
+//!<ul>
+//!<li id="list_item"></li>
+//!</ul>
+//!</body>
+//!
+//!</html>
+}
+test("image markers: rtl, smaller than font, image")
+	require success "PRECONDITION: Font check";
+	require SUPPORT_TEXT_DIRECTION;
+{
+	FramesDocument* doc = state.doc;
+	OpRect rect = GetRectOfMarker(doc, "list_item");
+	OpRect expected = ComposeExpectedImageMarkerRect(doc, 30, 40, 0, 100, 10);
+
+	verify(rects_equal_with_error(rect, expected, 0));
+}
+
+html
+{
+//!<!DOCTYPE html>
+//!<html>
+//!<head>
+//!
+//!<style>
+//!*
+//!{
+//!	margin:0;padding:0;
+//!	font-size:30px;
+//!	font-family:'AHEM';
+//!}
+//!
+//!ul, ol
+//!{
+//!	padding-left:40px;
+//!	list-style-type:disc;
+//!	list-style-image:url(data:image/svg+xml;base64,PD94bWwgdmVyc2lvbj0iMS4wIiBzdGFuZGFsb25lPSJubyI/Pg0KPCFET0NUWVBFIHN2ZyBQVUJMSUMgIi0vL1czQy8vRFREIFNWRyAxLjEvL0VOIiANCiJodHRwOi8vd3d3LnczLm9yZy9HcmFwaGljcy9TVkcvMS4xL0RURC9zdmcxMS5kdGQiPg0KDQo8c3ZnIHdpZHRoPSIxMCIgaGVpZ2h0PSIxMCIgdmVyc2lvbj0iMS4xIg0KeG1sbnM9Imh0dHA6Ly93d3cudzMub3JnLzIwMDAvc3ZnIj4NCg0KPHJlY3Qgd2lkdGg9IjEwIiBoZWlnaHQ9IjEwIg0Kc3R5bGU9ImZpbGw6cmdiKDAsMjU1LDApO3N0cm9rZS13aWR0aDoxOw0Kc3Ryb2tlOnJnYigwLDAsMCkiLz4NCg0KPC9zdmc+);
+//!}
+//!
+//!li
+//!{
+//!	display:list-item;
+//!	width:100px;
+//!	list-style-position:inside;
+//!	background-color:yellow;
+//!	direction:rtl;
+//!}
+//!
+//!</style>
+//!</head>
+//!
+//!<body>
+//!<ul>
+//!<li id="list_item"></li>
+//!</ul>
+//!</body>
+//!
+//!</html>
+}
+test("wait until svg ready 3") async;
+	require success "PRECONDITION: Font check";
+	require SVG_SUPPORT;
+	require SUPPORT_TEXT_DIRECTION;
+{
+	if (!state.doc)
+		ST_failed("There is no document!");
+	else
+		WaitUntilSVGReadyObj::WaitUntilSVGReady("list_item");
+}
+test("image markers: rtl, smaller than font, svg")
+	require success "wait until svg ready 3";
+{
+	FramesDocument* doc = state.doc;
+	OpRect rect = GetRectOfMarker(doc, "list_item");
+	OpRect expected = ComposeExpectedImageMarkerRect(doc, 30, 40, 0, 100, 10);
+
+	verify(rects_equal_with_error(rect, expected, 0));
+}
+
+html
+{
+//!<!DOCTYPE html>
+//!<html>
+//!<head>
+//!
+//!<style>
+//!*
+//!{
+//!	margin:0;padding:0;
+//!	font-size:30px;
+//!	font-family:'AHEM';
+//!}
+//!
+//!ul, ol
+//!{
+//!	padding-left:40px;
+//!	list-style-type:disc;
+//!	list-style-image:url("data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAACgAAAAoCAYAAACM/rhtAAAAAXNSR0IArs4c6QAAAARnQU1BAACxjwv8YQUAAAAJcEhZcwAADsQAAA7EAZUrDhsAAABeSURBVFhH7dKxDcAwDAQxxZNn8wTwCteooPsDBPqfeeebxe8svu2e5sD6QwQJVoHa2yDBKlB7GyRYBWpvgwSrQO1tkGAVqL0NEqwCtbdBglWg9jZIsArU3gYJVoHa/6erAc8b0tpmAAAAAElFTkSuQmCC");
+//!}
+//!
+//!li
+//!{
+//!	display:list-item;
+//!	width:100px;
+//!	list-style-position:inside;
+//!	background-color:yellow;
+//!	direction:rtl;
+//!}
+//!
+//!</style>
+//!</head>
+//!
+//!<body>
+//!<ul>
+//!<li id="list_item"></li>
+//!</ul>
+//!</body>
+//!
+//!</html>
+}
+test("image markers: rtl, bigger than font, image")
+	require success "PRECONDITION: Font check";
+	require SUPPORT_TEXT_DIRECTION;
+{
+	FramesDocument* doc = state.doc;
+	OpRect rect = GetRectOfMarker(doc, "list_item");
+	OpRect expected = ComposeExpectedImageMarkerRect(doc, 30, 40, 0, 100, 40);
+
+	verify(rects_equal_with_error(rect, expected, 0));
+}
+
+html
+{
+//!<!DOCTYPE html>
+//!<html>
+//!<head>
+//!
+//!<style>
+//!*
+//!{
+//!	margin:0;padding:0;
+//!	font-size:30px;
+//!	font-family:'AHEM';
+//!}
+//!
+//!ul, ol
+//!{
+//!	padding-left:40px;
+//!	list-style-type:disc;
+//!	list-style-image:url(data:image/svg+xml;base64,PD94bWwgdmVyc2lvbj0iMS4wIiBzdGFuZGFsb25lPSJubyI/Pg0KPCFET0NUWVBFIHN2ZyBQVUJMSUMgIi0vL1czQy8vRFREIFNWRyAxLjEvL0VOIiANCiJodHRwOi8vd3d3LnczLm9yZy9HcmFwaGljcy9TVkcvMS4xL0RURC9zdmcxMS5kdGQiPg0KDQo8c3ZnIHdpZHRoPSI0MCIgaGVpZ2h0PSI0MCIgdmVyc2lvbj0iMS4xIg0KeG1sbnM9Imh0dHA6Ly93d3cudzMub3JnLzIwMDAvc3ZnIj4NCg0KPHJlY3Qgd2lkdGg9IjQwIiBoZWlnaHQ9IjQwIg0Kc3R5bGU9ImZpbGw6cmdiKDAsMjU1LDApO3N0cm9rZS13aWR0aDoxOw0Kc3Ryb2tlOnJnYigwLDAsMCkiLz4NCg0KPC9zdmc+);
+//!}
+//!
+//!li
+//!{
+//!	display:list-item;
+//!	width:100px;
+//!	list-style-position:inside;
+//!	background-color:yellow;
+//!	direction:rtl;
+//!}
+//!
+//!</style>
+//!</head>
+//!
+//!<body>
+//!<ul>
+//!<li id="list_item"></li>
+//!</ul>
+//!</body>
+//!
+//!</html>
+}
+test("wait until svg ready 4") async;
+	require success "PRECONDITION: Font check";
+	require SVG_SUPPORT;
+	require SUPPORT_TEXT_DIRECTION;
+{
+	if (!state.doc)
+		ST_failed("There is no document!");
+	else
+		WaitUntilSVGReadyObj::WaitUntilSVGReady("list_item");
+}
+test("image markers: rtl, bigger than font, svg")
+	require success "wait until svg ready 4";
+{
+	FramesDocument* doc = state.doc;
+	OpRect rect = GetRectOfMarker(doc, "list_item");
+	OpRect expected = ComposeExpectedImageMarkerRect(doc, 30, 40, 0, 100, 40);
+
+	verify(rects_equal_with_error(rect, expected, 0));
+}
+
+html
+{
+//!<!DOCTYPE html>
+//!<html>
+//!<head>
+//!
+//!<style>
+//!*
+//!{
+//!	margin:0;padding:0;
+//!	font-size:20px;
+//!}
+//!
+//!ul, ol
+//!{
+//!	padding-left:40px;
+//!	list-style-type:decimal;
+//!}
+//!
+//!li
+//!{
+//!	display:list-item;
+//!	list-style-position:inside;
+//!}
+//!
+//!</style>
+//!
+//!<script>
+//!window.onload = on_load;
+//!
+//!function on_load()
+//!{
+//!	element = document.getElementById("attr_change");
+//!	element.setAttribute('value','10');
+//!	finish();
+//!}
+//!
+//!function finish()
+//!{
+//!	element = document.getElementById("dummy");
+//!	element.setAttribute("id", "function_executed");
+//!}
+//!</script>
+//!
+//!</head>
+//!
+//!<body>
+//!<ol>
+//!<li id="first">X</li>
+//!<li id="attr_change" value="2">Y</li>
+//!<li id="third">Z</li>
+//!</ol>
+//!
+//!<p id="dummy"></p>
+//!
+//!</body>
+//!
+//!</html>
+}
+test("wait until scripts finished 1") async;
+{
+	if (!state.doc)
+		ST_failed("There is no document!");
+	else
+		CheckJSFunctionExecutedObj::WaitUntilJSFunctionExecuted(state.doc);
+}
+test("numbering after value attribute change")
+	require success "wait until scripts finished 1";
+{
+	verify(CheckNumberStringOfListItem(state.doc, "first", "1."));
+	verify(CheckNumberStringOfListItem(state.doc, "attr_change", "10."));
+	verify(CheckNumberStringOfListItem(state.doc, "third", "11."));
+}
+
+html
+{
+//!<!DOCTYPE html>
+//!<html>
+//!<head>
+//!
+//!<style>
+//!*
+//!{
+//!	margin:0;padding:0;
+//!	font-size:20px;
+//!}
+//!
+//!ul, ol
+//!{
+//!	padding-left:40px;
+//!	list-style-type:decimal;
+//!}
+//!
+//!li
+//!{
+//!	display:list-item;
+//!	list-style-position:inside;
+//!}
+//!
+//!</style>
+//!
+//!<script>
+//!window.onload = on_load;
+//!
+//!function on_load()
+//!{
+//!	element = document.getElementById("insert_before");
+//!	ul_element = document.getElementById("ol");
+//!	var new_li = document.createElement('li');
+//!
+//!	new_li.setAttribute('id','second');
+//!	ul_element.insertBefore(new_li, element);
+//!	finish();
+//!}
+//!
+//!function finish()
+//!{
+//!	element = document.getElementById("dummy");
+//!	element.setAttribute("id", "function_executed");
+//!}
+//!</script>
+//!
+//!</head>
+//!
+//!<body>
+//!<ol id="ol">
+//!	<li id="first">X</li>
+//!	<li id="insert_before">Y</li>
+//!</ol>
+//!
+//!<p id="dummy"></p>
+//!
+//!</body>
+//!
+//!</html>
+}
+test("wait until scripts finished 2") async;
+{
+	if (!state.doc)
+		ST_failed("There is no document!");
+	else
+		CheckJSFunctionExecutedObj::WaitUntilJSFunctionExecuted(state.doc);
+}
+test("numbering after list item node insertion")
+	require success "wait until scripts finished 2";
+{
+	verify(CheckNumberStringOfListItem(state.doc, "first", "1."));
+	verify(CheckNumberStringOfListItem(state.doc, "second", "2."));
+	verify(CheckNumberStringOfListItem(state.doc, "insert_before", "3."));
+}
+
+html
+{
+//!<!DOCTYPE html>
+//!<html>
+//!<head>
+//!
+//!<style>
+//!*
+//!{
+//!	margin:0;padding:0;
+//!	font-size:20px;
+//!}
+//!
+//!ul, ol
+//!{
+//!	padding-left:40px;
+//!	list-style-type:decimal;
+//!}
+//!
+//!li
+//!{
+//!	display:list-item;
+//!	list-style-position:inside;
+//!}
+//!
+//!</style>
+//!
+//!<script>
+//!window.onload = on_load;
+//!
+//!function on_load()
+//!{
+//!	element = document.getElementById("to_remove");
+//!	ul_element = document.getElementById("ol");
+//!
+//!	ul_element.removeChild(element);
+//!	finish();
+//!}
+//!
+//!function finish()
+//!{
+//!	element = document.getElementById("dummy");
+//!	element.setAttribute("id", "function_executed");
+//!}
+//!</script>
+//!
+//!</head>
+//!
+//!<body>
+//!<ol id="ol">
+//!	<li id="first">X</li>
+//!	<li id="to_remove">Y</li>
+//!	<li id="third">Z</li>
+//!</ol>
+//!
+//!<p id="dummy"></p>
+//!
+//!</body>
+//!
+//!</html>
+}
+test("wait until scripts finished 3") async;
+{
+	if (!state.doc)
+		ST_failed("There is no document!");
+	else
+		CheckJSFunctionExecutedObj::WaitUntilJSFunctionExecuted(state.doc);
+}
+test("numbering after list item node remove")
+	require success "wait until scripts finished 3";
+{
+	verify(CheckNumberStringOfListItem(state.doc, "first", "1."));
+	verify(CheckNumberStringOfListItem(state.doc, "third", "2."));
+}
+
+html
+{
+//!<!DOCTYPE html>
+//!<html>
+//!<head>
+//!
+//!<style>
+//!*
+//!{
+//!	margin:0;padding:0;
+//!	font-size:20px;
+//!}
+//!
+//!ul, ol
+//!{
+//!	padding-left:40px;
+//!	list-style-type:disc;
+//!}
+//!
+//!li
+//!{
+//!	display:list-item;
+//!	list-style-position:inside;
+//!}
+//!
+//!</style>
+//!
+//!<script>
+//!window.onload = on_load;
+//!
+//!function on_load()
+//!{
+//!	element = document.getElementById("changing");
+//!	element.style.listStyleType = 'decimal';
+//!	finish();
+//!}
+//!
+//!function finish()
+//!{
+//!	element = document.getElementById("dummy");
+//!	element.setAttribute("id", "function_executed");
+//!}
+//!</script>
+//!
+//!</head>
+//!
+//!<body>
+//!
+//!<ul>
+//!	<li>X</li>
+//!	<li id="changing">Y</li>
+//!</ul>
+//!
+//!<p id="dummy"></p>
+//!
+//!</body>
+//!
+//!</html>
+}
+test("wait until scripts finished 4") async;
+{
+	if (!state.doc)
+		ST_failed("There is no document!");
+	else
+		CheckJSFunctionExecutedObj::WaitUntilJSFunctionExecuted(state.doc);
+}
+test("numbering after glyph to decimal style change")
+	require success "wait until scripts finished 4";
+{
+	verify(CheckNumberStringOfListItem(state.doc, "changing", "2."));
+}
+
+html
+{
+//!<!DOCTYPE html>
+//!<html>
+//!<head>
+//!
+//!<style>
+//!*
+//!{
+//!	margin:0;padding:0;
+//!	font-size:20px;
+//!	font-family:'AHEM';
+//!}
+//!
+//!ul, ol
+//!{
+//!	padding-left:40px;
+//!	list-style-type:disc;
+//!}
+//!
+//!li
+//!{
+//!	display:list-item;
+//!	list-style-position:outside;
+//!}
+//!
+//!div.first
+//!{
+//!	width:40px;
+//!	height:20px;
+//!	background-color:lime;
+//!	padding-top:10px;
+//!}
+//!
+//!#modified
+//!{
+//!	width:40px;
+//!	height:10px;
+//!	background-color:yellow;
+//!}
+//!
+//!</style>
+//!
+//!<script>
+//!window.onload = on_load;
+//!
+//!function on_load()
+//!{
+//!	element = document.getElementById("modified");
+//!	element.style.width = '50px';
+//!	finish();
+//!}
+//!
+//!function finish()
+//!{
+//!	element = document.getElementById("dummy");
+//!	element.setAttribute("id", "function_executed");
+//!}
+//!</script>
+//!
+//!</head>
+//!
+//!<body>
+//!
+//!<ul>
+//!	<li id="list_item">
+//!		<div class="first">X</div>
+//!		<div id="modified"></div>
+//!	</li>
+//!</ul>
+//!
+//!<p id="dummy"></p>
+//!
+//!</body>
+//!
+//!</html>
+}
+test("wait until scripts finished 5") async;
+	require success "PRECONDITION: Font check";
+{
+	if (!state.doc)
+		ST_failed("There is no document!");
+	else
+		CheckJSFunctionExecutedObj::WaitUntilJSFunctionExecuted(state.doc);
+}
+test("flexible marker position after descendant's prop change")
+	require success "wait until scripts finished 5";
+	/* Changing a property of a list item's descendant that marks the element dirty
+	   but not extra dirty and the flexible marker should be vertically aligned
+	   with some earlier list item's descendant line. */
+{
+	FramesDocument* doc = state.doc;
+	OpRect rect = GetRectOfMarker(doc, "list_item");
+	OpRect expected = ComposeExpectedOutsideMarkerRect(doc, 20, 40, 0, 10, 0);
+
+	verify(rects_equal_with_error(rect, expected, 0));
+}
+
+html
+{
+//!<!DOCTYPE html>
+//!<html>
+//!<head>
+//!
+//!<style>
+//!*
+//!{
+//!	margin:0;padding:0;
+//!	font-size:20px;
+//!}
+//!
+//!ul, ol
+//!{
+//!	padding-left:40px;
+//!	list-style-type:decimal;
+//!}
+//!
+//!li
+//!{
+//!	display:list-item;
+//!	list-style-position:inside;
+//!}
+//!
+//!</style>
+//!
+//!<script>
+//!window.onload = on_load;
+//!
+//!function on_load()
+//!{
+//!	element = document.getElementById("to_none");
+//!	element.style.display = 'none';
+//!
+//!	finish();
+//!}
+//!
+//!function finish()
+//!{
+//!	element = document.getElementById("dummy");
+//!	element.setAttribute("id", "function_executed");
+//!}
+//!</script>
+//!
+//!</head>
+//!
+//!<body>
+//!<ol id="ol">
+//!	<li id="first">X</li>
+//!	<li id="to_none">Y</li>
+//!	<li id="third">Z</li>
+//!</ol>
+//!
+//!<p id="dummy"></p>
+//!
+//!</body>
+//!
+//!</html>
+}
+test("wait until scripts finished 6") async;
+{
+	if (!state.doc)
+		ST_failed("There is no document!");
+	else
+		CheckJSFunctionExecutedObj::WaitUntilJSFunctionExecuted(state.doc);
+}
+test("numbering after setting one list item display to none")
+	require success "wait until scripts finished 6";
+{
+	verify(CheckNumberStringOfListItem(state.doc, "first", "1."));
+	verify(CheckNumberStringOfListItem(state.doc, "third", "2."));
+}
+
+html
+{
+//!<!DOCTYPE html>
+//!<html>
+//!<head>
+//!
+//!<style>
+//!*
+//!{
+//!	margin:0;padding:0;
+//!	font-size:20px;
+//!}
+//!
+//!ul, ol
+//!{
+//!	padding-left:40px;
+//!	list-style-type:decimal;
+//!}
+//!
+//!li
+//!{
+//!	display:list-item;
+//!	list-style-position:inside;
+//!}
+//!
+//!</style>
+//!
+//!<script>
+//!window.onload = on_load;
+//!
+//!function on_load()
+//!{
+//!	element = document.getElementById("attr_change");
+//!	element.setAttribute('value','10');
+//!	finish();
+//!}
+//!
+//!function finish()
+//!{
+//!	element = document.getElementById("dummy");
+//!	element.setAttribute("id", "function_executed");
+//!}
+//!</script>
+//!
+//!</head>
+//!
+//!<body>
+//!<ol reversed="1">
+//!<li id="first">X</li>
+//!<li id="attr_change" value="2">Y</li>
+//!<li id="third">Z</li>
+//!</ol>
+//!
+//!<p id="dummy"></p>
+//!
+//!</body>
+//!
+//!</html>
+}
+test("wait until scripts finished 7") async;
+{
+	if (!state.doc)
+		ST_failed("There is no document!");
+	else
+		CheckJSFunctionExecutedObj::WaitUntilJSFunctionExecuted(state.doc);
+}
+test("numbering after value attribute change - reversed")
+	require success "wait until scripts finished 7";
+{
+	verify(CheckNumberStringOfListItem(state.doc, "first", "3."));
+	verify(CheckNumberStringOfListItem(state.doc, "attr_change", "10."));
+	verify(CheckNumberStringOfListItem(state.doc, "third", "9."));
+}
+
+html
+{
+//!<!DOCTYPE html>
+//!<html>
+//!<head>
+//!
+//!<style>
+//!*
+//!{
+//!	margin:0;padding:0;
+//!	font-size:20px;
+//!}
+//!
+//!ul, ol
+//!{
+//!	padding-left:40px;
+//!	list-style-type:decimal;
+//!}
+//!
+//!li
+//!{
+//!	display:list-item;
+//!	list-style-position:inside;
+//!}
+//!
+//!</style>
+//!
+//!<script>
+//!window.onload = on_load;
+//!
+//!function on_load()
+//!{
+//!	element = document.getElementById("insert_before");
+//!	ol_element = document.getElementById("ol");
+//!	var new_li = document.createElement('li');
+//!
+//!	new_li.setAttribute('id','second');
+//!	ol_element.insertBefore(new_li, element);
+//!	finish();
+//!}
+//!
+//!function finish()
+//!{
+//!	element = document.getElementById("dummy");
+//!	element.setAttribute("id", "function_executed");
+//!}
+//!</script>
+//!
+//!</head>
+//!
+//!<body>
+//!<ol id="ol" reversed="1">
+//!	<li id="first">X</li>
+//!	<li id="insert_before">Y</li>
+//!</ol>
+//!
+//!<p id="dummy"></p>
+//!
+//!</body>
+//!
+//!</html>
+}
+test("wait until scripts finished 8") async;
+{
+	if (!state.doc)
+		ST_failed("There is no document!");
+	else
+		CheckJSFunctionExecutedObj::WaitUntilJSFunctionExecuted(state.doc);
+}
+test("numbering after list item node insertion - reversed")
+	require success "wait until scripts finished 8";
+{
+	verify(CheckNumberStringOfListItem(state.doc, "first", "3."));
+	verify(CheckNumberStringOfListItem(state.doc, "second", "2."));
+	verify(CheckNumberStringOfListItem(state.doc, "insert_before", "1."));
+}
+
+html
+{
+//!<!DOCTYPE html>
+//!<html>
+//!<head>
+//!
+//!<style>
+//!*
+//!{
+//!	margin:0;padding:0;
+//!	font-size:20px;
+//!}
+//!
+//!ul, ol
+//!{
+//!	padding-left:40px;
+//!	list-style-type:decimal;
+//!}
+//!
+//!li
+//!{
+//!	display:list-item;
+//!	list-style-position:inside;
+//!}
+//!
+//!</style>
+//!
+//!<script>
+//!window.onload = on_load;
+//!
+//!function on_load()
+//!{
+//!	element = document.getElementById("to_remove");
+//!	ol_element = document.getElementById("ol");
+//!
+//!	ol_element.removeChild(element);
+//!	finish();
+//!}
+//!
+//!function finish()
+//!{
+//!	element = document.getElementById("dummy");
+//!	element.setAttribute("id", "function_executed");
+//!}
+//!</script>
+//!
+//!</head>
+//!
+//!<body>
+//!<ol id="ol" reversed="1">
+//!	<li id="first">X</li>
+//!	<li id="to_remove">Y</li>
+//!	<li id="third">Z</li>
+//!</ol>
+//!
+//!<p id="dummy"></p>
+//!
+//!</body>
+//!
+//!</html>
+}
+test("wait until scripts finished 9") async;
+{
+	if (!state.doc)
+		ST_failed("There is no document!");
+	else
+		CheckJSFunctionExecutedObj::WaitUntilJSFunctionExecuted(state.doc);
+}
+test("numbering after list item node remove - reversed")
+	require success "wait until scripts finished 9";
+{
+	verify(CheckNumberStringOfListItem(state.doc, "first", "2."));
+	verify(CheckNumberStringOfListItem(state.doc, "third", "1."));
+}
+
+html
+{
+//!<!DOCTYPE html>
+//!<html>
+//!<head>
+//!
+//!<style>
+//!*
+//!{
+//!	margin:0;padding:0;
+//!	font-size:20px;
+//!}
+//!
+//!ul, ol
+//!{
+//!	padding-left:40px;
+//!	list-style-type:disc;
+//!}
+//!
+//!li
+//!{
+//!	display:list-item;
+//!	list-style-position:inside;
+//!}
+//!
+//!</style>
+//!
+//!<script>
+//!window.onload = on_load;
+//!
+//!function on_load()
+//!{
+//!	element = document.getElementById("changing");
+//!	element.style.listStyleType = 'decimal';
+//!	finish();
+//!}
+//!
+//!function finish()
+//!{
+//!	element = document.getElementById("dummy");
+//!	element.setAttribute("id", "function_executed");
+//!}
+//!</script>
+//!
+//!</head>
+//!
+//!<body>
+//!
+//!<ol reversed="1">
+//!	<li>X</li>
+//!	<li id="changing">Y</li>
+//!</ol>
+//!
+//!<p id="dummy"></p>
+//!
+//!</body>
+//!
+//!</html>
+}
+test("wait until scripts finished 10") async;
+{
+	if (!state.doc)
+		ST_failed("There is no document!");
+	else
+		CheckJSFunctionExecutedObj::WaitUntilJSFunctionExecuted(state.doc);
+}
+test("numbering after glyph to decimal style change - reversed")
+	require success "wait until scripts finished 10";
+{
+	verify(CheckNumberStringOfListItem(state.doc, "changing", "1."));
+}
+
+html
+{
+//!<!DOCTYPE html>
+//!<html>
+//!<head>
+//!
+//!<style>
+//!*
+//!{
+//!	margin:0;padding:0;
+//!	font-size:20px;
+//!}
+//!
+//!ul, ol
+//!{
+//!	padding-left:40px;
+//!	list-style-type:decimal;
+//!}
+//!
+//!li
+//!{
+//!	display:list-item;
+//!	list-style-position:inside;
+//!}
+//!
+//!</style>
+//!
+//!<script>
+//!window.onload = on_load;
+//!
+//!function on_load()
+//!{
+//!	element = document.getElementById("to_none");
+//!	element.style.display = 'none';
+//!
+//!	finish();
+//!}
+//!
+//!function finish()
+//!{
+//!	element = document.getElementById("dummy");
+//!	element.setAttribute("id", "function_executed");
+//!}
+//!</script>
+//!
+//!</head>
+//!
+//!<body>
+//!<ol id="ol" reversed="1">
+//!	<li id="first">X</li>
+//!	<li id="to_none">Y</li>
+//!	<li id="third">Z</li>
+//!</ol>
+//!
+//!<p id="dummy"></p>
+//!
+//!</body>
+//!
+//!</html>
+}
+test("wait until scripts finished 11") async;
+{
+	if (!state.doc)
+		ST_failed("There is no document!");
+	else
+		CheckJSFunctionExecutedObj::WaitUntilJSFunctionExecuted(state.doc);
+}
+test("numbering after setting one li's display to none - reversed")
+	require success "wait until scripts finished 11";
+{
+	verify(CheckNumberStringOfListItem(state.doc, "first", "2."));
+	verify(CheckNumberStringOfListItem(state.doc, "third", "1."));
+}
+
+html
+{
+//!<!DOCTYPE html>
+//!<html>
+//!<head>
+//!
+//!<style>
+//!*
+//!{
+//!	margin:0;padding:0;
+//!	font-size:20px;
+//!}
+//!
+//!ul, ol
+//!{
+//!	padding-left:40px;
+//!	list-style-type:decimal-leading-zero;
+//!}
+//!
+//!li
+//!{
+//!	display:list-item;
+//!	list-style-position:inside;
+//!}
+//!
+//!</style>
+//!
+//!</head>
+//!
+//!<body>
+//!<ol id="ol">
+//!	<li id="a" value="-10">A</li>
+//!	<li id="b" value="-9">B</li>
+//!	<li id="c" value="-1">C</li>
+//!	<li id="d" value="0">D</li>
+//!	<li id="e" value="1">E</li>
+//!	<li id="f" value="9">F</li>
+//!	<li id="g" value="10">G</li>
+//!</ol>
+//!
+//!</body>
+//!
+//!</html>
+}
+test("numbering when list-style-type:decimal-leading-zero")
+{
+	verify(CheckNumberStringOfListItem(state.doc, "a", "-10."));
+	verify(CheckNumberStringOfListItem(state.doc, "b", "-09."));
+	verify(CheckNumberStringOfListItem(state.doc, "c", "-01."));
+	verify(CheckNumberStringOfListItem(state.doc, "d", "00."));
+	verify(CheckNumberStringOfListItem(state.doc, "e", "01."));
+	verify(CheckNumberStringOfListItem(state.doc, "f", "09."));
+	verify(CheckNumberStringOfListItem(state.doc, "g", "10."));
+}
+
+html
+{
+//!<!DOCTYPE html>
+//!<html>
+//!<head>
+//!
+//!<style>
+//!*
+//!{
+//!	margin:0;padding:0;
+//!	font-size:20px;
+//!	font-family:'AHEM';
+//!}
+//!
+//!ul, ol
+//!{
+//!	padding-left:40px;
+//!	list-style-type:decimal;
+//!}
+//!
+//!li
+//!{
+//!	display:list-item;
+//!	list-style-position:outside;
+//!}
+//!
+//!li:first-line
+//!{
+//!	color:lime;
+//!}
+//!
+//!</style>
+//!</head>
+//!
+//!<body>
+//!
+//!<ul>
+//!	<li id="list_item"><span id="test_box">X</span></li>
+//!</ul>
+//!
+//!</body>
+//!
+//!</html>
+}
+test("numbering and layout in case of list item with first-line")
+	require success "PRECONDITION: Font check";
+	/* Tests the numbering and proper props setting for the marker
+	   (which affects the layout of the <span> box). */
+{
+	RECT expected = {40,0,60,20};
+	verify(CheckNumberStringOfListItem(state.doc, "list_item", "1."));
+	verify(CheckAfterMarkerElementRect(state.doc, expected, FALSE));
+}
+
+html
+{
+//!<!DOCTYPE html>
+//!<html>
+//!<head>
+//!
+//!<style>
+//!*
+//!{
+//!	margin:0;padding:0;
+//!	font-size:20px;
+//!	font-family:'AHEM';
+//!}
+//!
+//!ul, ol
+//!{
+//!	padding-left:40px;
+//!	list-style-type:upper-latin;
+//!}
+//!
+//!li
+//!{
+//!	display:list-item;
+//!	list-style-position:outside;
+//!}
+//!
+//!li:first-letter
+//!{
+//!	color:lime;
+//!}
+//!</style>
+//!</head>
+//!
+//!<body>
+//!
+//!<ul>
+//!<li id="list_item">Xy</li>
+//!</ul>
+//!
+//!</body>
+//!
+//!</html>
+}
+test("first letter skips outside list marker")
+{
+	verify(HasFirstLetterElementAfterMarker(state.doc));
+}
+
+html
+{
+//!<!DOCTYPE html>
+//!<html>
+//!<head>
+//!
+//!<style>
+//!*
+//!{
+//!	margin:0;padding:0;
+//!	font-size:20px;
+//!	font-family:'AHEM';
+//!}
+//!
+//!ul, ol
+//!{
+//!	padding-left:40px;
+//!	list-style-type:upper-latin;
+//!}
+//!
+//!li
+//!{
+//!	display:list-item;
+//!	list-style-position:inside;
+//!}
+//!
+//!li:first-letter
+//!{
+//!	color:lime;
+//!}
+//!</style>
+//!</head>
+//!
+//!<body>
+//!
+//!<ul>
+//!<li id="list_item">Xy</li>
+//!</ul>
+//!
+//!</body>
+//!
+//!</html>
+}
+test("first letter skips inside list marker")
+{
+	verify(HasFirstLetterElementAfterMarker(state.doc));
+}
+
+html
+{
+//!<!DOCTYPE html>
+//!<html>
+//!<head>
+//!
+//!<style>
+//!*
+//!{
+//!	margin:0;padding:0;
+//!	font-size:20px;
+//!	font-family:'AHEM';
+//!}
+//!
+//!ul, ol
+//!{
+//!	padding-left:40px;
+//!	list-style-type:disc;
+//!	text-align:justify;
+//!}
+//!
+//!li
+//!{
+//!	display:list-item;
+//!	width:140px;
+//!	list-style-position:outside;
+//!	direction:ltr;
+//!	background-color:yellow;
+//!}
+//!
+//!</style>
+//!</head>
+//!
+//!<body>
+//!	<ul>
+//!		<li id="list_item">XX X <span id="test_box">X</span> SECOND</li>
+//!	</ul>
+//!</body>
+//!
+//!</html>
+}
+test("outside marker + justify, ltr")
+	require success "PRECONDITION: Font check";
+{
+	FramesDocument* doc = state.doc;
+
+	OpRect rect = GetRectOfMarker(doc, "list_item");
+	OpRect expected = ComposeExpectedOutsideMarkerRect(doc, 20, 40, 0, 0, 0);
+
+	verify(rects_equal_with_error(rect, expected, 0));
+
+	RECT expected_content_rect = {160,0,180,20};
+	verify(CheckAfterMarkerElementRect(doc, expected_content_rect, FALSE));
+}
+
+html
+{
+//!<!DOCTYPE html>
+//!<html>
+//!<head>
+//!
+//!<style>
+//!*
+//!{
+//!	margin:0;padding:0;
+//!	font-size:20px;
+//!	font-family:'AHEM';
+//!}
+//!
+//!ul, ol
+//!{
+//!	padding-left:40px;
+//!	list-style-type:disc;
+//!	text-align:justify;
+//!}
+//!
+//!li
+//!{
+//!	display:list-item;
+//!	width:140px;
+//!	list-style-position:outside;
+//!	direction:rtl;
+//!	background-color:yellow;
+//!}
+//!
+//!</style>
+//!</head>
+//!
+//!<body>
+//!	<ul>
+//!		<li id="list_item">XX X <span id="test_box">X</span> SECOND</li>
+//!	</ul>
+//!</body>
+//!
+//!</html>
+}
+test("outside marker + justify, rtl")
+	require success "PRECONDITION: Font check";
+	require SUPPORT_TEXT_DIRECTION;
+{
+	FramesDocument* doc = state.doc;
+
+	OpRect rect = GetRectOfMarker(doc, "list_item");
+	OpRect expected = ComposeExpectedOutsideMarkerRect(doc, 20, 40, 0, 0, 140);
+
+	verify(rects_equal_with_error(rect, expected, 0));
+
+	RECT expected_content_rect = {160,0,180,20};
+	verify(CheckAfterMarkerElementRect(doc, expected_content_rect, FALSE));
+}
+
+html
+{
+//!<!DOCTYPE html>
+//!<html>
+//!<head>
+//!
+//!<style>
+//!*
+//!{
+//!	margin:0;padding:0;
+//!	font-size:20px;
+//!	font-family:'AHEM';
+//!}
+//!
+//!ul, ol
+//!{
+//!	padding-left:40px;
+//!	list-style-type:decimal;
+//!	text-align:justify;
+//!}
+//!
+//!li
+//!{
+//!	display:list-item;
+//!	width:140px;
+//!	list-style-position:outside;
+//!	direction:ltr;
+//!	background-color:yellow;
+//!}
+//!
+//!</style>
+//!</head>
+//!
+//!<body>
+//!	<ul>
+//!		<li id="list_item">XX X <span id="test_box">X</span> SECOND</li>
+//!	</ul>
+//!</body>
+//!
+//!</html>
+}
+test("outside marker (textual) + justify, ltr")
+	require success "PRECONDITION: Font check";
+{
+	FramesDocument* doc = state.doc;
+
+	RECT expected_content_rect = {160,0,180,20};
+	verify(CheckAfterMarkerElementRect(doc, expected_content_rect, FALSE));
+}
+
+html
+{
+//!<!DOCTYPE html>
+//!<html>
+//!<head>
+//!
+//!<style>
+//!*
+//!{
+//!	margin:0;padding:0;
+//!	font-size:20px;
+//!	font-family:'AHEM';
+//!}
+//!
+//!ul, ol
+//!{
+//!	padding-left:40px;
+//!	list-style-type:decimal;
+//!	text-align:justify;
+//!}
+//!
+//!li
+//!{
+//!	display:list-item;
+//!	width:140px;
+//!	list-style-position:outside;
+//!	direction:rtl;
+//!	background-color:yellow;
+//!}
+//!
+//!</style>
+//!</head>
+//!
+//!<body>
+//!	<ul>
+//!		<li id="list_item">XX X <span id="test_box">X</span> SECOND</li>
+//!	</ul>
+//!</body>
+//!
+//!</html>
+}
+test("outside marker (textual) + justify, rtl")
+	require success "PRECONDITION: Font check";
+	require SUPPORT_TEXT_DIRECTION;
+{
+	FramesDocument* doc = state.doc;
+
+	RECT expected_content_rect = {160,0,180,20};
+	verify(CheckAfterMarkerElementRect(doc, expected_content_rect, FALSE));
+}
+
+html
+{
+//!<!DOCTYPE html>
+//!<html>
+//!<head>
+//!
+//!<style>
+//!*
+//!{
+//!	margin:0;padding:0;
+//!	font-size:20px;
+//!	font-family:'AHEM';
+//!}
+//!
+//!ul, ol
+//!{
+//!	padding-left:40px;
+//!	list-style-type:disc;
+//!	text-align:justify;
+//!}
+//!
+//!li
+//!{
+//!	display:list-item;
+//!	width:140px;
+//!	list-style-position:outside;
+//!	direction:rtl;
+//!	background-color:yellow;
+//!}
+//!
+//!</style>
+//!</head>
+//!
+//!<body>
+//!	<ul>
+//!		<li id="list_item"><span id="test_box">A</span> <bdo dir="rtl"><bdo dir="ltr">BC</bdo> D</bdo> SECOND</li>
+//!	</ul>
+//!</body>
+//!
+//!</html>
+}
+test("outside marker + justify, rtl + nested text dir changes")
+	require success "PRECONDITION: Font check";
+	require SUPPORT_TEXT_DIRECTION;
+{
+	FramesDocument* doc = state.doc;
+
+	OpRect rect = GetRectOfMarker(doc, "list_item");
+	OpRect expected = ComposeExpectedOutsideMarkerRect(doc, 20, 40, 0, 0, 140);
+
+	verify(rects_equal_with_error(rect, expected, 0));
+
+	RECT expected_content_rect = {160,0,180,20};
+	verify(CheckAfterMarkerElementRect(doc, expected_content_rect, FALSE));
+}
+
+html
+{
+//!<!DOCTYPE html>
+//!<html>
+//!<head>
+//!
+//!<style>
+//!*
+//!{
+//!	margin:0;padding:0;
+//!	font-size:20px;
+//!	font-family:'AHEM';
+//!}
+//!
+//!ul, ol
+//!{
+//!	padding-left:40px;
+//!	list-style-type:disc;
+//!	text-align:justify;
+//!}
+//!
+//!li
+//!{
+//!	display:list-item;
+//!	width:160px;
+//!	list-style-position:inside;
+//!	direction:ltr;
+//!	background-color:yellow;
+//!}
+//!
+//!</style>
+//!</head>
+//!
+//!<body>
+//!	<ul>
+//!		<li id="list_item">X XX <span id="test_box">X</span> SECOND</li>
+//!	</ul>
+//!</body>
+//!
+//!</html>
+}
+test("inside marker + justify, ltr")
+	require success "PRECONDITION: Font check";
+{
+	RECT expected_content_rect = {180,0,200,20};
+	verify(CheckAfterMarkerElementRect(state.doc, expected_content_rect, FALSE));
+}
+
+html
+{
+//!<!DOCTYPE html>
+//!<html>
+//!<head>
+//!
+//!<style>
+//!*
+//!{
+//!	margin:0;padding:0;
+//!	font-size:20px;
+//!	font-family:'AHEM';
+//!}
+//!
+//!ul, ol
+//!{
+//!	padding-left:40px;
+//!	list-style-type:disc;
+//!	text-align:justify;
+//!}
+//!
+//!li
+//!{
+//!	display:list-item;
+//!	width:160px;
+//!	list-style-position:inside;
+//!	direction:rtl;
+//!	background-color:yellow;
+//!}
+//!
+//!</style>
+//!</head>
+//!
+//!<body>
+//!	<ul>
+//!		<li id="list_item">X XX X SECOND</li>
+//!	</ul>
+//!</body>
+//!
+//!</html>
+}
+test("inside marker + justify, rtl")
+	require success "PRECONDITION: Font check";
+	require SUPPORT_TEXT_DIRECTION;
+{
+	FramesDocument* doc = state.doc;
+	OpRect rect = GetRectOfMarker(doc, "list_item");
+	OpRect expected = ComposeExpectedInsideMarkerRect(doc, 20, 40, 0, 0, 0, 160, 0, 0, CSS_VALUE_right, TRUE);
+
+	verify(rects_equal_with_error(rect, expected, 0));
+}
+
+html
+{
+//!<!DOCTYPE html>
+//!<html>
+//!<head>
+//!
+//!<style>
+//!*
+//!{
+//!	margin:0;padding:0;
+//!	font-size:20px;
+//!	font-family:'AHEM';
+//!}
+//!
+//!li
+//!{
+//!	display:list-item;
+//!	list-style-position:outside;
+//!	list-style-type:disc;
+//!	width:100px;
+//!	margin-left:50px;
+//!	background-color:yellow;
+//!}
+//!
+//!div
+//!{
+//!	float: left;
+//!	width: 100px;
+//!	height: 50px;
+//!	background-color:lime;
+//!}
+//!
+//!</style>
+//!</head>
+//!
+//!<body>
+//!
+//!<div></div>
+//!
+//!<li id="list_item">XXX</li>
+//!
+//!</body>
+//!
+//!</html>
+}
+test("first line in list item elm. preceded by float is pushed below")
+	require success "PRECONDITION: Font check";
+{
+	FramesDocument* doc = state.doc;
+	OpRect rect = GetRectOfMarker(doc, "list_item");
+	OpRect expected = ComposeExpectedOutsideMarkerRect(doc, 20, 50, 50, 0, 0);
+
+	verify(rects_equal_with_error(rect, expected, 0));
+}
+
+/* The below four test the correct placement of a marker in case of rtl
+   for different numeration styles. */
+
+html
+{
+//!<!DOCTYPE html>
+//!<html>
+//!<head>
+//!
+//!<style>
+//!*
+//!{
+//!	margin:0;padding:0;
+//!	font-size:20px;
+//!	font-family:'AHEM';
+//!}
+//!
+//!ul, ol
+//!{
+//!	padding-left:0px;
+//!	list-style-type:decimal;
+//!}
+//!
+//!li
+//!{
+//!	display:list-item;
+//!	list-style-position:outside;
+//!	width:60px;
+//!	direction:rtl;
+//!	background-color:lime;
+//!}
+//!
+//!</style>
+//!</head>
+//!
+//!<body>
+//!
+//!<ol>
+//!<li id="list_item">X</li>
+//!</ol>
+//!
+//!</body>
+//!
+//!</html>
+}
+test("rtl correctness: decimal, outside")
+	require success "PRECONDITION: Font check";
+	require SUPPORT_TEXT_DIRECTION;
+{
+	FramesDocument* doc = state.doc;
+	OpRect rect = GetRectOfMarker(doc, "list_item");
+	int expected_left_edge = 60 + (doc->GetHandheldEnabled() ? MARKER_INNER_OFFSET_HANDHELD : MARKER_INNER_OFFSET);
+
+	verify(expected_left_edge == rect.x);
+}
+
+html
+{
+//!<!DOCTYPE html>
+//!<html>
+//!<head>
+//!
+//!<style>
+//!*
+//!{
+//!	margin:0;padding:0;
+//!	font-size:20px;
+//!	font-family:'AHEM';
+//!}
+//!
+//!ul, ol
+//!{
+//!	padding-left:0px;
+//!	list-style-type:upper-alpha;
+//!}
+//!
+//!li
+//!{
+//!	display:list-item;
+//!	list-style-position:outside;
+//!	width:60px;
+//!	direction:rtl;
+//!	background-color:lime;
+//!}
+//!
+//!</style>
+//!</head>
+//!
+//!<body>
+//!
+//!<ol>
+//!<li id="list_item">X</li>
+//!</ol>
+//!
+//!</body>
+//!
+//!</html>
+}
+test("rtl correctness: alpha, outside")
+	require success "PRECONDITION: Font check";
+	require SUPPORT_TEXT_DIRECTION;
+{
+	FramesDocument* doc = state.doc;
+	OpRect rect = GetRectOfMarker(doc, "list_item");
+	int expected_left_edge = 60 + (doc->GetHandheldEnabled() ? MARKER_INNER_OFFSET_HANDHELD : MARKER_INNER_OFFSET);
+
+	verify(expected_left_edge == rect.x);
+}
+
+html
+{
+//!<!DOCTYPE html>
+//!<html>
+//!<head>
+//!
+//!<style>
+//!*
+//!{
+//!	margin:0;padding:0;
+//!	font-size:20px;
+//!	font-family:'AHEM';
+//!}
+//!
+//!ul, ol
+//!{
+//!	padding-left:0px;
+//!	list-style-type:lower-roman;
+//!}
+//!
+//!li
+//!{
+//!	display:list-item;
+//!	list-style-position:inside;
+//!	width:80px;
+//!	direction:rtl;
+//!	background-color:lime;
+//!}
+//!
+//!</style>
+//!</head>
+//!
+//!<body>
+//!
+//!<ol>
+//!<li id="list_item">X</li>
+//!</ol>
+//!
+//!</body>
+//!
+//!</html>
+}
+test("rtl correctness: roman, inside")
+	require success "PRECONDITION: Font check";
+	require SUPPORT_TEXT_DIRECTION;
+{
+	FramesDocument* doc = state.doc;
+	OpRect rect = GetRectOfMarker(doc, "list_item");
+	int expected_right_edge = 80;
+
+	verify(expected_right_edge == rect.Right());
+}
+
+html
+{
+//!<!DOCTYPE html>
+//!<html>
+//!<head>
+//!
+//!<style>
+//!*
+//!{
+//!	margin:0;padding:0;
+//!	font-size:20px;
+//!	font-family:'AHEM';
+//!}
+//!
+//!ul, ol
+//!{
+//!	padding-left:0px;
+//!	list-style-type:lower-greek;
+//!}
+//!
+//!li
+//!{
+//!	display:list-item;
+//!	list-style-position:inside;
+//!	width:80px;
+//!	direction:rtl;
+//!	background-color:lime;
+//!}
+//!
+//!</style>
+//!</head>
+//!
+//!<body>
+//!
+//!<ol>
+//!<li id="list_item">X</li>
+//!</ol>
+//!
+//!</body>
+//!
+//!</html>
+}
+test("rtl correctness: greek, inside")
+	require success "PRECONDITION: Font check";
+	require SUPPORT_TEXT_DIRECTION;
+{
+	FramesDocument* doc = state.doc;
+	OpRect rect = GetRectOfMarker(doc, "list_item");
+	int expected_right_edge = 80;
+
+	verify(expected_right_edge == rect.Right());
+}
+
+html
+{
+//!<!DOCTYPE html>
+//!<html>
+//!<head>
+//!
+//!<style>
+//!*
+//!{
+//!	margin:0;padding:0;
+//!	font-size:20px;
+//!	font-family:'AHEM';
+//!}
+//!
+//!ul, ol
+//!{
+//!	padding-left:40px;
+//!	list-style-type:upper-roman;
+//!}
+//!
+//!li
+//!{
+//!	display:list-item;
+//!	list-style-position:outside;
+//!}
+//!
+//!</style>
+//!</head>
+//!
+//!<body dir="ltr">
+//!
+//!<ol>
+//!  <li id="list_item"><bdo dir="rtl">AB</bdo></li>
+//!</ol>
+//!
+//!</body>
+//!
+//!</html>
+}
+test("rtl text in ltr list item's container")
+	require success "PRECONDITION: Font check";
+	require SUPPORT_TEXT_DIRECTION;
+{
+	FramesDocument* doc = state.doc;
+	OpRect rect = GetRectOfMarker(doc, "list_item");
+	int expected_right_edge = 40 - (doc->GetHandheldEnabled() ? MARKER_INNER_OFFSET_HANDHELD : MARKER_INNER_OFFSET);
+
+	verify(expected_right_edge == rect.Right());
+}
+
+html
+{
+//!<!DOCTYPE html>
+//!<html>
+//!<head>
+//!<style>
+//!*
+//!{
+//!	margin:0;
+//!	padding:0;
+//!	font: 20px 'AHEM';
+//!}
+//!
+//!body > div
+//!{
+//!	columns: 2;
+//!	orphans: 1;
+//!	widows: 1;
+//!	margin-left:40px;
+//!}
+//!
+//!</style>
+//!</head>
+//!<body>
+//!<div>
+//!	<li id="list_item" style="list-style-position:outside;">
+//!		<div>
+//!			<span id="test_box">X</span>
+//!		</div>
+//!	</li>
+//!</div>
+//!</body>
+//!</html>
+}
+test("multicol with list item with outside marker")
+	/* List item has a line that contains only an outside list item marker
+	   and a block box on its container stack. Then there is some real
+	   content in that block. Tests whether it is positioned in the first
+	   column along with the marker. */
+	require success "PRECONDITION: Font check";
+{
+	verify(state.doc);
+
+	OpRect actual_rect = GetRectOfMarker(state.doc, "list_item");
+	OpRect expected_rect = ComposeExpectedOutsideMarkerRect(state.doc, 20, 40, 0, 0, 0);
+
+	verify(rects_equal_with_error(actual_rect, expected_rect, 0));
+
+	RECT expected = {40, 0, 60, 20};
+	verify(CheckAfterMarkerElementRect(state.doc, expected));
+}

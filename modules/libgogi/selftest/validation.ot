@@ -1,0 +1,375 @@
+/* -*- Mode: c++; tab-width: 4; indent-tabs-mode: t; c-basic-offset: 4 -*- */
+group "libgogi.validation";
+
+language c++;
+
+include "modules/libgogi/mde.h";
+include "modules/img/decoderfactorypng.h";
+
+global
+{
+	#define SCREEN_WIDTH 533
+	#define SCREEN_HEIGHT 533
+
+	// Hack to get around selftest parsing bug:
+	OP_STATUS VerifyPng(const char* refFile, unsigned int width, unsigned int height, unsigned int stride, UINT32* pixels, unsigned int linesToTest, unsigned int maxComponentDiff = 1, unsigned int maxPSNR = 0, bool regenerate = false)
+	{
+		return DecoderFactoryPng::verify(refFile,
+										 width, height, stride,
+										 pixels, linesToTest,
+										 maxComponentDiff, maxPSNR, regenerate);
+	}
+
+	bool VerifyImage(const char* refFile, unsigned int width, unsigned int height, unsigned int stride, UINT32* pixels, unsigned int linesToTest, unsigned int maxComponentDiff = 1, unsigned int maxPSNR = 0)
+	{
+		const OP_STATUS status = VerifyPng(refFile,
+										   width, height, stride,
+										   pixels, linesToTest,
+										   maxComponentDiff, maxPSNR, false);
+		if (OpStatus::IsError(status))
+		{
+			// output actual image with infix _failed
+			const int ref_len = (int)op_strlen(refFile);
+			const char* infix = "_failed";
+			OpString8 actual;
+			if (actual.Reserve(ref_len + (int)op_strlen(infix) + 1))
+			{
+				actual.Set(refFile);
+				actual.Insert(ref_len - 4/*.png*/, infix);
+				OpStatus::Ignore(VerifyPng(actual,
+										   width, height, stride,
+										   pixels, linesToTest,
+										   maxComponentDiff, maxPSNR, true));
+			}
+		}
+		return OpStatus::IsSuccess(status) ? true : false;
+	}
+
+	class TestScreen : public MDE_Screen
+	{
+	public:
+		TestScreen() {}
+		virtual ~TestScreen()
+		{
+			OP_DELETEA(data);
+		}
+
+		bool Init(int width, int height, MDE_FORMAT format)
+		{
+			this->format = format;
+			MDE_Screen::Init(width, height);
+			int num_bytes = width * height * MDE_GetBytesPerPixel(format);
+			data = OP_NEWA(char, num_bytes);
+			return data ? true : false;
+		}
+
+		virtual void OutOfMemory() {}
+		virtual MDE_FORMAT GetFormat() { return format; }
+#ifdef VEGA_OPPAINTER_SUPPORT
+		virtual class VEGAOpPainter* GetVegaPainter() { return NULL; }
+#endif // VEGA_OPPAINTER_SUPPORT
+
+		virtual MDE_BUFFER *LockBuffer()
+		{
+			MDE_InitializeBuffer(m_rect.w, m_rect.h, m_rect.w * MDE_GetBytesPerPixel(format), format, data, NULL, &buf);
+			return &buf;
+		}
+
+		virtual void UnlockBuffer(MDE_Region *update_region)
+		{
+			for(int i = 0; i < update_region->num_rects; i++)
+			{
+				OP_ASSERT(	update_region->rects[i].x >= 0 &&
+							update_region->rects[i].y >= 0 &&
+							update_region->rects[i].x + update_region->rects[i].w <= m_rect.w &&
+							update_region->rects[i].y + update_region->rects[i].h <= m_rect.h);
+			}
+		}
+
+		virtual void OnPaint(const MDE_RECT &rect, MDE_BUFFER *screen)
+		{
+			MDE_SetColor(MDE_RGB(255, 255, 255), screen);
+			MDE_DrawRectFill(rect, screen);
+		}
+	public:
+		MDE_FORMAT format;
+		MDE_BUFFER buf;
+		char *data;
+	};
+
+    class TestView : public MDE_View
+    {
+    public:
+        TestView() { Reset(); }
+        void Reset()
+		{
+			Validate(true);
+			SetInvalidFlag(false);
+			m_updatelock_counter = 0;
+			m_painted = false;
+			m_before_paint_called = false;
+		}
+
+		/* used from test code to determine if view was validated */
+		bool WasPainted() { return m_painted; }
+
+		virtual bool OnBeforePaintEx() { m_before_paint_called = true; return true; }
+		virtual bool OnPaintEx(const MDE_RECT &rect, MDE_BUFFER *screen)
+		{
+			m_painted = true;
+			return MDE_View::OnPaintEx(rect, screen);
+		}
+		virtual void OnInvalid() { m_invalidated = true; }
+
+		bool m_before_paint_called;
+		bool m_painted;
+		bool m_invalidated;
+	};
+
+#if defined(MDE_SUPPORT_SPRITES) && !defined(VEGA_OPPAINTER_SUPPORT)
+	class Sprite : public MDE_Sprite
+	{
+	public:
+		void OnPaint(const MDE_RECT &rect, MDE_BUFFER *screen)
+		{
+			MDE_SetColor(MDE_RGB(128, 128, 255), screen);
+			MDE_DrawEllipseFill(MDE_MakeRect(0, 0, m_rect.w, m_rect.h), screen);
+		}
+	};
+#endif // MDE_SUPPORT_SPRITES && !VEGA_OPPAINTER_SUPPORT
+}
+
+test("Validate transparent view with solid children(CORE-32207)")
+{
+	TestScreen* screen = NULL;
+
+	// create screen
+	screen = OP_NEW(TestScreen, ());
+	verify(screen && "OOM");
+	verify(screen->Init(100, 100, MDE_FORMAT_BGRA32));
+
+	// create parent view
+	TestView* p_view1 = OP_NEW(TestView, ());
+	verify(p_view1);
+	p_view1->SetRect(MDE_MakeRect(0, 0, 100, 100));
+	screen->AddChild(p_view1);
+	p_view1->SetTransparent(true);
+
+	// create child view
+	TestView* c_view1 = OP_NEW(TestView, ());
+	verify(c_view1);
+	p_view1->AddChild(c_view1);
+
+	c_view1->SetRect(MDE_MakeRect(0, 0, 100, 100));
+	p_view1->Validate(true);
+
+	verify(c_view1->m_before_paint_called);
+}
+finally
+{
+	OP_DELETE(screen); // also deletes the childviews
+}
+
+// Todo:
+// test transparent
+//   painting, scrolling inside and behind
+// scrolling
+//   with/without children
+//   with overlapping parents
+// invalidation during painting
+// sprites
+// region
+// font
+
+test("Validation")
+file testfile "Validation.png";
+require MDE_SUPPORT_SPRITES;
+require undefined VEGA_OPPAINTER_SUPPORT;
+{
+	TestScreen *screen = NULL;
+	Sprite *sprite = NULL;
+
+	screen = OP_NEW(TestScreen, ());
+	verify(screen);
+	verify(screen->Init(SCREEN_WIDTH, SCREEN_HEIGHT, MDE_FORMAT_BGRA32));
+
+	MDE_View *view = OP_NEW(MDE_View, ());
+	view->SetRect(MDE_MakeRect(10, 10, 100, 100));
+	screen->AddChild(view);
+
+	sprite = OP_NEW(Sprite, ());
+	verify(sprite->Init(20, 20, screen));
+	sprite->SetPos(100, 100);
+	sprite->SetView(view);
+	screen->AddSprite(sprite);
+
+	screen->Validate(true);
+
+	verify(VerifyImage(testfile,
+					   SCREEN_WIDTH, SCREEN_HEIGHT, SCREEN_WIDTH * 4,
+					   (UINT32 *)screen->data, SCREEN_HEIGHT, 1, 0));
+}
+finally
+{
+	if (sprite && screen)
+		screen->RemoveSprite(sprite);
+	OP_DELETE(sprite);
+	OP_DELETE(screen);
+}
+
+test("InvalidateRegion") language C++;
+require MDE_SMALLER_AREA_MORE_ONPAINT;
+{
+	TestScreen *screen = OP_NEW(TestScreen, ());
+	verify(screen);
+	verify(screen->Init(SCREEN_WIDTH, SCREEN_HEIGHT, MDE_FORMAT_BGRA32));
+
+	screen->Validate(true);
+
+	// Close
+	screen->Invalidate(MDE_MakeRect(10, 10, 10, 10));
+	screen->Invalidate(MDE_MakeRect(20, 10, 10, 10));
+	verify(screen->m_invalid_region.num_rects == 1);
+	screen->Validate(true);
+
+	// Not close
+	screen->Invalidate(MDE_MakeRect(10, 10, 10, 10));
+	screen->Invalidate(MDE_MakeRect(100, 100, 10, 10));
+	verify(screen->m_invalid_region.num_rects == 2);
+	screen->Validate(true);
+
+	// L region (upside down)
+	screen->Invalidate(MDE_MakeRect(0, 0, SCREEN_WIDTH, 10));
+	screen->Invalidate(MDE_MakeRect(0, 10, 10, SCREEN_HEIGHT - 10));
+	verify(screen->m_invalid_region.num_rects == 2);
+	screen->Validate(true);
+
+#ifndef VEGA_OPPAINTER_SUPPORT
+	// Scrolled and moved (inside)
+	screen->Invalidate(MDE_MakeRect(10, 10, 10, 10));
+	screen->ScrollRect(MDE_MakeRect(0, 0, 100, 100), 0, -10, false);
+	verify(screen->m_invalid_rect.x == 0 &&
+			screen->m_invalid_rect.y == 0 &&
+			screen->m_invalid_rect.w == 100 &&
+			screen->m_invalid_rect.h == 100);
+	verify(screen->m_invalid_region.num_rects == 2);
+	verify(screen->m_invalid_region.rects[0].x == 10 &&
+			screen->m_invalid_region.rects[0].y == 0 &&
+			screen->m_invalid_region.rects[0].w == 10 &&
+			screen->m_invalid_region.rects[0].h == 10);
+	verify(screen->m_invalid_region.rects[1].x == 0 &&
+			screen->m_invalid_region.rects[1].y == 90 &&
+			screen->m_invalid_region.rects[1].w == 100 &&
+			screen->m_invalid_region.rects[1].h == 10);
+	screen->Validate(true);
+
+	// Scrolled and not moved (outside)
+	screen->Invalidate(MDE_MakeRect(110, 10, 10, 10));
+	screen->ScrollRect(MDE_MakeRect(0, 0, 100, 100), 0, -10, false);
+	verify(screen->m_invalid_rect.x == 0 &&
+			screen->m_invalid_rect.y == 10 &&
+			screen->m_invalid_rect.w == 120 &&
+			screen->m_invalid_rect.h == 90);
+	verify(screen->m_invalid_region.num_rects == 2);
+	verify(screen->m_invalid_region.rects[0].x == 110 &&
+			screen->m_invalid_region.rects[0].y == 10 &&
+			screen->m_invalid_region.rects[0].w == 10 &&
+			screen->m_invalid_region.rects[0].h == 10);
+	verify(screen->m_invalid_region.rects[1].x == 0 &&
+			screen->m_invalid_region.rects[1].y == 90 &&
+			screen->m_invalid_region.rects[1].w == 100 &&
+			screen->m_invalid_region.rects[1].h == 10);
+	screen->Validate(true);
+
+	// Scrolled diagonally (produce L region)
+	screen->ScrollRect(MDE_MakeRect(0, 0, SCREEN_WIDTH, SCREEN_HEIGHT), 10, 10, false);
+	verify(screen->m_invalid_rect.x == 0 &&
+			screen->m_invalid_rect.y == 0 &&
+			screen->m_invalid_rect.w == SCREEN_WIDTH &&
+			screen->m_invalid_rect.h == SCREEN_HEIGHT);
+	verify(screen->m_invalid_region.num_rects == 2);
+	verify(screen->m_invalid_region.rects[0].x == 0 &&
+			screen->m_invalid_region.rects[0].y == 0 &&
+			screen->m_invalid_region.rects[0].w == 10 &&
+			screen->m_invalid_region.rects[0].h == SCREEN_HEIGHT);
+	verify(screen->m_invalid_region.rects[1].x == 10 &&
+			screen->m_invalid_region.rects[1].y == 0 &&
+			screen->m_invalid_region.rects[1].w == SCREEN_WIDTH - 10 &&
+			screen->m_invalid_region.rects[1].h == 10);
+	screen->Validate(true);
+#endif // !VEGA_OPPAINTER_SUPPORT
+}
+finally
+{
+	OP_DELETE(screen);
+}
+
+test("validation of locked transparent child")
+{
+	TestScreen screen;
+    TestView parent, child;
+    const MDE_RECT r = MDE_MakeRect(0,0, 100,100);
+
+	verify(screen.Init(r.w, r.h, MDE_FORMAT_BGRA32));
+
+    parent.SetRect(r); parent.m_screen = &screen;
+    child.SetRect(r);  child.m_screen  = &screen;
+    parent.AddChild(&child);
+
+    // transparent child, opaque parent
+    parent.SetTransparent(false);
+    child.SetTransparent(true);
+
+    // check that "regular" propagation works
+    parent.Reset(); child.Reset();
+    child.Invalidate(child.m_rect);
+	parent.Validate(true);
+    verify(child.WasPainted());
+
+    // lock child and check that invalidating it doesn't cause
+    // invalidation of parent
+    parent.Reset(); child.Reset();
+    child.LockUpdate(true);
+    child.Invalidate(child.m_rect);
+	parent.Validate(true);
+    verify(!child.WasPainted());
+
+    // unlock child and check that this does invalidate parent
+    child.LockUpdate(false);
+	parent.Validate(true);
+    verify(child.WasPainted());
+}
+finally
+{
+    parent.RemoveChild(&child);
+}
+
+test("unlocking a transparent child doesn't invalidate parent")
+{
+	TestScreen screen;
+    TestView parent, child;
+    const MDE_RECT r = MDE_MakeRect(0,0, 100,100);
+
+	verify(screen.Init(r.w, r.h, MDE_FORMAT_BGRA32));
+	screen.Validate(true);
+
+    parent.SetRect(r); parent.m_screen = &screen;
+    child.SetRect(r);  child.m_screen  = &screen;
+    parent.AddChild(&child);
+
+    parent.Reset(); child.Reset();
+
+	child.SetTransparent(true);
+	child.Invalidate(r);
+	parent.Validate(true);
+	verify(!child.GetInvalidFlag());
+
+	parent.m_invalidated = false;
+	child.LockUpdate(true);
+	child.LockUpdate(false);
+	verify(!parent.m_invalidated);
+}
+finally
+{
+    parent.RemoveChild(&child);
+}

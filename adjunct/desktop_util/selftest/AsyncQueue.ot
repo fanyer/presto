@@ -1,0 +1,140 @@
+/* -*- Mode: c++; tab-width: 4; c-basic-offset: 4 -*-
+ *
+ * Copyright (C) 1995-2009 Opera Software AS.  All rights reserved.
+ *
+ * This file is part of the Opera web browser.
+ * It may not be distributed under any circumstances.
+ *
+ * @author Arjan van Leeuwen (arjanl)
+ */
+
+group "desktop_util.AsyncQueue";
+
+include "adjunct/desktop_util/async_queue/AsyncQueue.h";
+include "adjunct/desktop_util/async_queue/AsyncCommand.h";
+
+global
+{
+	/** @brief Can be used to check if PostMessage() is called correctly, saves whether message arrived correctly and delay used */
+	struct DeliveryTestQueue : public AsyncQueue
+	{
+		DeliveryTestQueue(unsigned long delay = 0) : AsyncQueue(delay), got_msg(false), delay(0) {}
+		virtual BOOL PostMessage(OpMessage msg, MH_PARAM_1 par1, MH_PARAM_2 par2, unsigned long delay)
+		{
+			got_msg = got_msg || GetMessageHandler().HasCallBack(this, msg, par1);
+			this->delay = delay;
+			return TRUE;
+		}
+
+		bool got_msg;
+		unsigned long delay;
+	};
+
+	/** @brief Like AsyncQueue, but executes commands immediately */
+	struct SynchronousQueue : public AsyncQueue
+	{
+		virtual BOOL PostMessage(OpMessage msg, MH_PARAM_1 par1, MH_PARAM_2 par2, unsigned long delay)
+		{
+			HandleCallback(msg, par1, par2);
+			return TRUE;
+		}
+	};
+
+	struct DummyCommand : public AsyncCommand
+	{
+		void Execute() {}
+	};
+
+	struct ExecuteCommand : public AsyncCommand
+	{
+		ExecuteCommand(bool& executed) : m_executed(executed) {}
+		void Execute() { m_executed = true; }
+		bool& m_executed;
+	};
+
+	struct DestroyCommand : public DummyCommand
+	{
+		DestroyCommand(bool& destroyed) : m_destroyed(destroyed) {}
+		~DestroyCommand() { m_destroyed = TRUE; }
+		bool& m_destroyed;
+	};
+};
+
+test("Can check for unfinished commands")
+{
+	AsyncQueue queue;
+
+	verify(queue.Empty());
+
+	DummyCommand* command = OP_NEW(DummyCommand, ());
+	verify(OpStatus::IsSuccess(queue.AddCommand(command)));
+
+	verify(!queue.Empty());
+}
+
+test("Posts message to message queue when adding command")
+{
+	DeliveryTestQueue queue;
+	DummyCommand* command = OP_NEW(DummyCommand, ());
+
+	verify(OpStatus::IsSuccess(queue.AddCommand(command)));
+
+	verify(queue.got_msg);
+	verify(queue.delay == 0);
+}
+
+test("Command knows which queue it is in")
+{
+	AsyncQueue queue;
+	DummyCommand* command = OP_NEW(DummyCommand, ());
+
+	verify(OpStatus::IsSuccess(queue.AddCommand(command)));
+
+	verify(command->GetQueue() == &queue);
+};
+
+test("Uses correct delay when adding command")
+{
+	const unsigned long delay = 1000;
+	DeliveryTestQueue queue(delay);
+	DummyCommand* command = OP_NEW(DummyCommand, ());
+
+	verify(OpStatus::IsSuccess(queue.AddCommand(command)));
+
+	verify(queue.got_msg);
+	verify(queue.delay == delay);
+}
+
+test("Executes command")
+{
+	bool executed = false;
+	ExecuteCommand* command = OP_NEW(ExecuteCommand, (executed));
+
+	SynchronousQueue queue;
+	verify(OpStatus::IsSuccess(queue.AddCommand(command)));
+
+	verify(executed);
+}
+
+test("Destroys command after execution")
+{
+	bool destroyed = false;
+	DestroyCommand* command = OP_NEW(DestroyCommand, (destroyed));
+
+	SynchronousQueue queue;
+	verify(OpStatus::IsSuccess(queue.AddCommand(command)));
+
+	verify(destroyed);
+}
+
+test("Destroys commands still in queue when queue is destroyed")
+{
+	bool destroyed = false;
+	DestroyCommand* command = OP_NEW(DestroyCommand, (destroyed));
+	OpAutoPtr<AsyncQueue> queue (OP_NEW(AsyncQueue, ()));
+
+	verify(OpStatus::IsSuccess(queue->AddCommand(command)));
+	queue.reset();
+
+	verify(destroyed);
+}

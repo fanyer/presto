@@ -1,0 +1,201 @@
+/* -*- Mode: c++; tab-width: 4; indent-tabs-mode: t; c-basic-offset: 4 -*-
+**
+** Copyright (C) 2010 Opera Software ASA.  All rights reserved.
+**
+** This file is part of the Opera web browser.  It may not be distributed
+** under any circumstances.
+**
+** Jan Borsodi
+**
+** Basic test of the OpGadgetInstallObject.
+** More testing can be found in the Sniper framework which is run via scope,
+** under the WidgetManager group.
+** http://t/core/features/developertools/sniper/index.html
+*/
+
+group "gadgets.installobject";
+require GADGET_SUPPORT;
+require GADGETS_INSTALLER_SUPPORT;
+require init;
+
+include "modules/gadgets/OpGadgetManager.h";
+include "modules/gadgets/OpGadgetInstallObject.h";
+include "modules/dochand/win.h";
+include "modules/pi/OpSystemInfo.h";
+
+
+global
+{
+	OpGadgetClass *gadget_class = NULL;
+	OpGadgetInstallObject *installer = NULL;
+
+	BOOL load_widget(OpGadgetInstallObject &installer, const char *filename)
+	{
+		OpString filename_uni;
+		RETURN_VALUE_IF_ERROR(filename_uni.Set(filename), FALSE);
+		OpFile file;
+		file.Construct(filename_uni);
+		BOOL exists = FALSE;
+		if (OpStatus::IsError(file.Exists(exists)) || !exists)
+			return FALSE;
+		RETURN_VALUE_IF_ERROR(file.Open(OPFILE_READ), FALSE);
+		OpFileLength len;
+		RETURN_VALUE_IF_ERROR(file.GetFileLength(len), FALSE);
+		ByteBuffer buf;
+		OpAutoArray<char> tmp(OP_NEWA(char, static_cast<unsigned>(len)));
+		if (!tmp.get())
+			return FALSE;
+		OpFileLength bytes_read;
+		RETURN_VALUE_IF_ERROR(file.Read(static_cast<void *>(tmp.get()), len, &bytes_read), FALSE);
+		RETURN_VALUE_IF_ERROR(buf.AppendBytes(tmp.get(), static_cast<unsigned>(bytes_read)), FALSE);
+		RETURN_VALUE_IF_ERROR(installer.AppendData(buf), FALSE);
+		RETURN_VALUE_IF_ERROR(file.Close(), FALSE);
+		return TRUE;
+	}
+
+	OP_STATUS is_located_in_dir(const OpString &path, const uni_char *expected_dir, BOOL &equal)
+	{
+		OpFile tmp_file;
+		RETURN_IF_ERROR(tmp_file.Construct(path.CStr()));
+		OpString dirpath;
+		RETURN_IF_ERROR(tmp_file.GetDirectory(dirpath));
+		RETURN_IF_ERROR(g_op_system_info->PathsEqual(dirpath.CStr(), expected_dir, &equal));
+		return OpStatus::OK;
+	}
+}
+
+exit
+{
+	// Destroy previous gadget class, if any.
+	if (gadget_class)
+	{
+		g_gadget_manager->RemoveGadget(gadget_class->GetGadgetPath());
+		gadget_class = NULL;
+	}
+
+	OP_DELETE(installer);
+}
+
+test("Instantiate installer")
+{
+	verify_success(OpGadgetInstallObject::Make(installer, GADGET_CLASS_WIDGET));
+	verify(!installer->IsOpen());
+	verify_success(installer->Open());
+	verify(installer->IsOpen());
+	verify_success(installer->Close());
+	verify(!installer->IsOpen());
+
+	verify(installer->GetGadget() == NULL);
+	verify(installer->GetGadgetClass() == NULL);
+}
+finally
+{
+	OP_DELETE(installer);
+	installer = NULL;
+}
+
+test("Appending data")
+{
+	verify_success(OpGadgetInstallObject::Make(installer, GADGET_CLASS_WIDGET));
+	verify_success(installer->Open());
+	ByteBuffer buf;
+	verify_success(buf.AppendBytes("foo", 3));
+	verify_success(installer->AppendData(buf));
+	verify_success(installer->Close());
+	verify(!installer->IsValidWidget());
+}
+finally
+{
+	OP_DELETE(installer);
+	installer = NULL;
+}
+
+test("Updating file from widget name")
+	file zip_file "testfiles/widgets/case_sensitive.wgt";
+{
+	verify_success(OpGadgetInstallObject::Make(installer, GADGET_CLASS_WIDGET));
+	verify_success(installer->Open());
+	verify_success(load_widget(*installer, zip_file));
+	verify_success(installer->Close());
+	verify(installer->IsValidWidget());
+
+	OpString path;
+	verify_success(path.Set(installer->GetFullPath()));
+	verify(path.Length() > 0);
+	// Check that the widget is currently placed in the temporary folder
+	BOOL equal = FALSE;
+	/* This value only have to live to the end of the enclosing
+	 * function call, so it should be safe to reuse the storage
+	 * object.
+	 */
+	OpString tmp_storage;
+	verify_success(is_located_in_dir(path, g_folder_manager->GetFolderPathIgnoreErrors(OPFILE_TEMP_FOLDER, tmp_storage), equal));
+	verify(equal, "Located in temp dir");
+
+	OpString filename;
+	verify_success(filename.Set(installer->GetFilename()));
+	verify(filename.Length() > 0);
+
+	verify_success(installer->Update());
+	verify(installer->IsValidWidget());
+
+	OpString new_path;
+	verify_success(new_path.Set(installer->GetFullPath()));
+	verify(new_path.Length() > 0);
+	// Widget is still not installed so should be located in temporary folder still
+	equal = FALSE;
+	verify_success(is_located_in_dir(new_path, g_folder_manager->GetFolderPathIgnoreErrors(OPFILE_GADGET_FOLDER, tmp_storage), equal));
+	verify(equal, "Located in temp dir");
+}
+
+test("Install widget file")
+	require success "Updating file from widget name";
+	file zip_file "testfiles/widgets/case_sensitive.wgt";
+{
+	verify_success(g_gadget_manager->Install(installer));
+	gadget_class = installer->GetGadgetClass();
+	verify(installer->GetIsInstalled());
+	verify(gadget_class != NULL);
+}
+finally
+{
+	OP_DELETE(installer);
+	installer = NULL;
+}
+
+test("Upgrade widget file")
+	require success "Install widget file";
+	file zip_file "testfiles/widgets/w3c_widget_zipped.wgt";
+{
+	verify_success(OpGadgetInstallObject::Make(installer, GADGET_CLASS_WIDGET));
+	verify_success(installer->Open());
+	verify_success(load_widget(*installer, zip_file));
+	verify_success(installer->Close());
+
+	verify_success(installer->Update());
+
+	// Find the gadget that we want to upgrade to a new widget file
+	OpGadget *gadget = g_gadget_manager->FindGadget(GADGET_FIND_BY_PATH, gadget_class->GetGadgetPath(), TRUE);
+	if (!gadget)
+	{
+		verify_success(g_gadget_manager->CreateGadget(&gadget, gadget_class));
+		verify(gadget);
+	}
+	installer->SetGadget(gadget);
+
+	verify_success(g_gadget_manager->Upgrade(installer));
+
+	gadget_class = installer->GetGadgetClass();
+	verify(installer->GetIsInstalled());
+	verify(gadget_class != NULL);
+}
+finally
+{
+	if (gadget_class)
+	{
+		g_gadget_manager->RemoveGadget(gadget_class->GetGadgetPath());
+		gadget_class = NULL;
+	}
+	OP_DELETE(installer);
+	installer = NULL;
+}

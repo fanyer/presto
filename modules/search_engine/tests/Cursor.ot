@@ -1,0 +1,144 @@
+group "search_engine.cursor";
+
+require SEARCH_ENGINE;
+
+include "modules/search_engine/BlockStorage.h";
+include "modules/search_engine/Cursor.h";
+include "modules/search_engine/tests/test_util.h";
+
+test("Cursor operations")
+	file uni cursor_wr "data/cursor.wr";
+{
+	BlockStorage bs;
+	BSCursor rc;
+	BSCursor c(&bs);
+	OpFileLength id = 0;
+	int i16, i32;
+	char str[32];  /* ARRAY OK 2010-09-24 roarl */
+	OP_STATUS status;
+
+	verify_success(c.AddField("int16", 2));
+	verify_success(c.AddField("string", 0));
+	verify_success(c.AddField("int32", 4));
+
+	verify_success(rc.AddField("int16", 2));
+	verify_success(rc.AddField("string", 0));
+	verify_success(rc.AddField("int32", 4));
+
+	delete_file(cursor_wr);
+	status = bs.Open(cursor_wr, BlockStorage::OpenReadWrite, 32);
+	verify_success(status);
+
+	verify_success(c.Create());
+	verify_success(c["int16"].SetValue(4));
+	verify_success(c[2].SetValue(7));
+	verify_success(c["string"].SetStringValue("string of 23 characters"));
+	verify_success(c.Flush());
+	id = c.GetID();
+
+	rc.SetStorage(&bs);
+	verify_success(rc.Goto(id));
+	rc["int16"].GetValue(&i16);
+	rc["int32"].GetValue(&i32);
+	rc["string"].GetStringValue(str, sizeof(str));
+	verify_success(rc["string"].SetStringValue("string of  25  characters"));
+	if (id != 0) {
+		verify_success(rc.Flush());
+		id = rc.GetID();
+	}
+
+	bs.Close();
+
+	delete_file(cursor_wr);
+
+	verify(id != 0);
+	verify(i16 == 4);
+	verify(i32 == 7);
+	verify_string(str, "string of 23 characters");
+}
+
+test("Cursor errors")
+	file uni cursor_wr "data/cursor.wr";
+{
+	BlockStorage bs;
+	BSCursor c(&bs);
+//	BSCursor::ID id = 0;
+	int i32;
+	char str[32];  /* ARRAY OK 2010-09-24 roarl */
+	OP_STATUS status;
+
+	verify_success(c.AddField("int16", 2));
+	verify_success(c.AddField("string78", 0));  // MAX_FIELD_NAME should truncate this value to 7 chars
+
+	verify(OpStatus::IsError(c["int16"].SetValue(4)));
+	verify_success(c.Create());
+	verify_success(c["int16"].SetValue(5));
+
+	verify(OpStatus::IsError(c.Flush()));
+
+	delete_file(cursor_wr);
+	status = bs.Open(cursor_wr, BlockStorage::OpenReadWrite, 32);
+	verify_success(status);
+
+	verify(OpStatus::IsError(c.Goto(0)));
+	//c.Goto(4096);
+
+	c[0].GetValue(&i32);
+
+	verify_success(c.Create());
+	verify_success(c["string78"].SetStringValue("string of 23 characters"));
+	verify(OpStatus::IsError(c["nexist"].SetStringValue("any string")));
+	verify_success(c.Flush());
+
+	bs.Close();
+
+	c["string78"].GetStringValue(str, sizeof(str));
+
+	verify(OpStatus::IsError(c.Goto(32)));
+
+	delete_file(cursor_wr);
+
+	verify(i32 == 5);
+	verify_string(str, "string of 23 characters");
+}
+
+test("autocreate transaction")
+	file uni cursor_wr "data/cursor.wr";
+{
+	BlockStorage bs;
+	BSCursor c(&bs, TRUE);
+	OP_STATUS status;
+
+	verify_success(c.AddField("int16", 2));
+	verify_success(c.AddField("string", 0));
+	verify_success(c.AddField("int32", 4));
+
+	delete_file(cursor_wr);
+	status = bs.Open(cursor_wr, BlockStorage::OpenReadWrite, 32);
+	verify_success(status);
+
+	verify_success(c.Create());
+	verify_success(c["int16"].SetValue(4));
+	verify_success(c[2].SetValue(7));
+	verify_success(c["string"].SetStringValue("string of 23 characters"));
+	verify_success(c.Flush());
+
+	verify(bs.InTransaction());
+
+	verify_success(bs.Commit());
+
+	verify_success(c["int32"].SetValue(23));
+	verify(!bs.InTransaction());
+
+	verify_success(c["string"].SetStringValue("string of 23  xaracters"));
+	verify(!bs.InTransaction());
+
+	verify_success(c["string"].SetStringValue("string of 24  characters"));
+	verify(bs.InTransaction());
+
+	verify_success(bs.Commit());
+
+	bs.Close();
+	delete_file(cursor_wr);
+}
+

@@ -1,0 +1,241 @@
+group "search_engine.bufferedlowlevelfile";
+
+require SEARCH_ENGINE;
+
+include "modules/search_engine/tests/test_util.h";
+include "modules/search_engine/tests/MockLowLevelFile.h";
+include "modules/search_engine/BufferedLowLevelFile.h";
+
+subtest TestBufferedFile(OpLowLevelFile* file, MockLowLevelFile* mock, BOOL delete_file)
+{
+	OpLowLevelFile* f;
+	const char* file_contents;
+	unsigned int file_length;
+	char buf[256]; /* ARRAY OK 2010-09-24 roarl */
+	OpFileLength len, pos;
+	OP_STATUS status;
+
+	f = BufferedLowLevelFile::Create(file, status, 16);
+	verify_success(status);
+
+	//               0.......+.......1......
+	file_contents = "Mary had a little lamb,";
+	file_length = (int)op_strlen(file_contents);
+
+	if (mock) {
+		mock->Expect("Open", Mock::Str("%d", OPFILE_UPDATE), OpStatus::OK);
+		mock->Expect("GetFileLength", Mock::Str("OpFileLength*"), Mock::Str("%d, %d", file_length, OpStatus::OK));
+	}
+
+	verify(f->Open(OPFILE_UPDATE) == OpStatus::OK);
+	verify(f->SetFilePos(0) == OpStatus::OK);
+
+	if (mock) {
+		verify(mock->VerifyExpectations());
+
+		mock->Expect("Read", Mock::Str("void*, 16, OpFileLength*"), Mock::Str("'%.16s', 16, %d", file_contents, OpStatus::OK));
+	}
+
+	verify(f->SetFilePos(1) == OpStatus::OK);
+	verify(f->GetFilePos(&pos) == OpStatus::OK);
+	verify(pos == 1);
+	verify(f->GetFileLength(&len) == OpStatus::OK);
+	verify(len == file_length);
+	verify(f->Eof() == FALSE);
+
+	verify(f->Read(buf, 6, &len) == OpStatus::OK);
+	verify(len == 6);
+	verify(op_strncmp(buf, file_contents+pos, (size_t)len) == 0);
+
+	pos = 0;
+	verify(f->SetFilePos(pos) == OpStatus::OK);
+	verify(f->Read(buf, 8, &len) == OpStatus::OK);
+	verify(len == 8);
+	verify(op_strncmp(buf, file_contents+pos, (size_t)len) == 0);
+
+	pos = 8;	
+	verify(f->Read(buf, 8, &len) == OpStatus::OK);
+	verify(len == 8);
+	verify(op_strncmp(buf, file_contents+pos, (size_t)len) == 0);
+
+	verify(f->SetFilePos(0) == OpStatus::OK);
+	verify(f->Read(buf, 16, &len) == OpStatus::OK);
+	verify(len == 16);
+	verify(op_strncmp(buf, file_contents, (size_t)len) == 0);
+
+	if (mock) {
+		verify(mock->VerifyExpectations());
+
+		mock->Expect("Read", Mock::Str("void*, 16, OpFileLength*"), Mock::Str("'%.7s', 7, %d", file_contents+16, OpStatus::OK));
+	}
+
+	pos = 16;
+	verify(f->SetFilePos(pos) == OpStatus::OK);
+	verify(f->Read(buf, 16, &len) == OpStatus::OK);
+	verify(len == 7);
+	verify(op_strncmp(buf, file_contents+pos, (size_t)len) == 0);
+
+	pos = 18;
+	verify(f->SetFilePos(pos) == OpStatus::OK);
+	verify(f->Read(buf, 10, &len) == OpStatus::OK);
+	verify(len == 5);
+	verify(op_strncmp(buf, file_contents+pos, (size_t)len) == 0);
+
+	// Setting the virtual file position to another block should not set file position of the underlying file
+	pos = 11;
+	verify(f->SetFilePos(pos) == OpStatus::OK);
+
+	if (mock) {
+		verify(mock->VerifyExpectations());
+
+		mock->Expect("SetFilePos", Mock::Str("0, %d", SEEK_FROM_START), OpStatus::OK);
+		mock->Expect("Read", Mock::Str("void*, 16, OpFileLength*"), Mock::Str("'%.16s', 16, %d", file_contents, OpStatus::OK));
+		mock->Expect("Read", Mock::Str("void*, 16, OpFileLength*"), Mock::Str("'%.7s', 7, %d", file_contents+16, OpStatus::OK));
+	}
+
+	verify(f->Read(buf, 6, &len) == OpStatus::OK);
+	verify(len == 6);
+	verify(op_strncmp(buf, file_contents+pos, (size_t)len) == 0);
+
+	if (mock)
+		verify(mock->VerifyExpectations());
+
+	//               0.......+.......1......
+	file_contents = "Mary had a *HUGE* lamb,";
+
+	pos = 11;
+	if (mock) {
+		mock->Expect("SetFilePos", Mock::Str("%d, %d", (int)pos, SEEK_FROM_START), OpStatus::OK);
+		mock->Expect("Write", Mock::Str("'%.6s', 6", file_contents+pos), OpStatus::OK);
+	}
+
+	verify(f->SetFilePos(pos) == OpStatus::OK);
+	verify(f->Write(file_contents+pos, 6) == OpStatus::OK);
+	
+	// Reading buffer should be in the same place, _but_updated_ where writing overlaps
+	pos = 16;
+	verify(f->SetFilePos(pos) == OpStatus::OK);
+	verify(f->Read(buf, 1, &len) == OpStatus::OK);
+	verify(len == 1);
+	verify(op_strncmp(buf, file_contents+pos, (size_t)len) == 0);
+
+	if (mock)
+		verify(mock->VerifyExpectations());
+
+	//               0.......+.......1......+.......2.......+.......3.......+.......4.......+.......5.......+.......6.......+.....
+	file_contents = "Mary had a little lamb, Its fleece was white as snow; And everywhere that Mary went, The lamb was sure to go.";
+	file_length = (int)op_strlen(file_contents);
+
+	if (mock) {
+		mock->Expect("SetFilePos", Mock::Str("0, %d", SEEK_FROM_START), OpStatus::OK);
+		mock->Expect("Write", Mock::Str("'%s', %d", file_contents, file_length), OpStatus::OK);
+	}
+
+	pos = 0;
+	verify(f->SetFilePos(pos) == OpStatus::OK);
+	verify(f->Write(file_contents, file_length) == OpStatus::OK);
+	verify(f->GetFileLength(&len) == OpStatus::OK);
+	verify(len == file_length);
+	
+	// Reading buffer should be in the same place, but updated _and_expanded_ where writing overlaps
+	pos = 16;
+	verify(f->SetFilePos(pos) == OpStatus::OK);
+	verify(f->Read(buf, 16, &len) == OpStatus::OK);
+	verify(len == 16);
+	verify(op_strncmp(buf, file_contents+pos, (size_t)len) == 0);
+
+	if (mock) {
+		verify(mock->VerifyExpectations());
+	
+		mock->Expect("SetFilePos", Mock::Str("0, %d", SEEK_FROM_START), OpStatus::OK);
+		for (unsigned int i=0; i<file_length; i += 16) {
+			len = MIN(file_length-i, 16);
+			mock->Expect("Read", Mock::Str("void*, 16, OpFileLength*"),
+						 Mock::Str("'%.16s', %d, %d", file_contents+i, (int)len, OpStatus::OK));
+		}
+	}
+
+	pos = 0;
+	verify(f->SetFilePos(pos) == OpStatus::OK);
+	verify(f->Read(buf, 256, &len) == OpStatus::OK);
+	verify(len == file_length);
+	verify(op_strncmp(buf, file_contents, (size_t)len) == 0);
+
+	if (mock)
+		verify(mock->VerifyExpectations());
+	
+	pos = 16;
+	if (mock) {
+		mock->Expect("SetFilePos", Mock::Str("%d, %d", pos, SEEK_FROM_START), OpStatus::OK);
+		mock->Expect("Read", Mock::Str("void*, 16, OpFileLength*"), Mock::Str("'%.16s', 16, %d", file_contents+16, OpStatus::OK));
+	}
+
+	verify(f->SetFilePos(pos) == OpStatus::OK);
+	verify(f->Read(buf, 16, &len) == OpStatus::OK);
+	verify(len == 16);
+	verify(op_strncmp(buf, file_contents+pos, (size_t)len) == 0);
+
+	if (mock)
+		verify(mock->VerifyExpectations());
+	
+	//               0.......+.......1......
+	file_contents = "Mary had a little lamb,";
+	file_length = (int)op_strlen(file_contents);
+
+	if (mock)
+		mock->Expect("SetFileLength", Mock::Str("%d", file_length), OpStatus::OK);
+
+	verify(f->SetFileLength(file_length) == OpStatus::OK);
+	verify(f->GetFileLength(&len) == OpStatus::OK);
+	verify(len == file_length);
+
+	pos = 16;
+	verify(f->SetFilePos(pos) == OpStatus::OK);
+	verify(f->Read(buf, 16, &len) == OpStatus::OK);
+	verify(len == file_length-pos);
+	verify(op_strncmp(buf, file_contents+pos, (size_t)len) == 0);
+
+	if (mock) {
+		verify(mock->VerifyExpectations());
+	
+		mock->Expect("Close", NULL, OpStatus::OK);
+	}
+
+	f->Close();
+
+	if (mock)
+		verify(mock->VerifyExpectations());
+}
+finally
+{
+	if (mock)
+		mock->Expect("~MockLowLevelFile");
+	if (delete_file)
+	{
+		f->Close();
+		f->Delete();
+	}
+	OP_DELETE(f);
+	// Now, e too is gone, so we cannot mock->VerifyExpectations()
+}
+
+test("BufferedLowLevelFile, mocked virtual file")
+{
+	MockLowLevelFile* mock = OP_NEW(MockLowLevelFile, ());
+	verify(TestBufferedFile(mock, mock, FALSE));
+}
+
+test("BufferedLowLevelFile, actual file")
+	file uni test_file_name "data/BLLF_test.txt";
+{
+	OpLowLevelFile* f;
+
+	verify_success(OpLowLevelFile::Create(&f, test_file_name));
+	verify_success(f->Open(OPFILE_WRITE));
+	verify_success(f->Write("Mary had a little lamb,", 23));
+	verify_success(f->Close());
+	OP_DELETE(f);
+
+	verify_success(OpLowLevelFile::Create(&f, test_file_name));
+	verify(TestBufferedFile(f, NULL, TRUE));
+}

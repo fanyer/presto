@@ -1,0 +1,655 @@
+/* -*- Mode: c++; tab-width: 4; indent-tabs-mode: t; c-basic-offset: 4 -*-
+**
+** Copyright 2007-2010 Opera Software ASA.  All rights reserved.
+**
+** This file is part of the Opera web browser.
+** It may not be distributed under any circumstances.
+*/
+
+group "security_manager.security_gadget";
+
+require GADGET_SUPPORT;
+
+include "modules/security_manager/include/security_manager.h";
+include "modules/url/url2.h";
+include "modules/doc/frm_doc.h";
+include "modules/dochand/win.h";
+include "modules/gadgets/OpGadget.h";
+include "modules/gadgets/OpGadgetManager.h";
+include "modules/gadgets/gadget_selftest_utils.h";
+include "modules/xmlutils/xmlfragment.h";
+include "modules/xmlutils/xmlnames.h";
+
+global
+{
+	OpGadget* gadget = NULL;
+	GadgetSelftestUtils g_utils;
+}
+
+setup
+{
+	OpSecurityManager_Gadget::SetDefaultGadgetPolicy();
+}
+
+exit
+{
+	g_utils.UnloadGadget();
+}
+
+test("Create gadget")
+	file filename "securitywidget/config.xml";
+	file dummy "securitywidget/index.html";
+	async;
+{
+	OP_GADGET_STATUS status = g_utils.LoadGadgetForSelftest(filename, URL_GADGET_INSTALL_CONTENT, &gadget);
+
+	if (OpStatus::IsError(status))
+		ST_failed("Unable to install test widget, status: %d", status);
+	else if (status != OpGadgetStatus::OK_SIGNATURE_VERIFICATION_IN_PROGRESS)
+		ST_passed();
+}
+
+test("XmlHttpRequest to http://www.opera.com")
+	language ecmascript;
+{
+	try {
+		var req = new XMLHttpRequest();
+		req.open('GET', 'http://www.opera.com/xmlrequest', true);
+		req.send(null);
+		verify(true);
+	}
+	catch (ex) {
+		verify(false);
+	}
+}
+
+test("XmlHttpRequest to http://www.opera.com:5678")
+	language ecmascript;
+{
+	try {
+		var req = new XMLHttpRequest();
+		req.open('GET', 'http://www.opera.com:5678/xmlrequest', true);
+		req.send(null);
+		verify(true);
+	}
+	catch (ex) {
+		verify(false);
+	}
+}
+
+test("XmlHttpRequest to mms://my.videos/video")
+	language ecmascript;
+{
+	try {
+		var req = new XMLHttpRequest();
+		req.open('GET', 'mms://my.videos/video', true);
+		req.send(null);
+		verify(false);
+	}
+	catch (ex) {
+		verify(true);
+	}
+}
+
+test("XmlHttpRequest to https://www.opera.com")
+	language ecmascript;
+{
+	try {
+		var req = new XMLHttpRequest();
+		req.open('GET', 'https://www.opera.com/xmlrequest', true);
+		req.send(null);
+		verify(true);
+	}
+	catch (ex) {
+		verify(false);
+	}
+}
+
+test("Load widgets.xml")
+{
+	const char* policy_txt =	"<widgets>"
+									"<security>"
+										"<access>"
+											"<protocol>http</protocol>"
+											"<protocol>https</protocol>"
+											"<protocol>ftp</protocol>"
+											"<protocol>mms</protocol>"
+										"</access>"
+										"<content file=\"restricted\" webserver=\"yes\" plugin=\"yes\" />"
+										"<private-network allow=\"unrestricted\">"
+											"<host type=\"localhost\" />"
+											"<host type=\"range\">10.0.0.0-10.255.255.255</host>"
+											"<host type=\"range\">172.16.0.0-172.31.255.255</host>"
+											"<host type=\"range\">192.168.0.0-192.168.255.255</host>"
+											"<host type=\"range\">169.254.0.0-169.254.255.255</host>"
+										"</private-network>"
+										"<blacklist>"
+											"<exclude>"
+												"<port>9999</port>"
+												"<host>www.pvv.org</host>"
+												"<port>75-78</port>"
+												"<port>5001,5003,5005-5007,5008</port>"
+												"<port>5009-5012,5014-5016</port>"
+											"</exclude>"
+											"<exclude>"
+												"<host>www.ntnu.no</host>"
+											"</exclude>"
+											"<exclude>"
+												"<host>www.vg.no</host>"
+												"<path>/cats</path>"
+											"</exclude>"
+											"<exclude>"
+												"<host>*.uio.no</host>"
+											"</exclude>"
+											"<include>"
+												"<port>76</port>"
+											"</include>"
+										"</blacklist>"
+									"</security>"
+								"</widgets>";
+
+	XMLFragment f;
+
+	OpString tmp;
+	tmp.Set(policy_txt);
+
+	OP_STATUS err = f.Parse(tmp.CStr(), tmp.Length());
+	verify(err == OpStatus::OK);
+
+	verify(f.EnterElement(UNI_L("widgets")) == TRUE);
+	verify(f.EnterElement(UNI_L("security")) == TRUE);
+
+	err = OpSecurityManager::SetGlobalGadgetPolicy(&f);
+	verify(err == OpStatus::OK);
+}
+
+test("Check blacklist exclude host filter")
+	language ecmascript;
+	require success "Load widgets.xml";
+{
+	try {
+		var req = new XMLHttpRequest();
+		req.open('GET', 'http://www.ntnu.no/xmlrequest', true);
+		req.send(null);
+		verify(false);
+	}
+	catch (ex) {
+		verify(true);
+	}
+}
+
+test("Check blacklist exclude host filter with wildcard")
+	language ecmascript;
+	require success "Load widgets.xml";
+{
+	try {
+		var req = new XMLHttpRequest();
+		req.open('GET', 'http://www.uio.no/', true);
+		req.send(null);
+		verify(false);
+	}
+	catch (ex) {
+		verify(true);
+	}
+}
+
+test("Check blacklist exclude port filter")
+	language ecmascript;
+	require success "Load widgets.xml";
+{
+	foreach (target) from
+		{
+			{"http://www.pvv.org:77/xmlrequest"},
+			{"http://www.pvv.org:5001/xmlrequest"},
+			{"http://www.pvv.org:5003/xmlrequest"},
+			{"http://www.pvv.org:5006/xmlrequest"},
+			{"http://www.pvv.org:5008/xmlrequest"},
+			{"http://www.pvv.org:5010/xmlrequest"},
+			{"http://www.pvv.org:5014/xmlrequest"},
+		}
+	{
+		try {
+			var req = new XMLHttpRequest();
+			req.open('GET', target, true);
+			req.send(null);
+			verify(false);
+		}
+		catch (ex) {
+			verify(true);
+		}
+	} // foreach
+}
+
+test("Check blacklist include port filter")
+	language ecmascript;
+	require success "Load widgets.xml";
+{
+	try {
+		var req = new XMLHttpRequest();
+		req.open('GET', 'http://www.pvv.org:76/xmlrequest', true);
+		req.send(null);
+		verify(true);
+	}
+	catch (ex) {
+		verify(false);
+	}
+}
+
+test("Check blacklist exclude path filter")
+	language ecmascript;
+	require success "Load widgets.xml";
+{
+	try {
+		var req = new XMLHttpRequest();
+		req.open('GET', 'http://www.vg.no/catsanddogs', true);
+		req.send(null);
+		verify(false);
+	}
+	catch (ex) {
+		verify(true);
+	}
+}
+
+test("Check allow-protocol")
+	language ecmascript;
+	require success "Load widgets.xml";
+{
+	try {
+		var req = new XMLHttpRequest();
+		req.open('GET', 'ftp://ftp.opera.com/xmlrequest', true);
+		req.send(null);
+		verify(true);
+	}
+	catch (ex) {
+		verify(false);
+	}
+}
+
+test("Check allow-protocol for unknown protocol")
+	language ecmascript;
+	require success "Load widgets.xml";
+{
+	try {
+		var req = new XMLHttpRequest();
+		req.open('GET', 'mms://my.videos/video', true);
+		req.send(null);
+		verify(false);
+	}
+	catch (ex) {
+		verify(true);
+	}
+}
+
+test("Check allow-local")
+	language ecmascript;
+	require success "Load widgets.xml";
+{
+	try {
+		var req = new XMLHttpRequest();
+		req.open('GET', 'http://127.0.0.1/xmlrequest', true);
+		req.send(null);
+		verify(true);
+	}
+	catch (ex) {
+		verify(false);
+	}
+}
+
+test("Set up restricted gadget policy")
+{
+	verify(OpSecurityManager::SetRestrictedGadgetPolicy() == OpStatus::OK);
+}
+
+test("Check restricted gadget policy")
+	language ecmascript;
+{
+	try {
+		var req = new XMLHttpRequest();
+		req.open('GET', 'http://www.opera.com/xmlrequest', true);
+		req.send(null);
+		verify(false);
+	}
+	catch (ex) {
+		verify(true);
+	}
+}
+
+test("Global policy override (load policy)")
+	require GADGETS_MUTABLE_POLICY_SUPPORT;
+{
+	const char* policy_txt =
+							"<widgets>"
+							"	<security>"
+							"	<blacklist>"
+							"		<exclude>"
+							"			<host>opera.com</host>"
+							"		</exclude>"
+							"	</blacklist>"
+							"	</security>"
+							"</widgets>";
+
+	// Make sure we're using the default policy initially.
+	OP_STATUS err = OpSecurityManager::SetDefaultGadgetPolicy();
+	verify(err == OpStatus::OK);
+
+	// Reset private network settings to default as well.
+	gadget->GetClass()->GetSecurity()->private_network->allow = (
+		GadgetPrivateNetwork::INTRANET |
+		GadgetPrivateNetwork::INTERNET |
+		GadgetPrivateNetwork::UNRESTRICTED);
+
+	gadget->SetAllowGlobalPolicy(TRUE);
+
+	OpString str;
+	err = str.Set(policy_txt);
+	verify(err == OpStatus::OK);
+
+	// Load global policy override.
+	err = OpSecurityManager::SetGlobalGadgetPolicy(gadget, str.CStr());
+	verify(err == OpStatus::OK);
+}
+
+test("Global policy override")
+	require GADGETS_MUTABLE_POLICY_SUPPORT;
+	language ecmascript;
+{
+	try {
+		var req = new XMLHttpRequest();
+		req.open('GET', 'http://opera.com/xmlrequest', true);
+		req.send(null);
+		verify(false);
+	}
+	catch (ex) {
+		verify(true);
+	}
+}
+
+test("Global policy override (restore global policy)")
+	require GADGETS_MUTABLE_POLICY_SUPPORT;
+{
+	OP_STATUS err = OpSecurityManager::SetDefaultGadgetPolicy();
+	verify(err == OpStatus::OK);
+	OpSecurityManager::ClearGlobalGadgetPolicy(gadget);
+	gadget->SetAllowGlobalPolicy(FALSE);
+}
+
+test("CORE-26119 (Load widgets.xml)")
+{
+	const char* policy_txt =	"<widgets>"
+									"<security>"
+										"<access>"
+										"</access>"
+									"</security>"
+								"</widgets>";
+
+	XMLFragment f;
+
+	OpString tmp;
+	tmp.Set(policy_txt);
+
+	OP_STATUS err = f.Parse(tmp.CStr(), tmp.Length());
+	verify(err == OpStatus::OK);
+
+	verify(f.EnterElement(UNI_L("widgets")) == TRUE);
+	verify(f.EnterElement(UNI_L("security")) == TRUE);
+
+	err = OpSecurityManager::SetGlobalGadgetPolicy(&f);
+	verify(err == OpStatus::OK);
+
+	f.LeaveElement();
+	f.LeaveElement();
+}
+
+test("CORE-26119 Missing <protocol> -> disallow network access")
+	language ecmascript;
+	require success "CORE-26119 (Load widgets.xml)";
+{
+	try {
+		var req = new XMLHttpRequest();
+		req.open('GET', 'http://www.opera.com/next', true);
+		req.send(null);
+		verify(false);
+	}
+	catch (ex) {
+		verify(true);
+	}
+}
+
+test("CORE-26115 (Load widgets.xml)")
+{
+	const char* policy_txt =	"<widgets>"
+									"<security>"
+										"<access>"
+											"<protocol>http</protocol>"
+											"<host>*</host>"
+										"</access>"
+									"</security>"
+								"</widgets>";
+
+	XMLFragment f;
+
+	OpString tmp;
+	tmp.Set(policy_txt);
+
+	OP_STATUS err = f.Parse(tmp.CStr(), tmp.Length());
+	verify(err == OpStatus::OK);
+
+	verify(f.EnterElement(UNI_L("widgets")) == TRUE);
+	verify(f.EnterElement(UNI_L("security")) == TRUE);
+
+	err = OpSecurityManager::SetGlobalGadgetPolicy(&f);
+	verify(err == OpStatus::OK);
+
+	f.LeaveElement();
+	f.LeaveElement();
+}
+
+test("CORE-26115 Network access blocked with wildcard for <host>")
+	language ecmascript;
+	require success "CORE-26115 (Load widgets.xml)";
+{
+	try {
+		var req = new XMLHttpRequest();
+		req.open('GET', 'http://www.opera.com/next', true);
+		req.send(null);
+		verify(true);
+	}
+	catch (ex) {
+		verify(false);
+	}
+}
+
+test("CORE-26114 (Load widgets.xml)")
+{
+	const char* policy_txt =	"<widgets>"
+									"<security>"
+										"<access>"
+											"<protocol>http</protocol>"
+											"<host>*.google.com</host>"
+										"</access>"
+									"</security>"
+								"</widgets>";
+
+	XMLFragment f;
+
+	OpString tmp;
+	tmp.Set(policy_txt);
+
+	OP_STATUS err = f.Parse(tmp.CStr(), tmp.Length());
+	verify(err == OpStatus::OK);
+
+	verify(f.EnterElement(UNI_L("widgets")) == TRUE);
+	verify(f.EnterElement(UNI_L("security")) == TRUE);
+
+	err = OpSecurityManager::SetGlobalGadgetPolicy(&f);
+	verify(err == OpStatus::OK);
+
+	f.LeaveElement();
+	f.LeaveElement();
+}
+
+test("CORE-26114 wildcard for host element does not work")
+	language ecmascript;
+	require success "CORE-26114 (Load widgets.xml)";
+{
+	try {
+		var req = new XMLHttpRequest();
+		req.open('GET', 'http://www.opera.com/next', true);
+		req.send(null);
+		verify(false);
+	}
+	catch (ex) {
+		verify(true);
+	}
+
+	try {
+		var req = new XMLHttpRequest();
+		req.open('GET', 'http://mail.google.com', true);
+		req.send(null);
+		verify(true);
+	}
+	catch (ex) {
+		verify(false);
+	}
+}
+
+test("CORE-26116 (Load widgets.xml)")
+{
+	const char* policy_txt =	"<widgets>"
+									"<security>"
+										"<access>"
+											"<protocol>http</protocol>"
+											"<host></host>"
+										"</access>"
+									"</security>"
+								"</widgets>";
+
+	XMLFragment f;
+
+	OpString tmp;
+	tmp.Set(policy_txt);
+
+	OP_STATUS err = f.Parse(tmp.CStr(), tmp.Length());
+	verify(err == OpStatus::OK);
+
+	verify(f.EnterElement(UNI_L("widgets")) == TRUE);
+	verify(f.EnterElement(UNI_L("security")) == TRUE);
+
+	err = OpSecurityManager::SetGlobalGadgetPolicy(&f);
+	verify(err == OpStatus::OK);
+
+	f.LeaveElement();
+	f.LeaveElement();
+}
+
+test("CORE-26116 Empty <host> inside <access> does not block network access")
+	language ecmascript;
+	require success "CORE-26116 (Load widgets.xml)";
+{
+	try {
+		var req = new XMLHttpRequest();
+		req.open('GET', 'http://10.20.11.103/xmlrequest', true);
+		req.send(null);
+		verify(false);
+	}
+	catch (ex) {
+		verify(true);
+	}
+}
+
+test("Load widgets.xml - restricted to localhost, restrict gadget to intranet")
+{
+	const char* policy_txt =	"<widgets>"
+									"<security>"
+										"<access>"
+											"<protocol>http</protocol>"
+										"</access>"
+										"<private-network allow=\"restricted\">"
+											"<host>127.0.0.1</host>"
+										"</private-network>"
+									"</security>"
+								"</widgets>";
+
+	XMLFragment f;
+
+	OpString tmp;
+	tmp.Set(policy_txt);
+
+	OP_STATUS err = f.Parse(tmp.CStr(), tmp.Length());
+	verify(err == OpStatus::OK);
+
+	verify(f.EnterElement(UNI_L("widgets")) == TRUE);
+	verify(f.EnterElement(UNI_L("security")) == TRUE);
+
+	err = OpSecurityManager::SetGlobalGadgetPolicy(&f);
+	verify(err == OpStatus::OK);
+
+	// NB !! We set the gadet to be restricted to INTRANET ONLY !!
+	// Thus all tests done after this point need to be aware of this.
+	GadgetSecurityPolicy* policy = gadget->GetClass()->GetSecurity();
+	policy->private_network->allow = GadgetPrivateNetwork::INTRANET;
+}
+
+test("CORE-26229: <host> defines in <private-network> doesn't affect private-public classification.")
+	language ecmascript;
+{
+	try {
+		var req = new XMLHttpRequest();
+		req.open('GET', 'http://10.20.11.103/xmlrequest', true);
+		req.send(null);
+		verify(false);
+	}
+	catch (ex) {
+		verify(true);
+	}
+}
+
+test("CORE-26173 (Load widgets.xml)")
+{
+	const char* policy_txt =	"<widgets>"
+									"<security>"
+										"<access>"
+											"<protocol>http</protocol>"
+										"</access>"
+										"<private-network allow=\"unrestricted\">"
+											"<host>10.0.0.0-10.255.255.255</host>"
+										"</private-network>"
+									"</security>"
+								"</widgets>";
+
+	XMLFragment f;
+
+	OpString tmp;
+	tmp.Set(policy_txt);
+
+	OP_STATUS err = f.Parse(tmp.CStr(), tmp.Length());
+	verify(err == OpStatus::OK);
+
+	verify(f.EnterElement(UNI_L("widgets")) == TRUE);
+	verify(f.EnterElement(UNI_L("security")) == TRUE);
+
+	err = OpSecurityManager::SetGlobalGadgetPolicy(&f);
+	verify(err == OpStatus::OK);
+
+	// WARNING!! We set the gadget to be restricted to INTERNET ONLY !!
+	// Thus all tests done after this point need to be aware of this.
+	GadgetSecurityPolicy* policy = gadget->GetClass()->GetSecurity();
+	policy->private_network->allow = GadgetPrivateNetwork::INTERNET;
+
+	f.LeaveElement();
+	f.LeaveElement();
+}
+
+test("CORE-26173")
+	language ecmascript;
+{
+	try {
+		var req = new XMLHttpRequest();
+		req.open('GET', 'http://testsuites.oslo.opera.com/', true);
+		req.send(null);
+		verify(false);
+	}
+	catch (ex) {
+		verify(true);
+	}
+}

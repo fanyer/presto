@@ -1,0 +1,153 @@
+/* -*- Mode: c++; tab-width: 4; indent-tabs-mode: t; c-basic-offset: 4 -*- */
+
+group "vega_backends.blocklist";
+require VEGA_BACKENDS_USE_BLOCKLIST;
+
+include "modules/util/opautoptr.h";
+include "modules/util/opfile/opfile.h";
+include "platforms/vega_backends/vega_blocklist_device.h";
+include "platforms/vega_backends/vega_blocklist_file.h";
+
+global
+{
+	class TestDataProvider : public VEGABlocklistDevice::DataProvider
+	{
+	public:
+		TestDataProvider(const uni_char* val = 0) : m_val(val) {}
+		void SetValue(const uni_char* val) { m_val = val; }
+		OP_STATUS GetValueForKey(const uni_char* key, OpString& val)
+		{
+			return val.Set(m_val);
+		}
+		const uni_char* m_val;
+	};
+}
+
+test("blocked devices")
+file uni path "blocklists/blocked_devices.json";
+{
+	OpFile file;
+	verify_success(file.Construct(path));
+	verify_success(file.Open(OPFILE_READ));
+
+	VEGABlocklistFile f;
+	ST_VEGABlocklistFileAccessor acc(&f);
+
+	verify(OpStatus::IsSuccess(acc.Load(&file)));
+
+	OpAutoVector<VEGABlocklistFileEntry>* entries = acc.GetEntries();
+	verify(entries->GetCount() == 5);
+
+	TestDataProvider prov(UNI_L("testing 1.2.3"));
+
+	for (unsigned int i = 0; i < 5; ++i)
+	{
+		VEGABlocklistFileEntry* entry = entries->Get(i);
+		verify(entry);
+		verify(entry->Matches(&prov) == OpBoolean::IS_TRUE);
+		verify(entry->status2d == VEGABlocklistDevice::BlockedDevice);
+		verify(entry->status3d == VEGABlocklistDevice::Discouraged);
+	}
+}
+
+table vendor_driver_links(const uni_char*, const uni_char*)
+{
+	{ UNI_L("0x10de"), UNI_L("http://www.nvidia.com/Download/index.aspx") },
+	{ UNI_L("0x1002"), UNI_L("http://support.amd.com/us/gpudownload/Pages/index.aspx") },
+}
+test("driver urls")
+file uni path "blocklists/driver_urls.json";
+{
+	OpFile file;
+	verify_success(file.Construct(path));
+	verify_success(file.Open(OPFILE_READ));
+
+	VEGABlocklistFile f;
+	ST_VEGABlocklistFileAccessor acc(&f);
+
+	verify(OpStatus::IsSuccess(acc.Load(&file)));
+
+	TestDataProvider prov;
+
+	iterate(id, expected_url) from vendor_driver_links
+	{
+		prov.SetValue(id);
+		VEGABlocklistDriverLinkEntry* e;
+		verify(OpStatus::IsSuccess(f.FindMatchingDriverLink(&prov, e)));
+		verify(!uni_strcmp(expected_url, e->m_driver_link));
+	}
+}
+test("driver urls + entry")
+file uni path "blocklists/driver_urls_entry.json";
+{
+	OpFile file;
+	verify_success(file.Construct(path));
+	verify_success(file.Open(OPFILE_READ));
+
+	VEGABlocklistFile f;
+	ST_VEGABlocklistFileAccessor acc(&f);
+
+	verify(OpStatus::IsSuccess(acc.Load(&file)));
+
+	TestDataProvider prov;
+
+	iterate(id, expected_url) from vendor_driver_links
+	{
+		prov.SetValue(id);
+		VEGABlocklistDriverLinkEntry* e;
+		verify(OpStatus::IsSuccess(f.FindMatchingDriverLink(&prov, e)));
+		verify(!uni_strcmp(expected_url, e->m_driver_link));
+	}
+}
+
+/**
+   check that the shipped blocklists can be loaded. we sould never ship opera with broken blocklists.
+ */
+test("shipped blocklists")
+{
+	for (UINT16 i = 0; i < VEGABlocklistDevice::SelftestBlocklistFile; ++i)
+	{
+		const uni_char* path = ST_VEGABlocklistFileAccessor::GetName((VEGABlocklistDevice::BlocklistType)i);
+		verify(path);
+
+		OpFile file;
+		verify(OpStatus::IsSuccess(file.Construct(path, OPFILE_RESOURCES_FOLDER)));
+		verify(OpStatus::IsSuccess(file.Open(OPFILE_READ)));
+
+		VEGABlocklistFile f;
+		ST_VEGABlocklistFileAccessor acc(&f);
+		verify(OpStatus::IsSuccess(acc.Load(&file)));
+	}
+}
+
+table ArbStringPairs(const uni_char*, const uni_char*)
+{
+	{ UNI_L("i remember"), UNI_L("as though it were a meal ago"), },
+	{ UNI_L("truly a wonder of nature"), UNI_L("this urban predator"), },
+}
+test("arbitrary strings")
+file uni path "blocklists/strings.json";
+{
+	OpFile file;
+	verify_success(file.Construct(path));
+	verify_success(file.Open(OPFILE_READ));
+
+	VEGABlocklistFile f;
+	ST_VEGABlocklistFileAccessor acc(&f);
+	verify(OpStatus::IsSuccess(acc.Load(&file)));
+
+	OpAutoVector<VEGABlocklistFileEntry>* entries = acc.GetEntries();
+	UINT32 i = 0;
+	VEGABlocklistFileEntry* e;
+	while ((e = entries->Get(i)) != NULL)
+	{
+		++ i;
+		iterate (key, exp) from ArbStringPairs
+		{
+			uni_char* val;
+			verify_success(e->string_entries.GetData(key, &val));
+			verify(!uni_strcmp(val, exp));
+		}
+	}
+	verify(i == 2);
+}

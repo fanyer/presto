@@ -1,0 +1,265 @@
+/* -*- Mode: c++; tab-width: 4; indent-tabs-mode: t; c-basic-offset: 4 -*-
+**
+** Copyright (C) 2004-2007 Opera Software ASA.  All rights reserved.
+**
+** This file is part of the Opera web browser.  It may not be distributed
+** under any circumstances.
+**
+** Peter Karlsson
+*/
+
+group "prefsloader.download";
+require init;
+require PREFS_DOWNLOAD;
+
+include "modules/prefsloader/prefsloadmanager.h";
+include "modules/prefs/prefsmanager/prefsmanager.h";
+include "modules/prefs/prefsmanager/collections/pc_display.h";
+include "modules/prefs/prefsmanager/collections/pc_network.h";
+include "modules/hardcore/timer/optimer.h";
+
+// -- Global variables ---------------------------------------------------
+
+global
+{
+	/* Preference data URL template */
+	const char *data_template =
+		"data:application/x-opera-configuration-siteprefs,"
+		"<?xml version=\"1.0\" encoding=\"ISO-8859-1\"?>"
+		 "<preferences>"
+		  "<hostnames value=\"www.example.com\"/>"
+		   "<host name=\"www.example.com\">"
+		   "<section name=\"User Agent\">"
+		   "<pref name=\"Spoof UserAgent ID\" value=\"%d\"/>"
+		  "</section>"
+		 "</host>"
+		"</preferences>"
+	;
+
+	/* Listener for both the downloader and timer */
+	class myPrefsLoaderListener : public OpEndChecker, public OpTimerListener
+	{
+	public:
+		myPrefsLoaderListener(BOOL ignorehostname)
+			: m_success(FALSE), m_has_hostname(FALSE),
+			  m_ignore_hostname(ignorehostname),
+			  m_test_done(FALSE),
+			  m_do_delete(FALSE),
+			  m_self_pp(NULL)
+			{}
+
+		void TestDone()
+		{
+			m_test_done = TRUE;
+		}
+
+		BOOL DoDelete() const { return m_do_delete; }
+
+		/* OpEndChecker */
+		virtual BOOL IsEnd(OpStringC s)
+		{
+			if (m_ignore_hostname || s.Compare("www.example.com") == 0)
+			{
+				m_has_hostname = TRUE;
+			}
+			else
+			{
+				output("IsEnd() called with unrecognized parameter: \"%s\"\n", s.CStr() ? ST_down(s.CStr()) : "null");
+			}
+			return FALSE;
+		}
+
+		/* OpEndChecker - Called when finished processing the preference XML. */
+		virtual void Dispose()
+		{
+			m_success = TRUE;
+			if (!m_test_done)
+			{
+				if (m_has_hostname)
+				{
+					ST_passed();
+				}
+				else
+				{
+					ST_failed("IsEnd() not called, loading failed\n");
+				}
+			}
+
+			// Clean up if everything is finished
+			m_do_delete = TRUE;
+		}
+
+		/* OpTimerListener */
+		virtual void OnTimeOut(OpTimer *)
+		{
+			if (!m_success && !m_test_done)
+			{
+				ST_failed("Downloading not finished in 3s\n");
+			}
+		}
+
+	private:
+		BOOL m_success;
+		BOOL m_has_hostname;
+		BOOL m_ignore_hostname;
+		BOOL m_test_done;
+		BOOL m_do_delete;
+		myPrefsLoaderListener **m_self_pp;
+	} *m_my_listener = NULL, *m_my_listener_2 = NULL;
+
+	class OpTimer *m_timer = NULL;
+	class OpTimer *m_timer_2 = NULL;
+	int m_new_id;
+}
+
+// -- Tests --------------------------------------------------------------
+
+test("Checking for g_PrefsLoadManager")
+{
+	verify(g_PrefsLoadManager);
+}
+
+test("Downloading a preference")
+	require success "Checking for g_PrefsLoadManager";
+	require SUPPORT_DATA_URL;
+	async;
+{
+	// First check what UA value we should override to
+	m_new_id =
+		g_pcnet->GetIntegerPref(PrefsCollectionNetwork::UABaseId,
+		                        UNI_L("www.example.com")) == 1
+			? 2
+			: 1;
+
+	// Now create a useful data URL. data_url should be big enough to
+	// hold data_template + any growth required by expanding the format.
+	// It's not possible to use op_strlen(data_template) here because the size
+	// must be a constant (bauhaus gets a compiler warning for non-constants).
+	char data_url[512]; /* ARRAY OK 2009-06-22 molsson */
+	op_snprintf(data_url, sizeof data_url, data_template, m_new_id);
+	URL url = g_url_api->GetURL(data_url);
+	if (url.IsEmpty())
+	{
+		ST_failed("Failed setting up data URL\n");
+	}
+	else
+	{
+		// Set up a timer so we can detect if the loading failed
+		m_my_listener = OP_NEW(myPrefsLoaderListener, (FALSE));
+		if (!m_my_listener)
+		{
+			ST_failed("Failed allocating listener\n");
+		}
+		else
+		{
+			m_timer = OP_NEW(OpTimer, ());
+			if (!m_timer)
+			{
+				ST_failed("Failed to create timer\n");
+			}
+			else
+			{
+				m_timer->SetTimerListener(m_my_listener);
+				m_timer->Start(3000);
+
+				// Feed the data URL to the loader
+				if (OpStatus::IsError(g_PrefsLoadManager->InitLoader(url, m_my_listener)))
+				{
+					// Test will fail when the timer runs out so we don't bother to fail it here.
+					output("Failed to init loader\n");
+				}
+			}
+		}
+	}
+}
+
+test("Checking that the download succeeded")
+	require success "Downloading a preference";
+{
+	verify(g_pcnet->GetIntegerPref(PrefsCollectionNetwork::UABaseId,
+	        UNI_L("www.example.com")) == m_new_id);
+}
+
+test("Removing overrides")
+	require success "Checking that the download succeeded";
+{
+	verify(g_prefsManager->IsHostOverridden(UNI_L("www.example.com"), TRUE));
+	verify(g_pcnet->IsHostOverridden(UNI_L("www.example.com"), TRUE));
+
+	verify(g_prefsManager->RemoveOverridesL(UNI_L("www.example.com"), FALSE));
+}
+
+test("DSK-156163 (was: Bug#182507): Missing NULL pointer check")
+{
+	verify(OpStatus::IsSuccess(g_PrefsLoadManager->InitLoader(UNI_L("www.example.com"))));
+}
+
+// NOTE: this testcase might connect to the webserver
+// http://xml.opera.com/ depending on settings in opera.ini
+test("DSK-156163 (was: Bug#182507): Missing free")
+	require success "Checking for g_PrefsLoadManager";
+	require SUPPORT_DATA_URL;
+	async;
+{
+	// Set up a timer so we can detect if the loading failed
+	m_my_listener_2 = OP_NEW(myPrefsLoaderListener, (TRUE));
+	if (!m_my_listener_2)
+	{
+		ST_failed("Failed allocating listener\n");
+	}
+	else
+	{
+		m_timer_2 = OP_NEW(OpTimer, ());
+		if (!m_timer_2)
+		{
+			ST_failed("Failed to create timer\n");
+		}
+		else
+		{
+			m_timer_2->SetTimerListener(m_my_listener_2);
+			m_timer_2->Start(3000);
+
+			// Try downloading overrides for host == NULL (NULL will be treated as a
+			// "const uni_char*" which is then passed to the OpStringC constructor).
+			//
+			// Note that this will connect to the spoof server you have configured
+			// in opera.ini under section [Install] and key "Preference URL".
+			// By default this URL will be xml.opera.com/spoof/ but if you have some
+			// tweaks active in ./platforms/core/tweaks.h this might get reset to
+			// something else.
+			if (OpStatus::IsError(g_PrefsLoadManager->InitLoader(NULL, m_my_listener_2)))
+			{
+				// Test will fail when the timer runs out so we don't bother to fail it here.
+				output("Failed to init loader\n");
+			}
+		}
+	}
+}
+
+
+// -- Global cleanup -----------------------------------------------------
+
+exit
+{
+	OP_DELETE(m_timer);
+	OP_DELETE(m_timer_2);
+
+	// If everything passed, the listeners are deleted. Otherwise 
+	// we need to tell them the tests are over so they won't 
+	// output a spurious "FAIL" when the prefsloader module
+	// cleanup is performed.
+	if (m_my_listener)
+	{
+		if (m_my_listener->DoDelete())
+			OP_DELETE(m_my_listener);
+		else
+			m_my_listener->TestDone();
+	}
+	if (m_my_listener_2)
+	{
+		if (m_my_listener_2->DoDelete())
+			OP_DELETE(m_my_listener_2);
+		else
+			m_my_listener_2->TestDone();
+	}
+}

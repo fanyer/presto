@@ -1,0 +1,167 @@
+/* -*- Mode: c++; tab-width: 4; indent-tabs-mode: t; c-basic-offset: 4; -*-
+**
+** Copyright (C) 2009-2011 Opera Software ASA.  All rights reserved.
+**
+** This file is part of the Opera web browser.  It may not be distributed
+** under any circumstances.
+**
+** Peter Krefting
+*/
+
+group "display.tvmanager";
+require initialization;
+require HAS_ATVEF_SUPPORT;
+
+include "modules/display/tvmanager.h";
+include "modules/url/url_api.h";
+
+global
+{
+	TvManager *tv_man;
+
+	class SelftestTvListener
+		: public OpTvWindowListener
+	{
+	public:
+		virtual void SetDisplayRect(const uni_char *url, const OpRect &rect)
+		{
+			//output("SetDisplayRect(\"%s\", ...\")\n", ST_down(url));
+			m_rect = rect;
+			uni_strlcpy(m_url, url, 256);
+		}
+		virtual void OnTvWindowAvailable(const uni_char *url, BOOL available)
+		{
+			//output("OnTvWindowAvailable(\"%s\", ...\")\n", ST_down(url));
+			m_available = available;
+			uni_strlcpy(m_url, url, 256);
+		}
+
+#ifdef MEDIA_SUPPORT
+		virtual void SetDisplayRect(OpMediaHandle handle, const OpRect& rect, const OpRect &clipRect) {}
+		virtual void OnTvWindowAvailable(OpMediaHandle handle, BOOL available) {}
+#endif // MEDIA_SUPPORT
+
+		OpRect m_rect;
+		BOOL m_available;
+		uni_char m_url[256]; /* ARRAY OK 2010-04-27 peter */
+	} *listener1, *listener2;
+}
+
+setup
+{
+	tv_man = NULL;
+	listener1 = NULL;
+	listener2 = NULL;
+}
+
+test("Create objects")
+{
+	verify((tv_man = OP_NEW(TvManager, ())) != NULL);
+	verify((listener1 = OP_NEW(SelftestTvListener, ())) != NULL);
+	verify((listener2 = OP_NEW(SelftestTvListener, ())) != NULL);
+
+	listener1->m_available = FALSE;
+	listener2->m_available = FALSE;
+}
+
+test("RegisterTvListener")
+	require success "Create objects";
+{
+	verify(OpStatus::IsSuccess(tv_man->RegisterTvListener(listener1)));
+}
+
+
+test("Repeat RegisterTvListener")
+	require success "RegisterTvListener";
+{
+	verify(OpStatus::IsSuccess(tv_man->RegisterTvListener(listener1)));
+}
+
+test("SetDisplayRect")
+	require success "RegisterTvListener";
+{
+	OpRect r1(1, 1, 20, 20);
+	OpRect r2(40, 40, 90, 90);
+
+	const uni_char *u1 = UNI_L("tv://channel1");
+	const uni_char *u2 = UNI_L("tv://channel2");
+
+	URL url1(g_url_api->GetURL(u1));
+	URL url2(g_url_api->GetURL(u2));
+
+	tv_man->SetDisplayRect(&url1, r1);
+	verify(listener1->m_rect.Equals(r1));
+	verify(uni_strcmp(listener1->m_url, u1) == 0);
+
+	tv_man->SetDisplayRect(&url2, r2);
+	verify(listener1->m_rect.Equals(r2));
+	verify(uni_strcmp(listener1->m_url, u2) == 0);
+}
+
+test("OnTvWindowAvailable")
+	require success "RegisterTvListener";
+{
+	const uni_char *u3 = UNI_L("tv://channel3");
+	URL url3(g_url_api->GetURL(u3));
+
+	tv_man->OnTvWindowAvailable(&url3, TRUE);
+	verify(listener1->m_available);
+	verify(uni_strcmp(listener1->m_url, u3) == 0);
+
+	tv_man->OnTvWindowAvailable(&url3, FALSE);
+	verify(!listener1->m_available);
+	verify(uni_strcmp(listener1->m_url, u3) == 0);
+}
+
+test("Multiple listeners")
+	require success "RegisterTvListener";
+{
+	OpRect r3(90, 90, 100, 100);
+
+	const uni_char *u4 = UNI_L("tv://boo");
+
+	URL url4(g_url_api->GetURL(u4));
+
+	verify(OpStatus::IsSuccess(tv_man->RegisterTvListener(listener2)));
+
+	tv_man->SetDisplayRect(&url4, r3);
+	verify(listener1->m_rect.Equals(r3));
+	verify(listener2->m_rect.Equals(r3));
+	verify(uni_strcmp(listener1->m_url, u4) == 0);
+	verify(uni_strcmp(listener2->m_url, u4) == 0);
+
+	tv_man->UnregisterTvListener(listener2);
+}
+
+test("UnregisterTvListener")
+	require success "RegisterTvListener";
+{
+	const uni_char *u5 = UNI_L("tv://ignore");
+	URL url5(g_url_api->GetURL(u5));
+
+	tv_man->UnregisterTvListener(listener1);
+
+	BOOL before = listener1->m_available;
+	OpRect origrect = listener1->m_rect;
+	uni_char origurl[256]; /* ARRAY OK 2010-04-27 peter */
+	uni_strlcpy(origurl, listener1->m_url, 256);
+
+	tv_man->OnTvWindowAvailable(&url5, TRUE);
+	verify(listener1->m_available == before);
+	verify(uni_strcmp(listener1->m_url, origurl) == 0);
+
+	tv_man->OnTvWindowAvailable(&url5, FALSE);
+	verify(listener1->m_available == before);
+	verify(uni_strcmp(listener1->m_url, origurl) == 0);
+
+	tv_man->SetDisplayRect(&url5, OpRect(42, 42, 4711, 4711));
+	verify(listener1->m_rect.Equals(origrect));
+	verify(uni_strcmp(listener1->m_url, origurl) == 0);
+}
+
+exit
+{
+	OP_DELETE(tv_man);
+	OP_DELETE(listener1);
+	OP_DELETE(listener2);
+}

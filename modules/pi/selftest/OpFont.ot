@@ -1,0 +1,259 @@
+/* -*- Mode: c++; tab-width: 4; indent-tabs-mode: t; c-basic-offset: 4; c-file-style:"stroustrup" -*-
+**
+** Copyright (C) 1995-2010 Opera Software AS.  All rights reserved.
+**
+** This file is part of the Opera web browser.
+** It may not be distributed under any circumstances.
+*/
+
+group "pi.opfont";
+
+include "modules/pi/OpFont.h";
+include "modules/util/simset.h";
+
+global
+{
+	OpFontManager* tfm = NULL;
+	UINT32 fontcount = 0;
+	Head fontlist;
+
+	class FontInfoContainer : public Link
+	{
+	public:
+		OpFontInfo m_fontinfo;
+	};
+}
+
+test("create/destroy") repeat 17; leakcheck;
+{
+	tfm = NULL;
+	verify(OpStatus::IsSuccess(OpFontManager::Create(&tfm)));
+	verify(tfm != NULL);
+	OP_DELETE(tfm);
+}
+
+test("Create")
+{
+	verify(OpStatus::IsSuccess(OpFontManager::Create(&tfm)));
+	verify(tfm != NULL);
+}
+
+test("Begin/EndEnumeration") repeat 17; leakcheck; require success "Create";
+{
+	verify(OpStatus::IsSuccess(tfm->BeginEnumeration()));
+	verify(OpStatus::IsSuccess(tfm->EndEnumeration()));
+}
+
+test("EndEnumeration without BeginEnumeration") leakcheck; require success "Create";
+{
+	/* it is undefined what return value EndEnumeration should return
+	 * if BeginEnumeration hasn't been called first. but we check for
+	 * leaks. */
+
+	OP_STATUS status = tfm->EndEnumeration();
+
+	if (OpStatus::IsSuccess(status))
+		output("(returned success, probably good) ");
+	else if (OpStatus::IsMemoryError(status))
+	{
+		output("(returned memory error, probably not good) ");
+		verify(!OpStatus::IsMemoryError(status));
+	}
+	else
+		output("(returned error, probably good) ");
+}
+
+test("BeginEnumeration") require success "Create";
+{
+	verify(OpStatus::IsSuccess(tfm->BeginEnumeration()));
+}
+
+test("CountFonts") leakcheck; require success "BeginEnumeration";
+{
+	fontcount = tfm->CountFonts();
+	verify(fontcount > 0);
+	output("(%d fonts) ", fontcount);
+}
+
+test("GetFontInfo") leakcheck; require success "Create";
+{
+	OpFontInfo ofi;
+
+	for (UINT32 i = 0; i < fontcount; ++i)
+	{
+		OP_STATUS status = tfm->GetFontInfo(i, &ofi);
+		if (OpStatus::IsError(status))
+		{
+			output("GetFontInfo returned error for font number %d", i);
+			verify(OpStatus::IsSuccess(status));
+		}
+	}
+}
+
+test("EndEnumeration") require success "BeginEnumeration";
+{
+	verify(OpStatus::IsSuccess(tfm->EndEnumeration()));
+}
+
+test("FillFontDatabase") require success "EndEnumeration";
+{
+	verify(OpStatus::IsSuccess(tfm->BeginEnumeration()));
+
+	for (UINT32 i = 0; i < fontcount; ++i)
+	{
+		FontInfoContainer* info = OP_NEW(FontInfoContainer, ());
+		verify(info);
+
+		verify(OpStatus::IsSuccess(tfm->GetFontInfo(i, &info->m_fontinfo)));
+		info->Into(&fontlist);
+	}
+
+	verify(OpStatus::IsSuccess(tfm->EndEnumeration()));
+}
+
+test("CreateFont") leakcheck; require success "FillFontDatabase";
+{
+	FontInfoContainer* fic = NULL;
+	for(fic = (FontInfoContainer*)fontlist.First(); fic != NULL; fic = (FontInfoContainer*)fic->Suc())
+	{
+		OpFontInfo* info = &fic->m_fontinfo;
+		OpFont* font = NULL;
+
+		font = tfm->CreateFont(info->GetFace(), 3, 4, FALSE, FALSE, 0);
+		verify(font);
+		OP_DELETE(font);
+
+		font = tfm->CreateFont(info->GetFace(), 12, 7, FALSE, FALSE, 0);
+		verify(font);
+		OP_DELETE(font);
+
+		font = tfm->CreateFont(info->GetFace(), 17, 4, TRUE, FALSE, 0);
+		verify(font);
+		OP_DELETE(font);
+
+		font = tfm->CreateFont(info->GetFace(), 48, 7, TRUE, FALSE, 0);
+		verify(font);
+		OP_DELETE(font);
+	}
+}
+
+test("GetGenericFontName") require success "Create";
+{
+	verify(tfm->GetGenericFontName(GENERIC_FONT_SERIF));
+	verify(tfm->GetGenericFontName(GENERIC_FONT_SANSSERIF));
+	verify(tfm->GetGenericFontName(GENERIC_FONT_CURSIVE));
+	verify(tfm->GetGenericFontName(GENERIC_FONT_FANTASY));
+	verify(tfm->GetGenericFontName(GENERIC_FONT_MONOSPACE));
+}
+
+//#ifdef HAS_FONT_FOUNDRY
+	/**
+	 * Search for a font on any given format ("helvetica", "adobe-helvetica",
+	 * "adobe-helvetica-iso8859-1" etc.). This method should support any format
+	 * that is likely to be used (which is implementation specific). It should
+	 * return (through full_name) the full, real font name, as it is (or would
+	 * have been) stored in OpFontDatabase. The method may choose not to verify
+	 * that the font name exists, as long as it's on the valid format, e.g. if
+	 * 'name' is "foo-bar-oste-pop", and the implementation of
+	 * FindBestFontName() says that this is the right format (even though the
+	 * font doesn't necessarily exist), it may report success. This method is
+	 * here to help core find the right font name based on a font specified
+	 * on a webpage. On X11, a part of the font name is the foundry name.
+	 * Foundry names are never specified on a webpage. A webpage may specify
+	 * "Arial" as the font name, while the actual font name on the system is
+	 * "Arial [Xft]".
+	 * @param name the font name to search for (like "helvetica",
+	 * "adobe-helvetica", "adobe-helvetica-iso8859-1", "Helvetica [Adobe]",
+	 * etc.)
+	 * @full_name the fully qualified name. This name should be on the format
+	 * as stored in OpFontDatabase.
+	 * @return OpStatus::OK on success, OpStatus::ERR_NO_MEMORY on allocation
+	 * failure, OpStatus::ERR on invalid font format.
+	 */
+//	virtual OP_STATUS FindBestFontName(const uni_char *name, OpString &full_name) = 0;
+
+	/**
+	 * Extract the foundry name from a font string (like "adobe-helvetica-22",
+	 * or whatever the font format looks like)
+	 * @param font the font string
+	 * @param foundry where to put the result. This will be a string
+	 * containing only the  foundry name (like "adobe").
+	 */
+//	virtual OP_STATUS GetFoundry(const uni_char *font, OpString &foundry) = 0;
+
+	/**
+	 * Set the preferred foundry. When a font name is specified without the
+	 * foundry (i.e. only the family name is specified) as, for example, the
+	 * argument to FindBestFontName(), and this family is available from
+	 * several foundries, choose the preferred foundry if possible.
+	 * @param foundry The new preferred foundry.
+	 */
+//	virtual OP_STATUS SetPreferredFoundry(const uni_char *foundry) = 0;
+//#endif // HAS_FONT_FOUNDRY
+
+//#ifdef PLATFORM_FONTSWITCHING
+	/**
+	 * Set the preferred font for a specific unicode block
+	 * @param ch a character contained by the actual unicode block. This can be the
+	 * first character in the block (like number 0x0370 for Greek), for example.
+	 * @param monospace is the specified font supposed to be a replacement for
+	 * monospace fonts?
+	 */
+//	virtual void SetPreferredFont(uni_char ch, bool monospace, const uni_char *font,
+//								  OpFontInfo::CodePage codepage=OpFontInfo::OP_DEFAULT_CODEPAGE) = 0;
+//#endif // PLATFORM_FONTSWITCHING
+
+//#ifdef _GLYPHTESTING_SUPPORT_
+	/**
+		Make it possible for font manager to delay glyph mask scanning until the first call to OpFontInfo::HasGlyph()
+	*/
+//	virtual void UpdateGlyphMask(OpFontInfo *fontinfo) = 0;
+//#endif
+
+//#endif
+
+test("GetOutline") require SVG_SUPPORT; require success "CreateFont";
+{
+	const uni_char* str = UNI_L("abc");
+	UINT32 len = 3;
+	UINT32 iostrpos = 0;
+	OpFont* font = NULL;
+
+	for (FontInfoContainer* fic = (FontInfoContainer*)fontlist.First();
+		 fic != NULL;
+		 fic = (FontInfoContainer*)fic->Suc())
+	{
+		OpFontInfo* info = &fic->m_fontinfo;
+
+		font = tfm->CreateFont(info->GetFace(), 12, 4, FALSE, TRUE, 0);
+
+		if (font)
+		{
+			SVGNumber adv;
+			OP_STATUS err = font->GetOutline(str, len, iostrpos, 0, FALSE, adv, NULL);
+
+			/* CreateFont() must return an OpFont capable of getting outlines
+			   when the must_have_getoutline flag is set. */
+
+			verify(err != OpStatus::ERR_NOT_SUPPORTED);
+
+			OP_DELETE(font);
+			font = NULL;
+		}
+	}
+}
+finally
+{
+	OP_DELETE(font);
+}
+
+test("destroy") require success "Create";
+{
+	OP_DELETE(tfm);
+	tfm = NULL;
+}
+
+exit
+{
+	fontlist.Clear();
+}

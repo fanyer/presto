@@ -1,0 +1,1 @@
+/* from Mozilla bug512464: */ var x = postMessage; this.postMessage = this.addEventListener = this.removeEventListener = undefined; x(typeof postMessage === "undefined" && typeof addEventListener === "undefined" && typeof removeEventListener === "undefined")

@@ -1,0 +1,420 @@
+// -*- Mode: c++; tab-width: 4; c-basic-offset: 4 -*-
+group "util.opsharedptr";
+
+include "modules/util/OpSharedPtr.h";
+include "modules/util/OpSharedPtr.h"; // Testing double inclusion
+include "modules/util/opautoptr.h";
+
+global
+{
+	/* We have this registry to know when SimpleType's
+	 * destructor (and copy constructor) was called. */
+	struct SimpleTypeCallbackRegistry
+	{
+		SimpleTypeCallbackRegistry() :
+			dtorCalled(false), copyMade(false)
+		{}
+
+		bool dtorCalled;
+		bool copyMade;
+	};
+
+	class SimpleType
+	{
+	public:
+		SimpleType(SimpleTypeCallbackRegistry* reg, int value) :
+			m_reg(reg), m_someValue(value)
+		{}
+
+		virtual ~SimpleType()
+		{
+			m_reg->dtorCalled = true;
+		}
+
+		SimpleType(const SimpleType& other)
+		{
+			m_reg->copyMade = true;
+			m_someValue = other.m_someValue;
+		}
+
+		SimpleType& operator=(const SimpleType& other)
+		{
+			m_reg->copyMade = true;
+			m_someValue = other.m_someValue;
+			return *this;
+		}
+
+		bool operator==(const SimpleType& other)
+		{
+			return m_someValue == other.m_someValue;
+		}
+
+		SimpleTypeCallbackRegistry* m_reg;
+		int m_someValue;
+	};
+
+	class DerivedFromSimpleType : public SimpleType
+	{
+	public:
+		DerivedFromSimpleType(SimpleTypeCallbackRegistry* reg, int value) :
+			SimpleType(reg, value)
+		{}
+	};
+
+	class ReferenceInConstructorClass
+	{
+	public:
+		ReferenceInConstructorClass(int& ref) : r(ref)
+		{}
+		void Increment() { r++; }
+	private:
+		int& r;
+	};
+}
+
+test("Remove when going out of scope - single owner") leakcheck;
+{
+	OpAutoPtr<SimpleTypeCallbackRegistry> reg(OP_NEW(SimpleTypeCallbackRegistry, ()));
+	SimpleType* obj = OP_NEW(SimpleType, (reg.get(), 42));
+	{
+		// New scope begins.
+		OpSharedPtr<SimpleType> sp(obj);
+		verify(!reg->dtorCalled);
+		verify(!reg->copyMade);
+		// Scope ends.
+	}
+	// obj should have been deleted.
+	verify(reg->dtorCalled);
+	verify(!reg->copyMade);
+}
+
+test("Remove when going out of scope, inline creation - single owner") leakcheck;
+{
+	OpAutoPtr<SimpleTypeCallbackRegistry> reg(OP_NEW(SimpleTypeCallbackRegistry, ()));
+	{
+		// New scope begins.
+		OpSharedPtr<SimpleType> sp(OP_NEW(SimpleType, (reg.get(), 42)));
+		verify(!reg->dtorCalled);
+		verify(!reg->copyMade);
+		// Scope ends.
+	}
+	// obj should have been deleted.
+	verify(reg->dtorCalled);
+	verify(!reg->copyMade);
+}
+
+test("Remove when going out of scope, create by assignment - single owner") leakcheck;
+{
+	OpAutoPtr<SimpleTypeCallbackRegistry> reg(OP_NEW(SimpleTypeCallbackRegistry, ()));
+	{
+		// New scope begins.
+		OpSharedPtr<SimpleType> sp = OpSharedPtr<SimpleType>(OP_NEW(SimpleType, (reg.get(), 42)));
+		verify(!reg->dtorCalled);
+		verify(!reg->copyMade);
+		// Scope ends.
+	}
+	// obj should have been deleted.
+	verify(reg->dtorCalled);
+	verify(!reg->copyMade);
+}
+
+test("Remove when going out of scope - two owners, copy construction") leakcheck;
+{
+	OpAutoPtr<SimpleTypeCallbackRegistry> reg(OP_NEW(SimpleTypeCallbackRegistry, ()));
+	SimpleType* obj = OP_NEW(SimpleType, (reg.get(), 42));
+	{
+		OpSharedPtr<SimpleType> sp1(obj);
+		{
+			OpSharedPtr<SimpleType> sp2(sp1);
+			verify(!reg->dtorCalled);
+			verify(!reg->copyMade);
+			// sp2 goes out of scope.
+		}
+		// No deletion yet, sp1 still owns.
+		verify(!reg->dtorCalled);
+		verify(!reg->copyMade);
+	}
+	// obj should have been deleted.
+	verify(reg->dtorCalled);
+	verify(!reg->copyMade);
+}
+
+test("Remove when going out of scope - two owners, implicit conversion") leakcheck;
+{
+	OpAutoPtr<SimpleTypeCallbackRegistry> reg(OP_NEW(SimpleTypeCallbackRegistry, ()));
+	{
+		OpSharedPtr<DerivedFromSimpleType> sp1(OP_NEW(DerivedFromSimpleType, (reg.get(), 42)));
+		{
+			OpSharedPtr<SimpleType> sp2(sp1);
+			verify(!reg->dtorCalled);
+			verify(!reg->copyMade);
+			// sp2 goes out of scope.
+		}
+		// No deletion yet, sp1 still owns.
+		verify(!reg->dtorCalled);
+		verify(!reg->copyMade);
+	}
+	// obj should have been deleted.
+	verify(reg->dtorCalled);
+	verify(!reg->copyMade);
+}
+
+test("Getting pointer and value") leakcheck;
+{
+	OpAutoPtr<SimpleTypeCallbackRegistry> reg(OP_NEW(SimpleTypeCallbackRegistry, ()));
+	SimpleType* obj = OP_NEW(SimpleType, (reg.get(), 42));
+	OpSharedPtr<SimpleType> sp1(obj);
+
+	verify(sp1.get() == obj);
+	verify(sp1->m_someValue == obj->m_someValue);
+	verify((*sp1).m_someValue == obj->m_someValue);
+	verify(*sp1 == *obj);
+}
+
+subtest equal(bool expectedResult,
+			  OpSharedPtr<SimpleType> sp1,
+			  OpSharedPtr<SimpleType> sp2)
+{
+	verify((sp1 == sp2) == expectedResult);
+	verify(!(sp1 != sp2) == expectedResult);
+	verify(!(sp1 < sp2 || sp2 < sp1) == expectedResult); // Equivalence relation
+}
+
+test("Comparison operators, empty pointers") leakcheck;
+{
+	OpSharedPtr<SimpleType> sp1;
+	OpSharedPtr<SimpleType> sp2;
+
+	equal(true, sp1, sp2);
+}
+
+test("Comparison operators, different pointers, equal objects") leakcheck;
+{
+	OpAutoPtr<SimpleTypeCallbackRegistry> reg(OP_NEW(SimpleTypeCallbackRegistry, ()));
+	OpSharedPtr<SimpleType> sp1(OP_NEW(SimpleType, (reg.get(), 42)));
+	OpSharedPtr<SimpleType> sp2(OP_NEW(SimpleType, (reg.get(), 42)));
+
+	equal(false, sp1, sp2);
+}
+
+test("Comparison operators, same pointers") leakcheck;
+{
+	OpAutoPtr<SimpleTypeCallbackRegistry> reg(OP_NEW(SimpleTypeCallbackRegistry, ()));
+	OpSharedPtr<SimpleType> sp1(OP_NEW(SimpleType, (reg.get(), 42)));
+	OpSharedPtr<SimpleType> sp2(sp1);
+
+	equal(true, sp1, sp2);
+}
+
+test("Implicit conversion") leakcheck;
+{
+	OpAutoPtr<SimpleTypeCallbackRegistry> reg(OP_NEW(SimpleTypeCallbackRegistry, ()));
+	OpSharedPtr<SimpleType> sp1(OP_NEW(DerivedFromSimpleType, (reg.get(), 42)));
+
+	verify(!reg->copyMade);
+}
+
+test("Implicit conversion in assignment") leakcheck;
+{
+	OpAutoPtr<SimpleTypeCallbackRegistry> reg(OP_NEW(SimpleTypeCallbackRegistry, ()));
+	OpSharedPtr<SimpleType> sp1 = OpSharedPtr<DerivedFromSimpleType>(OP_NEW(DerivedFromSimpleType, (reg.get(), 42)));
+
+	verify(!reg->copyMade);
+}
+
+test("Implicit conversion, comparison operator, same object") leakcheck;
+{
+	OpAutoPtr<SimpleTypeCallbackRegistry> reg(OP_NEW(SimpleTypeCallbackRegistry, ()));
+	OpSharedPtr<DerivedFromSimpleType> sp1(OP_NEW(DerivedFromSimpleType, (reg.get(), 42)));
+	OpSharedPtr<SimpleType> sp2(sp1);
+
+	verify(!reg->copyMade);
+	equal(true, sp1, sp2);
+}
+
+test("Implicit conversion, comparison operator, different object") leakcheck;
+{
+	OpAutoPtr<SimpleTypeCallbackRegistry> reg(OP_NEW(SimpleTypeCallbackRegistry, ()));
+	OpSharedPtr<DerivedFromSimpleType> sp1(OP_NEW(DerivedFromSimpleType, (reg.get(), 42)));
+	OpSharedPtr<SimpleType> sp2(OP_NEW(SimpleType, (reg.get(), 42)));
+
+	verify(!reg->copyMade);
+	equal(false, sp1, sp2);
+}
+
+test("Null pointers") leakcheck;
+{
+	OpSharedPtr<SimpleType> sp1((SimpleType *) 0);
+	verify(sp1.get() == NULL);
+
+	OpSharedPtr<SimpleType> sp2 = OpSharedPtr<SimpleType>((SimpleType *) 0);
+	verify(sp2.get() == NULL);
+
+	// Two empty shared pointers are equal.
+	equal(true, sp1, sp2);
+}
+
+test("Swap operation") leakcheck;
+{
+	OpAutoPtr<SimpleTypeCallbackRegistry> reg1(OP_NEW(SimpleTypeCallbackRegistry, ()));
+	OpAutoPtr<SimpleTypeCallbackRegistry> reg2(OP_NEW(SimpleTypeCallbackRegistry, ()));
+	{
+		OpSharedPtr<SimpleType> sp1(OP_NEW(SimpleType, (reg1.get(), 45)));
+		{
+			OpSharedPtr<SimpleType> sp2(OP_NEW(SimpleType, (reg2.get(), 42)));
+			verify(!reg1->dtorCalled);
+			verify(!reg2->dtorCalled);
+
+			sp1.swap(sp2);
+
+			// Pointers should now be swapped, so...
+			verify(sp1->m_someValue == 42);
+			verify(sp2->m_someValue == 45);
+
+			// sp2 goes out of scope.
+		}
+		verify(reg1->dtorCalled); // sp2 was managing the first object after swap.
+		verify(!reg2->dtorCalled); // The second object should still live.
+
+		// sp1 goes out of scope.
+	}
+	verify(reg2->dtorCalled);
+
+	// Objects were not copied, only pointers were swapped.
+	verify(!reg1->copyMade);
+	verify(!reg2->copyMade);
+}
+
+test("Assignment, different types") leakcheck;
+{
+	OpAutoPtr<SimpleTypeCallbackRegistry> reg1(OP_NEW(SimpleTypeCallbackRegistry, ()));
+	OpAutoPtr<SimpleTypeCallbackRegistry> reg2(OP_NEW(SimpleTypeCallbackRegistry, ()));
+	{
+		OpSharedPtr<SimpleType> sp1(OP_NEW(SimpleType, (reg1.get(), 45)));
+		{
+			OpSharedPtr<DerivedFromSimpleType> sp2(OP_NEW(DerivedFromSimpleType, (reg2.get(), 42)));
+			verify(!reg1->dtorCalled);
+			verify(!reg2->dtorCalled);
+
+			sp1 = sp2;
+			verify(reg1->dtorCalled); // sp1 has dropped the first object and now manages second.
+
+			// Point to same object.
+			verify(sp1->m_someValue == 42);
+			verify(sp2->m_someValue == 42);
+			verify(sp1 == sp2);
+			verify(*sp1 == *sp2);
+
+			// sp2 goes out of scope.
+		}
+		verify(!reg2->dtorCalled); // sp1 still has ownership.
+
+		// sp1 goes out of scope.
+	}
+	verify(reg2->dtorCalled);
+
+	// Objects were not copied, only pointers were swapped.
+	verify(!reg1->copyMade);
+	verify(!reg2->copyMade);
+}
+
+test("Reset") leakcheck;
+{
+	OpAutoPtr<SimpleTypeCallbackRegistry> reg(OP_NEW(SimpleTypeCallbackRegistry, ()));
+	OpSharedPtr<SimpleType> sp1(OP_NEW(SimpleType, (reg.get(), 42)));
+	verify(!reg->dtorCalled);
+
+	sp1.reset();
+
+	verify(reg->dtorCalled);
+}
+
+test("Reset to a different object") leakcheck;
+{
+	OpAutoPtr<SimpleTypeCallbackRegistry> reg1(OP_NEW(SimpleTypeCallbackRegistry, ()));
+	OpAutoPtr<SimpleTypeCallbackRegistry> reg2(OP_NEW(SimpleTypeCallbackRegistry, ()));
+	{
+		SimpleType* obj1 = OP_NEW(SimpleType, (reg1.get(), 45));
+		OpSharedPtr<SimpleType> sp1(obj1);
+
+		SimpleType* obj2 = OP_NEW(SimpleType, (reg2.get(), 42));
+		sp1.reset(obj2);
+
+		verify(reg1->dtorCalled);
+		verify(!reg2->dtorCalled);
+	}
+	verify(reg2->dtorCalled);
+}
+
+test("Reset to a different object, derived class") leakcheck;
+{
+	OpAutoPtr<SimpleTypeCallbackRegistry> reg1(OP_NEW(SimpleTypeCallbackRegistry, ()));
+	OpAutoPtr<SimpleTypeCallbackRegistry> reg2(OP_NEW(SimpleTypeCallbackRegistry, ()));
+	{
+		SimpleType* obj1 = OP_NEW(SimpleType, (reg1.get(), 45));
+		OpSharedPtr<SimpleType> sp1(obj1);
+
+		DerivedFromSimpleType* obj2 = OP_NEW(DerivedFromSimpleType, (reg2.get(), 42));
+		sp1.reset(obj2);
+
+		verify(reg1->dtorCalled);
+		verify(!reg2->dtorCalled);
+	}
+	verify(reg2->dtorCalled);
+}
+
+test("Modify a shared object") leakcheck;
+{
+	OpAutoPtr<SimpleTypeCallbackRegistry> reg1(OP_NEW(SimpleTypeCallbackRegistry, ()));
+	OpAutoPtr<SimpleTypeCallbackRegistry> reg2(OP_NEW(SimpleTypeCallbackRegistry, ()));
+	OpSharedPtr<SimpleType> sp1(OP_NEW(SimpleType, (reg1.get(), 45)));
+	OpSharedPtr<SimpleType> sp2(sp1); // Now the object is shared.
+
+	sp1->m_someValue = 13;
+
+	verify(sp2->m_someValue == 13);
+
+	*sp1 = SimpleType(reg2.get(), 500); // Assign an entirely new object.
+	verify(reg1->copyMade);
+	verify(sp2->m_someValue == 500);
+}
+
+test("make_shared") leakcheck;
+{
+	OpAutoPtr<SimpleTypeCallbackRegistry> reg(OP_NEW(SimpleTypeCallbackRegistry, ()));
+	{
+		OpSharedPtr<SimpleType> sp1 = make_shared<SimpleType>(reg.get(), 14);
+		verify(!reg->dtorCalled);
+		verify(sp1->m_someValue == 14);
+	}
+	verify(reg->dtorCalled);
+}
+
+test("make_shared derived type") leakcheck;
+{
+	OpAutoPtr<SimpleTypeCallbackRegistry> reg(OP_NEW(SimpleTypeCallbackRegistry, ()));
+	{
+		OpSharedPtr<SimpleType> sp1 = make_shared<DerivedFromSimpleType>(reg.get(), 14);
+		verify(!reg->dtorCalled);
+		verify(sp1->m_someValue == 14);
+	}
+	verify(reg->dtorCalled);
+}
+
+test("bool conversion") leakcheck;
+{
+	OpSharedPtr<SimpleType> spEmpty;
+	verify(!spEmpty);
+
+	OpAutoPtr<SimpleTypeCallbackRegistry> reg(OP_NEW(SimpleTypeCallbackRegistry, ()));
+	OpSharedPtr<SimpleType> sp1 = make_shared<SimpleType>(reg.get(), 14);
+	verify(sp1);
+}
+
+test("reference in constructor")
+{
+	int i = 5;
+	OpSharedPtr<ReferenceInConstructorClass> sp = make_shared<ReferenceInConstructorClass>(Ref(i));
+	sp->Increment();
+	verify(i == 6);
+}

@@ -1,0 +1,1456 @@
+/* -*- Mode: c++; tab-width: 4; indent-tabs-mode: t; c-basic-offset: 4 -*-
+ *
+ * Copyright (C) 2008-2011 Opera Software ASA.  All rights reserved.
+ *
+ * This file is part of the Opera web browser.
+ * It may not be distributed under any circumstances.
+ */
+group "formats.uri_escape";
+
+require init;
+require FORMATS_URI_ESCAPE_SUPPORT;
+
+include "modules/formats/uri_escape.h";
+include "modules/util/opstring.h";
+include "modules/prefs/prefsmanager/collections/pc_network.h";
+
+global {
+	
+	class Test_UriEscape : public UriEscape
+	{
+	public:
+		static const int* GetNeedEscapeMasks()
+		{
+			return UriEscape::need_escape_masks;
+		}
+	};
+
+	void Test_GetNeedEscapeMasks(int need_escape_masks[256])
+	{
+		op_memset(need_escape_masks, 0, sizeof(int)*256);
+
+		for (int i=0; i<256; i++)
+		{
+			int need_escape_mask = 0;
+
+			if ((i >= 0x09 && i <= 0x0a) || i == 0x0d)
+				need_escape_mask |= UriEscape::SpaceCtrl;
+			else if (i < 0x20 || i == 0x7f)
+				need_escape_mask |= UriEscape::NonSpaceCtrl;
+
+			if (i == '/')
+				need_escape_mask |= UriEscape::Slash;
+			if (i == '\\')
+				need_escape_mask |= UriEscape::Backslash;
+			if (i == '#')
+				need_escape_mask |= UriEscape::Hash;
+			if (i == '%')
+				need_escape_mask |= UriEscape::Percent;
+			if (i == '=')
+				need_escape_mask |= UriEscape::Equals;
+			if (i == '*')
+				need_escape_mask |= UriEscape::Asterisk;
+
+			if (i >= 0x80 && i <= 0x9f)
+				need_escape_mask |= UriEscape::Range_80_9f;
+			if (i >= 0xa0 && i <= 0xff)
+				need_escape_mask |= UriEscape::Range_a0_ff;
+			
+			switch (i)
+			{
+			case '&':
+			case '?':
+				need_escape_mask |= UriEscape::AmpersandQmark;
+			}
+
+			switch (i)
+			{
+			case ':':
+			case ';':
+				need_escape_mask |= UriEscape::ColonSemicolon;
+			}
+
+			switch (i)
+			{
+			case ' ':
+			case '"':
+			case '<':
+			case '>':
+			case '^':
+			case '`':
+			case '{':
+			case '|':
+			case '}':
+				need_escape_mask |= UriEscape::URIExcluded;
+			}
+
+			switch (i)
+			{
+			case ' ':
+			case '"':
+			case '<':
+			case '>':
+			case '`':
+				need_escape_mask |= UriEscape::URIQueryExcluded;
+			}
+
+			switch (i)
+			{
+			case ' ':
+			case '!':
+			case '"':
+			case '#':
+			case '$':
+			case '%':
+			case '&':
+			case '\'':
+			case '(':
+			case ')':
+			case '+':
+			case ',':
+			case ':':
+			case ';':
+			case '<':
+			case '=':
+			case '>':
+			case '?':
+			case '@':
+			case '[':
+			case '\\':
+			case ']':
+			case '^':
+			case '`':
+			case '{':
+			case '|':
+			case '}':
+			case '~':
+				need_escape_mask |= UriEscape::UnsafePrintable;
+			}
+
+			switch (i)
+			{
+			default:
+				if (i >= 0x20 && i < 0x7f)
+					break;
+			case ' ':
+			case '"':
+			case '#':
+			case '$':
+			case '%':
+			case '&':
+			case '+':
+			case ',':
+			case '/':
+			case ':':
+			case ';':
+			case '<':
+			case '=':
+			case '>':
+			case '?':
+			case '@':
+			case '[':
+			case '\\':
+			case ']':
+			case '^':
+			case '`':
+			case '{':
+			case '|':
+			case '}':
+				need_escape_mask |= UriEscape::WMLUnsafe;
+			}
+
+			switch (i)
+			{
+			case '#':
+			case '%':
+			case '&':
+			case '+':
+			case ';':
+				need_escape_mask |= UriEscape::SearchUnsafe;
+			}
+			
+			switch(i)
+			{
+			default:
+				if (i >= 0x20 && i < 0x7f)
+					break;
+			case ' ':
+			case '"':
+			case '%':
+			case '\'':
+			case '(':
+			case ')':
+			case '*':
+			case ',':
+			case '/':
+			case ':':
+			case ';':
+			case '<':
+			case '=':
+			case '>':
+			case '?':
+			case '@':
+			case '[':
+			case '\\':
+			case ']':
+				need_escape_mask |= UriEscape::RFC2231Unsafe;
+			}
+
+			need_escape_masks[i] = need_escape_mask;
+		}
+	}
+
+	class Test_UriUnescapeIteratorBase : public UriUnescapeIteratorBase
+	{
+	public:
+		Test_UriUnescapeIteratorBase(const void* str, int len, int unescape_flags) : UriUnescapeIteratorBase(str, len, unescape_flags) {}
+
+		static const unsigned char* GetUnescapeExceptionMasks()
+		{
+			return UriUnescapeIteratorBase::unescape_exception_masks;
+		}
+	};
+
+	void Test_GetUnescapeExceptionMasks(unsigned char unescape_exception_masks[256])
+	{
+		op_memset(unescape_exception_masks, 0, 256);
+
+		for (int i=0; i<256; i++)
+		{
+			int unescape_exception_mask = 0;
+			if ((i < 0x20 && !op_isspace(i) && i != 0x1b) /*|| i == 0x7f*/)
+				unescape_exception_mask |= UriUnescape::ExceptUnsafeCtrl;
+			if (i < 0x20 && op_isspace(i))
+				unescape_exception_mask |= UriUnescape::ExceptSpaceCtrl;
+			if (i == 0x1b)
+				unescape_exception_mask |= UriUnescape::ExceptEsc;
+			OP_ASSERT(i >= 0x20 || (unescape_exception_mask & UriUnescape::ExceptCtrl) != 0);
+
+			if (i == 0x20)
+				unescape_exception_mask |= UriUnescape::ExceptSpace;
+			if (i >= 0x80 && i <= 0x9f)
+				unescape_exception_mask |= UriUnescape::Except_80_9f;
+			if (i >= 0xa0)
+				unescape_exception_mask |= UriUnescape::Except_a0_ff;
+			if (i == 0xa0)
+				unescape_exception_mask |= UriUnescape::ExceptNbsp;
+			OP_ASSERT(i < 0x80 || (unescape_exception_mask & UriUnescape::Except_80_ff) != 0);
+			OP_ASSERT((i != 0x20 && i != 0xa0 && !op_isspace(i)) || (unescape_exception_mask & UriUnescape::ExceptSpaces) != 0);
+			
+			switch(i)
+			{
+			case ';':
+			case '/':
+			case '?':
+			case ':':
+			case '@':
+			case '&':
+			case '=':
+			case '+':
+			case '$':
+			case ',':
+			case '<':
+			case '>':
+			case '#':
+			case '{':
+			case '[':
+			case ']':
+			case '}':
+			case '|':
+			case '\\':
+			case '^':
+			case '%':
+			case '\0':
+			case '\"':
+				unescape_exception_mask |= UriUnescape::ExceptUnsafe;
+			}
+
+			unescape_exception_masks[i] = unescape_exception_mask;
+		}
+	}
+
+#define NONSPACECTRL \
+	"\x01\x02\x03\x04\x05\x06\x07\x08\x0b\x0c\x0e\x0f" \
+	"\x10\x11\x12\x13\x14\x15\x16\x17\x18\x19\x1a\x1b\x1c\x1d\x1e\x1f\x7f"
+#define SPACECTRL "\t\n\r"
+#define RANGE_80_9F \
+	"\x80\x81\x82\x83\x84\x85\x86\x87\x88\x89\x8a\x8b\x8c\x8d\x8e\x8f" \
+	"\x90\x91\x92\x93\x94\x95\x96\x97\x98\x99\x9a\x9b\x9c\x9d\x9e\x9f"
+#define RANGE_A0_FF \
+	"\xa0\xa1\xa2\xa3\xa4\xa5\xa6\xa7\xa8\xa9\xaa\xab\xac\xad\xae\xaf" \
+	"\xb0\xb1\xb2\xb3\xb4\xb5\xb6\xb7\xb8\xb9\xba\xbb\xbc\xbd\xbe\xbf" \
+	"\xc0\xc1\xc2\xc3\xc4\xc5\xc6\xc7\xc8\xc9\xca\xcb\xcc\xcd\xce\xcf" \
+	"\xd0\xd1\xd2\xd3\xd4\xd5\xd6\xd7\xd8\xd9\xda\xdb\xdc\xdd\xde\xdf" \
+	"\xe0\xe1\xe2\xe3\xe4\xe5\xe6\xe7\xe8\xe9\xea\xeb\xec\xed\xee\xef" \
+	"\xf0\xf1\xf2\xf3\xf4\xf5\xf6\xf7\xf8\xf9\xfa\xfb\xfc\xfd\xfe\xff"
+
+}
+
+test("UriEscape::need_escape_masks")
+{
+	int need_escape_masks[256]; /* ARRAY OK 2009-01-05 roarl */
+	OpString8 str;
+
+	Test_GetNeedEscapeMasks(need_escape_masks);
+	if (op_memcmp(Test_UriEscape::GetNeedEscapeMasks(), need_escape_masks, sizeof(int)*256) != 0)
+	{
+		output("\nThe need_escape_masks values should be:\n");
+		str.Empty();
+		for (int j=0; j<32; j++)
+		{
+			for (int k=0; k<8; k++)
+			{
+				int code = need_escape_masks[j*8+k];
+				str.AppendFormat("0x%05x,", code);
+			}
+			if (j+1<32)
+				str.Append("\n    ");
+		}
+		output("    %s\n",str.CStr());
+		verify(0);
+	}
+}
+
+table test_need_escape(const char* testname, UriEscape::EscapeFlags flag, const char* escape_chars)
+{
+	{ "NonSpaceCtrl",	UriEscape::NonSpaceCtrl,	NONSPACECTRL },
+	{ "SpaceCtrl",		UriEscape::SpaceCtrl,		SPACECTRL },
+	{ "Slash",			UriEscape::Slash,			"/" },
+	{ "Backslash",		UriEscape::Backslash,		"\\" },
+	{ "Hash",			UriEscape::Hash,			"#" },
+	{ "Percent",		UriEscape::Percent,			"%" },
+	{ "Equals",			UriEscape::Equals,			"=" },
+	{ "AmpersandQmark",	UriEscape::AmpersandQmark,	"&?" },
+	{ "ColonSemicolon",	UriEscape::ColonSemicolon,	":;" },
+	{ "URIExcluded",	UriEscape::URIExcluded,		" \"<>^`{|}" },
+	{ "URIQueryExcluded",UriEscape::URIQueryExcluded," \"<>`" },
+	{ "UnsafePrintable",UriEscape::UnsafePrintable," !\"#$%&'()*+,:;<=>?@[\\]^`{|}~" },
+	{ "WMLUnsafe",		UriEscape::WMLUnsafe,		NONSPACECTRL SPACECTRL " \"#$%&+,/:;<=>?@[\\]^`{|}" RANGE_80_9F RANGE_A0_FF },
+	{ "SearchUnsafe",	UriEscape::SearchUnsafe,	"#%&+;" },
+	{ "RFC2231Unsafe",	UriEscape::RFC2231Unsafe,	NONSPACECTRL SPACECTRL " *'%()<>@,;:\\\"/[]?=" RANGE_80_9F RANGE_A0_FF },
+	{ "Range_80_9f",	UriEscape::Range_80_9f,		RANGE_80_9F },
+	{ "Range_a0_ff",	UriEscape::Range_a0_ff,		RANGE_A0_FF },
+}
+
+foreach (testname, flag, escape_chars) from test_need_escape
+{
+	test("UriEscape::NeedEscape(uni_char," testname ")")
+	{
+		for (int i=1; i<256; i++)
+			verify(UriEscape::NeedEscape((char)i, flag) == (op_strchr(escape_chars, (char)i) != NULL));
+	}
+}
+
+test("UriEscape::NeedEscape('\\0',UriEscape::NonSpaceCtrl)")
+{
+	verify(UriEscape::NeedEscape('\0', UriEscape::NonSpaceCtrl) == TRUE);
+}
+
+test("UriEscape::NeedEscape('\\0',WMLUnsafe)")
+{
+	verify(UriEscape::NeedEscape('\0', UriEscape::WMLUnsafe) == TRUE);
+}
+
+test("UriEscape::NeedEscape('\\0',RFC2231Unsafe)")
+{
+	verify(UriEscape::NeedEscape('\0', UriEscape::RFC2231Unsafe) == TRUE);
+}
+
+test("UriEscape::NeedEscape(uni_char,int)")
+{
+	verify(UriEscape::NeedEscape((uni_char)'a', UriEscape::AllUnsafe) == FALSE);
+	verify(UriEscape::NeedEscape((uni_char)'/', UriEscape::AllUnsafe) == TRUE);
+	verify(UriEscape::NeedEscape((uni_char)' ', UriEscape::UsePlusForSpace) == FALSE);
+	verify(UriEscape::NeedEscape((uni_char)256, UriEscape::AllUnsafe) == FALSE); // Can't escape >= 256 anyway
+}
+
+test("UriEscape::NeedEscape(uni_char,int)")
+{
+	verify(UriEscape::NeedEscape((uni_char)'a', UriEscape::AllUnsafe) == FALSE);
+	verify(UriEscape::NeedEscape((uni_char)'/', UriEscape::AllUnsafe) == TRUE);
+	verify(UriEscape::NeedEscape((uni_char)' ', UriEscape::UsePlusForSpace) == FALSE);
+}
+
+test("UriEscape::NeedEscape(char,int)")
+{
+	verify(UriEscape::NeedEscape('a', UriEscape::AllUnsafe) == FALSE);
+	verify(UriEscape::NeedEscape('/', UriEscape::AllUnsafe) == TRUE);
+	verify(UriEscape::NeedEscape(' ', UriEscape::UsePlusForSpace) == FALSE);
+}
+
+test("UriEscape::NeedModification(uni_char,int)")
+{
+	verify(UriEscape::NeedModification((uni_char)'a', UriEscape::AllUnsafe) == FALSE);
+	verify(UriEscape::NeedModification((uni_char)'/', UriEscape::AllUnsafe) == TRUE);
+	verify(UriEscape::NeedModification((uni_char)' ', UriEscape::UsePlusForSpace) == TRUE);
+}
+
+test("UriEscape::NeedModification(char,int)")
+{
+	verify(UriEscape::NeedModification('a', UriEscape::AllUnsafe) == FALSE);
+	verify(UriEscape::NeedModification('/', UriEscape::AllUnsafe) == TRUE);
+	verify(UriEscape::NeedModification(' ', UriEscape::UsePlusForSpace) == TRUE);
+}
+
+test("UriEscape::CountEscapes(const char*,int)")
+{
+	verify(UriEscape::CountEscapes((const char*)NULL, UriEscape::StandardUnsafe) == 0);
+	verify(UriEscape::CountEscapes("file://localhost/", UriEscape::StandardUnsafe) == 0);
+	verify(UriEscape::CountEscapes("file://localhost/\xE4", UriEscape::StandardUnsafe) == 1);
+}
+
+test("UriEscape::CountEscapes(const uni_char*,int)")
+{
+	verify(UriEscape::CountEscapes((const uni_char*)NULL, UriEscape::StandardUnsafe) == 0);
+	verify(UriEscape::CountEscapes(UNI_L("file://localhost/"), UriEscape::StandardUnsafe) == 0);
+	verify(UriEscape::CountEscapes(UNI_L("file://localhost/\xE4"), UriEscape::StandardUnsafe) == 1);
+}
+
+test("UriEscape::CountEscapes(const char*,int,int)")
+{
+	verify(UriEscape::CountEscapes((const char*)NULL, 0, UriEscape::StandardUnsafe) == 0);
+	verify(UriEscape::CountEscapes("http://www.opera.com/index page.html", 36, UriEscape::AllUnsafe) == 5);
+}
+
+test("UriEscape::CountEscapes(const uni_char*,int,int)")
+{
+	verify(UriEscape::CountEscapes((const uni_char*)NULL, 0, UriEscape::StandardUnsafe) == 0);
+	verify(UriEscape::CountEscapes(UNI_L("http://www.opera.com/index page.html"), 36, UriEscape::AllUnsafe) == 5);
+}
+
+test("UriEscape::GetEscapedLength(const char*,int)")
+{
+	verify(UriEscape::GetEscapedLength((const char*)NULL, UriEscape::StandardUnsafe) == 0);
+	verify(UriEscape::GetEscapedLength("http://www.opera.com/index page.html", UriEscape::AllUnsafe) == 36+5*2);
+}
+
+test("UriEscape::GetEscapedLength(const uni_char*,int)")
+{
+	verify(UriEscape::GetEscapedLength((const uni_char*)NULL, UriEscape::StandardUnsafe) == 0);
+	verify(UriEscape::GetEscapedLength(UNI_L("http://www.opera.com/index page.html"), UriEscape::AllUnsafe) == 36+5*2);
+}
+
+test("UriEscape::GetEscapedLength(const char*,int,int)")
+{
+	verify(UriEscape::GetEscapedLength((const char*)NULL, 0, UriEscape::StandardUnsafe) == 0);
+	verify(UriEscape::GetEscapedLength("http://www.opera.com/index page.html", 36, UriEscape::AllUnsafe) == 36+5*2);
+}
+
+test("UriEscape::GetEscapedLength(const uni_char*,int,int)")
+{
+	verify(UriEscape::GetEscapedLength((const uni_char*)NULL, 0, UriEscape::StandardUnsafe) == 0);
+	verify(UriEscape::GetEscapedLength(UNI_L("http://www.opera.com/index page.html"), 36, UriEscape::AllUnsafe|UriEscape::PrefixBackslashX) == 36+5*3);
+}
+
+test("UriEscape::EscapeFirst(char)")
+{
+	verify(UriEscape::EscapeFirst('/') == '2');
+}
+
+test("UriEscape::EscapeLast(char)")
+{
+	verify(UriEscape::EscapeLast('/') == 'F');
+}
+
+test("UriEscape::EscapeIfNeeded(char*,char,int)")
+{
+	char dst[4]; /* ARRAY OK 2009-02-10 roarl */
+	verify(UriEscape::EscapeIfNeeded(dst, 'a', UriEscape::AllUnsafe) == 1);
+	verify(op_strncmp(dst, "a", 1) == 0);
+	verify(UriEscape::EscapeIfNeeded(dst, '/', UriEscape::AllUnsafe) == 3);
+	verify(op_strncmp(dst, "%2F", 3) == 0);
+	verify(UriEscape::EscapeIfNeeded(dst, '/', UriEscape::AllUnsafe|UriEscape::PrefixBackslash) == 3);
+	verify(op_strncmp(dst, "\\2F", 3) == 0);
+	verify(UriEscape::EscapeIfNeeded(dst, '/', UriEscape::AllUnsafe|UriEscape::PrefixBackslashX) == 4);
+	verify(op_strncmp(dst, "\\x2F", 4) == 0);
+	verify(UriEscape::EscapeIfNeeded(dst, ' ', UriEscape::UsePlusForSpace) == 1);
+	verify(op_strncmp(dst, "+", 1) == 0);
+}
+
+test("UriEscape::EscapeIfNeeded(uni_char*,uni_char,int)")
+{
+	uni_char dst[4]; /* ARRAY OK 2009-02-10 roarl */
+	verify(UriEscape::EscapeIfNeeded(dst, (uni_char)'a', UriEscape::AllUnsafe) == 1);
+	verify(uni_strncmp(dst, UNI_L("a"), 1) == 0);
+	verify(UriEscape::EscapeIfNeeded(dst, (uni_char)'/', UriEscape::AllUnsafe) == 3);
+	verify(uni_strncmp(dst, UNI_L("%2F"), 3) == 0);
+	verify(UriEscape::EscapeIfNeeded(dst, (uni_char)'/', UriEscape::AllUnsafe|UriEscape::PrefixBackslash) == 3);
+	verify(uni_strncmp(dst, UNI_L("\\2F"), 3) == 0);
+	verify(UriEscape::EscapeIfNeeded(dst, (uni_char)'/', UriEscape::AllUnsafe|UriEscape::PrefixBackslashX) == 4);
+	verify(uni_strncmp(dst, UNI_L("\\x2F"), 4) == 0);
+	verify(UriEscape::EscapeIfNeeded(dst, (uni_char)' ', UriEscape::UsePlusForSpace) == 1);
+	verify(uni_strncmp(dst, UNI_L("+"), 1) == 0);
+}
+
+test("UriEscape::Escape(char*,const char*,int)")
+{
+	const char *src = "http://www.opera.com/index page.html";
+	const char *ref = "http://www.opera.com/index%20page.html";
+	char dst[36*3+1]; /* ARRAY OK 2009-02-10 roarl */
+
+	verify(UriEscape::Escape(dst, src, UriEscape::StandardUnsafe) == (int)op_strlen(ref));
+	verify_string(dst, ref);
+}
+
+test("UriEscape::Escape(uni_char*,const char*,int)")
+{
+	const char *src = "http://www.opera.com/index page.html";
+	const uni_char *ref = UNI_L("http://www.opera.com/index%20page.html");
+	uni_char dst[36*3+1]; /* ARRAY OK 2009-02-10 roarl */
+
+	verify(UriEscape::Escape(dst, src, UriEscape::StandardUnsafe) == (int)uni_strlen(ref));
+	verify_string(dst, ref);
+}
+
+test("UriEscape::Escape(uni_char*,const uni_char*,int)")
+{
+	const uni_char *src = ST_up("path" PATHSEP "##%%file");
+	const uni_char *ref = ST_up("path" PATHSEP "%23%23%25%25file");
+	uni_char dst[13*3+1]; /* ARRAY OK 2009-02-10 roarl */
+	
+	verify(UriEscape::Escape(dst, src, UriEscape::Filename) == (int)uni_strlen(ref));
+	verify_string(dst, ref);
+}
+
+test("UriEscape::Escape(char*,const char*,int,int)")
+{
+	const char *src = "http://www.opera.com/index page.html";
+	const char *ref = "http://www.opera.com/index%20page.html";
+	char dst[36*3+1]; /* ARRAY OK 2009-02-10 roarl */
+
+	dst[op_strlen(ref)] = 'R';
+	verify(UriEscape::Escape(dst, src, (int)op_strlen(src), UriEscape::StandardUnsafe) == (int)op_strlen(ref));
+	verify(dst[op_strlen(ref)] == 'R'); // Not null-terminated
+	verify(op_strncmp(dst, ref, op_strlen(ref)) == 0);
+}
+
+test("UriEscape::Escape(uni_char*,const char*,int,int)")
+{
+	const char *src = "http://www.opera.com/index page.html";
+	const uni_char *ref = UNI_L("http://www.opera.com/index%20page.html");
+	uni_char dst[36*3+1]; /* ARRAY OK 2009-02-10 roarl */
+
+	dst[uni_strlen(ref)] = 'R';
+	verify(UriEscape::Escape(dst, src, (int)op_strlen(src), UriEscape::StandardUnsafe) == (int)uni_strlen(ref));
+	verify(dst[uni_strlen(ref)] == 'R'); // Not null-terminated
+	verify(uni_strncmp(dst, ref, uni_strlen(ref)) == 0);
+}
+
+test("UriEscape::Escape(uni_char*,const uni_char*,int,int)")
+{
+	const uni_char *src = UNI_L("http://www.opera.com/index page.html");
+	const uni_char *ref = UNI_L("http://www.opera.com/index%20page.html");
+	uni_char dst[36*3+1]; /* ARRAY OK 2009-02-10 roarl */
+
+	dst[uni_strlen(ref)] = 'R';
+	verify(UriEscape::Escape(dst, src, (int)uni_strlen(src), UriEscape::StandardUnsafe) == (int)uni_strlen(ref));
+	verify(dst[uni_strlen(ref)] == 'R'); // Not null-terminated
+	verify(uni_strncmp(dst, ref, uni_strlen(ref)) == 0);
+}
+
+test("UriEscape::Escape(char*,int,const char*,int,int,int*)")
+{
+	const char *src = "http://www.opera.com/index page.html";
+	const char *ref = "http://www.opera.com/index%20page.html";
+	char dst[36*3+1]; /* ARRAY OK 2009-02-10 roarl */
+	int src_consumed;
+
+	verify(UriEscape::Escape(dst, 28, src, (int)op_strlen(src), UriEscape::StandardUnsafe, &src_consumed) == 26);
+	verify(src_consumed == 26);
+	verify(op_strncmp(dst, ref, 26) == 0);
+
+	dst[op_strlen(ref)] = 'R';
+	verify(UriEscape::Escape(dst, 36*3, src, (int)op_strlen(src), UriEscape::StandardUnsafe, &src_consumed) == (int)op_strlen(ref));
+	verify(src_consumed == (int)op_strlen(src));
+	verify(dst[op_strlen(ref)] == 'R'); // Not null-terminated
+	verify(op_strncmp(dst, ref, op_strlen(ref)) == 0);
+}
+
+test("UriEscape::Escape(uni_char*,int,const char*,int,int,int*)")
+{
+	const char *src = "http://www.opera.com/index page.html";
+	const uni_char *ref = UNI_L("http://www.opera.com/index%20page.html");
+	uni_char dst[36*3+1]; /* ARRAY OK 2009-02-10 roarl */
+	int src_consumed;
+
+	verify(UriEscape::Escape(dst, 28, src, (int)op_strlen(src), UriEscape::StandardUnsafe, &src_consumed) == 26);
+	verify(src_consumed == 26);
+	verify(uni_strncmp(dst, ref, 26) == 0);
+
+	dst[uni_strlen(ref)] = 'R';
+	verify(UriEscape::Escape(dst, 36*3, src, (int)op_strlen(src), UriEscape::StandardUnsafe, &src_consumed) == (int)uni_strlen(ref));
+	verify(src_consumed == (int)op_strlen(src));
+	verify(dst[uni_strlen(ref)] == 'R'); // Not null-terminated
+	verify(uni_strncmp(dst, ref, uni_strlen(ref)) == 0);
+}
+
+test("UriEscape::Escape(uni_char*,int,const uni_char*,int,int,int*)")
+{
+	const uni_char *src = UNI_L("http://www.opera.com/index page.html");
+	const uni_char *ref = UNI_L("http://www.opera.com/index%20page.html");
+	uni_char dst[36*3+1]; /* ARRAY OK 2009-02-10 roarl */
+	int src_consumed;
+
+	verify(UriEscape::Escape(dst, 28, src, (int)uni_strlen(src), UriEscape::StandardUnsafe, &src_consumed) == 26);
+	verify(src_consumed == 26);
+	verify(uni_strncmp(dst, ref, 26) == 0);
+
+	dst[uni_strlen(ref)] = 'R';
+	verify(UriEscape::Escape(dst, 36*3, src, (int)uni_strlen(src), UriEscape::StandardUnsafe, &src_consumed) == (int)uni_strlen(ref));
+	verify(src_consumed == (int)uni_strlen(src));
+	verify(dst[uni_strlen(ref)] == 'R'); // Not null-terminated
+	verify(uni_strncmp(dst, ref, uni_strlen(ref)) == 0);
+}
+
+test("UriEscape::AppendEscaped(OpString8&,char,int)")
+{
+	OpString8 dst;
+	verify_success(UriEscape::AppendEscaped(dst, 'a', UriEscape::AllUnsafe));
+	verify_string(dst, "a");
+	verify_success(UriEscape::AppendEscaped(dst, '/', UriEscape::AllUnsafe));
+	verify_string(dst, "a%2F");
+}
+
+test("UriEscape::AppendEscaped(OpString&,uni_char,int)")
+{
+	OpString dst;
+	verify_success(UriEscape::AppendEscaped(dst, (uni_char)'a', UriEscape::AllUnsafe));
+	verify_string(dst, "a");
+	verify_success(UriEscape::AppendEscaped(dst, (uni_char)'/', UriEscape::AllUnsafe));
+	verify_string(dst, "a%2F");
+}
+
+test("UriEscape::AppendEscaped(OpString8&,const char*,int)")
+{
+	OpString8 dst;
+	verify_success(UriEscape::AppendEscaped(dst, "a/", UriEscape::AllUnsafe));
+	verify_string(dst, "a%2F");
+}
+
+test("UriEscape::AppendEscaped(OpString&,const char*,int)")
+{
+	OpString dst;
+	verify_success(UriEscape::AppendEscaped(dst, "a/", UriEscape::AllUnsafe));
+	verify_string(dst, "a%2F");
+}
+
+test("UriEscape::AppendEscaped(OpString&,const uni_char*,int)")
+{
+	OpString dst;
+	verify_success(UriEscape::AppendEscaped(dst, UNI_L("a/"), UriEscape::AllUnsafe));
+	verify_string(dst, "a%2F");
+}
+
+test("UriEscape::AppendEscaped(OpString8&,const char*,int,int)")
+{
+	OpString8 dst;
+	verify_success(UriEscape::AppendEscaped(dst, "a/b", 2, UriEscape::AllUnsafe));
+	verify_string(dst, "a%2F");
+}
+
+test("UriEscape::AppendEscaped(OpString&,const char*,int,int)")
+{
+	OpString dst;
+	verify_success(UriEscape::AppendEscaped(dst, "a/b", 2, UriEscape::AllUnsafe));
+	verify_string(dst, "a%2F");
+}
+
+test("UriEscape::AppendEscaped(OpString&,const uni_char*,int,int)")
+{
+	OpString dst;
+	verify_success(UriEscape::AppendEscaped(dst, UNI_L("a/b"), 2, UriEscape::AllUnsafe));
+	verify_string(dst, "a%2F");
+}
+
+test("UriUnescapeIteratorBase::unescape_exception_masks")
+{
+	unsigned char unescape_exception_masks[256]; /* ARRAY OK 2008-12-15 roarl */
+	OpString8 str;
+
+	Test_GetUnescapeExceptionMasks(unescape_exception_masks);
+	if (op_memcmp(Test_UriUnescapeIteratorBase::GetUnescapeExceptionMasks(), unescape_exception_masks, 256) != 0)
+	{
+		output("\nThe unescape_exception_masks values should be:\n");
+		str.Empty();
+		for (int j=0; j<32; j++)
+		{
+			for (int k=0; k<8; k++)
+				str.AppendFormat("0x%02x,", unescape_exception_masks[j*8+k]);
+			if (j+1<32)
+				str.Append("\n    ");
+		}
+		output("    %s\n",str.CStr());
+		verify(0);
+	}
+}
+
+test("UriUnescape::Decode(char,char)")
+{
+	verify(UriUnescape::Decode('2', 'F') == '/');
+	verify(UriUnescape::Decode('2', 'f') == '/');
+}
+
+test("UriUnescape::Unescape(char*,const char*,int)")
+{
+	char buf[14]; /* ARRAY OK 2010-08-23 roarl */
+	verify(UriUnescape::Unescape(buf, "%23%2F%4F%00", UriUnescape::All) == 6);
+	verify_string(buf, "#/O%00");
+	verify(UriUnescape::Unescape(buf, "%E3%81%8Fpera", UriUnescape::ConvertUtf8) == 7);
+	verify_string(buf, "\xE3\x81\x8Fpera"); // Not "Opera", when '\x304F' is truncated to '\x4f'
+}
+
+test("UriUnescape::Unescape(uni_char*,const char*,int)")
+{
+	uni_char buf[10]; /* ARRAY OK 2009-02-10 roarl */
+	verify(UriUnescape::Unescape(buf, "%23%2F%4F", UriUnescape::All) == 3);
+	verify_string(buf, "#/O");
+	verify(UriUnescape::Unescape(buf, "%E3%80%80", UriUnescape::ConvertUtf8) == 1);
+	verify_string(buf, UNI_L("\x3000"));
+}
+
+test("UriUnescape::Unescape(uni_char*,const uni_char*,int)")
+{
+	uni_char buf[10]; /* ARRAY OK 2009-02-10 roarl */
+	verify(UriUnescape::Unescape(buf, UNI_L("%23%2F%4F"), UriUnescape::All) == 3);
+	verify_string(buf, "#/O");
+}
+
+test("UriUnescape::Unescape(char*,const char*,int,int)")
+{
+	char buf[13]; /* ARRAY OK 2009-02-10 roarl */
+	verify(UriUnescape::Unescape(buf, "%23%2F%4F%00", 12, UriUnescape::All) == 4);
+	verify(op_strncmp(buf, "#/O\0", 4) == 0);
+}
+
+test("UriUnescape::Unescape(uni_char*,const char*,int,int)")
+{
+	uni_char buf[10]; /* ARRAY OK 2009-02-10 roarl */
+	verify(UriUnescape::Unescape(buf, "%23%2F%4F", 9, UriUnescape::All) == 3);
+	verify(uni_strncmp(buf, UNI_L("#/O"), 3) == 0);
+	verify(UriUnescape::Unescape(buf, "%E3%80%80", 9, UriUnescape::ConvertUtf8) == 1);
+	verify(uni_strncmp(buf, UNI_L("\x3000"), 1) == 0);
+}
+
+test("UriUnescape::Unescape(uni_char*,const uni_char*,int,int)")
+{
+	uni_char buf[10]; /* ARRAY OK 2009-02-10 roarl */
+	verify(UriUnescape::Unescape(buf, UNI_L("%23%2F%4F"), 9, UriUnescape::All) == 3);
+	verify(uni_strncmp(buf, UNI_L("#/O"), 3) == 0);
+}
+
+test("UriUnescape::Unescape(uni_char*,const uni_char*,int,int) overrun")
+{
+	uni_char buf[12]; /* ARRAY OK 2011-11-07 roarl */
+	buf[5] = '*'; // Check that we do not overrun destination buffer
+	verify(UriUnescape::Unescape(buf, UNI_L("%23%2F%4F\xD835\xDCC0"), 10, UriUnescape::All) == 4);
+	verify_string(buf, UNI_L("#/O\xD835"));
+	verify(buf[5] == '*');
+}
+
+test("UriUnescape::Unescape(char*,const char*,StopAfterQuery)")
+{
+	char buf[20]; /* ARRAY OK 2010-08-05 roarl */
+	verify(UriUnescape::Unescape(buf, "%23%2F%4F?%23%2F%4F", UriUnescape::StopAfterQuery) == 13);
+	verify(op_strcmp(buf, "#/O?%23%2F%4F") == 0);
+}
+
+test("UriUnescape::Unescape(uni_char*,const char*,ConvertUtf8IfPref)")
+{
+	uni_char buf[10]; /* ARRAY OK 2010-08-05 roarl */
+	int prefPref = g_pcnet->GetIntegerPref(PrefsCollectionNetwork::UseUTF8Urls);
+
+#ifdef PREFS_WRITE
+	g_pcnet->WriteIntegerL(PrefsCollectionNetwork::UseUTF8Urls, TRUE);
+#else
+	if (prefPref)
+#endif
+	{
+		verify(UriUnescape::Unescape(buf, "%E3%80%80", UriUnescape::ConvertUtf8IfPref) == 1);
+		verify(uni_strcmp(buf, UNI_L("\x3000")) == 0);
+	}
+
+#ifdef PREFS_WRITE
+	g_pcnet->WriteIntegerL(PrefsCollectionNetwork::UseUTF8Urls, FALSE);
+#else
+	if (!prefPref)
+#endif
+	{
+		verify(UriUnescape::Unescape(buf, "%E3%80%80", UriUnescape::ConvertUtf8IfPref) == 3);
+		verify(uni_strcmp(buf, UNI_L("\xE3\x80\x80")) == 0);
+		verify(UriUnescape::Unescape(buf, "%E3%80%80", UriUnescape::SafeUtf8) == 9);
+		verify(uni_strcmp(buf, UNI_L("%E3%80%80")) == 0);
+	}
+}
+finally
+{
+#ifdef PREFS_WRITE
+	g_pcnet->WriteIntegerL(PrefsCollectionNetwork::UseUTF8Urls, prefPref);
+#endif
+}
+
+test("UriUnescape::Unescape(...) bug CORE-31579")
+{
+	char in[2]; /* ARRAY OK 2010-08-03 roarl */
+	char out[2]; /* ARRAY OK 2010-08-03 roarl */
+	uni_char uni_in[2]; /* ARRAY OK 2010-08-03 roarl */
+	uni_char uni_out[2]; /* ARRAY OK 2010-08-03 roarl */
+	int i;
+
+	in[1] = 0;
+	uni_in[1] = 0;
+
+	// All single characters should pass straight through (also '%' when not followed by hex digits)
+	for (i=0; i<256; i++)
+	{
+		in[0] = (char)i;
+		if (i > 0)
+		{
+			verify(UriUnescape::Unescape(out, in, UriUnescape::All) == 1);
+			verify(out[0] == (char)i);
+			verify(UriUnescape::Unescape(uni_out, in, UriUnescape::All) == 1);
+			verify(uni_out[0] == (uni_char)i);
+		}
+		verify(UriUnescape::Unescape(out, in, 1, UriUnescape::All) == 1);
+		verify(out[0] == (char)i);
+		verify(UriUnescape::Unescape(uni_out, in, 1, UriUnescape::All) == 1);
+		verify(uni_out[0] == (uni_char)i);
+	}
+	for (i=0; i<512; i++)
+	{
+		uni_in[0] = (uni_char)i;
+		if (i > 0)
+		{
+			verify(UriUnescape::Unescape(uni_out, uni_in, UriUnescape::All) == 1);
+			verify(uni_out[0] == (uni_char)i);
+		}
+		verify(UriUnescape::Unescape(uni_out, uni_in, 1, UriUnescape::All) == 1);
+		verify(uni_out[0] == (uni_char)i);
+	}
+}
+
+test("UriUnescape::UnescapeJavascriptURL(OpString,const char*)")
+{
+	OpString result;
+	const uni_char *r;
+
+	verify_success(UriUnescape::UnescapeJavascriptURL(result, ""));
+	verify(result.Compare("") == 0);
+	result.Empty();
+
+	verify_success(UriUnescape::UnescapeJavascriptURL(result, "a"));
+	verify(result.Compare("a") == 0);
+	result.Empty();
+
+	verify_success(UriUnescape::UnescapeJavascriptURL(result, "%20"));
+	verify(result.Compare(" ") == 0);
+	result.Empty();
+
+	verify_success(UriUnescape::UnescapeJavascriptURL(result, "%20a"));
+	verify(result.Compare(" a") == 0);
+	result.Empty();
+
+	verify_success(UriUnescape::UnescapeJavascriptURL(result, "a%20"));
+	verify(result.Compare("a ") == 0);
+	result.Empty();
+
+	verify_success(UriUnescape::UnescapeJavascriptURL(result, "a%F0"));
+	verify(result.Compare("a\xf0") == 0);
+	result.Empty();
+
+	verify_success(UriUnescape::UnescapeJavascriptURL(result, "a%F0Z"));
+	verify(result.Compare("a\xf0Z") == 0);
+	result.Empty();
+
+	verify_success(UriUnescape::UnescapeJavascriptURL(result, "a%ef%bf%bdb"));
+	r = result.CStr();
+	verify(result.Length() == 3 && r[0] == 'a' && r[1] == NOT_A_CHARACTER && r[2] == 'b');
+	result.Empty();
+
+	verify_success(UriUnescape::UnescapeJavascriptURL(result, "a%ef%bf%bd"));
+	r = result.CStr();
+	verify(result.Length() == 2 && r[0] == 'a' && r[1] == NOT_A_CHARACTER);
+	result.Empty();
+
+	verify_success(UriUnescape::UnescapeJavascriptURL(result, "a%ef%bfY"));
+	verify(result.Compare("a\xef\xbfY") == 0);
+	result.Empty();
+
+	verify_success(UriUnescape::UnescapeJavascriptURL(result, "a%ed%b0%80%f0"));
+	verify(result.Compare("a\xed\xb0\x80\xf0") == 0);
+	result.Empty();
+
+	verify_success(UriUnescape::UnescapeJavascriptURL(result, "a%ed%a0%80I"));
+	verify(result.Compare("a\xed\xa0\x80I") == 0);
+	result.Empty();
+
+    // U+24b62
+	verify_success(UriUnescape::UnescapeJavascriptURL(result, "a%f0%a4%ad%a2X"));
+	r = result.CStr();
+	verify(result.Length() == 4 && r[0] == 'a' && r[1] == 0xd852 && r[2] == 0xdf62 && r[3] == 'X');
+	result.Empty();
+
+	verify_success(UriUnescape::UnescapeJavascriptURL(result, "a%f0%a4%ff%ff%ff%ffX"));
+	verify(result.Compare("a\xf0\xa4\xff\xff\xff\xffX") == 0);
+	result.Empty();
+
+	verify_success(UriUnescape::UnescapeJavascriptURL(result, "p%e5l"));
+	r = result.CStr();
+	verify(result.Length() == 3 && r[0] == 'p' && r[1] == 0xe5 && r[2] == 'l');
+	result.Empty();
+
+	verify_success(UriUnescape::UnescapeJavascriptURL(result, "p%61ss"));
+	verify(result.Compare("pass") == 0);
+	result.Empty();
+
+	verify_success(UriUnescape::UnescapeJavascriptURL(result, "p%c3%a5san"));
+	r = result.CStr();
+	verify(result.Length() == 5 && r[0] == 'p' && r[1] == 0xe5 && r[2] == 's' && r[3] == 'a' && r[4] == 'n');
+	result.Empty();
+}
+
+test("UriUnescape::ReplaceChars(char*,int)")
+{
+	char buf[10]; /* ARRAY OK 2009-02-10 roarl */
+	op_strcpy(buf, "%23%2F%4F");
+	verify(UriUnescape::ReplaceChars(buf, UriUnescape::All) == 3);
+	verify_string(buf, "#/O");
+	op_strcpy(buf, "/+|");
+	verify(UriUnescape::ReplaceChars(buf, UriUnescape::All | UriUnescape::TranslatePlusToSpace) == 3);
+	verify_string(buf, "/ |");
+	op_strcpy(buf, "/+|");
+	verify(UriUnescape::ReplaceChars(buf, UriUnescape::All | UriUnescape::TranslatePathSepChar) == 3);
+	verify_string(buf, PATHSEP "+|");
+#ifdef SYS_CAP_FILESYSTEM_HAS_DRIVES
+	op_strcpy(buf, "/+|");
+	verify(UriUnescape::ReplaceChars(buf, UriUnescape::All | UriUnescape::TranslateDriveChar) == 3);
+	verify_string(buf, "/+:");
+#endif
+}
+
+test("UriUnescape::ReplaceChars(uni_char*,int)")
+{
+	uni_char buf[10]; /* ARRAY OK 2009-02-10 roarl */
+	uni_strcpy(buf, UNI_L("%23%2F%4F"));
+	verify(UriUnescape::ReplaceChars(buf, UriUnescape::All) == 3);
+	verify_string(buf, "#/O");
+
+	uni_strcpy(buf, UNI_L("\xD800\xDF00\xD800\xDF01"));
+	verify(UriUnescape::ReplaceChars(buf, UriUnescape::MailUtf8) == 4);
+	verify_string(buf, UNI_L("\xD800\xDF00\xD800\xDF01"));
+}
+
+test("UriUnescape::ReplaceChars(char*,int&,int)")
+{
+	char buf[10]; /* ARRAY OK 2009-02-10 roarl */
+	op_strcpy(buf, "%23%2F%4F");
+	int len = 9;
+	UriUnescape::ReplaceChars(buf, len, UriUnescape::All);
+	verify(len == 3);
+	verify(op_strncmp(buf, "#/O", 3) == 0);
+	verify(buf[3] == '%'); // Not null-terminated
+}
+
+test("UriUnescape::ReplaceChars(char*,int&,int) bug #256294")
+{
+	char buf[4]; /* ARRAY OK 2009-02-10 roarl */
+	op_strcpy(buf, "%G1");
+	int len = 3;
+	UriUnescape::ReplaceChars(buf, len, UriUnescape::NonCtrlAndEsc);
+	verify_string(buf, "%G1");
+
+	op_strcpy(buf, "%HF");
+	len = 3;
+	UriUnescape::ReplaceChars(buf, len, UriUnescape::NonCtrlAndEsc);
+	verify_string(buf, "%HF");
+
+	op_strcpy(buf, "%2H");
+	len = 3;
+	UriUnescape::ReplaceChars(buf, len, UriUnescape::NonCtrlAndEsc);
+	verify_string(buf, "%2H");
+}
+
+test("UriUnescape::ReplaceChars(char*,int&,int) bug #142153, #133002")
+{
+	// Checks that only the right chars are replaced
+	// See bug #142153 and bug #133002
+
+	char buf[4]; /* ARRAY OK 2009-02-10 roarl */
+	for (int i=0; i < 255; ++i)
+	{
+		op_sprintf(buf, "%%%.2x", i);
+		int len = 3;
+		UriUnescape::ReplaceChars(buf, len, UriUnescape::NonCtrlAndEsc);
+		if ((i >= 0x20 && i <= 0xff) || i == 0x1b)
+		{
+			verify(len == 1);
+			verify((unsigned char) buf[0] == i);
+		}
+		else
+		{
+			char cmp[4]; /* ARRAY OK 2009-02-10 roarl */
+			op_sprintf(cmp, "%%%.2x", i);
+
+			verify_string(buf, cmp);
+			verify(len == 3);
+		}
+	}
+}
+
+test("UriUnescape::ReplaceChars(uni_char*,int&,int)")
+{
+	uni_char buf[10]; /* ARRAY OK 2009-02-10 roarl */
+	uni_strcpy(buf, UNI_L("%23%2F%4F"));
+	int len = 9;
+	UriUnescape::ReplaceChars(buf, len, UriUnescape::All);
+	verify(len == 3);
+	verify(uni_strncmp(buf, UNI_L("#/O"), 3) == 0);
+	verify(buf[3] == (uni_char)'%'); // Not null-terminated
+}
+
+test("UriUnescape::ReplaceChars(uni_char*,int&,int) bug #256294")
+{
+	uni_char buf[4]; /* ARRAY OK 2009-02-10 roarl */
+	uni_strcpy(buf, UNI_L("%G1"));
+	int len = 3;
+	UriUnescape::ReplaceChars(buf, len, UriUnescape::NonCtrlAndEsc);
+	verify_string(buf, "%G1");
+
+	uni_strcpy(buf, UNI_L("%HF"));
+	len = 3;
+	UriUnescape::ReplaceChars(buf, len, UriUnescape::NonCtrlAndEsc);
+	verify_string(buf, "%HF");
+
+	uni_strcpy(buf, UNI_L("%2H"));
+	len = 3;
+	UriUnescape::ReplaceChars(buf, len, UriUnescape::NonCtrlAndEsc);
+	verify_string(buf, "%2H");
+}
+
+test("UriUnescape::ReplaceChars(uni_char*,int&,int) bug #142153, #133002")
+{
+	// Checks that only the right chars are replaced
+	// See bug #142153 and bug #133002
+
+	uni_char buf[4]; /* ARRAY OK 2009-02-10 roarl */
+	for (int i=0; i < 255; ++i)
+	{
+		uni_sprintf(buf, UNI_L("%%%.2x"), i);
+		int len = 3;
+		UriUnescape::ReplaceChars(buf, len, UriUnescape::NonCtrlAndEsc);
+		if ((i >= 0x20 && i <= 0xff) || i == 0x1b)
+		{
+			verify(len == 1);
+			verify(buf[0] == i);
+		}
+		else
+		{
+			uni_char cmp[4]; /* ARRAY OK 2009-02-10 roarl */
+			uni_sprintf(cmp, UNI_L("%%%.2x"), i);
+
+			verify_string(buf, cmp);
+			verify(len == 3);
+		}
+	}
+}
+
+test("UriUnescape::ReplaceChars(uni_char*,int&,LocalfileUtf8/SafeUtf8)")
+{
+	// Checks that only the right chars are replaced
+	// See bug #142153 and bug #133002
+
+	uni_char buf[10]; /* ARRAY OK 2009-02-10 roarl */
+	for (unsigned int i=0; i < 65536; ++i)
+	{
+		int len;
+		if (i < 0x80)
+		{
+			len = uni_sprintf(buf, UNI_L("%%%.2x"), i);
+		}
+		else if (i < 0x800)
+		{
+			len = uni_sprintf(buf, UNI_L("%%%.2x%%%.2x"), 0xC0 | (i >> 6), 0x80 | (i & 0x3F));
+		}
+		else
+		{
+			if (i == 0xD800)
+				i = 0xF900;
+			len = uni_sprintf(buf, UNI_L("%%%.2x%%%.2x%%%.2x"), 0xE0 | (i >> 12), 0x80 | ((i >> 6) & 0x3F), 0x80 | (i & 0x3F));
+		}
+		// Use OPSTR_LOCALFILE to force UTF-8
+		UriUnescape::ReplaceChars(buf, len, i >= 0x80 ? UriUnescape::LocalfileUtf8 : UriUnescape::SafeUtf8);
+
+		if (i <= 0x20 ||
+			i == ';' ||
+			i == '/' ||
+			i == '?' ||
+			i == ':' ||
+			i == '@' ||
+			i == '&' ||
+			i == '=' ||
+			i == '+' ||
+			i == '$' ||
+			i == ',' ||
+			i == '<' ||
+			i == '>' ||
+			i == '#' ||
+			i == '%' ||
+			i == '{' ||
+			i == '[' ||
+			i == ']' ||
+			i == '}' ||
+			i == '|' ||
+			i == '\\' ||
+			i == '^' ||
+			i == '\"')
+		{
+			uni_char cmp[4]; /* ARRAY OK 2009-02-10 roarl */
+			uni_sprintf(cmp, UNI_L("%%%.2x"), i);
+			if (!uni_strcmp(buf, cmp) == 0 || len != 3)
+			{
+				output("U+%04x: ", i);
+			}
+
+			verify_string(buf, cmp);
+			verify(len == 3);
+		}
+		else if (i == 0x115F || i == 0x1160 || i == 0x3164 ||
+				 (i >= 0x2000 && i <= 0x200B) || i == 0x3000 || i == 0x202e)
+		{
+			if (len != 9)
+			{
+				output("U+%04x: ", i);
+			}
+			verify(len == 9);
+		}
+		else
+		{
+			if (buf[0] != i || len != 1)
+			{
+				output("U+%04x: ", i);
+			}
+
+			verify(len == 1);
+			verify(buf[0] == i);
+		}
+	}
+}
+
+test("UriUnescape::ReplaceChars(uni_char*,int&,LocalfileUtf8) bug #256294")
+{
+	uni_char buf[4]; /* ARRAY OK 2009-02-10 roarl */
+	uni_strcpy(buf, UNI_L("%G1"));
+	int len = 3;
+	UriUnescape::ReplaceChars(buf, len, UriUnescape::LocalfileUtf8);
+	verify_string(buf, "%G1");
+
+	uni_strcpy(buf, UNI_L("%HF"));
+	len = 3;
+	UriUnescape::ReplaceChars(buf, len, UriUnescape::LocalfileUtf8);
+	verify_string(buf, "%HF");
+
+	uni_strcpy(buf, UNI_L("%2H"));
+	len = 3;
+	UriUnescape::ReplaceChars(buf, len, UriUnescape::LocalfileUtf8);
+	verify_string(buf, "%2H");
+}
+
+test("UriUnescape::ReplaceChars(uni_char*,int&,LocalfileAllUtf8) bug #264500")
+{
+	uni_char test[12] = { 'A', '%', 'E', '3', '%', '8', '0', '%', '8', '0', 'B', 0 };
+	uni_char ref[4] = { 'A', 0x3000, 'B', 0 };
+
+	int len = (int)uni_strlen(test);
+	UriUnescape::ReplaceChars(test, len, UriUnescape::LocalfileAllUtf8);
+	test[len] = 0;
+	verify_string(test, ref);
+}
+
+test("UriUnescape::ReplaceChars(uni_char*,int&,LocalfileUtf8) bug #264500")
+{
+	uni_char test[12] = { 'A', '%', 'E', '3', '%', '8', '0', '%', '8', '0', 'B', 0 };
+	uni_char ref[12] = { 'A', '%', 'E', '3', '%', '8', '0', '%', '8', '0', 'B', 0 };
+
+	int len = (int)uni_strlen(test);
+	UriUnescape::ReplaceChars(test, len, UriUnescape::LocalfileUtf8);
+	test[len] = 0;
+	verify_string(test, ref);
+}
+
+test("UriUnescape::strcmp(const char*,const char*,int)")
+{
+	verify(UriUnescape::strcmp("abc", "abc", UriUnescape::Safe) == 0);
+	verify(UriUnescape::strcmp("abc", "%61bc", UriUnescape::Safe) == 0);
+	verify(UriUnescape::strcmp("abc", "%62bc", UriUnescape::Safe) < 0);
+	verify(UriUnescape::strcmp("abc", "%60bc", UriUnescape::Safe) > 0);
+	verify(UriUnescape::strcmp("a%62c", "%60bc", UriUnescape::Safe) > 0);
+	verify(UriUnescape::strcmp("a%62c", "abc", UriUnescape::Safe) == 0);
+	verify(UriUnescape::strcmp("%HF", "/", UriUnescape::Safe) != 0);
+	verify(UriUnescape::strcmp("\xE3\x80\x80", "%E3%80%80", UriUnescape::All) == 0);
+	verify(UriUnescape::strcmp("%E3%80%80", "\xE3\x80\x80", UriUnescape::All) == 0);
+	verify(UriUnescape::strcmp("\xE3\x80\x80", "%E3%80%80", UriUnescape::ConvertUtf8) == 0);
+	verify(UriUnescape::strcmp("%E3%80%80", "\xE3\x80\x80", UriUnescape::ConvertUtf8) == 0);
+	verify(UriUnescape::strcmp("\x80\x80\x80", "%80%80%80", UriUnescape::ConvertUtf8) > 0);
+	verify(UriUnescape::strcmp("%80%80%80", "\x80\x80\x80", UriUnescape::ConvertUtf8) < 0);
+}
+
+test("UriUnescape::strcmp(const uni_char*,const uni_char*,int)")
+{
+	verify(UriUnescape::strcmp(UNI_L("abc"), UNI_L("abc"), UriUnescape::Safe) == 0);
+	verify(UriUnescape::strcmp(UNI_L("abc"), UNI_L("%61bc"), UriUnescape::Safe) == 0);
+	verify(UriUnescape::strcmp(UNI_L("abc"), UNI_L("%62bc"), UriUnescape::Safe) < 0);
+	verify(UriUnescape::strcmp(UNI_L("abc"), UNI_L("%60bc"), UriUnescape::Safe) > 0);
+	verify(UriUnescape::strcmp(UNI_L("a%62c"), UNI_L("%60bc"), UriUnescape::Safe) > 0);
+	verify(UriUnescape::strcmp(UNI_L("a%62c"), UNI_L("abc"), UriUnescape::Safe) == 0);
+	verify(UriUnescape::strcmp(UNI_L("%HF"), UNI_L("/"), UriUnescape::Safe) != 0);
+	verify(UriUnescape::strcmp(UNI_L("\xE3\x80\x80"), UNI_L("%E3%80%80"), UriUnescape::All) == 0);
+	verify(UriUnescape::strcmp(UNI_L("%E3%80%80"), UNI_L("\xE3\x80\x80"), UriUnescape::All) == 0);
+	verify(UriUnescape::strcmp(UNI_L("\xE3\x80\x80"), UNI_L("%E3%80%80"), UriUnescape::ConvertUtf8) < 0);
+	verify(UriUnescape::strcmp(UNI_L("%E3%80%80"), UNI_L("\xE3\x80\x80"), UriUnescape::ConvertUtf8) > 0);
+	verify(UriUnescape::strcmp(UNI_L("\x3000"), UNI_L("%E3%80%80"), UriUnescape::ConvertUtf8) == 0);
+	verify(UriUnescape::strcmp(UNI_L("%E3%80%80"), UNI_L("\x3000"), UriUnescape::ConvertUtf8) == 0);
+	verify(UriUnescape::strcmp(UNI_L("%F0%9D%93%80"), UNI_L("\xD835\xDCC0"), UriUnescape::ConvertUtf8) == 0);
+}
+
+test("UriUnescape::stricmp(const char*,const char*,int)")
+{
+	verify(UriUnescape::stricmp("FooBar", "foobar", UriUnescape::All) == 0);
+	verify(UriUnescape::stricmp("foobaz", "foobar", UriUnescape::All) > 0);
+	verify(UriUnescape::stricmp("fiebar", "g", UriUnescape::All) < 0);
+	verify(UriUnescape::stricmp("abc", "abc", UriUnescape::All) == 0);
+	verify(UriUnescape::stricmp("abc", "%61bc", UriUnescape::All) == 0);
+	verify(UriUnescape::stricmp("abc", "%62bc", UriUnescape::All) < 0);
+	verify(UriUnescape::stricmp("abc", "%60bc", UriUnescape::All) > 0);
+	verify(UriUnescape::stricmp("a%62c", "%60bc", UriUnescape::All) > 0);
+	verify(UriUnescape::stricmp("a%62c", "abc", UriUnescape::All) == 0);
+	verify(UriUnescape::stricmp("aBc", "abc", UriUnescape::All) == 0);
+	verify(UriUnescape::stricmp("aBc", "%61bc", UriUnescape::All) == 0);
+	verify(UriUnescape::stricmp("aBc", "%62bc", UriUnescape::All) < 0);
+	verify(UriUnescape::stricmp("aBc", "%60bc", UriUnescape::All) > 0);
+	verify(UriUnescape::stricmp("a%62c", "%60bC", UriUnescape::All) > 0);
+	verify(UriUnescape::stricmp("a%62c", "abC", UriUnescape::All) == 0);
+	verify(UriUnescape::stricmp("%HF", "/", UriUnescape::All) != 0);
+	verify(UriUnescape::stricmp("\xE3\x80\x80", "%C3%80%80", UriUnescape::All) == 0);
+	verify(UriUnescape::stricmp("%E3%80%80", "\xC3\x80\x80", UriUnescape::All) == 0);
+	verify(UriUnescape::stricmp("\xE3\x80\x80", "%E3%80%80", UriUnescape::ConvertUtf8) == 0);
+	verify(UriUnescape::stricmp("%E3%80%80", "\xE3\x80\x80", UriUnescape::ConvertUtf8) == 0);
+	verify(UriUnescape::stricmp("\x80\x80\x80", "%80%80%80", UriUnescape::ConvertUtf8) > 0);
+	verify(UriUnescape::stricmp("%80%80%80", "\x80\x80\x80", UriUnescape::ConvertUtf8) < 0);
+}
+
+test("UriUnescape::stricmp(const uni_char*,const uni_char*,int)")
+{
+	verify(UriUnescape::stricmp(UNI_L("abc"), UNI_L("abc"), UriUnescape::All) == 0);
+	verify(UriUnescape::stricmp(UNI_L("abc"), UNI_L("%61bc"), UriUnescape::All) == 0);
+	verify(UriUnescape::stricmp(UNI_L("abc"), UNI_L("%62bc"), UriUnescape::All) < 0);
+	verify(UriUnescape::stricmp(UNI_L("abc"), UNI_L("%60bc"), UriUnescape::All) > 0);
+	verify(UriUnescape::stricmp(UNI_L("a%62c"), UNI_L("%60bc"), UriUnescape::All) > 0);
+	verify(UriUnescape::stricmp(UNI_L("a%62c"), UNI_L("abc"), UriUnescape::All) == 0);
+	verify(UriUnescape::stricmp(UNI_L("aBc"), UNI_L("abc"), UriUnescape::All) == 0);
+	verify(UriUnescape::stricmp(UNI_L("aBc"), UNI_L("%61bc"), UriUnescape::All) == 0);
+	verify(UriUnescape::stricmp(UNI_L("aBc"), UNI_L("%62bc"), UriUnescape::All) < 0);
+	verify(UriUnescape::stricmp(UNI_L("aBc"), UNI_L("%60bc"), UriUnescape::All) > 0);
+	verify(UriUnescape::stricmp(UNI_L("a%62c"), UNI_L("%60bC"), UriUnescape::All) > 0);
+	verify(UriUnescape::stricmp(UNI_L("a%62c"), UNI_L("abC"), UriUnescape::All) == 0);
+	verify(UriUnescape::stricmp(UNI_L("%HF"), UNI_L("/"), UriUnescape::All) != 0);
+	verify(UriUnescape::stricmp(UNI_L("\xE3\x80\x80"), UNI_L("%C3%80%80"), UriUnescape::All) == 0);
+	verify(UriUnescape::stricmp(UNI_L("%E3%80%80"), UNI_L("\xC3\x80\x80"), UriUnescape::All) == 0);
+	verify(UriUnescape::stricmp(UNI_L("\xE3\x80\x80"), UNI_L("%E3%80%80"), UriUnescape::ConvertUtf8) < 0);
+	verify(UriUnescape::stricmp(UNI_L("%E3%80%80"), UNI_L("\xE3\x80\x80"), UriUnescape::ConvertUtf8) > 0);
+	verify(UriUnescape::stricmp(UNI_L("\x3000"), UNI_L("%E3%80%80"), UriUnescape::ConvertUtf8) == 0);
+	verify(UriUnescape::stricmp(UNI_L("%E3%80%80"), UNI_L("\x3000"), UriUnescape::ConvertUtf8) == 0);
+}
+
+test("UriUnescape::strncmp(const char*,const char*,int,int)")
+{
+	verify(UriUnescape::strncmp("abcd", 3, "abce", 3, UriUnescape::Safe) == 0);
+	verify(UriUnescape::strncmp("abcd", 3, "%61bce", 5, UriUnescape::Safe) == 0);
+	verify(UriUnescape::strncmp("abcd", 3, "%62bce", 5, UriUnescape::Safe) < 0);
+	verify(UriUnescape::strncmp("abcd", 3, "%60bce", 5, UriUnescape::Safe) > 0);
+	verify(UriUnescape::strncmp("a%62cd", 5, "%60bce", 5, UriUnescape::Safe) > 0);
+	verify(UriUnescape::strncmp("a%62cd", 5, "abce", 3, UriUnescape::Safe) == 0);
+	verify(UriUnescape::strncmp("%HFd", 3, "/e", 1, UriUnescape::Safe) != 0);
+	verify(UriUnescape::strncmp("\xE3\x80\x80", 3, "%E3%80%80", 9, UriUnescape::All) == 0);
+	verify(UriUnescape::strncmp("%E3%80%80", 9, "\xE3\x80\x80", 3, UriUnescape::All) == 0);
+	verify(UriUnescape::strncmp("\xE3\x80\x80", 3, "%E3%80%80", 9, UriUnescape::ConvertUtf8) == 0);
+	verify(UriUnescape::strncmp("%E3%80%80", 9, "\xE3\x80\x80", 3, UriUnescape::ConvertUtf8) == 0);
+	verify(UriUnescape::strncmp("\x80\x80\x80", 3, "%80%80%80", 9, UriUnescape::ConvertUtf8) > 0);
+	verify(UriUnescape::strncmp("%80%80%80", 9, "\x80\x80\x80", 3, UriUnescape::ConvertUtf8) < 0);
+}
+
+test("UriUnescape::strncmp(const uni_char*,const uni_char*,int,int)")
+{
+	verify(UriUnescape::strncmp(UNI_L("abcd"), 3, UNI_L("abce"), 3, UriUnescape::Safe) == 0);
+	verify(UriUnescape::strncmp(UNI_L("abcd"), 3, UNI_L("%61bce"), 5, UriUnescape::Safe) == 0);
+	verify(UriUnescape::strncmp(UNI_L("abcd"), 3, UNI_L("%62bce"), 5, UriUnescape::Safe) < 0);
+	verify(UriUnescape::strncmp(UNI_L("abcd"), 3, UNI_L("%60bce"), 5, UriUnescape::Safe) > 0);
+	verify(UriUnescape::strncmp(UNI_L("a%62cd"), 5, UNI_L("%60bce"), 5, UriUnescape::Safe) > 0);
+	verify(UriUnescape::strncmp(UNI_L("a%62cd"), 5, UNI_L("abce"), 3, UriUnescape::Safe) == 0);
+	verify(UriUnescape::strncmp(UNI_L("%HFd"), 3, UNI_L("/e"), 1, UriUnescape::Safe) != 0);
+	verify(UriUnescape::strncmp(UNI_L("\xE3\x80\x80"), 3, UNI_L("%E3%80%80"), 9, UriUnescape::All) == 0);
+	verify(UriUnescape::strncmp(UNI_L("%E3%80%80"), 9, UNI_L("\xE3\x80\x80"), 3, UriUnescape::All) == 0);
+	verify(UriUnescape::strncmp(UNI_L("\xE3\x80\x80"), 3, UNI_L("%E3%80%80"), 9, UriUnescape::ConvertUtf8) < 0);
+	verify(UriUnescape::strncmp(UNI_L("%E3%80%80"), 9, UNI_L("\xE3\x80\x80"), 3, UriUnescape::ConvertUtf8) > 0);
+	verify(UriUnescape::strncmp(UNI_L("\x3000"), 1, UNI_L("%E3%80%80"), 9, UriUnescape::ConvertUtf8) == 0);
+	verify(UriUnescape::strncmp(UNI_L("%E3%80%80"), 9, UNI_L("\x3000"), 1, UriUnescape::ConvertUtf8) == 0);
+}
+
+test("UriUnescape::strnicmp(const char*,const char*,int,int)")
+{
+	verify(UriUnescape::strnicmp("abcd", 3, "abce", 3, UriUnescape::All) == 0);
+	verify(UriUnescape::strnicmp("abcd", 3, "%61bce", 5, UriUnescape::All) == 0);
+	verify(UriUnescape::strnicmp("abcd", 3, "%62bce", 5, UriUnescape::All) < 0);
+	verify(UriUnescape::strnicmp("abcd", 3, "%60bce", 5, UriUnescape::All) > 0);
+	verify(UriUnescape::strnicmp("a%62cd", 5, "%60bce", 5, UriUnescape::All) > 0);
+	verify(UriUnescape::strnicmp("a%62cd", 5, "abce", 3, UriUnescape::All) == 0);
+	verify(UriUnescape::strnicmp("aBcd", 3, "abce", 3, UriUnescape::All) == 0);
+	verify(UriUnescape::strnicmp("aBcd", 3, "%61bce", 5, UriUnescape::All) == 0);
+	verify(UriUnescape::strnicmp("aBcd", 3, "%62bce", 5, UriUnescape::All) < 0);
+	verify(UriUnescape::strnicmp("aBcd", 3, "%60bce", 5, UriUnescape::All) > 0);
+	verify(UriUnescape::strnicmp("a%62cd", 5, "%60bCe", 5, UriUnescape::All) > 0);
+	verify(UriUnescape::strnicmp("a%62cd", 5, "abCe", 3, UriUnescape::All) == 0);
+	verify(UriUnescape::strnicmp("%HFd", 3, "/e", 1, UriUnescape::All) != 0);
+	verify(UriUnescape::strnicmp("\xE3\x80\x80", 3, "%C3%80%80", 9, UriUnescape::All) == 0);
+	verify(UriUnescape::strnicmp("%E3%80%80", 9, "\xC3\x80\x80", 3, UriUnescape::All) == 0);
+	verify(UriUnescape::strnicmp("\xE3\x80\x80", 3, "%E3%80%80", 9, UriUnescape::ConvertUtf8) == 0);
+	verify(UriUnescape::strnicmp("%E3%80%80", 9, "\xE3\x80\x80", 3, UriUnescape::ConvertUtf8) == 0);
+	verify(UriUnescape::strnicmp("\x80\x80\x80", 3, "%80%80%80", 9, UriUnescape::ConvertUtf8) > 0);
+	verify(UriUnescape::strnicmp("%80%80%80", 9, "\x80\x80\x80", 3, UriUnescape::ConvertUtf8) < 0);
+}
+
+test("UriUnescape::strnicmp(const uni_char*,const uni_char*,int,int)")
+{
+	verify(UriUnescape::strnicmp(UNI_L("abcd"), 3, UNI_L("abce"), 3, UriUnescape::All) == 0);
+	verify(UriUnescape::strnicmp(UNI_L("abcd"), 3, UNI_L("%61bce"), 5, UriUnescape::All) == 0);
+	verify(UriUnescape::strnicmp(UNI_L("abcd"), 3, UNI_L("%62bce"), 5, UriUnescape::All) < 0);
+	verify(UriUnescape::strnicmp(UNI_L("abcd"), 3, UNI_L("%60bce"), 5, UriUnescape::All) > 0);
+	verify(UriUnescape::strnicmp(UNI_L("a%62cd"), 5, UNI_L("%60bce"), 5, UriUnescape::All) > 0);
+	verify(UriUnescape::strnicmp(UNI_L("a%62cd"), 5, UNI_L("abce"), 3, UriUnescape::All) == 0);
+	verify(UriUnescape::strnicmp(UNI_L("aBcd"), 3, UNI_L("abce"), 3, UriUnescape::All) == 0);
+	verify(UriUnescape::strnicmp(UNI_L("aBcd"), 3, UNI_L("%61bce"), 5, UriUnescape::All) == 0);
+	verify(UriUnescape::strnicmp(UNI_L("aBcd"), 3, UNI_L("%62bce"), 5, UriUnescape::All) < 0);
+	verify(UriUnescape::strnicmp(UNI_L("aBcd"), 3, UNI_L("%60bce"), 5, UriUnescape::All) > 0);
+	verify(UriUnescape::strnicmp(UNI_L("a%62cd"), 5, UNI_L("%60bCe"), 5, UriUnescape::All) > 0);
+	verify(UriUnescape::strnicmp(UNI_L("a%62cd"), 5, UNI_L("abCe"), 3, UriUnescape::All) == 0);
+	verify(UriUnescape::strnicmp(UNI_L("%HFd"), 3, UNI_L("/e"), 1, UriUnescape::All) != 0);
+	verify(UriUnescape::strnicmp(UNI_L("\xE3\x80\x80"), 3, UNI_L("%C3%80%80"), 9, UriUnescape::All) == 0);
+	verify(UriUnescape::strnicmp(UNI_L("%E3%80%80"), 9, UNI_L("\xC3\x80\x80"), 3, UriUnescape::All) == 0);
+	verify(UriUnescape::strnicmp(UNI_L("\xE3\x80\x80"), 3, UNI_L("%E3%80%80"), 9, UriUnescape::ConvertUtf8) < 0);
+	verify(UriUnescape::strnicmp(UNI_L("%E3%80%80"), 9, UNI_L("\xE3\x80\x80"), 3, UriUnescape::ConvertUtf8) > 0);
+	verify(UriUnescape::strnicmp(UNI_L("\x3000"), 1, UNI_L("%E3%80%80"), 9, UriUnescape::ConvertUtf8) == 0);
+	verify(UriUnescape::strnicmp(UNI_L("%E3%80%80"), 9, UNI_L("\x3000"), 1, UriUnescape::ConvertUtf8) == 0);
+}
+
+test("UriUnescape::isstrprefix(const char*,const char*,int)")
+{
+	verify( UriUnescape::isstrprefix("pre", "prefix", UriUnescape::All) != 0);
+	verify( UriUnescape::isstrprefix("", "prefix", UriUnescape::All) != 0);
+	verify( UriUnescape::isstrprefix("prefixfoo", "prefix", UriUnescape::All) == 0);
+	verify( UriUnescape::isstrprefix("abc", "abcdef", UriUnescape::All));
+	verify( UriUnescape::isstrprefix("%61bc", "%61bcdef", UriUnescape::All));
+	verify( UriUnescape::isstrprefix("%61bc", "abcdef", UriUnescape::All));
+	verify( UriUnescape::isstrprefix("abc", "a%62cdef", UriUnescape::All));
+	verify(!UriUnescape::isstrprefix("abcdef", "abc", UriUnescape::All));
+	verify(!UriUnescape::isstrprefix("%61bcdef", "%61bc", UriUnescape::All));
+	verify(!UriUnescape::isstrprefix("%61bcdef", "abc", UriUnescape::All));
+	verify(!UriUnescape::isstrprefix("abcdef", "a%62c", UriUnescape::All));
+	verify(!UriUnescape::isstrprefix("%HF", "/foo", UriUnescape::All));
+	verify(!UriUnescape::isstrprefix("%E3%81%8Fpera", "Opera", UriUnescape::ConvertUtf8));
+	verify(!UriUnescape::isstrprefix("Opera", "%E3%81%8Fpera", UriUnescape::ConvertUtf8));
+}
+
+test("UriUnescape::isstrprefix(const uni_char*,const uni_char*,int)")
+{
+	verify( UriUnescape::isstrprefix(UNI_L("pre"), UNI_L("prefix"), UriUnescape::All) != 0);
+	verify( UriUnescape::isstrprefix(UNI_L(""), UNI_L("prefix"), UriUnescape::All) != 0);
+	verify( UriUnescape::isstrprefix(UNI_L("prefixfoo"), UNI_L("prefix"), UriUnescape::All) == 0);
+	verify( UriUnescape::isstrprefix(UNI_L("abc"), UNI_L("abcdef"), UriUnescape::All));
+	verify( UriUnescape::isstrprefix(UNI_L("%61bc"), UNI_L("%61bcdef"), UriUnescape::All));
+	verify( UriUnescape::isstrprefix(UNI_L("%61bc"), UNI_L("abcdef"), UriUnescape::All));
+	verify( UriUnescape::isstrprefix(UNI_L("abc"), UNI_L("a%62cdef"), UriUnescape::All));
+	verify(!UriUnescape::isstrprefix(UNI_L("abcdef"), UNI_L("abc"), UriUnescape::All));
+	verify(!UriUnescape::isstrprefix(UNI_L("%61bcdef"), UNI_L("%61bc"), UriUnescape::All));
+	verify(!UriUnescape::isstrprefix(UNI_L("%61bcdef"), UNI_L("abc"), UriUnescape::All));
+	verify(!UriUnescape::isstrprefix(UNI_L("abcdef"), UNI_L("a%62c"), UriUnescape::All));
+	verify(!UriUnescape::isstrprefix(UNI_L("%HF"), UNI_L("/foo"), UriUnescape::All));
+}
+
+test("UriUnescape::ContainsValidEscapedUtf8(const char*)")
+{
+	verify(!UriUnescape::ContainsValidEscapedUtf8(""));
+	verify(!UriUnescape::ContainsValidEscapedUtf8("Opera"));
+	verify(!UriUnescape::ContainsValidEscapedUtf8("Opera%"));
+	verify(!UriUnescape::ContainsValidEscapedUtf8("Opera%0"));
+	verify(!UriUnescape::ContainsValidEscapedUtf8("Opera%h0"));
+	verify(!UriUnescape::ContainsValidEscapedUtf8("Opera%0h"));
+	verify(!UriUnescape::ContainsValidEscapedUtf8("Opera%00"));
+	verify(!UriUnescape::ContainsValidEscapedUtf8("Opera%00%80"));
+	verify(!UriUnescape::ContainsValidEscapedUtf8("Opera%00%80%"));
+	verify(!UriUnescape::ContainsValidEscapedUtf8("Opera%00%80%0"));
+	verify(!UriUnescape::ContainsValidEscapedUtf8("Opera%00%80%h0"));
+	verify(!UriUnescape::ContainsValidEscapedUtf8("Opera%00%80%0h"));
+	verify(!UriUnescape::ContainsValidEscapedUtf8("Opera%00%80%00"));
+	verify(!UriUnescape::ContainsValidEscapedUtf8("Opera%00%80%80"));
+	verify(!UriUnescape::ContainsValidEscapedUtf8("Opera%00%C0%80"));
+	verify( UriUnescape::ContainsValidEscapedUtf8("Opera%00%C2%80"));
+	verify( UriUnescape::ContainsValidEscapedUtf8("Opera%00%DF%BF"));
+	verify(!UriUnescape::ContainsValidEscapedUtf8("Opera%00%C2%80%"));
+	verify(!UriUnescape::ContainsValidEscapedUtf8("Opera%00%C2%80%0"));
+	verify(!UriUnescape::ContainsValidEscapedUtf8("Opera%00%C2%80%h0"));
+	verify(!UriUnescape::ContainsValidEscapedUtf8("Opera%00%C2%80%0h"));
+	verify( UriUnescape::ContainsValidEscapedUtf8("Opera%00%C2%80%00"));
+	verify(!UriUnescape::ContainsValidEscapedUtf8("Opera%00%E0%80"));
+	verify(!UriUnescape::ContainsValidEscapedUtf8("Opera%00%E0%80%"));
+	verify(!UriUnescape::ContainsValidEscapedUtf8("Opera%00%E0%80%0"));
+	verify(!UriUnescape::ContainsValidEscapedUtf8("Opera%00%E0%80%h0"));
+	verify(!UriUnescape::ContainsValidEscapedUtf8("Opera%00%E0%80%0h"));
+	verify(!UriUnescape::ContainsValidEscapedUtf8("Opera%00%E0%80%00"));
+	verify(!UriUnescape::ContainsValidEscapedUtf8("Opera%00%E0%80%80"));
+	verify( UriUnescape::ContainsValidEscapedUtf8("Opera%00%E0%A0%80"));
+	verify( UriUnescape::ContainsValidEscapedUtf8("Opera%00%EF%BF%BF"));
+	verify(!UriUnescape::ContainsValidEscapedUtf8("Opera%00%E0%A0%80%"));
+	verify(!UriUnescape::ContainsValidEscapedUtf8("Opera%00%E0%A0%80%0"));
+	verify(!UriUnescape::ContainsValidEscapedUtf8("Opera%00%E0%A0%80%h0"));
+	verify(!UriUnescape::ContainsValidEscapedUtf8("Opera%00%E0%A0%80%0h"));
+	verify( UriUnescape::ContainsValidEscapedUtf8("Opera%00%E0%A0%80%00"));
+}
+
+test("UriUnescape::ContainsValidEscapedUtf8(const char*, int)")
+{
+	verify(!UriUnescape::ContainsValidEscapedUtf8("Opera%00%C2%80", 11));
+	verify( UriUnescape::ContainsValidEscapedUtf8("Opera%00%C2%80", 14));
+	verify( UriUnescape::ContainsValidEscapedUtf8("Opera%00%C2%80%0h", 14));
+	verify(!UriUnescape::ContainsValidEscapedUtf8("Opera%00%C2%80%0h", 17));
+	verify(!UriUnescape::ContainsValidEscapedUtf8("Opera%00%C2%80%00", 15));
+	verify(!UriUnescape::ContainsValidEscapedUtf8("Opera%00%C2%80%00", 16));
+	verify( UriUnescape::ContainsValidEscapedUtf8("Opera%00%C2%80%00", 17));
+}
+
+test("UriUnescape::ContainsValidEscapedUtf8(const uni_char*)")
+{
+	verify(!UriUnescape::ContainsValidEscapedUtf8(UNI_L("")));
+	verify(!UriUnescape::ContainsValidEscapedUtf8(UNI_L("Opera%00%C0%80")));
+	verify( UriUnescape::ContainsValidEscapedUtf8(UNI_L("Opera%00%C2%80")));
+}
+
+test("UriUnescape::ContainsValidEscapedUtf8(const uni_char*, int)")
+{
+	verify(!UriUnescape::ContainsValidEscapedUtf8(UNI_L("Opera%00%C2%80"), 11));
+	verify( UriUnescape::ContainsValidEscapedUtf8(UNI_L("Opera%00%C2%80"), 14));
+	verify( UriUnescape::ContainsValidEscapedUtf8(UNI_L("Opera%00%C2%80%0h"), 14));
+	verify(!UriUnescape::ContainsValidEscapedUtf8(UNI_L("Opera%00%C2%80%0h"), 17));
+	verify(!UriUnescape::ContainsValidEscapedUtf8(UNI_L("Opera%00%C2%80%00"), 15));
+	verify(!UriUnescape::ContainsValidEscapedUtf8(UNI_L("Opera%00%C2%80%00"), 16));
+	verify( UriUnescape::ContainsValidEscapedUtf8(UNI_L("Opera%00%C2%80%00"), 17));
+}
+
+test("UriUnescapeIterator::GetStatus(BOOL*,BOOL*)")
+{
+	const char* str = "%E3%80%80";
+	BOOL illegal_escaping_found, utf8_escaping_found;
+	UriUnescapeIterator it(str, UriUnescape::ConvertUtf8 | UriUnescape::ExceptUnsafeHigh);
+	while (it.More())
+		it.NextUni();
+	it.GetStatus(&illegal_escaping_found, &utf8_escaping_found);
+	verify(illegal_escaping_found == FALSE);
+	verify(utf8_escaping_found == TRUE);
+}

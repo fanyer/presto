@@ -1,0 +1,458 @@
+/* -*- Mode: c++; tab-width: 4; indent-tabs-mode: t; c-basic-offset: 4; -*-
+*
+** Copyright (C) 2003-2012 Opera Software ASA.  All rights reserved.
+**
+** This file is part of the Opera web browser.  It may not be distributed
+** under any circumstances.
+*/
+
+group "viewers.generic";
+
+include "modules/viewers/viewers.h";
+
+global
+{
+	Viewers* viewers_list;
+	Viewer* viewer;
+	const uni_char* testurl = UNI_L("www.example.com?url=%s");
+}
+
+setup
+{
+	viewers_list = NULL;
+	viewer = NULL;
+}
+
+test("Enums fit in bit fields")
+{
+	// Verifies that the ViewerTypes struct can hold its data.
+	ViewerTypes type;
+	type.action = VIEWER_NOT_DEFINED;
+	verify(type.action == VIEWER_NOT_DEFINED);
+	type.ctype = FROM_RANGED_ENUM(URLContentType, URL_NUMER_OF_CONTENT_TYPES);
+	verify(type.ctype == FROM_RANGED_ENUM(URLContentType, URL_NUMER_OF_CONTENT_TYPES));
+	type.container = VIEWER_LAST;
+	verify(type.container == VIEWER_LAST);
+	type.web_handler_allowed = true;
+	verify(type.web_handler_allowed == true);
+	type.allow_any_extension = true;
+	verify(type.allow_any_extension == true);
+
+	/* Some compilers (notably MSVC) store enums as signed ints in bit fields,
+	 * so if we are testing with a compiler that does not, make sure to test
+	 * for that as well (Core only runs selftests on lingogi, which uses GCC).
+	 */
+	ViewerTypes signtest;
+	op_memset(&signtest, 255, sizeof (ViewerTypes));
+	if (signtest.container >= VIEWER_LAST)
+	{
+		/* Bit field is unsigned */
+		ViewersEnum twice = static_cast<ViewersEnum>(static_cast<int>(VIEWER_LAST) * 2);
+		type.container = twice;
+		verify(type.container == twice);
+	}
+	if (signtest.action >= VIEWER_NOT_DEFINED)
+	{
+		/* Bit field is unsigned */
+		ViewAction twice = static_cast<ViewAction>(static_cast<int>(VIEWER_NOT_DEFINED) * 2);
+		type.action = twice;
+		verify(type.action == twice);
+	}
+
+}
+
+test("Viewers")
+{
+	viewers_list = OP_NEW(Viewers, ());
+	verify_not_oom(viewers_list);
+}
+
+test("Viewer")
+	require success "Viewers";
+{
+	viewer = OP_NEW(Viewer, ());
+	verify_not_oom(viewer);
+
+	viewer->SetAction(VIEWER_ASK_USER);
+	verify_success(viewer->SetContentType(UNI_L("application/foo")));
+	verify_success(viewer->SetExtensions(UNI_L(".test, .testing")));
+	verify_success(viewer->SetSaveToFolder(UNI_L("/tmp/test/foo")));
+}
+
+test("Extensions")
+	require success "Viewer";
+{
+	verify_string(viewer->GetExtensions(), ".test, .testing");
+}
+
+test("Action")
+	require success "Viewer";
+{
+	verify(viewer->GetAction() == VIEWER_ASK_USER);
+	viewer->SetAction(VIEWER_SAVE);
+	verify(viewer->GetAction() == VIEWER_SAVE);
+	viewer->SetAction(VIEWER_ASK_USER);
+	verify(viewer->GetAction() == VIEWER_ASK_USER);
+}
+
+test("Destination folder")
+	require success "Viewers";
+{
+	verify_string(viewer->GetSaveToFolder(), "/tmp/test/foo");
+}
+
+test("Add")
+	require success "Viewer";
+    require success "Viewers";
+{
+	verify_success(viewers_list->AddViewer(viewer));
+
+	Viewer *res_viewer = viewers_list->FindViewerByMimeType(UNI_L("application/foo"));
+	verify(res_viewer == viewer);
+	res_viewer = viewers_list->FindViewerByMimeType(UNI_L("application/bar"));
+	verify(!res_viewer);
+}
+
+test("GetAction")
+{
+	Viewer *res_viewer = viewers_list->FindViewerByMimeType(UNI_L("application/foo"));
+
+	verify(res_viewer && res_viewer->GetAction() == VIEWER_ASK_USER);
+	res_viewer->SetAction(VIEWER_SAVE);
+	verify(res_viewer->GetAction() == VIEWER_SAVE);
+}
+
+test("GetApp")
+	require success "GetAction";
+{
+	Viewer *res_viewer = viewers_list->FindViewerByMimeType(UNI_L("application/foo"));
+	verify(res_viewer);
+
+	verify_success(res_viewer->SetApplicationToOpenWith(UNI_L("foo")));
+
+	res_viewer = viewers_list->FindViewerByMimeType(UNI_L("application/foo"));
+	verify(res_viewer);
+	const uni_char* app = res_viewer->GetApplicationToOpenWith();
+	verify_string(app, "foo");
+}
+
+test("GetExtensions")
+	require success "GetApp";
+{
+	Viewer *res_viewer, *res_viewer2, *res_viewer3, *res_viewer4;
+	verify_success(viewers_list->FindViewerByExtension(UNI_L("test"), res_viewer));
+	verify_success(viewers_list->FindViewerByExtension("test", res_viewer2));
+	verify_success(viewers_list->FindViewerByFilename(UNI_L("exe.test"), res_viewer3));
+	verify_success(viewers_list->FindViewerByFilename("exe.test", res_viewer4));
+	verify(res_viewer && res_viewer == res_viewer2);
+	verify(res_viewer == res_viewer3 && res_viewer == res_viewer4);
+
+	const uni_char* extension = res_viewer->GetExtensions();
+	verify(extension != NULL);
+	verify_string(extension, ".test, .testing");
+
+	verify_string(res_viewer->GetExtension(0), "test");
+	verify_string(res_viewer->GetExtension(1), "testing");
+
+	verify_success(res_viewer->SetExtensions(UNI_L(".xyz")));
+
+	extension = res_viewer->GetExtensions();
+	verify(extension != NULL);
+	verify_string(extension, ".xyz");
+}
+
+test("IsNativeViewerType")
+ 	require success "Add";
+{
+	verify(viewers_list->IsNativeViewerType("application/foo") == FALSE);
+}
+
+test("CopyFrom")
+ 	require success "Add";
+	require success "GetExtensions";
+{
+	Viewer *copied_viewer = OP_NEW(Viewer, ());
+	verify_not_oom(copied_viewer);
+
+	Viewer *res_viewer = viewers_list->FindViewerByMimeType(UNI_L("application/foo"));
+	verify(res_viewer);
+	verify_success(copied_viewer->CopyFrom(res_viewer));
+	verify_string(copied_viewer->GetExtensions(), ".xyz");
+}
+finally
+{
+	OP_DELETE(copied_viewer);
+}
+
+test("Adding a duplicate content type")
+	require success "CopyFrom";
+{
+	Viewer* new_viewer = OP_NEW(Viewer, ());
+	verify_not_oom(new_viewer);
+
+	Viewer *res_viewer = viewers_list->FindViewerByMimeType(UNI_L("application/foo"));
+	verify(res_viewer);
+	verify_success(new_viewer->CopyFrom(res_viewer));
+
+	verify_status(viewers_list->AddViewer(new_viewer), OpStatus::ERR);
+}
+finally
+{
+	OP_DELETE(new_viewer);
+}
+
+test("DeleteViewer")
+	require success "Adding a duplicate content type";
+{
+	Viewer *res_viewer = viewers_list->FindViewerByMimeType(UNI_L("application/foo"));
+	verify(res_viewer);
+
+	viewers_list->DeleteViewer(res_viewer);
+
+	res_viewer = viewers_list->FindViewerByMimeType(UNI_L("application/foo"));
+	verify(!res_viewer);
+}
+
+/* We used to have an unknown *+xml -> application/xml fallback that caused site compatibility issues. */
+test("Unknown +xml type remains unknown")
+{
+	OpStringC type(UNI_L("gazonk/fubar+xml"));
+	Viewer* v = g_viewers->FindViewerByMimeType(type);
+	verify(v == 0);
+}
+
+test("module.viewers takes precedence over fallback")
+{
+	OpStringC type(UNI_L("application/vnd.wap.xhtml+xml"));
+	Viewer* v = g_viewers->FindViewerByMimeType(type);
+	verify(v != 0);
+	verify(v->GetContentType() == URL_HTML_CONTENT);
+}
+
+test("AddViewer")
+	require success "Viewers";
+{
+	UINT count = viewers_list->GetViewerCount();
+	verify_success(viewers_list->AddViewer(VIEWER_PLUGIN, URL_UNDETERMINED_CONTENT,
+		UNI_L("content_type_string"), UNI_L("extensions_string"),
+		ViewActionFlag::NO_FLAGS, UNI_L("application_to_open_with"),
+		UNI_L("save_to_folder"),
+#ifdef _PLUGIN_SUPPORT_
+		UNI_L("preferred_plugin_path"),
+#endif // _PLUGIN_SUPPORT_
+		UNI_L("description")));
+	verify(viewers_list->GetViewerCount() == ++count);
+}
+
+test("Find viewer")
+	require success "AddViewer";
+{
+	/* This selftest tests the iterating methods and finds the
+	   added viewer by also testing HasExtensionL(). */
+
+	OP_STATUS status = OpStatus::OK;
+	ChainedHashIterator* viewer_iter;
+	verify_success(viewers_list->CreateIterator(viewer_iter));
+	verify_not_oom(viewer_iter);
+	OpAutoPtr<OpHashIterator> viewer_iter_ap(viewer_iter);
+	while ((viewer = viewers_list->GetNextViewer(viewer_iter)) != NULL)
+	{
+		BOOL found = FALSE;
+		TRAP(status, found = viewer->HasExtensionL("fail"));
+		verify_success(status);
+		verify(!found);
+		TRAP(status, found = viewer->HasExtensionL("extensions_string"));
+		verify_success(status);
+		if (found)
+			break;
+	}
+	verify(viewer);
+}
+
+test("ResetAction")
+	require success "Find viewer";
+{
+	verify(viewer->GetAction() == VIEWER_PLUGIN);
+	viewer->ResetAction();
+	verify(viewer->GetAction() == VIEWER_ASK_USER);
+}
+
+test("SetWebHandlerToOpenWith")
+	require success "Find viewer";
+	require WEB_HANDLERS_SUPPORT;
+{
+	verify_success(viewer->SetWebHandlerToOpenWith(testurl));
+	viewer->SetAction(VIEWER_WEB_APPLICATION);
+}
+
+test("FindViewerByWebApplication")
+	require success "SetWebHandlerToOpenWith";
+	require WEB_HANDLERS_SUPPORT;
+{
+	verify_success(viewers_list->FindViewerByWebApplication(testurl, viewer));
+	verify(viewer);
+}
+
+test("WriteViewersL")
+	require success "FindViewerByWebApplication";
+	require WEB_HANDLERS_SUPPORT;
+	require PREFS_HAS_PREFSFILE;
+	require PREFS_WRITE;
+{
+	OP_STATUS status = OpStatus::OK;
+	TRAP(status, viewers_list->WriteViewersL());
+	verify_success(status);
+	viewers_list->DeleteViewer(viewer);
+	verify_success(viewers_list->FindViewerByWebApplication(testurl, viewer));
+	verify(!viewer);
+	verify_success(viewers_list->ReadViewersL());
+	verify_success(viewers_list->FindViewerByWebApplication(testurl, viewer));
+	verify(viewer);
+}
+
+test("GetContentTypeString")
+	require success "AddViewer";
+{
+	verify(!viewers_list->GetContentTypeString(URL_UNDETERMINED_CONTENT));
+	verify(!viewers_list->GetContentTypeString(URL_UNKNOWN_CONTENT));
+	verify_string(viewers_list->GetContentTypeString(URL_HTML_CONTENT), "text/html");
+}
+
+exit
+{
+	OP_DELETE(viewers_list);
+}
+
+group "viewers.plugins";
+
+require _PLUGIN_SUPPORT_;
+
+include "modules/prefs/prefsmanager/collections/pc_app.h";
+include "modules/prefs/prefsmanager/prefsmanager.h";
+
+global
+{
+	PluginViewers* pviewers;
+	PluginViewer* pv;
+	OpStringC orig_pref_value;
+}
+
+setup
+{
+	pviewers = NULL;
+	pv = NULL;
+}
+
+test("Read and save disabled plugins pref")
+{
+	// Save current pref value - we want to restore it after test finishes.
+	orig_pref_value = g_pcapp->GetStringPref(PrefsCollectionApp::DisabledPlugins);
+	// Clear pref before testing.
+	verify_success(g_pcapp->WriteStringL(PrefsCollectionApp::DisabledPlugins, UNI_L("")));
+
+	pviewers = OP_NEW(PluginViewers, ());
+	verify_not_oom(pviewers);
+
+	/* Makes sure that we won't trigger lookup in default plugin path.
+	   That could add plugins to list and mess with our expected results. */
+	pviewers->DeleteAllPlugins();
+
+	// Insert two Plugins.
+	void* token;
+	// Enabled plugin.
+	verify_success(pviewers->OnPrepareNewPlugin(UNI_L("/path/plugin1.dll"), UNI_L(""), UNI_L(""), UNI_L(""), COMPONENT_PLUGIN, TRUE, token));
+	verify_success(pviewers->OnCommitPreparedPlugin(token));
+	// Disabled plugin.
+	verify_success(pviewers->OnPrepareNewPlugin(UNI_L("/path/plugin2_disabled.dll"), UNI_L(""), UNI_L(""), UNI_L(""), COMPONENT_PLUGIN, TRUE, token));
+	verify_success(pviewers->OnCommitPreparedPlugin(token));
+	verify(pv = pviewers->GetPluginViewer(1));
+	pv->SetEnabledPluginViewer(FALSE);
+
+	// List should have 2 plugins.
+	verify(pviewers->GetPluginViewerCount() == 2);
+	// Only 1 plugins should be enabled.
+	verify(pviewers->GetPluginViewerCount(TRUE) == 1);
+
+	// Disabled plugins pref should contain 1 plugin.
+	verify_success(pviewers->SaveDisabledPluginsPref());
+	OpString reference1;
+	verify_success(reference1.AppendFormat(UNI_L("/path/plugin2_disabled.dll%c"), CLASSPATHSEPCHAR));
+	verify_string(g_pcapp->GetStringPref(PrefsCollectionApp::DisabledPlugins), reference1.CStr());
+
+	// Add one more plugin to pref, manually. And with added evilness.
+	OpString data1;
+	verify_success(data1.AppendFormat(UNI_L("/path/plugin2_disabled.dll%c%c/path/plugin1.dll"), CLASSPATHSEPCHAR, CLASSPATHSEPCHAR));
+	verify_success(g_pcapp->WriteStringL(PrefsCollectionApp::DisabledPlugins, data1));
+	verify_success(pviewers->ReadDisabledPluginsPref());
+
+	// Remove all plugins and save pref. We should get pref cleaned from empty paths but otherwise untouched.
+	pviewers->DeleteAllPlugins();
+	verify(pviewers->GetPluginViewerCount() == 0);
+	verify_success(pviewers->SaveDisabledPluginsPref());
+	OpString reference2;
+	verify_success(reference2.AppendFormat(UNI_L("/path/plugin2_disabled.dll%c/path/plugin1.dll%c"), CLASSPATHSEPCHAR, CLASSPATHSEPCHAR));
+	verify_string(g_pcapp->GetStringPref(PrefsCollectionApp::DisabledPlugins), reference2.CStr());
+}
+finally
+{
+	// Restore original pref value.
+	g_pcapp->WriteStringL(PrefsCollectionApp::DisabledPlugins, orig_pref_value);
+	g_prefsManager->CommitL();
+	OP_DELETE(pviewers);
+}
+
+test("OnCancelPreparedPlugin")
+{
+	pviewers = OP_NEW(PluginViewers, ());
+	verify_not_oom(pviewers);
+	verify_success(pviewers->MakeSurePluginsAreDetected());
+	UINT count = pviewers->GetPluginViewerCount();
+	void* token;
+	verify_success(pviewers->OnPrepareNewPlugin(UNI_L("/path/plugin1.dll"), UNI_L(""), UNI_L(""), UNI_L(""), COMPONENT_PLUGIN, TRUE, token));
+	verify_success(pviewers->OnCommitPreparedPlugin(token));
+	verify(pviewers->GetPluginViewerCount() == ++count);
+	verify_success(pviewers->OnPrepareNewPlugin(UNI_L("/path/plugin2.dll"), UNI_L(""), UNI_L(""), UNI_L(""), COMPONENT_PLUGIN, TRUE, token));
+	verify_success(pviewers->OnCancelPreparedPlugin(token));
+	verify(pviewers->GetPluginViewerCount() == count);
+	pviewers->DeleteAllPlugins();
+	verify(pviewers->GetPluginViewerCount() == 0);
+}
+finally
+{
+	OP_DELETE(pviewers);
+}
+
+test("Test plugin installed")
+{
+	OpString16 mime_type;
+	mime_type.Set("application/x-vnd.opera-test-plugin");
+	verify(g_viewers->FindViewerByMimeType(mime_type) != NULL);
+}
+
+test("DeletePluginViewer, GetTypeDescription and RemoveContentType")
+	require success "Test plugin installed";
+{
+	verify_success(g_plugin_viewers->MakeSurePluginsAreDetected());
+	UINT count = g_plugin_viewers->GetPluginViewerCount();
+	verify(count > 0); // Test plugin should be installed, it is a test requirement.
+	UINT index = 0;
+	while (index < count)
+	{
+		PluginViewer *candidate_viewer = g_plugin_viewers->GetPluginViewer(index++);
+		verify(candidate_viewer);
+		if (candidate_viewer->SupportsContentType(UNI_L("application/x-vnd.opera-test-plugin")))
+		{
+			OpString description;
+			verify_success(candidate_viewer->GetTypeDescription(UNI_L("application/x-vnd.opera-test-plugin"), description));
+			verify(description.HasContent()); // The description value depends on the platform so it is not testable.
+			verify_success(candidate_viewer->RemoveContentType(UNI_L("application/x-vnd.opera-test-plugin")));
+			verify(!candidate_viewer->SupportsContentType(UNI_L("application/x-vnd.opera-test-plugin")));
+			verify_success(g_plugin_viewers->DeletePluginViewer(candidate_viewer));
+			break;
+		}
+		verify(index < count); // Test plugin should be installed, it is a test requirement.
+	}
+	verify(g_plugin_viewers->GetPluginViewerCount() == count - 1);
+	verify_success(g_plugin_viewers->RefreshPluginViewers(FALSE));
+	verify(g_plugin_viewers->GetPluginViewerCount() == count);
+}

@@ -1,0 +1,176 @@
+/* -*- Mode: c++; tab-width: 4; indent-tabs-mode: t; c-basic-offset: 4 -*-
+**
+** Copyright (C) 2006-2011 Opera Software ASA.  All rights reserved.
+**
+** This file is part of the Opera web browser.  It may not be distributed
+** under any circumstances.
+*/
+
+group "display.writingsystemheuristic";
+require DISPLAY_WRITINGSYSTEM_HEURISTIC;
+include "modules/display/writingsystemheuristic.h";
+include "modules/doc/frm_doc.h";
+include "modules/dochand/fdelm.h";
+include "modules/windowcommander/src/WindowCommander.h";
+include "modules/selftest/src/doc_st_utils.h";
+
+
+global
+{
+	// first two characters from s are used to determine script
+	WritingSystem::Script GetScript(const char* s)
+	{
+		UINT16 key = ((UINT8)s[0] << 8) + (UINT8)s[1];
+		switch (key)
+		{
+		case ((UINT8)'e' << 8) + (UINT8)'n':
+			return WritingSystem::LatinWestern;
+			break;
+		case ((UINT8)'j' << 8) + (UINT8)'a':
+			return WritingSystem::Japanese;
+			break;
+		case ((UINT8)'i' << 8) + (UINT8)'w':
+			return WritingSystem::Hebrew;
+			break;
+		case ((UINT8)'r' << 8) + (UINT8)'u':
+			return WritingSystem::Cyrillic;
+			break;
+		case ((UINT8)'t' << 8) + (UINT8)'h':
+			return WritingSystem::Thai;
+			break;
+		case ((UINT8)'k' << 8) + (UINT8)'n':
+			return WritingSystem::IndicKannada;
+			break;
+		case ((UINT8)'h' << 8) + (UINT8)'i':
+			return WritingSystem::IndicDevanagari;
+			break;
+		}
+		return WritingSystem::Unknown;
+	}
+}
+
+
+// Open a window for test documents
+html
+{
+	//! <body>
+	//! </body>
+}
+/**
+   all files in test named ws_*_??.mht will be tested for detected
+   language. ?? will be passed to GetScript and is used to determine
+   expected script.
+ */
+table TestPages(char *) filelist "tests" name "ws_*_??.mht";
+foreach (page) from TestPages
+{
+	test ("loadpage_dummy") async;
+	{
+		OpString16 s;
+		if (OpStatus::IsError(s.Set(page)))
+			ST_failed("OOM");
+		else
+		{
+			Window* win = state.GetWindow();
+			if (!win)
+				ST_failed("No window!");
+			else
+				WaitUntilLoadedObj::LoadAndWaitUntilLoaded(win, s.CStr());
+		}
+	}
+
+    test("Page - $(page)")
+    {
+		const size_t len = op_strlen(page);
+		verify(len > 6);
+		const WritingSystem::Script script = GetScript(page + len - 6);
+
+		DocumentManager *doc_man = state.doc->GetWindow()->DocManager();
+		verify(doc_man);
+		FramesDocument* frm_doc = doc_man->GetCurrentDoc();
+		verify(frm_doc);
+
+		// stupid workaround: for some profiles mht archives are
+		// wrapped
+		URLCacheType cache_type = static_cast<URLCacheType>(frm_doc->GetURL().GetAttribute(URL::KCacheType));
+		if (cache_type == URL_CACHE_MHTML)
+		{
+			verify(frm_doc->GetIFrmRoot());
+			verify(frm_doc->GetIFrmRoot()->Next());
+			FramesDocument* f = frm_doc->GetIFrmRoot()->Next()->GetCurrentDoc();
+			verify(f && f != frm_doc);
+			frm_doc = f;
+		}
+
+		HLDocProfile* hld = frm_doc->GetHLDocProfile();
+		verify(hld);
+		const WritingSystem::Script detected = hld->GetPreferredScript();
+        verify(detected == script);
+    }
+}
+
+table TestStrings(WritingSystem::Script, const uni_char*)
+{ 
+    // ASCII only
+    { WritingSystem::LatinWestern,	UNI_L("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ") }
+    // Other Latin chars
+    { WritingSystem::LatinUnknown,	UNI_L("\x0100\x0101\x0102\x0103\x0104\x0105\x0106\x0107\x0108") }
+    // Arbitrary characters from the Cyrillic set only
+    { WritingSystem::Cyrillic,		UNI_L("\x0400\x0401\x0402\x0403\x047e\x047f\x0480\x0481") }
+    { WritingSystem::Cyrillic,		UNI_L("\xa680\xa681\xa682\xa683\xa694\xa695\xa696\xa697") }
+    // Arbitrary characters from the Hangul set only
+    { WritingSystem::Korean,		UNI_L("\x1100\x1101\x1102\x1103\xffd7\xffda\xffdb\xffdc") }
+    // Arbitrary characters from the Hiragana set only
+    { WritingSystem::Japanese,		UNI_L("\x3041\x3042\x3043\x3044\x3096\x309d\x309e\x309f") }
+    // Arbitrary characters from the Katakana set only
+    { WritingSystem::Japanese,		UNI_L("\x30a1\x30a2\x30a3\x30a4\xff71\xff9b\xff9c\xff9d") }
+
+    // Arbitrary characters from the Han set plus 1 Hangul character
+    { WritingSystem::Korean,		UNI_L("\x2e80\x2e99\x2e9b\x3007\x3021\x303a\x4e00\x1100") }
+    // Arbitrary characters from the Han set plus 1 Hiragana character
+    { WritingSystem::Japanese,		UNI_L("\x2e80\x2e99\x2e9b\x3007\x3021\x303a\x4e00\x3041") }
+    // Arbitrary characters from the Han set plus 1 Katakana character
+    { WritingSystem::Japanese,		UNI_L("\x2e80\x2e99\x2e9b\x3007\x3021\x303a\x4e00\x30a1") }
+
+    // Arbitrary characters from the Han set plus 1 Hangul character and some whitespace and punctuation
+    { WritingSystem::Korean,		UNI_L("\x2e80; \x2e99, \x2e9b	.\x3007%^@\x3021   @#$!#$  \x1100") }
+    // Arbitrary characters from the Han set plus 1 Hiragana character and some whitespace and punctuation
+    { WritingSystem::Japanese,		UNI_L("\x2e80; \x2e99, \x2e9b	.\x3007%^@\x3021   @#$!#$  \x3041") }
+    // Arbitrary characters from the Han set plus 1 Katakana character and some whitespace and punctuation
+    { WritingSystem::Japanese,		UNI_L("\x2e80; \x2e99, \x2e9b	.\x3007%^@\x3021   @#$!#$  \x30a1") }
+
+    // Arbitrary latin characters, with too little Han too make a difference
+    { WritingSystem::LatinWestern,	UNI_L("abcdefg \x2e80 hijklmno \x2e99, QWERTY pqrstuvwxyz .\x3007%^@ @#") }
+
+    // words / short sentences
+    { WritingSystem::Japanese, UNI_L(
+			"\x30e9\x30c9\x30af\x30ea\x30d5\x3001\x30de\x30e9\x30bd\x30f3\x4e94\x8f2a\x4ee3\x8868\x306b\x0031\x4e07\x006d\x51fa\x5834\x306b\x3082\x542b\x307f") }
+    { WritingSystem::Hebrew, UNI_L(
+			"\x05d4\x05d0\x05e7\x05d3\x05de\x05d9\x05d4\x0020\x05dc\x05dc\x05e9\x05d5\x05df\x0020\x05d4\x05e2\x05d1\x05e8\x05d9\x05ea") }
+    { WritingSystem::ChineseTraditional, UNI_L(
+			"\x807d\x5abd\x5abd\x7684\x8a71\x3000\x5225\x8b93\x5979\x53d7\x50b7\x3000\x60f3\x5feb\x5feb\x9577\x5927\x3000\x624d\x554f\x80fd\x4fdd\x8b77\x5979") }
+    { WritingSystem::ChineseSimplified, UNI_L(
+			"\x542c\x5988\x5988\x7684\x8bdd\x3000\x522b\x8ba9\x4ed6\x53d7\x4f24\x3000\x60f3\x5feb\x5feb\x957f\x5927\x3000\x624d\x80fd\x4fdd\x62a4\x4ed6") }
+    { WritingSystem::Korean, UNI_L("\xc6b8\xb780\xbc14\xb530\xb974") }
+    { WritingSystem::Arabic, UNI_L("\x0627\x0644\x0639\x0631\x0628\x064a\x0629") }
+    { WritingSystem::Persian, UNI_L("\x067e\x0627\x0631\x0633\x06cc") }
+    // same as previous, but using presentation forms
+    { WritingSystem::Persian, UNI_L("\xfb58\xfe8e\xfead\xfeb3\xfbfd") }
+    { WritingSystem::IndicDevanagari, UNI_L("\x0926\x0947\x0935\x0928\x093e\x0917\x0930\x0940") }
+    { WritingSystem::IndicKannada, UNI_L("\x0c95\x0ca8\x0ccd\x0ca8\x0ca1\x0cbf\x0c97\x0cb0\x0cc1") }
+    { WritingSystem::Thai, UNI_L("\x0e20\x0e32\x0e29\x0e32\x0e44\x0e17\x0e22") }
+    { WritingSystem::LatinWestern, UNI_L("ich habe zwei kokon\x00fcsse") }
+	// james joyce is awesome :)
+    { WritingSystem::LatinWestern, UNI_L(
+			"that was mean of wells, shouldering him into the square ditch because he wouldn't swop his little snuff-box for wells' seasoned hacking chestnut, the conqueror of forty. how cold and slimy the water had been. a fellow once saw a big rat jump into the scum.") }
+    { WritingSystem::Cherokee, UNI_L("\x13A0\x13A1\x13A2\x13A3\x13A4...") }
+};
+foreach(script, string) from TestStrings
+{
+    test("Unicode string - $(script)")
+    {
+        WritingSystemHeuristic heuristic;
+        heuristic.Analyze(string);
+        verify(heuristic.GuessScript() == script);
+    }
+}

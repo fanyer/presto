@@ -1,0 +1,418 @@
+/* -*- Mode: c++; tab-width: 4; indent-tabs-mode: t; c-basic-offset: 4; c-file-style:"stroustrup" -*-
+**
+** Copyright (C) 1995-2011 Opera Software AS.  All rights reserved.
+**
+** This file is part of the Opera web browser.  It may not be distributed
+** under any circumstances.
+**
+*/
+
+group "opsockssocket";
+
+require SOCKS_SUPPORT;
+require initialization;
+
+include "modules/pi/network/OpSocket.h";
+include "modules/pi/network/OpSocketAddress.h";
+include "modules/url/url_socket_wrapper.h";
+
+include "modules/hardcore/timer/optimer.h";
+include "modules/prefs/prefsmanager/collections/pc_network.h";
+
+global {
+#define FOOFOOFOO_1 } // Indentation hack for emacs
+
+	// host:port of the SOCKS proxy server
+	static const uni_char* GetProxyHost()     { return UNI_L("127.0.0.1"); }
+	static UINT            GetProxyPort()     { return 20336; }
+	static const uni_char* GetProxyHostPort() { return UNI_L("127.0.0.1:20336"); } // supposedly unused port
+	
+	// A single record of this structure represents a single client to SOCKS-proxy-emulator request - response pair (see http://www.faqs.org/rfcs/rfc1928.html)
+	struct RqRs_t
+	{
+		const char* rq; UINT rq_len;
+		const char* rs; UINT rs_len;
+	};
+
+	// array of request - response pairs for the test session;
+	// note that last line contains request only (not response) - the HTTP request itself
+	static const void*   RqRs1()
+	{
+		static const RqRs_t result[] =
+		{
+			{ "\x05\x02\x00\x02", 4,
+			  "\x05\x00", 2 },
+//			{ "\x05\x01\x00\x01\x7f\x00\x00\x01\x00\x50", 10,   // you can uncomment these two lines and comment next two; this will slightly change the test
+//			  "\x05\x00\x00\x01\x7f\x00\x00\x01\x00\x50", 10 },
+			{ "\x05\x01\x00\x01\x5E\x47\x91\x89\x00\x50", 10,
+			  "\x05\x00\x00\x01\x5E\x47\x91\x89\x00\x50", 10 },
+			{ "GET / HTTP/1.1\x0d\x0a", 16, NULL, 0 }
+		};
+		return result;
+	}
+	
+	// the target host:port derived from the second request record of the rq_rs sequence
+	static const unsigned char* target_host_port(const RqRs_t* rq_rs)
+	{
+		return (const unsigned char*)rq_rs[1].rq + 4;
+	}
+
+	// the http get request derived from the 3rd request record of the rq_rs sequence
+	static const char* HTTP_GET(const RqRs_t* rq_rs)
+	{
+		return rq_rs[2].rq;
+	}
+
+public:
+
+	// class to tweak the prefs upon test entry to enable SOCKS at specific port at localhost
+	// then to reset SOCKS settings to its previous values upon test exit
+    class PrefsSetter
+    {
+		OpString  orig_server_port;
+		int       orig_socks_enabled;
+
+    public:
+#define g_pc_network (g_opera->prefs_module.PrefsCollectionNetwork())
+        PrefsSetter()
+        {
+			orig_server_port.Set(g_pc_network->GetStringPref(PrefsCollectionNetwork::SOCKSProxy));
+			orig_socks_enabled = g_pc_network->GetIntegerPref(PrefsCollectionNetwork::UseSOCKSProxy);
+
+			g_pc_network->WriteStringL(PrefsCollectionNetwork::SOCKSProxy, OpStringC(GetProxyHostPort()));
+			g_pc_network->WriteIntegerL(PrefsCollectionNetwork::UseSOCKSProxy, 1);
+        }
+        
+        ~PrefsSetter()
+        {
+			g_pc_network->WriteStringL(PrefsCollectionNetwork::SOCKSProxy, orig_server_port);
+			g_pc_network->WriteIntegerL(PrefsCollectionNetwork::UseSOCKSProxy, orig_socks_enabled);
+        }
+#undef g_pc_network
+    };
+
+    PrefsSetter* prefsSetter = NULL;
+    
+
+private:
+
+	// timer used to fail the test if it hasn't finished in certain amount of time.
+	class TimeoutListener : public OpTimerListener
+	{
+	public:
+		virtual void OnTimeOut(OpTimer* timer)
+		{
+			ST_failed("Timed out");
+		}
+	};
+
+	OpTimer* timer;
+	TimeoutListener* timeout_listener;
+
+	void StartTimer(UINT32 timeout)
+	{
+		OP_DELETE(timer);
+		timer = OP_NEW(OpTimer, ());
+		if (timer)
+		{
+			timer->SetTimerListener(timeout_listener);
+			timer->Start(timeout);
+		}
+		else
+			ST_failed("OOM");
+	}
+
+	void StopTimer()
+	{
+		OP_DELETE(timer);
+		timer = 0;
+	}
+
+
+	// SOCKS-proxy like server, that listens on specific port on localhost in order to test the SOCKS client code (class OpSocksSocket)
+	class SocksProxyEmulator : public OpSocketListener
+	{
+	private:
+		const RqRs_t* rq_rs;
+		UINT          stage;
+		OpSocket*     client_socket;
+	public:
+
+		SocksProxyEmulator(const RqRs_t* RqRs) : rq_rs(RqRs), stage(0), client_socket(NULL) {}
+		virtual ~SocksProxyEmulator()
+		{
+			if (client_socket)
+				OP_DELETE(client_socket);
+		}
+
+		virtual void OnSocketConnected(OpSocket* socket) {;}
+
+		virtual void OnSocketDataReady(OpSocket* socket)
+		{
+			char  in_buffer[32];
+			UINT  bytes_received;
+			OP_STATUS status;
+
+			if (socket != client_socket)
+			{			
+				status = socket->Recv(in_buffer, ARRAY_SIZE(in_buffer), &bytes_received);
+				return;
+			}
+			
+			if (FailIf(client_socket != socket, "Incoming data from unexpected socket"))
+				return;
+					
+			if (FailIf(ARRAY_SIZE(in_buffer) < rq_rs[stage].rq_len, "Expected request longer than buffer"))
+				return;
+
+			status = socket->Recv(in_buffer, rq_rs[stage].rq_len, &bytes_received);
+
+			if (FailIf(OpStatus::IsError(status), "Failure receiving request"))
+				return;
+
+			if (rq_rs[stage].rs == NULL) // this indicates that is the final request we don't need to response to. Just check it is the right rq:
+			{
+				if (!FailIf(bytes_received != rq_rs[stage].rq_len || 0 != op_memcmp(in_buffer, rq_rs[stage].rq, bytes_received),
+						"HTTP GET request is not the expected one"))
+				{
+					ST_passed();
+				}
+				return;
+			}
+			if (FailIf(OpStatus::IsError(status), "Failure receiving expected request"))
+				return;
+			if (FailIf(bytes_received != rq_rs[stage].rq_len, "Received request is shorter or longer than expected", &rq_rs[stage]))
+				return;
+			if (FailIf(0 != op_memcmp(in_buffer, rq_rs[stage].rq, bytes_received), "Received request is non-identical with expected reuqest", &rq_rs[stage]))
+				return;
+			
+			const char* rs = rq_rs[stage].rs;
+			UINT rs_len = rq_rs[stage].rs_len;
+			status = socket->Send(rs, rs_len);
+
+			FailIf(OpStatus::IsError(status), "Failure sending server response");
+
+			stage++;
+		}
+
+		virtual void OnSocketDataSent(OpSocket* socket, UINT bytes_sent) {;}
+
+		virtual void OnSocketClosed(OpSocket* socket)
+		{
+			if (socket == client_socket)
+			{
+				FailIf(rq_rs[stage].rs != NULL, "Connection closed unexpectedly");
+				OP_DELETE(client_socket);
+				client_socket = NULL;
+				stage = 0;
+			}
+		}
+
+#ifdef SOCKET_LISTEN_SUPPORT
+		virtual void OnSocketConnectionRequest(OpSocket* socket)
+		{
+			if (client_socket)
+				FailIf(TRUE, "More then one incoming connection!");
+			else
+			{
+				OP_STATUS stat = SocketWrapper::CreateTCPSocket(&client_socket, this/*listener*/, SocketWrapper::NO_WRAPPERS);
+				if (FailIf(OpStatus::IsError(stat), "Failed creating in-bound socket"))
+					return;
+				stat = socket->Accept(client_socket);
+				if (FailIf(OpStatus::IsError(stat), "Failed accepting in-bound socket"))
+					return;
+			}
+		}
+
+		virtual void OnSocketListenError(OpSocket* socket, OpSocket::Error error)  { FailIf(TRUE, "OnSocketListenError"); }
+#endif // SOCKET_LISTEN_SUPPORT
+
+		virtual void OnSocketConnectError(OpSocket* socket, OpSocket::Error error) { FailIf(TRUE, "OnSocketConnectError"); }
+
+		virtual void OnSocketReceiveError(OpSocket* socket, OpSocket::Error error) { FailIf(TRUE, "OnSocketReceiveError"); }
+
+		virtual void OnSocketSendError(OpSocket* socket, OpSocket::Error error)    { FailIf(TRUE, "OnSocketSendError"); }
+
+		virtual void OnSocketCloseError(OpSocket* socket, OpSocket::Error error)   { FailIf(TRUE, "OnSocketCloseError"); }
+
+#ifndef URL_CAP_TRUST_ONSOCKETDATASENT
+		virtual void OnSocketDataSendProgressUpdate(OpSocket* socket, UINT bytes_sent) { }
+#endif // !URL_CAP_TRUST_ONSOCKETDATASENT
+
+		BOOL  FailIf(BOOL fail_cond, const char* fail_msg, const RqRs_t* rqrs=NULL)
+		{
+			if (fail_cond)
+			{
+				OpString8 s;
+				s.Append(fail_msg);
+				if (rqrs)
+				{
+					s.Append(":\n\t");
+					for (UINT i=0; i < rqrs->rq_len; ++i)
+					{
+						char buf[4];
+						op_sprintf(buf, " %02x", (UINT)rqrs->rq[i] & 0xffU);
+						s.Append(buf);
+					}
+	/*				s.Append(" while expecting:\n\t");
+					for (UINT i=0; i < rqrs->rs_len; ++i)
+					{
+						char buf[4];
+						op_sprintf(buf, " %02x", (UINT)rqrs->rs[i] & 0xffU);
+						s.Append(buf);
+					}				
+	*/			}
+				::ST_failed(s.CStr());
+			}
+			return fail_cond;
+		}
+	};
+
+
+	// wrapper for the socks client code to be tested (OpSocksSocket)
+	// It creates a socket through SocketWrapper::CreateTCPSocket which (due to the tweaked prefs settings) will result in a OpSocksSocket being created
+	// the SocksSocket will try to initiaqte a SOCKS session with the socks proxy emulator which will compare the requests to the expected ones
+	//   and send the expected responses.
+	class SocksProxyTest : public OpSocketListener {
+		const RqRs_t*       rq_rs;
+		SocksProxyEmulator  proxy_emulator;
+		OpSocketAddress*    proxy_address;
+		OpSocket*           proxy_socket;
+		OpSocketAddress*    web_address;
+		OpSocket*           client_socket;
+		UINT                stage;
+		BOOL                init_ok;
+		
+	public:
+
+		SocksProxyTest() : rq_rs((const RqRs_t*)RqRs1()), proxy_emulator((const RqRs_t*)RqRs1()), proxy_address(0), proxy_socket(0), web_address(0), client_socket(0), stage(0), init_ok(FALSE) {;}
+		~SocksProxyTest()
+		{
+			if (proxy_address)
+				OP_DELETE(proxy_address);
+			if (proxy_socket)
+				OP_DELETE(proxy_socket);
+			if (web_address)
+				OP_DELETE(web_address);
+			if (client_socket)
+				OP_DELETE(client_socket);
+		}
+		
+		BOOL Init()
+		{
+			OP_STATUS status;
+			
+			status = OpSocketAddress::Create(&proxy_address);
+																						if (OpStatus::IsError(status)) return FALSE;
+			status = proxy_address->FromString(GetProxyHost());							if (OpStatus::IsError(status)) return FALSE;
+			proxy_address->SetPort(GetProxyPort());
+
+			status = SocketWrapper::CreateTCPSocket(&proxy_socket, &proxy_emulator, SocketWrapper::NO_WRAPPERS);	if (OpStatus::IsError(status)) return FALSE;
+			status = proxy_socket->Listen(proxy_address, 3);							if (OpStatus::IsError(status)) return FALSE;
+
+			status = OpSocketAddress::Create(&web_address);								if (OpStatus::IsError(status)) return FALSE;
+			
+			uni_char buf[16];
+			const unsigned char* hp = target_host_port(rq_rs);
+			uni_snprintf(buf, ARRAY_SIZE(buf), UNI_L("%u.%u.%u.%u"), hp[0], hp[1], hp[2], hp[3]);
+			status = web_address->FromString(buf);										if (OpStatus::IsError(status)) return FALSE;
+			web_address->SetPort(hp[4] << 8 | hp[5]);
+
+			status = SocketWrapper::CreateTCPSocket(&client_socket, this, SocketWrapper::NO_WRAPPERS);	if (OpStatus::IsError(status)) return FALSE;
+			
+			return (init_ok = TRUE);
+		}
+		
+		BOOL  run_test()
+		{
+			if (init_ok)
+			{
+				OP_STATUS status = client_socket->Connect(web_address);
+				return OpStatus::IsSuccess(status);
+			}
+			else
+				return false;
+		}
+		
+		virtual void OnSocketConnected(OpSocket* socket)
+		{
+			const char* msg = HTTP_GET(rq_rs);
+			OP_STATUS status = client_socket->Send(msg, op_strlen(msg));
+			if (OpStatus::IsError(status))
+				::ST_failed("send HTTP GET request to proxy server");
+		}
+		
+		virtual void OnSocketDataReady(OpSocket* socket)
+		{
+			stage++;
+		}
+
+		virtual void OnSocketDataSent(OpSocket* socket, UINT bytes_sent) {;}
+
+		virtual void OnSocketClosed(OpSocket* socket) {;}
+
+#ifdef SOCKET_LISTEN_SUPPORT
+		virtual void OnSocketConnectionRequest(OpSocket* socket) { FailIf(TRUE, "OnSocketConnectionRequest"); }
+
+		virtual void OnSocketListenError(OpSocket* socket, OpSocket::Error error)  { FailIf(TRUE, "OnSocketListenError"); }
+#endif // SOCKET_LISTEN_SUPPORT
+
+		virtual void OnSocketConnectError(OpSocket* socket, OpSocket::Error error) { FailIf(TRUE, "OnSocketConnectError"); }
+
+		virtual void OnSocketReceiveError(OpSocket* socket, OpSocket::Error error) { FailIf(TRUE, "OnSocketReceiveError"); }
+
+		virtual void OnSocketSendError(OpSocket* socket, OpSocket::Error error)    { FailIf(TRUE, "OnSocketSendError"); }
+
+		virtual void OnSocketCloseError(OpSocket* socket, OpSocket::Error error)   { FailIf(TRUE, "OnSocketCloseError"); }
+
+#ifndef URL_CAP_TRUST_ONSOCKETDATASENT
+		virtual void OnSocketDataSendProgressUpdate(OpSocket* socket, UINT bytes_sent) { FailIf(TRUE, "OnSocketDataSendProgressUpdate"); }
+#endif // !URL_CAP_TRUST_ONSOCKETDATASENT
+
+		BOOL  FailIf(BOOL fail_cond, const char* fail_msg)
+		{
+			if (fail_cond)
+				::ST_failed(fail_msg);
+			return fail_cond;
+		}	
+	};
+
+#define FOOFOOFOO_2 { // indentation hack for emacs
+
+public:
+	SocksProxyTest socks_proxy_test;
+} // global
+
+
+setup
+{
+	prefsSetter = OP_NEW(PrefsSetter, ());
+    
+	timer = 0;
+	timeout_listener = OP_NEW(TimeoutListener, ());
+	
+	if (!socks_proxy_test.Init())
+	{
+		::ST_failed("SOCKS proxy test failed to initialize");
+	}
+}
+
+exit
+{
+	OP_DELETE(timer);
+	OP_DELETE(timeout_listener);
+	
+	OP_DELETE(prefsSetter);
+}
+
+test("prefsSetter exists")
+{
+    verify(prefsSetter != NULL);
+}
+
+test("OpSocksSocket test") async;
+{
+	StartTimer(10000);
+	socks_proxy_test.run_test();
+	StopTimer();
+}

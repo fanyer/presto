@@ -1,0 +1,189 @@
+/* -*- Mode: c++; tab-width: 4; indent-tabs-mode: t; c-basic-offset: 4 -*-
+ *
+ * Copyright (C) 2009 Opera Software AS.  All rights reserved.
+ *
+ * This file is part of the Opera web browser.
+ * It may not be distributed under any circumstances.
+ */
+
+group "database.webstorage.simplefile";
+
+require init;
+require CLIENTSIDE_STORAGE_SUPPORT;
+require WEBSTORAGE_ENABLE_SIMPLE_BACKEND;
+
+language c++;
+
+include "modules/doc/frm_doc.h";
+include "modules/database/src/webstorage_data_abstraction_simple_impl.h";
+include "modules/database/src/filestorage.h";
+
+global
+{
+	static BOOL _verify(BOOL b, unsigned line_number, const char *msg) {
+		if(!b) {
+			char buf[1000]={0}; /* ARRAY OK 2009-12-15 joaoe */
+			op_snprintf(buf,999,"\b\b\b%d: %s should be true", line_number, msg);
+			ST_failed(buf);
+		}
+		return b;
+	}
+
+	static BOOL _verify(const void* p, unsigned line_number, const char *msg) {
+		return _verify(p != NULL, line_number, msg);
+	}
+
+#undef verify
+#define verify(b) do{ \
+	if(!_verify(b,__LINE__,#b)) {return 0;} }while(0)
+
+	/********* File contents **********
+	<?xml version="1.0" encoding="utf-8"?>
+	<!DOCTYPE web-storage-entries>
+	<ws>
+		<e>
+			<k>Fisk</k>
+			<v>Frosk</v>
+		</e>
+		<e>
+			<k>Frukt</k>
+			<v>Drue er godt</v>
+		</e>
+		<e>
+			<k></k>
+			<v>1</v>
+		</e>
+		<e>
+			<k>1</k>
+			<v></v>
+		</e>
+		<e>
+			<k>2</k>
+		</e>
+	</ws>
+	*******************/
+
+	class FSTestCallback : public FileStorageLoadingCallback, public FileStorageSavingCallback
+	{
+	public:
+
+		FSTestCallback() : test_failed(FALSE) {}
+
+		virtual ~FSTestCallback() { vector.DeleteAll(); }
+
+		virtual int OnLoadingFinishedAux()
+		{
+			WebStorageValueInfo* vi;
+			verify(vector.GetCount() == 5);
+
+			vi = vector.Get(0);
+			verify(vi->m_key.Equals(UNI_L("Fisk"), 4));
+			verify(vi->m_value.Equals(UNI_L("Frosk"), 5));
+
+			vi = vector.Get(1);
+			verify(vi->m_key.Equals(UNI_L("Frukt"), 5));
+			verify(vi->m_value.Equals(UNI_L("Drue er godt"), 12));
+
+			vi = vector.Get(2);
+			verify(vi->m_key.Equals(NULL, 0));
+			verify(vi->m_value.Equals(UNI_L("1"), 1));
+
+			vi = vector.Get(3);
+			verify(vi->m_key.Equals(UNI_L("1"), 1));
+			verify(vi->m_value.Equals(UNI_L(""), 0));
+
+			vi = vector.Get(4);
+			verify(vi->m_key.Equals(UNI_L("2"), 1));
+			verify(vi->m_value.Equals(UNI_L(""), 0));
+
+			return 1;
+		}
+		virtual void OnLoadingFinished()
+		{
+			if (OnLoadingFinishedAux() != 0)
+				ST_passed();
+		};
+
+		virtual void OnLoadingFailed(OP_STATUS err)
+		{
+			TestFailed(err, "OnLoadingFailed");
+		};
+
+		virtual void	OnSavingFinished()
+		{
+			ST_passed();
+		};
+
+		virtual void OnSavingFailed(OP_STATUS err)
+		{
+			TestFailed(err, "OnSavingFailed");
+		};
+
+		void TestFailed(OP_STATUS err, const char* fn)
+		{
+			if (test_failed) return;
+
+			char msg[128] = {0};
+			op_snprintf(msg, 127, "\b\b\b%d: Whoops, %s failed with errcode: %d\n", __LINE__+1, fn, err);
+			ST_failed(msg);
+			test_failed = TRUE;
+		}
+		virtual OP_STATUS OnValueFound(WebStorageValueInfo* vi)
+		{
+			OP_STATUS status;
+			//GetDataFileSize is unlikely to ever fail
+			if (OpStatus::IsError(status = vector.Add(vi)))
+			{
+				TestFailed(status, "OnValueFound");
+				OP_DELETE(vi);
+			}
+			return status;
+		}
+		BOOL test_failed;
+		OpVector<WebStorageValueInfo> vector;
+	};
+
+	FSTestCallback callback;
+
+	FileStorageLoader* loader = NULL;
+	FileStorageSaver* saver = NULL;
+}
+
+test("test file path")
+	file uni ps_file "example.opfilestorage";
+{
+	verify(OpDbUtils::IsFilePathAbsolute(ps_file));
+}
+
+test("load file")
+	async;
+	require success "test file path";
+	file uni ps_file "example.opfilestorage";
+{
+	loader = OP_NEW(FileStorageLoader, (&callback));
+	verify(loader != NULL);
+	verify(OpStatus::IsSuccess(loader->Load(ps_file)));
+}
+
+test("save file")
+	async;
+	require success "load file";
+	file uni ps_file "new.opfilestorage";
+{
+	const uni_char* ps_file_path = ps_file;
+	saver = OP_NEW(FileStorageSaver, (g_selftest.utils->doc->GetMessageHandler(), &callback, FALSE));
+	verify(saver != NULL);
+	verify(OpStatus::IsSuccess(saver->Save(ps_file, &callback.vector)));
+}
+finally
+{
+	OpFile output_file;
+	if (OpStatus::IsSuccess(output_file.Construct(ps_file_path)))
+		OpStatus::IsError(output_file.Delete());
+}
+
+exit
+{
+	OP_DELETE(loader);
+	OP_DELETE(saver);
+}

@@ -1,0 +1,2464 @@
+/* -*- Mode: c++; tab-width: 4; indent-tabs-mode: t; c-basic-offset: 4 -*-
+**
+** Copyright (C) 2004-2012 Opera Software ASA.  All rights reserved.
+**
+** This file is part of the Opera web browser.
+** It may not be distributed under any circumstances.
+**
+** This file tests the basic functionalities of the cache from an higher level:
+** load a document and test if it is really accessed from the cache
+**
+** Luca Venturi
+**
+** Test for the basic functionalities of the cache
+*/
+group "cache basic tests";
+
+require init;
+require DYNAMIC_FOLDER_SUPPORT;
+require DISK_CACHE_SUPPORT;
+require WEBSERVER_SUPPORT;
+
+include "modules/security_manager/include/security_manager.h";
+include "modules/cache/cache_selftest.h";
+include "modules/cache/cache_common.h";
+include "modules/cache/cache_st_helpers.h";
+include "modules/cache/cache_debug.h";
+include "modules/cache/cache_exporter.h";
+include "modules/cache/cache_ctxman_disk.h";
+include "modules/url/url2.h";
+include "modules/url/protocols/http1.h";
+include "modules/prefs/prefsmanager/collections/pc_network.h";
+include "modules/dochand/winman.h";
+
+#include "cache_html.oth";
+
+global
+{
+	OpSecurityManager::PrivilegedBlock g_webserver_privileged_block;
+
+	UINT32 SIZE_EMBEDDED;
+	UINT32 SIZE_CONTAINERS;
+	UINT32 SIZE_PLAIN;
+
+	MultiContext mctx;
+
+	// Managed contexts
+	URL_CONTEXT_ID ctx;			// Context used to write on the cache
+	URL_CONTEXT_ID ctx_err;		// Context used to check for errors
+	URL_CONTEXT_ID ctx_delete_local;	// Context used to test delete of "local" URLS
+	URL_CONTEXT_ID ctx_delete_http;		// Context used to test delete of "http" URLS
+	URL_CONTEXT_ID ctx_delete_http2;	// Context used to test delete of "http" URLS, explicitly for expire
+#ifdef WEB_TURBO_MODE
+	URL_CONTEXT_ID ctx_turbo_1;	// Context of Turbo
+	URL_CONTEXT_ID ctx_turbo_2;	// Second context used to test Turbo (it is not a Turbo context, though)
+#endif
+	URL_CONTEXT_ID ctx_sessions;		// Context used to check sessions URL (unique)
+	URL_CONTEXT_ID ctx_empty_master;	// Context used to check Empty on exit (this context saves the files)
+	URL_CONTEXT_ID ctx_empty1;			// Context used to check Empty on exit
+	URL_CONTEXT_ID ctx_empty2;			// Context used to check Empty on exit
+	URL_CONTEXT_ID ctx_privacy;			// Context used to check the privacy mode behavior
+	URL_CONTEXT_ID ctx_download;		// Context used to check the download storage
+	URL_CONTEXT_ID ctx_cache_limit;		// Context used to check the download storage
+	URL_CONTEXT_ID ctx_redir;			// Context used to check redirections
+	URL_CONTEXT_ID ctx_redir2;			// Context used to check redirections
+	URL_CONTEXT_ID ctx_async;			// Context used to check asynchronous export
+	URL_CONTEXT_ID ctx_big_headers;		// Context used to test big headers
+
+	// Unmanaged
+	URL_CONTEXT_ID ctx_disabled;	// Context used to test if the cache can be disabled at runtime
+	URL_CONTEXT_ID ctx_load;	// Context used to test that the cache is loaded
+	URL_CONTEXT_ID ctx_load2;	// Context used to test that the cache is loaded
+	URL_CONTEXT_ID ctx_sync;	// Context used to test the index synchronization
+	URL_CONTEXT_ID ctx_sync2;	// Context used to test the index synchronization
+	URL_CONTEXT_ID ctx_sync3;	// Context used to test the index synchronization
+	URL_CONTEXT_ID ctx_sessions2;		// Context used to check sessions URL (unique)
+
+	// Managed
+	OpFileFolder basic_folder;	// Cache folder used to check basic functionalities
+	OpFileFolder basic_folder_err;	// Cache folder used to check basic error
+	OpFileFolder delete_folder_local;	// Cache folder used to check delete
+	OpFileFolder delete_folder_http;	// Cache folder used to check delete from http
+	OpFileFolder delete_folder_http2;	// Cache folder used to check delete from http
+	OpFileFolder sessions_folder;	// Cache folder used to check delete from http
+	OpFileFolder empty_folder;	// Cache folder used to check empty on exit
+	OpFileFolder privacy_folder;	// Cache folder used to check the privacy mode
+	OpFileFolder big_headers_folder;	// Cache folder used to test big headers
+
+	// Unmanaged
+	OpFileFolder disabled_folder;	// Cache folder used to check if the cache can be disabled at runtime
+	OpFileFolder sync_folder;	// Cache folder used to check delete from http
+
+#if CACHE_SMALL_FILES_LIMIT>0
+	OpString path_embedded;
+	OpString path_embedded2;
+	OpFile file_embedded;
+	OpFile file_embedded2;
+	URL url_embedded;
+	URL url_mime_xml;
+	URL url_mime_svg;
+	URL url_mime_html;
+	URL url_mime_jpeg;
+	URL url_mime_txt;
+	URL url_mime_txt_fake;
+	URL url_mime_xml_fake;
+	URL url_mime_svg_broken;
+	OpFileLength size_embedded;
+	URL url_embedded_redir;
+	URL url_embedded_redir2;
+	URL url_embedded_redir3;
+	URL url_embedded_redir4;
+	URL url_embedded_redir5;
+	URL url_embedded_redir6;
+#endif
+#if CACHE_CONTAINERS_ENTRIES>0
+	OpString path_cont;
+	OpString path_cont2;
+	OpFile file_cont;
+	OpFile file_cont2;
+	URL url_cont;
+	URL url_cont_redir;
+	URL url_cont_redir2;
+	URL url_cont_redir3;
+	URL url_cont_redir4;
+	URL url_cont_redir5;
+	URL url_cont_redir6;
+	URL url_range;
+	OpFileLength size_cont;
+#endif
+	OpString path_plain;
+	OpString path_plain2;
+	OpFile file_plain;
+	OpFile file_plain2;
+	URL url_plain;
+	URL url_plain_redir;
+	URL url_plain_redir2;
+	URL url_plain_redir3;
+	URL url_plain_redir4;
+	URL url_plain_redir5;
+	URL url_plain_redir6;
+	OpFileLength size_plain;
+	UniteCacheTester uct;
+	CacheHelpers ch;
+	OpAutoVector<URL> del_urls_local;			// Local URLs for delete test
+	OpAutoVector<URL> del_urls_http;	// HTTP URLs for delete test
+	URL url_install;
+	URL url_export;
+	URL url_exp_soon;   	// The page will expire soon
+	URL url_exp_expired;	// The page is already expired
+	URL url_exp_later;		// The page will expire later
+	URL url_empty1;			// Test for Empty on exit
+	URL url_empty2;			// Test for Empty on exit
+	URL url_local;			// Used for testing local files
+	URL url_limit;		    // Used for the cache limit tests
+	URL url_big_headers;    // Used to check big headers
+	OpString8 url_local_str; // Used for testing local files
+	OpFile f_local;			// Used for testing local files
+	int num_start; // Number of starting files, for the sync check
+	int num_simulate;  // Number of simulated files, for the sync check
+	int num_check;   // Number of final files, for the sync check
+	WaitURLs *wait;
+	MessageHandler *mh;
+	BOOL disk_cache_enabled;
+	UINT32 num_disk_read;
+	OpFileLength ram_cache_size;
+	OpFileLength disk_cache_size;
+#if defined __OEM_EXTENDED_CACHE_MANAGEMENT && defined __OEM_OPERATOR_CACHE_MANAGEMENT
+	OpFileLength oem_cache_size;
+#endif // defined __OEM_EXTENDED_CACHE_MANAGEMENT && defined __OEM_OPERATOR_CACHE_MANAGEMENT
+
+	void deleteURLLocal(int num)
+	{
+		OP_ASSERT(del_urls_local.Get(num));
+		OP_DELETE(del_urls_local.Get(num));
+		del_urls_local.Replace(num, NULL);
+	}
+
+	void deleteURLHTTP(int num)
+	{
+		OP_ASSERT(del_urls_http.Get(num));
+		CacheTester::BrutalDelete(del_urls_http.Get(num), TRUE);
+		del_urls_http.Replace(num, NULL);
+	}
+
+#ifdef PI_ASYNC_FILE_OP
+	class AsyncExportWaiter: public AsyncExporterListener
+	{
+	public:
+		void NotifyStart(OpFileLength length, URL_Rep *rep, const OpStringC &name, UINT32 param) { output("Start exporting\n"); }
+
+		void NotifyProgress(OpFileLength bytes_saved, OpFileLength length, URL_Rep *rep, const OpStringC &name, UINT32 param)
+		{
+			output("Export progress: %d of %d KB\n", (UINT32)bytes_saved/1024, (UINT32)length/1024);
+		}
+
+		void NotifyEnd(OP_STATUS ops, OpFileLength bytes_saved, OpFileLength length, URL_Rep *rep, const OpStringC &name, UINT32 param)
+		{
+			if(OpStatus::IsSuccess(ops))
+			{
+				URL url(rep, (const char*)NULL);
+
+				OP_STATUS ops=CacheFileTest::VerifyFileContent(url, name.CStr());
+
+				if(OpStatus::IsSuccess(ops))
+					ST_passed();
+				else
+					ST_failed("Export content is wrong!");
+			}
+			else
+				ST_failed("Export failed");
+
+			OP_DELETE(this);
+		}
+
+	};
+#endif
+}
+
+setup
+{
+	CacheHelpers::CloseUnusedWindows();
+
+#if CACHE_SMALL_FILES_LIMIT>0
+	SIZE_EMBEDDED=CACHE_SMALL_FILES_SIZE-1;
+#else
+	SIZE_EMBEDDED=0;
+#endif
+
+#if CACHE_CONTAINERS_ENTRIES>0
+	SIZE_CONTAINERS=CACHE_CONTAINERS_FILE_LIMIT-1;
+	SIZE_PLAIN=CACHE_CONTAINERS_FILE_LIMIT*2;
+#else
+	SIZE_EMBEDDED=0;
+	SIZE_PLAIN=32768;
+#endif
+
+	disk_cache_enabled = (BOOL) g_pcnet->GetIntegerPref(PrefsCollectionNetwork::CacheToDisk);
+
+	g_folder_manager->AddFolder(OPFILE_CACHE_FOLDER, UNI_L("basic_sync"),&sync_folder);
+
+	OpMessage messages[]={MSG_URL_DATA_LOADED, MSG_URL_LOADING_FAILED, MSG_URLMAN_DELETE_SOMEFILES};
+
+	mh=OP_NEW(MessageHandler, (NULL));
+	wait=OP_NEW(WaitURLs, (sync_folder, sync_folder, mh));
+	mh->SetCallBackList(wait, 0, messages, 3);
+	num_disk_read = 0;
+	ram_cache_size = disk_cache_size = oem_cache_size = 0;
+}
+
+exit
+{
+	mh->UnsetCallBacks(wait);
+	OP_DELETE(mh);
+	mh=NULL;
+	OP_DELETE(wait);
+	wait=NULL;
+}
+
+test("Start WebServer if required") async;
+{
+	uct.SetWindow(state.GetWindow());
+	uct.StartWebServer();
+}
+
+test("Check WebServer and create the service")
+async;
+{
+	uct.StartService(UNI_L("cache_js_selftest"), UNI_L("webserver/cache_js_selftest_service/"));
+}
+
+test("Freeze test")
+{
+	output("*** WARNING - This test is very invasive, and if there are problems it could potentially affects many of the tests after it, also in other .ot files\n");
+	CacheTester::FreezeTests();
+}
+
+test("Create the contexts")
+{
+	// WARNING: these contexts will be deleted for the test "URL counting and double loading check"
+	verify_success(mctx.CreateNewContext(ctx, UNI_L("basic"), TRUE, &basic_folder));
+	verify_success(mctx.CreateNewContext(ctx_err, UNI_L("basic_err"), TRUE, &basic_folder_err));
+	verify_success(mctx.CreateNewContext(ctx_delete_local, UNI_L("basic_delete_local"), TRUE, &delete_folder_local));
+	verify_success(mctx.CreateNewContext(ctx_delete_http, UNI_L("basic_delete_http"), TRUE, &delete_folder_http));
+	verify_success(mctx.CreateNewContext(ctx_delete_http2, UNI_L("basic_delete_http2"), TRUE, &delete_folder_http2));
+	verify_success(mctx.CreateNewContext(ctx_sessions, UNI_L("basic_sessions"), TRUE, &sessions_folder));
+	verify_success(mctx.CreateNewContext(ctx_empty_master, UNI_L("basic_empty"), TRUE, &empty_folder));
+	verify_success(mctx.CreateNewContext(ctx_privacy, UNI_L("basic_privacy"), TRUE, &privacy_folder));
+	verify_success(mctx.CreateNewContext(ctx_download, UNI_L("basic_download"), TRUE, NULL));
+	verify_success(mctx.CreateNewContext(ctx_cache_limit, UNI_L("basic_limit"), TRUE, NULL));
+	verify_success(mctx.CreateNewContext(ctx_redir, UNI_L("basic_redir"), TRUE, NULL));
+	verify_success(mctx.CreateNewContext(ctx_async, UNI_L("basic_async"), TRUE, NULL));
+	verify_success(mctx.CreateNewContext(ctx_big_headers, UNI_L("basic_big_headers"), TRUE, &big_headers_folder));
+
+#ifdef CACHE_MULTIPLE_FOLDERS
+	urlManager->FindContextManager(ctx_empty_master)->SetEnableDirectories(FALSE);
+#endif
+
+	g_folder_manager->AddFolder(OPFILE_CACHE_FOLDER, UNI_L("basic_disabled"),&disabled_folder);
+
+	verify_success(CacheFileTest::DeleteCacheDir(sync_folder));
+	verify_success(CacheFileTest::DeleteCacheDir(disabled_folder));
+
+	ctx_sync=urlManager->GetNewContextID();
+	ctx_sessions2=urlManager->GetNewContextID();
+	urlManager->AddContextL(ctx_sync, sync_folder, sync_folder, sync_folder, sync_folder, FALSE);
+
+	urlManager->Debug_AcceptOverlappingContexts();
+	urlManager->AddContextL(ctx_sessions2, sessions_folder, sessions_folder, sessions_folder, sessions_folder, FALSE);
+
+	// Increase the size limit, to avoid problems
+	urlManager->FindContextManager(ctx_sync)->SetCacheSize(10*1024*1024);
+	urlManager->FindContextManager(ctx_delete_http)->SetCacheSize(10*1024*1024);
+	urlManager->FindContextManager(ctx_delete_http2)->SetCacheSize(10*1024*1024);
+
+#ifdef WEB_TURBO_MODE
+	verify_success(g_windowManager->CheckTuboModeContext());
+
+	ctx_turbo_1 = g_windowManager->GetTurboModeContextId();
+	ctx_turbo_2 = ctx_delete_http2;
+
+	output("Turbo Context: %d", ctx_turbo_1);
+	mctx.AddContext(urlManager->FindContextManager(ctx_turbo_1));
+#endif
+}
+
+test("Empty turbo")
+async;
+{
+#ifdef WEB_TURBO_MODE
+	mctx.EmptyDCache(ctx_turbo_1);
+#else
+	ST_passed();
+#endif
+}
+
+test("Enable deep debug in Turbo")
+{
+#ifdef WEB_TURBO_MODE
+	CacheTester::SetDeepDebug(ctx_turbo_1, TRUE);
+#endif
+}
+
+// Used to check the basic functionlaties, for each size
+table TableSizes(char*, int, OpString&, OpFile&, URL&, char*, char*, CacheType)
+{
+  { "[embedded]", SIZE_EMBEDDED, path_embedded, file_embedded, url_embedded, "embedded", "embedded2", TYPE_EMBEDDED},
+  { "[container]", SIZE_CONTAINERS, path_cont, file_cont, url_cont, "container", "container2", TYPE_CONTAINER },
+  { "[plain]", SIZE_PLAIN, path_plain, file_plain, url_plain, "plain", "plain2", TYPE_PLAIN }
+}
+
+table TableSizesTurbo(char*, int, OpString&, OpFile&, URL&, char*, char*, CacheType, URL_CONTEXT_ID, URL_CONTEXT_ID)
+{
+  { "[embedded]", SIZE_EMBEDDED, path_embedded, file_embedded, url_embedded, "embedded", "embedded2", TYPE_EMBEDDED, ctx_delete_http, ctx_delete_http2},
+  { "[container]", SIZE_CONTAINERS, path_cont, file_cont, url_cont, "container", "container2", TYPE_CONTAINER, ctx_delete_http, ctx_delete_http2 },
+  { "[plain]", SIZE_PLAIN, path_plain, file_plain, url_plain, "plain", "plain2", TYPE_PLAIN, ctx_delete_http, ctx_delete_http2 }
+#ifdef WEB_TURBO_MODE
+/*  ,
+  { "[Turbo embedded]", SIZE_EMBEDDED, path_embedded, file_embedded, url_embedded, "embedded", "embedded2", TYPE_EMBEDDED, ctx_turbo_1, ctx_turbo_2},
+  { "[Turbo container]", SIZE_CONTAINERS, path_cont, file_cont, url_cont, "container", "container2", TYPE_CONTAINER, ctx_turbo_1, ctx_turbo_2 },
+  { "[Turbo plain]", SIZE_PLAIN, path_plain, file_plain, url_plain, "plain", "plain2", TYPE_PLAIN, ctx_turbo_1, ctx_turbo_2 }*/
+#endif
+}
+
+// Used to check if URL provides the correct MIME
+table TableMIME(char*, char *, char *, URL&, BOOLEAN, char *)
+{
+  { "[XML]", "test.xml", "text/xml", url_mime_xml, TRUE, "true"},
+  { "[SVG]", "redball.svg", "image/svg+xml", url_mime_svg, TRUE, "true"},
+  { "[HTML]", "test.html", "text/html", url_mime_html, FALSE, "false" },  
+  { "[TXT]", "test.txt", "text/plain", url_mime_txt, FALSE, "false" },
+  { "[JPEG]", "penguins2.jpg", "image/jpeg", url_mime_jpeg, FALSE, "false" },
+  { "[TXT FAKE]", "text_fake.txt", NULL, url_mime_txt_fake, FALSE, "false" },
+  { "[XML FAKE]", "xml_fake.xml", NULL, url_mime_xml_fake, FALSE, "false" },
+  { "[SVG_BROKEN]", "redball_broken.svg", "image/svg+xml", url_mime_svg_broken, FALSE, "false"},
+}
+
+// Used to check if the cache is avle to properly trak the size of different files at different size
+table TableSizesCacheLimit(char*, int, BOOL)
+{
+  { "[0 bytes]", 0, FALSE},
+  { "[1 byte]", 1, FALSE},
+  { "[embedded]", SIZE_EMBEDDED, FALSE},
+  { "[container]", SIZE_CONTAINERS, FALSE},
+  { "[plain]", SIZE_PLAIN, FALSE},
+  { "[min force size]", MIN_FORCE_DISK_STORAGE+1, FALSE},
+  { "[max memory]", MAX_MEMORY_CONTENT_SIZE+1, FALSE},
+  { "[1 MB]", 1024*1024, FALSE},
+#if defined __OEM_EXTENDED_CACHE_MANAGEMENT && defined __OEM_OPERATOR_CACHE_MANAGEMENT
+  { "[0 bytes OEM]", 0, TRUE},
+  { "[1 byte OEM]", 1, TRUE},
+  { "[embedded OEM]", SIZE_EMBEDDED, TRUE},
+  { "[container OEM]", SIZE_CONTAINERS, TRUE},
+  { "[plain OEM]", SIZE_PLAIN, TRUE},
+  { "[min force size OEM]", MIN_FORCE_DISK_STORAGE+1, TRUE},
+  { "[max memory OEM]", MAX_MEMORY_CONTENT_SIZE+1, TRUE},
+  { "[1 MB OEM]", 1024*1024, TRUE}
+#endif // __OEM_EXTENDED_CACHE_MANAGEMENT && defined __OEM_OPERATOR_CACHE_MANAGEMENT
+}
+
+// Used to check redirects
+table TableRedir(char*, int, OpString&, char *, char *, OpFile&, URL&, int, BOOL, int)
+{
+  { "[embedded 301]", SIZE_EMBEDDED, path_embedded2, "redir1", "emb301", file_embedded2, url_embedded_redir, 301, TRUE, HTTP_METHOD_GET},
+  { "[container 301]", SIZE_CONTAINERS, path_cont2, "redir2", "cnt301", file_cont2, url_cont_redir, 301, TRUE, HTTP_METHOD_GET},
+  { "[plain 301]", SIZE_PLAIN, path_plain2, "redir3", "plain301", file_plain2, url_plain_redir, 301, TRUE, HTTP_METHOD_GET},
+  { "[embedded POST 301]", SIZE_EMBEDDED, path_embedded2, "redir4", "emb301P", file_embedded2, url_embedded_redir2, 301, FALSE, HTTP_METHOD_POST},
+  { "[container POST 301]", SIZE_CONTAINERS, path_cont2, "redir5", "cnt301P", file_cont2, url_cont_redir2, 301, FALSE, HTTP_METHOD_POST},
+  { "[plain POST 301]", SIZE_PLAIN, path_plain2, "redir6", "plain301P", file_plain2, url_plain_redir2, 301, FALSE, HTTP_METHOD_POST},
+
+  { "[embedded 302]", SIZE_EMBEDDED, path_embedded2, "redir7", "emb302", file_embedded2, url_embedded_redir3, 302, FALSE, HTTP_METHOD_GET},
+  { "[container 302]", SIZE_CONTAINERS, path_cont2, "redir8", "cnt302", file_cont2, url_cont_redir3, 302, FALSE, HTTP_METHOD_GET},
+  { "[plain 302]", SIZE_PLAIN, path_plain2, "redir9", "plain302", file_plain2, url_plain_redir3, 302, FALSE, HTTP_METHOD_GET},
+  { "[embedded POST 302]", SIZE_EMBEDDED, path_embedded2, "redir10", "emb302P", file_embedded2, url_embedded_redir4, 302, FALSE, HTTP_METHOD_POST},
+  { "[container POST 302]", SIZE_CONTAINERS, path_cont2, "redir11", "cnt302P", file_cont2, url_cont_redir4, 302, FALSE, HTTP_METHOD_POST},
+  { "[plain POST 302]", SIZE_PLAIN, path_plain2, "redir12", "plain302P", file_plain2, url_plain_redir4, 302, FALSE, HTTP_METHOD_POST},
+
+  { "[embedded 307]", SIZE_EMBEDDED, path_embedded2, "redir13", "emb307", file_embedded2, url_embedded_redir5, 307, FALSE, HTTP_METHOD_GET},
+  { "[container 307]", SIZE_CONTAINERS, path_cont2, "redir14", "cnt307", file_cont2, url_cont_redir5, 307, FALSE, HTTP_METHOD_GET},
+  { "[plain 307]", SIZE_PLAIN, path_plain2, "redir15", "plain307", file_plain2, url_plain_redir5, 307, FALSE, HTTP_METHOD_GET},
+  /*{ "[embedded POST 307]", SIZE_EMBEDDED, path_embedded2, "redir16", "emb307P", file_embedded2, url_embedded_redir6, 307, FALSE, HTTP_METHOD_POST},
+  { "[container POST 307]", SIZE_CONTAINERS, path_cont2, "redir17", "cnt307P", file_cont2, url_cont_redir6, 307, FALSE, HTTP_METHOD_POST},
+  { "[plain POST 307]", SIZE_PLAIN, path_plain2, "redir18", "plain307P", file_plain2, url_plain_redir6, 307, FALSE, HTTP_METHOD_POST}*/
+}
+
+// Just used because repeat seems not to work with async tests...
+table Table32(int)
+{
+  { 0 },  { 1 },  { 2 },  { 3 },  { 4 },  { 5 },  { 6 },  { 7 },  { 8 },  { 9 },
+  { 10 }, { 11 }, { 12 }, { 13 }, { 14 }, { 15 }, { 16 }, { 17 }, { 18 }, { 19 },
+  { 20 }, { 21 }, { 22 }, { 23 }, { 24 }, { 25 }, { 26 }, { 27 }, { 28 }, { 29 },
+  { 30 },  { 31 }
+}
+
+test("Local files cache: create and download")
+async;
+{
+	f_local.Construct(UNI_L("op_local.tmp"), basic_folder_err);
+	f_local.Open(OPFILE_WRITE);
+	f_local.Write("Test", 4);
+	f_local.Close();
+
+	url_local_str.Set(f_local.GetFullPath());
+	url_local_str.Insert(0, "file://localhost/");
+	url_local_str.ReplaceAll("\\", "/");
+
+	output("loading %s - ", url_local_str.CStr());
+	url_local = urlManager->GetURL(url_local_str, ctx_err);
+
+	URL referrer;
+
+	uct.LoadOK(url_local, &f_local); // Unconditional download
+
+	if(url_local.GetRep()->GetDataStorage() && url_local.GetRep()->GetDataStorage()->GetCacheStorage())
+		num_disk_read = url_local.GetRep()->GetDataStorage()->GetCacheStorage()->DebugGetNumberOfDiskRead();
+}
+
+test("Local files cache: second download from cache")
+require success "Local files cache: create and download";
+async;
+{
+	// Retrieving from cache
+	uct.LoadNormalOK(url_local, &f_local);
+}
+
+test("Basic IsCacheToSync() check for main context")
+{
+	verify(CacheTester::IsCacheToSync(0));
+}
+
+test("Efficiency check 1")
+require success "Local files cache: create and download";
+{
+	unsigned int num=url_local.GetRep()->GetDataStorage()->GetCacheStorage()->DebugGetNumberOfDiskRead();
+
+	if(num_disk_read != num)
+		ST_failed("Inefficiency problem 1: performed an useless disk access: %d != %d", num_disk_read, num);
+}
+
+// Used for a manual performance test
+test("Local files cache: download unchanged from cache")
+require success "Local files cache: create and download";
+async;
+{
+	uct.LoadNoReloadOK(url_local, &f_local);   // Retrieved from cache
+}
+
+test("Efficiency check 2")
+require success "Local files cache: create and download";
+{
+	unsigned int num=url_local.GetRep()->GetDataStorage()->GetCacheStorage()->DebugGetNumberOfDiskRead();
+
+	if(num_disk_read != num)
+		ST_failed("Inefficiency problem 2: performed an useless disk access: %d != %d", num_disk_read, num);
+}
+
+test("Local files cache: change the content")
+require success "Local files cache: create and download";
+async;
+{
+	time_t t1, t2;
+	if (f_local.IsOpen()) // uct.LoadOK() left it open for reading
+		f_local.Close();
+
+	if (OpStatus::IsError(f_local.GetLastModified(t1)))
+		ST_failed("Failed to discover prior time-stamp");
+
+	/* The selftest could be too quick in release, so we wait for the timestamp
+	 * to actually change.
+	 *
+	 * This might not be truly needed; it used to fail on the first time round
+	 * the loop because file was open for reading, not writing; and nothing
+	 * checked for error, so nothing noticed that the write simply didn't
+	 * happen, so it may have appeared that we were simply too quick, when in
+	 * fact we'd failed to write !  But it doesn't hurt to make the selftest
+	 * robust. */
+	do
+	{
+		if (OpStatus::IsError(f_local.Open(OPFILE_WRITE)) ||
+			OpStatus::IsError(f_local.Write("TEST2", 5)) ||
+			OpStatus::IsError(f_local.Close()))
+			ST_failed("Failed to modify file");
+		// Split - else compiler warns t2 may be uninitialized:
+		if (OpStatus::IsError(f_local.GetLastModified(t2)))
+			ST_failed("Failed to discover revised time-stamp");
+	}
+	while (t1 == t2);
+
+	// Retrieving from cache
+	uct.LoadNoReloadOK(url_local, &f_local);
+}
+
+test("Efficiency check 3")
+require success "Local files cache: create and download";
+{
+	unsigned int num=url_local.GetRep()->GetDataStorage()->GetCacheStorage()->DebugGetNumberOfDiskRead();
+
+	if(num_disk_read+1 != num)
+		ST_failed("Inefficiency problem 3: performed an useless disk access: %d != %d", (num_disk_read+1), num);
+}
+
+test("Local files cache: download again")
+require success "Local files cache: create and download";
+async;
+{
+	uct.LoadOK(url_local, &f_local);  // Unconditional download
+}
+
+test("Local files cache: download again from cache")
+require success "Local files cache: create and download";
+async;
+{
+	// The unconditional load created a new Rep
+	num_disk_read = url_local.GetRep()->GetDataStorage()->GetCacheStorage()->DebugGetNumberOfDiskRead();
+
+	// Retrieving from cache
+	uct.LoadNoReloadOK(url_local, &f_local);
+}
+
+test("Efficiency check 4")
+require success "Local files cache: create and download";
+{
+	unsigned int num=url_local.GetRep()->GetDataStorage()->GetCacheStorage()->DebugGetNumberOfDiskRead();
+
+	if(num_disk_read != num)
+		ST_failed("Inefficiency problem 4: performed an useless disk access: %d != %d", num_disk_read, num);
+}
+
+test("Info")
+{
+	output("\nEmbedded test size: %d\n", SIZE_EMBEDDED);
+	output("Containers test size: %d\n", SIZE_CONTAINERS);
+	output("Plain test size: %d\n", SIZE_PLAIN);
+
+#ifdef GOGI_DOWNLOAD_MANAGER
+	output("GOGI_DOWNLOAD_MANAGER: ON\n");
+#else
+	output("GOGI_DOWNLOAD_MANAGER: OFF\n");
+#endif
+
+	#ifdef _DEBUG
+	    int dbg=1;
+
+		output("_DEBUG enabled\n");
+	#else
+		output("_DEBUG disabled\n");
+	#endif
+
+	#ifdef DEBUG_ENABLE_OPASSERT
+		int opa=1;
+
+		output("DEBUG_ENABLE_OPASSERT enabled\n");
+	#else
+		output("DEBUG_ENABLE_OPASSERT disabled\n");
+	#endif
+
+	#ifdef DEBUGGING
+	DEBUG_CODE_BEGIN("cache")
+		output("Test\n");
+		output("Debug key 'cache' enabled - dbg:%d - op_assert: %d\n", dbg, opa);
+	DEBUG_CODE_END
+
+	DEBUG_CODE_BEGIN("cache.del")
+		output("Debug key 'cache.del' enabled\n");
+	DEBUG_CODE_END
+
+	DEBUG_CODE_BEGIN("cache.1")
+		output("Debug key 'cache.1' enabled\n");
+	DEBUG_CODE_END
+
+	DEBUG_CODE_BEGIN("cache.2")
+		output("Debug key 'cache.2' enabled\n");
+	DEBUG_CODE_END
+	#endif
+}
+
+//////// Redir tests
+foreach (descr, file_size, file_path, vredirpath, vtargetpath, file, url_redir, response_code, create_file, method) from TableRedir
+{
+	test("Redirect: Create temporary file " descr)
+	{
+		if(create_file)
+		{
+			verify_success(CacheFileTest::CreateTempFile(file_size, TRUE, file_path, file));
+		}
+		else
+			output("DISABLED");
+	}
+
+	test("Redirect: Share target url" descr)
+	{
+		if(vtargetpath && *vtargetpath)
+		{
+			URL url_tmp;
+
+			verify_success(uct.Share(file_path.CStr(), vtargetpath, NULL, url_tmp, ctx_redir));
+		}
+	}
+
+	test("Redirect: install redirect services" descr)
+	language ecmascript;
+	{
+		InstallRedirect(vredirpath, vtargetpath, "text/html", response_code);
+	}
+
+	test("Redirect: create redirected URLs" descr)
+	{
+		url_redir=uct.GetURL(vredirpath, ctx_redir);
+
+		url_redir.SetAttribute(URL::KHTTP_Method, method);
+
+		if(method==HTTP_METHOD_POST)
+		{
+			verify_success(url_redir.SetHTTP_Data((const char *)NULL, TRUE));
+			verify_success(url_redir.SetHTTP_ContentType("text/html"));
+
+			url_redir.SetAttributeL(URL::KHTTPIsFormsRequest, TRUE);
+		}
+	}
+
+	test("Redirect: Load redir file " descr) async;
+	{
+		uct.SetExpectedTransferRange(file_size, file_size+1024);
+		uct.LoadOK(url_redir, &file);
+	}
+
+	test("Redirect: Check redir file " descr)
+	{
+		CacheTester::SaveFiles(ctx_redir, TRUE, TRUE);
+
+		verify_success(CacheFileTest::VerifyFileContent(url_redir, file_path, REDIR_REQUIRED_FOLLOW, method==HTTP_METHOD_POST));
+	}
+
+	// Retest, just to be sure that a double reload, from cache, works
+	test("Redirect: Load redir file 2 " descr) async;
+	{
+		if(method==HTTP_METHOD_GET)
+		{
+			uct.SetExpectedTransferRange(0, 0);
+			uct.LoadNoReloadOK(url_redir, &file);
+		}
+		else
+			ST_passed();
+	}
+
+	test("Redirect: Check redir file 2 " descr)
+	{
+		if(method==HTTP_METHOD_GET)
+		{
+			CacheTester::SaveFiles(ctx_redir, TRUE, TRUE);
+
+			verify_success(CacheFileTest::VerifyFileContent(url_redir, file_path, REDIR_REQUIRED_FOLLOW, method==HTTP_METHOD_POST));
+		}
+	}
+
+	// Unshare the target, so we are sure that it is taken from the cache
+	test("Redirect: UnShare " descr)
+	{
+		if(create_file && vtargetpath && *vtargetpath)
+		{
+			verify_success(uct.UnShare(vtargetpath));
+		}
+		else
+			output("DISABLED");
+	}
+
+	test("Redirect: Load redir file 3 " descr) async;
+	{
+		if(method==HTTP_METHOD_GET)
+		{
+			uct.SetExpectedTransferRange(0, 0);
+
+			// 301 are cached permanently, 302 and 307 are asked again to the server
+			if(response_code==301)
+				uct.LoadNormalOK(url_redir, &file);
+			else
+				uct.LoadNoReloadOK(url_redir, &file);
+		}
+		else
+			ST_passed();
+	}
+
+	test("Redirect: Check redir file 3 " descr)
+	{
+		if(method==HTTP_METHOD_GET)
+		{
+			CacheTester::SaveFiles(ctx_redir, TRUE, TRUE);
+
+			verify_success(CacheFileTest::VerifyFileContent(url_redir, file_path, REDIR_REQUIRED_FOLLOW, method==HTTP_METHOD_POST));
+		}
+	}
+
+	// Try to mess up the redirect, to be sure that is taken from the cache
+	test("Redirect: pollute redirect " descr)
+	language ecmascript;
+	{
+		InstallRedirect(vredirpath, vtargetpath+"_fake", "text/html", response_code);
+	}
+
+	test("Redirect: Load redir file 4 " descr) async;
+	{
+		if(method==HTTP_METHOD_GET)
+		{
+			uct.SetExpectedTransferRange(0, 0);
+			uct.LoadNoReloadOK(url_redir, &file);
+		}
+		else
+			ST_passed();
+	}
+
+	test("Redirect: Check redir file 4 " descr)
+	{
+		if(method==HTTP_METHOD_GET)
+		{
+			CacheTester::SaveFiles(ctx_redir, TRUE, TRUE);
+
+			verify_success(CacheFileTest::VerifyFileContent(url_redir, file_path, REDIR_REQUIRED_FOLLOW, method==HTTP_METHOD_POST));
+		}
+	}
+
+}
+
+test("Redirect: Restart simulation (new context, same directory)")
+{
+	verify_success(CacheTester::SaveFiles(ctx_redir, TRUE, TRUE));
+	verify_success(CacheTester::WriteIndex(ctx_redir));
+	urlManager->FindContextManager(ctx_redir)->SetInvariantsCheck(FALSE);
+
+	verify_success(CacheTester::ForceCacheSync(ctx_redir));
+	verify_success(mctx.CreateNewContext(ctx_redir2, UNI_L("basic_redir"), FALSE, NULL));
+
+	output("Context %d restarted as %d", ctx_redir, ctx_redir2);
+}
+
+foreach (descr, file_size, file_path, vredirpath, vtargetpath, file, url_redir, response_code, create_file, method) from TableRedir
+{
+	test("Redirect restart: Load redir file " descr) async;
+	{
+		if(method==HTTP_METHOD_GET)
+		{
+			url_redir = g_url_api->GetURL(url_redir.GetAttribute(URL::KName).CStr(), ctx_redir2);
+
+			if(response_code==301)
+				uct.SetExpectedTransferRange(0, 0);
+			else
+				uct.SetExpectedTransferRange(file_size, file_size+1024);
+			uct.LoadNormalOK(url_redir, &file);
+		}
+		else
+			ST_passed();
+	}
+
+	test("Redirect restart: Check redir file" descr)
+	{
+		if(method==HTTP_METHOD_GET)
+		{
+			CacheTester::SaveFiles(ctx_redir2, TRUE, TRUE);
+
+			verify_success(CacheFileTest::VerifyFileContent(url_redir, file_path, REDIR_REQUIRED_FOLLOW, method==HTTP_METHOD_POST));
+		}
+	}
+}
+
+
+
+// It should not crash...
+test("Simulate OOM Crash on ADDContexL()")
+{
+	urlManager->Debug_SimulateOOMOnContextCreation(TRUE);
+	urlManager->Debug_AcceptOverlappingContexts();
+
+	URL_CONTEXT_ID ctx_oom=urlManager->GetNewContextID();
+	TRAPD(op_err, urlManager->AddContextL(ctx_oom, sync_folder, sync_folder, sync_folder, sync_folder, FALSE));
+	urlManager->Debug_SimulateOOMOnContextCreation(FALSE);
+
+	verify(op_err==OpStatus::ERR_NO_MEMORY);
+}
+
+// It should not crash...
+test("Download Storage crash attempt 1")
+{
+	URL url_download=ch.CacheBogusURLRetrieve(ctx_download, SIZE_PLAIN, FALSE, FALSE);
+	Cache_Storage *cs=url_download.GetRep()->GetDataStorage()->GetCacheStorage();
+	OpString name;
+
+	name.Set("opr_cs");
+	OpString8 enc;
+
+	enc.Set("text/html");
+	cs->TakeOverContentEncoding(enc);
+
+	verify_success(url_download.GetRep()->GetDataStorage()->LoadToFile(name));
+	Cache_Storage *cs2=url_download.GetRep()->GetDataStorage()->GetCacheStorage();
+
+	verify(cs!=cs2);
+
+	CacheTester::SimulateStoreError((Download_Storage *)cs2);
+
+	// A crash is a fail.  :-)
+	cs2->StoreData((const unsigned char*)"Test", 4);
+}
+
+// Mainly used for crash check (this case was crashing in JOZO86-1593)
+test("Download Storage crash attempt 2")
+{
+	URL url_download=ch.CacheBogusURLRetrieve(ctx_download, SIZE_PLAIN, FALSE, FALSE);
+	Cache_Storage *cs=url_download.GetRep()->GetDataStorage()->GetCacheStorage();
+	OpString name;
+
+	name.Set("opr_dl");
+	OpString8 enc;
+
+	enc.Set("text/html");
+	cs->TakeOverContentEncoding(enc);
+	cs->UnsetFinished();
+
+	verify_success(url_download.GetRep()->GetDataStorage()->LoadToFile(name));
+	Cache_Storage *cs2=url_download.GetRep()->GetDataStorage()->GetCacheStorage();
+
+	verify(cs!=cs2);
+
+	CacheTester::SimulateStoreError((Download_Storage *)cs2);
+
+	// A crash is a fail.  :-)
+	cs2->StoreData((const unsigned char*)"Test", 4);
+}
+
+test("Basic Privacy mode test")
+{
+	// Test normal behavior
+	verify(CacheHelpers::CheckDirectory(privacy_folder) == 0);
+
+	URL url1=ch.CacheBogusURLRetrieve(ctx_privacy, SIZE_PLAIN, FALSE, TRUE);
+
+	CacheTester::SaveFiles(ctx_privacy);
+	verify(CacheHelpers::CheckDirectory(privacy_folder) == 1);
+	verify(url1.GetAttribute(URL::KFileName).Length()>0);
+
+	// Test privacy mode behavior
+	urlManager->SetContextIsRAM_Only(ctx_privacy, TRUE);
+	URL url2=ch.CacheBogusURLRetrieve(ctx_privacy, SIZE_PLAIN, FALSE, TRUE);
+
+	CacheTester::SaveFiles(ctx_privacy);
+	verify(CacheHelpers::CheckDirectory(privacy_folder) == 1 || CacheHelpers::CheckDirectory(privacy_folder) == 0);
+	verify(url1.GetAttribute(URL::KFileName).Length()>0);
+	verify(url2.GetAttribute(URL::KFileName).Length()==0);
+
+	verify(0==url2.PrepareForViewing(URL::KFollowRedirect, TRUE, TRUE, FALSE));
+	verify(url2.GetAttribute(URL::KFileName).Length()==0);
+
+	verify(0==url2.PrepareForViewing(URL::KFollowRedirect, TRUE, TRUE, TRUE));
+	verify(url2.GetAttribute(URL::KFileName).Length()>0);
+}
+
+test("Empty on exit after a crash")
+async;
+{
+	url_empty1=ch.CacheBogusURLRetrieve(ctx_empty_master, SIZE_PLAIN, FALSE, TRUE);
+
+	CacheTester::SaveFiles(ctx_empty_master);
+	CacheTester::WriteIndex(ctx_empty_master);
+	CacheTester::TouchFiles(empty_folder, 0, TRUE); // Create the activity.opr
+
+	// Enable empty on exit
+	g_pcnet->WriteIntegerL(PrefsCollectionNetwork::EmptyCacheOnExit, 1);
+
+	// It should delete the files
+	urlManager->Debug_AcceptOverlappingContexts();
+	mctx.CreateNewContext(ctx_empty1, empty_folder, FALSE);
+	CacheTester::WriteIndex(ctx_empty1);
+
+	mctx.WaitForFiles(ctx_empty1, 0, TRUE);
+}
+
+test("Empty on exit without a crash")
+async;
+{
+	url_empty2=ch.CacheBogusURLRetrieve(ctx_empty_master, SIZE_PLAIN, FALSE, TRUE);
+
+	CacheTester::SaveFiles(ctx_empty_master);
+	CacheTester::WriteIndex(ctx_empty_master);
+
+	// Remove the activity file
+	OpFile file;
+
+	file.Construct(CACHE_ACTIVITY_FILE, empty_folder);
+	file.Delete();
+
+	// It should delete the files
+	urlManager->Debug_AcceptOverlappingContexts();
+	mctx.CreateNewContext(ctx_empty2, empty_folder, FALSE);
+	CacheTester::WriteIndex(ctx_empty2);
+
+	// Disable empty on exit
+	g_pcnet->WriteIntegerL(PrefsCollectionNetwork::EmptyCacheOnExit, 0);
+
+	mctx.WaitForFiles(ctx_empty2, 0, TRUE);
+}
+
+test("Session URLs path")
+{
+ 	URL url1=ch.CacheBogusURLRetrieve(ctx_sessions, 1, FALSE, FALSE, TRUE);
+ 	URL url2=ch.CacheBogusURLRetrieve(ctx_sessions2, 1, FALSE, FALSE, TRUE);
+ 	OpString8 name1;
+ 	OpString8 name2;
+ 	OpString8 expected1;
+ 	OpString8 expected2;
+
+ 	verify_success(name1.Set(url1.GetAttribute(URL::KFileName).CStr()));
+ 	verify_success(name2.Set(url2.GetAttribute(URL::KFileName).CStr()));
+
+ 	expected1.AppendFormat("sesn%copr00001.tmp", PATHSEPCHAR);
+
+ 	#ifdef URL_CHECK_CACHE_FILES
+ 		output("\nFiles should not collide: %s and %s", name1.CStr(), name2.CStr());
+
+		expected2.AppendFormat("sesn%copr00002.tmp", PATHSEPCHAR);
+ 	#else
+ 		output("\nFiles should collide: %s and %s", name1.CStr(), name2.CStr());
+
+ 		expected2.AppendFormat("sesn%copr00001.tmp", PATHSEPCHAR);
+ 	#endif
+
+ 	output("\nExpected: %s and %s", expected1.CStr(), expected2.CStr());
+
+ 	verify(!name1.Compare(expected1));
+	verify(!name2.Compare(expected2));
+}
+
+// This test does not really work as it should... trying to reload the main context is quite complicated, maybe it's not worth the pain
+test("URL counting and double loading check")
+{
+	Context_Manager *man=urlManager->FindContextManager(0);
+
+	verify(man);
+	verify(man->CheckDoubleURLs());
+}
+
+test("Install JS service")
+	language ecmascript;
+{
+	InstallCacheServices();
+}
+
+
+test("Load from JS service")
+async;
+{
+	url_install=uct.JScreatePage(65536, -1, ctx_delete_http);
+}
+
+test("Verify JS Service")
+{
+	int bytes=uct.GetLastTransfer();
+
+	output("Transferred bytes: %d - cache type: %d - Expired: %d ", 65536, (int)url_install.GetAttribute(URL::KCacheType), (int)url_install.Expired(FALSE, FALSE));
+	verify(bytes>(int)65536);
+}
+
+test("Load a small URL")
+async;
+{
+	url_big_headers=uct.JScreatePage(SIZE_PLAIN, 1000, ctx_big_headers, TRUE, FALSE);
+}
+
+test("Verify big headers behavior")
+{
+    // Verify that the is one file in the index
+	verify(url_big_headers.GetRep()->GetAttribute(URL::KCacheType) != URL_CACHE_TEMP);
+	verify(CacheTester::GetURLObjectSize(url_big_headers)<65536);
+	verify(mctx.CheckIndex(ctx_big_headers, TRUE) == 1);
+	verify(url_big_headers.GetRep()->GetAttribute(URL::KCacheType) != URL_CACHE_TEMP);
+	verify(!url_big_headers.GetAttribute(URL::KUnique));
+
+	// Add a big header of above 100KB
+	OpString8 str;
+
+	for(int i=0; i<1000; i++)
+		verify_success(str.Append("0123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789"));
+
+	url_big_headers.SetAttribute(URL::KHTTP_EntityTag, str);
+	verify(!url_big_headers.GetAttribute(URL::KUnique));
+
+	// Verifies that now there are no files in the index
+	verify(url_big_headers.GetRep()->GetAttribute(URL::KCacheType) != URL_CACHE_TEMP);
+	verify(mctx.CheckIndex(ctx_big_headers, TRUE) == 0);
+
+	// Verifies that the URL is now temporary but still not unique
+	verify(!url_big_headers.GetAttribute(URL::KUnique));
+	verify(url_big_headers.GetRep()->GetAttribute(URL::KCacheType) == URL_CACHE_TEMP);
+}
+
+test("Increase the cache size")
+{
+	CacheTester::SetCacheSize(ctx_cache_limit, 2*1024*1024, 2*1024*1024);
+}
+
+foreach (descr, file_size, never_flush) from TableSizesCacheLimit
+{
+	test("Load a file for cache limit test " descr)
+	async;
+	{
+		ram_cache_size = urlManager->FindContextManager(ctx_cache_limit)->GetRamCacheUsed();
+		disk_cache_size = urlManager->FindContextManager(ctx_cache_limit)->GetDiskCacheUsed();
+	#if defined __OEM_EXTENDED_CACHE_MANAGEMENT && defined __OEM_OPERATOR_CACHE_MANAGEMENT
+		oem_cache_size = urlManager->GetMainContext()->GetOEMCacheUsed();
+	#endif
+
+		url_limit=uct.JScreatePage(file_size, 1000, ctx_cache_limit, TRUE, never_flush);
+	}
+
+	test("Check size used for cache limit test " descr)
+	{
+		OpFileLength new_ram_cache_size = urlManager->FindContextManager(ctx_cache_limit)->GetRamCacheUsed();
+		OpFileLength new_disk_cache_size = urlManager->FindContextManager(ctx_cache_limit)->GetDiskCacheUsed();
+		OpFileLength url_size = CacheTester::GetURLObjectSize(url_limit);
+		OpFileLength exp_max_ram = ram_cache_size + url_size + file_size;
+		OpFileLength exp_max_disk = disk_cache_size + url_size + file_size;
+
+		// Don't make assumptions on where the file size is stored: it can be either RAM or disk, but it ahs to be computed
+		output("URL Object size: %d - file size: %d - total: %d\n", (UINT32) url_size, (UINT32) file_size, (UINT32) (url_size + file_size));
+		output("RAM: %d ==> %d - diff: %d - excess: %d\n", (UINT32) ram_cache_size, (UINT32) new_ram_cache_size, (UINT32) (new_ram_cache_size - ram_cache_size), (UINT32) (new_ram_cache_size>exp_max_ram ? new_ram_cache_size - exp_max_ram : 0));
+		output("Disk: %d ==> %d - diff: %d - excess: %d\n", (UINT32) disk_cache_size, (UINT32) new_disk_cache_size, (UINT32) (new_disk_cache_size - disk_cache_size), (UINT32) (new_disk_cache_size>exp_max_disk ? new_disk_cache_size - exp_max_disk : 0));
+
+		// Possible values: unchanged, increased by url_size or increased by file_size+url_size
+		// The RAM cache could decrease because of a clean operation. No reasons to be too strict in this test, also because
+		// the real problems were related to the disk size
+		if(new_ram_cache_size>ram_cache_size)
+			verify(new_ram_cache_size==ram_cache_size || new_ram_cache_size==ram_cache_size+url_size || new_ram_cache_size==ram_cache_size+url_size+file_size);
+		verify(new_disk_cache_size==disk_cache_size || new_disk_cache_size==disk_cache_size+url_size || new_disk_cache_size==disk_cache_size+url_size+file_size);
+
+	#if defined __OEM_EXTENDED_CACHE_MANAGEMENT && defined __OEM_OPERATOR_CACHE_MANAGEMENT
+	    OpFileLength new_oem_cache_size = urlManager->GetMainContext()->GetOEMCacheUsed();
+		OpFileLength exp_max_oem = oem_cache_size + url_size + file_size;
+		
+		output("OEM: %d ==> %d - diff: %d - excess: %d\n", (UINT32) oem_cache_size, (UINT32) new_oem_cache_size, (UINT32) (new_oem_cache_size - oem_cache_size), (UINT32) (new_oem_cache_size>exp_max_oem ? new_oem_cache_size - exp_max_oem : 0));
+
+		verify(new_oem_cache_size==oem_cache_size || new_oem_cache_size==oem_cache_size+url_size || new_oem_cache_size==oem_cache_size+url_size+file_size);
+				
+		// Check that at least one is getting the full size (theoritically counting it twice could be fine in some situations)
+		verify(new_ram_cache_size==ram_cache_size+url_size+file_size ||
+		       new_disk_cache_size==disk_cache_size+url_size+file_size ||
+			   new_oem_cache_size==oem_cache_size+url_size+file_size);
+
+		// When a file is for the operator cache, it cannot go to disk, while it cans till stay in RAM
+		if(	never_flush )
+			verify(new_disk_cache_size==disk_cache_size);
+	#else
+		verify(new_ram_cache_size==ram_cache_size+url_size+file_size || new_disk_cache_size==disk_cache_size+url_size+file_size);
+	#endif
+	}
+}
+
+test("Range Requests - HTTPRange object")
+{
+	HTTPRange range;
+
+	/// Tests with "bytes"
+	verify_success(range.Parse("bytes=1-3", FALSE));
+	verify(range.GetStart()==1 && range.GetEnd()==3);
+
+	verify_success(range.Parse("bytes = 1-3", FALSE));
+	verify(range.GetStart()==1 && range.GetEnd()==3);
+
+	verify(OpStatus::IsError(range.Parse("bytes = 1a-3b", FALSE)));
+	verify(OpStatus::IsError(range.Parse("bytes = 1a-3", FALSE)));
+	verify(OpStatus::IsError(range.Parse("bytes = 1-3b", FALSE)));
+
+	verify_success(range.Parse("  bytes =   1  -    3 ", FALSE));
+	verify(range.GetStart()==1 && range.GetEnd()==3);
+
+	verify_success(range.Parse("  bytes =   1  -    3 ", TRUE));
+	verify(range.GetStart()==1 && range.GetEnd()==3);
+
+	verify_success(range.Parse("bytes=0-5", FALSE));
+	verify(range.GetStart()==0 && range.GetEnd()==5);
+
+	verify_success(range.Parse("bytes=1-1", FALSE));
+	verify(range.GetStart()==1 && range.GetEnd()==1);
+
+	verify_success(range.Parse("bytes=0-0", FALSE));
+	verify(range.GetStart()==0 && range.GetEnd()==0);
+
+	verify_success(range.Parse("bytes=-5", FALSE));
+	verify(range.GetStart()==FILE_LENGTH_NONE && range.GetEnd()==5);
+
+	verify_success(range.Parse("bytes=4-", FALSE));
+	verify(range.GetStart()==4 && range.GetEnd()==FILE_LENGTH_NONE);
+
+	/// Tests syntax errors
+	verify(OpStatus::IsError(range.Parse(NULL, FALSE)));
+	verify(OpStatus::IsError(range.Parse("", FALSE)));
+	verify(OpStatus::IsError(range.Parse(NULL, TRUE)));
+	verify(OpStatus::IsError(range.Parse("", TRUE)));
+	verify(OpStatus::IsError(range.Parse("=1-3", FALSE)));
+	verify(OpStatus::IsError(range.Parse("1-3", FALSE)));
+	verify(OpStatus::IsError(range.Parse("bytes=13", FALSE)));
+	verify(OpStatus::IsError(range.Parse("bytes=13;", FALSE)));
+	verify(OpStatus::IsError(range.Parse(";bytes=1-3", FALSE)));
+	verify(OpStatus::IsError(range.Parse("bytes;=1-3", FALSE)));
+	verify(OpStatus::IsError(range.Parse("bytes=;1-3", FALSE)));
+	verify(OpStatus::IsError(range.Parse("bytes=1;-3", FALSE)));
+	verify(OpStatus::IsError(range.Parse("bytes=1-;3", FALSE)));
+	verify(OpStatus::IsError(range.Parse("bytes=1-3;", FALSE)));
+	verify(OpStatus::IsError(range.Parse("=1-3", TRUE)));
+	verify(OpStatus::IsError(range.Parse("bytes=13", TRUE)));
+	verify(OpStatus::IsError(range.Parse("13", TRUE)));
+	verify(OpStatus::IsError(range.Parse(";bytes=1-3", TRUE)));
+	verify(OpStatus::IsError(range.Parse("bytes;=1-3", TRUE)));
+	verify(OpStatus::IsError(range.Parse("bytes=;1-3", TRUE)));
+	verify(OpStatus::IsError(range.Parse("bytes=1;-3", TRUE)));
+	verify(OpStatus::IsError(range.Parse("bytes=1-;3", TRUE)));
+	verify(OpStatus::IsError(range.Parse("bytes=1-3;", TRUE)));
+
+	/// Tests without bytes
+	verify_success(range.Parse("1-3", TRUE));
+	verify(range.GetStart()==1 && range.GetEnd()==3);
+
+	verify_success(range.Parse(" 1-3 ", TRUE));
+	verify(range.GetStart()==1 && range.GetEnd()==3);
+
+	verify_success(range.Parse("1  -    3 ", TRUE));
+	verify(range.GetStart()==1 && range.GetEnd()==3);
+
+	verify_success(range.Parse("1  -    3 ", TRUE));
+	verify(range.GetStart()==1 && range.GetEnd()==3);
+
+	verify_success(range.Parse("0-5", TRUE));
+	verify(range.GetStart()==0 && range.GetEnd()==5);
+
+	verify_success(range.Parse("1-1", TRUE));
+	verify(range.GetStart()==1 && range.GetEnd()==1);
+
+	verify_success(range.Parse("0-0", TRUE));
+	verify(range.GetStart()==0 && range.GetEnd()==0);
+
+	verify_success(range.Parse("  -5  ", TRUE));
+	verify(range.GetStart()==FILE_LENGTH_NONE && range.GetEnd()==5);
+
+	verify_success(range.Parse("4-", TRUE));
+	verify(range.GetStart()==4 && range.GetEnd()==FILE_LENGTH_NONE);
+
+	// Tests with file length
+	verify_success(range.Parse("bytes=1-3", FALSE, 25));
+	verify(range.GetStart()==1 && range.GetEnd()==3);
+
+	verify_success(range.Parse("bytes = 1-3", FALSE, 25));
+	verify(range.GetStart()==1 && range.GetEnd()==3);
+
+	verify_success(range.Parse("  bytes =   1  -    3 ", FALSE, 25));
+	verify(range.GetStart()==1 && range.GetEnd()==3);
+
+	verify_success(range.Parse("  bytes =   1  -    3 ", TRUE, 25));
+	verify(range.GetStart()==1 && range.GetEnd()==3);
+
+	verify_success(range.Parse("bytes=0-5", FALSE, 25));
+	verify(range.GetStart()==0 && range.GetEnd()==5);
+
+	verify_success(range.Parse("bytes=1-1", FALSE, 25));
+	verify(range.GetStart()==1 && range.GetEnd()==1);
+
+	verify_success(range.Parse("bytes=0-0", FALSE, 25));
+	verify(range.GetStart()==0 && range.GetEnd()==0);
+
+	verify_success(range.Parse("bytes=-5", FALSE, 25));
+	verify(range.GetStart()==20 && range.GetEnd()==24);
+
+	verify_success(range.Parse("bytes=4-", FALSE, 25));
+	verify(range.GetStart()==4 && range.GetEnd()==24);
+}
+
+test("Range Requests via DOM: share file")
+require success "Check WebServer and create the service";
+file uni path_range "range_test.html";
+{
+	verify(OpStatus::IsSuccess(uct.Share(path_range, "range.html", NULL, url_range, 0)));
+}
+
+test("Range Requests via DOM: execute and check 1: 0-5")
+async;
+language ecmascript;
+{
+	loadXMLDocRange('range.html', 0, 5, 'abcdef' );
+}
+
+test("Range Requests via DOM: execute and check 2: 2-9")
+async;
+language ecmascript;
+{
+	loadXMLDocRange('range.html', 2, 9, 'cdefghij' );
+}
+
+test("Range Requests via DOM: execute and check 3: 11-")
+async;
+language ecmascript;
+{
+	loadXMLDocRange('range.html', 11, '', 'lmnopqrstuvwxyz' );
+}
+
+test("Range Requests via DOM: execute and check 4: 0-")
+async;
+language ecmascript;
+{
+	loadXMLDocRange('range.html', 0, '', 'abcdefghijklmnopqrstuvwxyz' );
+}
+
+test("Range Requests via DOM: execute and check 5: -3")
+async;
+language ecmascript;
+{
+	loadXMLDocRange('range.html', '', 3, 'xyz' );
+}
+
+test("Range Requests via DOM: execute and check 6: 0-1")
+async;
+language ecmascript;
+{
+	loadXMLDocRange('range.html', 0, 1, 'ab' );
+}
+
+test("Range Requests via DOM: execute and check 7: 1-1")
+async;
+language ecmascript;
+{
+	loadXMLDocRange('range.html', 1, 1, 'b' );
+}
+
+test("Range Requests via DOM: execute and check 8: 0-0")
+async;
+language ecmascript;
+{
+	loadXMLDocRange('range.html', 0, 0, 'a' );
+}
+
+test("AsyncExport load an URL")
+async;
+{
+	url_export=uct.JScreatePage(SIZE_PLAIN, -1, ctx_async);
+}
+
+test("AsyncExport load an URL")
+async;
+{
+	url_export=uct.JScreatePage(SIZE_PLAIN, -1, ctx_async);
+}
+
+test("AsyncExport test of in memory URL - Supposedly done in 'safe mode'")
+require PI_ASYNC_FILE_OP;
+async;
+{
+	OpString name;
+	AsyncExportWaiter *aew=new AsyncExportWaiter();
+
+	name.Set("plain_out.exp");
+
+	if(!url_export.GetRep())
+		ST_failed("Rep null!");
+	else if(!url_export.GetRep()->GetDataStorage())
+		ST_failed("Data storage null!");
+	else if(!url_export.GetRep()->GetDataStorage()->GetCacheStorage())
+		ST_failed("Cache storage null!");
+	else
+	{
+		OP_STATUS ops=url_export.ExportAsFileAsync(name, aew);
+
+		if(OpStatus::IsError(ops))
+			ST_failed("ExportAsFileAsync failed");
+	}
+}
+
+test("AsyncExport test of in memory URL - Supposedly done in 'half-fast mode'")
+require PI_ASYNC_FILE_OP;
+async;
+{
+	OpString name;
+	AsyncExportWaiter *aew=new AsyncExportWaiter();
+
+	name.Set("plain2_out.exp");
+
+	if(!url_export.GetRep())
+		ST_failed("Rep null!");
+	else if(!url_export.GetRep()->GetDataStorage())
+		ST_failed("Data storage null!");
+	else if(!url_export.GetRep()->GetDataStorage()->GetCacheStorage())
+		ST_failed("Cache storage null!");
+	else
+	{
+		OP_STATUS ops=url_export.ExportAsFileAsync(name, aew);
+
+		if(OpStatus::IsError(ops))
+			ST_failed("ExportAsFileAsync failed");
+	}
+}
+
+test("AsyncExport big file")
+require PI_ASYNC_FILE_OP;
+timer;
+async;
+{
+#ifdef DESKTOP_PROFILE
+	UINT32 size_big=SIZE_PLAIN+100*1024*1024;  // Big size, to actually get more than one message. Note: the time is mostly spent creating the URL
+#else
+	UINT32 size_big=SIZE_PLAIN+1024*1024;
+#endif
+
+	URL url=ch.CacheBogusURLRetrieve(ctx_async, size_big);
+	OpString name;
+	AsyncExportWaiter *aew=new AsyncExportWaiter();
+
+	name.Set("big_out.exp");
+
+	if(!url.GetRep())
+		ST_failed("Rep null!");
+	else if(!url.GetRep()->GetDataStorage())
+		ST_failed("Data storage null!");
+	else if(!url.GetRep()->GetDataStorage()->GetCacheStorage())
+		ST_failed("Cache storage null!");
+	else
+	{
+		OP_STATUS ops=url.ExportAsFileAsync(name, aew);
+
+		if(OpStatus::IsError(ops))
+			ST_failed("ExportAsFileAsync failed");
+	}
+};
+
+foreach (descr, file_size, file_path, file, url, vpath, vpath2, cache_type) from TableSizes
+{
+	test("AsyncExport - different sizes" descr)
+	require PI_ASYNC_FILE_OP;
+	timer;
+	async;
+	{
+		URL url=ch.CacheBogusURLRetrieve(ctx_async, file_size);
+		OpString name;
+		AsyncExportWaiter *aew=new AsyncExportWaiter();
+
+		name.Set(vpath);
+		name.AppendFormat(UNI_L("_out.exp"));
+
+		if(!url.GetRep())
+			ST_failed("Rep null!");
+		else if(!url.GetRep()->GetDataStorage())
+			ST_failed("Data storage null!");
+		else if(!url.GetRep()->GetDataStorage()->GetCacheStorage())
+			ST_failed("Cache storage null!");
+		else
+		{
+			OP_STATUS ops=url.ExportAsFileAsync(name, aew);
+
+			if(OpStatus::IsError(ops))
+				ST_failed("ExportAsFileAsync failed");
+		}
+	};
+
+
+	test("Runtime cache disable " descr)
+	{
+		// Disable the disk cache at runtime
+		g_pcnet->WriteIntegerL(PrefsCollectionNetwork::CacheToDisk, FALSE);
+
+		// Starting checks
+		verify_success(CacheFileTest::DeleteCacheDir(disabled_folder));
+		verify(CacheHelpers::CheckIndex(disabled_folder, TRUE) == -1);
+		verify(CacheHelpers::CheckDirectory(disabled_folder) == 0);
+
+		// Create the context
+		ctx_disabled=urlManager->GetNewContextID();
+		urlManager->AddContextL(ctx_disabled, disabled_folder, disabled_folder, disabled_folder, disabled_folder, FALSE);
+
+		verify(CacheHelpers::CheckIndex(disabled_folder, TRUE) == -1);
+		verify(CacheHelpers::CheckDirectory(disabled_folder) == 0);
+
+		// Populate
+		// TODO: Population is not working properly
+		//URL url_test=ch.CacheBogusURLRetrieve(ctx_disabled, file_size);
+
+		verify(CacheHelpers::CheckIndex(disabled_folder, TRUE) == -1);
+		verify(CacheHelpers::CheckDirectory(disabled_folder) == 0);
+
+		// Save the index
+		TRAPD(rc, urlManager->FindContextManager(ctx_disabled)->WriteCacheIndexesL(FALSE, FALSE));
+
+		verify(CacheHelpers::CheckIndex(disabled_folder, TRUE) == -1);
+		verify(CacheHelpers::CheckDirectory(disabled_folder) == 0);
+
+		// Enable at runtime
+		g_pcnet->WriteIntegerL(PrefsCollectionNetwork::CacheToDisk, 1);
+
+		verify(CacheHelpers::CheckIndex(disabled_folder, TRUE) == -1);
+		verify(CacheHelpers::CheckDirectory(disabled_folder) == 0);
+
+		// Save the index
+		TRAP(rc, urlManager->FindContextManager(ctx_disabled)->WriteCacheIndexesL(FALSE, FALSE));
+
+		verify(CacheHelpers::CheckIndex(disabled_folder) == 0);
+		verify(CacheHelpers::CheckDirectory(disabled_folder) == 0);
+
+		// TODO: Population is not working properly
+		/*verify(CacheHelpers::CheckIndex(disabled_folder) == 1);
+		if(cache_type != TYPE_EMBEDDED)
+			verify(CacheHelpers::CheckDirectory(disabled_folder) == 1);
+		else
+			verify(CacheHelpers::CheckDirectory(disabled_folder) == 0);*/
+	}
+
+	test("Restore runtime behavior")
+	{
+		// Restore and remove
+		g_pcnet->WriteIntegerL(PrefsCollectionNetwork::CacheToDisk, disk_cache_enabled);
+		TRAPD(rc, urlManager->FindContextManager(ctx_disabled)->WriteCacheIndexesL(TRUE, TRUE));
+		urlManager->RemoveContext(ctx_disabled, TRUE);
+		verify_success(CacheFileTest::DeleteCacheDir(disabled_folder));
+	}
+}
+
+
+// Some preliminary check
+foreach (descr, file_size, file_path, file, url, vpath, vpath2, cache_type) from TableSizes
+{
+	test("DataPresent" descr)
+	{
+		URL url_test=ch.CacheBogusURLRetrieve(ctx, file_size);
+
+		URL_Rep *rep=url_test.GetRep();
+		Cache_Storage *cs=(rep && rep->GetDataStorage() && rep->GetDataStorage()->GetCacheStorage())?rep->GetDataStorage()->GetCacheStorage():NULL;
+
+		verify(cs);
+		verify(cs->DataPresent());
+		cs->Flush();
+		verify(cs->DataPresent());
+	}
+}
+
+// Verify URL deleted; these tests are especially important for containers; no assert should pop-up during this test,
+// not even if "cache.dbg" is enabled
+foreach (descr, file_size, file_path, file, url, vpath, vpath2,  cache_type, ctx_1, ctx_2) from TableSizesTurbo
+{
+	test("Check Containers Delete Local 1")
+	{
+#if CACHE_CONTAINERS_ENTRIES>0
+		output("Local URLs to delete: %d\r\n", CacheTester::CheckMarked(ctx_1))
+#endif// CACHE_CONTAINERS_ENTRIES>0
+	}
+
+	test("Check Containers Delete HTTP 1")
+	{
+#if CACHE_CONTAINERS_ENTRIES>0
+		output("HTTP URLs to delete: %d\r\n", CacheTester::CheckMarked(ctx_1))
+#endif// CACHE_CONTAINERS_ENTRIES>0
+	}
+
+
+	test("local URLs Delete" descr)
+	{
+		del_urls_local.DeleteAll();
+		ch.CacheBogusURLs(ctx_1, file_size, file_size, 32, 0, &del_urls_local);
+
+		// Force URLs to become containers (if they qualify for it)
+		Context_Manager *man=urlManager->FindContextManager(ctx_1);
+
+		verify(man);
+
+		if(man)
+		{
+			TRAPD(rc, man->WriteCacheIndexesL(FALSE, FALSE));
+		}
+		CacheTester::FlushContainers(ctx_1);
+
+		deleteURLLocal(0);
+
+		deleteURLLocal(15);
+		deleteURLLocal(8);
+		deleteURLLocal(12);
+
+		deleteURLLocal(16);
+		deleteURLLocal(17);
+		deleteURLLocal(21);
+		deleteURLLocal(19);
+
+		deleteURLLocal(24);
+		deleteURLLocal(31);
+		deleteURLLocal(25);
+		deleteURLLocal(30);
+		deleteURLLocal(29);
+		deleteURLLocal(26);
+		deleteURLLocal(28);
+		deleteURLLocal(27);
+
+		if(man)
+		{
+			OP_ASSERT(man->IsDebugDeepEnabled());
+			man->CheckInvariants();
+
+	#if CACHE_CONTAINERS_ENTRIES>0
+			output("Local URLs to delete - Start: %d\r\n", CacheTester::CheckMarked(ctx_1));
+	#endif// CACHE_CONTAINERS_ENTRIES>0
+			TRAPD(rc, man->WriteCacheIndexesL(FALSE, FALSE));
+	#if CACHE_CONTAINERS_ENTRIES>0
+			output("Local URLs to delete - FALSE FALSE: %d\r\n", CacheTester::CheckMarked(ctx_1));
+	#endif// CACHE_CONTAINERS_ENTRIES>0
+			TRAP(rc, man->WriteCacheIndexesL(TRUE, FALSE));
+	#if CACHE_CONTAINERS_ENTRIES>0
+			output("Local URLs to delete - TRUE FALSE: %d\r\n", CacheTester::CheckMarked(ctx_1));
+	#endif// CACHE_CONTAINERS_ENTRIES>0
+			TRAP(rc, man->WriteCacheIndexesL(TRUE, TRUE));
+	#if CACHE_CONTAINERS_ENTRIES>0
+			output("Local URLs to delete - TRUE TRUE: %d\r\n", CacheTester::CheckMarked(ctx_1));
+	#endif// CACHE_CONTAINERS_ENTRIES>0
+		}
+	}
+
+	test("Check Containers Delete Local 2")
+	{
+#if CACHE_CONTAINERS_ENTRIES>0
+		output("Local URLs to delete: %d\r\n", CacheTester::CheckMarked(ctx_1))
+#endif// CACHE_CONTAINERS_ENTRIES>0
+	}
+
+	test("Init var for " descr)
+	{
+		del_urls_http.DeleteAll();
+	}
+
+	foreach (num) from Table32
+	{
+		test("Load more HTTP urls for delete test" descr)
+		async;
+		{
+			URL url=uct.JScreatePage(file_size, 500, ctx_1);
+
+			del_urls_http.Add(OP_NEW(URL, (url)));
+		}
+	}
+
+	test("Check some files 1" descr)
+	require success "Start WebServer if required";
+	async;
+	{
+		URL url1=*del_urls_http.Get(1);
+		URL url9=*del_urls_http.Get(9);
+
+		URLStatus st1=(URLStatus)url1.GetAttribute(URL::KLoadStatus);
+		URLStatus st9=(URLStatus)url9.GetAttribute(URL::KLoadStatus);
+
+		output("\nURL 1 - cache type: %d - Expired: %d - Status: %d\n", (int)url1.GetAttribute(URL::KCacheType), url1.Expired(FALSE, FALSE), st1);
+		output("URL 9 - cache type: %d - Expired: %d - Status: %d\n", (int)url9.GetAttribute(URL::KCacheType), url9.Expired(FALSE, FALSE), st9);
+
+		if(st1!=URL_LOADED || st9!=URL_LOADED)
+		  ST_failed("URL status wrong 1");
+
+		// Refresh, as Expired() can change the load status
+		st1=(URLStatus)url1.GetAttribute(URL::KLoadStatus);
+		st9=(URLStatus)url9.GetAttribute(URL::KLoadStatus);
+
+		output("\nURL 1b - cache type: %d - Expired: %d - Status: %d\n", (int)url1.GetAttribute(URL::KCacheType), url1.Expired(FALSE, FALSE), st1);
+		output("URL 9b - cache type: %d - Expired: %d - Status: %d\n", (int)url9.GetAttribute(URL::KCacheType), url9.Expired(FALSE, FALSE), st9);
+
+		if(st1!=URL_LOADED || st9!=URL_LOADED)
+		  ST_failed("URL status wrong 2");
+
+		uct.LoadNoReloadOK(url1, NULL);
+	}
+
+	test("Check some files 2" descr)
+	require success "Start WebServer if required";
+	async;
+	{
+		URLStatus st1=(URLStatus)del_urls_http.Get(1)->GetAttribute(URL::KLoadStatus);
+		URLStatus st9=(URLStatus)del_urls_http.Get(9)->GetAttribute(URL::KLoadStatus);
+
+		output("\nURL 1 - cache type: %d - Expired: %d - Status: %d\n", (int)del_urls_http.Get(1)->GetAttribute(URL::KCacheType), (int)del_urls_http.Get(1)->Expired(FALSE, FALSE), st1);
+		output("URL 9 - cache type: %d - Expired: %d - Status: %d\n", (int)del_urls_http.Get(9)->GetAttribute(URL::KCacheType), (int)del_urls_http.Get(9)->Expired(FALSE, FALSE), st9);
+
+		if(st1!=URL_LOADED || st9!=URL_LOADED)
+		  ST_failed("URL status wrong");
+
+		uct.LoadNoReloadOK(*del_urls_http.Get(9), NULL);
+	}
+
+	test("Post load " descr)
+	require success "Start WebServer if required";
+	{
+		URLStatus st1=(URLStatus)del_urls_http.Get(1)->GetAttribute(URL::KLoadStatus);
+		URLStatus st9=(URLStatus)del_urls_http.Get(9)->GetAttribute(URL::KLoadStatus);
+
+		output("\nURL 1 - cache type: %d - Expired: %d - Status: %d\n", (int)del_urls_http.Get(1)->GetAttribute(URL::KCacheType), (int)del_urls_http.Get(1)->Expired(FALSE, FALSE), st1);
+		output("URL 9 - cache type: %d - Expired: %d - Status: %d\n", (int)del_urls_http.Get(9)->GetAttribute(URL::KCacheType), (int)del_urls_http.Get(9)->Expired(FALSE, FALSE), st9);
+
+		if(st1!=URL_LOADED || st9!=URL_LOADED)
+		  ST_failed("URL status wrong");
+
+		uct.SetExpectedTransferRange(-1, -1);
+	}
+
+	test("HTTP URLs Delete" descr)
+	require success "Start WebServer if required";
+	{
+		// Force URLs to become containers (if they qualify for it)
+		Context_Manager *man=urlManager->FindContextManager(ctx_1);
+
+		verify(man);
+
+		if(man)
+		{
+			TRAPD(rc, man->WriteCacheIndexesL(FALSE, FALSE));
+		}
+		CacheTester::FlushContainers(ctx_1);
+
+#if CACHE_CONTAINERS_ENTRIES>0
+		output("HTTP URLs to delete: %d\r\n", CacheTester::CheckMarked(ctx_1));
+#endif// CACHE_CONTAINERS_ENTRIES>0
+
+		deleteURLHTTP(0);
+
+		deleteURLHTTP(15);
+		deleteURLHTTP(8);
+		deleteURLHTTP(12);
+
+		deleteURLHTTP(16);
+		deleteURLHTTP(17);
+		deleteURLHTTP(21);
+		deleteURLHTTP(19);
+
+		deleteURLHTTP(24);
+		deleteURLHTTP(31);
+		deleteURLHTTP(25);
+		deleteURLHTTP(30);
+		deleteURLHTTP(29);
+		deleteURLHTTP(26);
+		deleteURLHTTP(28);
+		deleteURLHTTP(27);
+
+		if(man)
+		{
+			OP_ASSERT(man->IsDebugDeepEnabled());
+
+	#if CACHE_CONTAINERS_ENTRIES>0
+			output("HTTP URLs to delete - Start: %d\r\n", CacheTester::CheckMarked(ctx_1));
+	#endif// CACHE_CONTAINERS_ENTRIES>0
+			TRAPD(rc, man->WriteCacheIndexesL(FALSE, FALSE));
+
+			man->CheckInvariants();
+
+			// No delete of the URLs, to test for update
+		}
+
+	}
+
+	// Download expected (on Desktop, with default settings), as all the containers have been deleted
+	foreach (num) from Table32
+	{
+		test("Update HTTP URLs" descr)
+		async;
+		{
+			URL *url=del_urls_http.Get(num);
+
+			if(url)
+			{
+				uct.SetExpectedTransferRange(file_size, file_size+1024);
+				uct.LoadOK(*url, NULL);
+			}
+			else
+			{
+				if (num==0 ||
+					num==15 || num==8  || num==12 ||
+					num==16 || num==17 || num==21 || num==19 ||
+					num>=24)
+					ST_passed();
+				else
+					ST_failed("URL %d not supposed to be NULL!", num);
+			}
+		}
+	}
+
+	test("HTTP Post update " descr)
+	{
+		uct.SetExpectedTransferRange(-1, -1);
+
+		Context_Manager *man=urlManager->FindContextManager(ctx_1);
+
+		verify(man);
+
+		if(man)
+		{
+			OP_ASSERT(man->IsDebugDeepEnabled());
+			man->CheckInvariants();
+
+	#if CACHE_CONTAINERS_ENTRIES>0
+			output("HTTP URLs to delete - Start: %d\r\n", CacheTester::CheckMarked(ctx_1));
+	#endif// CACHE_CONTAINERS_ENTRIES>0
+			TRAPD(rc, man->WriteCacheIndexesL(FALSE, FALSE));
+	#if CACHE_CONTAINERS_ENTRIES>0
+			output("HTTP URLs to delete - FALSE FALSE: %d\r\n", CacheTester::CheckMarked(ctx_1));
+	#endif// CACHE_CONTAINERS_ENTRIES>0
+			TRAP(rc, man->WriteCacheIndexesL(TRUE, FALSE));
+	#if CACHE_CONTAINERS_ENTRIES>0
+			output("HTTP URLs to delete - TRUE FALSE: %d\r\n", CacheTester::CheckMarked(ctx_1));
+	#endif// CACHE_CONTAINERS_ENTRIES>0
+		}
+
+	}
+
+	// At this point, check if the containers are still fine...
+	test("ReCheck some files 1" descr)
+	require success "Start WebServer if required";
+	async;
+	{
+		URL url1=*del_urls_http.Get(1);
+		URL url9=*del_urls_http.Get(9);
+
+		URLStatus st1=(URLStatus)url1.GetAttribute(URL::KLoadStatus);
+		URLStatus st9=(URLStatus)url9.GetAttribute(URL::KLoadStatus);
+
+		output("\nURL 1 - cache type: %d - Expired: %d - Status: %d\n", (int)url1.GetAttribute(URL::KCacheType), url1.Expired(FALSE, FALSE), st1);
+		output("URL 9 - cache type: %d - Expired: %d - Status: %d\n", (int)url9.GetAttribute(URL::KCacheType), url9.Expired(FALSE, FALSE), st9);
+
+		if(st1!=URL_LOADED || st9!=URL_LOADED)
+		  ST_failed("URL status wrong");
+
+		uct.LoadNoReloadOK(url1, NULL);
+	}
+
+	test("ReCheck some files 2" descr)
+	require success "Start WebServer if required";
+	async;
+	{
+		URLStatus st1=(URLStatus)del_urls_http.Get(1)->GetAttribute(URL::KLoadStatus);
+		URLStatus st9=(URLStatus)del_urls_http.Get(9)->GetAttribute(URL::KLoadStatus);
+
+		output("\nURL 1 - cache type: %d - Expired: %d - Status: %d\n", (int)del_urls_http.Get(1)->GetAttribute(URL::KCacheType), (int)del_urls_http.Get(1)->Expired(FALSE, FALSE), st1);
+		output("URL 9 - cache type: %d - Expired: %d - Status: %d\n", (int)del_urls_http.Get(9)->GetAttribute(URL::KCacheType), (int)del_urls_http.Get(9)->Expired(FALSE, FALSE), st9);
+
+		if(st1!=URL_LOADED || st9!=URL_LOADED)
+		  ST_failed("URL status wrong");
+
+		uct.LoadNoReloadOK(*del_urls_http.Get(9), NULL);
+	}
+
+	test("ReCheck some files 3" descr)
+	require success "Start WebServer if required";
+	async;
+	{
+		URLStatus st1=(URLStatus)del_urls_http.Get(1)->GetAttribute(URL::KLoadStatus);
+		URLStatus st9=(URLStatus)del_urls_http.Get(9)->GetAttribute(URL::KLoadStatus);
+
+		output("\nURL 1 - cache type: %d - Expired: %d - Status: %d\n", (int)del_urls_http.Get(1)->GetAttribute(URL::KCacheType), (int)del_urls_http.Get(1)->Expired(FALSE, FALSE), st1);
+		output("URL 9 - cache type: %d - Expired: %d - Status: %d\n", (int)del_urls_http.Get(9)->GetAttribute(URL::KCacheType), (int)del_urls_http.Get(9)->Expired(FALSE, FALSE), st9);
+
+		if(st1!=URL_LOADED || st9!=URL_LOADED)
+		  ST_failed("URL status wrong");
+
+		uct.LoadNoReloadOK(*del_urls_http.Get(18), NULL);
+	}
+
+	test("ReCheck some files 4" descr)
+	async;
+	{
+		uct.LoadNoReloadOK(*del_urls_http.Get(20), NULL);
+	}
+
+	test("ReCheck some files 5" descr)
+	async;
+	{
+		uct.LoadNoReloadOK(*del_urls_http.Get(22), NULL);
+	}
+
+	test("ReCheck some files 6" descr)
+	async;
+	{
+		uct.LoadNoReloadOK(*del_urls_http.Get(22), NULL);
+	}
+
+	/////////// Explicit expire test
+	test("Explicit expire soon " descr)
+	async;
+	{
+		url_exp_soon=uct.JScreatePage(file_size, 1, ctx_2);
+	}
+
+	test("Check reload expire soon " descr)
+	async;
+	{
+		uct.LoadNoReloadOK(url_exp_soon, NULL);
+	}
+
+	test("Explicit expire later" descr)
+	async;
+	{
+		url_exp_later=uct.JScreatePage(file_size, 500, ctx_2);
+	}
+
+	test("Check reload expire later " descr)
+	async;
+	{
+		uct.LoadNoReloadOK(url_exp_later, NULL);
+	}
+
+	test("Explicit already expired " descr)
+	async;
+	{
+		url_exp_expired=uct.JScreatePage(file_size, -1, ctx_2);
+	}
+
+	test("Check reload expire later " descr)
+	async;
+	{
+		uct.LoadNoReloadOK(url_exp_later, NULL);
+	}
+
+	test("Save indexes")
+	{
+		Context_Manager *man=urlManager->FindContextManager(ctx_2);
+
+		TRAPD(rc, man->WriteCacheIndexesL(TRUE, FALSE));
+	}
+
+	test("ReCheck reload expire later 1 " descr)
+	async;
+	{
+		uct.LoadNoReloadOK(url_exp_later, NULL);
+	}
+
+	test("wait for the page that will expire soon")
+	async;
+	language ecmascript;
+	{
+		setTimeout("ST_passed()", 1000);
+	}
+
+	test("ReSave indexes")
+	require success "Start WebServer if required";
+	{
+		Context_Manager *man=urlManager->FindContextManager(ctx_2);
+
+		CacheTester::BrutalDelete(&url_exp_expired, FALSE);  // Delete the expired URL
+		TRAPD(rc, man->WriteCacheIndexesL(TRUE, FALSE));
+	}
+
+	test("ReCheck reload expire later 2 " descr)
+	async;
+	{
+		uct.LoadNoReloadOK(url_exp_later, NULL);
+	}
+
+	test("ReCheck reload expire later 3 " descr)
+	async;
+	{
+		uct.LoadNormalOK(url_exp_later, NULL);
+	}
+
+	test("ReCheck reload expire soon" descr)
+	async;
+	{
+		uct.LoadNoReloadOK(url_exp_soon, NULL);
+	}
+}
+
+
+// Create the files
+foreach (descr, file_size, file_path, file, url, vpath, vpath2, cache_type) from TableSizes
+{
+	test("Create temporary file " descr)
+	{
+		if(file_size>0)
+		{
+			verify_success(CacheFileTest::CreateTempFile(file_size, TRUE, file_path, file));
+		}
+		else
+			output("DISABLED");
+	}
+
+	test("Share (twice) file " descr)
+	{
+		if(file_size>0)
+		{
+			URL url_tmp;
+
+			verify_success(uct.Share(file_path.CStr(), vpath, NULL, url, ctx));
+			// Useless for the redirect tests now, but it keeps testing a feature of the webserver
+			verify_success(uct.Share(file_path.CStr(), vpath2, NULL, url_tmp, ctx_redir));
+		}
+		else
+			output("DISABLED");
+	}
+
+	test("Load file " descr) async;
+	{
+		uct.SetExpectedTransferRange(file_size, file_size+1024);
+		uct.LoadOK(url, &file);
+	}
+
+	test("Verify transfer "  descr)
+	{
+		int bytes=uct.GetLastTransfer();
+
+		output("Transferred bytes: %d ", bytes);
+		verify(bytes>(int)file_size);
+	}
+
+	test("size check" descr)
+	{
+		OpFileLength len=0;
+		url.GetAttribute(URL::KContentSize, &len);
+
+		verify(len==file_size);
+	}
+
+	// Unshare, so we are sure that it is taken from the cache
+	test("UnShare file " descr)
+	{
+		if(file_size>0)
+		{
+			verify_success(uct.UnShare(vpath));
+		}
+		else
+			output("DISABLED");
+	}
+
+}
+
+test("Save files")
+{
+	TRAPD(rc, urlManager->WriteCacheIndexesL(FALSE, FALSE, TRUE));
+}
+
+// Verify the content
+foreach (descr, file_size, file_path, file, url, vpath, vpath2, cache_type) from TableSizes
+{
+	// Verify the content reading from the cache storage object
+	test("Verify content " descr)
+	{
+		URL_Rep *rep=url.GetRep();
+		Cache_Storage *cs=(rep && rep->GetDataStorage() && rep->GetDataStorage()->GetCacheStorage())?rep->GetDataStorage()->GetCacheStorage():NULL;
+		verify(cs);
+
+	#ifdef CACHE_FAST_INDEX
+		//// TODO: Implement this function also for containers and plain files
+		SimpleStreamReader *reader=cs->CreateStreamReader();
+
+		if(reader) // Content in memory
+		{
+			OP_STATUS ops=CacheFileTest::VerifyFileContent(reader, file_path.CStr());
+
+			OP_DELETE(reader);
+
+			verify_success(ops);
+		}
+	#endif
+	}
+
+	// Download again
+	test("Load again file (NoReload) "  descr) async;
+	{
+		uct.LoadNoReloadOK(url, &file);
+	}
+
+	// Verify size
+	test("size check again" descr)
+	{
+		OpFileLength len=0;
+		url.GetAttribute(URL::KContentSize, &len);
+
+		verify(len==file_size);
+	}
+
+	// Download again: it must fail, because it has been unshared
+	test("Load (NoReload) file from other context (must fail) "  descr)
+	async;
+	{
+		URL url_err=uct.GetURL(vpath, ctx_err);
+		uct.LoadNoReload404(url_err);
+	}
+
+	// Download again: it must fail, because it has been unshared
+	test("Load (Reload) file from other context (must fail) "  descr)
+	async;
+	{
+		URL url_err=uct.GetURL(vpath, ctx_err);
+		uct.Load404(url_err);
+	}
+
+	/// Create a context that load the index
+	test("New Contexts" descr)
+	{
+		verify_success(CacheTester::ForceCacheSync(basic_folder));
+		ctx_load=urlManager->GetNewContextID();
+		urlManager->Debug_AcceptOverlappingContexts();
+		urlManager->AddContextL(ctx_load, basic_folder, basic_folder, basic_folder, basic_folder, FALSE);
+
+		verify_success(CacheTester::ForceCacheSync(basic_folder));
+		ctx_load2=urlManager->GetNewContextID();
+		urlManager->Debug_AcceptOverlappingContexts();
+		urlManager->AddContextL(ctx_load2, basic_folder, basic_folder, basic_folder, basic_folder, FALSE);
+	}
+
+	// Load from cache
+	test("Load (NoReload) file from other context"  descr)
+	async;
+	{
+		URL url_load=uct.GetURL(vpath, ctx_load);
+
+		uct.LoadNoReloadOK(url_load, &file);
+	}
+
+	test("Verify no transfer "  descr)
+	{
+		int bytes=uct.GetLastTransfer();
+
+		output("Transferred bytes: %d ", bytes);
+		verify(bytes==0);
+	}
+
+	// Verify size
+	test("size check new context" descr)
+	{
+		URL url_load=uct.GetURL(vpath, ctx_load);
+		OpFileLength len=0;
+
+		url_load.GetAttribute(URL::KContentSize, &len);
+
+		verify(len==file_size);
+	}
+
+	// Load normal, expected to load from the cache
+	test("Load (Normal) file from other context"  descr)
+	async;
+	{
+		URL url_load2=uct.GetURL(vpath, ctx_load2);
+
+		uct.LoadNormalOK(url_load2, &file);
+	}
+
+	test("Verify no transfer 2 "  descr)
+	{
+		int bytes=uct.GetLastTransfer();
+
+		output("Transferred bytes: %d ", bytes);
+		verify(bytes==0);
+	}
+
+	// Verify size
+	test("size check new context" descr)
+	{
+		URL url_load2=uct.GetURL(vpath, ctx_load2);
+		OpFileLength len=0;
+
+		url_load2.GetAttribute(URL::KContentSize, &len);
+
+		verify(len==file_size);
+	}
+
+	// Check Export
+	test("check ExportAsFile() " descr)
+	{
+		OpString path_export;
+
+		verify_success(path_export.Set(file_path.CStr()));
+		verify_success(path_export.Append("_export"));
+
+		verify(url.IsExportAllowed());
+		verify(url.IsExportAllowed()); // Multiple checks
+
+		// Try a direct export, and switch to safe if problem occurs
+		OP_STATUS ops=url.ExportAsFile(path_export);
+
+		verify(OpStatus::IsSuccess(ops) || cache_type==TYPE_EMBEDDED || cache_type==TYPE_CONTAINER);
+
+		if(OpStatus::IsError(ops))
+		{
+			output("*** switched to SaveAsFile... ***");
+			verify_success(url.SaveAsFile(path_export));
+		}
+
+		// More tests
+		verify(url.IsExportAllowed()); // Multiple checks
+
+		verify_success(CacheFileTest::VerifyFileContent(url, path_export.CStr()));
+		verify_success(CacheFileTest::VerifyFileContent(url, file_path.CStr()));
+
+		SimpleFileReader sfr;
+
+		verify_success(sfr.Construct(path_export.CStr(), OPFILE_ABSOLUTE_FOLDER));
+
+		verify_success(CacheFileTest::VerifyFileContent(&sfr, file_path.CStr()));
+
+		verify(url.IsExportAllowed()); // Multiple checks
+
+		// Second save
+		verify_success(path_export.Append("_2"));
+
+		verify(url.IsExportAllowed());
+		verify(url.IsExportAllowed()); // Multiple checks
+
+		// Try a direct export, and switch to safe if problem occurs
+		ops=url.ExportAsFile(path_export);
+
+		verify(OpStatus::IsSuccess(ops) || cache_type==TYPE_EMBEDDED || cache_type==TYPE_CONTAINER);
+
+		if(OpStatus::IsError(ops))
+		{
+			output("*** switched to SaveAsFile... ***");
+			verify_success(url.SaveAsFile(path_export));
+		}
+
+		verify(url.IsExportAllowed()); // Multiple checks
+
+		verify_success(CacheFileTest::VerifyFileContent(url, path_export.CStr()));
+		verify_success(CacheFileTest::VerifyFileContent(url, file_path.CStr()));
+
+		SimpleFileReader sfr2;
+
+		verify_success(sfr2.Construct(path_export.CStr(), OPFILE_ABSOLUTE_FOLDER));
+
+		verify_success(CacheFileTest::VerifyFileContent(&sfr2, file_path.CStr()));
+
+		verify(url.IsExportAllowed()); // Multiple checks
+	}
+
+	test("Delete temporary file " descr)
+	{
+		if(file_size>0)
+		{
+			file.Delete();
+		}
+		else
+			output("DISABLED");
+	}
+
+	test("Sync 1 " descr)
+	async;
+	{
+		#if CACHE_SYNC==CACHE_SYNC_NONE
+			output("NO CACHE SYNC!");
+		#else
+			#if CACHE_SYNC==CACHE_SYNC_FULL
+				output("Sync always");
+			#elseif CACHE_SYNC==CACHE_SYNC_ON_CHANGE
+				output("Sync on change");
+			#endif
+		#endif
+
+		// Delete the files
+		CacheFileTest::DeleteCacheDir(sync_folder);
+
+		num_start=CacheHelpers::CheckDirectory(sync_folder);
+
+		if(num_start!=0)
+		{
+			ST_failed("Expected 0 files");
+
+			return 0;
+		}
+
+		// Create test files
+		if(CacheTester::IsCacheToSync(ctx_sync))
+		{
+			ST_failed("Cache should be in sync - 1");
+
+			return 0;
+		}
+
+		ch.CacheBogusURLs(ctx_sync, file_size, file_size, 32, 0, NULL);
+
+		Context_Manager *man=urlManager->FindContextManager(ctx_sync);
+
+		// Save the files and count
+		CacheTester::SaveFiles(ctx_sync);
+		CacheTester::FlushContainers(ctx_sync);
+		num_start=CacheHelpers::CheckDirectory(sync_folder);
+
+		//if(cache_type != TYPE_EMBEDDED)
+			//verify(CacheTester::IsCacheToSync(ctx_sync));
+
+		// Synchronize the index with the directory
+		TRAPD(rc, man->WriteCacheIndexesL(TRUE, TRUE));
+		if(CacheTester::IsCacheToSync(ctx_sync))
+		{
+			ST_failed("Cache should be in sync - 2");
+
+			return 0;
+		}
+
+		num_start=CacheHelpers::CheckDirectory(sync_folder);
+
+		output("Files on the directory: %d\n", num_start);
+
+		if(cache_type == TYPE_EMBEDDED && num_start)
+		{
+			ST_failed("Expected 0 files for embedded ");
+
+			return 0;
+		}
+		else if(cache_type != TYPE_EMBEDDED && !num_start)
+		{
+			ST_failed("Expected more files");
+
+			return 0;
+		}
+
+		// Create num files
+		CacheTester::TouchFiles(sync_folder, 10);
+
+		num_simulate=CacheHelpers::CheckDirectory(sync_folder);
+
+		output("Files after touch: %d\n", num_simulate);
+		if(num_simulate!=num_start+10)
+		{
+			ST_failed("Expected %d files instead of %d", num_start+10, num_simulate);
+
+			return 0;
+		}
+
+		// Create a new context, that overlap and does not synchronize (because no sync file is present)
+		CacheTester::ForceCacheSync(sync_folder);
+		ctx_sync2=urlManager->GetNewContextID();
+		urlManager->Debug_AcceptOverlappingContexts();
+		urlManager->AddContextL(ctx_sync2, sync_folder, sync_folder, sync_folder, sync_folder, FALSE);
+		urlManager->FindContextManager(ctx_sync2)->SetCacheSize(10*1024*1024);
+
+		num_check=CacheHelpers::CheckDirectory(sync_folder);
+
+		if(num_simulate!=num_check)
+		{
+			ST_failed("Expected %d files instead of %d", num_simulate, num_check);
+
+			return 0;
+		}
+
+		if(!CacheTester::IsCacheToSync(ctx_sync))  // The cache should benver be in sync! Only after removing the manager...
+		{
+			ST_failed("Cache should NOT be in sync - 1");
+
+			return 0;
+		}
+
+		// Create a new context, that overlap and synchronize (because the sync file is forced)
+		ctx_sync3=urlManager->GetNewContextID();
+		urlManager->Debug_AcceptOverlappingContexts();
+		urlManager->AddContextL(ctx_sync3, sync_folder, sync_folder, sync_folder, sync_folder, FALSE);
+		urlManager->FindContextManager(ctx_sync3)->SetCacheSize(10*1024*1024);
+
+		// The delete is asynchronous...
+		wait->SetExpectedFiles(-1, num_start);
+		mh->PostDelayedMessage(MSG_URLMAN_DELETE_SOMEFILES, 0, 0, 1000);  // Wait to delete the files
+	}
+
+	// Second part
+	test("Sync 2 " descr)
+	{
+		num_check=CacheHelpers::CheckDirectory(sync_folder);
+
+		output("Files * start: %d - touch: %d - final: %d \n", num_start, num_simulate, num_check);
+		verify(num_check==num_start);
+
+		Context_Manager *man3=urlManager->FindContextManager(ctx_sync3);
+
+		// Synchronize the index with the directory
+		TRAPD(rc, man3->WriteCacheIndexesL(TRUE, TRUE));
+
+		num_check=CacheHelpers::CheckDirectory(sync_folder);
+
+		output("Files * start: %d - touch: %d - final: %d \n", num_start, num_simulate, num_check);
+		verify(num_check==num_start);
+
+		verify(CacheTester::IsCacheToSync(ctx_sync));
+		verify(CacheTester::IsCacheToSync(sync_folder));
+
+		// Remove the context
+		urlManager->RemoveContext(ctx_sync2, TRUE);
+		urlManager->RemoveContext(ctx_sync3, TRUE);
+
+		verify(!CacheTester::IsCacheToSync(ctx_sync));  // Side effect, as these context overlap
+		verify(!CacheTester::IsCacheToSync(sync_folder));
+
+		// Delete the files
+		//man->EmptyDCache();
+		verify_success(CacheFileTest::DeleteCacheDir(sync_folder));
+	}
+}
+
+test("LRU RAM")
+{
+	CacheTester::TestURLsRAM(ctx);
+}
+
+
+test("LRU Temp")
+{
+	CacheTester::TestURLsTemp(ctx);
+}
+
+test("LRU Disk")
+{
+	CacheTester::TestURLsDisk(ctx);
+}
+
+test("FileNames test")
+{
+	OpFileFolder folder;
+	FileName_Store filenames1(3);
+	FileName_Store filenames2(3);
+	FileName_Store filenames3(3);
+	FileName_Store filenames4(3);
+
+	verify_success(filenames1.Construct());
+	verify_success(filenames2.Construct());
+	verify_success(filenames3.Construct());
+	verify_success(filenames4.Construct());
+
+	verify_success(CacheFileTest::CreateEmptyCacheDir(UNI_L("test_file_name"), folder));
+	verify_success(CacheTester::TouchFiles(folder, 10));
+
+	Context_Manager::ReadDCacheDir(filenames1, filenames1, folder, TRUE, FALSE, NULL, 2);
+	verify(filenames1.LinkObjectCount()==2);
+
+	Context_Manager::ReadDCacheDir(filenames2, filenames2, folder, TRUE, FALSE, NULL, 3);
+	verify(filenames2.LinkObjectCount()==3);
+
+	Context_Manager::ReadDCacheDir(filenames3, filenames3, folder, TRUE, FALSE, NULL, 4);
+	verify(filenames3.LinkObjectCount()==4);
+
+	Context_Manager::ReadDCacheDir(filenames4, filenames4, folder, TRUE, FALSE, NULL);
+	verify(filenames4.LinkObjectCount()==10);
+}
+
+
+foreach (descr, file_path, expected, url, xml, xmlJS) from TableMIME
+{
+	test("MIME share and Load - " + descr)
+	file uni path_64 file_path;
+	async;
+	{
+		if(expected)
+		{
+			if(OpStatus::IsError(uct.Share(path_64, file_path, NULL, url, ctx_download)))
+				ST_failed("Share failed!");
+			else
+			{
+				uct.SetExpectedTransferRange(-1, -1);
+				uct.LoadOK(url);
+			}
+		}
+		else
+			ST_passed();  // No share: 404 expected
+	}
+
+	test("ShowInfo " descr)
+	{
+		output("\n%s - expected: %s - KContentType: %d - KOriginalContentType: %d - KMime_Type: %s - KOriginal_MimeType: %s - HTTP response code: %d", descr, expected, (int)url.GetAttribute(URL::KContentType), (int)url.GetAttribute(URL::KOriginalContentType), url.GetAttribute(URL::KMIME_Type).CStr(), url.GetAttribute(URL::KOriginalMIME_Type).CStr(), url.GetAttribute(URL::KHTTP_Response_Code, TRUE));
+		output("\nLoaded %s\n", url.GetAttribute(URL::KName).CStr());
+
+		if(expected)
+		{
+			verify(url.GetAttribute(URL::KHTTP_Response_Code, TRUE) == 200);
+			verify(!(url.GetAttribute(URL::KMIME_Type).Compare(expected)));
+		}
+		else
+			verify(url.GetAttribute(URL::KHTTP_Response_Code, TRUE) == 404 || url.GetAttribute(URL::KHTTP_Response_Code, TRUE) == 0);
+	}
+
+	test("JS XHR" descr)
+	language ecmascript;
+	async;
+	{
+		var xhr = new XMLHttpRequest();
+		var ws = opera.io.webserver;
+		var g_server = "localhost:" + ws.port;
+		var g_service_url = "http://" + g_server +  ws.currentServicePath;
+		var url_to_open=g_service_url + file_path;
+
+		xhr.open("GET",url_to_open,true);
+		xhr.onreadystatechange=function() {
+			if (this.readyState==4) {
+				if (this.responseXML) {
+					opera.postError("XML response " + this.status + " for " + descr + " " + url_to_open + ": " + this.responseXML);
+				} else {
+					opera.postError("HTML response " + this.status + " for " + descr + " " + url_to_open + ": " + this.responseXML);
+				}
+
+				if(xmlJS=="true" && !this.responseXML)
+			    {
+					opera.postError("-Failing 1-");
+					ST_failed("Expecting XML response", "cache_basic.ot", 0);
+				}
+				else if(xmlJS=="false" && this.responseXML)
+				{
+					opera.postError("-Failing 2-");
+					ST_failed("XML response should be NULL", "cache_basic.ot", 0);
+				}
+				else
+				{
+					opera.postError("-Succeeding-");
+					ST_passed();
+				}
+			}
+		}
+		xhr.send(null);
+	}
+
+}
+
+test("Restore WebServer if required")
+{
+	uct.StopWebServer();
+}
+
+test("Delete the contexts")
+{
+	CacheTester::SetDeepDebug(ctx_sync, FALSE);  // There will be errors... that's normal...
+
+	url_empty1.GetRep()->DecUsed(1);
+	url_empty2.GetRep()->DecUsed(1);
+
+	mctx.RemoveFoldersAndContexts();
+
+	urlManager->RemoveContext(ctx_load, TRUE);
+	urlManager->RemoveContext(ctx_load2, TRUE);
+	verify(!CacheTester::IsCacheToSync(ctx_sync));
+	verify(!CacheTester::IsCacheToSync(sync_folder));
+	urlManager->RemoveContext(ctx_sync, TRUE);
+	urlManager->RemoveContext(ctx_empty1, TRUE);
+	urlManager->RemoveContext(ctx_empty2, TRUE);
+
+	verify_success(CacheFileTest::DeleteCacheDir(sync_folder));
+}

@@ -1,0 +1,420 @@
+/* -*- mode: c++; tab-width: 4; c-basic-offset: 4 -*- */
+
+group "dnd";
+require init;
+require undefined HAS_NOTEXTSELECTION;
+require DRAG_SUPPORT;
+include "modules/dragdrop/dragdrop_manager.h";
+include "modules/pi/OpDragObject.h";
+include "modules/dragdrop/src/private_data.h";
+include "modules/doc/frm_doc.h";
+include "modules/doc/html_doc.h";
+include "modules/layout/box/box.h";
+include "modules/logdoc/logdoc.h";
+include "modules/logdoc/htm_elm.h";
+
+language C++;
+
+global
+{
+	BOOL GetDragPoint(const uni_char* dragged_el_id, OpPoint& point)
+	{
+		LogicalDocument* logdoc = state.doc->GetLogicalDocument();
+		NamedElementsIterator el_iterator;
+		int found = logdoc->SearchNamedElements(el_iterator, NULL, dragged_el_id, TRUE, TRUE);
+		if (found)
+			if (HTML_Element* named_element = el_iterator.GetNextElement())
+			{
+				RECT rect;
+				if (named_element->GetLayoutBox() && named_element->GetLayoutBox()->GetRect(state.doc, CONTENT_BOX, rect))
+				{
+					point.x = rect.left + (rect.right - rect.left) / 2;
+					point.y = rect.top + (rect.bottom - rect.top) / 2;
+
+					return TRUE;
+				}
+			}
+
+		return FALSE;
+	}
+	void EndDrag()
+	{
+		if (g_drag_manager->GetDragObject())
+		{
+			OP_ASSERT(!"Test did not finish dnd operation.");
+			g_drag_manager->StopDrag(TRUE);
+		}
+	}
+	BOOL CompareStringData(int data_i, const uni_char* data_mime, const uni_char* data_string)
+	{
+		OpDragObject* drag_object = g_drag_manager->GetDragObject();
+		OpDragDataIterator& iter = drag_object->GetDataIterator();
+		if (iter.First())
+		{
+			while (data_i > 0)
+			{
+				if (!iter.Next())
+					return FALSE;
+				--data_i;
+			}
+
+			if (iter.IsStringData() && uni_str_eq(iter.GetMimeType(), data_mime)
+				&& uni_str_eq(iter.GetStringData(), data_string))
+				return TRUE;
+		}
+		return FALSE;
+	}
+}
+
+html {
+	//!	<!DOCTYPE html>
+	//! <style>
+	//! div {
+	//! 	height: 200px;
+	//! 	width: 200px;
+	//! 	background-color: orange;
+	//! 	position: absolute;
+	//! 	top: 0;
+	//! 	left: 0;
+	//! 	overflow: auto;
+	//! }
+	//! div + div {
+	//! 	background-color: navy;
+	//! 	left: 250px;
+	//! }
+	//! div + p {
+	//! 	margin-top: 220px;
+	//! }
+	//! pre {
+	//! 	position:absolute;
+	//! 	top: 0;
+	//! 	right: 0;
+	//! 	overflow:auto;
+	//! 	height:100%;
+	//! 	width: 50%;
+	//! }
+	//! form {
+	//! 	position:absolute;
+	//! 	top:400px;
+	//! }
+	//! a:hover{background-color:red;}
+	//! </style>
+	//! <div draggable='true' id='draggable'></div>
+	//! <div id='receiver'></div>
+}
+
+test("Simple drag, check OpDragObject")
+{
+	verify(state.doc->GetHtmlDocument());
+	OpPoint point;
+	verify(GetDragPoint(UNI_L("draggable"), point));
+	g_drag_manager->OnDragStart(NULL, state.doc->GetHtmlDocument(), point.x, point.y, SHIFTKEY_NONE, point.x, point.y);
+	OpDragObject* drag_object = g_drag_manager->GetDragObject();
+	verify(drag_object);
+
+	g_drag_manager->OnDragMove(state.doc->GetHtmlDocument(), 100, 150, SHIFTKEY_NONE);
+	g_drag_manager->OnDragMove(state.doc->GetHtmlDocument(), 100, 250, SHIFTKEY_NONE); // Move down, outside <div>s.
+	PrivateDragData* priv_data = static_cast<PrivateDragData*>(drag_object->GetPrivateData());
+	verify(priv_data);
+	verify(!priv_data->IsSelection());
+	verify(drag_object->GetDropType() == DROP_NOT_AVAILABLE);
+	verify(drag_object->GetDataCount() == 2);
+	verify(CompareStringData(0, UNI_L("application/microdata+json"), UNI_L("{\"items\":[]}")));
+	verify(CompareStringData(1, UNI_L("text/html"), UNI_L("<div draggable=\"true\" id=\"draggable\"></div>")));
+
+	g_drag_manager->OnDragDrop(250, 250, SHIFTKEY_NONE);
+	drag_object = g_drag_manager->GetDragObject();
+	verify(!drag_object);
+}
+finally
+{
+	EndDrag();
+}
+
+test("Simple dnd")
+{
+	verify(state.doc->GetHtmlDocument());
+	OpPoint point;
+	verify(GetDragPoint(UNI_L("draggable"), point));
+	g_drag_manager->OnDragStart(NULL, state.doc->GetHtmlDocument(), point.x, point.y, SHIFTKEY_NONE, point.x, point.y);
+	OpDragObject* drag_object = g_drag_manager->GetDragObject();
+	verify(drag_object);
+
+	g_drag_manager->OnDragMove(state.doc->GetHtmlDocument(), 150, 100, SHIFTKEY_NONE);
+	g_drag_manager->OnDragMove(state.doc->GetHtmlDocument(), 250, 100, SHIFTKEY_NONE);
+	g_drag_manager->OnDragMove(state.doc->GetHtmlDocument(), 300, 100, SHIFTKEY_NONE); // Move over 'receiver'.
+
+	g_drag_manager->OnDragDrop(300, 100, SHIFTKEY_NONE);
+
+	drag_object = g_drag_manager->GetDragObject();
+	verify(!drag_object);
+}
+finally
+{
+	EndDrag();
+}
+
+test("Simple drag cancel")
+{
+	verify(state.doc->GetHtmlDocument());
+	OpPoint point;
+	verify(GetDragPoint(UNI_L("draggable"), point));
+	g_drag_manager->OnDragStart(NULL, state.doc->GetHtmlDocument(), point.x, point.y, SHIFTKEY_NONE, point.x, point.y);
+	OpDragObject* drag_object = g_drag_manager->GetDragObject();
+	verify(drag_object);
+
+	g_drag_manager->OnDragMove(state.doc->GetHtmlDocument(), 150, 100, SHIFTKEY_NONE);
+	g_drag_manager->OnDragMove(state.doc->GetHtmlDocument(), 250, 100, SHIFTKEY_NONE);
+	g_drag_manager->OnDragMove(state.doc->GetHtmlDocument(), 300, 100, SHIFTKEY_NONE); // Move over 'receiver'.
+
+	g_drag_manager->OnDragCancel(300, 100, SHIFTKEY_NONE);
+	drag_object = g_drag_manager->GetDragObject();
+	verify(!drag_object);
+}
+finally
+{
+	EndDrag();
+}
+
+
+html {
+	//!	<!DOCTYPE html>
+	//! <style>
+	//! div {
+	//! 	height: 200px;
+	//! 	width: 200px;
+	//! 	background-color: orange;
+	//! 	position: absolute;
+	//! 	top: 0;
+	//! 	left: 0;
+	//! 	overflow: auto;
+	//! }
+	//! div + div {
+	//! 	background-color: navy;
+	//! 	left: 250px;
+	//! }
+	//! div + p {
+	//! 	margin-top: 220px;
+	//! }
+	//! pre {
+	//! 	position:absolute;
+	//! 	top: 0;
+	//! 	right: 0;
+	//! 	overflow:auto;
+	//! 	height:100%;
+	//! 	width: 50%;
+	//! }
+	//! form {
+	//! 	position:absolute;
+	//! 	top:400px;
+	//! }
+	//! a:hover{background-color:red;}
+	//! </style>
+	//! <div id='selection'>
+	//! I am the dark flame<br>
+	//! amongst the winds of God<br>
+	//! flying with a groan into the distance,<br>
+	//! like a hollow bell of north.<br>
+	//! I am in the darkness of the mountains,<br>
+	//! to light up the red of auroras<br>
+	//! with the spark of my pains,<br>
+	//! with the star of my incapacity.<br>
+	//! </div>
+	//! <div id='receiver'></div>
+}
+
+test("Selection dnd, check OpDragObject")
+{
+	uni_char* selection_buf = NULL;
+	verify(state.doc->GetHtmlDocument());
+	HTML_Document* document = state.doc->GetHtmlDocument();
+	verify(document);
+	const uni_char* string_to_check = UNI_L("I am the dark flame\n amongst the winds of God\n flying with a groan into the distance,\n like a hollow bell of north.\n I am in the darkness of the mountains,\n to light up the red of auroras\n with the spark of my pains,\n with the star of my incapacity.");
+	document->SelectAll();
+	int selection_len = document->GetSelectedTextLen();
+	selection_buf = OP_NEWA(uni_char, selection_len + 1);
+	document->GetSelectedText(selection_buf, selection_len+1);
+	verify(uni_str_eq(selection_buf, string_to_check));
+
+	g_drag_manager->OnDragStart(NULL, state.doc->GetHtmlDocument(), 100, 100, SHIFTKEY_NONE, 100, 100);
+	OpDragObject* drag_object = g_drag_manager->GetDragObject();
+	verify(drag_object);
+	g_drag_manager->OnDragMove(state.doc->GetHtmlDocument(), 100, 150, SHIFTKEY_NONE);
+	g_drag_manager->OnDragMove(state.doc->GetHtmlDocument(), 100, 250, SHIFTKEY_NONE); // Move down, outside <div>s.
+	PrivateDragData* priv_data = static_cast<PrivateDragData*>(drag_object->GetPrivateData());
+	verify(priv_data);
+	verify(priv_data->IsSelection());
+	verify(drag_object->GetDataCount() == 3);
+	verify(CompareStringData(0, UNI_L("text/plain"), string_to_check));
+	verify(CompareStringData(1, UNI_L("application/microdata+json"), UNI_L("{\"items\":[]}")));
+	verify(CompareStringData(2, UNI_L("text/html"), UNI_L("\nI am the dark flame<br>\namongst the winds of God<br>\nflying with a groan into the distance,<br>\nlike a hollow bell of north.<br>\nI am in the darkness of the mountains,<br>\nto light up the red of auroras<br>\nwith the spark of my pains,<br>\nwith the star of my incapacity.")));
+
+	g_drag_manager->OnDragDrop(250, 250, SHIFTKEY_NONE);
+	drag_object = g_drag_manager->GetDragObject();
+	verify(!drag_object);
+}
+finally
+{
+	EndDrag();
+	OP_DELETEA(selection_buf);
+}
+
+html {
+	//!	<!DOCTYPE html>
+	//! <style>
+	//! a {
+	//! 	height: 200px;
+	//! 	width: 200px;
+	//! 	background-color: orange;
+	//! 	position: absolute;
+	//! 	top: 0;
+	//! 	left: 0;
+	//! 	overflow: auto;
+	//! }
+	//! a + a {
+	//! 	left: 250px;
+	//! }
+	//! a + a + a {
+	//! 	left: 500px;
+	//! }
+	//! a:hover{background-color:red;}
+	//! </style>
+	//! <a id='url1' href="http://example.com">link<span>a</span>acetylseryltyrosylserylisoleucylthreonylserylprolyl-serylglutaminylphenylalanylvalylphenylalanylleucylserylseryl-valyltryptophylalanylaspartylprolylisoleucylglutamylleucyl-leucylasparaginylvalylcysteinylthreonylserylserylleucylglycyl-asparaginylglutaminylphenylalanylglutaminylthreonylglutaminyl-glutaminylalanylarginylthreonylthreonylglutaminylvalyl-glutaminylglutaminylphenylalanylserylglutaminylvalyl-tryptophyllysylprolylphenylalanylprolylglutaminylseryl-threonylvalylarginylphenylalanylprolylglycylaspartylvalyl-tyrosyllysylvalyltyrosylarginyltyrosylasparaginylalanylvalyl-leucylaspartylprolylleucylisoleucylthreonylalanylleucyl-leucylglycylthreonylphenylalanylaspartylthreonylarginyl-asparaginylarginylisoleucylisoleucylglutamylvalylglutamyl-asparaginylglutaminylglutaminylserylprolylthreonylthreonyl-alanylglutamylthreonylleucylaspartylalanylthreonylarginyl-arginylvalylaspartylaspartylalanylthreonylvalylalanyl-isoleucylarginylserylalanylasparaginylisoleucylasparaginyl-leucylvalylasparaginylglutamylleucylvalylarginylglycyl-threonylglycylleucyltyrosylasparaginylglutaminylasparaginyl-threonylphenylalanylglutamylserylmethionylserylglycylleucyl-valyltryptophylthreonylserylalanylprolylalanylserine</a>
+	//! <a id='url2' href="http://example.com">abc<input type=text value=xyz>acetylseryltyrosylserylisoleucylthreonylserylprolyl-serylglutaminylphenylalanylvalylphenylalanylleucylserylseryl-valyltryptophylalanylaspartylprolylisoleucylglutamylleucyl-leucylasparaginylvalylcysteinylthreonylserylserylleucylglycyl-asparaginylglutaminylphenylalanylglutaminylthreonylglutaminyl-glutaminylalanylarginylthreonylthreonylglutaminylvalyl-glutaminylglutaminylphenylalanylserylglutaminylvalyl-tryptophyllysylprolylphenylalanylprolylglutaminylseryl-threonylvalylarginylphenylalanylprolylglycylaspartylvalyl-tyrosyllysylvalyltyrosylarginyltyrosylasparaginylalanylvalyl-leucylaspartylprolylleucylisoleucylthreonylalanylleucyl-leucylglycylthreonylphenylalanylaspartylthreonylarginyl-asparaginylarginylisoleucylisoleucylglutamylvalylglutamyl-asparaginylglutaminylglutaminylserylprolylthreonylthreonyl-alanylglutamylthreonylleucylaspartylalanylthreonylarginyl-arginylvalylaspartylaspartylalanylthreonylvalylalanyl-isoleucylarginylserylalanylasparaginylisoleucylasparaginyl-leucylvalylasparaginylglutamylleucylvalylarginylglycyl-threonylglycylleucyltyrosylasparaginylglutaminylasparaginyl-threonylphenylalanylglutamylserylmethionylserylglycylleucyl-valyltryptophylthreonylserylalanylprolylalanylserine</a>
+}
+
+test("Link with span dnd, check OpDragObject")
+{
+	verify(state.doc->GetHtmlDocument());
+	OpPoint point;
+	verify(GetDragPoint(UNI_L("url1"), point));
+	g_drag_manager->OnDragStart(NULL, state.doc->GetHtmlDocument(), point.x, point.y, SHIFTKEY_NONE, point.x, point.y);
+	OpDragObject* drag_object = g_drag_manager->GetDragObject();
+	verify(drag_object);
+	g_drag_manager->OnDragMove(state.doc->GetHtmlDocument(), 100, 150, SHIFTKEY_NONE);
+	g_drag_manager->OnDragMove(state.doc->GetHtmlDocument(), 100, 250, SHIFTKEY_NONE); // Move down, outside <a>s.
+	PrivateDragData* priv_data = static_cast<PrivateDragData*>(drag_object->GetPrivateData());
+	verify(priv_data);
+	verify(!priv_data->IsSelection());
+	verify(drag_object->GetDataCount() == 5);
+	verify(CompareStringData(0, UNI_L("text/x-opera-description"), UNI_L("linkaacetylseryltyrosylserylisoleucylthreonylserylprolyl-serylglutaminylphenylalanylvalylphenylalanylleucylserylseryl-valyltryptophylalanylaspartylprolylisoleucylglutamylleucyl-leucylasparaginylvalylcysteinylthreonylserylserylleucylglycyl-asparaginylglutaminylphenylalanylglutaminylthreonylglutaminyl-glutaminylalanylarginylthreonylthreonylglutaminylvalyl-glutaminylglutaminylphenylalanylserylglutaminylvalyl-tryptophyllysylprolylphenylalanylprolylglutaminylseryl-threonylvalylarginylphenylalanylprolylglycylaspartylvalyl-tyrosyllysylvalyltyrosylarginyltyrosylasparaginylalanylvalyl-leucylaspartylprolylleucylisoleucylthreonylalanylleucyl-leucylglycylthreonylphenylalanylaspartylthreonylarginyl-asparaginylarginylisoleucylisoleucylglutamylvalylglutamyl-asparaginylglutaminylglutaminylserylprolylthreonylthreonyl-alanylglutamylthreonylleucylaspartylalanylthreonylarginyl-arginylvalylaspartylaspartylalanylthreonylvalylalanyl-isoleucylarginylserylalanylasparaginylisoleucylasparaginyl-leucylvalylasparaginylglutamylleucylvalylarginylglycyl-threonylglycylleucyltyrosylasparaginylglutaminylasparaginyl-threonylphenylalanylglutamylserylmethionylserylglycylleucyl-valyltryptophylthreonylserylalanylprolylalanylserine")));
+	verify(CompareStringData(1, UNI_L("text/plain"), UNI_L("http://example.com/")));
+	verify(CompareStringData(2, UNI_L("application/microdata+json"), UNI_L("{\"items\":[]}")));
+	verify(CompareStringData(3, UNI_L("text/uri-list"), UNI_L("http://example.com/\r\n")));
+	verify(CompareStringData(4, UNI_L("text/html"), UNI_L("<a id=\"url1\" href=\"http://example.com\">link<span>a</span>acetylseryltyrosylserylisoleucylthreonylserylprolyl-serylglutaminylphenylalanylvalylphenylalanylleucylserylseryl-valyltryptophylalanylaspartylprolylisoleucylglutamylleucyl-leucylasparaginylvalylcysteinylthreonylserylserylleucylglycyl-asparaginylglutaminylphenylalanylglutaminylthreonylglutaminyl-glutaminylalanylarginylthreonylthreonylglutaminylvalyl-glutaminylglutaminylphenylalanylserylglutaminylvalyl-tryptophyllysylprolylphenylalanylprolylglutaminylseryl-threonylvalylarginylphenylalanylprolylglycylaspartylvalyl-tyrosyllysylvalyltyrosylarginyltyrosylasparaginylalanylvalyl-leucylaspartylprolylleucylisoleucylthreonylalanylleucyl-leucylglycylthreonylphenylalanylaspartylthreonylarginyl-asparaginylarginylisoleucylisoleucylglutamylvalylglutamyl-asparaginylglutaminylglutaminylserylprolylthreonylthreonyl-alanylglutamylthreonylleucylaspartylalanylthreonylarginyl-arginylvalylaspartylaspartylalanylthreonylvalylalanyl-isoleucylarginylserylalanylasparaginylisoleucylasparaginyl-leucylvalylasparaginylglutamylleucylvalylarginylglycyl-threonylglycylleucyltyrosylasparaginylglutaminylasparaginyl-threonylphenylalanylglutamylserylmethionylserylglycylleucyl-valyltryptophylthreonylserylalanylprolylalanylserine</a>")));
+	g_drag_manager->OnDragDrop(250, 250, SHIFTKEY_NONE);
+}
+finally
+{
+	EndDrag();
+}
+
+test("Link with input dnd, check OpDragObject")
+{
+	verify(state.doc->GetHtmlDocument());
+	OpPoint point;
+	verify(GetDragPoint(UNI_L("url2"), point));
+	g_drag_manager->OnDragStart(NULL, state.doc->GetHtmlDocument(), point.x, point.y, SHIFTKEY_NONE, point.x, point.y);
+	OpDragObject* drag_object = g_drag_manager->GetDragObject();
+	verify(drag_object);
+	g_drag_manager->OnDragMove(state.doc->GetHtmlDocument(), 300, 150, SHIFTKEY_NONE);
+	g_drag_manager->OnDragMove(state.doc->GetHtmlDocument(), 300, 250, SHIFTKEY_NONE); // Move down, outside <a>s.
+	PrivateDragData* priv_data = static_cast<PrivateDragData*>(drag_object->GetPrivateData());
+	verify(priv_data);
+	verify(!priv_data->IsSelection());
+	verify(drag_object->GetDataCount() == 5);
+	verify(CompareStringData(0, UNI_L("text/x-opera-description"), UNI_L("abcacetylseryltyrosylserylisoleucylthreonylserylprolyl-serylglutaminylphenylalanylvalylphenylalanylleucylserylseryl-valyltryptophylalanylaspartylprolylisoleucylglutamylleucyl-leucylasparaginylvalylcysteinylthreonylserylserylleucylglycyl-asparaginylglutaminylphenylalanylglutaminylthreonylglutaminyl-glutaminylalanylarginylthreonylthreonylglutaminylvalyl-glutaminylglutaminylphenylalanylserylglutaminylvalyl-tryptophyllysylprolylphenylalanylprolylglutaminylseryl-threonylvalylarginylphenylalanylprolylglycylaspartylvalyl-tyrosyllysylvalyltyrosylarginyltyrosylasparaginylalanylvalyl-leucylaspartylprolylleucylisoleucylthreonylalanylleucyl-leucylglycylthreonylphenylalanylaspartylthreonylarginyl-asparaginylarginylisoleucylisoleucylglutamylvalylglutamyl-asparaginylglutaminylglutaminylserylprolylthreonylthreonyl-alanylglutamylthreonylleucylaspartylalanylthreonylarginyl-arginylvalylaspartylaspartylalanylthreonylvalylalanyl-isoleucylarginylserylalanylasparaginylisoleucylasparaginyl-leucylvalylasparaginylglutamylleucylvalylarginylglycyl-threonylglycylleucyltyrosylasparaginylglutaminylasparaginyl-threonylphenylalanylglutamylserylmethionylserylglycylleucyl-valyltryptophylthreonylserylalanylprolylalanylserine")));
+	verify(CompareStringData(1, UNI_L("text/plain"), UNI_L("http://example.com/")));
+	verify(CompareStringData(2, UNI_L("application/microdata+json"), UNI_L("{\"items\":[]}")));
+	verify(CompareStringData(3, UNI_L("text/uri-list"), UNI_L("http://example.com/\r\n")));
+	verify(CompareStringData(4, UNI_L("text/html"), UNI_L("<a id=\"url2\" href=\"http://example.com\">abc<input type=\"text\" value=\"xyz\">acetylseryltyrosylserylisoleucylthreonylserylprolyl-serylglutaminylphenylalanylvalylphenylalanylleucylserylseryl-valyltryptophylalanylaspartylprolylisoleucylglutamylleucyl-leucylasparaginylvalylcysteinylthreonylserylserylleucylglycyl-asparaginylglutaminylphenylalanylglutaminylthreonylglutaminyl-glutaminylalanylarginylthreonylthreonylglutaminylvalyl-glutaminylglutaminylphenylalanylserylglutaminylvalyl-tryptophyllysylprolylphenylalanylprolylglutaminylseryl-threonylvalylarginylphenylalanylprolylglycylaspartylvalyl-tyrosyllysylvalyltyrosylarginyltyrosylasparaginylalanylvalyl-leucylaspartylprolylleucylisoleucylthreonylalanylleucyl-leucylglycylthreonylphenylalanylaspartylthreonylarginyl-asparaginylarginylisoleucylisoleucylglutamylvalylglutamyl-asparaginylglutaminylglutaminylserylprolylthreonylthreonyl-alanylglutamylthreonylleucylaspartylalanylthreonylarginyl-arginylvalylaspartylaspartylalanylthreonylvalylalanyl-isoleucylarginylserylalanylasparaginylisoleucylasparaginyl-leucylvalylasparaginylglutamylleucylvalylarginylglycyl-threonylglycylleucyltyrosylasparaginylglutaminylasparaginyl-threonylphenylalanylglutamylserylmethionylserylglycylleucyl-valyltryptophylthreonylserylalanylprolylalanylserine</a>")));
+	g_drag_manager->OnDragDrop(250, 250, SHIFTKEY_NONE);
+}
+finally
+{
+	EndDrag();
+}
+
+html{
+	//!	<!DOCTYPE html>
+	//!	<style>
+	//!	img, div {
+	//!		height: 200px;
+	//!		width: 200px;
+	//!		position: absolute;
+	//!		top: 0;
+	//!		left: 0;
+	//!	}
+	//!	img + div { left: 250px; background-color:orange;}
+	//!	div + div { left: 550px; background-color:orange;}
+	//!	</style>
+	//!	<img id='img' itemprop='propimg' src='data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAADUAAAAyCAYAAAD845PIAAAABHNCSVQICAgIfAhkiAAAAAlwSFlzAAAN1wAADdcBQiibeAAAABl0RVh0U29mdHdhcmUAd3d3Lmlua3NjYXBlLm9yZ5vuPBoAAAMeSURBVGiB1ZpNSBVhFIafoxaVZJs2/f9YYVkKFS5cCBUlUYRFCBJBULRoEbmqSE1DiDa1T9rVKojWLVpGtAmMoqKgjQsp8SeyH9PTYmbyqnO93zf3nnE8cHBzv3nfx3fud8/95oqqkkaJSAdwW1UnrbXKrAUARGQH0A20paGXChTQBZQDN0TEXNNcQER2Mp1QDdBqrZlGUjdn6XSIiFgKmkKJyG7mJlMLnLLUtU6qG4hLpdMyLTMoEaknfyL1wAkrbcukeohPKapOM2VVLXkD+wB16GMW+lZJ9Ti+ziYtg5QacEsp6iOLIalbnq/vKrmDEqfUiF9KUR/MclK+KUVV2rRKmFITyVKKuqlUXiQ05F0isgaoDnsbcJpgYE1ar4E+4CPwARjQhObyQolIObCRadO5AFuByiSCHjVOABhB/v+rqqPzLRSC/+52ZpquBjYDS8wsF1eDxMACn1V1AuAiMEVx74es9F/gTvQmPwdMZsBUsf0QqMjdvc6EpAttLGnfB8pUldnbciswkQGDvn1vBkfM581J4E8GjLp27xyGPB+kx4FfGTBcqK/H+p9nQmgGfmbAeFxPAZfzei8w+hwCfmQAIrcngfPz+nac6b5nAEYJNrG2gp4dh9VGYHSBgX4DLU5+PabwBmB4gYDGgWZnrz4jPbAXGEoZaAzPryVeUCFYXSiUBtAw0ODr0fubr6r2E2ypadR7VX3lu8gbSkQ2Aat81yWsXUkWJTmjqEsilLCqRGS976KsQ0HwlMSrFgOU9y24GKBskxKR5QTnGWmW+e1XS/BAOs0yv/3SvvUgwQ6YFlQ/0At8TbjeLy3PEek5fmPOO4Jzj+jQdCXB03rfMavdbPYDvjma+AScJTzdibnOauAu7kcGfSZQwFoH8S/ABaDC8ZobgAcUPpp7YQV1dB7RAeASsNR3og6vXQM8Jv9J8YgV1NUYsUGgHViWBCZGYz/wLA/YOguoRzkCQ8A1oLIUMDFaB4CXs6AOW0C9AUbC3avKAiZGswV4G0JdcV3n9DkV/pztCbBFVXtUdcxlXbGlqk+BPQQPMFa4rvsHSdpVSyJMR7IAAAAASUVORK5CYII='></img>
+	//!	<div id='div' itemprop='propdiv'></div>
+	//!	<DIV draggable='true' id='microdata' itemscope='true' itemref='div img'></DIV>
+}
+
+test("Image dnd, check OpDragObject")
+{
+	verify(state.doc->GetHtmlDocument());
+	OpPoint point;
+	verify(GetDragPoint(UNI_L("img"), point));
+	g_drag_manager->OnDragStart(NULL, state.doc->GetHtmlDocument(), point.x, point.y, SHIFTKEY_NONE, point.x, point.y);
+	OpDragObject* drag_object = g_drag_manager->GetDragObject();
+	verify(drag_object);
+	g_drag_manager->OnDragMove(state.doc->GetHtmlDocument(), 300, 150, SHIFTKEY_NONE);
+	g_drag_manager->OnDragMove(state.doc->GetHtmlDocument(), 300, 250, SHIFTKEY_NONE);
+	PrivateDragData* priv_data = static_cast<PrivateDragData*>(drag_object->GetPrivateData());
+	verify(priv_data);
+	verify(!priv_data->IsSelection());
+	verify(drag_object->GetDataCount() == 4);
+
+	verify(CompareStringData(0, UNI_L("text/plain"), UNI_L("data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAADUAAAAyCAYAAAD845PIAAAABHNCSVQICAgIfAhkiAAAAAlwSFlzAAAN1wAADdcBQiibeAAAABl0RVh0U29mdHdhcmUAd3d3Lmlua3NjYXBlLm9yZ5vuPBoAAAMeSURBVGiB1ZpNSBVhFIafoxaVZJs2/f9YYVkKFS5cCBUlUYRFCBJBULRoEbmqSE1DiDa1T9rVKojWLVpGtAmMoqKgjQsp8SeyH9PTYmbyqnO93zf3nnE8cHBzv3nfx3fud8/95oqqkkaJSAdwW1UnrbXKrAUARGQH0A20paGXChTQBZQDN0TEXNNcQER2Mp1QDdBqrZlGUjdn6XSIiFgKmkKJyG7mJlMLnLLUtU6qG4hLpdMyLTMoEaknfyL1wAkrbcukeohPKapOM2VVLXkD+wB16GMW+lZJ9Ti+ziYtg5QacEsp6iOLIalbnq/vKrmDEqfUiF9KUR/MclK+KUVV2rRKmFITyVKKuqlUXiQ05F0isgaoDnsbcJpgYE1ar4E+4CPwARjQhObyQolIObCRadO5AFuByiSCHjVOABhB/v+rqqPzLRSC/+52ZpquBjYDS8wsF1eDxMACn1V1AuAiMEVx74es9F/gTvQmPwdMZsBUsf0QqMjdvc6EpAttLGnfB8pUldnbciswkQGDvn1vBkfM581J4E8GjLp27xyGPB+kx4FfGTBcqK/H+p9nQmgGfmbAeFxPAZfzei8w+hwCfmQAIrcngfPz+nac6b5nAEYJNrG2gp4dh9VGYHSBgX4DLU5+PabwBmB4gYDGgWZnrz4jPbAXGEoZaAzPryVeUCFYXSiUBtAw0ODr0fubr6r2E2ypadR7VX3lu8gbSkQ2Aat81yWsXUkWJTmjqEsilLCqRGS976KsQ0HwlMSrFgOU9y24GKBskxKR5QTnGWmW+e1XS/BAOs0yv/3SvvUgwQ6YFlQ/0At8TbjeLy3PEek5fmPOO4Jzj+jQdCXB03rfMavdbPYDvjma+AScJTzdibnOauAu7kcGfSZQwFoH8S/ABaDC8ZobgAcUPpp7YQV1dB7RAeASsNR3og6vXQM8Jv9J8YgV1NUYsUGgHViWBCZGYz/wLA/YOguoRzkCQ8A1oLIUMDFaB4CXs6AOW0C9AUbC3avKAiZGswV4G0JdcV3n9DkV/pztCbBFVXtUdcxlXbGlqk+BPQQPMFa4rvsHSdpVSyJMR7IAAAAASUVORK5CYII=")));
+	verify(CompareStringData(1, UNI_L("application/microdata+json"), UNI_L("{\"items\":[]}")));
+	verify(CompareStringData(2, UNI_L("text/uri-list"), UNI_L("data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAADUAAAAyCAYAAAD845PIAAAABHNCSVQICAgIfAhkiAAAAAlwSFlzAAAN1wAADdcBQiibeAAAABl0RVh0U29mdHdhcmUAd3d3Lmlua3NjYXBlLm9yZ5vuPBoAAAMeSURBVGiB1ZpNSBVhFIafoxaVZJs2/f9YYVkKFS5cCBUlUYRFCBJBULRoEbmqSE1DiDa1T9rVKojWLVpGtAmMoqKgjQsp8SeyH9PTYmbyqnO93zf3nnE8cHBzv3nfx3fud8/95oqqkkaJSAdwW1UnrbXKrAUARGQH0A20paGXChTQBZQDN0TEXNNcQER2Mp1QDdBqrZlGUjdn6XSIiFgKmkKJyG7mJlMLnLLUtU6qG4hLpdMyLTMoEaknfyL1wAkrbcukeohPKapOM2VVLXkD+wB16GMW+lZJ9Ti+ziYtg5QacEsp6iOLIalbnq/vKrmDEqfUiF9KUR/MclK+KUVV2rRKmFITyVKKuqlUXiQ05F0isgaoDnsbcJpgYE1ar4E+4CPwARjQhObyQolIObCRadO5AFuByiSCHjVOABhB/v+rqqPzLRSC/+52ZpquBjYDS8wsF1eDxMACn1V1AuAiMEVx74es9F/gTvQmPwdMZsBUsf0QqMjdvc6EpAttLGnfB8pUldnbciswkQGDvn1vBkfM581J4E8GjLp27xyGPB+kx4FfGTBcqK/H+p9nQmgGfmbAeFxPAZfzei8w+hwCfmQAIrcngfPz+nac6b5nAEYJNrG2gp4dh9VGYHSBgX4DLU5+PabwBmB4gYDGgWZnrz4jPbAXGEoZaAzPryVeUCFYXSiUBtAw0ODr0fubr6r2E2ypadR7VX3lu8gbSkQ2Aat81yWsXUkWJTmjqEsilLCqRGS976KsQ0HwlMSrFgOU9y24GKBskxKR5QTnGWmW+e1XS/BAOs0yv/3SvvUgwQ6YFlQ/0At8TbjeLy3PEek5fmPOO4Jzj+jQdCXB03rfMavdbPYDvjma+AScJTzdibnOauAu7kcGfSZQwFoH8S/ABaDC8ZobgAcUPpp7YQV1dB7RAeASsNR3og6vXQM8Jv9J8YgV1NUYsUGgHViWBCZGYz/wLA/YOguoRzkCQ8A1oLIUMDFaB4CXs6AOW0C9AUbC3avKAiZGswV4G0JdcV3n9DkV/pztCbBFVXtUdcxlXbGlqk+BPQQPMFa4rvsHSdpVSyJMR7IAAAAASUVORK5CYII=\r\n")));
+	verify(CompareStringData(3, UNI_L("text/html"), UNI_L("<img id=\"img\" itemprop=\"propimg\" src=\"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAADUAAAAyCAYAAAD845PIAAAABHNCSVQICAgIfAhkiAAAAAlwSFlzAAAN1wAADdcBQiibeAAAABl0RVh0U29mdHdhcmUAd3d3Lmlua3NjYXBlLm9yZ5vuPBoAAAMeSURBVGiB1ZpNSBVhFIafoxaVZJs2/f9YYVkKFS5cCBUlUYRFCBJBULRoEbmqSE1DiDa1T9rVKojWLVpGtAmMoqKgjQsp8SeyH9PTYmbyqnO93zf3nnE8cHBzv3nfx3fud8/95oqqkkaJSAdwW1UnrbXKrAUARGQH0A20paGXChTQBZQDN0TEXNNcQER2Mp1QDdBqrZlGUjdn6XSIiFgKmkKJyG7mJlMLnLLUtU6qG4hLpdMyLTMoEaknfyL1wAkrbcukeohPKapOM2VVLXkD+wB16GMW+lZJ9Ti+ziYtg5QacEsp6iOLIalbnq/vKrmDEqfUiF9KUR/MclK+KUVV2rRKmFITyVKKuqlUXiQ05F0isgaoDnsbcJpgYE1ar4E+4CPwARjQhObyQolIObCRadO5AFuByiSCHjVOABhB/v+rqqPzLRSC/+52ZpquBjYDS8wsF1eDxMACn1V1AuAiMEVx74es9F/gTvQmPwdMZsBUsf0QqMjdvc6EpAttLGnfB8pUldnbciswkQGDvn1vBkfM581J4E8GjLp27xyGPB+kx4FfGTBcqK/H+p9nQmgGfmbAeFxPAZfzei8w+hwCfmQAIrcngfPz+nac6b5nAEYJNrG2gp4dh9VGYHSBgX4DLU5+PabwBmB4gYDGgWZnrz4jPbAXGEoZaAzPryVeUCFYXSiUBtAw0ODr0fubr6r2E2ypadR7VX3lu8gbSkQ2Aat81yWsXUkWJTmjqEsilLCqRGS976KsQ0HwlMSrFgOU9y24GKBskxKR5QTnGWmW+e1XS/BAOs0yv/3SvvUgwQ6YFlQ/0At8TbjeLy3PEek5fmPOO4Jzj+jQdCXB03rfMavdbPYDvjma+AScJTzdibnOauAu7kcGfSZQwFoH8S/ABaDC8ZobgAcUPpp7YQV1dB7RAeASsNR3og6vXQM8Jv9J8YgV1NUYsUGgHViWBCZGYz/wLA/YOguoRzkCQ8A1oLIUMDFaB4CXs6AOW0C9AUbC3avKAiZGswV4G0JdcV3n9DkV/pztCbBFVXtUdcxlXbGlqk+BPQQPMFa4rvsHSdpVSyJMR7IAAAAASUVORK5CYII=\">")));
+
+	g_drag_manager->OnDragDrop(250, 250, SHIFTKEY_NONE);
+}
+finally
+{
+	EndDrag();
+}
+
+test("Non-draggable, check OpDragObject")
+{
+	verify(state.doc->GetHtmlDocument());
+	OpPoint point;
+	verify(GetDragPoint(UNI_L("div"), point));
+	g_drag_manager->OnDragStart(NULL, state.doc->GetHtmlDocument(), point.x, point.y, SHIFTKEY_NONE, point.x, point.y);
+	OpDragObject* drag_object = g_drag_manager->GetDragObject();
+	verify(!drag_object);
+}
+finally
+{
+	EndDrag();
+}
+
+test("Simple Microdata, check OpDragObject")
+{
+	verify(state.doc->GetHtmlDocument());
+	OpPoint point;
+	verify(GetDragPoint(UNI_L("microdata"), point));
+	g_drag_manager->OnDragStart(NULL, state.doc->GetHtmlDocument(), point.x, point.y, SHIFTKEY_NONE, point.x, point.y);
+	OpDragObject* drag_object = g_drag_manager->GetDragObject();
+	verify(drag_object);
+	g_drag_manager->OnDragMove(state.doc->GetHtmlDocument(), 600, 150, SHIFTKEY_NONE);
+	g_drag_manager->OnDragMove(state.doc->GetHtmlDocument(), 600, 250, SHIFTKEY_NONE);
+	PrivateDragData* priv_data = static_cast<PrivateDragData*>(drag_object->GetPrivateData());
+	verify(priv_data);
+	verify(!priv_data->IsSelection());
+	verify(drag_object->GetDataCount() == 2);
+	verify(CompareStringData(0, UNI_L("application/microdata+json"), UNI_L("{\"items\":[{\"properties\":{\"propimg\":[\"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAADUAAAAyCAYAAAD845PIAAAABHNCSVQICAgIfAhkiAAAAAlwSFlzAAAN1wAADdcBQiibeAAAABl0RVh0U29mdHdhcmUAd3d3Lmlua3NjYXBlLm9yZ5vuPBoAAAMeSURBVGiB1ZpNSBVhFIafoxaVZJs2/f9YYVkKFS5cCBUlUYRFCBJBULRoEbmqSE1DiDa1T9rVKojWLVpGtAmMoqKgjQsp8SeyH9PTYmbyqnO93zf3nnE8cHBzv3nfx3fud8/95oqqkkaJSAdwW1UnrbXKrAUARGQH0A20paGXChTQBZQDN0TEXNNcQER2Mp1QDdBqrZlGUjdn6XSIiFgKmkKJyG7mJlMLnLLUtU6qG4hLpdMyLTMoEaknfyL1wAkrbcukeohPKapOM2VVLXkD+wB16GMW+lZJ9Ti+ziYtg5QacEsp6iOLIalbnq/vKrmDEqfUiF9KUR/MclK+KUVV2rRKmFITyVKKuqlUXiQ05F0isgaoDnsbcJpgYE1ar4E+4CPwARjQhObyQolIObCRadO5AFuByiSCHjVOABhB/v+rqqPzLRSC/+52ZpquBjYDS8wsF1eDxMACn1V1AuAiMEVx74es9F/gTvQmPwdMZsBUsf0QqMjdvc6EpAttLGnfB8pUldnbciswkQGDvn1vBkfM581J4E8GjLp27xyGPB+kx4FfGTBcqK/H+p9nQmgGfmbAeFxPAZfzei8w+hwCfmQAIrcngfPz+nac6b5nAEYJNrG2gp4dh9VGYHSBgX4DLU5+PabwBmB4gYDGgWZnrz4jPbAXGEoZaAzPryVeUCFYXSiUBtAw0ODr0fubr6r2E2ypadR7VX3lu8gbSkQ2Aat81yWsXUkWJTmjqEsilLCqRGS976KsQ0HwlMSrFgOU9y24GKBskxKR5QTnGWmW+e1XS/BAOs0yv/3SvvUgwQ6YFlQ/0At8TbjeLy3PEek5fmPOO4Jzj+jQdCXB03rfMavdbPYDvjma+AScJTzdibnOauAu7kcGfSZQwFoH8S/ABaDC8ZobgAcUPpp7YQV1dB7RAeASsNR3og6vXQM8Jv9J8YgV1NUYsUGgHViWBCZGYz/wLA/YOguoRzkCQ8A1oLIUMDFaB4CXs6AOW0C9AUbC3avKAiZGswV4G0JdcV3n9DkV/pztCbBFVXtUdcxlXbGlqk+BPQQPMFa4rvsHSdpVSyJMR7IAAAAASUVORK5CYII=\"],\"propdiv\":[\"\"]}}]}")));
+	verify(CompareStringData(1, UNI_L("text/html"), UNI_L("<div draggable=\"true\" id=\"microdata\" itemscope=\"true\" itemref=\"div img\"></div>")));
+
+	g_drag_manager->OnDragDrop(250, 250, SHIFTKEY_NONE);
+}
+finally
+{
+	EndDrag();
+}
+

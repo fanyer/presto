@@ -1,0 +1,135 @@
+group "webfeeds.entrylist";
+require init;
+require WEBFEEDS_BACKEND_SUPPORT;
+
+include "modules/webfeeds/src/webfeed.h";
+include "modules/webfeeds/src/webfeedentry.h";
+
+language C++;
+
+global
+{
+	BOOL is_sorted(OpFeedEntry* first)
+	{
+		if (!first)
+			return TRUE;
+		
+		OpFeedEntry* pred = first;
+		for (OpFeedEntry* e = first->GetNext(); e; e = e->GetNext())
+		{
+			if (pred->GetPublicationDate() < e->GetPublicationDate())
+				return FALSE;
+			
+			pred = e;
+		}
+		
+		return TRUE;
+	}
+	
+	OpFeedEntry* findId(OpFeedEntry* first, const uni_char* id)
+	{
+		if (!first)
+			return NULL;
+		
+		for (OpFeedEntry* e = first; e; e = e->GetNext())
+			if (uni_strcmp(e->GetGuid(), id) == 0)
+				return e;
+
+		return NULL;
+	}
+	
+	BOOL has_duplicates(OpFeedEntry* first)
+	{
+		if (!first || !first->GetNext())
+			return FALSE;
+
+		for (OpFeedEntry* e = first; e; e = e->GetNext())
+			if (findId(e->GetNext(), e->GetGuid()))
+				return TRUE;
+
+		return has_duplicates(first->GetNext());
+	}
+}
+
+test("Adding entries")
+{
+	OpAutoPtr<WebFeed> feed(OP_NEW(WebFeed, ())); verify(feed.get() && feed->Init() == OpStatus::OK);
+	feed->SetMaxAge(UINT_MAX);
+	
+	WebFeedContentElement* title = OP_NEW(WebFeedContentElement, ()); verify(title != NULL);
+	OpString title_string; title_string.Set(UNI_L("Some unique title"));
+	title->SetValue(title_string);
+
+	verify(feed->GetFirstEntry() == NULL);
+
+	OP_STATUS status;
+
+	WebFeedEntry* e1 = OP_NEW(WebFeedEntry, ()); verify(e1 && e1->Init() == OpStatus::OK);
+	e1->SetPublicationDate(5);
+	e1->SetGuid(UNI_L("file://1"));
+	TRAP(status, feed->AddEntryL(e1));
+	verify(status == OpStatus::OK);
+	e1->DecRef();
+
+	verify(is_sorted((WebFeedEntry*)feed->GetFirstEntry()) && !has_duplicates((WebFeedEntry*)feed->GetFirstEntry()));
+
+	// Add a later entry:
+	WebFeedEntry* e2 = OP_NEW(WebFeedEntry, ()); verify(e2 && e2->Init() == OpStatus::OK);
+	e2->SetPublicationDate(8);
+	e2->SetGuid(UNI_L("file://2"));
+	feed->AddEntryL(e2);
+	e2->DecRef();
+
+	verify(is_sorted((WebFeedEntry*)feed->GetFirstEntry()) && !has_duplicates((WebFeedEntry*)feed->GetFirstEntry()));
+
+	// Add an earlier entry:
+	WebFeedEntry* e3 = OP_NEW(WebFeedEntry, ()); verify(e3 && e3->Init() == OpStatus::OK);
+	e3->SetPublicationDate(2);
+	e3->SetTitle(title);
+	e3->SetGuid(UNI_L("file://3"));
+	feed->AddEntryL(e3);
+	e3->DecRef();
+
+	verify(is_sorted((WebFeedEntry*)feed->GetFirstEntry()) && !has_duplicates((WebFeedEntry*)feed->GetFirstEntry()));
+
+	// Add an entry with same date and id as first entry:
+	WebFeedEntry* e4 = OP_NEW(WebFeedEntry, ()); verify(e4 && e4->Init() == OpStatus::OK);
+	e4->SetPublicationDate(5);
+	e4->SetGuid(UNI_L("file://1"));
+	feed->AddEntryL(e4);
+	e4->DecRef();
+	
+	verify(is_sorted((WebFeedEntry*)feed->GetFirstEntry()) && !has_duplicates((WebFeedEntry*)feed->GetFirstEntry()));
+
+	// Add an entry with same id and updated time as second entry:
+	// Add a later entry:
+	WebFeedEntry* e5 = OP_NEW(WebFeedEntry, ()); verify(e5 && e5->Init() == OpStatus::OK);
+	e5->SetPublicationDate(10);
+	e5->SetTitle(title);
+	e5->SetGuid(UNI_L("file://2"));
+	feed->AddEntryL(e5);
+	e5->DecRef();
+
+	verify(is_sorted((WebFeedEntry*)feed->GetFirstEntry()) && !has_duplicates((WebFeedEntry*)feed->GetFirstEntry()));
+	
+	// Add a duplicate without guid (but with same title and timestamp), and check that it is not added:
+	WebFeedEntry* e6 = OP_NEW(WebFeedEntry, ()); verify(e6 && e6->Init() == OpStatus::OK);
+	e6->SetPublicationDate(10);
+	e6->SetTitle(title);
+	feed->AddEntryL(e6);
+	e6->DecRef();
+
+	// Should now be 3 entries in list
+
+	OpFeedEntry* e = feed->GetFirstEntry();
+	verify(e && e->GetPublicationDate() == 10 && uni_strcmp(e->GetGuid(), UNI_L("file://2")) == 0);
+	e = e->GetNext();
+	verify(e && e->GetPublicationDate() == 5 && uni_strcmp(e->GetGuid(), UNI_L("file://1")) == 0);
+	e = e->GetNext();
+	verify(e && e->GetPublicationDate() == 2 && uni_strcmp(e->GetGuid(), UNI_L("file://3")) == 0);
+	verify(e->GetNext() == NULL);
+
+	title->DecRef();
+	feed->DecRef();
+	feed.release();
+}

@@ -1,0 +1,265 @@
+/* -*- Mode: c++; tab-width: 4; indent-tabs-mode: t; c-basic-offset: 4 -*- */
+
+group "layout.screenshots";
+
+require MDF_FREETYPE_SUPPORT;
+
+include "modules/display/vis_dev.h";
+include "modules/img/image.h";
+include "modules/img/decoderfactorypng.h";
+include "modules/windowcommander/OpWindowCommander.h";
+include "modules/windowcommander/src/WindowCommander.h";
+include "modules/doc/frm_doc.h";
+include "modules/dochand/win.h";
+include "modules/dochand/fdelm.h";
+include "modules/hardcore/timer/optimer.h";
+
+global
+{
+	OpString test_path;
+
+	class WaitUntilLoadedObj : public OpTimerListener
+	{
+	public:
+		OpTimer *m_timer;
+
+		char refpath[200]; /* ARRAY OK 2011-09-15 mstensho */
+
+		OP_STATUS VerifyImage(const char* refimage, int width, int height, BOOL generate)
+		{
+			VisualDevice* vd = state.doc->GetVisualDevice();
+
+			OpBitmap* bitmap_to_paint;
+			RETURN_IF_ERROR(OpBitmap::Create(&bitmap_to_paint, width, height, FALSE, FALSE, 0, 0, TRUE));
+
+			OpPainter* painter = bitmap_to_paint->GetPainter();
+			if (!painter)
+			{
+				OP_DELETE(bitmap_to_paint);
+				return OpStatus::ERR;
+			}
+
+			CoreViewContainer* cview = vd->GetView()->GetContainer();
+			cview->Paint(OpRect(0, 0, width, height), painter, 0, 0, TRUE, FALSE);
+
+			bitmap_to_paint->ReleasePainter();
+
+			OP_STATUS status = DecoderFactoryPng::verify(refimage, bitmap_to_paint, height, 5, 0, generate);
+			if (OpStatus::IsError(status))
+			{
+				OpString8 refimage_failed;
+				refimage_failed.Set(refimage);
+				refimage_failed.Insert(op_strlen(refimage) - 4, "_failed");
+				DecoderFactoryPng::verify(refimage_failed.CStr(), bitmap_to_paint, height, 5, 0, TRUE);
+			}
+
+			OP_DELETE(bitmap_to_paint);
+
+			return status;
+		}
+
+		WaitUntilLoadedObj(char* rp)
+		{
+			op_strlcpy(refpath, rp, sizeof(refpath));
+
+			m_timer = OP_NEW(OpTimer, ());
+			if (m_timer)
+			{
+				m_timer->SetTimerListener(this);
+				m_timer->Start(100);
+			}
+			else
+				ST_failed("Out of memory");
+		}
+
+		~WaitUntilLoadedObj()
+		{
+			OP_DELETE(m_timer);
+		}
+
+		virtual void OnTimeOut(OpTimer* timer)
+		{
+			Window* window = g_selftest.utils->GetWindow();
+			FramesDocument* doc = window->GetCurrentDoc();
+
+			if (!doc)
+			{
+				ST_failed("Failed to get document manager\n");
+				OP_DELETE(this);
+				return;
+			}
+
+			LogicalDocument *logdoc = doc->GetLogicalDocument();
+
+			if (!logdoc)
+			{
+				ST_failed("Failed to get document\n");
+				OP_DELETE(this);
+				return;
+			}
+
+			if (doc->IsLoaded(TRUE))
+			{
+				if (OpStatus::IsError(doc->Reflow(FALSE)))
+				{
+					ST_failed("Reflow failed\n");
+					OP_DELETE(this);
+					return;
+				}
+
+				char* tn = 0;
+
+				BOOL generate = FALSE; // Turn to TRUE to generate new refimages.
+
+				// open ref image
+				tn = op_strdup(refpath);
+
+				if (!tn)
+				{
+					ST_failed("Failed to allocate string, OOM\n");
+					OP_DELETE(this);
+					return;
+				}
+
+				char *t = op_strrchr(tn, '.');
+
+				if (!t)
+				{
+					ST_failed("Incomplete path\n");
+					op_free(tn);
+					OP_DELETE(this);
+					return;
+				}
+
+				*t = 0;
+
+				OpString8 refimage;
+
+				if (refimage.Set(tn) != OpStatus::OK)
+				{
+					ST_failed("Failed to set string, OOM\n");
+					op_free(tn); OP_DELETE(this);
+					return;
+				}
+
+				if (refimage.Append(".png") != OpStatus::OK)
+				{
+					ST_failed("Failed to append string, OOM\n");
+					op_free(tn); OP_DELETE(this);
+					return;
+				}
+
+				// Use the size of the body element as imagesize.
+				RECT rect;
+
+				HTML_Element* body = logdoc->GetBodyElm();
+
+				if (!body)
+				{
+					ST_failed("Failed to get the body element\n");
+					op_free(tn); OP_DELETE(this);
+					return;
+				}
+
+				if (!body->GetBoxRect(doc, BOUNDING_BOX, rect))
+				{
+					ST_failed("Failed to get the body rect\n");
+					op_free(tn); OP_DELETE(this);
+					return;
+				}
+
+				int width = rect.right - rect.left;
+				int height = rect.bottom - rect.top;
+				VisualDevice *vd = doc->GetVisualDevice();
+
+				if (!vd)
+				{
+					ST_failed("Failed to get visualdevice\n");
+					op_free(tn); OP_DELETE(this);
+					return;
+				}
+
+				BOOL success = OpStatus::IsSuccess(VerifyImage(refimage.CStr(), vd->ScaleToScreen(width), vd->ScaleToScreen(height), generate));
+
+				op_free(tn);
+				OP_DELETE(this);
+
+				if (success)
+					ST_passed();
+				else
+					ST_failed("Image mismatch\n");
+			}
+			else
+				m_timer->Start(10);
+		}
+	};
+	void WaitUntilLoaded(char* file)
+	{
+		if (!(OP_NEW(WaitUntilLoadedObj, (file))))
+			ST_failed("Out of memory\n");
+	}
+}
+
+setup
+{
+}
+
+exit
+{
+}
+
+html
+{
+	//! <!-- Dummy document, to give the selftest system an extra kick.
+	//!      If this test is run separately, state.doc would be NULL otherwise,
+	//!      and we would crash. -->
+}
+
+table test_files(char*) filelist "tests" name "*.html";
+
+/* Manually reference images to have them properly copied to the selftest dir */
+table ref_images(char*) filelist "tests" name "*.png";
+table sample_image(char*) filelist "tests" name "sample.gif";
+
+foreach (FILE) from test_files
+{
+	test("$(FILE)") async;
+	require undefined ADAPTIVE_ZOOM_SUPPORT;
+	{
+		if (test_path.Set(FILE) == OpStatus::OK)
+		{
+			int i = test_path.Length() - 1;
+
+			while (i >= 0 && test_path[i] != '\\' && test_path[i] != '/')
+				i--;
+
+			if (i >= 0)
+			{
+				test_path.Delete(i);
+
+				if (test_path.Append(UNI_L("/")) == OpStatus::OK)
+				{
+					OpString file;
+
+					if (file.Set(FILE) == OpStatus::OK)
+					{
+						state.doc->GetWindow()->SetScale(100);
+						OpWindowCommander::OpenURLOptions options;
+						options.entered_by_user = TRUE;
+						state.doc->GetWindow()->GetWindowCommander()->OpenURL(file.CStr(), options);
+
+						WaitUntilLoaded(FILE);
+					}
+					else
+						ST_failed("Failed to setup test, OOM\n");
+				}
+				else
+					ST_failed("Failed to setup test, OOM\n");
+			}
+			else
+				ST_failed("Problematic test path\n");
+		}
+		else
+			ST_failed("Failed to setup test, OOM\n");
+	}
+}

@@ -1,0 +1,260 @@
+/* -*- Mode: c++; tab-width: 4; indent-tabs-mode: t; c-basic-offset: 4 -*-
+**
+** Copyright (C) 2009-2012 Opera Software ASA.  All rights reserved.
+**
+** This file is part of the Opera web browser.
+** It may not be distributed under any circumstances.
+*/
+
+group "url Dynamic Attribute API int";
+
+//disabled;
+require init;
+
+include "core/pch.h";
+include "modules/url/url2.h";
+include "modules/url/url_man.h";
+include "modules/url/url_ds.h";
+include "modules/url/url_dynattr.h";
+include "modules/url/url_dynattr_int.h";
+
+
+global {
+
+	URL_DynamicUIntAttributeHandler default_handler;
+	URL_DynamicUIntAttributeHandler flag_handler;
+
+	URL::URL_Uint32Attribute  first_attr;
+	URL::URL_Uint32Attribute  second_attr;
+	URL::URL_Uint32Attribute  flag_attr[64];
+}
+
+
+setup
+{
+	first_attr = URL::KNoInt;
+	second_attr = URL::KNoInt;
+	for(size_t i=0;i<ARRAY_SIZE(flag_attr); i++)
+		flag_attr[i] = URL::KNoInt;
+
+	flag_handler.SetIsFlag(TRUE);
+}
+
+exit
+{
+}
+
+test("Set up attributes")
+{
+	OP_MEMORY_VAR OP_STATUS op_err = OpStatus::OK;
+	OP_MEMORY_VAR size_t i;
+
+	TRAP(op_err, first_attr = g_url_api->RegisterAttributeL(&default_handler));
+	verify(OpStatus::IsSuccess(op_err));
+	verify(first_attr >= URL::KFirstUintDynamicAttributeItem);
+
+	TRAP(op_err, second_attr = g_url_api->RegisterAttributeL(&default_handler));
+	verify(OpStatus::IsSuccess(op_err));
+	verify(second_attr >= URL::KFirstUintDynamicAttributeItem);
+
+
+	for(i=0;i<ARRAY_SIZE(flag_attr); i++)
+	{
+		TRAP(op_err, flag_attr[i] = g_url_api->RegisterAttributeL(&flag_handler));
+		verify(OpStatus::IsSuccess(op_err));
+		verify(flag_attr[i] >= URL::KFirstUintDynamicAttributeItem);
+	}
+
+	const URL_DynamicUIntAttributeDescriptor *desc;
+
+	desc = urlManager->FindAttribute(first_attr);
+
+	verify(desc != NULL);
+	verify(desc->GetAttributeID() == first_attr);
+	verify(desc->GetIsFlag() == FALSE);
+
+	uint32 val;
+	uint32 test_val;
+	URL test_url = g_url_api->GetURL("http://www.opera.com/", (const char *)NULL, TRUE);
+	verify(test_url.IsValid());
+	URL test_url2 = g_url_api->GetURL("http://www.opera.com/", (const char *)NULL, TRUE);
+	verify(test_url2.IsValid());
+
+	for(test_val= 0; test_val < 16000; test_val += 560)
+	{
+		val = test_val;
+		BOOL set = FALSE;
+		verify(OpStatus::IsSuccess(desc->OnSetValue(test_url, NULL, val, set)));
+
+		verify(set == TRUE);
+		verify(val == test_val);
+
+		verify(OpStatus::IsSuccess(desc->OnGetValue(test_url, val)));
+		verify(val == test_val);
+	}
+
+	for(test_val= 0; test_val < 16000; test_val += 560)
+	{
+		verify(OpStatus::IsSuccess(test_url2.SetAttribute(first_attr, test_val)));
+
+		val = test_url2.GetAttribute(first_attr);
+		verify(val == test_val);
+	}
+
+
+	desc = urlManager->FindAttribute(second_attr);
+
+	verify(desc != NULL);
+	verify(desc->GetAttributeID() == second_attr);
+	verify(desc->GetIsFlag() == FALSE);
+
+	for(test_val= 1; test_val < 16000; test_val += 560)
+	{
+		val = test_val;
+		BOOL set = FALSE;
+		verify(OpStatus::IsSuccess(desc->OnSetValue(test_url, NULL, val, set)));
+
+		verify(set == TRUE);
+		verify(val == test_val);
+
+		verify(OpStatus::IsSuccess(desc->OnGetValue(test_url, val)));
+		verify(val == test_val);
+	}
+
+	for(test_val= 1; test_val < 16000; test_val += 560)
+	{
+		verify(OpStatus::IsSuccess(test_url2.SetAttribute(second_attr, test_val)));
+
+		val = test_url2.GetAttribute(second_attr);
+		verify(val == test_val);
+	}
+
+	const URL_DynamicUIntAttributeDescriptor *flag_descs[ARRAY_SIZE(flag_attr)];
+	BOOL flags_checkers[ARRAY_SIZE(flag_attr)];
+	BOOL visited[ARRAY_SIZE(flag_attr)];
+
+	size_t num_flags = ARRAY_SIZE(flag_attr);
+
+	for(i = 0; i<num_flags; i++)
+	{
+		flags_checkers[i] = visited[i] = FALSE;
+		flag_descs[i] = desc = urlManager->FindAttribute(flag_attr[i]);
+
+		verify(desc != NULL);
+		verify(desc->GetAttributeID() == flag_attr[i]);
+		verify(desc->GetIsFlag() == TRUE);
+		verify(desc->GetFlagAttributeId() >= URL::KFirstUintDynamicAttributeItem);
+
+		uint32 mask = desc->GetFlagMask();
+		verify(mask != 0);
+
+		while((mask & 0x01) != 1)
+			mask >>= 1;
+
+		verify(mask == 1);
+	}
+
+	size_t rounds =0;
+
+	while(1)
+	{
+		for(i=0; i< num_flags; i++)
+			if(!visited[i])
+				break;
+
+		if(i>=num_flags)
+			break;
+
+		rounds ++;
+		size_t item = i;
+		URL::URL_Uint32Attribute current_buffer = flag_descs[item]->GetFlagAttributeId();
+		uint32 mask_ref = flag_descs[item]->GetFlagMask();
+		for(i=0; i< num_flags; i++)
+		{
+		if(i != item &&  flag_descs[i]->GetFlagAttributeId() == current_buffer)
+		{
+			uint32 current_mask = flag_descs[i]->GetFlagMask();
+			verify((current_mask & mask_ref) == 0);
+
+			for(size_t j = i+1; j <num_flags; j++)
+			{
+				if(flag_descs[j]->GetFlagAttributeId() == current_buffer)
+					verify((flag_descs[j]->GetFlagMask() & current_mask) == 0);
+			}
+
+			visited[i] = TRUE;
+			}
+		}
+		visited[item] = TRUE;
+	}
+
+	verify(rounds <=  ((num_flags+ 31)/32 +1));
+
+	for(i = 0; i<num_flags; i++)
+	{
+		desc = flag_descs[i];
+		uint32 check = static_cast<uint32>(flags_checkers[i]);
+		URL::URL_Uint32Attribute attr = flag_attr[i];
+
+		val = 0;
+		verify(OpStatus::IsSuccess(desc->OnGetValue(test_url, val)));
+		verify(val == check);
+		val = test_url2.GetAttribute(attr);
+		verify(val == check);
+	}
+
+	for(i = 2; i< num_flags; i+=5)
+		flags_checkers[i] = TRUE;
+
+	for(i = 0; i< num_flags; i++)
+	{
+		desc = flag_descs[i];
+
+		uint32 check = static_cast<uint32>(flags_checkers[i]);
+		URL::URL_Uint32Attribute attr = flag_attr[i];
+		val = check;
+		BOOL set = FALSE;
+		verify(OpStatus::IsSuccess(desc->OnSetValue(test_url, NULL, val, set)));
+
+		verify(set == FALSE);
+		verify(val == check);
+
+		val = 0;
+		verify(OpStatus::IsSuccess(desc->OnGetValue(test_url, val)));
+		verify(val == check);
+
+		verify(OpStatus::IsSuccess(test_url2.SetAttribute(attr, check)));
+
+		val = test_url2.GetAttribute(attr);
+		verify(val == check);
+	}
+
+	for(i = 0; i< num_flags; i++)
+		flags_checkers[i] = FALSE;
+	for(i = 3; i< num_flags; i+=5)
+		flags_checkers[i] = TRUE;
+
+	for(i = 0; i< num_flags; i++)
+	{
+		desc = flag_descs[i];
+
+		uint32 check = static_cast<uint32>(flags_checkers[i]);
+		URL::URL_Uint32Attribute attr = flag_attr[i];
+		val = (check ? i*30+3 : 0);
+		BOOL set = FALSE;
+		verify(OpStatus::IsSuccess(desc->OnSetValue(test_url, NULL, val, set)));
+
+		verify(set == FALSE);
+		verify(val == check);
+
+		val = 0;
+		verify(OpStatus::IsSuccess(desc->OnGetValue(test_url, val)));
+		verify(val == check);
+
+		val = (check ? i*30+5 : 0);
+		verify(OpStatus::IsSuccess(test_url2.SetAttribute(attr, val)));
+
+		val = test_url2.GetAttribute(attr);
+		verify(val == check);
+	}
+}

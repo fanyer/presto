@@ -1,0 +1,418 @@
+/* -*- mode: c++; tab-width: 4 -*-
+**
+** Copyright (C) 2009 Opera Software AS.  All rights reserved.
+**
+** This file is part of the Opera web browser.  It may not be distributed
+** under any circumstances.
+**
+** Test for Protocol Buffer wire format and proto types.
+**
+** Jan Borsodi
+*/
+
+group "protobuf.protocolbuffer";
+
+require init;
+require PROTOBUF_SUPPORT;
+
+language c++;
+
+include "modules/protobuf/src/protobuf.h";
+include "modules/protobuf/src/protobuf_data.h";
+include "modules/util/adt/bytebuffer.h";
+
+foreach (input, expected_size) from
+  {
+    {0x0,        1}
+   ,{0x7f,       1}
+   ,{0x80,       2}
+   ,{0x3fff,     2}
+   ,{0x4000,     3}
+   ,{0x1fffff,   3}
+   ,{0x200000,   4}
+   ,{0xfffffff,  4}
+   ,{0x10000000, 5}
+   ,{0x7fffffff, 5}
+   ,{-1,         5}
+   ,{-0x7f,      5}
+   ,{-0x3fff,    5}
+   ,{-0x1fffff,  5}
+   ,{-0xfffffff, 5}
+   ,{0x80000000, 5}
+  }
+{
+	test("Varint32 encoding size: $(input)")
+	{
+		int size = OpProtobufWireFormat::VarIntSize32(static_cast<UINT32>(input));
+		verify(size == expected_size);
+	}
+}
+
+foreach (input, expected_size) from
+  {
+    {0x0,                 1}
+   ,{0x7f,                1}
+   ,{0x80,                2}
+   ,{0x3fff,              2}
+   ,{0x4000,              3}
+   ,{0x1fffff,            3}
+   ,{0x200000,            4}
+   ,{0xfffffff,           4}
+   ,{0x10000000,          5}
+   ,{0x7ffffffff,         5}
+   ,{0x800000000,         6}
+   ,{0x3ffffffffff,       6}
+   ,{0x40000000000,       7}
+   ,{0x1ffffffffffff,     7}
+   ,{0x2000000000000,     8}
+   ,{0xffffffffffffff,    8}
+   ,{0x100000000000000,   9}
+   ,{0x7fffffffffffffff,  9}
+   ,{0xffffffffffffffff, 10} // -1
+   ,{0xffffffffffffff81, 10} // -0x7f
+   ,{0xffffffffffffc001, 10} // -0x3fff
+   ,{0xffffffffffe00001, 10} // -0x1fffff
+   ,{0xfffffffff0000001, 10} // -0xfffffff
+   ,{0xffffffff80000000, 10}
+  }
+{
+	test("Varint64 encoding size: $(input)")
+		require OP_PROTOBUF_64BIT_SUPPORT;
+	{
+		int size = OpProtobufWireFormat::VarIntSize64(OP_UINT64(input));
+		verify(size == expected_size);
+	}
+}
+
+foreach (type, number, expected_number) from
+  {
+    {OpProtobufWireFormat::VarInt,  0,  0}
+   ,{OpProtobufWireFormat::VarInt,  15, 0x78}
+   ,{OpProtobufWireFormat::Fixed32, 15, 0x7d}
+  }
+{
+	test("EncodeField32($(type), $(number))")
+	{
+		int encoded = OpProtobufWireFormat::EncodeField32(type, number);
+		verify(encoded == expected_number);
+	}
+}
+
+test("Field header size")
+{
+	int size = 0;
+	size = OpProtobufWireFormat::FieldHeaderSize(OpProtobufWireFormat::VarInt, 0);
+	verify(size == 1);
+	size = OpProtobufWireFormat::FieldHeaderSize(OpProtobufWireFormat::Fixed32, 15);
+	verify(size == 1);
+	size = OpProtobufWireFormat::FieldHeaderSize(OpProtobufWireFormat::Fixed32, 16);
+	verify(size == 2);
+}
+
+test("String size")
+{
+	OpString str;
+	int size, size2;
+	// Note: expected_size includes the size of the "size" field put before strings
+	foreach (input, len, expected_size) from
+	  {
+		 {"",           -1, 1}
+		,{"Sanxion",    -1, 8}
+		,{"Last V8",     4, 5}
+		,{"Last Ninja",  0, 1}
+	  }
+	{
+		str.SetL(input);
+		size = OpProtobufFormat::StringSize(str, len);
+		verify(size == expected_size);
+		size2 = OpProtobufFormat::StringSize(str.DataPtr(), len);
+		verify(size2 == expected_size);
+	}
+}
+
+test("Byte size")
+{
+	// Note: expected_size includes the size of the "size" field put before bytes
+	foreach (input, len, expected_size) from
+	  {
+		 {"",            0,  1}
+		,{"Sanxion",     7,  8}
+		,{"Last V8",     7,  8}
+		,{"Last Ninja", 10, 11}
+	  }
+	{
+		{
+			ByteBuffer buf;
+			int size;
+			const char data[] = input;
+			buf.AppendBytes(data, len);
+			OpProtobufDataChunkRange range(buf);
+			size = OpProtobufFormat::BytesSize(range);
+			verify(size == expected_size);
+		}
+	}
+}
+
+test("Field encode 32")
+{
+	UINT32 field1 = OpProtobufWireFormat::EncodeField32(OpProtobufWireFormat::VarInt, 15);
+	verify(field1 == 0x78);
+	UINT32 field2 = OpProtobufWireFormat::EncodeField32(OpProtobufWireFormat::Fixed32, 15);
+	verify(field2 == 0x7d);
+	UINT32 field3 = OpProtobufWireFormat::EncodeField32(OpProtobufWireFormat::Fixed32, 16);
+	verify(field3 == 0x85);
+	
+	verify(OpProtobufWireFormat::DecodeFieldType32(field1) == OpProtobufWireFormat::VarInt);
+	verify(OpProtobufWireFormat::DecodeFieldNumber32(field1) == 15);
+	verify(OpProtobufWireFormat::DecodeFieldType32(field2) == OpProtobufWireFormat::Fixed32);
+	verify(OpProtobufWireFormat::DecodeFieldNumber32(field2) == 15);
+	verify(OpProtobufWireFormat::DecodeFieldType32(field3) == OpProtobufWireFormat::Fixed32);
+	verify(OpProtobufWireFormat::DecodeFieldNumber32(field3) == 16);
+}
+
+test("Field encode 64")
+	require OP_PROTOBUF_64BIT_SUPPORT;
+{
+	UINT64 field1 = OpProtobufWireFormat::EncodeField64(OpProtobufWireFormat::VarInt, 15);
+	verify(field1 == 0x78);
+	UINT64 field2 = OpProtobufWireFormat::EncodeField64(OpProtobufWireFormat::Fixed32, 15);
+	verify(field2 == 0x7d);
+	UINT64 field3 = OpProtobufWireFormat::EncodeField64(OpProtobufWireFormat::Fixed32, 16);
+	verify(field3 == 0x85);
+	
+	verify(OpProtobufWireFormat::DecodeFieldType64(field1) == OpProtobufWireFormat::VarInt);
+	verify(OpProtobufWireFormat::DecodeFieldNumber64(field1) == 15);
+	verify(OpProtobufWireFormat::DecodeFieldType64(field2) == OpProtobufWireFormat::Fixed32);
+	verify(OpProtobufWireFormat::DecodeFieldNumber64(field2) == 15);
+	verify(OpProtobufWireFormat::DecodeFieldType64(field3) == OpProtobufWireFormat::Fixed32);
+	verify(OpProtobufWireFormat::DecodeFieldNumber64(field3) == 16);
+}
+
+foreach (decoded_value, encoded_size, encoded_value, input, input_size) from
+  {
+    {0x0,        1, {0x00}                        , {0x00},                         1}
+   ,{0x7f,       1, {0x7f}                        , {0x7f},                         1}
+   ,{0x80,       2, {0x80, 0x01}                  , {0x80, 0x01},                   2}
+   ,{0x3fff,     2, {0xff, 0x7f}                  , {0xff, 0x7f},                   2}
+   ,{0x4000,     3, {0x80, 0x80, 0x01}            , {0x80, 0x80, 0x01},             3}
+   ,{0x1fffff,   3, {0xff, 0xff, 0x7f}            , {0xff, 0xff, 0x7f},             3}
+   ,{0x200000,   4, {0x80, 0x80, 0x80, 0x01}      , {0x80, 0x80, 0x80, 0x01},       4}
+   ,{0xfffffff,  4, {0xff, 0xff, 0xff, 0x7f}      , {0xff, 0xff, 0xff, 0x7f},       4}
+   ,{0x10000000, 5, {0x80, 0x80, 0x80, 0x80, 0x01}, {0x80, 0x80, 0x80, 0x80, 0x01}, 5}
+   ,{0x7fffffff, 5, {0xff, 0xff, 0xff, 0xff, 0x07}, {0xff, 0xff, 0xff, 0xff, 0x07}, 5}
+   ,{-1,         5, {0xff, 0xff, 0xff, 0xff, 0x0f}, {0xff, 0xff, 0xff, 0xff, 0x0f}, 5}
+   ,{-0x7f,      5, {0x81, 0xff, 0xff, 0xff, 0x0f}, {0x81, 0xff, 0xff, 0xff, 0x0f}, 5}
+   ,{-0x3fff,    5, {0x81, 0x80, 0xff, 0xff, 0x0f}, {0x81, 0x80, 0xff, 0xff, 0x0f}, 5}
+   ,{-0x1fffff,  5, {0x81, 0x80, 0x80, 0xff, 0x0f}, {0x81, 0x80, 0x80, 0xff, 0x0f}, 5}
+   ,{-0xfffffff, 5, {0x81, 0x80, 0x80, 0x80, 0x0f}, {0x81, 0x80, 0x80, 0x80, 0x0f}, 5}
+   ,{0x80000000, 5, {0x80, 0x80, 0x80, 0x80, 0x08}, {0x80, 0x80, 0x80, 0x80, 0x08}, 5}
+
+   // These entries are valid protobuf varints even though they exceed the 5 byte limit of a 32bit varint
+   // The excess bytes should be parsed and then discarded.
+   // This is currently sent from the official implementation of protobuf for Java, as Java does not have
+   // unsigned values a negative int32 is extended to a 64bit value.
+   ,{0x80000000,  5, {0x80, 0x80, 0x80, 0x80, 0x08}, {0x80, 0x80, 0x80, 0x80, 0xf8, 0x7f},                          6 }
+   ,{0x80000000,  5, {0x80, 0x80, 0x80, 0x80, 0x08}, {0x80, 0x80, 0x80, 0x80, 0xf8, 0xff, 0x7f},                    7 }
+   ,{0x80000000,  5, {0x80, 0x80, 0x80, 0x80, 0x08}, {0x80, 0x80, 0x80, 0x80, 0xf8, 0xff, 0xff, 0x7f},              8 }
+   ,{0x80000000,  5, {0x80, 0x80, 0x80, 0x80, 0x08}, {0x80, 0x80, 0x80, 0x80, 0xf8, 0xff, 0xff, 0xff, 0x7f},        9 }
+   ,{0x80000000,  5, {0x80, 0x80, 0x80, 0x80, 0x08}, {0x80, 0x80, 0x80, 0x80, 0xf8, 0xff, 0xff, 0xff, 0xff, 0x01}, 10 }
+   ,{0xffffffffu, 5, {0xff, 0xff, 0xff, 0xff, 0x0f}, {0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x01}, 10 }
+  }
+{
+	test("Varint32 decoding: $(decoded_value)")
+	{
+		const unsigned char data[] = input;
+		int value, size;
+		verify(OpStatus::IsSuccess(OpProtobufWireFormat::DecodeVarInt32(data, data + sizeof(data), size, value)));
+		verify(size == input_size);
+		verify(value == (int)decoded_value);
+	}
+
+	test("Varint32 decoding failure: $(decoded_value)")
+	{
+		const unsigned char data[] = input;
+		int value, size;
+		// Note: Here we send the buffer end one byte to early, should cause decode failure
+		verify(OpStatus::IsError(OpProtobufWireFormat::DecodeVarInt32(data, data + sizeof(data) - 1, size, value)));
+		verify(size < input_size);
+	}
+
+	test("Varint32 encoding: $(decoded_value)")
+	{
+		const unsigned char expected_data[] = encoded_value;
+		char unsigned data[encoded_size];
+		int size;
+		verify(OpStatus::IsSuccess(OpProtobufWireFormat::EncodeVarInt32(reinterpret_cast<char *>(data), sizeof(data), size, static_cast<UINT32>(decoded_value))));
+		verify(size == encoded_size);
+		for (unsigned int i = 0; i < sizeof(data); ++i)
+			verify(expected_data[i] == data[i]);
+	}
+
+	test("Varint32 encoding failure: $(decoded_value)")
+	{
+		char unsigned data[encoded_size];
+		int size;
+		// Note: Here we send 1 missing byte from the buffer size, should cause encode failure
+		verify(OpStatus::IsError(OpProtobufWireFormat::EncodeVarInt32(reinterpret_cast<char *>(data), sizeof(data) - 1, size, static_cast<UINT32>(decoded_value))));
+	}
+}
+
+foreach (decoded_value, encoded_size, encoded_value) from
+  {
+    {0x0,                 1, {0x00} }
+   ,{0x7f,                1, {0x7f} }
+   ,{0x80,                2, {0x80, 0x01} }
+   ,{0x3fff,              2, {0xff, 0x7f} }
+   ,{0x4000,              3, {0x80, 0x80, 0x01} }
+   ,{0x1fffff,            3, {0xff, 0xff, 0x7f} }
+   ,{0x200000,            4, {0x80, 0x80, 0x80, 0x01} }
+   ,{0xfffffff,           4, {0xff, 0xff, 0xff, 0x7f} }
+   ,{0x10000000,          5, {0x80, 0x80, 0x80, 0x80, 0x01} }
+   ,{0x7fffffff,          5, {0xff, 0xff, 0xff, 0xff, 0x07} }
+   ,{0x80000000,          5, {0x80, 0x80, 0x80, 0x80, 0x08} }
+   ,{0x800000000,         6, {0x80, 0x80, 0x80, 0x80, 0x80, 0x01}}
+   ,{0x3ffffffffff,       6, {0xff, 0xff, 0xff, 0xff, 0xff, 0x7f}}
+   ,{0x40000000000,       7, {0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x01}}
+   ,{0x1ffffffffffff,     7, {0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x7f}}
+   ,{0x2000000000000,     8, {0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x01}}
+   ,{0xffffffffffffff,    8, {0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x7f}}
+   ,{0x100000000000000,   9, {0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x01}}
+   ,{0x7fffffffffffffff,  9, {0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x7f}}
+   ,{0xffffffffffffffff, 10, {0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x01}} // -1
+   ,{0xffffffffffffff81, 10, {0x81, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x01}} // -0x7f
+   ,{0xffffffffffffc001, 10, {0x81, 0x80, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x01}} // -0x3fff
+   ,{0xffffffffffe00001, 10, {0x81, 0x80, 0x80, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x01}} // -0x1fffff
+   ,{0xfffffffff0000001, 10, {0x81, 0x80, 0x80, 0x80, 0xff, 0xff, 0xff, 0xff, 0xff, 0x01}} // -0xfffffff
+   ,{0xffffffff80000000, 10, {0x80, 0x80, 0x80, 0x80, 0xf8, 0xff, 0xff, 0xff, 0xff, 0x01}}
+  }
+{
+	test("Varint64 decoding: $(decoded_value)")
+		require OP_PROTOBUF_64BIT_SUPPORT;
+	{
+		const unsigned char data[] = encoded_value;
+		INT64 value;
+		int size;
+		verify(OpStatus::IsSuccess(OpProtobufWireFormat::DecodeVarInt64(data, data + sizeof(data), size, value)));
+		verify(size == encoded_size);
+		verify((UINT64) value == OP_UINT64(decoded_value));
+	}
+
+	test("Varint64 decoding failure: $(decoded_value)")
+		require OP_PROTOBUF_64BIT_SUPPORT;
+	{
+		const unsigned char data[] = encoded_value;
+		INT64 value;
+		int size;
+		// Note: Here we send the buffer end one byte to early, should cause decode failure
+		verify(OpStatus::IsError(OpProtobufWireFormat::DecodeVarInt64(data, data + sizeof(data) - 1, size, value)));
+		verify(size < encoded_size);
+	}
+
+	test("Varint64 encoding: $(decoded_value)")
+		require OP_PROTOBUF_64BIT_SUPPORT;
+	{
+		const unsigned char expected_data[] = encoded_value;
+		char unsigned data[encoded_size];
+		int size;
+		verify(OpStatus::IsSuccess(OpProtobufWireFormat::EncodeVarInt64(reinterpret_cast<char *>(data), sizeof(data), size, OP_UINT64(decoded_value))));
+		verify(size == encoded_size);
+		for (unsigned int i = 0; i < sizeof(data); ++i)
+			verify(expected_data[i] == data[i]);
+	}
+
+	test("Varint64 encoding failure: $(decoded_value)")
+		require OP_PROTOBUF_64BIT_SUPPORT;
+	{
+		char unsigned data[encoded_size];
+		int size;
+		// Note: Here we send 1 missing byte from the buffer size, should cause encode failure
+		verify(OpStatus::IsError(OpProtobufWireFormat::EncodeVarInt64(reinterpret_cast<char *>(data), sizeof(data) - 1, size, OP_UINT64(decoded_value))));
+	}
+}
+
+test("Varint32 decoding overflow failure")
+{
+	const unsigned char data[] = {0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x01}; // VarInt32 can either decode 4 (bit 7 set) + 1 (bit 7 cleared) bytes or 5 extra bytes (bit 7 set) which are discarded
+	int value, size;
+	verify(OpStatus::IsError(OpProtobufWireFormat::DecodeVarInt32(data, data + sizeof(data), size, value)));
+	verify(0 <= size && (unsigned int)size < sizeof(data));
+}
+
+test("Varint64 decoding overflow failure")
+	require OP_PROTOBUF_64BIT_SUPPORT;
+{
+	const unsigned char data[] = {0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x01}; // VarInt64 can only decode 9 (bit 7 set) + 1 (bit 7 cleared) bytes
+	INT64 value;
+	int size;
+	verify(OpStatus::IsError(OpProtobufWireFormat::DecodeVarInt64(data, data + sizeof(data), size, value)));
+	verify(size < (INT64) sizeof(data));
+}
+
+foreach (decoded_value, encoded_value) from
+  {
+    {0x0,        {0x00, 0x00, 0x00, 0x00} }
+   ,{0x7f,       {0x7f, 0x00, 0x00, 0x00} }
+   ,{0xffffffff, {0xff, 0xff, 0xff, 0xff} }
+   ,{0xdeadbeef, {0xef, 0xbe, 0xad, 0xde} }
+  }
+{
+	test("Fixed32 decoding: $(decoded_value)")
+	{
+		const unsigned char data[] = encoded_value;
+		unsigned int value;
+		verify(OpStatus::IsSuccess(OpProtobufWireFormat::DecodeFixed32(data, value)));
+		verify(value == decoded_value);
+	}
+
+	test("Fixed32 encoding: $(decoded_value)")
+	{
+		const unsigned char expected_data[] = encoded_value;
+		char unsigned data[4];
+		verify(OpStatus::IsSuccess(OpProtobufWireFormat::EncodeFixed32(reinterpret_cast<char *>(data), sizeof(data), decoded_value)));
+		for (unsigned int i = 0; i < sizeof(data); ++i)
+			verify(expected_data[i] == data[i]);
+	}
+
+	test("Fixed32 encoding failure: $(decoded_value)")
+	{
+		char unsigned data[4];
+		// Note: Here we send 1 missing byte from the buffer size, should cause encode failure
+		verify(OpStatus::IsError(OpProtobufWireFormat::EncodeFixed32(reinterpret_cast<char *>(data), sizeof(data) - 1, decoded_value)));
+	}
+}
+
+foreach (decoded_value, encoded_value) from
+  {
+    {0x0,                {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00} }
+   ,{0x7f,               {0x7f, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00} }
+   ,{0xffffffffffffffff, {0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff} }
+   ,{0xdeadbeefcafebabe, {0xbe, 0xba, 0xfe, 0xca, 0xef, 0xbe, 0xad, 0xde} }
+  }
+{
+	test("Fixed64 decoding: $(decoded_value)")
+		require OP_PROTOBUF_64BIT_SUPPORT;
+	{
+		const unsigned char data[] = encoded_value;
+		UINT64 value;
+		verify(OpStatus::IsSuccess(OpProtobufWireFormat::DecodeFixed64(data, value)));
+		verify(value == OP_UINT64(decoded_value));
+	}
+
+	test("Fixed64 encoding: $(decoded_value)")
+		require OP_PROTOBUF_64BIT_SUPPORT;
+	{
+		const unsigned char expected_data[] = encoded_value;
+		char unsigned data[8];
+		verify(OpStatus::IsSuccess(OpProtobufWireFormat::EncodeFixed64(reinterpret_cast<char *>(data), sizeof(data), OP_UINT64(decoded_value))));
+		for (unsigned int i = 0; i < sizeof(data); ++i)
+			verify(expected_data[i] == data[i]);
+	}
+
+	test("Fixed64 encoding failure: $(decoded_value)")
+		require OP_PROTOBUF_64BIT_SUPPORT;
+	{
+		char unsigned data[8];
+		// Note: Here we send 1 missing byte from the buffer size, should cause encode failure
+		verify(OpStatus::IsError(OpProtobufWireFormat::EncodeFixed64(reinterpret_cast<char *>(data), sizeof(data) - 1, OP_UINT64(decoded_value))));
+	}
+}

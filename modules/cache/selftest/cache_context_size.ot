@@ -1,0 +1,277 @@
+/* -*- Mode: c++; tab-width: 4; indent-tabs-mode: t; c-basic-offset: 4 -*-
+**
+** Copyright (C) 2004-2006 Opera Software ASA.  All rights reserved.
+**
+** This file is part of the Opera web browser.  It may not be distributed
+** under any circumstances.
+**
+*/
+
+group "cache context size";
+require init;
+require DYNAMIC_FOLDER_SUPPORT;
+require CACHE_FAST_INDEX;
+include "modules/cache/cache_int.h";
+include "modules/cache/cache_common.h";
+include "modules/dochand/winman.h";
+include "modules/cache/cache_st_helpers.h";
+include "modules/prefs/prefsmanager/collections/pc_network.h";
+include "modules/cache/cache_selftest.h";
+include "modules/cache/cache_debug.h";
+
+global
+{
+	OpFileFolder defSizeFolder;
+	OpFileFolder custSizeFolder;
+	FileName_Store *filesMain;
+	FileName_Store *filesDefSize;
+	FileName_Store *filesCustSize;
+	URL_CONTEXT_ID defSizeContext;
+	URL_CONTEXT_ID custSizeContext;
+	MessageHandler *mh;
+	WaitURLs *wait;
+
+	int oldCacheSize;
+	
+	int kCacheSize;
+	int kMinFileSize;
+	int kMaxFileSize;
+	int defaultCacheSize;
+
+	OpAutoVector<URL> *testURLs;
+	MultiContext mctx; // Only used to automactially set the cache preferences to meaningful values for these tests
+}
+
+
+setup
+{
+	CacheTester::BlockPeriodicFreeUnusedResources();
+	
+	kCacheSize = 0x100000 * 5;  // 5MB
+	kMinFileSize = 0x10;		// 16B
+	kMaxFileSize = 0x100000;	// 1MB
+	defSizeContext = urlManager->GetNewContextID();
+	custSizeContext = urlManager->GetNewContextID();
+	filesMain = OP_NEW(FileName_Store, (8191));
+	filesDefSize = OP_NEW(FileName_Store, (8191));
+	filesCustSize = OP_NEW(FileName_Store, (8191));
+	mh = OP_NEW(MessageHandler, (NULL));
+	
+	filesMain->Construct();
+	filesDefSize->Construct();
+	filesCustSize->Construct();
+
+	g_folder_manager->AddFolder(OPFILE_CACHE_FOLDER, UNI_L("context_default_size"), &defSizeFolder);
+	CacheFileTest::DeleteCacheDir(defSizeFolder);
+	urlManager->AddContextL(defSizeContext, defSizeFolder, defSizeFolder, defSizeFolder, defSizeFolder, FALSE);
+	output("Created custom context: %d \n", defSizeContext);
+
+	// ToDo: It'd be better to be able to retrieve this size from the context 
+	// instead of duplicating the way it's calculated.
+	defaultCacheSize = g_pcnet->GetIntegerPref(PrefsCollectionNetwork::DiskCacheSize) * 1024 / 20; 
+	if (defaultCacheSize < 50 * 1024)
+		defaultCacheSize = 50 * 1024; // 50KB
+
+	g_folder_manager->AddFolder(OPFILE_CACHE_FOLDER, UNI_L("context_custom_size"), &custSizeFolder);
+	CacheFileTest::DeleteCacheDir(custSizeFolder);
+	urlManager->AddContextL(custSizeContext, custSizeFolder, custSizeFolder, custSizeFolder, custSizeFolder, FALSE);
+	urlManager->FindContextManager(custSizeContext)->SetCacheSize(kCacheSize);
+	
+	output("Created custom context: %d \n", custSizeContext);
+
+	OpMessage messages[]={MSG_URL_DATA_LOADED, MSG_URL_LOADING_FAILED, MSG_URLMAN_DELETE_SOMEFILES};
+	
+	wait = OP_NEW(WaitURLs, (defSizeFolder, custSizeFolder, mh));
+	mh->SetCallBackList(wait, 0, messages, 3);
+	
+	CacheHelpers::CloseUnusedWindows();
+	
+	oldCacheSize = g_pcnet->GetIntegerPref(PrefsCollectionNetwork::DiskCacheSize);
+
+	int newCacheSize = kCacheSize / 1024;
+	TRAPD(op_err, g_pcnet->WriteIntegerL(PrefsCollectionNetwork::DiskCacheSize, newCacheSize));
+
+	testURLs = OP_NEW(OpAutoVector<URL>, ());
+}
+
+exit
+{
+	OP_STATUS op_err;
+	TRAP(op_err, g_pcnet->WriteIntegerL(PrefsCollectionNetwork::DiskCacheSize, oldCacheSize));
+
+	OP_DELETE(filesMain);
+	OP_DELETE(filesDefSize);
+	OP_DELETE(filesCustSize);
+	
+	mh->UnsetCallBacks(wait);
+	OP_DELETE(mh);
+	mh=NULL;
+	OP_DELETE(wait);
+	wait=NULL;
+	
+	OP_DELETE(testURLs);
+	
+	CacheTester::RestorePeriodicFreeUnusedResources();
+}
+
+// Helper test to clear out the cache.
+subtest EmptyCache()
+{
+	wait->SetExpectedSize(0, 0);
+	urlManager->EmptyDCache();
+	mh->PostDelayedMessage(MSG_URLMAN_DELETE_SOMEFILES, 0, 0, 1000);  // Wait to delete the files
+}
+
+
+table Table1(int, char*)
+{
+  { 0, "[main]" },
+  { 1, "[defsize]" },
+  { 2, "[custsize]" },
+}
+
+
+// for each of the context test cases do all the tests.
+foreach (run, contextName) from Table1
+{
+	//-----------------------------------------------------------------------------
+	// Flood main context, stop using URLs, call free unused
+	//-----------------------------------------------------------------------------
+
+	test("Context - Empty cache 1 " contextName) async;
+	{
+		// Make sure we're starting each run without any URLS from the previous one.
+		for (UINT32 j = 0; j != testURLs->GetCount(); ++j)
+			OP_DELETE(testURLs->Get(j));
+		testURLs->Clear();
+
+		EmptyCache();
+	}
+
+	test("Context - Flood context 1 " contextName)
+	{
+		int context = (run == 1 ? defSizeContext : (run == 2 ? custSizeContext : 0));
+
+		CacheHelpers::CacheBogusURLs(context, kMinFileSize, kMaxFileSize, 0, kCacheSize * 2); 
+	}
+
+	test("Context - Check free unused resources with inactive URLs " contextName) async;
+	{
+		urlManager->FreeUnusedResources(TRUE);
+		TRAPD(rc, urlManager->WriteCacheIndexesL(TRUE, TRUE));
+		
+		wait->SetExpectedSize(0, (int)((run == 1 ? defaultCacheSize : kCacheSize)*1.05)); 
+		
+		mh->PostDelayedMessage(MSG_URLMAN_DELETE_SOMEFILES, 0, 0, 1000);
+	}
+
+
+	//-----------------------------------------------------------------------------
+	// Flood main context, stop using URLs, call empty cache
+	//-----------------------------------------------------------------------------
+
+	test("Context - Empty cache 2 " contextName) async;
+	{
+		EmptyCache();
+	}
+
+	test("Context - Flood context 2 " contextName)
+	{
+		int context = (run == 1 ? defSizeContext : (run == 2 ? custSizeContext : 0));
+
+		CacheHelpers::CacheBogusURLs(context, kMinFileSize, kMaxFileSize, 0, kCacheSize * 2); 
+	}
+
+	test("Context - Check empty cache with inactive URLs " contextName) async;
+	{
+		TRAPD(rc, urlManager->WriteCacheIndexesL(TRUE, TRUE));
+
+		urlManager->EmptyDCache();
+		
+		wait->SetExpectedSize(0, 0);
+		
+		mh->PostDelayedMessage(MSG_URLMAN_DELETE_SOMEFILES, 0, 0, 1000);
+	}
+
+
+	//-----------------------------------------------------------------------------
+	// Flood main context, free unused, stop using URLs, free unused
+	//-----------------------------------------------------------------------------
+
+	test("Context - Empty cache 3 " contextName) async;
+	{
+		EmptyCache();
+	}
+
+	test("Context - Flood context 3 " contextName)
+	{
+		int context = (run == 1 ? defSizeContext : (run == 2 ? custSizeContext : 0));
+
+		// Create URLs in use
+		CacheHelpers::CacheBogusURLs(context, kMinFileSize, kMaxFileSize, 0, kCacheSize * 2, testURLs, 0, FALSE, FALSE, TRUE, FALSE);
+		TRAPD(rc, urlManager->WriteCacheIndexesL(FALSE, FALSE));
+	}
+
+	test("Context - Check free unused with active URLs " contextName) async;
+	{
+		DebugFreeUnusedResources dfur(1);
+		BOOL b=urlManager->Cache_Manager::FreeUnusedResources(FALSE, &dfur);
+
+		output("FreeUnusedResources finished: %s - ",(b) ? "FALSE" : "TRUE");
+		dfur.OutputData();
+		wait->SetExpectedSize((UINT32)(kCacheSize * 2 * 1.05f - kMaxFileSize), (UINT32)(kCacheSize * 2 * 1.05f + kMaxFileSize)); 
+		
+		mh->PostDelayedMessage(MSG_URLMAN_DELETE_SOMEFILES, 0, 0, 1000);
+	}
+
+	test("Context - Check free unused with inactive URLs " contextName) async;
+	{
+		for (UINT32 j = 0; j != testURLs->GetCount(); ++j)
+		{
+			CacheTester::DecUsed(testURLs->Get(j));
+			CacheTester::BrutalDelete(testURLs->Get(j), TRUE);
+		}
+		testURLs->Clear();
+
+		urlManager->FreeUnusedResources(TRUE);
+
+		wait->SetExpectedSize(0, (int)(kCacheSize*1.05));
+		
+		mh->PostDelayedMessage(MSG_URLMAN_DELETE_SOMEFILES, 0, 0, 1000);
+	}
+
+	//-----------------------------------------------------------------------------
+	// Flood main context, empty cache (with active URLs)
+	//-----------------------------------------------------------------------------
+
+	test("Context - Empty cache 4 " contextName) async;
+	{
+		EmptyCache();
+	}
+
+	test("Context - Flood context 4 " contextName)
+	{
+		int context = (run == 1 ? defSizeContext : (run == 2 ? custSizeContext : 0));
+
+		CacheHelpers::CacheBogusURLs(context, kMinFileSize, kMaxFileSize, 0, kCacheSize * 2, testURLs); 
+	}
+
+	test("Context - Check empty cache with active URLs " contextName) async;
+	{
+		TRAPD(rc, urlManager->WriteCacheIndexesL(TRUE, TRUE));
+
+		wait->SetExpectedSize(0, 0);
+		urlManager->EmptyDCache();
+		mh->PostDelayedMessage(MSG_URLMAN_DELETE_SOMEFILES, 0, 0, 1000);
+	}
+} // foreach
+
+
+test("Delete context directories")
+{
+	urlManager->RemoveContext(defSizeContext, TRUE);
+	urlManager->RemoveContext(custSizeContext, TRUE);
+	
+	verify(OpStatus::IsSuccess(CacheFileTest::DeleteCacheDir(defSizeFolder)));
+	verify(OpStatus::IsSuccess(CacheFileTest::DeleteCacheDir(custSizeFolder)));
+}

@@ -1,0 +1,458 @@
+// -*- Mode: c++; tab-width: 4; indent-tabs-mode: nil; c-basic-offset: 4 -*-
+group "DOM.CrossMessage";
+require init;
+require DOM_CROSSDOCUMENT_MESSAGING_SUPPORT;
+
+language ecmascript;
+
+test("Setup")
+{
+    checkSameValue = function checkSameValue(a, b) {
+        if (typeof a != typeof b)
+            return false;
+        if (typeof a != 'object')
+            return (a === b);
+        else
+        {
+            for (var p in a)
+            {
+                if (!(p in b))
+                    return false;
+                if (!checkSameValue(a[p], b[p]))
+                    return false;
+            }
+            return true;
+        }
+    }
+}
+
+// Initial check that the window has the necessary toplevel objects
+test("Environment")
+{
+    verify("MessageChannel" in window);
+    verify("MessagePort" in window);
+    verify("postMessage" in window);
+}
+
+test("Clone (basic clone)")
+    async;
+{
+    var expected = [1, 2, 3, "aa", "a\u0000bcd"];
+
+    function check(e) {
+       verify(e instanceof MessageEvent);
+       if (checkSameValue(e.data, expected))
+           ST_passed();
+       else
+           ST_failed("Clone failure: cloned value not matching expected.", "", "");
+    }
+
+    var ch = new MessageChannel();
+    ch.port2.onmessage = check;
+    ch.port1.postMessage(expected);
+}
+
+test("Clone (sharing)")
+    async;
+{
+    var obj1 = {a: 2, c: "aa"};
+    var expected = [obj1, 2, obj1];
+
+    function check(e) {
+       verify(e instanceof MessageEvent);
+       if (checkSameValue(e.data, expected) && expected[0] === expected[2])
+           ST_passed();
+       else
+           ST_failed("Clone failure: cloned value not matching expected.", "", "");
+    }
+
+    // Check if sharing is maintained.
+    var ch = new MessageChannel();
+    ch.port2.onmessage = check;
+    ch.port1.postMessage(expected);
+}
+
+test("Clone (transferable #1)")
+    async;
+{
+    var obj1 = {a: 2, c: "aa"};
+    var expected = [obj1, 2, {}];
+
+    function check2(e) {
+       verify(e instanceof MessageEvent);
+       if (checkSameValue(e.data, expected))
+           ST_passed();
+       else
+           ST_failed("Clone failure: cloned value not matching expected.", "", "");
+    }
+
+    function check(e) {
+       verify(e instanceof MessageEvent);
+       if (checkSameValue(e.data, expected) && e.ports.length == 2)
+       {
+           e.ports[0].onmessage = check2;
+           e.ports[1].postMessage(e.data);
+       }
+       else
+           ST_failed("Clone failure: cloned value not matching expected.", "", "");
+    }
+
+    // Check if ports can be cloned.
+    var ch = new MessageChannel();
+    ch.port2.onmessage = check;
+    var ch2 = new MessageChannel();
+    ch.port1.postMessage(expected, [ch2.port1, ch2.port2]);
+}
+
+test("Clone (transferable #2)")
+    async;
+{
+    var obj1 = {a: 2, c: "aa"};
+    var expected = [obj1, 2, {}];
+
+    function check2(e) {
+       verify(e instanceof MessageEvent);
+       if (checkSameValue(e.data, expected))
+           ST_passed();
+       else
+           ST_failed("Clone failure: cloned value not matching expected.", "", "");
+    }
+
+    function check(e) {
+       verify(e instanceof MessageEvent);
+       if (e.ports.length == 2 && e.data === e.ports[0])
+       {
+           e.ports[0].onmessage = check2;
+           e.ports[1].postMessage(expected);
+       }
+       else
+           ST_failed("Clone failure: cloned value not matching expected.", "", "");
+    }
+
+    // Check if ports can be cloned and that their correctly
+    // referred to by the cloned data.
+    var ch = new MessageChannel();
+    ch.port2.onmessage = check;
+    var ch2 = new MessageChannel();
+    ch.port1.postMessage(ch2.port1, [ch2.port1, ch2.port2]);
+}
+
+test("Clone (transferable #3)")
+{
+    var ch = new MessageChannel();
+    var ch2 = new MessageChannel();
+    ch.port1.postMessage(ch2.port1, [ch2.port1, ch2.port2]);
+    try {
+        ch.port1.postMessage(ch2.port1, [ch2.port1, ch2.port2]);
+        verify(!"repeated cloning of ports is expected to throw.");
+    } catch (e) {
+        verify(e instanceof DOMException);
+        verify(e.code == DOMException.DATA_CLONE_ERR);
+    }
+}
+
+test("Clone (transferable #4)")
+{
+    var buf = new ArrayBuffer(24);
+    var ta  = new Int8Array(20);
+    var ch = new MessageChannel();
+    ch.port1.postMessage({}, [buf, ta]);
+    try {
+        ch.port1.postMessage({}, [ta, buf]);
+        verify(!"repeated cloning of transferables is expected to throw.");
+    } catch (e) {
+        verify(e instanceof DOMException);
+        verify(e.code == DOMException.DATA_CLONE_ERR);
+    }
+}
+
+test("Clone (transferable #5)")
+{
+    var buf = new ArrayBuffer(24);
+    var ch = new MessageChannel();
+    ch.port2.onmessage = function () {};
+    try {
+        ch.port1.postMessage({}, [buf, buf]);
+        verify(!"repeated occurrences of transferables is expected to throw.");
+    } catch (e) {
+        verify(e instanceof DOMException);
+        verify(e.code == DOMException.DATA_CLONE_ERR);
+    }
+}
+
+test("Clone (array buffer)")
+    async;
+{
+    var buffer = new ArrayBuffer(65);
+    for (var i = 0; i < buffer.byteLength; i++)
+        buffer[i] = i;
+
+    var expected = buffer;
+
+    function check(e) {
+       verify(e instanceof MessageEvent);
+       if (checkSameValue(e.data, expected))
+           ST_passed();
+       else
+           ST_failed("Clone failure: cloned value not matching expected.", "", "");
+    }
+
+    // Check ArrayBuffer cloning.
+    var ch = new MessageChannel();
+    ch.port2.onmessage = check;
+    ch.port1.postMessage(expected);
+}
+
+test("Clone (typed array: Int8)")
+    async;
+{
+    var buffer = new ArrayBuffer(65);
+    for (var i = 0; i < buffer.byteLength; i++)
+        buffer[i] = i;
+
+    var x = new Int8Array(buffer);
+    var expected = x;
+
+    function check(e) {
+       verify(e instanceof MessageEvent);
+       if (checkSameValue(e.data, expected))
+           ST_passed();
+       else
+           ST_failed("Clone failure: cloned value not matching expected.", "", "");
+    }
+
+    // Check TypedArray cloning.
+    var ch = new MessageChannel();
+    ch.port2.onmessage = check;
+    ch.port1.postMessage(expected);
+}
+
+test("Clone (typed array: Int16)")
+    async;
+{
+    var buffer = new ArrayBuffer(66);
+    for (var i = 0; i < buffer.byteLength; i++)
+        buffer[i] = i;
+
+    var x = new Int16Array(buffer, 4);
+    var expected = x;
+
+    function check(e) {
+       verify(e instanceof MessageEvent);
+       if (checkSameValue(e.data, expected))
+           ST_passed();
+       else
+           ST_failed("Clone failure: cloned value not matching expected.", "", "");
+    }
+
+    // Check TypedArray cloning.
+    var ch = new MessageChannel();
+    ch.port2.onmessage = check;
+    ch.port1.postMessage(expected);
+}
+
+test("Clone (typed array: Int32)")
+    async;
+{
+    var buffer = new ArrayBuffer(64);
+    for (var i = 0; i < buffer.byteLength; i++)
+        buffer[i] = i;
+
+    var x = new Int32Array(buffer, 8, 10);
+    var expected = x;
+
+    function check(e) {
+       verify(e instanceof MessageEvent);
+       if (checkSameValue(e.data, expected))
+           ST_passed();
+       else
+           ST_failed("Clone failure: cloned value not matching expected.", "", "");
+    }
+
+    // Check TypedArray cloning.
+    var ch = new MessageChannel();
+    ch.port2.onmessage = check;
+    ch.port1.postMessage(expected);
+}
+
+test("Clone (typed array: Uint8)")
+    async;
+{
+    var buffer = new ArrayBuffer(65);
+    for (var i = 0; i < buffer.byteLength; i++)
+        buffer[i] = i;
+
+    var x = new Uint8Array(buffer);
+    var expected = x;
+
+    function check(e) {
+       verify(e instanceof MessageEvent);
+       if (e.data.length == 2 && e.data[0] === e.data[1] && checkSameValue(e.data[0], expected))
+           ST_passed();
+       else
+           ST_failed("Clone failure: cloned value not matching expected.", "", "");
+    }
+
+    // Check TypedArray cloning.
+    var ch = new MessageChannel();
+    ch.port2.onmessage = check;
+    ch.port1.postMessage([expected, expected]);
+}
+
+test("Clone+transfer (typed array: Uint16)")
+    async;
+{
+    var buffer = new ArrayBuffer(64);
+
+    var x = new Uint16Array(buffer);
+    var expected = x;
+    for (var i = 0; i < expected.length; i++)
+        expected[i] = i;
+
+    function check(e) {
+       verify(e instanceof MessageEvent);
+       verify(e.data.length == 32);
+       verify(buffer.byteLength == 0);
+       verify(expected.length == 0);
+       for (var i = 0; i < 32; i++)
+           if (e.data[i] != i)
+           {
+               ST_failed("Clone failure: cloned value not matching expected.", "", "");
+               return;
+           }
+
+       ST_passed();
+    }
+
+    // Check TypedArray cloning + transferring.
+    var ch = new MessageChannel();
+    ch.port2.onmessage = check;
+    ch.port1.postMessage(expected, [expected.buffer]);
+}
+
+test("Clone+transfer (typed array: Uint32) #1")
+    async;
+{
+    var buffer = new ArrayBuffer(64);
+
+    var x = new Uint32Array(buffer);
+    var expected = x;
+    for (var i = 0; i < expected.length; i++)
+        expected[i] = i;
+
+    function check(e) {
+       verify(e instanceof MessageEvent);
+       verify(e.data.length == 16);
+       verify(buffer.byteLength == 0);
+       verify(expected.length == 0);
+       for (var i = 0; i < 16; i++)
+           if (e.data[i] != i)
+           {
+               ST_failed("Clone failure: cloned value not matching expected.", "", "");
+               return;
+           }
+
+       ST_passed();
+    }
+
+    // Check TypedArray cloning + transferring.
+    var ch = new MessageChannel();
+    ch.port2.onmessage = check;
+    ch.port1.postMessage(expected, [expected.buffer]);
+}
+
+test("Clone+transfer (typed array: Uint32) #2")
+    async;
+{
+    var buffer = new ArrayBuffer(64);
+    for (var i = 0; i < buffer.byteLength; i++)
+        buffer[i] = i;
+
+    var x = new Uint32Array(buffer);
+    var expected = x;
+
+    function check(e) {
+       verify(e instanceof MessageEvent);
+       verify(e.data.length == 64);
+       verify(buffer.byteLength == 0);
+       verify(expected.length == 0);
+       for (var i = 0; i < 64; i++)
+           if (e.data[i] != i)
+           {
+               ST_failed("Clone failure: cloned value not matching expected.", "", "");
+               return;
+           }
+
+       ST_passed();
+    }
+
+    var ch = new MessageChannel();
+    ch.port2.onmessage = check;
+    ch.port1.postMessage(expected.buffer, [expected.buffer]);
+}
+
+test("Clone+transfer (typed array: Float32)")
+    async;
+{
+    var buffer = new ArrayBuffer(64);
+    var x = new Float32Array(buffer, 4);
+    var expected = x;
+    var expected_length = expected.length;
+    for (var i = 0; i < expected_length; i++)
+        expected[i] = i;
+
+    function check(e) {
+       verify(e instanceof MessageEvent);
+       verify(e.data.length == 2);
+       verify(e.data[0] === e.data[1]);
+       verify(e.data[0].length === expected_length);
+       verify(e.data[0].buffer === e.data[1].buffer);
+       verify(buffer.byteLength == 0);
+       verify(expected.length == 0);
+       for (var i = 0; i < expected_length; i++)
+           if (e.data[0][i] != i)
+           {
+               ST_failed("Clone failure: cloned value not matching expected.", "", "");
+               return;
+           }
+
+       ST_passed();
+    }
+
+    var ch = new MessageChannel();
+    ch.port2.onmessage = check;
+    ch.port1.postMessage([expected, expected], [expected.buffer]);
+}
+
+test("Clone+transfer (typed array: Float64)")
+    async;
+{
+    var buffer = new ArrayBuffer(64);
+    var x = new Float64Array(buffer, 8);
+    var expected = x;
+    var expected_length = expected.length;
+    for (var i = 0; i < expected_length; i++)
+        expected[i] = i;
+
+    function check(e) {
+       verify(e instanceof MessageEvent);
+       verify(e.data.length == 2);
+       verify(e.data[0] === e.data[1]);
+       verify(e.data[0].length === expected_length);
+       verify(e.data[0].buffer === e.data[1].buffer);
+       verify(buffer.byteLength == 0);
+       verify(expected.length == 0);
+       for (var i = 0; i < expected_length; i++)
+           if (e.data[0][i] != i)
+           {
+               ST_failed("Clone failure: cloned value not matching expected.", "", "");
+               return;
+           }
+
+       ST_passed();
+    }
+
+    var ch = new MessageChannel();
+    ch.port2.onmessage = check;
+    ch.port1.postMessage([expected, expected], [expected.buffer]);
+}

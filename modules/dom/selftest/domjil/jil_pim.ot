@@ -1,0 +1,669 @@
+/* -*- Mode: c++; tab-width: 4; indent-tabs-mode: t; c-basic-offset: 4 -*-
+**
+** Copyright 2007-2010 Opera Software ASA.  All rights reserved.
+**
+** This file is part of the Opera web browser.
+** It may not be distributed under any circumstances.
+*/
+
+group "DOM.JIL.PIM";
+
+require GADGET_SUPPORT;
+require DOM_JIL_API_SUPPORT;
+include "modules/security_manager/include/security_manager.h";
+include "modules/gadgets/gadget_selftest_utils.h";
+
+include "modules/doc/frm_doc.h";
+include "modules/dom/src/domenvironmentimpl.h";
+include "modules/dom/src/domobj.h";
+include "modules/dom/src/domruntime.h";
+include "modules/pi/device_api/OpAddressBook.h";
+
+global
+{
+	OpSecurityManager::PrivilegedBlock disable_security;
+
+	static OP_STATUS GetAttributeNames(OpINT32HashTable<OpString>* attribute_names, const OpAddressBook::OpAddressBookFieldInfo::Meaning* attributes, unsigned int attribute_count)
+	{
+		const OpAddressBook::OpAddressBookFieldInfo* field_infos;
+		unsigned int info_count;
+		g_op_address_book->GetFieldInfos(&field_infos, &info_count);
+		for (unsigned int attr_index = 0; attr_index < attribute_count; ++attr_index)
+		{
+			for (unsigned int i = 0; i < info_count; ++i)
+			{
+				if (field_infos[i].meaning == attributes[attr_index])
+				{
+					OpAutoPtr<OpString> ap_attribute_name(OP_NEW(OpString, ()));
+					RETURN_IF_ERROR(ap_attribute_name.get() != NULL);
+					RETURN_IF_ERROR(ap_attribute_name->Set(field_infos[i].name));
+					RETURN_IF_ERROR(attribute_names->Add(attributes[attr_index], ap_attribute_name.get()));
+					ap_attribute_name.release();
+				}
+			}
+		}
+		return OpStatus::OK;
+	}
+
+	static OP_STATUS AddStringToArray(ES_Object* array, int index, const uni_char* string, DOM_Runtime* runtime)
+	{
+		ES_Value value;
+		DOM_Object::DOMSetString(&value, string);
+		return runtime->PutIndex(array, index, value);
+	}
+
+	// Returns a JavaScript array that contains names of JIL attributes for name.
+	static int getJILNameAttributes(DOM_Object* this_object, ES_Value* argv, int argc, ES_Value* return_value, DOM_Runtime* origining_runtime)
+	{
+		OpAutoINT32HashTable<OpString> attribute_names;
+		OpAddressBook::OpAddressBookFieldInfo::Meaning fields[] = {
+			OpAddressBook::OpAddressBookFieldInfo::MEANING_FIRST_NAME,
+			OpAddressBook::OpAddressBookFieldInfo::MEANING_MIDDLE_NAME,
+			OpAddressBook::OpAddressBookFieldInfo::MEANING_LAST_NAME,
+			OpAddressBook::OpAddressBookFieldInfo::MEANING_FULL_NAME };
+		CALL_FAILED_IF_ERROR(GetAttributeNames(&attribute_names, fields, ARRAY_SIZE(fields)));
+
+		ES_Object* array;
+		CALL_FAILED_IF_ERROR(origining_runtime->CreateNativeArrayObject(&array, 0));
+		int array_index = 0;
+		if (attribute_names.Contains(OpAddressBook::OpAddressBookFieldInfo::MEANING_FULL_NAME))
+			CALL_FAILED_IF_ERROR(AddStringToArray(array, array_index, UNI_L("fullName"), origining_runtime));	// JIL standard name
+		else
+		{
+			OpString* name;
+			if (OpStatus::IsSuccess(attribute_names.GetData(OpAddressBook::OpAddressBookFieldInfo::MEANING_FIRST_NAME, &name)))
+				CALL_FAILED_IF_ERROR(AddStringToArray(array, array_index++, name->CStr(), origining_runtime));
+			if (OpStatus::IsSuccess(attribute_names.GetData(OpAddressBook::OpAddressBookFieldInfo::MEANING_MIDDLE_NAME, &name)))
+				CALL_FAILED_IF_ERROR(AddStringToArray(array, array_index++, name->CStr(), origining_runtime));
+			if (OpStatus::IsSuccess(attribute_names.GetData(OpAddressBook::OpAddressBookFieldInfo::MEANING_LAST_NAME, &name)))
+				CALL_FAILED_IF_ERROR(AddStringToArray(array, array_index++, name->CStr(), origining_runtime));
+		}
+		DOM_Object::DOMSetObject(return_value, array);
+
+		return ES_VALUE;
+	}
+
+	// Returns a JavaScript array that contains names of JIL attributes for address. The list is simplified, contains
+	// either street name, street number, city or the whole "address".
+	static int getJILAddressAttributes(DOM_Object* this_object, ES_Value* argv, int argc, ES_Value* return_value, DOM_Runtime* origining_runtime)
+	{
+		OpAutoINT32HashTable<OpString> attribute_names;
+		OpAddressBook::OpAddressBookFieldInfo::Meaning fields[] = {
+			OpAddressBook::OpAddressBookFieldInfo::MEANING_ADDRESS_NUMBER,
+			OpAddressBook::OpAddressBookFieldInfo::MEANING_ADDRESS_STREET,
+			OpAddressBook::OpAddressBookFieldInfo::MEANING_ADDRESS_CITY,
+			OpAddressBook::OpAddressBookFieldInfo::MEANING_FULL_ADDRESS };
+		CALL_FAILED_IF_ERROR(GetAttributeNames(&attribute_names, fields, ARRAY_SIZE(fields)));
+
+		ES_Object* array;
+		CALL_FAILED_IF_ERROR(origining_runtime->CreateNativeArrayObject(&array, 0));
+		int array_index = 0;
+		if (attribute_names.Contains(OpAddressBook::OpAddressBookFieldInfo::MEANING_FULL_ADDRESS))
+			CALL_FAILED_IF_ERROR(AddStringToArray(array, array_index, UNI_L("address"), origining_runtime));	// JIL standard name
+		else
+		{
+			OpString* name;
+			if (OpStatus::IsSuccess(attribute_names.GetData(OpAddressBook::OpAddressBookFieldInfo::MEANING_ADDRESS_STREET, &name)))
+				CALL_FAILED_IF_ERROR(AddStringToArray(array, array_index++, name->CStr(), origining_runtime));
+			if (OpStatus::IsSuccess(attribute_names.GetData(OpAddressBook::OpAddressBookFieldInfo::MEANING_ADDRESS_NUMBER, &name)))
+				CALL_FAILED_IF_ERROR(AddStringToArray(array, array_index++, name->CStr(), origining_runtime));
+			if (OpStatus::IsSuccess(attribute_names.GetData(OpAddressBook::OpAddressBookFieldInfo::MEANING_ADDRESS_CITY, &name)))
+				CALL_FAILED_IF_ERROR(AddStringToArray(array, array_index++, name->CStr(), origining_runtime));
+		}
+		DOM_Object::DOMSetObject(return_value, array);
+
+		return ES_VALUE;
+	}
+
+	GadgetSelftestUtils g_utils;
+}
+
+exit
+{
+	g_utils.UnloadGadget();
+}
+
+table dummy1(const char *) filelist "pim_test_wgt" recursively;
+
+test("Load PIM test gadget")
+	file zip_file "pim_test_wgt/config.xml";
+	async;
+{
+	OP_GADGET_STATUS status = g_utils.LoadGadgetForSelftest(zip_file, URL_GADGET_INSTALL_CONTENT);
+
+	if (OpStatus::IsError(status))
+		ST_failed("Unable to install test widget, status: %d", status);
+	else if (status != OpGadgetStatus::OK_SIGNATURE_VERIFICATION_IN_PROGRESS)
+		ST_passed();
+}
+
+test("Test PIM existence")
+	language ecmascript;
+	require success "Load PIM test gadget";
+{
+	verify(Widget);
+	verify(Widget.PIM);
+}
+
+test("Test new PIM.AddressBookItem")
+	language ecmascript;
+	require success "Test PIM existence";
+{
+	var item = new Widget.PIM.AddressBookItem;
+	verify(item);
+	verify(item instanceof Widget.PIM.AddressBookItem);
+}
+
+test("Test non-string assignment to PIM.AddressBookItem")
+	language ecmascript;
+	require success "Test PIM existence";
+{
+	var item = new Widget.PIM.AddressBookItem;
+	item.title = 5;
+	verify(typeof item.title == "string");
+	verify(item.title === "5");
+}
+
+test("Test null assignment to PIM.AddressBookItem")
+	language ecmascript;
+	require success "Test PIM existence";
+{
+	var item = new Widget.PIM.AddressBookItem;
+	item.title = null;
+
+	// Check that it's null or undefined
+	verify(item.title == null);
+}
+
+test("Test assignment to non-attribute property on PIM.AddressBookItem")
+	language ecmascript;
+	require success "Test PIM existence";
+{
+	var item = new Widget.PIM.AddressBookItem;
+	item.non_attribute_property = 5;
+	verify(typeof item.non_attribute_property == "number");
+	verify(item.non_attribute_property === 5);
+}
+
+test("Test that PIM.AddressBookItem.addressBookItemId is read-only")
+	language ecmascript;
+	require success "Test PIM existence";
+{
+	var item = new Widget.PIM.AddressBookItem;
+	item.addressBookItemId = "1";
+	verify(item.addressBookItemId == null);
+}
+
+test("Test setAttributeValue + property read")
+	language ecmascript;
+	require success "Test PIM existence";
+{
+	var item = new Widget.PIM.AddressBookItem;
+	item.setAttributeValue("eMail", "abc@test.domain");
+	verify(item.eMail == "abc@test.domain");
+}
+
+test("Test property assignment + getAttributeValue")
+	language ecmascript;
+	require success "Test PIM existence";
+{
+	var item = new Widget.PIM.AddressBookItem;
+	item.eMail = "abc@test.domain";
+	verify(item.getAttributeValue("eMail") == "abc@test.domain");
+}
+
+test("Test property assignment: null")
+	language ecmascript;
+	require success "Test PIM existence";
+{
+	var item = new Widget.PIM.AddressBookItem;
+	item.eMail = "abc@test.domain";
+	item.eMail = null;
+	verify(typeof item.eMail == "undefined");
+}
+
+test("Test setAttributeValue: null")
+	language ecmascript;
+	require success "Test PIM existence";
+{
+	var item = new Widget.PIM.AddressBookItem;
+	item.eMail = "abc@test.domain";
+	item.setAttributeValue("eMail", null);
+	verify(typeof item.eMail == "undefined");
+}
+
+test("Test setAttributeValue: number")
+	language ecmascript;
+	require success "Test PIM existence";
+{
+	var item = new Widget.PIM.AddressBookItem;
+	item.eMail = "abc@test.domain";
+	item.setAttributeValue("eMail", 5);
+	verify(item.eMail === "5");
+}
+
+test("Test invalid argument to setAttributeValue")
+	language ecmascript;
+	require success "Test PIM existence";
+{
+	var item = new Widget.PIM.AddressBookItem;
+	try {
+		item.setAttributeValue("nonexistent_attribute", 5);
+		ST_failed("No exception has been thrown");
+	}
+	catch(e)
+	{
+		if (! (e instanceof Widget.Exception))
+			ST_failed("Invalid exception has been thrown: " + e)
+		else if (e.type != Widget.ExceptionTypes.INVALID_ARGUMENT)
+			ST_failed("Invalid type of exception: " + e)
+
+		// otherwise passed
+	}
+}
+
+test("Test required attributes of AddressBookItem")
+	language ecmascript;
+	require success "Test PIM existence";
+{
+	var required_attributes = [ 'address', 'company', 'eMail', 'fullName', 'homePhone', 'mobilePhone', 'title', 'workPhone' ];
+
+	var item = new Widget.PIM.AddressBookItem();
+	for (var i = 0; i < required_attributes.length; ++i)
+	{
+		item.setAttributeValue(required_attributes[i], "value");
+		verify(item[required_attributes[i]] == "value");
+	}
+}
+
+test("Test PIM.add/get/removeAddressBookItem + getAddressBookItemCount")
+	language ecmascript;
+	require success "Test new PIM.AddressBookItem";
+{
+	var address_book_item = new Widget.PIM.AddressBookItem;
+	verify(address_book_item);
+	address_book_item.title = "test";
+
+	var count_before_add = Widget.PIM.getAddressBookItemsCount();
+	verify(address_book_item.addressBookItemId == null);
+	var id = Widget.PIM.addAddressBookItem(address_book_item);
+	verify(id != null);
+	verify(address_book_item.addressBookItemId == null);
+	var count_after_add = Widget.PIM.getAddressBookItemsCount();
+	verify (count_after_add == count_before_add + 1);
+
+	var retrieved_address_book_item = Widget.PIM.getAddressBookItem(id);
+	verify(retrieved_address_book_item);
+	verify(retrieved_address_book_item instanceof Widget.PIM.AddressBookItem);
+	verify(retrieved_address_book_item.addressBookItemId != null);
+	verify(retrieved_address_book_item.addressBookItemId == id);
+	verify(retrieved_address_book_item.title == address_book_item.title);
+
+	Widget.PIM.deleteAddressBookItem(id);
+	var count_after_remove = Widget.PIM.getAddressBookItemsCount();
+	verify(count_after_remove == count_before_add);
+	try
+	{
+		retrieved_address_book_item = Widget.PIM.getAddressBookItem(id);
+		verify(false);
+	}
+	catch(e)
+	{
+		verify(e instanceof Widget.Exception);
+		verify(e.type == Widget.ExceptionTypes.INVALID_PARAMETER);
+	}
+}
+
+test("Test PIM.findAddressBookItems with no callback (CORE-32957) - should not crash")
+	language ecmascript;
+	require success "Test new PIM.AddressBookItem";
+{
+	Widget.PIM.onAddressBookItemsFound = null;
+	Widget.PIM.findAddressBookItems(new Widget.PIM.AddressBookItem(), 0, 1);
+	Widget.PIM.findAddressBookItems(new Widget.PIM.AddressBookItem(), 2, 1);
+}
+
+
+test("Test Seraching for AddressBookItems")
+	language ecmascript;
+	require success "Test new PIM.AddressBookItem";
+	async;
+{
+	var added_items = new Array;
+	cleanup_added_items = function()
+	{
+		remove_address_book_items(added_items);
+	}
+
+	var i = 0;
+	while (i < 31)
+	{
+		var item = add_address_book_item("TestTitle" + i, "test" + i + "@test.com", "771" + i, "602" + i , "1337643" );
+		added_items.push(item);
+		i = i + 1;
+	}
+
+	make_search = function(title, eMail, homePhone, mobilePhone, workPhone, numResults, results )
+	{
+		var item = new Widget.PIM.AddressBookItem;
+		if (!item)
+		{
+			cleanup_added_items();
+			throw new Error("Failed to create AddressBookItem");
+		}
+		item.title = title;
+		item.eMail = eMail;
+		item.homePhone = homePhone;
+		item.mobilePhone = mobilePhone;
+		item.workPhone = workPhone;
+
+		var object = {criterion:item, numResults:numResults, results:results};
+		return object;
+	}
+	var searches = new Array;
+	searches.push(make_search("TestTitle*", "test*@test.com", "771*", "602*" , "1337643", 31));
+	searches.push(make_search(null, null, null, null , "1337643", 31));
+	searches.push(make_search("TestTitle31",  null, null, null , "1337643", 0));
+	searches.push(make_search("TestTitle*1",  null, null, null , "1337643", 3, [added_items[1],added_items[11],added_items[21]]));
+	searches.push(make_search("TestTitle*1*",  null, null, null , "1337643", 12));
+	test_search = function(searches_array, search_count)
+	{
+
+		if (searches_array.length == 0)
+		{
+			cleanup_added_items();
+			ST_passed();
+			return;
+		}
+
+		Widget.PIM.onAddressBookItemsFound = function(results)
+		{
+			if (!results)
+			{
+				cleanup_added_items();
+				ST_failed("Search no " + search_count + ": no result (i.e. error occurred during search)", "A", "B");
+				return;
+			}
+
+			if (results.length != searches_array[0].numResults)
+			{
+				cleanup_added_items();
+				ST_failed("Search no " + search_count + ": Bad result got " + results.length + " results, " + searches_array[0].numResults + " expected" ,"A","B");
+				return;
+			}
+
+			if (searches_array[0].results)
+			{
+				for (var i in results)
+				{
+					var found = false;
+					var error_message;
+					if (results[i] instanceof Widget.PIM.AddressBookItem)
+					{
+						error_message = "Unexpected result " + results[i].addressBookItemId;
+						for (var j in searches_array[0].results)
+						{
+							if (searches_array[0].results[j].addressBookItemId == results[i].addressBookItemId)
+							{
+								found = true;
+								break;
+							}
+						}
+					}
+					else
+						error_message = "Find result is not an instance of Widget.PIM.AddressBookItem: " + results[j];
+
+					if (!found)
+					{
+						cleanup_added_items();
+						ST_failed("Search no " + search_count + ": " + error_message, "", "");
+						return;
+					}
+				}
+			}
+
+			test_search(searches_array.slice(1), search_count + 1);
+		}
+		Widget.PIM.findAddressBookItems(searches_array[0].criterion, 0, 200);
+	}
+	test_search(searches, 0);
+}
+
+test("Test Searching for AddressBookItems with * escaping")
+	language ecmascript;
+	require success "Test new PIM.AddressBookItem";
+	async;
+{
+	var added_items = [];
+	for (var i = 0; i < 5; i++)
+	{
+		var item = add_address_book_item("TestTitle" + i, "test" + i + "@test.com", "771" + i, "602" + i , "1337643" );
+		added_items.push(item);
+	}
+	var item = add_address_book_item("TestTitle*", "test@test.com", "771", "602", "1337643" );
+	added_items.push(item);
+
+	var search_criteria = new Widget.PIM.AddressBookItem;
+	search_criteria.title = "TestTitle\\*";
+
+	Widget.PIM.onAddressBookItemsFound = function(results)
+	{
+		if (!results)
+		{
+			remove_address_book_items(added_items);
+			ST_failed("Search returned no result (i.e. error occurred during search)", "", "");
+			return;
+		}
+
+		if (results.length == 1 && results[0].title == "TestTitle*")
+		{
+			remove_address_book_items(added_items);
+			ST_passed();
+		}
+		else if (results.length != 1)
+		{
+			remove_address_book_items(added_items);
+			ST_failed("Search returned " + results.length + " results instead of just one", "", "");
+		}
+		else
+		{
+			remove_address_book_items(added_items);
+			ST_failed("Search returned incorrect result (title = " + results[0].title + " instead of 'TestTitle*')", "", "");
+		}
+	}
+
+	Widget.PIM.findAddressBookItems(search_criteria, 0, 200);
+}
+
+test("findAddressBookItems with invalid arguments")
+	language ecmascript;
+{
+	try
+	{
+		var item = new Widget.PIM.AddressBookItem;
+		Widget.PIM.findAddressBookItems(item, "invalid", 1);
+		verify(false);
+	}
+	catch(e)
+	{
+		verify(e instanceof Widget.Exception);
+		verify(e.type === Widget.ExceptionTypes.INVALID_PARAMETER);
+	}
+
+	try
+	{
+		var item = new Widget.PIM.AddressBookItem;
+		Widget.PIM.findAddressBookItems(item, -4, 10);
+		verify(false);
+	}
+	catch(e)
+	{
+		verify(e instanceof Widget.Exception);
+		verify(e.type === Widget.ExceptionTypes.INVALID_PARAMETER);
+	}
+}
+
+test("findAddressBookItems with startInx greater than endInx")
+	language ecmascript;
+	async;
+{
+	var item = new Widget.PIM.AddressBookItem;
+	Widget.PIM.onAddressBookItemsFound = function (result) {
+		try {
+			if (result == null)                  ST_failed("The result is null", "", "");
+			else if (typeof(result) != "object") ST_failed("The result is not an object, it's a " + typeof(result), "", "");
+			else if (!(result instanceof Array)) ST_failed("The result is not an array, it's a " + result.toString(), "", "");
+			else if (result.length != 0)         ST_failed("The result doesn't contain 0 elements, as expected. It contains " + result.length, "", "");
+			else ST_passed();
+		}
+		catch(e) {
+			ST_failed("Unexpected exception while processing the result: " + e);
+		}
+	}
+	Widget.PIM.findAddressBookItems(item, 2, 1);
+}
+
+test("findAddressBookItems with startInx equal to endInx")
+	language ecmascript;
+	async;
+{
+	var item = new Widget.PIM.AddressBookItem;
+	Widget.PIM.onAddressBookItemsFound = function (result) {
+		try {
+			if (result == null)                  ST_failed("The result is null", "", "");
+			else if (typeof(result) != "object") ST_failed("The result is not an object, it's a " + typeof(result), "", "");
+			else if (!(result instanceof Array)) ST_failed("The result is not an array, it's a " + result.toString(), "", "");
+			else if (result.length != 0 && result.length != 1) ST_failed("The result contains neither 0 nor 1 elements, as expected. It contains " + result.length, "", "");
+			else ST_passed();
+		}
+		catch(e) {
+			ST_failed("Unexpected exception while processing the result: " + e);
+		}
+	}
+	Widget.PIM.findAddressBookItems(item, 1, 1);
+}
+
+test("findAddressBookItems with end index of Number.POSITIVE_INFINITY")
+	language ecmascript;
+	async;
+{
+	var item = new Widget.PIM.AddressBookItem;
+	Widget.PIM.onAddressBookItemsFound = function (result) {
+		try {
+			if (result == null)                  ST_failed("The result is null", "", "");
+			else if (typeof(result) != "object") ST_failed("The result is not an object, it's a " + typeof(result), "", "");
+			else if (!(result instanceof Array)) ST_failed("The result is not an array, it's a " + result.toString(), "", "");
+			else ST_passed();
+		}
+		catch(e) {
+			ST_failed("Unexpected exception while processing the result: " + e);
+		}
+	}
+	Widget.PIM.findAddressBookItems(item, 0, Number.POSITIVE_INFINITY);
+}
+
+test("Add helpers")
+	file uni reference_file_str "reference_vCard.vcf";
+{
+	// This is ugly but it's the easiest way of providing data from C++ to EcmaScript tests.
+	state.doc->ConstructDOMEnvironment();
+	DOM_Runtime* rt = reinterpret_cast<DOM_Runtime*>(state.doc->GetESRuntime());
+	DOM_Object* global_object = rt->GetEnvironment()->GetWindow();
+	global_object->AddFunctionL(getJILNameAttributes, "getJILNameAttributes");
+	global_object->AddFunctionL(getJILAddressAttributes, "getJILAddressAttributes");
+	global_object->PutStringConstant(UNI_L("vcard_reference_filename"), reference_file_str);
+}
+
+test("Test exportAsVCard")
+	language ecmascript;
+	async;
+{
+	var setName = function(item, firstName, lastName)
+	{
+		var name_attributes = getJILNameAttributes();
+		if (name_attributes.length == 1)
+		{
+			item.setAttributeValue(name_attributes[0], firstName + " " + lastName);
+		}
+		else
+		{
+			item.setAttributeValue(name_attributes[0], firstName);
+			item.setAttributeValue(name_attributes[name_attributes.length - 1], lastName);
+		}
+	};
+
+	var setAddress = function(item, streetName, streetNumber, city)
+	{
+		var address_attributes = getJILAddressAttributes();
+		if (address_attributes.length == 1)
+			item.setAttributeValue(address_attributes[0], streetName + " " + streetNumber + " " + city);
+		else
+		{
+			if (address_attributes.length != 3)
+				ST_failed("The address attributes are different than expected. The test needs street name, number and city name attributes.");
+			else
+			{
+				item.setAttributeValue(address_attributes[0], streetName);
+				item.setAttributeValue(address_attributes[1], streetNumber);
+				item.setAttributeValue(address_attributes[2], city);
+			}
+		}
+	};
+
+	var item = new Widget.PIM.AddressBookItem();
+
+	setName(item, "Jan", "Kowalski");
+	setAddress(item, "ul. Bzowa", "65A/13", "Walim");
+	item.email = "funky.jan@koval.com"
+
+	var id = Widget.PIM.addAddressBookItem(item);
+	var items = new Array();
+
+	items[0] = Widget.PIM.getAddressBookItem(id);
+
+	item = new Widget.PIM.AddressBookItem();
+
+	setName(item, "Marek", "Stefczyk");
+	setAddress(item, "al. Armii Krajowej", "2", "Kraków");
+	item.email = "mareczek@markowo.pl";
+	item.workPhone = "07007676767";
+	item.mobilePhone = "60423125";
+	item.homePhone = "744909892";
+	item.company = "FakeCompany inc.";
+	item.title = "Prof.";
+
+	id = Widget.PIM.addAddressBookItem(item);
+
+	items[1] = Widget.PIM.getAddressBookItem(id);
+
+	var timeout = setTimeout(function()
+	{
+		Widget.PIM.onVCardExportingFinish = null;
+		ST_failed("timed out", "", "");
+	},	2000);
+
+	Widget.PIM.onVCardExportingFinish = function(path)
+	{
+		try
+		{
+			clearTimeout(timeout);
+			Widget.PIM.onVCardExportingFinish = null;
+			if (path)
+			{
+				if (ST_binary_compare_files(vcard_reference_filename, ST_jil_to_system_path(path)))
+					ST_passed();
+				else
+					ST_failed("The exported file (" + ST_jil_to_system_path(path) + ") does not match expected contents (" + vcard_reference_filename + ")", "", "");
+			}
+			else
+					ST_failed("exporting failed", "", "");
+		}
+		catch(e)
+		{
+			ST_failed("Unexpected exception in onVCardExportingFinish handler: " + e);
+		}
+	}
+
+	Widget.PIM.exportAsVCard(items);
+}
+

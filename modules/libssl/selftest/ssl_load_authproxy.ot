@@ -1,0 +1,223 @@
+
+/* -*- Mode: c++; tab-width: 4; indent-tabs-mode: t; c-basic-offset: 4 -*-
+**
+** Copyright (C) 2004-2011 Opera Software ASA.  All rights reserved.
+**
+** This file is part of the Opera web browser.  It may not be distributed
+** under any circumstances.
+**
+** Yngve N. Pettersen
+*/
+
+group "ssl auth proxy loading";
+
+require init;
+language c++;
+require _NATIVE_SSL_SUPPORT_;
+require PREFS_WRITE;
+
+include "core/pch.h";
+
+include "modules/dochand/win.h";
+include "modules/dochand/docman.h";
+include "modules/doc/frm_doc.h";
+
+include "modules/url/url_man.h";
+include "modules/libssl/sslbase.h";
+include "modules/libssl/ssl_api.h";
+include "modules/libssl/options/sslopt.h";
+
+include "modules/network_selftest/basicwincom.h";
+include "modules/network_selftest/urldoctestman.h";
+include "modules/network_selftest/ssl_waitupdate.h";
+include "modules/network_selftest/proxy_replace.h";
+include "modules/network_selftest/auth_handler.h";
+
+global {
+
+	URL_DocSelfTest_Manager *libssl_tests = NULL;
+	
+	Selftest_ProxyOveride proxy_setting;
+	
+#ifdef LIBSSL_AUTO_UPDATE
+	SSL_WaitForAutoUpdate update_waiter;
+#endif
+
+	WindowCommander *wc=NULL;
+    SimpleAuthenticationListener *listener = NULL;
+}
+
+table filename_list (const char *) filelist "testfiles/simple";
+
+table url_list (const char *, const char *) 
+{
+  {"operasoftware.png", "https://bugs.opera.com/static/operalogo-1.png"},
+  {"dnbnor_logo.gif","https://www.dnbnor.no/portalfront/nor/images/gfx/logo.gif"},
+  {"operalogo.png","https://t.oslo.opera.com/operalogo.png"},
+  {"citibank_logo.gif","https://online.citibank.com/JRS/cm/img/top_nav/logo.gif"},
+  {"www_vrsn_logo.gif","https://www.verisign.com/stellent/groups/public/documents/image/www_vrsn_logo.gif"},
+}
+
+setup 
+{
+	urlManager->RemoveSensitiveData();
+	if(g_ssl_api->CheckSecurityManager())
+		g_securityManager->Init(SSL_LOAD_ALL_STORES);
+
+	libssl_tests = OP_NEW(URL_DocSelfTest_Manager, ());
+
+}
+
+exit
+{
+	OP_DELETE(libssl_tests);
+	libssl_tests = NULL;
+	
+	proxy_setting.ShutDown();
+	
+	// Do a shutdown of the pending connections
+	urlManager->FreeUnusedResources(TRUE);
+
+	if(wc)
+	    wc->SetLoadingListener(listener->GetFallback());
+	
+	OP_DELETE(listener);
+	listener = NULL;
+	urlManager->Clear_Authentication_List();
+}
+
+html { "<html><body>Empty document, proxy Authentication going on. An authentication dialog is a failure.</body></html>" };
+
+test("Initialized")
+{
+	verify(libssl_tests != NULL);
+	
+    wc = state.doc->GetWindow()->GetWindowCommander();
+    WindowCommander::SelftestHelper helper(wc);
+    listener = OP_NEW(SimpleAuthenticationListener, (libssl_tests, helper.GetPlatformLoadingListener()));
+    verify(listener != NULL);
+    verify(OpStatus::IsSuccess(listener->SetCredentials(TRUE, UNI_L("foo"), UNI_L("bar"))));
+    wc->SetLoadingListener(listener);
+}
+
+test("Check for updates")
+	require defined LIBSSL_AUTO_UPDATE;
+	require success "Initialized";
+	async;
+{
+	update_waiter.Activate();
+}
+
+test("Activate Proxy")
+	require success "Initialized";
+{
+	verify(OpStatus::IsSuccess(proxy_setting.Construct( UNI_L("netcore3.oslo.osa:8889"), TRUE)));
+	verify(proxy_setting.Active());
+}
+
+subtest AddSimpleTest(URL_DocSelfTest_Batch *batch, const OpStringC8 &url, URL &ref_url, const OpStringC8 &filename)
+{
+	verify(batch != NULL);
+	verify(filename.HasContent());
+
+	OpAutoPtr<URL_DocVerySimpleTest> test(OP_NEW(URL_DocVerySimpleTest, ()));
+	verify(test.get() != NULL);
+
+	verify(OpStatus::IsSuccess(test->Construct(url, ref_url, filename)));
+
+	verify(batch->AddTestCase(test.release()));
+}
+
+subtest AddBatch(URL_DocSelfTest_Batch *batch)
+{
+	verify(batch != NULL);
+	verify(libssl_tests->AddBatch(batch));
+}
+
+subtest StartTestSet()
+{
+	verify(libssl_tests->SetLastBatch());
+}
+
+subtest ConfigureATest(URL_DocSelfTest_Batch *batch, const OpStringC8 &filename, URL &ref_url)
+{
+	verify(batch != NULL);
+
+	iterate(name, url) from url_list
+	{
+		OpString a_filename;
+		verify(OpStatus::IsSuccess(a_filename.Set(filename)));
+
+		OpFile a_file;
+
+		verify(OpStatus::IsSuccess(a_file.Construct(a_filename)));
+
+		OpStringC a_name(a_file.GetName());
+
+		verify(a_name.HasContent());
+
+		if(a_name.Compare(name) == 0)
+		{
+			verify(AddSimpleTest(batch, url, ref_url, filename));
+		}
+	}
+}
+
+
+subtest Setup_SingleSSLTest(const OpStringC8 &filename, URL &ref_url)
+{
+	OpAutoPtr<URL_DocSelfTest_Batch> batch(OP_NEW(URL_DocSelfTest_Batch, ()));
+
+	verify(batch.get() != NULL);
+	batch->Construct(state.doc->GetMessageHandler());
+
+	verify(ConfigureATest(batch.get(), filename, ref_url));
+
+	verify(!batch->Empty());
+
+	verify(AddBatch(batch.release()));
+}
+
+subtest Setup_BatchSSLtest()
+{
+	int count = 0;
+	URL ref_url;
+	OpAutoPtr<URL_DocSelfTest_Batch> batch(OP_NEW(URL_DocSelfTest_Batch, ()));
+
+	verify(batch.get() != NULL);
+	batch->Construct(state.doc->GetMessageHandler());
+
+	iterate(filename) from filename_list
+	{
+		verify(ConfigureATest(batch.get(), filename, ref_url));
+		count++;
+	}
+
+	verify(batch->Cardinal() == count);
+
+	verify(AddBatch(batch.release()));
+}
+
+test("Load SSL URLs")
+	require success "Activate Proxy";
+	async;
+{
+	URL ref_url;
+	iterate(filename) from filename_list
+	{
+		if (!Setup_SingleSSLTest(filename, ref_url))
+			ST_failed("Could not setup test %s", filename);
+	}
+	//Setup_BatchSSLtest();
+	if (!StartTestSet())
+		ST_failed("Could not start test set");
+}
+
+test("Check credentials sent")
+	require success "Activate Proxy";
+{
+	verify(listener && listener->CredentialSent());
+}
+
+
+

@@ -1,0 +1,125 @@
+/* -*- Mode: c++; tab-width: 4; indent-tabs-mode: t; c-basic-offset: 4 -*-
+ *
+ * Copyright (C) 2009 Opera Software AS.  All rights reserved.
+ *
+ * This file is part of the Opera web browser.
+ * It may not be distributed under any circumstances.
+ */
+
+group "database.opdatabase.validator";
+
+require init;
+require SUPPORT_DATABASE_INTERNAL;
+
+language c++;
+
+include "modules/database/opdatabase.h";
+include "modules/sqlite/sqlite3.h";
+
+global
+{
+#undef SELFTEST_URLCTXID
+#define SELFTEST_URLCTXID 0
+#undef WEBDB_SELFTEST_ORIGIN
+#define WEBDB_SELFTEST_ORIGIN UNI_L("http://opera.selftest")
+
+#undef SQL_WRAP
+#define SQL_WRAP(s) SqlText(SqlText::CONST_16BIT, UNI_L(s), sizeof(s) - 1)
+
+	static BOOL _verify(BOOL b, const char *msg, unsigned line_number) {
+		if(!b) {
+			char buf[1000]={0}; /* ARRAY OK 2009-04-15 joaoe */
+			op_snprintf(buf,999,"\b\b\b%d: %s should be true", line_number, msg);
+			ST_failed(buf);
+		}
+		return b;
+	}
+
+#undef verify
+#define verify(b) do{if(!_verify((BOOL)(b),#b, __LINE__)) return OpStatus::ERR;}while(0)
+
+	PS_Manager *ps_manager;
+	SqlTransaction* transaction;
+
+	OP_STATUS GetTestDB(AutoReleaseWSDDatabasePtr& db)
+	{
+		PS_Object* ps_obj;
+		RETURN_IF_ERROR(ps_manager->GetObject(PS_ObjectTypes::KWebDatabases, WEBDB_SELFTEST_ORIGIN, UNI_L("name"), FALSE, SELFTEST_URLCTXID, &ps_obj));
+		db = static_cast<WSD_Database*>(ps_obj);
+		return OpStatus::OK;
+	}
+
+#undef verify
+	OP_STATUS status;
+}
+
+setup
+{
+	DATABASE_MODULE_ADD_CONTEXT(0, OPFILE_PERSISTENT_STORAGE_FOLDER);
+}
+
+test("manager setup")
+{
+	verify_not_oom(ps_manager = PS_Manager::NewForSelfTest());
+	transaction = NULL;
+}
+
+test("Untrusted SQL")
+{
+	class TestCallback : public SqlStatement::Callback{
+	public:
+		OP_STATUS m_error;
+		const uni_char *m_error_message;
+
+		TestCallback() : m_error(OpStatus::OK), m_error_message(NULL) {}
+		~TestCallback() { OP_DELETEA(const_cast<uni_char*>(m_error_message)); }
+		virtual OP_STATUS HandleCallback(SqlResultSet * result_set) {
+			OP_DELETE(result_set);
+			return OpStatus::ERR;
+		}
+		virtual Window*	GetWindow() { return g_selftest.utils->GetWindow(); }
+		virtual OpFileLength GetPreferredSize() { return 0; }
+		const uni_char* GetDisplayName() { return NULL; }
+		virtual void Discard() {}
+		virtual OP_STATUS HandleError(OP_STATUS error, const uni_char* error_message, BOOL is_fatal)
+		{
+			m_error = error;
+			if (m_error_message != NULL)
+				OP_DELETEA(const_cast<uni_char*>(m_error_message));
+			m_error_message = error_message;
+			return OpStatus::OK;
+		}
+	};
+
+	AutoReleaseWSDDatabasePtr db;
+	verify_success(GetTestDB(db));
+	verify(db != NULL);
+
+	transaction = db->CreateTransactionSync(FALSE);
+	verify(transaction != NULL);
+
+	transaction->SetSqlValidator(SqlValidator::UNTRUSTED);
+
+	TestCallback cb;
+	// create the table
+	OP_STATUS status = transaction->ExecuteSql(SQL_WRAP("pragma page_size;"), NULL, &cb);
+
+	verify(status == PS_Status::ERR_AUTHORIZATION);
+	verify(cb.m_error == PS_Status::ERR_AUTHORIZATION);
+
+	status = transaction->Release();
+	transaction = NULL;
+	verify(OpStatus::IsSuccess(status));
+}
+finally
+{
+	if (transaction != NULL)
+		OpStatus::Ignore(transaction->Release());
+	transaction = NULL;
+}
+
+exit
+{
+	//TRAP(status,ps_manager->DumpIndexL(UNI_L("Exit")));
+	OP_DELETE(ps_manager);
+}

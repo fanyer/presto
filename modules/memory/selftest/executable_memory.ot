@@ -1,0 +1,165 @@
+/* -*- Mode: c++; tab-width: 4; indent-tabs-mode: t; c-basic-offset: 4 -*-
+ *
+ * Copyright (C) 2009 Opera Software AS.  All rights reserved.
+ *
+ * This file is part of the Opera web browser.  It may not be distributed
+ * under any circumstances.
+ */
+
+group "memory.executable";
+
+language C++;
+
+require EXECUTABLE_MEMORY_MANAGER;
+
+include "modules/memory/src/memory_executable.h";
+
+global
+{
+	OpExecMemoryManager* emm;
+	const OpExecMemory* exmem;
+
+	// Borrow these two functions from pi/selftest/OpMemory.cpp
+	extern "C" int OpMemory_Test_ExecutableMemory(int arg);
+	extern "C" int OpMemory_Test_ExecutableMemory2(int arg);
+}
+
+setup
+{
+	emm = 0;
+	exmem = 0;
+}
+
+exit
+{
+	if ( exmem != 0 )
+		OpExecMemoryManager::Free(exmem);
+	OP_DELETE(emm);
+	emm = 0;
+}
+
+test("Create OpExecMemoryManager")
+{
+	emm = OP_NEW(OpExecMemoryManager, (MEMCLS_SELFTEST1));
+	verify(emm != 0);
+}
+
+test("Make allocation")
+	require success "Create OpExecMemoryManager";
+{
+
+	TRAPD(status, exmem = emm->AllocateL(256));
+	verify(OpStatus::IsSuccess(status));
+
+	verify(exmem->size >= 256); // Must be large enough
+	verify(exmem->size <= 512); // Don't make it too large
+	verify(exmem->address != 0); // Need a real address
+
+#ifndef MEMORY_SMALL_EXEC_SEGMENTS
+	// When the OpExecMemoryManager class keeps track of the allocations,
+	// we can test that the underlying OpMemSegment is created.
+	verify(emm->Test_GetSegmentCount() == 1);
+#endif
+}
+
+// IMPORTANT NOTE: If you fix issues with the following two testcases, then
+// also see if your fixes are applicable to the lower-level testcases for
+// executable memory found in modules/pi/selftest/OpMemory.ot
+test("Write function into allocation and finalize")
+	require success "Make allocation";
+{
+	// Sanity check original test-function.
+	// This might also resolve the "real" function address if lazy binding
+	// is used on this platform.
+	verify(OpMemory_Test_ExecutableMemory(10) == 13);
+	verify(OpMemory_Test_ExecutableMemory(100) == 144);
+
+	size_t function_size = 256; // Conservative estimate
+	void* function = (void*)OpMemory_Test_ExecutableMemory;
+
+	//
+	// Sometimes (observed on 32-bit WinGogi/Debug_Desktop in VS2008) the
+	// compiler will put OpMemory_Test_ExecutableMemory behind a jump
+	// table, and we end up copying the jump table instead of the actual
+	// function itself. This will cause a crash in the test below if the
+	// jump table uses relative function addresses.
+	// To counteract this, we try to detect the existence of this jump
+	// table, and if one is found, we manually calculate the "real"
+	// function address and copy that instead.
+	// This code will probably need to be extended to handle similar
+	// behavior on other compilers/platforms.
+	//
+#ifdef ARCHITECTURE_IA32
+	unsigned char *function_bytes = (unsigned char *)function;
+	if (*function_bytes == 0xe9) // Function starts with JMP <rel32>
+	{
+		// Assume function address points to a jump table that does a
+		// relative jump to the "real" function.
+		// Calculate address to "real" function.
+		INT32 rel_addr = *(INT32 *)(function_bytes + 1);
+		function = (void *)((function_bytes + 5) + rel_addr);
+	}
+#endif // ARCHITECTURE_IA32
+
+	op_memcpy(exmem->address, function, function_size);
+	TRAPD(status, OpExecMemoryManager::FinalizeL(exmem));
+	verify(OpStatus::IsSuccess(status));
+}
+
+// NOTE: This testcase could possibly be unreliable on some platforms,
+// fixes appreciated. If you fix issues with this testcase please see
+// the note on the previous testcase as well.
+test("Call function inside allocation")
+	require success "Write function into allocation and finalize";
+{
+	// Sanity check original test-function
+	verify(OpMemory_Test_ExecutableMemory(10) == 13);
+	verify(OpMemory_Test_ExecutableMemory(100) == 144);
+
+	// Compare test-function with its copied version in the segment
+	int (*copied_function)(int) = (int (*)(int))exmem->address;
+
+	// ... for some different values of the argument
+	for ( int k = 0; k < 1000; k++ )
+	{
+		int original = OpMemory_Test_ExecutableMemory(k); // Call original
+		//
+		// If the following function call causes a crash, and you're
+		// pretty sure that it's not caused by the allocated memory
+		// not being executable, then it may be that we have failed
+		// to correctly copy OpMemory_Test_ExecutableMemory into
+		// exmem->address.
+		// See the above test for hints on how to fix that.
+		//
+		int copied = copied_function(k); // Call into segment
+		verify(original == copied);
+	}
+}
+
+test("Merge with another OpExecMemoryManager")
+	require success "Create OpExecMemoryManager";
+{
+	OP_STATUS status = OpStatus::OK;
+	OpExecMemoryManager* emm_other = OP_NEW(OpExecMemoryManager, (MEMCLS_SELFTEST1));
+	verify(emm_other != 0);
+	const OpExecMemory* exmem_other = NULL;
+	TRAP(status, exmem_other = emm_other->AllocateL(256));
+	verify_success(status);
+	verify(exmem_other);
+	verify(exmem_other->size >= 256); // Must be large enough.
+	emm->MergeWith(emm_other);
+	OpExecMemoryManager::Free(exmem_other);
+}
+
+test("Free allocation")
+	require success "Make allocation";
+{
+	OpExecMemoryManager::Free(exmem);
+	exmem = 0;
+
+#ifndef MEMORY_SMALL_EXEC_SEGMENTS
+	// When the OpExecMemoryManager class keeps track of the allocations,
+	// we can test that the underlying OpMemSegment is released.
+	verify(emm->Test_GetSegmentCount() == 0);
+#endif
+}

@@ -1,0 +1,677 @@
+group "search_engine.blockstorage";
+
+require SEARCH_ENGINE;
+
+include "modules/search_engine/BlockStorage.h";
+include "modules/search_engine/tests/test_util.h";
+include "modules/util/opfile/opfile.h";
+
+test("BS Open")
+	file uni wr_err_b    "data/wr_err.b";
+	file uni wr_err_b_j  "data/wr_err.b-j";
+	file uni wr_err_f    "data/wr_err.f";
+	file uni wr_err_f_j  "data/wr_err.f-j";
+	file uni wr_err2_b   "data/wr_err2.b";
+	file uni wr_err2_b_j "data/wr_err2.b-j";
+	file uni wr_err2_f   "data/wr_err2.f";
+	file uni wr_err2_f_j "data/wr_err2.f-j";
+	file uni bigendian_b "data/bigendian.b";
+{
+	OP_STATUS rv = OpStatus::OK;
+	BlockStorage bs;
+	char test1[16];  /* ARRAY OK 2010-09-24 roarl */
+
+	// little endian files
+	if (BlockStorage::FileExists(wr_err_b) == OpBoolean::IS_TRUE &&
+		BlockStorage::FileExists(wr_err_b_j) == OpBoolean::IS_TRUE)
+	{
+		copy_file(wr_err_b, wr_err_f);
+		copy_file(wr_err_b_j, wr_err_f_j);
+
+		rv = bs.Open(wr_err_f, BlockStorage::OpenRead, 256);
+		bs.Close();
+
+		delete_file(wr_err_f);
+		delete_file(wr_err_f_j);
+	}
+	else {
+		output("\ndata/wr_err.b not found, aborting ...");
+	}
+
+	verify(rv == OpStatus::OK);
+
+	if (BlockStorage::FileExists(wr_err2_b) == OpBoolean::IS_TRUE &&
+		BlockStorage::FileExists(wr_err2_b_j) == OpBoolean::IS_TRUE)
+	{
+		copy_file(wr_err2_b, wr_err2_f);
+		copy_file(wr_err2_b_j, wr_err2_f_j);
+
+		rv = bs.Open(wr_err2_f, BlockStorage::OpenReadWrite, 256);
+		test1[0] = 0;
+		verify(bs.Read(test1, 13, bs.GetBlockSize() * 2));
+		bs.Close();
+
+		delete_file(wr_err2_f);
+		delete_file(wr_err2_f_j);
+
+		verify(rv == OpStatus::OK);
+		verify_string(test1, "transaction2");
+	}
+	else {
+		output("\ndata/wr_err2.b not found, aborting ...");
+	}
+
+
+	// big endian file
+	if (BlockStorage::FileExists(bigendian_b) == OpBoolean::IS_TRUE)
+	{
+		rv = bs.Open(bigendian_b, BlockStorage::OpenRead, 256);
+		verify(bs.Read(test1, 7, bs.GetBlockSize() * 2));
+		bs.Close();
+
+		verify(rv == OpStatus::OK);
+		verify_string(test1, "123456");
+	}
+	else {
+		output("\ndata/bigendian.b not found, aborting ...");
+	}
+}
+
+test("Small block")
+	file uni bss_wr "data/bss.wr";
+{
+	BlockStorage bs;
+	OpFileLength pos1, pos2, pos3;
+	char test1[16], test3[20];
+	OP_STATUS status;
+
+	delete_file(bss_wr);
+
+	status = bs.Open(bss_wr, BlockStorage::OpenReadWrite, 16);
+	verify_success(status);
+
+	pos1 = bs.Write("4444test1", 10);
+	bs.Close();
+
+	verify_success(bs.Open(bss_wr, BlockStorage::OpenRead, 256));
+	test1[0] = 0;
+	verify(bs.Read(test1, 10, pos1));
+	bs.Close();
+
+	verify_success(bs.Open(bss_wr, BlockStorage::OpenReadWrite, 256));
+	pos2 = bs.Write("4444test2", 10);
+	verify(bs.Delete(pos2));
+	pos3 = bs.Write("4444test3", 10);
+	verify(bs.Update("4444longtest3", 14, pos3));
+	verify(bs.Read(test3, 14, pos3));
+	bs.Close();
+
+	delete_file(bss_wr);
+
+	verify_string(test1, "4444test1");
+	verify_string(test3, "4444longtest3");
+	verify(pos2 == pos3);
+}
+
+test("Normal block")
+	file uni bsn_wr "data/bsn.wr";
+{
+	BlockStorage bs;
+	int i;
+	OpFileLength pos1, pos2, pos;
+	int len;
+	char test1w[512], test1r[512];
+	OP_STATUS status;
+
+	delete_file(bsn_wr);
+
+	status = bs.Open(bsn_wr, BlockStorage::OpenReadWrite, 256);
+	verify_success(status);
+
+	for (i = 0; i < (int)sizeof(test1w); ++i)
+		test1w[i] = (char)op_rand();
+
+	pos1 = bs.Write(test1w, 64);
+	pos2 = bs.Write(test1w, 64);
+	verify(bs.Delete(pos1));
+	pos1 = bs.Write(test1w, 320);
+	
+	// Verify startblocks
+	verify(bs.IsStartBlocksSupported());
+	for (pos=0; pos < bs.GetFileSize(); pos += bs.GetBlockSize())
+		verify(bs.IsStartBlock(pos) == (pos==pos1 || pos==pos2));
+	
+	verify(bs.Delete(pos2));  // makes gap in pos1 data
+	verify(bs.Update(test1w, 512, pos1));
+
+	len = bs.DataLength(pos1);
+	
+	verify(bs.Read(test1r, 512, pos1));
+
+	// Verify startblocks
+	for (pos=0; pos < bs.GetFileSize(); pos += bs.GetBlockSize())
+		verify(bs.IsStartBlock(pos) == (pos==pos1));
+	
+	verify(bs.Delete(pos1));  // we should have an empty file
+
+	bs.Close();
+
+	delete_file(bsn_wr);
+
+	verify(len == 512);
+	verify(op_memcmp(test1w, test1r, 512) == 0);
+}
+
+test("Transaction")
+	file uni bst_wr   "data/bst.wr";
+	file uni bst_wr_j "data/bst.wr-j";
+{
+	BlockStorage bs;
+	OpFileLength pos1, pos2;
+	int len, i;
+	char test1w[512], test1r[512];
+	OP_STATUS status;
+
+	delete_file(bst_wr);
+	delete_file(bst_wr_j);
+
+	status = bs.Open(bst_wr, BlockStorage::OpenReadWrite, 128);
+	verify_success(status);
+
+	for (i = 0; i < (int)sizeof(test1w); ++i)
+		test1w[i] = (char)op_rand();
+
+	verify_success(bs.BeginTransaction());
+
+	pos1 = bs.Write(test1w, 64);
+	pos2 = bs.Write(test1w, 64);
+
+	verify_success(bs.Commit());
+
+	len = bs.DataLength(pos1);
+
+	verify_success(bs.BeginTransaction());
+
+	verify(bs.Delete(pos2));
+	verify(bs.Delete(pos1));
+
+	verify_success(bs.Rollback());
+
+	len = bs.DataLength(pos1);
+
+	verify_success(bs.BeginTransaction());
+
+	verify(bs.Update(test1w, 256, pos1));
+	verify(bs.Delete(pos2));
+	verify(bs.Update(test1w, 512, pos1));
+
+	verify(bs.Read(test1r, 512, pos1));
+
+	verify_success(bs.Rollback());
+
+	len = bs.DataLength(pos1);
+
+	bs.Close();
+
+	delete_file(bst_wr);
+
+	verify(op_memcmp(test1w, test1r, 512) == 0);
+	verify(len == 64);
+}
+
+test("Update over two blocks")
+	file uni bsp_wr "data/bsp.wr";
+{
+	BlockStorage bs;
+	OpFileLength pos1, pos2;
+	int len;
+	char test1[32];  /* ARRAY OK 2010-09-24 roarl */
+	char test2[32];  /* ARRAY OK 2010-09-24 roarl */
+	OP_STATUS status;
+
+	delete_file(bsp_wr);
+
+	status = bs.Open(bsp_wr, BlockStorage::OpenReadWrite, 16);
+	verify_success(status);
+
+	pos2 = bs.Write("abcd", 4);
+
+	pos1 = bs.Write("1234ABCD", 8);
+
+	verify(bs.Update("ab", 2, pos1));
+	verify(bs.Update("EFGH", 4, pos1));
+	
+	len = bs.DataLength(pos1);
+	verify(bs.Read(test1, len, pos1));
+	test1[len] = 0;
+
+	verify(bs.Update("abcd1234", 8, pos2));
+	verify(bs.Delete(pos1));
+	verify(bs.Update("abcd1234ABCDEFGH", 16, pos2));
+
+	verify(bs.Update(4, pos2));
+	verify(bs.Update(2, pos2));
+
+	verify(bs.Update("1234abcd", 8, pos2));
+
+	len = bs.DataLength(pos2);
+	verify(bs.Read(test2, len, pos2));
+	test2[len] = 0;
+
+	bs.Close();
+
+	delete_file(bsp_wr);
+
+	verify_string(test1, "EFGH");
+	verify_string(test2, "1234abcd");
+}
+
+test("Partial update")
+	file uni bsp_wr "data/bsp.wr";
+{
+	BlockStorage bs;
+	OpFileLength pos1;
+	int len;
+	char test1[64];  /* ARRAY OK 2010-09-24 roarl */
+	OP_STATUS status;
+
+	delete_file(bsp_wr);
+
+	status = bs.Open(bsp_wr, BlockStorage::OpenReadWrite, 16);
+	verify_success(status);
+
+	pos1 = bs.Write("1234ABCDefgh5678", 16);
+
+	verify(bs.Update("8", 3, 1, pos1));
+	verify(bs.Update("GH12", 10, 4, pos1));
+	verify(bs.Update("IJ", 16, 2, pos1));
+	verify(bs.Update("KLmn", 18, 4, pos1));
+	verify(bs.Update("op/*-+", 22, 6, pos1));
+	verify(bs.Update("90", 28, 2, pos1));
+	verify(bs.Update("12345678", 30, 8, pos1));
+	verify(bs.Update(32, pos1));
+	verify(bs.Update(30, pos1));
+	
+	len = bs.DataLength(pos1);
+	verify(bs.Read(test1, len, pos1));
+	test1[len] = 0;
+
+	bs.Close();
+
+	delete_file(bsp_wr);
+
+	verify_string(test1, "1238ABCDefGH1278IJKLmnop/*-+90");
+}
+
+test("Reserve")
+	file uni bsr_wr "data/bsr.wr";
+{
+	BlockStorage bs;
+	OpFileLength pos1, pos2, pos3, pos4;
+	int fsize;
+	char test1[8];  /* ARRAY OK 2010-09-24 roarl */
+	char test2;
+	OP_STATUS status;
+
+	delete_file(bsr_wr);
+
+	status = bs.Open(bsr_wr, BlockStorage::OpenReadWrite, 16);
+	verify_success(status);
+
+	pos1 = bs.Write("1", 2);
+	pos2 = bs.Write("2", 2);
+	verify(bs.Delete(pos1));
+
+	verify_success(bs.BeginTransaction(TRUE));
+	pos3 = bs.Reserve();
+	pos4 = bs.Reserve();
+	verify_success(bs.Rollback());
+
+	fsize = (int)(bs.GetFileSize() / bs.GetBlockSize());
+
+	verify_success(bs.BeginTransaction(TRUE));
+
+	pos3 = bs.Reserve();
+	pos4 = bs.Reserve();
+
+	verify_success(bs.FlushJournal());
+
+	verify(bs.Write("12345", 6, pos3) != 0);
+	verify(bs.Write("4", 1, pos4) != 0);
+
+	verify_success(bs.Commit());
+
+	bs.Close();
+	verify_success(bs.Open(bsr_wr, BlockStorage::OpenReadWrite, 16));
+
+	verify(bs.Write("i", 1) != 0);
+
+	verify(bs.Read(test1, 6, pos3));
+	verify(bs.Read(&test2, 1, pos4));
+
+	bs.Close();
+
+	delete_file(bsr_wr);
+
+	verify(fsize == 4);
+	verify(pos1 == pos3 && pos2 < pos4);
+	verify_string(test1, "12345");
+	verify(test2 == '4');
+}
+
+test("Append")
+	file uni bsa_wr "data/bsa.wr";
+{
+	BlockStorage bs;
+	int i;
+	OpFileLength pos1, pos2, pos3;
+	INT32 value[16];  /* ARRAY OK 2010-09-24 roarl */
+	INT32 v1[16], v2[16], v3[16];  /* ARRAY OK 2010-09-24 roarl */
+	int l1, l2, l3;
+	OP_STATUS status;
+
+	delete_file(bsa_wr);
+	status = bs.Open(bsa_wr, BlockStorage::OpenReadWrite, 20);  // 8 bytes left in a block for data
+	verify_success(status);
+
+	for (i = 0; i < (int)sizeof(value) / 4; ++i)
+	{
+		value[i] = i;
+		v1[i] = -1;
+		v2[i] = -1;
+		v3[i] = -1;
+	}
+
+	pos1 = bs.Append(value,  4, 0);
+	pos2 = bs.Append(value,  8, 0);
+	pos3 = bs.Append(value, 12, 0);
+
+	pos1 = bs.Append(value + 1,  4, pos1);
+	pos2 = bs.Append(value + 2, 12, pos2);
+	pos3 = bs.Append(value + 3,  8, pos3);
+
+	pos1 = bs.Append(value + 2, 32, pos1);
+
+	l1 = bs.DataLength(pos1);
+	l2 = bs.DataLength(pos2);
+	l3 = bs.DataLength(pos3);
+	
+	verify(bs.ReadApnd(v1, l1, pos1));
+	verify(bs.ReadApnd(v2, l2, pos2));
+	verify(bs.ReadApnd(v3, l3, pos3));
+
+
+	bs.Close();
+
+	delete_file(bsa_wr);
+
+	verify(l1 == 40);
+	verify(l2 == 20);
+	verify(l3 == 20);
+
+	for (i = 0; i < 10; ++i)
+		verify(v1[i] == i);
+
+	for (i = 0; i < 5; ++i)
+		verify(v2[i] == i);
+
+	for (i = 0; i < 5; ++i)
+		verify(v3[i] == i);
+}
+
+test("Append struct cut in the middle")
+	file uni bsa_wr "data/bsa.wr";
+{
+	struct EBstruct {
+		EBstruct() : a(0), b(0) {}
+		EBstruct(int i) {a = (UINT32)i; b = (UINT32)i + 1;}
+		UINT32 a;
+		UINT32 b;
+	};
+
+	BlockStorage bs;
+	int i;
+	OpFileLength pos1;
+	EBstruct value[16];  /* ARRAY OK 2010-09-24 roarl */
+	EBstruct v1[16], v2[16];  /* ARRAY OK 2010-09-24 roarl */
+	int l1;
+	OP_STATUS status;
+
+	delete_file(bsa_wr);
+	status = bs.Open(bsa_wr, BlockStorage::OpenReadWrite, 112);
+	verify_success(status);
+
+	for (i = 0; i < (int)(sizeof(value) / sizeof(value[0])); ++i)
+	{
+		value[i] = EBstruct(i << 1);
+		v1[i] = EBstruct(-2);
+	}
+
+	pos1 = bs.Append(value,  sizeof(value) / 2, 0);
+	pos1 = bs.Append(value + 8,  sizeof(value) / 2, pos1);
+
+//	pos1 = bs.Append(value + 1,  3 * sizeof(value[0]) / 2, pos1);
+
+//	pos1 = bs.Append((char *)value + 5 * sizeof(value[0]) / 2, sizeof(value) - 5 * sizeof(value[0]) / 2, pos1);
+
+	l1 = bs.DataLength(pos1);
+	
+	verify(bs.ReadApnd(v1, 16, pos1));
+	verify(bs.ReadApnd(v2, l1, pos1));
+
+	bs.Close();
+
+	delete_file(bsa_wr);
+
+	verify(l1 == sizeof(value));
+
+	for (i = 0; i < (int)(sizeof(value) / sizeof(value[0])); ++i)
+	{
+		verify(v2[i].a % 2 == 0);
+		verify(v2[i].b % 2 == 1);
+		verify(v2[i].a == v2[i].b - 1);
+	}
+
+	for (i = 0; i < 2; ++i)
+	{
+		verify(v1[i].a % 2 == 0);
+		verify(v1[i].b % 2 == 1);
+		verify(v1[i].a == v1[i].b - 1);
+	}
+}
+
+test("Two bitfields")
+	file uni bsb_wr   "data/bsb.wr";
+	file uni bsb_wr_j "data/bsb.wr-j";
+{
+	BlockStorage bs;
+	int i;
+	OP_STATUS status;
+	INT32 val = 0x10101010;
+	OpFileLength firstpos, lastpos;
+
+	delete_file(bsb_wr);
+	delete_file(bsb_wr_j);
+
+	status = bs.Open(bsb_wr, BlockStorage::OpenReadWrite, 16);
+	verify_success(status);
+
+	firstpos = bs.Write(&val, 4);
+
+	for (i = 1; i < 16 * 8; ++i)
+		verify(bs.Write(&val, 4) != 0);
+
+	lastpos = bs.Write(&val, 4);
+
+	verify(firstpos == 2 * 16 && lastpos == (16 * 8 + 3) * 16);
+
+	verify(bs.Delete(lastpos));
+
+	verify(bs.GetFileSize() == lastpos - 16);
+
+	for (i = (int)(lastpos - 32); i >= (int)firstpos; i -= 16)
+		verify(bs.Delete(i));
+
+	verify(bs.GetFileSize() == 16);
+
+	for (i = 0; i <= 16 * 8; ++i)
+		verify(bs.Write(&val, 4) != 0);
+
+	for (i = (int)firstpos; i < (int)(lastpos - 16); i+= 16)
+		verify(bs.Delete(i));
+
+	verify(bs.Delete(lastpos));
+
+	verify(bs.GetFileSize() == 16);
+
+	bs.Close();
+	delete_file(bsb_wr);
+}
+
+test("Deletion and insertion in transaction")
+	file uni bsdt_wr   "data/bsdt.wr";
+	file uni bsdt_wr_j "data/bsdt.wr-j";
+{
+	BlockStorage bs;
+	int i;
+	OP_STATUS status;
+	INT32 val = 0x10101010;
+	OpFileLength firstpos, lastpos, reserved;
+
+	delete_file(bsdt_wr);
+	delete_file(bsdt_wr_j);
+
+	status = bs.Open(bsdt_wr, BlockStorage::OpenReadWrite, 16);
+	verify_success(status);
+
+	firstpos = bs.Write(&val, 4);
+	verify(firstpos != 0);
+
+	for (i = 1; i < 16 * 8; ++i)
+		verify(bs.Write(&val, 4) != 0);
+
+	lastpos = bs.Write(&val, 4);
+
+	verify(bs.Delete(64));
+
+	verify_success(bs.BeginTransaction(TRUE));
+
+	verify_success(bs.PreJournal(128));
+
+	reserved = bs.Reserve();
+
+	verify_success(bs.FlushJournal());
+
+	verify(bs.Delete(128));
+
+	verify_success(bs.Rollback());
+
+	verify(reserved == 64);
+	verify(bs.GetFileSize() == lastpos + 16);
+
+	reserved = bs.Write(&val, 4);
+	verify(reserved == 64);
+
+	reserved = bs.Write(&val, 4);
+	verify(reserved == lastpos + 16);
+
+	verify(bs.Delete(reserved));
+
+	verify(bs.Delete(64));
+	verify(bs.Delete(80));
+	verify(bs.Delete(96));
+
+	verify_success(bs.BeginTransaction(TRUE));
+
+	reserved = bs.Reserve();
+
+	verify_success(bs.FlushJournal());
+
+	verify(bs.Write(&val, 4) != 0);
+
+	verify(bs.Delete(128));
+
+	verify(bs.Write(&val, 4) != 0);
+
+	verify(bs.Write(&val, 4, reserved) != 0);
+
+	verify(bs.Write(&val, 4) != 0);
+	verify(bs.Write(&val, 4) != 0);
+
+	verify_success(bs.Commit());
+
+	verify(reserved == 64);
+	verify(bs.GetFileSize() == lastpos + 32);
+
+	bs.Close();
+	delete_file(bsdt_wr);
+}
+
+test("Upgrading from old format")
+	file uni old_format_b "data/old_format.b";
+	file uni old_format_f "data/old_format.f";
+{
+	OP_STATUS status;
+	BlockStorage bs;
+
+	if (BlockStorage::FileExists(old_format_b) == OpBoolean::IS_TRUE)
+	{
+		copy_file(old_format_b, old_format_f);
+
+		status = bs.Open(old_format_f, BlockStorage::OpenReadWrite, 256);
+		verify_success(status);
+
+		OpFileLength pos = bs.GetBlockSize() * 2; // Position of the only valid start block
+
+		// Upgrade to support startblocks
+		verify(!bs.IsStartBlocksSupported());
+		verify_success(bs.SetStartBlock(pos));
+		verify_success(bs.StartBlocksUpdated());
+		verify(bs.IsStartBlocksSupported());
+		
+		bs.Close();
+
+		// Verify that file now supports start blocks
+		status = bs.Open(old_format_f, BlockStorage::OpenRead, 256);
+		verify_success(status);
+
+		verify(bs.IsStartBlocksSupported());
+		for (OpFileLength p=0; p < bs.GetFileSize(); p += bs.GetBlockSize())
+			verify(bs.IsStartBlock(p) == (p==pos));
+		bs.Close();
+
+		delete_file(old_format_f);
+	}
+	else {
+		output("\ndata/old_format.b not found, aborting ...");
+	}
+}
+
+test("Too small block, CORE-28977")
+	file uni bss_wr "data/bss.wr";
+{
+	BlockStorage bs;
+	OpFileLength pos1;
+	char test1[20];  /* ARRAY OK 2010-09-24 roarl */
+	OP_STATUS status;
+	OpFile file;
+
+	delete_file(bss_wr);
+
+	status = bs.Open(bss_wr, BlockStorage::OpenReadWrite, 256);
+	verify_success(status);
+
+	pos1 = bs.Write("01234567890123456789", 20);
+	bs.Close();
+
+	verify_success(file.Construct(bss_wr));
+	verify_success(file.Open(OPFILE_UPDATE));
+	verify_success(file.SetFileLength(pos1+8+4+10));
+	verify_success(file.Close());
+
+	verify_success(bs.Open(bss_wr, BlockStorage::OpenRead, 256));
+	verify(!bs.Read(test1, 20, pos1));
+	bs.Close();
+
+	delete_file(bss_wr);
+}

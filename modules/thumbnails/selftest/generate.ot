@@ -1,0 +1,878 @@
+/* -*- Mode: c++; tab-width: 4; indent-tabs-mode: t; c-basic-offset: 4; -*-
+ *
+ * Copyright (C) 2008-2011 Opera Software ASA.  All rights reserved.
+ *
+ * This file is part of the Opera web browser.
+ * It may not be distributed under any circumstances.
+ */
+group "thumbnails.generate";
+
+require SUPPORT_GENERATE_THUMBNAILS;
+
+include "modules/thumbnails/thumbnailmanager.h";
+include "modules/dochand/winman.h";
+include "modules/url/url_api.h";
+
+include "modules/thumbnails/src/thumbnail.h";
+include "modules/img/decoderfactorypng.h";
+include "modules/formats/uri_escape.h";
+include "modules/windowcommander/src/WindowCommander.h";
+
+// Set to TRUE to generate new reference images.
+constant GENERATE_REF_IMAGES = FALSE;
+
+global
+{
+	const char* urls[] = {
+		  "http://www.opera.com/"
+		, "http://www.myopera.com/"
+		/*, "http://www.vg.no/"
+		  , "http://www.cnn.com/"
+		  , "http://www.aftonbladet.se/"
+		  , "http://www.bbc.co.uk/"
+		  , "http://www.dn.se/" */
+	};
+	int num_urls = ARRAY_SIZE(urls);
+
+	class ThumbnailSelftestUtils
+	{
+	public:
+		static OP_STATUS GetResolvedURL(const char* url_string, URL& url)
+		{
+			OpString in, resolved_url;
+			RETURN_IF_ERROR(in.Set(url_string));
+
+			if (g_url_api->ResolveUrlNameL(in, resolved_url) == FALSE )
+				return OpStatus::ERR;
+
+			url = g_url_api->GetURL(resolved_url);
+			if (url.IsEmpty())
+				return OpStatus::ERR;
+
+			return OpStatus::OK;
+		}
+	};
+
+	/// Used to verify that thumbnail render correctly
+	class RenderingVerifier : public ThumbnailManagerListener
+	{
+	public:
+		enum Mode { NORMAL, SMALL, LOGO, LOW_QUALITY };
+
+		RenderingVerifier(Mode mode = NORMAL) : m_mode(mode)
+		{}
+
+		virtual ~RenderingVerifier()
+		{}
+
+	private:
+		virtual void OnThumbnailRequestStarted(const URL &document_url, BOOL reload)
+		{
+		}
+
+		virtual void OnInvalidateThumbnails()
+		{
+		}
+
+		virtual void OnThumbnailReady(const URL &document_url, const Image &thumbnail, const uni_char *title, long preview_refresh)
+		{
+			OpString8 ref_image_unescaped, ref_image;
+			if (OpStatus::IsError(document_url.GetAttribute(URL::KName, ref_image_unescaped)))
+			{
+				ST_failed("OOM");
+			}
+
+			if (ref_image.Reserve(ref_image_unescaped.Length()) == NULL)
+				ST_failed("OOM");
+
+			if (UriUnescape::Unescape(ref_image.CStr(), ref_image_unescaped.CStr(), 0) <= 0)
+				ST_failed("Could not unescape thumbnail URL");
+
+			OpString8 reference_filename, filename;
+			char* dir = ST_make_path("reference");
+
+			// The path fetched via URL::KName hasn't got the platform path separator, but rather '/'.
+			// Therefore we can't use the PATHSEPCHAR here.
+			int last_slash = ref_image.FindLastOf('/');
+			if (OpStatus::IsError(filename.AppendFormat("%s", ref_image.SubString(last_slash + 1, ref_image.Length()).CStr())))
+				ST_failed("OOM");
+
+			if (OpStatus::IsError(reference_filename.Set(dir)))
+				ST_failed("OOM");
+
+			if (OpStatus::IsError(reference_filename.AppendFormat("%s%s", PATHSEP, filename.CStr())))
+				ST_failed("OOM");
+
+			reference_filename.Delete(reference_filename.Length() - 4);
+			switch(m_mode)
+			{
+				case SMALL:
+					if (OpStatus::IsError(reference_filename.Append("_small")))
+						ST_failed("OOM");
+					break;
+				case LOGO:
+					if (OpStatus::IsError(reference_filename.Append("_logo")))
+						ST_failed("OOM");
+					break;
+				case LOW_QUALITY:
+					if (OpStatus::IsError(reference_filename.Append("_lq")))
+						ST_failed("OOM");
+					break;
+				default:;
+			}
+			if (OpStatus::IsError(reference_filename.Append(".png")))
+				ST_failed("OOM");
+
+			Image image = thumbnail;
+			OpBitmap* bitmap_to_paint = image.GetBitmap(NULL);
+			if (bitmap_to_paint == NULL)
+				ST_failed("OOM");
+
+			OP_STATUS status = DecoderFactoryPng::selftest_verify(reference_filename.CStr(), bitmap_to_paint, 192, 5, 0, GENERATE_REF_IMAGES);
+
+			if (OpStatus::IsSuccess(status))
+			{
+				ST_passed();
+			}
+			else
+			{
+				OpString8 failed_filename, filename;
+				char* dir = ST_make_path("failed");
+
+				// The path fetched via URL::KName hasn't got the platform path separator, but rather '/'.
+				// Therefore we can't use the PATHSEPCHAR here.
+				int last_slash = ref_image.FindLastOf('/');
+				if (OpStatus::IsError(filename.AppendFormat("%s", ref_image.SubString(last_slash + 1, ref_image.Length()).CStr())))
+					ST_failed("OOM");
+
+				if (OpStatus::IsError(failed_filename.Set(dir)))
+					ST_failed("OOM");
+
+				switch(m_mode)
+				{
+					case SMALL:
+						if (OpStatus::IsError(failed_filename.AppendFormat("%s%s_small.jpg", PATHSEP, filename.CStr())))
+							ST_failed("OOM");
+						break;
+					case LOGO:
+						if (OpStatus::IsError(failed_filename.AppendFormat("%s%s_logo.jpg", PATHSEP, filename.CStr())))
+							ST_failed("OOM");
+						break;
+					case LOW_QUALITY:
+						if (OpStatus::IsError(failed_filename.AppendFormat("%s%s_lq.jpg", PATHSEP, filename.CStr())))
+							ST_failed("OOM");
+						break;
+					default:
+						if (OpStatus::IsError(failed_filename.AppendFormat("%s%s.jpg", PATHSEP, filename.CStr())))
+							ST_failed("OOM");
+						break;
+				}
+
+				DecoderFactoryPng::verify(failed_filename.CStr(), bitmap_to_paint, 192, 5, 0, TRUE);
+
+				ST_failed("Thumbnails did not match");
+			}
+			image.ReleaseBitmap();
+		}
+
+		virtual void OnThumbnailFailed(const URL &document_url, OpLoadingListener::LoadingFinishStatus status)
+		{
+			ST_failed("OpThumbnail failed");
+		}
+
+	private:
+		Mode m_mode;
+	};
+
+	/// Used to verify that thumbnail loads, finishes correctly etc..
+	class LoadVerifier : public ThumbnailManagerListener
+	{
+	public:
+		enum { INITIAL, STARTED, FAILED, READY };
+
+		LoadVerifier()
+			: m_num_urls(0)
+			, m_urls(0)
+			, m_loaded(0)
+			, m_done(FALSE)
+		{}
+
+		~LoadVerifier()
+		{
+			OP_DELETEA(m_loaded);
+		}
+
+		void SetUrls(const char** urls, int num_urls)
+		{
+			m_urls = urls;
+			m_num_urls = num_urls;
+			m_loaded = OP_NEWA(int, num_urls);
+
+			for (int i=0; i < m_num_urls; i++)
+				m_loaded[i] = INITIAL;
+		}
+
+		virtual void OnThumbnailRequestStarted(const URL &document_url, BOOL reload)
+		{
+			OpString8 url;
+			int index = GetIndex(document_url, url);
+			if (index < 0)
+			{
+				ST_failed("Unexpected url '%s'", url.CStr());
+				m_done = FALSE;
+			}
+			else if (m_loaded[index] != INITIAL)
+			{
+				ST_failed("Not in initial when started loading '%s'", url.CStr());
+				m_done = FALSE;
+			}
+			else
+				m_loaded[index] = STARTED;
+		}
+
+		virtual void OnInvalidateThumbnails()
+		{
+		}
+
+		virtual void OnThumbnailReady(const URL &document_url, const Image &thumbnail, const uni_char *title, long preview_refresh)
+		{
+			if (IsDone()) return;
+
+			OpString8 url;
+			int index = GetIndex(document_url, url);
+			if (index < 0)
+			{
+				ST_failed("Unexpected url '%s'", url.CStr());
+				return;
+			}
+
+			/* If sequential loading is enabled make sure that no thumbnails are
+			 * generated before the previous one. */
+#ifdef THUMBNAILS_SEQUENTIAL_GENERATE
+			if (index > 0 && (m_loaded[index-1] == STARTED || m_loaded[index-1] == INITIAL))
+			{
+				OpString8 str;
+				if (OpStatus::IsError(document_url.GetAttribute(URL::KName_Escaped, str)))
+					ST_failed("OOM");
+
+				ST_failed("%s ready before previous", str.CStr());
+				m_done = TRUE;
+				return;
+			}
+#endif // THUMBNAILS_SEQUENTIAL_GENERATE
+
+			if (m_loaded[index] == FAILED)
+			{
+				OpString8 str;
+				if (OpStatus::IsError(document_url.GetAttribute(URL::KName_Escaped, str)))
+					ST_failed("OOM");
+
+				ST_failed("Ready after failed on %s", str.CStr());
+				m_done = TRUE;
+				return;
+			}
+
+			if (m_loaded[index] == READY)
+				return; // Multiple ready messages, nothing to worry about.
+
+			// Set as ready
+			m_loaded[index] = READY;
+
+			if (IsDone()) Report();
+		}
+
+		virtual void OnThumbnailFailed(const URL &document_url, OpLoadingListener::LoadingFinishStatus status)
+		{
+			if (IsDone()) return;
+
+			OpString8 url;
+			int index = GetIndex(document_url, url);
+			if (index < 0)
+			{
+				ST_failed("Unexpected url '%s'", url.CStr());
+				return;
+			}
+			m_loaded[index] = FAILED;
+
+			if (IsDone()) Report();
+		}
+
+	private:
+		void Report()
+		{
+			BOOL has_failed = FALSE;
+			for (int i=0; i < m_num_urls; i++)
+			{
+				BOOL failed = (m_loaded[i] == FAILED);
+				has_failed |= failed;
+				output("\n\t%s %s", m_urls[i], failed ? "failed" : "ready");
+			}
+			output("\n");
+
+			if (has_failed)
+				ST_failed("Oops");
+			else
+				ST_passed();
+		}
+
+		int GetIndex(const char* url) const
+		{
+			for (int i=0; i < m_num_urls; i++)
+				if (!op_strcmp(m_urls[i], url))
+					return i;
+
+			return -1;
+		}
+
+		int GetIndex(const URL& url, OpString8& url_str) const
+		{
+			if (OpStatus::IsSuccess(url.GetAttribute(URL::KName_Escaped, url_str)))
+			{
+				return GetIndex(url_str.CStr());
+			}
+
+			return -1;
+		}
+
+		BOOL IsDone() const
+		{
+			if (m_done) return TRUE;
+
+			for (int i=0; i < m_num_urls; i++)
+				if (m_loaded[i] == INITIAL || m_loaded[i] == STARTED)
+					return FALSE;
+
+			return TRUE;
+		}
+
+		int m_num_urls;
+		const char **m_urls;
+		int *m_loaded;
+		BOOL m_done;
+	};
+
+	/// Used to verify the friendly thumbnails are rendering OK
+	class FriendlyVerifier : public ThumbnailManagerListener
+	{
+	public:
+
+		FriendlyVerifier()
+		{
+		}
+
+		virtual ~FriendlyVerifier()
+		{
+		}
+
+		OP_STATUS Verify(int current_zoom, const char* file_name)
+		{
+			m_zoom = current_zoom;
+
+			ThumbnailManager::ThumbnailSize size;
+			size.max_zoom = 200;
+			size.base_thumbnail_width = THUMBNAIL_WIDTH;
+			size.base_thumbnail_height = THUMBNAIL_HEIGHT;
+			g_thumbnail_manager->SetThumbnailSize(size.base_thumbnail_width, size.base_thumbnail_height, size.max_zoom);
+
+			int zoomed_width = (int)(THUMBNAIL_WIDTH * (float)current_zoom/100);
+			int zoomed_height = (int)(THUMBNAIL_HEIGHT * (float)current_zoom/100);
+
+			if (OpStatus::IsError(ThumbnailSelftestUtils::GetResolvedURL(file_name, m_url)))
+				ST_failed("GetResolvedURL failed");
+
+			if (OpStatus::IsError(g_thumbnail_manager->AddThumbnailRef(m_url)))
+				ST_failed("AddThumbnailRef failed");
+			else if (OpStatus::IsError(g_thumbnail_manager->RequestThumbnail(m_url, TRUE, TRUE, OpThumbnail::SpeedDial, zoomed_width, zoomed_height)))
+			{
+				ST_failed("RequestThumbnail");
+				return OpStatus::ERR;
+			}
+
+			OpStatus::Ignore(g_thumbnail_manager->DelThumbnailRef(m_url));
+
+			return OpStatus::OK;
+		}
+
+	private:
+		virtual void OnThumbnailRequestStarted(const URL &document_url, BOOL reload)
+		{
+		}
+
+		virtual void OnInvalidateThumbnails()
+		{
+		}
+
+		virtual void OnThumbnailReady(const URL &document_url, const Image &thumbnail, const uni_char *title, long)
+		{
+			if (document_url.Id() != m_url.Id())
+				return;
+
+			OpString8 ref_image_unescaped, ref_image;
+			if (OpStatus::IsError(document_url.GetAttribute(URL::KName, ref_image_unescaped)))
+			{
+				ST_failed("OOM");
+			}
+
+			if (ref_image.Reserve(ref_image_unescaped.Length()) == NULL)
+				ST_failed("OOM");
+
+			if (UriUnescape::Unescape(ref_image.CStr(), ref_image_unescaped.CStr(), 0) <= 0)
+				ST_failed("Could not unescape thumbnail URL");
+
+			ref_image.Delete(ref_image.Length() - 4);
+			if (OpStatus::IsError(ref_image.Append(".png")))
+				ST_failed("OOM");
+
+			// The path fetched via URL::KName hasn't got the platform path separator, but rather '/'.
+			// Therefore we can't use the PATHSEPCHAR here.
+			int last_slash = ref_image.FindLastOf('/');
+			OpString8 reference_filename, failed_filename, filename;
+
+			if (OpStatus::IsError(filename.AppendFormat("zoom_%d-%s", m_zoom, ref_image.SubString(last_slash + 1, ref_image.Length()).CStr())))
+				ST_failed("OOM");
+
+			char* dir = ST_make_path("reference");
+			if (OpStatus::IsError(reference_filename.Set(dir)))
+				ST_failed("OOM");
+			
+			if (OpStatus::IsError(reference_filename.AppendFormat("%s%s", PATHSEP, filename.CStr())))
+				ST_failed("OOM");
+
+			// ST_make_path will return the same buffer reused!
+			dir = ST_make_path("failed");
+			if (OpStatus::IsError(failed_filename.Set(dir)))
+				ST_failed("OOM");
+
+			if (OpStatus::IsError(failed_filename.AppendFormat("%s%s", PATHSEP, filename.CStr())))
+				ST_failed("OOM");
+
+			Image image = thumbnail;
+			OpBitmap* bitmap_to_paint = image.GetBitmap(NULL);
+			if (bitmap_to_paint == NULL)
+				ST_failed("OOM");
+
+			OP_STATUS status = DecoderFactoryPng::selftest_verify(reference_filename.CStr(), bitmap_to_paint, thumbnail.Height(), 5, 0, GENERATE_REF_IMAGES);
+
+			if (!OpStatus::IsSuccess(status))
+			{
+				ST_failed("Thumbnails did not match");
+				// Save the failed image to the 'failed' dir
+				DecoderFactoryPng::verify(failed_filename.CStr(), bitmap_to_paint, thumbnail.Height(), 5, 0, TRUE);
+			}
+
+			image.ReleaseBitmap();
+
+			Finish();
+			ST_passed();
+		}
+
+		virtual void OnThumbnailFailed(const URL &document_url, OpLoadingListener::LoadingFinishStatus status)
+		{
+			Finish();
+			ST_failed("thumbnail failed");
+		}
+
+		void Finish()
+		{
+			g_thumbnail_manager->RemoveListener(this);
+			OP_DELETE(this);
+		}
+
+	private:
+		int m_zoom;
+		URL m_url;
+	};
+
+	void ClearListeners()
+	{
+		if (g_thumbnail_manager)
+			g_thumbnail_manager->RemoveListener(m_load_verifier);
+		OP_DELETE(m_load_verifier); m_load_verifier = NULL;
+
+		if (g_thumbnail_manager)
+			g_thumbnail_manager->RemoveListener(m_rendering_verifier);
+		OP_DELETE(m_rendering_verifier); m_rendering_verifier = NULL;
+	}
+
+	LoadVerifier*		m_load_verifier = NULL;
+	RenderingVerifier*	m_rendering_verifier = NULL;
+}
+
+setup
+{
+}
+
+exit
+{
+	ClearListeners();
+}
+
+test ("Generate thumbnail (synchronous)")
+{
+	Image result;
+	Window* w = state.GetWindow();
+
+	if (w)	// Skip this test if we can't find any open window.
+	{
+		verify(OpStatus::IsSuccess(g_thumbnail_manager->GetThumbnailForWindow(w, result, TRUE)));
+	}
+}
+
+test ("Find logo (synchronous)")
+	require THUMBNAILS_LOGO_FINDER;
+{
+	Image result;
+	Window* w = state.GetWindow();
+
+	if (w)	// Skip this test if we can't find any open window.
+	{
+		verify(OpStatus::IsSuccess(g_thumbnail_manager->GetThumbnailForWindow(w, result, TRUE, OpThumbnail::FindLogo)));
+	}
+}
+
+// Verify that internal sanity checking works
+test ("Zero size thumbnail (CORE-16041)")
+{
+	Window* w = state.GetWindow();
+
+	if (w)	// Skip this test if we can't find any open window.
+	{
+		OpRect r;
+		r.Empty();
+
+		verify(NULL == OpThumbnail::CreateThumbnail(w, 0, 0, r));
+		verify(NULL == OpThumbnail::CreateThumbnail(w, 0, 0, FALSE));
+	}
+}
+
+test ("Asynchronous thumbnails generation")
+	async;
+{
+
+	ClearListeners();
+	if (OpStatus::IsError(g_thumbnail_manager->Purge()))
+		ST_failed("ThumbnailManager::Purge() failed");
+
+	m_load_verifier = OP_NEW(LoadVerifier, ());
+	if (m_load_verifier == NULL)
+		ST_failed("OOM");
+
+	if (OpStatus::IsError(g_thumbnail_manager->AddListener(m_load_verifier)))
+		ST_failed("OOM");
+
+	// Setup urls
+	m_load_verifier->SetUrls(urls, num_urls);
+
+	// Generate thumbmnails of all urls simultaneously
+	for (int i = 0; i < num_urls; i++)
+	{
+		URL url;
+		if (OpStatus::IsError(ThumbnailSelftestUtils::GetResolvedURL(urls[i], url)))
+			ST_failed("GetResolvedURL failed");
+
+		if (OpStatus::IsError(g_thumbnail_manager->AddThumbnailRef(url)))
+			ST_failed("AddThumbnailRef failed");
+		else if (OpStatus::IsError(g_thumbnail_manager->RequestThumbnail(url, TRUE, TRUE)))
+			ST_failed("RequestThumbnail");
+	}
+}
+
+test ("Cleanup")
+{
+	for (int i = 0; i < num_urls; i++)
+	{
+		URL url;
+		if (OpStatus::IsError(ThumbnailSelftestUtils::GetResolvedURL(urls[i], url)))
+			ST_failed("GetResolvedURL failed");
+
+		verify(OpStatus::IsSuccess(g_thumbnail_manager->DelThumbnailRef(url)));
+	}
+}
+
+table RenderingTests_Data(const char*) filelist "tests" name "*.htm";
+test ("Rendering tests")
+	async;
+{
+	ClearListeners();
+	g_thumbnail_manager->Purge();
+
+	iterate (filename) from RenderingTests_Data
+	{
+		URL url;
+		if (OpStatus::IsError(ThumbnailSelftestUtils::GetResolvedURL(filename, url)) ||
+			OpStatus::IsError(g_thumbnail_manager->CancelThumbnail(url)) )
+			ST_failed("Could not cancel thumbnail");
+	}
+
+	m_rendering_verifier = OP_NEW(RenderingVerifier, ());
+	if (m_rendering_verifier == NULL)
+		ST_failed("OOM");
+
+	if (OpStatus::IsError(g_thumbnail_manager->AddListener(m_rendering_verifier)))
+		ST_failed("OOM");
+
+	iterate (filename) from RenderingTests_Data
+	{
+		URL url;
+		if (OpStatus::IsError(ThumbnailSelftestUtils::GetResolvedURL(filename, url)))
+			ST_failed("GetResolvedURL failed");
+
+		if (OpStatus::IsError(g_thumbnail_manager->AddThumbnailRef(url)))
+			ST_failed("AddThumbnailRef failed");
+		else if (OpStatus::IsError(g_thumbnail_manager->RequestThumbnail(url, TRUE, TRUE)))
+			ST_failed("RequestThumbnail");
+
+		OpStatus::Ignore(g_thumbnail_manager->DelThumbnailRef(url));
+	}
+}
+
+test ("Rendering tests (find logo)")
+	require THUMBNAILS_LOGO_FINDER;
+	async;
+{
+	ClearListeners();
+	g_thumbnail_manager->Purge();
+
+	iterate (filename) from RenderingTests_Data
+	{
+		URL url;
+		if (OpStatus::IsError(ThumbnailSelftestUtils::GetResolvedURL(filename, url)) ||
+			OpStatus::IsError(g_thumbnail_manager->CancelThumbnail(url)) )
+			ST_failed("Could not cancel thumbnail");
+	}
+
+	m_rendering_verifier = OP_NEW(RenderingVerifier, (RenderingVerifier::LOGO));
+	if (m_rendering_verifier == NULL)
+		ST_failed("OOM");
+
+	if (OpStatus::IsError(g_thumbnail_manager->AddListener(m_rendering_verifier)))
+		ST_failed("OOM");
+
+	iterate (filename) from RenderingTests_Data
+	{
+		URL url;
+		if (OpStatus::IsError(ThumbnailSelftestUtils::GetResolvedURL(filename, url)))
+			ST_failed("GetResolvedURL failed");
+
+		if (OpStatus::IsError(g_thumbnail_manager->AddThumbnailRef(url)))
+			ST_failed("AddThumbnailRef failed");
+		else if (OpStatus::IsError(g_thumbnail_manager->RequestThumbnail(url, TRUE, TRUE, OpThumbnail::FindLogo)))
+			ST_failed("RequestThumbnail");
+
+		OpStatus::Ignore(g_thumbnail_manager->DelThumbnailRef(url));
+	}
+}
+
+test ("Rendering tests (small)")
+	require THUMBNAILS_LOGO_FINDER;
+	async;
+{
+	ClearListeners();
+	g_thumbnail_manager->Purge();
+
+	iterate (filename) from RenderingTests_Data
+	{
+		URL url;
+		if (OpStatus::IsError(ThumbnailSelftestUtils::GetResolvedURL(filename, url)) ||
+			OpStatus::IsError(g_thumbnail_manager->CancelThumbnail(url)) )
+			ST_failed("Could not cancel thumbnail");
+	}
+
+	m_rendering_verifier = OP_NEW(RenderingVerifier, (RenderingVerifier::SMALL));
+	if (m_rendering_verifier == NULL)
+		ST_failed("OOM");
+
+	if (OpStatus::IsError(g_thumbnail_manager->AddListener(m_rendering_verifier)))
+		ST_failed("OOM");
+
+	iterate (filename) from RenderingTests_Data
+	{
+		URL url;
+		if (OpStatus::IsError(ThumbnailSelftestUtils::GetResolvedURL(filename, url)))
+			ST_failed("GetResolvedURL failed");
+
+		if (OpStatus::IsError(g_thumbnail_manager->AddThumbnailRef(url)))
+			ST_failed("AddThumbnailRef failed");
+		else if (OpStatus::IsError(g_thumbnail_manager->RequestThumbnail(url, TRUE, TRUE, OpThumbnail::ViewPort, 128, 96)))
+			ST_failed("RequestThumbnail");
+
+		OpStatus::Ignore(g_thumbnail_manager->DelThumbnailRef(url));
+	}
+}
+
+test ("Rendering tests (low-quality)")
+	require THUMBNAILS_LOGO_FINDER;
+	async;
+{
+	ClearListeners();
+	g_thumbnail_manager->Purge();
+
+	iterate (filename) from RenderingTests_Data
+	{
+		URL url;
+		if (OpStatus::IsError(ThumbnailSelftestUtils::GetResolvedURL(filename, url)) ||
+			OpStatus::IsError(g_thumbnail_manager->CancelThumbnail(url)) )
+			ST_failed("Could not cancel thumbnail");
+	}
+
+	m_rendering_verifier = OP_NEW(RenderingVerifier, (RenderingVerifier::LOW_QUALITY));
+	if (m_rendering_verifier == NULL)
+		ST_failed("OOM");
+
+	if (OpStatus::IsError(g_thumbnail_manager->AddListener(m_rendering_verifier)))
+		ST_failed("OOM");
+
+	iterate (filename) from RenderingTests_Data
+	{
+		URL url;
+		if (OpStatus::IsError(ThumbnailSelftestUtils::GetResolvedURL(filename, url)))
+			ST_failed("GetResolvedURL failed");
+
+		if (OpStatus::IsError(g_thumbnail_manager->AddThumbnailRef(url)))
+			ST_failed("AddThumbnailRef failed");
+		else if (OpStatus::IsError(g_thumbnail_manager->RequestThumbnail(url, TRUE, TRUE, OpThumbnail::ViewPortLowQuality)))
+			ST_failed("RequestThumbnail");
+
+		OpStatus::Ignore(g_thumbnail_manager->DelThumbnailRef(url));
+	}
+}
+
+table FriendlyTests_Data(const char*) filelist "friendly_html" name "*.htm";
+foreach (ZOOM) from {50, 100, 200}
+{
+	foreach (FILE) from FriendlyTests_Data
+	{
+		test("Friendly thumbnail content") async;
+		{
+			ClearListeners();
+
+			FriendlyVerifier* verifier = OP_NEW(FriendlyVerifier, ());
+			if (verifier == NULL)
+				ST_failed("OOM");
+
+			if (OpStatus::IsError(g_thumbnail_manager->AddListener(verifier)))
+				ST_failed("OOM");
+
+			OpString8 file, filename;
+			if (OpStatus::IsError(file.Set(FILE)))
+				ST_failed("OOM");
+
+			int filename_start = file.FindLastOf(PATHSEPCHAR);
+			if (filename_start == KNotFound)
+				ST_failed("Should not happen");
+
+			if (OpStatus::IsError(filename.Set(file.SubString(filename_start + 1).CStr(), file.Length())))
+				ST_failed("OOM");
+
+			output("%s (%d%%)...", filename.CStr(), ZOOM);
+
+			if (OpStatus::IsError(verifier->Verify(ZOOM, file.CStr())))
+				ST_failed("Could not request thumbnail");
+
+			// This is an async test, the FriendlyVerifier will be called back by the thumbnail manager.
+		}
+
+	}
+}
+
+html
+{
+	//! <html>
+	//! <head><title>Simple thumbnail test</title></head>
+	//! <body style="background-color: lightgrey">
+	//! <h1>FOOBAR</h1><br />
+	//! <h1 style="color: Green">FOOBAR</h1><br />
+	//! <h1 style="color: Blue">FOOBAR</h1><br />
+	//! <h1 style="color: Red">FOOBAR</h1><br />
+	//! <h1 style="color: Black">FOOBAR</h1><br />
+	//! <h1 style="color: Yellow">FOOBAR</h1><br />
+	//! <h1 style="color: Maroon">FOOBAR</h1><br />
+	//! </body>
+	//! </html>
+}
+test ("Rendering tests zoom")
+file reference_image "simple_zoom.png";
+{
+	Window* window = NULL;
+	verify(state.doc);
+	window = state.doc->GetWindow();
+	verify(window);
+	window->GetWindowCommander()->SetScale(50);
+	Image thumbnail;
+	verify_success(g_thumbnail_manager->GetThumbnailForWindow(window, thumbnail, TRUE, OpThumbnail::FindLogo));
+	OpBitmap* bitmap_to_paint = thumbnail.GetBitmap(NULL);
+	if (bitmap_to_paint == NULL)
+		ST_failed("OOM");
+
+	OP_STATUS status = DecoderFactoryPng::selftest_verify(reference_image, bitmap_to_paint, 192, 5, 0, GENERATE_REF_IMAGES);
+	if (!OpStatus::IsSuccess(status))
+	{
+		OpString8 reference_image_failed;
+		if (OpStatus::IsError(reference_image_failed.Set(reference_image)))
+			ST_failed("OOM");
+
+		if (OpStatus::IsError(reference_image_failed.Insert(reference_image_failed.Length() - 4, "_failed")))
+			ST_failed("OOM");
+
+		DecoderFactoryPng::selftest_verify(reference_image_failed.CStr(), bitmap_to_paint, 192, 5, 0, TRUE);
+		ST_failed("Simple zoom thumbnail failed");
+	}
+	else
+		ST_passed();
+	thumbnail.ReleaseBitmap();
+}
+finally
+{
+	if (window) window->GetWindowCommander()->SetScale(100);
+}
+
+html
+{
+	//! <style>
+	//! div { width:200px; height:200px; border: 1px solid black; }
+	//! div.fail { color:white; background-color:red; }
+	//! @media print { div.fail { display:none; } }
+	//! @media screen { div.pass { display:none; } }
+	//! </style>
+	//! <div class="pass">PASS</div><div class="fail">FAIL</div>
+}
+test("Thumbnail with print-preview")
+require defined _PRINT_SUPPORT_;
+file reference_image "ref_print_preview.png";
+{
+	Window* window = NULL;
+	OpBitmap* bitmap_to_paint = NULL;
+	verify(state.doc);
+	window = state.doc->GetWindow();
+	verify(window);
+	window->GetWindowCommander()->SetScale(100);
+	verify(!window->GetPreviewMode());
+	verify(!window->GetPrintMode());
+	window->TogglePrintMode(TRUE); // Go to preview mode
+	Image thumbnail;
+	verify_success(g_thumbnail_manager->GetThumbnailForWindow(window, thumbnail, TRUE, OpThumbnail::FindLogo));
+	bitmap_to_paint = thumbnail.GetBitmap(NULL);
+	if (bitmap_to_paint == NULL)
+		ST_failed("OOM");
+
+	OP_STATUS status = DecoderFactoryPng::selftest_verify(reference_image, bitmap_to_paint, 192, 5, 0, GENERATE_REF_IMAGES);
+	if (!OpStatus::IsSuccess(status))
+	{
+		OpString8 reference_image_failed;
+		if (OpStatus::IsError(reference_image_failed.Set(reference_image)))
+			ST_failed("OOM");
+
+		if (OpStatus::IsError(reference_image_failed.Insert(reference_image_failed.Length() - 4, "_failed")))
+			ST_failed("OOM");
+
+		DecoderFactoryPng::selftest_verify(reference_image_failed.CStr(), bitmap_to_paint, 192, 5, 0, TRUE);
+		ST_failed("Thumbnail with print-preview failed");
+	}
+	else
+		ST_passed();
+	thumbnail.ReleaseBitmap();
+}
+finally
+{
+	if (window) window->TogglePrintMode(TRUE); // return to normal mode
+}

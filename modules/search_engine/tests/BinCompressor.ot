@@ -1,0 +1,280 @@
+group "search_engine.bincompressor";
+
+require SEARCH_ENGINE;
+
+include "modules/search_engine/BinCompressor.h";
+include "modules/pi/system/OpLowLevelFile.h";
+include "modules/pi/OpSystemInfo.h";
+
+test("Uncompressible")
+{
+	BinCompressor uc;
+
+	const uni_char *src = UNI_L("0123456789 \xFFFF \x7FFF e");
+	unsigned char dst[54];  /* ARRAY OK 2010-09-24 roarl */
+	uni_char chk[64];  /* ARRAY OK 2010-09-24 roarl */
+	int size;
+
+	verify_success(uc.InitCompDict());
+
+	size = uc.Compress(dst, src, ((unsigned)uni_strlen(src) + 1) * 2);
+	uc.Decompress(chk, dst, size);
+
+	verify_string(chk, src);
+}
+
+test("Short input")
+{
+	BinCompressor uc;
+
+	const uni_char *src = UNI_L("012012");
+	unsigned char dst[54];  /* ARRAY OK 2010-09-24 roarl */
+	uni_char chk[64];  /* ARRAY OK 2010-09-24 roarl */
+	int size;
+
+	verify_success(uc.InitCompDict());
+
+	size = uc.Compress(dst, src, ((unsigned)uni_strlen(src) + 1) * 2);
+	uc.Decompress(chk, dst, size);
+
+	verify_string(chk, src);
+}
+
+test("Invalid input")
+{
+	BinCompressor uc;
+
+	const uni_char *src = UNI_L("0123456789 \xFFFF \x7FFF e");
+	uni_char chk[64];  /* ARRAY OK 2010-09-24 roarl */
+	int size;
+
+	size = uc.Decompress(chk, (unsigned char *)src, 16);
+
+	verify(size == 0);
+}
+
+test("All compressed")
+{
+	BinCompressor uc;
+
+	const char *src = "0a1a0a1a0a1a0a1a0a1a";
+	unsigned char dst[54];  /* ARRAY OK 2010-09-24 roarl */
+	char chk[64];  /* ARRAY OK 2010-09-24 roarl */
+	int size;
+
+	verify_success(uc.InitCompDict());
+
+	size = uc.Compress(dst, src, (unsigned)op_strlen(src));
+	uc.Decompress(chk, dst, size);
+
+	verify(op_strncmp(chk, src, op_strlen(src)) == 0 && size == 11);
+}
+
+test("Mixed data")
+{
+	BinCompressor uc;
+
+	const uni_char *src = UNI_L("01A01B01C01D01");
+	unsigned char dst[54];  /* ARRAY OK 2010-09-24 roarl */
+	uni_char chk[64];  /* ARRAY OK 2010-09-24 roarl */
+	int size;
+
+	verify_success(uc.InitCompDict());
+
+	size = uc.Compress(dst, src, ((unsigned)uni_strlen(src) + 1) * 2);
+	uc.Decompress(chk, dst, size);
+
+	verify_string(chk, src);
+}
+
+test("Random input to decompressor") // should not crash or trigger valgrind
+{
+	BinCompressor uc;
+
+	unsigned char *src = OP_NEWA(unsigned char, 1024);
+	unsigned char *dst = OP_NEWA(unsigned char, 2048);
+
+	op_srand((unsigned int)op_time(0));
+	src[0] = 2048 & 0xFF;
+	src[1] = (2048 >> 8) & 0xFF;
+	src[2] = (2048 >> 16) & 0xFF;
+	src[3] = (2048 >> 24) & 0xFF;
+	for (int i=0; i<10000; i++)
+	{
+		for (int j=4; j<1024; j++)
+			src[j] = (unsigned char)(op_rand() & 0xff);
+		uc.Decompress(dst, src, 1024);
+	}
+}
+finally
+{
+	OP_DELETEA(src);
+	OP_DELETEA(dst);
+}
+
+test("Random input to compressor")
+{
+	BinCompressor uc;
+	unsigned char letters[256]; /* ARRAY OK 2010-09-24 roarl */
+	unsigned char *src = OP_NEWA(unsigned char, 0x20000);
+	unsigned char *dst = OP_NEWA(unsigned char, 0x40000);
+	unsigned char *chk = OP_NEWA(unsigned char, 0x40000);
+	unsigned i, j, length, comp_length;
+	double b, exp_b;
+
+	verify_success(uc.InitCompDict());
+	op_srand((unsigned int)op_time(0));
+
+	for (i=0; i<100; i++)
+	{
+		// Permute order of letters
+		for (j=0; j<256; j++)
+			letters[j] = (unsigned char)j;
+		for (j=255; j>0; j--)
+		{
+			int swapI = (op_rand()&0x7fffffff)%(j+1);
+			unsigned char tmp = letters[j];
+			letters[j] = letters[swapI];
+			letters[swapI] = tmp;
+		}
+		// Create a random block of compressible characters, distributed like e^(-x*b), 0 < x < 1
+		length = 0x10000 + (op_rand()&0xffff);
+		b = 200;
+		exp_b = op_exp(-b);
+		for (j=0; j<length; j++) {
+			double rnd = (op_rand()&0x7fffffff)/(double)0x7fffffff;
+			int val = (int)(-op_log(1-rnd+rnd*exp_b)/b * 255);
+			src[j] = letters[val];
+		}
+
+		comp_length = uc.Compress(dst, src, length);
+		verify(uc.Decompress(chk, dst, comp_length) == length);
+		verify(op_memcmp(chk, src, length) == 0);
+		//printf("Compression ratio %f\n",(double)comp_length/length);
+	}
+}
+finally
+{
+	OP_DELETEA(src);
+	OP_DELETEA(dst);
+	OP_DELETEA(chk);
+}
+
+test("long text")
+{
+	const char *src =
+"English\n"
+"The Free Encyclopedia\n"
+"1 383 000+ articles\n"
+"Deutsch\n"
+"Die freie Enzyklopädie\n"
+"465 000+ Artikel\n"
+"Français\n"
+"L’encyclopédie libre\n"
+"361 000+ articles\n"
+"Polski\n"
+"Wolna Encyklopedia\n"
+"293 000+ haseł\n"
+"日本語\n"
+"フリー百科事典\n"
+"258 000+ 記事\n"
+"Nederlands\n"
+"De vrije encyclopedie\n"
+"226 000+ artikelen\n"
+"Italiano\n"
+"L’enciclopedia libera\n"
+"195 000+ voci\n"
+"Svenska\n"
+"Den fria encyklopedin\n"
+"182 000+ artiklar\n"
+"Português\n"
+"A enciclopédia livre\n"
+"181 000+ artigos\n"
+"Español\n"
+"La enciclopedia libre\n"
+"152 000+ artículos\n"
+"Search • Suche • Rechercher • Szukaj • 検索 • Zoeken • Ricerca • Sök • Busca • Buscar • Поиск \n"
+" 100 000+  \n"
+"日本語 • Русский • Deutsch • English • Español • Français • Italiano • Nederlands • Polski • Português • Svenska \n"
+" 10 000+  \n"
+"العربية • فارسی • 한국어 • עברית • ไทย • 中文 • ქართული • Ελληνικά • Български • Српски • Українська • Bosanski • Català • Česky • Dansk • Eesti • Simple English • Esperanto • Euskara • Galego • Hrvatski • Ido • Bahasa Indonesia • Íslenska • Lëtzebuergesch • Lietuvių • Magyar • Bahasa Melayu • Norsk (bokmål · nynorsk) • Nnapulitano • Română • Slovenčina • Slovenščina • Suomi • Türkçe • Tiếng Việt \n"
+" 1000+  \n"
+"اردو • ئۇيغۇرچه • বাংলা • हिन्दी • ಕನ್ನಡ • मराठी • தமிழ் • తెలుగు • ייִדיש • 粵語 • Հայերէն • Беларуская • Чăваш • Ирон æвзаг • Македонски • Afrikaans • Alemannisch • Aragonés • Arpitan • Asturianu • Kreyòl Ayisyen • Azərbaycan • Bân-lâm-gú • Basa Banyumasan • Brezhoneg • Corsu • Cymraeg • Føroyskt • Frysk • Furlan • Gaeilge • Gàidhlig • Ilokano • Interlingua • Basa Jawa • Kapampangan • Kernewek • Kurdî / كوردی • Ladino / לאדינו • Latina • Latviešu • Limburgs • Lumbaart • Nedersaksisch • Nouormand • Occitan • O‘zbek • Piemontèis • Plattdüütsch • Ripoarisch • Sámegiella • Scots • Shqip • Sicilianu • Sinugboanon • Basa Sunda • Srpskohrvatski / Српскохрватски • Kiswahili • Tagalog • Tatarça • Walon • Winaray \n"
+" 100+  \n"
+"ܐܪܡܝܐ • አማርኛ • བོད་ཡིག • कश्मीरी / كشميري • नेपाली • संस्कृतम् • සිංහල • ગુજરાતી • മലയാളം • ދިވެހި • پښتو • ᏣᎳᎩ • ������������ • Авар • Башҡорт • Кыргызча • Молдовеняскэ • Монгол • Қазақша • Тоҷикӣ • Удмурт • Armâneashti • Bamanankan • Deitsch • Eald Englisc • Gaelg • Interlingue • Kaszëbsczi • Kongo • Ligure • Lingála • lojban • Malagasy • Malti • Māori • Nāhuatl • Ekakairũ Naoero • Tok Pisin • Romani / रोमानी • Rumantsch • Runa Simi • Sardu • Tetun • Türkmen / تركمن / Туркмен • Vèneto • Volapük • Võro • West-Vlaoms • Wollof • Žemaitėška \n"
+"Other languages • Weitere Sprachen • 他の言語 • Kompletna lista języków • 其他语言 • Aliaj lingvoj • 다른 언어 • Ngôn ngữ khác \n"
+"   Wiktionary\n"
+"   Wikibooks\n"
+"   Wikiquote\n"
+"   Wikisource\n"
+"   Wikispecies\n"
+"   Wikinews\n"
+"   Commons\n"
+"   Meta-Wiki\n";
+
+	BinCompressor uc;
+	unsigned char dst[9600];  /* ARRAY OK 2010-09-24 roarl */
+	char chk[8000];  /* ARRAY OK 2010-09-24 roarl */
+	unsigned size, size_chk;
+
+	verify_success(uc.InitCompDict());
+	size = uc.Compress(dst, src, (unsigned)op_strlen(src) + 1);
+	//output("\nInput size %u, compressed size=%u\n", (unsigned)(op_strlen(src)+1), size);
+	size_chk = uc.Decompress(chk, dst, size);
+	verify(size_chk == op_strlen(src) + 1);
+
+	verify_string(chk, src);
+}
+
+test("performance") disabled;
+	file uni english_txt "data/english.txt";
+{
+	BinCompressor uc;
+	char *src = NULL;
+	unsigned char *dst = NULL;
+	char *chk = NULL;
+	unsigned size, size_chk, i;
+	OpLowLevelFile* f = NULL;
+	BOOL exists;
+	OpFileLength file_length;
+	double time_1, time_2, time_3;
+
+	verify_success(OpLowLevelFile::Create(&f, english_txt));
+	verify_success(f->Exists(&exists));
+	if (!exists)
+	{
+		output("\ndata/english.txt not found, aborting ...\n");
+		verify(0);
+	}
+
+	verify_success(f->Open(OPFILE_READ));
+	verify_success(f->GetFileLength(&file_length));
+	verify((src = OP_NEWA(char, file_length)) != NULL);
+	verify_success(f->Read(src, file_length));
+	verify_success(f->Close());
+	verify((dst = OP_NEWA(unsigned char, 3 * file_length / 2 + 6)) != NULL);
+	verify((chk = OP_NEWA(char, file_length)) != NULL);
+
+	verify_success(uc.InitCompDict());
+
+	time_1 = g_op_time_info->GetWallClockMS();
+	for (i=0; i<1000; i++)
+		size = uc.Compress(dst, src, (unsigned)file_length);
+	time_2 = g_op_time_info->GetWallClockMS();
+	for (i=0; i<1000; i++)
+		size_chk = uc.Decompress(chk, dst, size);
+	time_3 = g_op_time_info->GetWallClockMS();
+
+	verify((OpFileLength)size_chk == file_length);
+	verify(op_memcmp(chk, src, file_length) == 0);
+
+	output("\nInput size %u, compressed size=%u\n", (unsigned)file_length, size);
+	output("Compression time %lg ms, decompression time %lg ms.\n",time_2-time_1, time_3-time_2);
+}
+finally
+{
+	OP_DELETE(f);
+	OP_DELETEA(src);
+	OP_DELETEA(dst);
+	OP_DELETEA(chk);
+}

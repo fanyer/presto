@@ -1,0 +1,680 @@
+/* -*- Mode: c++; tab-width: 4; c-basic-offset: 4 -*-
+ *
+ * Copyright (C) 1995-2011 Opera Software AS.  All rights reserved.
+ *
+ * This file is part of the Opera web browser.
+ * It may not be distributed under any circumstances.
+ */
+group "util.zipload";
+
+require USE_ZLIB;
+
+include "modules/util/zipload.h";
+include "modules/stdlib/util/opdate.h";
+
+global
+{
+#ifndef CAN_DELETE_OPEN_FILE
+#	define CANNOT_DELETE_OPEN_FILE
+#endif
+
+	OpFile* target_folder = 0;
+}
+
+setup
+{
+	target_folder = OP_NEW(OpFile, ());
+	if (target_folder)
+	{
+		if (OpStatus::IsError(target_folder->Construct(UNI_L("util_zipload_selftest"), OPFILE_HOME_FOLDER)))
+		{
+			OP_DELETE(target_folder);
+			target_folder = 0;
+		}
+	}
+}
+
+
+test("OpZip")
+	file uni zip_file "test.zip";
+{
+	OpZip* zip = OP_NEW(OpZip, ());
+	OpString filename;
+	verify_success(filename.Set(zip_file));
+	verify_success(zip->Open(filename, FALSE /* read-only */));
+
+	OpAutoVector<OpString> list;
+	verify_success(zip->GetFileNameList(list));
+	verify(list.GetCount() == 5);
+
+	verify_success(zip->Open(filename));
+	zip->Close();
+	verify_success(zip->Open(filename, FALSE));
+	zip->Close();
+}
+finally
+{
+    if (zip) OP_DELETE(zip);
+}
+
+test("OpZipFolder") require ZIPFILE_DIRECT_ACCESS_SUPPORT;
+	file uni zip_file "test.zip";
+{
+	OP_STATUS ret;
+	OpZipFolder *z = NULL;
+	OpString filename, str;
+
+	filename.Set(zip_file);
+	filename.Append(PATHSEP);
+	filename.Append("content.txt");
+
+	ret = OpZipFolder::Create(&z, filename.CStr());
+	verify_success(ret);
+
+	verify(TestContentsFile(*z, filename));
+
+	verify_success(z->Close());
+}
+finally
+{
+	OP_DELETE(z);
+}
+
+subtest TestContentsFile(OpLowLevelFile& zip, const OpStringC& contents_filename) require ZIPFILE_DIRECT_ACCESS_SUPPORT;
+{
+	verify(uni_strcmp(zip.GetFullPath(), contents_filename.CStr()) == 0);
+
+	OpFileLength rlen;
+	verify_success(zip.GetFileLength(&rlen));
+	verify(rlen == 7);
+
+	char data[32]; /* ARRAY OK 2009-04-03 adame */
+	OpFileLength len = 32;
+	zip.Read(data, len, &rlen);
+	verify(rlen == 7);
+	data[rlen] = 0;
+	verify(op_strcmp(data, "content") == 0);
+
+	verify(zip.Eof());
+}
+
+test("File in archive is accessible after usage count drops to 0")
+		require ZIPFILE_DIRECT_ACCESS_SUPPORT;
+		file uni archive_path "test.zip";
+{
+	OpString file_path;
+	file_path.SetConcat(archive_path, UNI_L(PATHSEP), UNI_L("content.txt"));
+
+	OpAutoPtr<OpZipFolder> zip_folder_holder;
+	OpZipFolder* zip_folder = NULL;
+
+	verify_success(OpZipFolder::Create(&zip_folder, file_path));
+	zip_folder_holder.reset(zip_folder);
+	verify(TestContentsFile(*zip_folder, file_path));
+
+	zip_folder_holder.reset();
+	verify_success(OpZipFolder::Create(&zip_folder, file_path));
+	zip_folder_holder.reset(zip_folder);
+	verify(TestContentsFile(*zip_folder, file_path));
+}
+
+test("OpZipFolder's archive is closed after usage count drops to 0")
+		require ZIPFILE_DIRECT_ACCESS_SUPPORT;
+		require CANNOT_DELETE_OPEN_FILE;
+		file uni archive_path "test.zip";
+{
+	OpString file_path;
+	file_path.SetConcat(archive_path, UNI_L(PATHSEP), UNI_L("content.txt"));
+
+	OpZipFolder* zip_folder = NULL;
+	verify_success(OpZipFolder::Create(&zip_folder, file_path));
+	OP_DELETE(zip_folder);
+	zip_folder = NULL;
+
+	OpZip* zip = NULL;
+	verify_success(g_opera->util_module.m_zipcache->GetData(archive_path, &zip));
+	verify(zip != NULL);
+	verify(zip->GetUsageCount() == 0);
+	verify(!zip->IsOpen());
+}
+
+test("ZipCache doesn't give stale objects")
+		require ZIPFILE_DIRECT_ACCESS_SUPPORT;
+		require CANNOT_DELETE_OPEN_FILE;
+		require UTIL_ZIP_WRITE;
+		file uni orig_archive_path			"test.zip";
+		file uni new_archive_path			"temp123.zip";
+		file uni archive_path				"temp456.zip";
+		file uni new_archive_content_path	"zipload.ot";
+{
+	OpFile orig_archive, new_archive, archive;
+
+	// Copy "test.zip" over to "temp456.zip".
+	archive.Construct(archive_path);
+	orig_archive.Construct(orig_archive_path);
+	archive.CopyContents(&orig_archive, FALSE);
+
+	// Make sure the archive ends up in ZipCache, but is then closed.
+	OpString file_path;
+	file_path.SetConcat(archive_path, UNI_L(PATHSEP), UNI_L("content.txt"));
+	{
+		OpFile file;
+		verify_success(file.Construct(file_path));
+	}
+
+	OpZip* cached_zip = NULL;
+	verify_success(g_opera->util_module.m_zipcache->GetData(
+				archive_path, &cached_zip));
+	verify(cached_zip != NULL);
+	verify(!cached_zip->IsOpen());
+
+	// "Modify" the archive by copying another archive over it.
+	OpZip generated_zip;
+	generated_zip.Open(new_archive_path, TRUE);
+	OpFile new_archive_content;
+	new_archive_content.Construct(new_archive_content_path);
+	verify_success(generated_zip.AddFileToArchive(&new_archive_content));
+	generated_zip.Close();
+
+	new_archive.Construct(new_archive_path);
+	archive.CopyContents(&new_archive, FALSE);
+	archive.Close();
+
+	// Verify the cached archive is refreshed.
+	OpString new_file_path;
+	new_file_path.SetConcat(archive_path, UNI_L(PATHSEP), UNI_L("zipload.ot"));
+	{
+		OpFile new_file;
+		verify_success(new_file.Construct(new_file_path));
+	}
+}
+finally
+{
+	archive.Close();
+	archive.Delete();
+	new_archive.Close();
+	new_archive.Delete();
+}
+
+test("OpZipFolderLister") require ZIPFILE_DIRECT_ACCESS_SUPPORT;
+	file uni zip_file "test.zip";
+{
+	OpZipFolderLister zl, z2, z3;
+	OpString filename;
+	OP_STATUS ret;
+
+	verify_success(filename.Set(zip_file));
+
+	ret = zl.Construct(filename.CStr(), UNI_L("even*"));
+	verify_success(ret);
+
+	zl.Next();
+	verify(zl.GetFileName() && uni_strcmp(zl.GetFileName(), UNI_L("evenmorecontent.txt")) == 0);
+
+	verify_success(filename.Append(PATHSEP));
+	verify_success(filename.Append("subfolder"));
+	ret = z2.Construct(filename.CStr(), UNI_L("*"));
+	verify_success(ret);
+
+	verify(z2.Next() == TRUE);
+	verify(z2.GetFileName() && uni_strcmp(z2.GetFileName(), UNI_L("foo.txt")) == 0);
+	OpString ref;
+	verify_success(ref.Set(zip_file));
+	verify_success(ref.Append(PATHSEP));
+	verify_success(ref.Append("subfolder"));
+	verify_success(ref.Append(PATHSEP));
+	verify_success(ref.Append("foo.txt"));
+	verify(z2.GetFullPath() && uni_strcmp(z2.GetFullPath(), ref.CStr()) == 0);
+	verify(z2.Next() == FALSE);
+
+	filename.Set(zip_file);
+	OpString ref2;
+	verify_success(ref2.Set(UNI_L("subfolder")));
+	verify_success(ref2.Append(PATHSEP));
+	verify_success(ref2.Append("*"));
+	ret = z3.Construct(filename.CStr(), ref2.CStr());
+	verify_success(ret);
+
+	verify(z3.Next() == TRUE);
+	verify_success(ref2.Set(UNI_L("subfolder")));
+	verify_success(ref2.Append(PATHSEP));
+	verify_success(ref2.Append("foo.txt"));
+	verify(z3.GetFileName() && uni_strcmp(z3.GetFileName(), ref2.CStr()) == 0);
+	verify(z3.GetFullPath() && uni_strcmp(z3.GetFullPath(), ref.CStr()) == 0);
+	verify(z3.Next() == FALSE);
+}
+
+test("GetFileInfo") require ZIPFILE_DIRECT_ACCESS_SUPPORT;
+	file uni zip_file "test.zip";
+{
+	OpZipFolder *z1 = NULL, *z2 = NULL;
+	OpString filename1, filename2;
+	OpFileInfo info;
+
+	verify_success(filename1.Set(zip_file));
+	verify_success(filename1.Append(PATHSEP));
+	verify_success(filename1.Append("subfolder"));
+	verify_success(filename1.Append(PATHSEP));
+
+	verify_success(filename2.Set(zip_file));
+	verify_success(filename2.Append(PATHSEP));
+	verify_success(filename2.Append("content.txt"));
+
+	// test that a single flag (MODE) returns the correct mode
+	verify_success(OpZipFolder::Create(&z1, filename1.CStr()));
+	info.flags = OpFileInfo::MODE;
+	info.mode = static_cast<OpFileInfo::Mode>(170);
+	verify_success(z1->GetFileInfo(&info));
+	verify(info.mode == OpFileInfo::DIRECTORY);
+
+	// test that another single flag (LAST_MODIFIED) returns the correct time
+	info.flags = OpFileInfo::LAST_MODIFIED;
+	info.last_modified = 13;
+	int time1 = (int)(OpDate::ParseDate(UNI_L("2009-03-03T15:05:08Z")) / 1000.0);
+	verify_success(z1->GetFileInfo(&info));
+	verify(info.last_modified == time1);
+
+	// test that combining two flags returns both values:
+	info.flags = OpFileInfo::MODE | OpFileInfo::LAST_MODIFIED;
+	info.mode = static_cast<OpFileInfo::Mode>(170);
+	info.last_modified = 13;
+	verify_success(z1->GetFileInfo(&info));
+	verify(info.mode == OpFileInfo::DIRECTORY);
+	verify(info.last_modified == time1);
+
+	// test that an unsupported flag returns an error status:
+	info.flags = OpFileInfo::CREATION_TIME;
+	verify_status(OpStatus::ERR_NOT_SUPPORTED, z1->GetFileInfo(&info));
+
+	// test that with one supported flag and one unsupported flag we
+	// still get an error status:
+	info.flags = OpFileInfo::MODE | OpFileInfo::CREATION_TIME;
+	verify_status(OpStatus::ERR_NOT_SUPPORTED, z1->GetFileInfo(&info));
+
+	info.flags = OpFileInfo::MODE;
+	verify_success(OpZipFolder::Create(&z2, filename2.CStr()));
+	verify_success(z2->GetFileInfo(&info));
+	verify(info.mode == OpFileInfo::FILE);
+
+	info.flags = OpFileInfo::LAST_MODIFIED;
+	int time2 = (int)(OpDate::ParseDate(UNI_L("2006-09-28T16:18:24Z")) / 1000.0);
+
+	verify_success(z1->GetFileInfo(&info));
+	verify(info.last_modified == time1);
+
+	verify_success(z2->GetFileInfo(&info));
+	verify(info.last_modified == time2);
+}
+finally
+{
+	OP_DELETE(z1);
+	OP_DELETE(z2);
+}
+
+test("File index")
+	file uni zip_file "test.zip";
+{
+	OpZip zip;
+	OpString filename;
+	verify_success(filename.Set(zip_file));
+	verify_success(zip.Open(filename, FALSE /* read-only */));
+
+	OpAutoVector<OpString> list;
+	verify_success(zip.GetFileNameList(list));
+	verify(list.GetCount() == 5);
+
+	int i;
+	for (i=0; i<5; i++)
+		verify(zip.GetFileIndex(list.Get(i), NULL) == i);
+}
+
+test("CORE-19220: CRC32 checking in zip files")
+	require ZIPFILE_DIRECT_ACCESS_SUPPORT;
+	file zip_file "crc32error.zip";
+{
+	// Construct file name inside zip
+	OpString filename;
+	verify_success(filename.Set(zip_file));
+	verify_success(filename.Append(PATHSEP));
+	verify_success(filename.Append("index.html"));
+
+	// Opening the file should fail
+	OpFile file;
+	verify(OpStatus::IsError(file.Construct(filename.CStr())) ||
+	       OpStatus::IsError(file.Open(OPFILE_READ)));
+}
+
+test("CORE-23192: UTF-8 support in zip files")
+	require ZIPFILE_DIRECT_ACCESS_SUPPORT;
+	file zip_file "utf-8.zip";
+{
+	// Construct file name inside zip
+	OpString filename;
+	verify_success(filename.Set(zip_file));
+	verify_success(filename.Append(PATHSEP));
+	verify_success(filename.Append(UNI_L("\x0D36\x0D30\x0D3F.html")));
+
+	// Opening the file should succeed
+	OpFile file;
+	verify_success(file.Construct(filename.CStr()));
+	verify_success(file.Open(OPFILE_READ));
+	verify_success(file.Close());
+}
+
+test("CreateCopy") require ZIPFILE_DIRECT_ACCESS_SUPPORT;
+	file uni zip_file "test.zip";
+{
+	OpString filename;
+
+	verify_success(filename.Set(zip_file));
+	verify_success(filename.Append(PATHSEP));
+	verify_success(filename.Append("content.txt"));
+
+	OpZipFolder* zip = 0;
+	verify_success(OpZipFolder::Create(&zip, filename.CStr()));
+	OpAutoPtr<OpZipFolder> holder(zip);
+
+	OpAutoPtr<OpLowLevelFile> copy (zip->CreateCopy());
+
+	verify(copy.get());
+	verify(TestContentsFile(*copy, filename));
+}
+
+test("CORE-26769: Check zip")
+	file zip_file "emptydir.zip";
+{
+	OpZip zip;
+	OpString filename;
+
+	verify_success(filename.Set(zip_file));
+	verify_success(zip.Init(&filename));
+
+	OpAutoVector<OpString> list;
+	verify_success(zip.GetFileNameList(list));
+	verify(list.GetCount() == 2);
+
+	int i;
+	for (i = 0; i < (int) list.GetCount(); i++)
+	{
+		OpZipFile f;
+		verify(zip.GetFileIndex(list.Get(i), NULL) == i);
+		verify_success(zip.GetFile(i, &f));
+	}
+}
+
+test("CORE-26769: Create temp directory")
+	require success "CORE-26769: Check zip";
+{
+	BOOL exists;
+	verify(target_folder);
+	verify_success(target_folder->Exists(exists));
+	if (!exists)
+		verify_success(target_folder->MakeDirectory());
+}
+
+
+test("CORE-26769: Extract text file")
+	require success "CORE-26769: Create temp directory";
+	file zip_file "emptydir.zip";
+{
+	OpZip zip;
+	OpString filename;
+	verify_success(filename.Set(zip_file));
+	verify_success(zip.Init(&filename));
+
+	OpString target_file;
+	OpString zipped_file;
+	verify_success(zipped_file.Set(UNI_L("foo.txt")));
+	verify_success(target_file.Set(target_folder->GetFullPath()));
+	verify_success(target_file.Append(UNI_L(PATHSEP)));
+	verify_success(target_file.Append(zipped_file));
+	verify_success(zip.Extract(&zipped_file, &target_file));
+
+	OpFile target;
+	verify_success(target.Construct(target_file));
+
+	BOOL exists;
+	verify(OpStatus::IsSuccess(target.Exists(exists)) && exists);
+
+	OpFileInfo::Mode mode;
+	verify(OpStatus::IsSuccess(target.GetMode(mode)) && mode == OpFileInfo::FILE);
+}
+
+test("CORE-26769: Extract empty directory")
+	require success "CORE-26769: Create temp directory";
+	file zip_file "emptydir.zip";
+{
+	OpZip zip;
+	OpString filename;
+	verify_success(filename.Set(zip_file));
+	verify_success(zip.Init(&filename));
+
+	OpString target_file;
+	OpString zipped_file;
+	verify_success(zipped_file.Set(UNI_L("empty")));
+	verify_success(zipped_file.Append(UNI_L(PATHSEP)));
+	verify_success(target_file.Set(target_folder->GetFullPath()));
+	verify_success(target_file.Append(UNI_L(PATHSEP)));
+	verify_success(target_file.Append(zipped_file));
+	verify_success(zip.Extract(&zipped_file, &target_file));
+
+	OpFile target;
+	verify_success(target.Construct(target_file));
+
+	BOOL exists;
+	verify(OpStatus::IsSuccess(target.Exists(exists)) && exists);
+
+	OpFileInfo::Mode mode;
+	verify(OpStatus::IsSuccess(target.GetMode(mode)) && mode == OpFileInfo::DIRECTORY);
+}
+
+test("Zip file path name with OpFile")
+	require ZIPFILE_DIRECT_ACCESS_SUPPORT;
+	file uni zip_file "test.zip";
+{
+	OpString inside_path;
+
+	verify_success(inside_path.Set(zip_file));
+	verify_success(inside_path.Append(PATHSEP));
+	verify_success(inside_path.Append("content.txt"));
+
+	OpFile file;
+	verify_success(file.Construct(inside_path, OPFILE_ABSOLUTE_FOLDER, OPFILE_FLAGS_ASSUME_ZIP));
+	verify(inside_path.Compare(file.GetFullPath()) == 0);
+}
+
+test("DSK-304384: OpZipFolder works for directories")
+	require success "CORE-26769: Extract empty directory";
+	require ZIPFILE_DIRECT_ACCESS_SUPPORT;
+	file zip_file "emptydir.zip";
+{
+	OpString filename;
+	OpZipFolder *zipfolder = NULL;
+	BOOL exists = FALSE;
+
+	// Construct file name inside zip
+	verify_success(filename.Set(zip_file));
+	verify_success(filename.Append(PATHSEP));
+	verify_success(filename.Append("empty"));
+
+	// The zipfolder can be successfully created, and Exists() is TRUE
+	verify_success(OpZipFolder::Create(&zipfolder, filename.CStr()));
+	verify(zipfolder);
+	verify_success(zipfolder->Exists(&exists));
+	verify(exists);
+
+	// GetFileInfo tests
+	OpFileInfo info;
+	info.flags = OpFileInfo::LAST_MODIFIED | OpFileInfo::MODE |
+		OpFileInfo::FULL_PATH | OpFileInfo::WRITABLE |
+		OpFileInfo::OPEN | OpFileInfo::HIDDEN | OpFileInfo::LENGTH;
+	verify_success(zipfolder->GetFileInfo(&info));
+	verify(!uni_strcmp(info.full_path, filename.CStr()));
+	verify(!info.open);
+	verify(info.mode == OpFileInfo::DIRECTORY);
+
+	info.flags = OpFileInfo::CREATION_TIME;
+	verify_status(OpStatus::ERR_NOT_SUPPORTED, zipfolder->GetFileInfo(&info));
+
+	// Opening the file (which is really a directory) should fail
+	verify_status(OpStatus::ERR_FILE_NOT_FOUND, zipfolder->Open(OPFILE_READ));
+}
+finally
+{
+	if (zipfolder) OP_DELETE(zipfolder);
+}
+
+test("DSK-304384: OpZipFolder works for non-existing files")
+	require success "CORE-26769: Extract empty directory";
+	require ZIPFILE_DIRECT_ACCESS_SUPPORT;
+	file zip_file "emptydir.zip";
+{
+	OpString filename;
+	OpZipFolder *zipfolder = NULL;
+	BOOL exists = FALSE;
+
+	// Construct file name inside zip
+	verify_success(filename.Set(zip_file));
+	verify_success(filename.Append(PATHSEP));
+	verify_success(filename.Append("nonexisting"));
+
+	// The zipfolder can be successfully created, and Exists() is TRUE
+	verify_success(OpZipFolder::Create(&zipfolder, filename.CStr()));
+	verify(zipfolder);
+	verify_success(zipfolder->Exists(&exists));
+	verify(!exists);
+
+	// GetFileInfo tests
+	OpFileInfo info;
+	info.flags = OpFileInfo::FULL_PATH | OpFileInfo::WRITABLE |
+		OpFileInfo::OPEN | OpFileInfo::LENGTH;
+	verify_success(zipfolder->GetFileInfo(&info));
+	verify(!uni_strcmp(info.full_path, filename.CStr()));
+	verify(!info.open);
+	verify(info.length == 0);
+
+	info.flags = OpFileInfo::LAST_MODIFIED;
+	verify_status(OpStatus::ERR, zipfolder->GetFileInfo(&info));
+	info.flags = OpFileInfo::CREATION_TIME;
+	verify_status(OpStatus::ERR_NOT_SUPPORTED, zipfolder->GetFileInfo(&info));
+	info.flags = OpFileInfo::MODE;
+	verify_status(OpStatus::ERR, zipfolder->GetFileInfo(&info));
+	info.flags = OpFileInfo::HIDDEN;
+	verify_status(OpStatus::ERR, zipfolder->GetFileInfo(&info));
+
+	// Opening the file (which doesn't exist) should fail
+	verify_status(OpStatus::ERR_FILE_NOT_FOUND, zipfolder->Open(OPFILE_READ));
+}
+finally
+{
+	if (zipfolder) OP_DELETE(zipfolder);
+}
+
+test("OpZipFolder read/write-ability does not depend on OpFileAdditionalFlags")
+	require ZIPFILE_DIRECT_ACCESS_SUPPORT;
+	file uni zip_file "test.zip";
+{
+	OpString inside_path;
+	verify_success(inside_path.Set(zip_file));
+	verify_success(inside_path.Append(PATHSEP));
+	verify_success(inside_path.Append("content.txt"));
+
+	BOOL writable;
+	OpZip *zip = NULL;
+	size_t len;
+#ifdef UTIL_ZIP_CACHE
+	// Make sure we call zip->Open() in OpZipFolder::Create() (called from OpFile::Construct() below)
+	g_zipcache->FlushUnused();
+	verify_status(OpStatus::ERR, g_zipcache->SearchData(inside_path.CStr(), len, &zip));
+	verify(zip == NULL);
+#endif
+	{
+		OpFile file1;
+		verify_success(file1.Construct(inside_path, OPFILE_ABSOLUTE_FOLDER, OPFILE_FLAGS_ASSUME_ZIP));
+		verify(inside_path.Compare(file1.GetFullPath()) == 0);
+		writable = file1.IsWritable();
+	}
+
+#ifdef UTIL_ZIP_CACHE
+	// Make sure we call zip->Open() in OpZipFolder::Create() (called from OpFile::Construct() below)
+	g_zipcache->FlushUnused();
+	verify_status(OpStatus::ERR, g_zipcache->SearchData(inside_path.CStr(), len, &zip));
+	verify(zip == NULL);
+#endif
+	OpFile file2;
+	verify_success(file2.Construct(inside_path, OPFILE_ABSOLUTE_FOLDER, OPFILE_FLAGS_ASSUME_ZIP | OPFILE_FLAGS_CASE_SENSITIVE_ZIP));
+	verify(inside_path.Compare(file2.GetFullPath()) == 0);
+	verify(file2.IsWritable() == writable);
+}
+
+test("CORE-42450: Zip file with corrupted directory entry")
+	file uni zip_file "corrupt_dir.zip";
+{
+	OpZip *zip = OP_NEW(OpZip, ());
+	OpAutoPtr<OpZip> anchor_zip(zip);
+	OpString filename;
+	verify_success(filename.Set(zip_file));
+	verify_status(OpStatus::ERR, zip->Open(filename, FALSE /* read-only */));
+}
+
+test("CORE-33296: support for bsdtar zip files")
+	require ZIPFILE_DIRECT_ACCESS_SUPPORT;
+	file zip_file "bsdtar.zip";
+{
+	// Construct file name inside zip
+	OpString filename;
+	verify_success(filename.Set(zip_file));
+	verify_success(filename.Append(PATHSEP));
+	verify_success(filename.Append("pass"));
+
+	// Opening the file should succeed
+	OpFile file;
+	verify_success(file.Construct(filename.CStr()));
+	verify_success(file.Open(OPFILE_READ));
+
+	// The file should contain "pass\n"
+	char data[6]; // ARRAY OK 2011-11-29 peter
+	OpFileLength bytes_read = 0;
+	verify_success(file.Read(data, 5, &bytes_read));
+	verify(bytes_read == 5);
+	data[5] = 0;
+	verify_string(data, "pass\n");
+
+	verify_success(file.Close());
+}
+
+test("CORE-33296: ZIP64 support in zip files")
+	require ZIPFILE_DIRECT_ACCESS_SUPPORT;
+	file zip_file "zip64.zip";
+{
+	// Construct file name inside zip
+	OpString filename;
+	verify_success(filename.Set(zip_file));
+	verify_success(filename.Append(PATHSEP));
+	verify_success(filename.Append("test.txt"));
+
+	// Opening the file should succeed
+	OpFile file;
+	verify_success(file.Construct(filename.CStr()));
+	verify_success(file.Open(OPFILE_READ));
+
+	// The file should contain "PASS\n"
+	char data[6]; // ARRAY OK 2011-11-29 peter
+	OpFileLength bytes_read = 0;
+	verify_success(file.Read(data, 5, &bytes_read));
+	verify(bytes_read == 5);
+	data[5] = 0;
+	verify_string(data, "PASS\n");
+
+	verify_success(file.Close());
+}
+
+exit
+{
+	if (target_folder)
+	{
+		target_folder->Delete(TRUE);
+		OP_DELETE(target_folder);
+	}
+}
+

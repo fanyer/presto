@@ -1,0 +1,1093 @@
+/* -*- Mode: c++; tab-width: 4; indent-tabs-mode: t; c-basic-offset: 4 -*- */
+group "logdoc.HTMLParsing";
+require init;
+
+include "modules/doc/frm_doc.h";
+include "modules/dochand/docman.h";
+include "modules/logdoc/htm_elm.h";
+include "modules/logdoc/html5parser.h";
+include "modules/logdoc/logdoc.h";
+include "modules/logdoc/src/textdata.h";
+include "modules/logdoc/htm_lex.h";
+include "modules/logdoc/html_att.h";
+
+language C++;
+
+// Bug 209264, treat a stray </p> as <p></p>
+html
+{
+	"<html><head></head><body></p></body></html>"
+}
+
+test("Stray </p>")
+{
+	verify (state.doc);
+	HTML_Element* root = state.doc->GetDocRoot();
+	verify(root->Type() == HE_DOC_ROOT);
+	verify(root->FirstChild());
+	verify(root->FirstChild()->IsMatchingType(HE_HTML, NS_HTML));
+	HTML_Element* html = root->FirstChild();
+	verify(html->FirstChild());
+	verify(html->FirstChild()->Suc());
+	verify(html->FirstChild()->Suc()->IsMatchingType(HE_BODY, NS_HTML));
+	HTML_Element* body = html->FirstChild()->Suc();
+	verify(body->FirstChild());
+	verify(body->FirstChild()->IsMatchingType(HE_P, NS_HTML));
+	HTML_Element* p = body->FirstChild();
+	verify(!p->FirstChild());
+	verify(!p->Suc());
+}
+
+// Bug 2225226, allow " in tag names (and another " to make emacs' highlighting correct)
+html
+{
+	"<html><head></head><body><l\"i\"></body></html>"
+}
+
+test("quotes in tag names")
+{
+	verify (state.doc);
+	HTML_Element* root = state.doc->GetDocRoot();
+	verify(root->Type() == HE_DOC_ROOT);
+	verify(root->FirstChild());
+	verify(root->FirstChild()->IsMatchingType(HE_HTML, NS_HTML));
+	HTML_Element* html = root->FirstChild();
+	verify(html->FirstChild());
+	verify(html->FirstChild()->Suc());
+	verify(html->FirstChild()->Suc()->IsMatchingType(HE_BODY, NS_HTML));
+	HTML_Element* body = html->FirstChild()->Suc();
+	verify(body->FirstChild());
+	verify(body->FirstChild()->Type() == HE_UNKNOWN);
+	HTML_Element* li = body->FirstChild();
+	verify (uni_str_eq(li->GetTagName(), "l\"i\""));
+}
+
+// This test used to hang opera for a while. It better not do it again.
+html
+{
+	//! <html>
+	//! <head>
+	//! <title>You should see PASS on the page (frameset in body)</title>
+	//! </head>
+	//! <body>
+	//!    <frameset cols="*">
+	//!      <frame name="theframe">
+	//!      <p>PASS</p>
+	//!    </frameset>
+	//! </body>
+	//! </html>
+}
+
+html
+{
+	//! <html>
+	//! <body>
+	//! <a><ins></ins></a>
+	//! <a><del></del></a>
+	//! </body></html>
+}
+
+test("ins as inline element - bug 216970")
+{
+	HTML_Element* ins = find_element("ins");
+	verify(ins);
+	verify(ins->Parent());
+	verify(ins->Parent()->IsMatchingType(HE_A, NS_HTML));
+}
+
+test("del as inline element - bug 216970")
+{
+	HTML_Element* del = find_element("del");
+	verify(del);
+	verify(del->Parent());
+	verify(del->Parent()->IsMatchingType(HE_A, NS_HTML));
+}
+
+// Bug 256000, don't let a stray </caption> match a parser generated <caption>
+html
+{
+	"<table>O<col><html></caption>"
+}
+
+test("stray </caption> - bug 256000")
+{
+	// This used to hang the parser so it's a success just to get
+	// here, but check that we have the expected elements in the tree
+	// and that there are no caption element beside the one generated
+	// by the parser.
+	verify(find_element("table"));
+	verify(find_element("table")->GetInserted() == HE_NOT_INSERTED);
+	verify(find_element("col"));
+	verify(find_element("col")->GetInserted() == HE_NOT_INSERTED);
+	verify(!find_element("caption")); // Ignored according to HTML 5
+}
+
+html
+{
+	"<html><body>a<test:foo>b</test:foo>c</body></html>"
+}
+
+test("element names with colon")
+{
+	HTML_Element* body = find_element("body");
+	verify(body);
+
+	HTML_Element* a = body->FirstChildActual();
+	verify(a);
+	verify(a->IsText());
+	TextData* a_text = a->GetTextData();
+	verify(a_text);
+	verify(a_text->GetText());
+	verify(uni_str_eq(a_text->GetText(), "a"));
+
+	HTML_Element* testfoo = a->SucActual();
+	verify(testfoo);
+	verify(testfoo->Type() == HE_UNKNOWN);
+	const uni_char* name = testfoo->GetTagName();
+	verify(name);
+	verify(uni_str_eq(name, "test:foo"));
+
+	HTML_Element* b = testfoo->FirstChildActual();
+	verify(b);
+	verify(b->IsText());
+	TextData* b_text = b->GetTextData();
+	verify(b_text);
+	verify(b_text->GetText());
+	verify(uni_str_eq(b_text->GetText(), "b"));
+
+	verify(b->SucActual() == NULL);
+
+	HTML_Element* c = testfoo->SucActual();
+	verify(c);
+	verify(c->IsText());
+	TextData* c_text = c->GetTextData();
+	verify(c_text);
+	verify(c_text->GetText());
+	verify(uni_str_eq(c_text->GetText(), "c"));
+
+	verify(c->SucActual() == NULL);
+}
+
+html
+{
+	"<html><body>a</??#>b</body></html>"
+}
+
+test("Bogus comment elements")
+{
+	HTML_Element* body = find_element("body");
+	verify(body);
+
+	HTML_Element* a = body->FirstChildActual();
+	verify(a);
+	verify(a->IsText());
+	TextData* a_text = a->GetTextData();
+	verify(a_text);
+	verify(a_text->GetText());
+	verify(uni_str_eq(a_text->GetText(), "a"));
+
+	HTML_Element* bogus = a->SucActual();
+	verify(bogus);
+	verify(bogus->Type() == HE_COMMENT);
+	const uni_char* content = bogus->GetAttrValue(ATTR_CONTENT);
+	verify(content);
+	verify(uni_str_eq(content, "??#"));
+
+	HTML_Element* b = bogus->SucActual();
+	verify(b);
+	verify(b->IsText());
+	TextData* b_text = b->GetTextData();
+	verify(b_text);
+	verify(b_text->GetText());
+	verify(uni_str_eq(b_text->GetText(), "b"));
+
+	verify(b->SucActual() == NULL);
+}
+
+html
+{
+	"<html><body>a</###bogus"
+}
+
+test("Unclosed bogus comment at end of buffer")
+{
+	HTML_Element* body = find_element("body");
+	verify(body);
+
+	HTML_Element* a = body->FirstChildActual();
+	verify(a);
+	verify(a->IsText());
+	TextData* a_text = a->GetTextData();
+	verify(a_text);
+	verify(a_text->GetText());
+	verify(uni_str_eq(a_text->GetText(), "a"));
+
+	HTML_Element* bogus = a->SucActual();
+	verify(bogus);
+	verify(bogus->Type() == HE_COMMENT);
+	const uni_char* content = bogus->GetAttrValue(ATTR_CONTENT);
+	verify(content);
+	verify(uni_str_eq(content, "###bogus"));
+
+	verify(bogus->SucActual() == NULL);
+}
+
+html
+{
+	"<html><body>a</></></>b</body></html>"
+}
+
+test("Empty close tags between text")
+language ecmascript;
+{
+	var body = document.getElementsByTagName("body")[0];
+	verify(body);
+	
+	var ab = body.firstChild;
+	verify(ab);
+	verify(ab.nodeType == 3); // text node
+	verify(ab.length == 2);
+	verify(ab.data == "ab");
+	verify(!ab.nextSibling);
+}
+
+html
+{
+	//! <html>
+	//! <body></body>
+	//! </html>
+}
+
+test("Attributes with entities from XML into HTML")
+require DOM3_LOAD;
+language ecmascript;
+{
+	var parser = document.implementation.createLSParser(DOMImplementationLS.MODE_SYNCHRONOUS, "");
+	verify(parser);
+	var doc = parser.parseURI("data:text/xml,<e a='&amp;amp;'/>");
+	verify(doc);
+	var docelm = doc.documentElement;
+	verify(docelm);
+	var attr_val = docelm.getAttributeNS(null, "a");
+	verify(attr_val);
+	verify(attr_val == "&amp;");
+}
+
+html
+{
+	//! <html><body>
+	//! <div>&ouml;<script>document.write("&oum");document.write("l")</script></div>
+	//! </body></html>
+}
+
+test("Split entities")
+language ecmascript;
+{
+	var div = document.getElementsByTagName("div")[0];
+	verify(div);
+
+	var text1 = div.firstChild;
+	verify(text1);
+	verify(text1.nodeType == 3); // text node
+	verify(text1.length == 1);
+
+	var text2 = div.lastChild;
+	verify(text2);
+	verify(text2.nodeType == 3); // text node
+	verify(text2.length == 1);
+
+	verify(text1.data == text2.data);
+}
+
+html
+{
+	//! <html><body>
+	//! <div><script>document.write("<xmp>Foo")</script></xmp></div>
+	//! <script>
+	//!   window.xmp = document.getElementsByTagName("xmp")[0];
+	//!   window.xmpchild = xmp ? xmp.firstChild : null;
+	//! </script>
+	//! </body></html>
+}
+
+test("Unterminated <xmp>")
+	language ecmascript;
+{
+	// Have to make the test in the html since a document.close()
+	// (which the selftest framework does) might change the result.
+	verify("xmp" in window);
+	verify(xmp);
+	verify("xmpchild" in window);
+	verify(xmpchild);
+	verify(xmpchild.nodeType == 3);
+	verify(xmpchild.data == "Foo");
+}
+
+html
+{
+	//! <html><body><div><script>
+	//! var str = "i\n i"; // wrappable or the layout engine will explode
+	//! while (str.length < 70000)
+	//! str = str+str;
+	//! document.write("<plaintext>"+str);
+	//! </script></body></html>
+}
+
+test("Huge plaintext")
+	language ecmascript;
+{
+	var plaintext = document.getElementsByTagName("plaintext")[0];
+	verify(plaintext);
+	// A single text child
+	var text = plaintext.firstChild;
+	verify(text);
+	verify(text.nodeType == 3);
+	verify(text.length > 70000); // 70000 string + html cruft
+
+	verify(str);
+	verify(str.length >= 70000);
+
+	verify(text.data.indexOf(str) == 0);
+}
+
+html
+{
+	//! <html><body><div><script>
+	//! var str = "i i "; // wrappable or the layout engine will explode
+	//! while (str.length < 70000)
+	//! str = str+str;
+	//! document.write("<textarea>"+str+"</textarea>");
+	//! </script></body></html>
+}
+
+test("Huge textarea")
+	language ecmascript;
+{
+	var textarea = document.getElementsByTagName("textarea")[0];
+	verify(textarea);
+	// A single text child
+	var text = textarea.firstChild;
+	verify(text);
+	verify(text.nodeType == 3);
+	verify(text.length >= 70000); // 70000+ string
+
+	verify(str);
+	verify(str.length >= 70000);
+
+	verify(text.data == str);
+
+	verify(textarea.value == text.data);
+}
+
+html
+{
+	//! <html><head><script>
+	//! var str = "i i  \ti"; // wrappable or the layout engine will explode
+	//! while (str.length < 70000)
+	//! str = str+str;
+	//! document.write("<title>"+str+"</title>");
+	//! </script></head><body></body></html>
+}
+
+test("Huge dirty title")
+	language ecmascript;
+{
+	var title = document.getElementsByTagName("title")[0];
+	verify(title);
+	// A single text child
+	var text = title.firstChild;
+	verify(text);
+	verify(text.nodeType == 3);
+	verify(text.length >= 70000); // 70000+ string
+
+	verify(str);
+	verify(str.length >= 70000);
+
+	verify(text.data == str);
+
+	// Test document.title that should be cleaned up
+	var clean_title = document.title;
+	verify(clean_title.indexOf("  ") == -1);
+	verify(clean_title.indexOf("\t") == -1);
+	verify(clean_title.indexOf("\r") == -1);
+	verify(clean_title.indexOf("\n") == -1);
+}
+
+
+html
+{
+	//! <!DOCTYPE html PUBLIC "-//W3C//DTD HTML 4.01//EN" "http://www.w3.org/TR/html4/strict.dtd">
+	//! <html><head><title>Document type node</title></head><body></body>
+	//! </html>
+}
+
+test("Doctype")
+language ecmascript;
+{
+	var doctype = document.firstChild;
+	verify(doctype.nodeType == 10);
+	verify(doctype.nodeName == 'html'); // The name immediately after the DOCTYPE keyword (i.e. "html" in the doctype above)
+	verify(doctype.publicId == "-//W3C//DTD HTML 4.01//EN");
+	verify(doctype.systemId == "http://www.w3.org/TR/html4/strict.dtd");
+}
+
+
+
+html
+{
+	//! <html><body>Empty document
+}
+
+test("Attribute separators") // Bug 334781
+{
+	HTM_Lex lexer;
+	TRAPD(status, lexer.InitL());
+	verify(status == OpStatus::OK);
+    // Either test_buf's span has one attribute ("x.y" with the value
+    // "z") or it has two attributes ("x" with no value and "y" with
+    // value "z"), depending on what . is:
+    uni_char test_buf[] =
+		{ '<', 's', 'p', 'a', 'n', ' ', // "<span "
+		  'x', '.', 'y', '=', 'z', '>', // "x.y=z>"
+		  '<', '/', 's', 'p', 'a', 'n', '>', '\0' }; // "</span>"
+
+	int test_attr_start_index = 6;
+	verify(test_buf[test_attr_start_index] == 'x');
+	int test_offset_index = 7;
+	verify(test_buf[test_offset_index] == '.');
+	int test_attr_y_offset = 8;
+	verify(test_buf[test_attr_y_offset] == 'y');
+	int test_attr_z_offset = 10;
+	verify(test_buf[test_attr_z_offset] == 'z');
+	HtmlAttrEntry attr;
+	for (int i = 1; i < 0xffff; i++)
+	{
+		test_buf[test_offset_index] = i;
+
+		uni_char* buf_start = test_buf+test_attr_start_index;
+		uni_char* buf_end = test_buf+sizeof(test_buf);
+		unsigned level = 1;
+		BOOL resolve_ns = FALSE;
+		BOOL strict_html = TRUE;
+		BOOL can_grow = FALSE;
+		int res = lexer.GetAttrValue(&buf_start, buf_end, &attr, strict_html, state.doc->GetHLDocProfile(), can_grow, NS_HTML, level, resolve_ns);
+		verify(res == HTM_Lex::ATTR_RESULT_FOUND);
+		verify(attr.name == test_buf + test_attr_start_index);
+		if (i == ' ' || i == '\n' || i == '\r' || i == '\t' || i == 0x0c /* FormFeed */ || i == '/')
+		{
+			verify(attr.name_len == 1);
+			verify(attr.name[0] == 'x');
+			verify(attr.value == NULL);
+			verify(attr.value_len == 0);
+			if (i == '/')
+				verify(buf_start == test_buf + test_offset_index);
+			else
+				verify(buf_start == test_buf + test_attr_y_offset); // consume trailing whitespace
+		}
+		else if (i == '=')
+		{
+			verify(attr.name_len == 1);
+			verify(attr.name[0] == 'x');
+			verify(attr.value == test_buf + test_attr_y_offset);
+			verify(attr.value_len == 3);
+			verify(attr.value[0] == 'y');
+			verify(attr.value[1] == '=');
+			verify(attr.value[2] == 'z');
+			verify(buf_start == test_buf + test_attr_z_offset+1);
+		}
+		else if (i == '>')
+		{
+			verify(attr.name_len == 1);
+			verify(attr.name[0] == 'x');
+			verify(attr.value == NULL);
+			verify(attr.value_len == 0);
+			verify(buf_start == test_buf + test_offset_index); // Leave '>' in the buffer
+		}
+		else
+		{
+			verify(attr.name_len == 3);
+			verify(attr.name[0] == 'x');
+			verify(attr.name[1] == i);
+			verify(attr.name[2] == 'y');
+			verify(attr.value == test_buf + test_attr_z_offset);
+			verify(attr.value_len == 1);
+			verify(buf_start == test_buf + test_attr_z_offset + 1);
+		}
+	}
+}
+
+html
+{
+	//! <html><head><noscript></noscript>
+	//! <script>var i = 10</script></head><body></body></html>
+}
+
+test("NOSCRIPT in HEAD")
+language ecmascript;
+{
+	// Bug 327329
+
+	var head = document.getElementsByTagName('head')[0];
+	verify(head);
+	var scripts = head.getElementsByTagName('script');
+	verify(scripts.length == 1);
+}
+
+html
+{
+	//! <html><body><span id="empty">A<xxx>B</span>C<i id="outside">D</i></body>
+}
+
+test("Unknown tag inside span#1")
+{
+	// Bug 346154
+	HTML_Element* x = find_element("xxx");
+	verify(x);
+	HTML_Element* span = find_element("span");
+	verify(span);
+	HTML_Element* body = find_element("body");
+	verify(body);
+	HTML_Element* i = find_element("i");
+	verify(i);
+
+	verify(span->ParentActual() == body);
+	verify(x->ParentActual() == span);
+	if (i->ParentActual() != body)
+		verify(!"</span> didn't close the unknown tag");
+}
+
+test("Unknown tag inside span#2")
+language ecmascript;
+{
+	// Bug 346154
+	var span = document.getElementById("empty");
+	verify(span);
+	var i = document.getElementById("outside");
+	verify(i);
+
+	span.innerHTML = span.innerHTML;
+
+	i = document.getElementById("outside");
+	verify(i || !"Setting span.innerHTML killed the outside element i");
+}
+
+html
+{
+	//! <html><head>
+	//!    <script>document.write('...'); // Forces the creation of the name-id database as well as a body element
+	//!    </script>
+	//! </head>
+	//! <body id="body">
+	//! <span id="result">TEST DID NOT RUN</span></body></html>
+}
+
+test("Double body tags") // bug 344121
+language ecmascript;
+{
+	verify(document.getElementById("body"));
+	verify(document.getElementsByTagName("body").length == 1);
+}
+
+html
+{
+    "<html><head></head><body><a'junk>hi</a'junk></html>"
+}
+
+test("Bug 362023 - junk in tag names")
+{
+	HTML_Element* body = find_element("body");
+	verify(body);
+	verify(body->FirstChildActual());
+	HTML_Element* junk = find_element("a'junk");
+	verify(junk);
+	verify(junk == body->FirstChildActual());
+	verify(!junk->SucActual());
+}
+
+html
+{
+    "<html><head></head><body><a/></a><b a/b></b><c /=></c><d ' a/></d></html>"
+}
+
+test("Bug 363777 - slash in attribute names")
+language ecmascript;
+{
+	var a = document.getElementsByTagName("a")[0];
+	verify(a);
+	var b = document.getElementsByTagName("b")[0];
+	verify(b);
+	var c = document.getElementsByTagName("c")[0];
+	verify(c);
+	var d = document.getElementsByTagName("d")[0];
+	verify(d);
+
+	verify(a.nextSibling == b);
+	verify(b.nextSibling == c);
+	verify(c.nextSibling == d);
+
+	verify(a.attributes);
+	verify(a.attributes.length == 0);
+
+	verify(b.attributes);
+	verify(b.attributes.length == 2);
+	verify(b.hasAttribute("a"));
+	verify(b.hasAttribute("b"));
+
+	verify(c.attributes);
+	verify(c.attributes.length == 1);
+	verify(c.hasAttribute("="));
+
+	verify(d.attributes);
+	verify(d.attributes.length == 2);
+	verify(d.hasAttribute("a"));
+	verify(d.hasAttribute("'"));
+}
+
+html
+{
+	"<html><head></head><body><div><td></td></div><div style='display:table'><p></p><td></td></div></body>"
+}
+
+test("Discarding stray <td> elements")
+language ecmascript;
+{
+	verify(document.getElementsByTagName("td").length == 0);
+}
+
+html
+{
+	"<!DOCTYPE html><p><table>"
+}
+
+test("No tables in <p> in strict mode")
+{
+	// We had a bug where this hung Opera in the parser
+	HTML_Element* table = find_element("table");
+	HTML_Element* p = find_element("p");
+	verify(table);
+	verify(p);
+	verify(p != table->ParentActual());
+	verify(p->SucActual() == table);
+}
+
+html
+{
+	"<body><table><td><col>"
+}
+
+test("col should break out into the table top-level")
+{
+	HTML_Element* table = find_element("table");
+	verify(table);
+	verify(table->Parent());
+	verify(table->Parent()->Type() == HE_BODY);
+	verify(table->Parent()->IsMatchingType(HE_BODY, NS_HTML));
+
+	HTML_Element* col = find_element("col");
+	verify(col);
+	verify(col->Parent());
+	verify(col->Parent()->Type() != HE_TD);
+	verify(col->Parent()->Type() == HE_COLGROUP);
+	verify(col->Parent()->Parent());
+	verify(col->Parent()->Parent()->Type() == HE_TABLE);
+	verify(col->FirstChild() == NULL);
+}
+
+html
+{
+	"<body><table><td><colgroup><col>"
+}
+
+test("col should break out into the table top-level unless its parent is colgroup")
+{
+	HTML_Element* table = find_element("table");
+	verify(table);
+	verify(table->Parent());
+	verify(table->Parent()->Type() == HE_BODY);
+	verify(table->Parent()->IsMatchingType(HE_BODY, NS_HTML));
+
+	HTML_Element* colgroup = find_element("colgroup");
+	verify(colgroup);
+	verify(colgroup->Parent());
+	verify(colgroup->Parent()->Type() != HE_TD);
+	verify(colgroup->Parent() == table);
+
+	HTML_Element* col = find_element("col");
+	verify(col);
+	verify(col->Parent());
+	verify(col->Parent()->Type() != HE_TD);
+	verify(col->Parent() != table);
+	verify(col->Parent() == colgroup);
+	verify(col->FirstChild() == NULL);
+
+	verify(colgroup->FirstChild() == col);
+}
+
+html
+{
+	"<html><body><table> <tbody> <tr> <td> </td> </tr> </tbody> </table></body></html>"
+}
+
+test("whitespace in tables")
+language ecmascript;
+{
+	var table = document.getElementsByTagName("table")[0];
+	verify(table);
+	verify(table.childNodes.length == 3);
+
+	var tbody_ = table.childNodes[1];
+	var tbody = document.getElementsByTagName("tbody")[0];
+	verify(tbody == tbody_);
+	verify(tbody.childNodes.length == 3);
+
+	var tr_ = tbody.childNodes[1];
+	var tr = document.getElementsByTagName("tr")[0];
+	verify(tr == tr_);
+	verify(tr.childNodes.length == 3);
+
+	var td_ = tr.childNodes[1];
+	var td = document.getElementsByTagName("td")[0];
+	verify(td == td_);
+	verify(td.childNodes.length == 1);
+}
+
+global
+{
+	/** Stupid but hopefully sufficient code to remove all elements (except HE_DOC_ROOT) in the document */
+
+	void EmptyDoc(FramesDocument* doc)
+	{
+		LogicalDocument* logdoc = doc->GetLogicalDocument();
+
+		logdoc->SetDocRoot(0);
+		logdoc->GetHLDocProfile()->ResetBodyElm();
+
+		while (HTML_Element* child = logdoc->GetRoot()->FirstChild())
+			if (child->OutSafe(doc))
+				child->Free(doc);
+	}
+}
+
+html { "" }
+test("resume parsing")
+{
+	FramesDocument* doc = state.doc;
+	LogicalDocument* logdoc = doc->GetLogicalDocument();
+	doc->GetDocManager()->SetLoadStatus(DOC_CREATED); // to make the parser believe that we are in a loading state
+
+	OpString data1;
+	OpString data2;
+	OpString data3;
+	const uni_char* start;
+	const uni_char* end;
+
+	EmptyDoc(doc);
+
+	verify(doc->GetDocRoot());
+	verify(!doc->GetDocRoot()->FirstChild());
+
+	verify(OpStatus::IsSuccess(data1.Set("<html><head></head><body><div>")));
+	verify(OpStatus::IsSuccess(data2.Set("<span></span></div><h1>")));
+	verify(OpStatus::IsSuccess(data3.Set("</h1><h2></h2></body></html>")));
+
+	start = data1.CStr();
+	end = start + data1.Length();
+	logdoc->FeedHtmlParser(start, end, TRUE, FALSE, FALSE);
+	logdoc->ParseHtml(TRUE);
+	verify(start == end);
+	verify(logdoc->IsParsingUnderElm(find_element("div")));
+
+	start = data2.CStr();
+	end = start + data2.Length();
+	logdoc->FeedHtmlParser(start, end, TRUE, FALSE, FALSE);
+	logdoc->ParseHtml(TRUE);
+	verify(start == end);
+	verify(logdoc->IsParsingUnderElm(find_element("h1")));
+
+	start = data3.CStr();
+	end = start + data3.Length();
+	logdoc->FeedHtmlParser(start, end, FALSE, FALSE, FALSE);
+	logdoc->ParseHtml(FALSE);
+	verify(start == end);
+
+	HTML_Element* elm = doc->GetDocRoot()->FirstChild();
+	verify(elm);
+	verify(elm->Type() == HE_HTML);
+	verify(!elm->Suc());
+
+	elm = elm->FirstChild();
+	verify(elm);
+	verify(elm->Type() == HE_HEAD);
+	verify(!elm->FirstChild());
+
+	elm = elm->Suc();
+	verify(elm);
+	verify(elm->Type() == HE_BODY);
+	verify(!elm->Suc());
+
+	elm = elm->FirstChild();
+	verify(elm);
+	verify(elm->Type() == HE_DIV);
+
+	HTML_Element* div = elm;
+
+	elm = elm->FirstChild();
+	verify(elm);
+	verify(elm->Type() == HE_SPAN);
+	verify(!elm->Suc());
+	verify(!elm->FirstChild());
+
+	elm = div;
+	elm = elm->Suc();
+	verify(elm);
+	verify(elm->Type() == HE_H1);
+	verify(!elm->FirstChild());
+
+	elm = elm->Suc();
+	verify(elm->Type() == HE_H2);
+	verify(!elm->Suc());
+	verify(!elm->FirstChild());
+
+	verify(!elm->Next());
+}
+
+html { "" }
+test("resume parsing - insert body (simple)")
+{
+	FramesDocument* doc = state.doc;
+	LogicalDocument* logdoc = doc->GetLogicalDocument();
+	doc->GetDocManager()->SetLoadStatus(DOC_CREATED); // to make the parser believe that we are in a loading state
+
+	OpString data1;
+	OpString data2;
+	const uni_char* start;
+	const uni_char* end;
+
+	EmptyDoc(doc);
+
+	verify(doc->GetDocRoot());
+	verify(!doc->GetDocRoot()->FirstChild());
+
+	verify(OpStatus::IsSuccess(data1.Set("<html><head>")));
+	verify(OpStatus::IsSuccess(data2.Set("APEKATT</html>")));
+
+	start = data1.CStr();
+	end = start + data1.Length();
+	logdoc->FeedHtmlParser(start, end, TRUE, FALSE, FALSE);
+	logdoc->ParseHtml(TRUE);
+	verify(start == end);
+	verify(logdoc->IsParsingUnderElm(find_element("head")));
+
+	start = data2.CStr();
+	end = start + data2.Length();
+	logdoc->FeedHtmlParser(start, end, FALSE, FALSE, FALSE);
+	logdoc->ParseHtml(FALSE);
+	verify(start == end);
+
+	HTML_Element* elm = doc->GetDocRoot()->FirstChild();
+	verify(elm);
+	verify(elm->Type() == HE_HTML);
+	verify(!elm->Suc());
+
+	elm = elm->FirstChild();
+	verify(elm);
+	verify(elm->Type() == HE_HEAD);
+	verify(!elm->FirstChild());
+
+	elm = elm->Suc();
+	verify(elm);
+	verify(elm->Type() == HE_BODY);
+	verify(!elm->Suc());
+
+	elm = elm->FirstChild();
+	verify(elm);
+	verify(elm->Type() == HE_TEXT);
+
+	verify(!elm->Next());
+}
+
+html { "" }
+test("resume parsing - insert body")
+{
+	FramesDocument* doc = state.doc;
+	LogicalDocument* logdoc = doc->GetLogicalDocument();
+	doc->GetDocManager()->SetLoadStatus(DOC_CREATED); // to make the parser believe that we are in a loading state
+	
+	OpString data1;
+	OpString data2;
+	const uni_char* start;
+	const uni_char* end;
+
+	EmptyDoc(doc);
+
+	verify(doc->GetDocRoot());
+	verify(!doc->GetDocRoot()->FirstChild());
+
+	verify(OpStatus::IsSuccess(data1.Set("<html><head></head><span>")));
+	verify(OpStatus::IsSuccess(data2.Set("APEKATT</span></html>")));
+
+	start = data1.CStr();
+	end = start + data1.Length();
+	logdoc->FeedHtmlParser(start, end, TRUE, FALSE, FALSE);
+	logdoc->ParseHtml(TRUE);
+	verify(start == end);
+	verify(logdoc->IsParsingUnderElm(find_element("span")));
+
+	start = data2.CStr();
+	end = start + data2.Length();
+	logdoc->FeedHtmlParser(start, end, FALSE, FALSE, FALSE);
+	logdoc->ParseHtml(FALSE);
+	verify(start == end);
+
+	HTML_Element* elm = doc->GetDocRoot()->FirstChild();
+	verify(elm);
+	verify(elm->Type() == HE_HTML);
+	verify(!elm->Suc());
+
+	elm = elm->FirstChild();
+	verify(elm);
+	verify(elm->Type() == HE_HEAD);
+	verify(!elm->FirstChild());
+
+	elm = elm->Suc();
+	verify(elm);
+	verify(elm->Type() == HE_BODY);
+	verify(!elm->Suc());
+
+	elm = elm->FirstChild();
+	verify(elm);
+	verify(elm->Type() == HE_SPAN);
+	verify(!elm->Suc());
+
+	elm = elm->FirstChild();
+	verify(elm);
+	verify(elm->Type() == HE_TEXT);
+
+	verify(!elm->Next());
+}
+
+html { "" }
+test("resume parsing - buffer underrun")
+{
+	FramesDocument* doc = state.doc;
+	LogicalDocument* logdoc = doc->GetLogicalDocument();
+	doc->GetDocManager()->SetLoadStatus(DOC_CREATED); // to make the parser believe that we are in a loading state
+
+	OpString data1;
+	OpString data2;
+	OpString data3;
+	const uni_char* start;
+	const uni_char* end;
+
+	EmptyDoc(doc);
+
+	verify(doc->GetDocRoot());
+	verify(!doc->GetDocRoot()->FirstChild());
+
+	verify(OpStatus::IsSuccess(data1.Set("<html><head><body>")));
+	verify(OpStatus::IsSuccess(data2.Set("APEKATT")));
+	verify(OpStatus::IsSuccess(data3.Set("APEKATTHEST</body></html>")));
+
+	start = data1.CStr();
+	end = start + data1.Length();
+	logdoc->FeedHtmlParser(start, end, TRUE, FALSE, FALSE);
+	logdoc->ParseHtml(TRUE);
+	verify(start == end);
+	verify(logdoc->IsParsingUnderElm(find_element("body")));
+
+	start = data2.CStr();
+	end = start + data2.Length();
+	logdoc->FeedHtmlParser(start, end, TRUE, FALSE, FALSE);
+	logdoc->ParseHtml(TRUE);
+	verify(logdoc->IsParsingUnderElm(find_element("body")));
+
+	start = data3.CStr();
+	end = start + data3.Length();
+	logdoc->FeedHtmlParser(start, end, TRUE, FALSE, FALSE);
+	logdoc->ParseHtml(TRUE);
+	verify(start == end);
+
+	HTML_Element* elm = doc->GetDocRoot()->FirstChild();
+	verify(elm);
+	verify(elm->Type() == HE_HTML);
+	verify(!elm->Suc());
+
+	elm = elm->FirstChild();
+	verify(elm);
+	verify(elm->Type() == HE_HEAD);
+	verify(!elm->FirstChild());
+
+	elm = elm->Suc();
+	verify(elm);
+	verify(elm->Type() == HE_BODY);
+	verify(!elm->Suc());
+
+	elm = elm->FirstChild();
+	verify(elm);
+	verify(elm->Type() == HE_TEXT);
+
+	verify(!elm->Next());
+}
+
+html
+{
+	//! <basefont size="1"><font size="+1">
+}
+
+test("Basefont support is nuked")
+{
+	HTML_Element* font = find_element("font");
+	verify(font);
+	verify(font->HasNumAttr(ATTR_SIZE));
+	int size = font->GetNumAttr(ATTR_SIZE);
+	verify (size == 4); // Would have been 2 with basefont
+
+	HTML_Element* basefont = find_element("basefont");
+	verify(basefont);
+	verify(basefont->FirstChildActual() == NULL); // Selfclosing element
+}
+
+html
+{
+	//! <!doctype html><html><head></head><body><object><param name="width" value="500" /><param name="height" value="500" /></object></body></html>
+}
+
+test("CORE-35487 DSE mem corruption in HTML_Element::GetParams")
+	require DELAYED_SCRIPT_EXECUTION;
+{
+	HTML_Element *root = state.doc->GetDocRoot();
+	verify(root);
+	verify(root->Type() == HE_DOC_ROOT);
+
+	HTML_Element *doctype = root->FirstChildActual();
+	verify(doctype);
+	verify(doctype->IsMatchingType(HE_DOCTYPE, NS_HTML));
+
+	HTML_Element *html = doctype->NextActual();
+	verify(html);
+	HTML_Element *body = html->FirstChild()->Next();
+	verify(body);
+
+	HTML_Element *obj = body->FirstChildActual();
+	verify(obj);
+	verify(obj->IsMatchingType(HE_OBJECT, NS_HTML));
+
+	HTML_Element *param1 = obj->FirstChildActual();
+	verify(param1);
+	HTML_Element *param2 = param1->NextActual();
+	verify(param2);
+
+	verify(param1->IsMatchingType(HE_PARAM, NS_HTML));
+	verify(param2->IsMatchingType(HE_PARAM, NS_HTML));
+
+	// Simulate DSE
+	param1->SetInserted(HE_INSERTED_BY_PARSE_AHEAD);
+	param2->SetInserted(HE_INSERTED_BY_PARSE_AHEAD);
+
+	int next_index = 0;
+
+	// Now don't crash here.
+	obj->GetParams(NULL, NULL, next_index);
+
+	verify(next_index == 0);
+}

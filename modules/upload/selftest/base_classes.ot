@@ -1,0 +1,956 @@
+/* -*- Mode: c++; tab-width: 4; c-basic-offset: 4 -*- 
+**
+** Copyright (C) 2008-2009 Opera Software ASA.  All rights reserved.
+**
+** This file is part of the Opera web browser.  It may not be distributed
+** under any circumstances.
+**
+** Roar Lauritzsen
+*/
+
+group "upload base classes";
+
+require init;
+
+include "modules/upload/upload.h";
+
+test("Boundary_Item")
+{
+	Boundary_Item boundary;
+	unsigned char output[100]; /* ARRAY OK roarl 2008-06-17 */
+	unsigned char* p;
+	const char* str;
+	uint32 len, committed;
+	Boundary_Compare_Status status;
+
+	g_selftest.seed_deterministic_rand(0);
+	verify_trap(boundary.GenerateL(NULL, 30));
+	str = "----------HYzwJ2R4LCjG5YDAlclI";
+	verify_string(boundary.Boundary(), str);
+
+	g_selftest.seed_deterministic_rand(0);
+	verify_trap(boundary.GenerateL(NULL));
+	str = "----------HYzwJ2R4LCjG5Y";
+	verify_string(boundary.Boundary(), str);
+
+	len = 100;
+	p = boundary.WriteBoundary(output, len, Boundary_First);
+	str = "------------HYzwJ2R4LCjG5Y\r\n";
+	verify(len == 100-op_strlen(str));
+	verify(op_memcmp(output, str, op_strlen(str)) == 0);
+	verify(p == output+op_strlen(str));
+	verify(boundary.Length(Boundary_First) == op_strlen(str));
+
+	len = 100;
+	p = boundary.WriteBoundary(output, len, Boundary_Internal);
+	str = "\r\n------------HYzwJ2R4LCjG5Y\r\n";
+	verify(len == 100-op_strlen(str));
+	verify(op_memcmp(output, str, op_strlen(str)) == 0);
+	verify(p == output+op_strlen(str));
+	verify(boundary.Length(Boundary_Internal) == op_strlen(str));
+
+	len = 100;
+	p = boundary.WriteBoundary(output, len, Boundary_Last);
+	str = "\r\n------------HYzwJ2R4LCjG5Y--\r\n";
+	verify(len == 100-op_strlen(str));
+	verify(op_memcmp(output, str, op_strlen(str)) == 0);
+	verify(p == output+op_strlen(str));
+	verify(boundary.Length(Boundary_Last) == op_strlen(str));
+
+	len = 100;
+	p = boundary.WriteBoundary(output, len, Boundary_First_Last);
+	str = "------------HYzwJ2R4LCjG5Y--\r\n";
+	verify(len == 100-op_strlen(str));
+	verify(op_memcmp(output, str, op_strlen(str)) == 0);
+	verify(p == output+op_strlen(str));
+	verify(boundary.Length(Boundary_First_Last) == op_strlen(str));
+
+	len = 100;
+	p = boundary.WriteBoundary(NULL, len, Boundary_Last);
+	verify(p == NULL);
+
+	str = "----------HYzwJ2R4LCjG5Y";
+	status = boundary.ScanForBoundary(reinterpret_cast<const unsigned char*>(str), (uint32)op_strlen(str), committed);
+	verify(status == Boundary_Match);
+	verify(committed == 0);
+
+	str = "----------HYzwJ2R4LCjXXX";
+	status = boundary.ScanForBoundary(reinterpret_cast<const unsigned char*>(str), (uint32)op_strlen(str), committed);
+	verify(status == Boundary_Not_Found);
+	verify(committed == op_strlen(str));
+
+	str = "committed----------HYzwJ2R4LCjG5Y...ignored";
+	status = boundary.ScanForBoundary(reinterpret_cast<const unsigned char*>(str), (uint32)op_strlen(str), committed);
+	verify(status == Boundary_Match);
+	verify(committed == 9);
+	
+	str = "committed----------HY";
+	status = boundary.ScanForBoundary(reinterpret_cast<const unsigned char*>(str), (uint32)op_strlen(str), committed);
+	verify(status == Boundary_Partial_Match);
+	verify(committed == 9);
+
+	status = boundary.ScanForBoundary(NULL, 0, committed);
+	verify(status == Boundary_Not_Found);
+	verify(committed == 0);
+}
+
+test("Boundary_List")
+{
+	Boundary_List boundaries;
+	Boundary_Item item1, item2;
+	const char* str;
+	uint32 committed;
+	Boundary_Compare_Status status;
+
+	g_selftest.seed_deterministic_rand(0);
+	verify_trap(boundaries.InitL());
+	str = "----------HYzwJ2R4LCjG5Y";
+	verify_string(boundaries.GetBoundaryL(), str);
+	
+	item1.Into(&boundaries);
+	item2.Into(&boundaries);
+	verify_trap(boundaries.GenerateL());
+
+	str = "----------HYzwJ2R4LCjG5YDAlclIza";
+	verify_string(item1.Boundary(), str);
+	str = "----------HYzwJ2R4LCjG5YzOVgzYLk";
+	verify_string(item2.Boundary(), str);
+
+	str = "----------HYzwJ2R4LCjG5Y";
+	status = boundaries.ScanForBoundaryL(reinterpret_cast<const unsigned char*>(str), (uint32)op_strlen(str), committed);
+	verify(status == Boundary_Match);
+	verify(committed == 0);
+}
+
+test("Header_Parameter")
+{
+	Header_Parameter hp;
+	char output[100]; /* ARRAY OK roarl 2008-06-17 */
+	char* p;
+	const char* str;
+
+	str = "val";
+	verify(hp.IsEmpty());
+	verify_trap(hp.InitL(str));
+	verify(!hp.IsEmpty());
+	verify(hp.GetName().IsEmpty());
+	verify_string(hp.GetValue(), str);
+	verify(hp.CalculateLength() == op_strlen(str));
+	output[op_strlen(str)] = '\xff';
+	p = hp.OutputParameters(output);
+	verify(p == output+op_strlen(str));
+	verify_string(output, str);
+
+	verify_trap(hp.InitL("name", "value"));
+	verify_string(hp.GetName(), "name");
+	verify_string(hp.GetValue(), "value");
+	str = "name=value";
+	verify(hp.CalculateLength() == op_strlen(str));
+	output[op_strlen(str)] = '\xff';
+	p = hp.OutputParameters(output);
+	verify(p == output+op_strlen(str));
+	verify_string(output, str);
+	
+	verify_trap(hp.InitL("name2", "value2", TRUE));
+	verify_string(hp.GetName(), "name2");
+	verify_string(hp.GetValue(), "\"value2\"");
+	str = "name2=\"value2\"";
+	verify(hp.CalculateLength() == op_strlen(str));
+	output[op_strlen(str)] = '\xff';
+	p = hp.OutputParameters(output);
+	verify(p == output+op_strlen(str));
+	verify_string(output, str);
+
+	str = "\"value2\"";
+	verify_trap(hp.InitL("name2", str, TRUE));
+	verify_string(hp.GetName(), "name2");
+	verify_string(hp.GetValue(), "\"value2\"");
+	str = "name2=\"value2\"";
+	verify(hp.CalculateLength() == op_strlen(str));
+	output[op_strlen(str)] = '\xff';
+	p = hp.OutputParameters(output);
+	verify(p == output+op_strlen(str));
+	verify_string(output, str);
+
+	verify_trap(hp.InitL("name3\r\n", "\r\r\nvalue3\r\r\n\n"));
+	verify_string(hp.GetName(), "name3");
+	verify_string(hp.GetValue(), "value3");
+	str = "name3=value3";
+	verify(hp.CalculateLength() == op_strlen(str));
+	output[op_strlen(str)] = '\xff';
+	p = hp.OutputParameters(output);
+	verify(p == output+op_strlen(str));
+	verify_string(output, str);
+
+	verify_trap(hp.SetNameL("name4"));
+	str = "value4\"\\\"";
+	verify_trap(hp.SetValueL(str, TRUE));
+	verify_string(hp.GetName(), "name4");
+	verify_string(hp.GetValue(), "\"value4\\\"\\\\\\\"\"");
+	str = "name4=\"value4\\\"\\\\\\\"\"";
+	verify(hp.CalculateLength() == op_strlen(str));
+	output[op_strlen(str)] = '\xff';
+	p = hp.OutputParameters(output);
+	verify(p == output+op_strlen(str));
+	verify_string(output, str);
+
+	verify_trap(hp.SetNameL("name5\r\n"));
+	str = "\r\r\nvalue5\"\\\"\r\r\n\n";
+	verify_trap(hp.SetValueL(str, TRUE));
+	verify_string(hp.GetName(), "name5");
+	verify_string(hp.GetValue(), "\"value5\\\"\\\\\\\"\"");
+	str = "name5=\"value5\\\"\\\\\\\"\"";
+	verify(hp.CalculateLength() == op_strlen(str));
+	p = hp.OutputParameters(output);
+	verify(p == output+op_strlen(str));
+	verify_string(output, str);
+
+	verify_trap(hp.SetNameL("name6"));
+	verify_trap(hp.SetValueL(NULL, TRUE));
+	verify_string(hp.GetName(), "name6");
+	verify(hp.GetValue() == NULL);
+	str = "name6";
+	verify(hp.CalculateLength() == op_strlen(str));
+	p = hp.OutputParameters(output);
+	verify(p == output+op_strlen(str));
+	verify_string(output, str);
+
+	verify_trap(hp.SetNameL("name7"));
+	verify_trap(hp.SetValueL(""));
+	verify_string(hp.GetName(), "name7");
+	verify_string(hp.GetValue(), "");
+	str = "name7=";
+	verify(hp.CalculateLength() == op_strlen(str));
+	p = hp.OutputParameters(output);
+	verify(p == output+op_strlen(str));
+	verify_string(output, str);
+
+	verify_trap(hp.SetNameL("name8"));
+	verify_trap(hp.SetValueL("", TRUE));
+	verify_string(hp.GetName(), "name8");
+	verify_string(hp.GetValue(), "\"\"");
+	str = "name8=\"\"";
+	verify(hp.CalculateLength() == op_strlen(str));
+	p = hp.OutputParameters(output);
+	verify(p == output+op_strlen(str));
+	verify_string(output, str);
+
+	verify_trap(hp.SetNameL("name9"));
+	str = "\r\r\n va\r\n lu\n\te9\r\nOpera";
+	verify_trap(hp.SetValueL(str, TRUE));
+	verify_string(hp.GetName(), "name9");
+	verify_string(hp.GetValue(), "\"\r\n va\r\n lu\r\n\te9\"");
+	str = "name9=\"\r\n va\r\n lu\r\n\te9\"";
+	verify(hp.CalculateLength() == op_strlen(str));
+	p = hp.OutputParameters(output);
+	verify(p == output+op_strlen(str));
+	verify_string(output, str);
+
+	verify_trap(hp.SetNameL("nameA"));
+	str = "\r valueA";
+	verify_trap(hp.SetValueL(str, TRUE));
+	verify_string(hp.GetName(), "nameA");
+	verify_string(hp.GetValue(), "\"\r\n valueA\"");
+	str = "nameA=\"\r\n valueA\"";
+	verify(hp.CalculateLength() == op_strlen(str));
+	p = hp.OutputParameters(output);
+	verify(p == output+op_strlen(str));
+	verify_string(output, str);
+
+	verify_trap(hp.SetNameL("nameB"));
+	str = "val\r ueB";
+	verify_trap(hp.SetValueL(str, TRUE));
+	verify_string(hp.GetName(), "nameB");
+	verify_string(hp.GetValue(), "\"val\r\n ueB\"");
+	str = "nameB=\"val\r\n ueB\"";
+	verify(hp.CalculateLength() == op_strlen(str));
+	p = hp.OutputParameters(output);
+	verify(p == output+op_strlen(str));
+	verify_string(output, str);
+
+	verify_trap(hp.SetNameL("nameC"));
+	str = "value\n C";
+	verify_trap(hp.SetValueL(str));
+	verify_string(hp.GetName(), "nameC");
+	verify_string(hp.GetValue(), "value\r\n C");
+	str = "nameC=value\r\n C";
+	verify(hp.CalculateLength() == op_strlen(str));
+	p = hp.OutputParameters(output);
+	verify(p == output+op_strlen(str));
+	verify_string(output, str);
+
+	verify_trap(hp.SetNameL("nameD"));
+	str = "\n valueD";
+	verify_trap(hp.SetValueL(str));
+	verify_string(hp.GetName(), "nameD");
+	verify_string(hp.GetValue(), "\r\n valueD");
+	str = "nameD=\r\n valueD";
+	verify(hp.CalculateLength() == op_strlen(str));
+	p = hp.OutputParameters(output);
+	verify(p == output+op_strlen(str));
+	verify_string(output, str);
+}
+
+test("Header_Parameter_Collection")
+{
+	Header_Parameter_Collection hpc(SEPARATOR_COMMA_NEWLINE);
+	char output[100]; /* ARRAY OK roarl 2008-06-17 */
+	char* p;
+	const char* str;
+	
+	verify(hpc.IsEmpty());
+	verify(hpc.CalculateLength()==0);
+	output[0] = '\xff';
+	p = hpc.OutputParameters(output);
+	verify(p == output);
+	verify(output[0] == 0);
+	verify(hpc.SeparatorLength()==4);
+	p = hpc.OutputSeparator(output);
+	verify(p == output+4);
+	verify_string(output, ",\r\n ");
+
+	hpc.SetSeparator(SEPARATOR_SEMICOLON);
+	verify(hpc.SeparatorLength()==2);
+	p = hpc.OutputSeparator(output);
+	verify(p == output+2);
+	verify_string(output, "; ");
+
+	verify_trap(hpc.AddParameter(OP_NEW_L(Header_Parameter, ())));
+	verify(hpc.IsEmpty());
+	verify(hpc.CalculateLength()==0);
+	p = hpc.OutputParameters(output);
+	verify(p == output);
+
+	verify_trap(hpc.AddParameter(OP_NEW_L(Header_Parameter, ())));
+	verify(hpc.IsEmpty());
+	verify(hpc.CalculateLength()==0);
+	output[0] = '\xff';
+	p = hpc.OutputParameters(output);
+	verify(p == output);
+	verify(output[0] == 0);
+
+	Header_Parameter* OP_MEMORY_VAR hp = NULL;
+	verify_trap(hp = OP_NEW_L(Header_Parameter, ()));
+	verify_trap(hpc.AddParameter(hp));
+	verify(hpc.IsEmpty());
+	verify(hpc.CalculateLength()==0);
+	verify_trap(hp->InitL("name", "value"));
+	verify(!hpc.IsEmpty());
+	verify_trap(hpc.AddParameter(hp)); // Not nice, but hp should remove itself from the "previous" list
+	str = "name=value";
+	verify(hpc.CalculateLength() == op_strlen(str));
+	p = hpc.OutputParameters(output);
+	verify(p == output+op_strlen(str));
+	verify_string(output, str);
+	OP_DELETE(hp); // Not nice, but hp should remove itself from hpc
+	verify(hpc.IsEmpty());
+	verify(hpc.CalculateLength()==0);
+
+	str = "val";
+	verify_trap(hpc.AddParameterL(str));
+	verify(!hpc.IsEmpty());
+	verify(hpc.CalculateLength() == op_strlen(str));
+	output[op_strlen(str)] = '\xff';
+	p = hpc.OutputParameters(output);
+	verify(p == output+op_strlen(str));
+	verify_string(output, str);
+	
+	str = "value\"\\\"";
+	verify_trap(hpc.AddParameterL("name", str, TRUE));
+	str = "val; name=\"value\\\"\\\\\\\"\"";
+	verify(hpc.CalculateLength() == op_strlen(str));
+	output[op_strlen(str)] = '\xff';
+	p = hpc.OutputParameters(output);
+	verify(p == output+op_strlen(str));
+	verify_string(output, str);
+	
+	hpc.Clear();
+	verify_trap(hpc.AddParameterL("one"));
+	verify_trap(hpc.AddParameterL("two"));
+	verify(hpc.SeparatorLength()==2);
+	hpc.OutputParameters(output);
+	verify_string(output, "one; two");
+	hpc.SetSeparator(SEPARATOR_SPACE);
+	verify(hpc.SeparatorLength()==1);
+	hpc.OutputParameters(output);
+	verify_string(output, "one two");
+	hpc.SetSeparator(SEPARATOR_COMMA);
+	verify(hpc.SeparatorLength()==2);
+	hpc.OutputParameters(output);
+	verify_string(output, "one, two");
+	hpc.SetSeparator(SEPARATOR_NEWLINE);
+	verify(hpc.SeparatorLength()==3);
+	hpc.OutputParameters(output);
+	verify_string(output, "one\r\n two");
+	hpc.SetSeparator(SEPARATOR_COMMA_NEWLINE);
+	verify(hpc.SeparatorLength()==4);
+	hpc.OutputParameters(output);
+	verify_string(output, "one,\r\n two");
+	hpc.SetSeparator(SEPARATOR_SEMICOLON_NEWLINE);
+	verify(hpc.SeparatorLength()==4);
+	hpc.OutputParameters(output);
+	verify_string(output, "one;\r\n two");
+	hpc.SetSeparator(SEPARATOR_COLON);
+	verify(hpc.SeparatorLength()==0);
+	hpc.OutputParameters(output);
+	verify_string(output, "onetwo");
+}
+
+test("Header_QuotedPrintable_Parameter")
+	require URL_UPLOAD_QP_SUPPORT;
+{
+	Header_QuotedPrintable_Parameter hqpp;
+	
+	verify_trap(hqpp.InitL("name1", "value1", "us-ascii", ENCODING_AUTODETECT, TRUE));
+	verify_string(hqpp.GetName(), "name1");
+	verify_string(hqpp.GetValue(), "\"value1\"");
+
+	verify_trap(hqpp.InitL("name1b", "value 1b", "us-ascii", ENCODING_AUTODETECT));
+	verify_string(hqpp.GetName(), "name1b");
+	verify_string(hqpp.GetValue(), "\"value 1b\"");
+
+	verify_trap(hqpp.InitL("name2", UNI_L("value\x00C6\x00D8\x00C5"), "iso-8859-1", ENCODING_QUOTED_PRINTABLE));
+	verify_string(hqpp.GetName(), "name2");
+	verify_string(hqpp.GetValue(), "=?iso-8859-1?Q?value=C6=D8=C5?=");
+
+	verify_trap(hqpp.InitL("name3", UNI_L("value\x00C6\x00D8\x00C5"), "utf-8", ENCODING_BASE64));
+	verify_string(hqpp.GetName(), "name3");
+	verify_string(hqpp.GetValue(), "=?utf-8?B?dmFsdWXDhsOYw4U=?=");
+
+	verify_trap(hqpp.InitL("name4", UNI_L("value\x00C6\x00D8\x00C5"), "utf-8", ENCODING_AUTODETECT));
+	verify_string(hqpp.GetName(), "name4");
+	verify_string(hqpp.GetValue(), "=?utf-8?B?dmFsdWXDhsOYw4U=?=");
+
+	verify_trap(hqpp.InitL("name5", UNI_L("value\x00C6"), "iso-8859-1", ENCODING_AUTODETECT));
+	verify_string(hqpp.GetName(), "name5");
+	verify_string(hqpp.GetValue(), "=?iso-8859-1?Q?value=C6?=");
+}
+
+test("Header_RFC2231_Parameter")
+	require URL_UPLOAD_RFC_2231_SUPPORT;
+{
+	Header_RFC2231_Parameter hrfcp;
+	char output[200]; /* ARRAY OK roarl 2008-06-17 */
+	const char* str;
+	
+	verify_trap(hrfcp.InitL("name1", "value1", "us-ascii"));
+	str = "name1=value1";
+	hrfcp.OutputParameters(output);
+	verify_string(output, str);
+
+	verify_trap(hrfcp.InitL("name2", "value2value2value2value2value2value2value2value2value2value2value2", "us-ascii"));
+	str = "name2*0=\"value2value2value2value2value2value2valu\";\r\n name2*1=\"e2value2value2value2value2\"";
+	hrfcp.OutputParameters(output);
+	verify_string(output, str);
+
+	str = "value(%\"@)";
+	verify_trap(hrfcp.InitL("name3", str, "utf-8"));
+	str = "name3=\"value(%\\\"@)\"";
+	hrfcp.OutputParameters(output);
+	verify_string(output, str);
+
+	str = "value(%\"@)";
+	verify_trap(hrfcp.InitL("name4", str, "iso-8859-1"));
+	str = "name4*=iso-8859-1''value%28%25%22%40%29";
+	hrfcp.OutputParameters(output);
+	verify_string(output, str);
+
+	verify_trap(hrfcp.InitL("name5", UNI_L("value=\x00C6\x00D8\x00C5\x00C6\x00D8\x00C5"), "utf-16"));
+	str = "name5*0*=utf-8''value%3D%C3%86%C3%98%C3%85%C3%86;\r\n name5*1*=%C3%98%C3%85";
+	hrfcp.OutputParameters(output);
+	verify_string(output, str);
+}
+
+test("Header_RFC2231_Parameter, all characters")
+	require URL_UPLOAD_RFC_2231_SUPPORT;
+{
+	Header_RFC2231_Parameter hrfcp;
+	const char* str;
+	char output[200]; /* ARRAY OK 2009-01-16 roarl */
+	char source[3];   /* ARRAY OK 2009-01-16 roarl */
+	OP_MEMORY_VAR int i;
+
+	source[0] = '\n'; // One unsafe character to ensure that the RFC2231 format is used
+	source[2] = 0;
+	str = "name*=iso-8859-1''%0A";
+	int len = (int)op_strlen(str);
+	for (i=1; i < 256; ++i)
+	{
+		source[1] = (char)i;
+		verify_trap(hrfcp.InitL("name", source, "iso-8859-1"));
+		hrfcp.OutputParameters(output);
+		verify(op_strncmp(output, str, len) == 0);
+		switch(i)
+		{
+		default:
+			if (!(i < 0x20 || i >= 0x7f))
+			{
+				verify(output[len] == i);
+				verify(output[len+1] == 0);
+				break;
+			}
+			// Fall through
+		case ' ':
+		case '*':
+		case '\'':
+		case '%':
+		case '(':
+		case ')':
+		case '<':
+		case '>':
+		case '@':
+		case ',':
+		case ';':
+		case ':':
+		case '\\':
+		case '\"':
+		case '/':
+		case '[':
+		case ']':
+		case '?':
+		case '=':
+			{
+				char cmp[4]; /* ARRAY OK 2009-01-16 roarl */
+				op_sprintf(cmp, "%%%02X", i);
+				verify_string(output+len, cmp);
+			}
+		}
+	}
+}
+
+test("Header_Boundary_Parameter")
+{
+	Header_Boundary_Parameter hbp;
+	Boundary_Item boundary;
+
+	verify_trap(hbp.InitL("boundary", &boundary));
+	verify_string(hbp.GetName(), "boundary");
+	verify(hbp.GetValue().IsEmpty());
+
+	g_selftest.seed_deterministic_rand(0);
+	verify_trap(boundary.GenerateL(NULL));
+	verify_string(hbp.GetValue(), "----------HYzwJ2R4LCjG5Y");
+	
+	verify_trap(hbp.InitL("bnd", &boundary, TRUE));
+	verify_string(hbp.GetName(), "bnd");
+	verify(hbp.GetValue().IsEmpty());
+
+	g_selftest.seed_deterministic_rand(0);
+	verify_trap(boundary.GenerateL(NULL));
+	verify_string(hbp.GetValue(), "\"----------HYzwJ2R4LCjG5Y\"");
+}
+
+test("Header_Item")
+{
+	Header_Item hi;
+	char output[100]; /* ARRAY OK roarl 2008-06-17 */
+	char* p;
+	const char* str;
+
+	verify(hi.GetNameSeparator() == SEPARATOR_COLON);
+	verify(hi.IsEnabled());
+	verify(!hi.HasParameters());
+	verify(hi.CalculateLength() == 0);
+	output[0] = '\xff';
+	p = hi.OutputHeader(output);
+	verify(p == output);
+	verify(output[0] == 0);	
+
+	verify_trap(hi.AddParameterL("val"));
+	str = "val\r\n";
+	verify(hi.CalculateLength() == op_strlen(str));
+	output[op_strlen(str)] = '\xff';
+	p = hi.OutputHeader(output);
+	verify(p == output+op_strlen(str));
+	verify_string(output, str);
+
+	verify_trap(hi.InitL("it"));
+	verify_string(hi.GetName(), "it");
+	verify(hi.CalculateLength() == 0);
+	output[0] = '\xff';
+	p = hi.OutputHeader(output);
+	verify(p == output);
+	verify(output[0] == 0);
+
+	hi.SetNameSeparator(SEPARATOR_SPACE);
+	verify(hi.GetNameSeparator() == SEPARATOR_SPACE);
+	str = "it";
+	verify(hi.CalculateLength() == op_strlen(str));
+	output[op_strlen(str)] = '\xff';
+	p = hi.OutputHeader(output);
+	verify(p == output+op_strlen(str));
+	verify_string(output, str);
+	hi.SetNameSeparator(SEPARATOR_COLON);
+
+	verify_trap(hi.AddParameterL("val"));
+	str = "it: val\r\n";
+	verify(hi.CalculateLength() == op_strlen(str));
+	output[op_strlen(str)] = '\xff';
+	p = hi.OutputHeader(output);
+	verify(p == output+op_strlen(str));
+	verify_string(output, str);
+
+	verify_trap(hi.InitL("item", "value"));
+	str = "item: value\r\n";
+	hi.OutputHeader(output);
+	verify_string(output, str);
+
+	verify_trap(hi.AddParameterL("param", "pvalue", TRUE));
+	str = "item: value; param=\"pvalue\"\r\n";
+	hi.OutputHeader(output);
+	verify_string(output, str);
+
+	Header_RFC2231_Parameter* OP_MEMORY_VAR hrfcp = NULL;
+	verify_trap(hrfcp = OP_NEW_L(Header_RFC2231_Parameter, ()));
+	verify_trap(hrfcp->InitL("filename", UNI_L("value\x00C6\x00D8\x00C5"), "utf-8"));
+	hi.AddParameter(hrfcp);
+	str = "item: value; param=\"pvalue\"; filename*=utf-8''value%C3%86%C3%98%C3%85\r\n";
+	hi.OutputHeader(output);
+	verify_string(output, str);
+
+	hi.SetNameSeparator(SEPARATOR_SPACE);
+	hi.SetSeparator(SEPARATOR_COMMA);
+	str = "item value, param=\"pvalue\", filename*=utf-8''value%C3%86%C3%98%C3%85";
+	hi.OutputHeader(output);
+	verify_string(output, str);
+
+	hi.SetEnabled(FALSE);
+	verify(!hi.IsEnabled());
+	verify(hi.CalculateLength() == 0);
+	output[0] = '\xff';
+	p = hi.OutputHeader(output);
+	verify(p == output);
+	verify(output[0] == 0);	
+	hi.SetEnabled(TRUE);
+
+	hi.ClearParameters();
+	verify(!hi.HasParameters());
+	str = "item";
+	hi.OutputHeader(output);
+	verify_string(output, str);
+}
+
+test("Header_List")
+{
+	Header_List hl, hl2;
+	char output[200]; /* ARRAY OK roarl 2008-06-17 */
+	char* p;
+	const char* str;
+
+	verify(hl.CalculateLength() == 0);
+	output[0] = '\xff';
+	p = hl.OutputHeaders(output);
+	verify(p == output);
+	verify(output[0] == 0);
+	verify(hl.FindHeader(NULL, FALSE) == NULL);
+	verify(hl.FindHeader("first", FALSE) == NULL);
+	
+	const char *names[3];
+	names[0] = "first";
+	names[1] = "second";
+	names[2] = NULL;
+	verify_trap(hl.InitL(names));
+	verify_trap(hl.AddParameterL("second", "ok"));
+	str = "second: ok\r\n";
+	verify(hl.CalculateLength() == op_strlen(str));
+	output[op_strlen(str)] = '\xff';
+	p = hl.OutputHeaders(output);
+	verify(p == output+op_strlen(str));
+	verify_string(output, str);
+
+	verify_trap(hl.AddParameterL("first", "ok"));
+	str = "first: ok\r\nsecond: ok\r\n";
+	verify(hl.CalculateLength() == op_strlen(str));
+	output[op_strlen(str)] = '\xff';
+	hl.OutputHeaders(output);
+	verify_string(output, str);
+
+	verify_trap(hl.AddParameterL("third", "name", "n", TRUE));
+	str = "first: ok\r\nsecond: ok\r\nthird: name=\"n\"\r\n";
+	hl.OutputHeaders(output);
+	verify_string(output, str);
+	
+	Header_Item* OP_MEMORY_VAR item = NULL;
+	verify_trap(item = OP_NEW_L(Header_Item, (SEPARATOR_SEMICOLON)));
+	verify_trap(item->InitL("fourth"));
+	verify_trap(hl.InsertHeader(item, HEADER_INSERT_BEFORE, "second"));
+	verify_trap(hl.InsertHeader(item, HEADER_INSERT_BEFORE, "third")); // Should remove item from list first
+	verify_trap(hl.InsertHeader(NULL)); // Does nothing
+
+	verify_trap(hl.InsertHeaderL("fifth", HEADER_INSERT_AFTER, SEPARATOR_SEMICOLON, "fourth"));
+	verify_trap(hl.InsertHeaderL("sixth", HEADER_INSERT_FRONT));
+	verify_trap(hl.AddParameterL("fourth", "ok"));
+	verify_trap(hl.AddParameterL("fifth", "ok"));
+	verify_trap(hl.AddParameterL("sixth", "ok"));
+	verify_trap(hl.AddParameterL("seventh", "ok"));
+	str = "sixth: ok\r\nfirst: ok\r\nsecond: ok\r\nfourth: ok\r\nfifth: ok\r\nthird: name=\"n\"\r\nseventh: ok\r\n";
+	hl.OutputHeaders(output);
+	verify_string(output, str);
+
+	OP_DELETE(item); // Not nice, but item should remove itself from hl
+	str = "sixth: ok\r\nfirst: ok\r\nsecond: ok\r\nfifth: ok\r\nthird: name=\"n\"\r\nseventh: ok\r\n";
+	hl.OutputHeaders(output);
+	verify_string(output, str);
+
+	hl.Clear();
+	verify(hl.CalculateLength() == 0);
+
+#ifdef URL_UPLOAD_RFC_2231_SUPPORT
+	Header_RFC2231_Parameter* OP_MEMORY_VAR hrfcp = NULL;
+	verify_trap(hrfcp = OP_NEW_L(Header_RFC2231_Parameter, ()));
+	verify_trap(hrfcp->InitL("filename", UNI_L("value\x00C6\x00D8\x00C5"), "utf-8"));
+	verify_trap(hl.AddParameterL("first", hrfcp));
+	str = "first: filename*=utf-8''value%C3%86%C3%98%C3%85\r\n";
+	hl.OutputHeaders(output);
+	verify_string(output, str);
+
+	verify_trap(hl.AddParameterL("second", "ok"));
+	str = "first: filename*=utf-8''value%C3%86%C3%98%C3%85\r\nsecond: ok\r\n";
+	hl.OutputHeaders(output);
+	verify_string(output, str);
+
+	hl2.Clear();
+	verify_trap(hl2.AddParameterL("first", "ok2"));
+	verify_trap(hl2.AddParameterL("second", "ok2"));
+	hl.InsertHeaders(hl2);
+	verify(hl2.Empty());
+	str = "first: filename*=utf-8''value%C3%86%C3%98%C3%85\r\nsecond: ok\r\nfirst: ok2\r\nsecond: ok2\r\n";
+	hl.OutputHeaders(output);
+	verify_string(output, str);
+#endif
+
+	hl.Clear();
+	verify_trap(hl.AddParameterL("first", "ok"));
+	verify_trap(hl.AddParameterL("second", "ok"));
+	verify_trap(hl.AddParameterL("third", "ok"));
+	hl2.Clear();
+	verify_trap(hl2.AddParameterL("first", "ok2"));
+	verify_trap(hl2.AddParameterL("second", "ok2"));
+	hl.InsertHeaders(hl2, HEADER_INSERT_LAST, OpStringC8(NULL), TRUE);
+	verify(hl2.Empty());
+	str = "third: ok\r\nfirst: ok2\r\nsecond: ok2\r\n";
+	hl.OutputHeaders(output);
+	verify_string(output, str);
+
+	hl.Clear();
+	verify_trap(hl.AddParameterL("one", "ok"));
+	verify_trap(hl.AddParameterL("two", "ok"));
+	verify_trap(hl.AddParameterL("three", "ok"));
+	hl.InsertHeaders(hl2, HEADER_INSERT_FRONT); // hl2 empty, does nothing
+	verify_trap(hl2.AddParameterL("one", "ok2"));
+	verify_trap(hl2.AddParameterL("two", "ok2"));
+	verify_trap(hl2.AddParameterL("thr", "ok2"));
+	hl.InsertHeaders(hl2, HEADER_INSERT_FRONT);
+	verify(hl2.Empty());
+	str = "one: ok2\r\ntwo: ok2\r\nthr: ok2\r\none: ok\r\ntwo: ok\r\nthree: ok\r\n";
+	hl.OutputHeaders(output);
+	verify_string(output, str);
+
+	hl.Clear();
+	verify_trap(hl.AddParameterL("one", "ok"));
+	verify_trap(hl.AddParameterL("two", "ok"));
+	verify_trap(hl.AddParameterL("three", "ok"));
+	verify_trap(hl2.AddParameterL("one", "ok2"));
+	verify_trap(hl2.AddParameterL("two", "ok2"));
+	verify_trap(hl2.AddParameterL("thr", "ok2"));
+	hl.InsertHeaders(hl2, HEADER_INSERT_BEFORE, "two");
+	str = "one: ok\r\none: ok2\r\ntwo: ok2\r\nthr: ok2\r\ntwo: ok\r\nthree: ok\r\n";
+	hl.OutputHeaders(output);
+	verify_string(output, str);
+
+	hl.Clear();
+	verify_trap(hl.AddParameterL("one", "ok"));
+	verify_trap(hl.AddParameterL("two", "ok"));
+	verify_trap(hl.AddParameterL("three", "ok"));
+	verify_trap(hl2.AddParameterL("one", "ok2"));
+	verify_trap(hl2.AddParameterL("two", "ok2"));
+	verify_trap(hl2.AddParameterL("thr", "ok2"));
+	hl.InsertHeaders(hl2, HEADER_INSERT_AFTER, "two");
+	str = "one: ok\r\ntwo: ok\r\none: ok2\r\ntwo: ok2\r\nthr: ok2\r\nthree: ok\r\n";
+	hl.OutputHeaders(output);
+	verify_string(output, str);
+
+	hl.Clear();
+	verify_trap(hl.AddParameterL("one", "ok"));
+	verify_trap(hl.AddParameterL("two", "ok"));
+	verify_trap(hl.AddParameterL("three", "ok"));
+	verify_trap(hl2.AddParameterL("one", "ok2"));
+	verify_trap(hl2.InsertHeaderL("one")->AddParameterL("ok3"));
+	verify_trap(hl2.AddParameterL("two", "ok2"));
+	verify_trap(hl2.InsertHeaderL("two")->AddParameterL("ok3"));
+	verify_trap(hl2.AddParameterL("three", "ok2"));
+	verify_trap(hl2.AddParameterL("thr", "ok3"));
+	hl.InsertHeaders(hl2, HEADER_INSERT_SORT_BEFORE, "two");
+	str = "one: ok2\r\none: ok3\r\none: ok\r\nthr: ok3\r\ntwo: ok2\r\ntwo: ok3\r\ntwo: ok\r\nthree: ok2\r\nthree: ok\r\n";
+	hl.OutputHeaders(output);
+	verify_string(output, str);
+
+	hl.Clear();
+	verify_trap(hl.AddParameterL("one", "ok"));
+	verify_trap(hl.AddParameterL("two", "ok"));
+	verify_trap(hl.AddParameterL("three", "ok"));
+	verify_trap(hl2.AddParameterL("one", "ok2"));
+	verify_trap(hl2.InsertHeaderL("one")->AddParameterL("ok3"));
+	verify_trap(hl2.AddParameterL("two", "ok2"));
+	verify_trap(hl2.InsertHeaderL("two")->AddParameterL("ok3"));
+	verify_trap(hl2.AddParameterL("three", "ok2"));
+	verify_trap(hl2.AddParameterL("thr", "ok3"));
+	hl.InsertHeaders(hl2, HEADER_INSERT_SORT_AFTER, "two");
+	str = "one: ok\r\none: ok2\r\none: ok3\r\ntwo: ok\r\ntwo: ok2\r\ntwo: ok3\r\nthr: ok3\r\nthree: ok\r\nthree: ok2\r\n";
+	hl.OutputHeaders(output);
+	verify_string(output, str);
+	
+	hl.Clear();
+	verify_trap(hl.SetSeparatorL("one", SEPARATOR_COMMA));
+	verify_trap(hl.AddParameterL("one", "ok"));
+	verify_trap(hl.AddParameterL("one", "ok2"));
+	verify_trap(hl.AddParameterL("two", "ok"));
+	verify_trap(hl.AddParameterL("two", "ok2"));
+	str = "one: ok, ok2\r\ntwo: ok; ok2\r\n";
+	hl.OutputHeaders(output);
+	verify_string(output, str);
+	hl.SetSeparator(SEPARATOR_SPACE);
+	str = "one: ok ok2\r\ntwo: ok ok2\r\n";
+	hl.OutputHeaders(output);
+	verify_string(output, str);
+
+#ifdef URL_UPLOAD_QP_SUPPORT
+	hl.Clear();
+	verify_trap(hl.AddQuotedPrintableParameterL("one", "param", "value\xC6\xD8\xC5", "iso-8859-1", ENCODING_QUOTED_PRINTABLE));
+	verify_trap(hl.AddQuotedPrintableParameterL("two", "param", UNI_L("value\x00C6\x00D8\x00C5"), "utf-8", ENCODING_AUTODETECT));
+	str = "one: param==?iso-8859-1?Q?value=C6=D8=C5?=\r\ntwo: param==?utf-8?B?dmFsdWXDhsOYw4U=?=\r\n";
+	hl.OutputHeaders(output);
+	verify_string(output, str);
+#endif
+
+#ifdef URL_UPLOAD_RFC_2231_SUPPORT
+	hl.Clear();
+	str = "value(%\"@)";
+	verify_trap(hl.AddRFC2231ParameterL("one", "param", str, "iso-8859-1"));
+	verify_trap(hl.AddRFC2231ParameterL("two", "param", UNI_L("value\x00C6\x00D8\x00C5"), "utf-16"));
+	str = "one: param*=iso-8859-1''value%28%25%22%40%29\r\ntwo: param*=utf-8''value%C3%86%C3%98%C3%85\r\n";
+	hl.OutputHeaders(output);
+	verify_string(output, str);
+#endif
+
+	hl.Clear();
+	verify_trap(hl.AddParameterL("one", "ok"));
+	verify_trap(hl.InsertHeaderL("one")->AddParameterL("ok2"));
+	verify_trap(hl.AddParameterL("two", "ok"));
+	verify_trap(hl.InsertHeaderL("two")->AddParameterL("ok2"));
+	hl.ClearHeader("one");
+	verify_trap(hl.AddParameterL("one", "ok3"));
+	verify_trap(hl.ClearAndAddParameterL("two", "ok3"));
+	verify_trap(hl.ClearAndAddParameterL("three", "ok3"));
+	verify_trap(hl.FindHeader("two", FALSE)->AddParameterL("ok4"));
+	verify_trap(hl.FindHeader("two", TRUE)->AddParameterL("ok5"));
+	str = "one: ok\r\none: ok3\r\ntwo: ok; ok4\r\ntwo: ok3; ok5\r\nthree: ok3\r\n";
+	hl.OutputHeaders(output);
+	verify_string(output, str);
+
+	hl.Clear();
+	verify_trap(hl.AddParameterL("one", "ok"));
+	verify_trap(hl.InsertHeaderL("one")->AddParameterL("ok2"));
+	verify_trap(hl.AddParameterL("two", "ok"));
+	str = "one: ok\r\none: ok2\r\ntwo: ok\r\n";
+	hl.OutputHeaders(output);
+	verify_string(output, str);
+	hl.RemoveHeader("one");
+	str = "two: ok\r\n";
+	hl.OutputHeaders(output);
+	verify_string(output, str);
+
+#ifdef UPLOAD_CLEARADD_PARAMETER_PAIR
+	hl.Clear();
+	verify_trap(hl.AddParameterL("one", "ok"));
+	verify_trap(hl.ClearAndAddParameterL("one", "ok2", "value2"));
+	verify_trap(hl.ClearAndAddParameterL("two", "ok", "value"));
+	str = "one: ok2=value2\r\ntwo: ok=value\r\n";
+	hl.OutputHeaders(output);
+	verify_string(output, str);
+#endif
+
+#if defined(UPLOAD_CLEARADD_PARAMETER) && defined(URL_UPLOAD_RFC_2231_SUPPORT)
+	Header_RFC2231_Parameter* OP_MEMORY_VAR hrfcp2 = NULL;
+	hl.Clear();
+	verify_trap(hl.AddParameterL("one", "ok"));
+	verify_trap(hrfcp2 = OP_NEW_L(Header_RFC2231_Parameter, ()));
+	verify_trap(hrfcp2->InitL("filename", UNI_L("value\x00C6\x00D8\x00C5"), "utf-8"));
+	verify_trap(hl.ClearAndAddParameterL("one", hrfcp2));
+	verify_trap(hrfcp2 = OP_NEW_L(Header_RFC2231_Parameter, ()));
+	verify_trap(hrfcp2->InitL("name", UNI_L("value"), "utf-8"));
+	verify_trap(hl.ClearAndAddParameterL("two", hrfcp2));
+	str = "one: filename*=utf-8''value%C3%86%C3%98%C3%85\r\ntwo: name=value\r\n";
+	hl.OutputHeaders(output);
+	verify_string(output, str);
+#endif
+
+#ifdef UPLOAD_CLEARADD_PARAMETER_SEP
+	hl.Clear();
+	verify_trap(hl.AddParameterL("one", "ok"));
+	verify_trap(hl.ClearAndSetSeparatorL("one", SEPARATOR_COMMA));
+	verify_trap(hl.AddParameterL("one", "ok2"));
+	verify_trap(hl.AddParameterL("one", "ok3"));
+	verify_trap(hl.ClearAndSetSeparatorL("two", SEPARATOR_SPACE));
+	verify_trap(hl.AddParameterL("two", "ok"));
+	verify_trap(hl.AddParameterL("two", "ok2"));
+	str = "one: ok2, ok3\r\ntwo: ok ok2\r\n";
+	hl.OutputHeaders(output);
+	verify_string(output, str);
+#endif
+
+	hl.Clear();
+	OP_MEMORY_VAR uint32 consumed = 0;
+	const char* s = "Accept: ok\r\nAccept-Charset: iso-8859-1\r\none: ok\r\ntwo:ok\r\n\r\nHello world";
+	verify_trap(consumed = hl.ExtractHeadersL(reinterpret_cast<const unsigned char*>(s), (uint32)op_strlen(s)));
+	verify(consumed == op_strlen(s)-STRINGLENGTH("Hello world"));
+	str = "one: ok\r\ntwo: ok\r\n";
+	hl.OutputHeaders(output);
+	verify_string(output, str);
+
+	hl.Clear();
+	s = "one: ok\r\nContent-Type: text/plain\r\n\r\nHello world";
+	verify_trap(consumed = hl.ExtractHeadersL(reinterpret_cast<const unsigned char*>(s), (uint32)op_strlen(s), FALSE, HEADER_REMOVE_HTTP_CONTENT_TYPE));
+	verify(consumed == op_strlen(s)-STRINGLENGTH("Hello world"));
+	str = "one: ok\r\n";
+	hl.OutputHeaders(output);
+	verify_string(output, str);
+
+	hl.Clear();
+	KeywordIndex exclude[2];
+	exclude[0].keyword = NULL;  exclude[0].index = FALSE;
+	exclude[1].keyword = "one"; exclude[1].index = TRUE;
+	s = "Bcc: ok\r\none: ok\r\ntwo:ok\n\nHello world";
+	verify_trap(consumed = hl.ExtractHeadersL(reinterpret_cast<const unsigned char*>(s), (uint32)op_strlen(s), FALSE, HEADER_REMOVE_BCC, exclude, 2));
+	verify(consumed == op_strlen(s)-STRINGLENGTH("Hello world"));
+	str = "two: ok\r\n";
+	hl.OutputHeaders(output);
+	verify_string(output, str);
+
+	hl.Clear();
+	s = "one: ok\r\n\x05\r\n\r\n"; // Illegal character
+	verify_trap(consumed = hl.ExtractHeadersL(reinterpret_cast<const unsigned char*>(s), (uint32)op_strlen(s)));
+	verify(consumed == 0);
+	verify(hl.CalculateLength() == 0);
+
+	hl.Clear();
+	verify_trap(consumed = hl.ExtractHeadersL(NULL, 0));
+	verify(consumed == 0);
+	verify(hl.CalculateLength() == 0);
+
+	hl.Clear();
+	verify_trap(hl.AddParameterL("one", "ok"));
+	verify_trap(hl.InsertHeaderL("one")->AddParameterL("ok2"));
+	verify_trap(hl.AddParameterL("two", "ok"));
+	verify_trap(hl.HeaderSetEnabledL("one", FALSE));
+	verify_trap(hl.HeaderSetEnabledL("three", TRUE));
+	verify(hl.FindHeader("three", TRUE) != NULL);
+#ifdef UPLOAD_HDR_IS_ENABLED
+	verify(!hl.HeaderIsEnabled("one"));
+	verify(hl.HeaderIsEnabled("two"));
+	verify(hl.HeaderIsEnabled("four"));
+#endif
+	str = "two: ok\r\n";
+	hl.OutputHeaders(output);
+	verify_string(output, str);
+}

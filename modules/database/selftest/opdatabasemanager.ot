@@ -1,0 +1,539 @@
+/* -*- Mode: c++; tab-width: 4; indent-tabs-mode: t; c-basic-offset: 4 -*-
+ *
+ * Copyright (C) 2009 Opera Software AS.  All rights reserved.
+ *
+ * This file is part of the Opera web browser.
+ * It may not be distributed under any circumstances.
+ */
+
+group "database.opdatabasemanager";
+
+require init;
+require DATABASE_MODULE_MANAGER_SUPPORT;
+
+language c++;
+
+include "modules/database/opdatabasemanager.h";
+include "modules/database/opdatabase.h";
+include "modules/database/ps_commander.h";
+include "modules/database/src/webstorage_data_abstraction_simple_impl.h";
+
+global {
+
+#undef SELFTEST_URLCTXID
+#define SELFTEST_URLCTXID 0
+#ifdef DATABASE_STORAGE_SUPPORT
+# define OBJECT_TYPE_ENUM KWebDatabases
+# define OBJECT_TYPE WSD_Database
+# define NAMEWRAP(s) s
+#elif defined WEBSTORAGE_ENABLE_SIMPLE_BACKEND
+# define OBJECT_TYPE_ENUM KLocalStorage
+# define OBJECT_TYPE WebStorageBackend_SimpleImpl
+# define NAMEWRAP(s) NULL
+#else
+// The database manager should only be enabled if either web dbs
+// or the simple web storage backend is enabled
+# error "Why is DATABASE_MODULE_MANAGER_SUPPORT enabled?"
+#endif
+
+#define RELEASE_AND_CLEAR(p) do { if((p) != NULL) {(p)->Release();(p)=NULL;}}while(0)
+
+	PS_Manager *ps_manager;
+
+	typedef struct _db_def{
+		PS_ObjectTypes::PS_ObjectType m_type;
+		const uni_char* m_origin;
+		const uni_char* m_name;
+		const char* m_domain;
+	} db_def;
+
+	unsigned num_dbs_items;
+	unsigned num_origins;
+	db_def dbs[4];
+	unsigned dbs_sorted_index[4];
+	PS_Object* persistent_ptrs[4];
+
+	OP_STATUS status;
+
+	class OpTestcasePolicy_1 : public OpDefaultGlobalPolicy
+	{
+	public:
+		OpTestcasePolicy_1(PS_Policy* parent = NULL) : OpDefaultGlobalPolicy(parent)
+		{
+			Reset();
+		}
+		virtual ~OpTestcasePolicy_1()
+		{
+			if (g_database_policies->GetOverridePolicy() == this)
+				g_database_policies->SetOverridePolicy(NULL);
+		}
+		void Reset()
+		{
+			m_max_dbs = OpDefaultGlobalPolicy::GetAttribute(KMaxObjectsPerOrigin, SELFTEST_URLCTXID, NULL);
+		}
+		virtual unsigned GetAttribute(SecAttrUint attr, URL_CONTEXT_ID context_id, const uni_char* domain = NULL, const Window* window = NULL) const
+		{
+			switch(attr) {
+			case KMaxObjectsPerOrigin:
+				return m_max_dbs;
+			}
+			return OpDefaultGlobalPolicy::GetAttribute(attr, context_id, domain, window);
+		}
+		unsigned m_max_dbs;
+	};
+	OpTestcasePolicy_1 test_case_policy_1;
+
+	class TestPersistentStorageCommander : public PersistentStorageCommander
+	{
+	public:
+		PS_Manager *m_mgr;
+		TestPersistentStorageCommander(PS_Manager *mgr) : m_mgr(mgr){}
+		virtual void* GetManagerPtr() { return m_mgr; }
+	};
+	PersistentStorageCommander *ps_commander;
+
+	OP_STATUS GetDatabase(PS_Manager* mgr, PS_ObjectTypes::PS_ObjectType type, const uni_char* origin,
+			const uni_char* name, BOOL is_persistent, OBJECT_TYPE** object)
+	{
+		PS_Object *ps_obj;
+		RETURN_IF_ERROR(mgr->GetObject(type, origin, name, is_persistent, SELFTEST_URLCTXID, &ps_obj));
+		*object = static_cast<OBJECT_TYPE*>(ps_obj);
+		return OpStatus::OK;
+	}
+}
+
+setup
+{
+	DATABASE_MODULE_ADD_CONTEXT(0, OPFILE_PERSISTENT_STORAGE_FOLDER);
+
+	op_memset(persistent_ptrs, 0, sizeof(persistent_ptrs));
+	ps_manager = NULL;
+	ps_commander = NULL;
+
+	num_dbs_items = 0;
+	num_origins = 0;
+	// NOTE: when changing these fix the "iterateOrdered" and "iterateUnordered" subtests.
+	{
+		db_def t = {PS_ObjectTypes::OBJECT_TYPE_ENUM, UNI_L("http://ADJH2345hkhg344507/"), NAMEWRAP(UNI_L("wdgt-foo")), "ADJH2345hkhg344507"};
+		dbs[num_dbs_items++] = t;
+		num_origins++;
+	}
+	{
+		db_def t = {PS_ObjectTypes::OBJECT_TYPE_ENUM, UNI_L("http://www.example.org:81/"), NAMEWRAP(UNI_L("example")), "www.example.org"};
+		dbs[num_dbs_items++] = t;
+		num_origins++;
+	}
+#ifdef DATABASE_STORAGE_SUPPORT
+	{
+		db_def t = {PS_ObjectTypes:: OBJECT_TYPE_ENUM, UNI_L("http://ADJH2345hkhg344507/"), NAMEWRAP(UNI_L("acmetool")), "ADJH2345hkhg344507"};
+		dbs[num_dbs_items++] = t;
+	}
+#endif // DATABASE_STORAGE_SUPPORT
+	{
+		db_def t = {PS_ObjectTypes::OBJECT_TYPE_ENUM, UNI_L("widget://wuid-38a3820e-8633-04f9-0dcb-8cac86334995"), NAMEWRAP(UNI_L("zzzzz")), "wuid-38a3820e-8633-04f9-0dcb-8cac86334995"};
+		dbs[num_dbs_items++] = t;
+		num_origins++;
+	}
+	// A sanity check to make sure the array is increased if more test subjects are added.
+	OP_ASSERT(num_dbs_items <= ARRAY_SIZE(dbs));
+
+#ifdef DATABASE_STORAGE_SUPPORT
+	dbs_sorted_index[0] = 2;
+	dbs_sorted_index[1] = 0;
+	dbs_sorted_index[2] = 1;
+	dbs_sorted_index[3] = 3;
+#else // DATABASE_STORAGE_SUPPORT
+	dbs_sorted_index[0] = 0;
+	dbs_sorted_index[1] = 1;
+	dbs_sorted_index[2] = 2;
+#endif // DATABASE_STORAGE_SUPPORT
+}
+
+test("Create databases")
+{
+	verify_not_oom(ps_manager = PS_Manager::NewForSelfTest());
+	verify_not_oom(ps_commander = OP_NEW(TestPersistentStorageCommander, (ps_manager)));
+
+	for(unsigned k = 0;k<num_dbs_items;k++)
+	{
+		verify_success(ps_manager->GetObject(dbs[k].m_type,dbs[k].m_origin,
+			dbs[k].m_name,TRUE,SELFTEST_URLCTXID, persistent_ptrs+k));
+		PS_Object* db = persistent_ptrs[k];
+		verify(db != NULL);
+		verify(!db->IsMemoryOnly());
+		verify_string(db->GetDomain(), dbs[k].m_domain);
+
+		if (k == 1)
+		{
+			//add unused memory only database
+			PS_Object* db2 = NULL;
+			verify_success(ps_manager->GetObject(dbs[k].m_type,dbs[k].m_origin,
+				dbs[k].m_name,FALSE,SELFTEST_URLCTXID, &db2));
+			AutoReleasePSObjectPtr db2_ptr(db2);
+			verify(db2 != NULL);
+			verify(db2->IsMemoryOnly());
+			verify(db2!=db);
+		}
+	}
+}
+
+subtest iterateUnorderedL()
+{
+	PS_IndexIterator* itr = ps_manager->GetIteratorL(SELFTEST_URLCTXID);
+	OpStackAutoPtr<PS_IndexIterator> iterator(itr);
+	verify(itr != NULL);
+	verify(!itr->AtEndL());
+	PS_IndexEntry* item;
+
+	for(unsigned k = 0; k<num_dbs_items; k++)
+	{
+		item = itr->GetItemL();
+		verify(item != NULL);
+
+		BOOL item_equal_to_db_get_index_entry = FALSE;
+		for(unsigned j = 0; j<num_dbs_items; j++)
+		{
+			PS_Object* db;
+			verify_success(ps_manager->GetObject(dbs[j].m_type,dbs[j].m_origin,
+				dbs[j].m_name,TRUE,SELFTEST_URLCTXID, &db));
+			verify(db != NULL);
+			AutoReleasePSObjectPtr db_ptr(db);
+
+			if (item->IsEqual(db->GetIndexEntry())) {
+				item_equal_to_db_get_index_entry = TRUE;
+				break;
+			}
+			else
+			{
+				verify(item!=db->GetIndexEntry());
+			}
+		}
+		verify(item_equal_to_db_get_index_entry);
+		if(k<num_dbs_items-1)
+			verify(itr->MoveNextL());
+	}
+	verify(!itr->MoveNextL());
+	verify(itr->AtEndL());
+	verify(itr->GetItemL() == NULL);
+}
+
+test("Iterator unordered")
+{
+	int result = 0;
+	verify_trap(result = iterateUnorderedL());
+	verify(result);
+}
+
+subtest iterateOrderedL()
+{
+	PS_IndexIterator* itr = ps_manager->GetIteratorL(SELFTEST_URLCTXID, PS_IndexIterator::KDBTypeStart, TRUE,PS_IndexIterator::ORDERED_ASCENDING);
+	OpStackAutoPtr<PS_IndexIterator> iterator(itr);
+	verify(itr != NULL);
+	verify(!itr->AtEndL());
+	PS_IndexEntry* item;
+
+	verify(itr->IsOrdered());
+	//3 items
+	for(unsigned k = 0; k < num_dbs_items; k++)
+	{
+		item = itr->GetItemL();
+		verify(item != NULL);
+
+		unsigned sorted_index = dbs_sorted_index[k];
+
+		PS_Object* db;
+		verify_success(ps_manager->GetObject(dbs[sorted_index].m_type,dbs[sorted_index].m_origin,
+			dbs[sorted_index].m_name,TRUE,SELFTEST_URLCTXID, &db));
+		verify(db != NULL);
+		AutoReleasePSObjectPtr db_ptr(db);
+		verify(item == db->GetIndexEntry());
+		verify(item->IsEqual(db->GetIndexEntry()));
+		if(k<num_dbs_items-1)
+			verify(itr->MoveNextL());
+	}
+	verify(!itr->MoveNextL());
+	verify(itr->AtEndL());
+	verify(itr->GetItemL() == NULL);
+}
+
+test("Iterator ordered")
+{
+	int result = 0;
+	verify_trap(result = iterateOrderedL());
+	verify(result);
+}
+
+subtest iterateForOriginUnorderedL()
+{
+	PS_IndexIterator* itr = ps_manager->GetIteratorL(SELFTEST_URLCTXID, dbs[1].m_type,dbs[1].m_origin, TRUE, PS_IndexIterator::UNORDERED);
+
+	OpStackAutoPtr<PS_IndexIterator> iterator(itr);
+	verify(itr != NULL);
+	verify(!itr->AtEndL());
+
+	PS_IndexEntry* item = itr->GetItemL();
+	verify(item != NULL);
+
+	verify(item->IsEqual(dbs[1].m_type,dbs[1].m_origin,
+			dbs[1].m_name, TRUE, SELFTEST_URLCTXID));
+
+	verify(!itr->MoveNextL());
+	verify(itr->AtEndL());
+	verify(itr->GetItemL() == NULL);
+}
+
+test("Iterator for origin unordered")
+{
+	int result = 0;
+	verify_trap(result = iterateForOriginUnorderedL());
+	verify(result);
+}
+
+subtest iterateForOriginOrderedL()
+{
+	PS_IndexIterator* itr = ps_manager->GetIteratorL(SELFTEST_URLCTXID, dbs[1].m_type,dbs[1].m_origin, TRUE, PS_IndexIterator::ORDERED_ASCENDING);
+
+	OpStackAutoPtr<PS_IndexIterator> iterator(itr);
+	verify(itr != NULL);
+	verify(!itr->AtEndL());
+
+	PS_IndexEntry* item = itr->GetItemL();
+	verify(item != NULL);
+
+	verify(item->IsEqual(dbs[1].m_type,dbs[1].m_origin,
+			dbs[1].m_name, TRUE, SELFTEST_URLCTXID));
+
+	verify(!itr->MoveNextL());
+	verify(itr->AtEndL());
+	verify(itr->GetItemL() == NULL);
+}
+
+test("Iterator for origin ordered")
+{
+	int result = 0;
+	verify_trap(result = iterateForOriginOrderedL());
+	verify(result);
+}
+
+test("max database per type and origin")
+	require SUPPORT_DATABASE_INTERNAL;
+{
+	const unsigned num_dbs_test = 10;
+	WSD_Database* dbs[num_dbs_test]; /* ARRAY OK joaoe 2011-10-07 */
+	SqlTransaction* trs[num_dbs_test*2];/* ARRAY OK joaoe 2011-10-07 */
+	TempBuffer names[num_dbs_test]; /* ARRAY OK joaoe 2011-10-07 */
+
+	op_memset(dbs, 0, sizeof(dbs));
+	op_memset(trs, 0, sizeof(trs));
+
+	PS_ObjectTypes::PS_ObjectType type = PS_ObjectTypes::KWebDatabases;
+	const uni_char* origin = UNI_L("test-origin");
+	unsigned j, number_of_dbs = ps_manager->GetNumberOfObjects(SELFTEST_URLCTXID,type, origin);
+	g_database_policies->SetOverridePolicy(&test_case_policy_1);
+
+	//set limit to finish in 5 dbs
+	test_case_policy_1.m_max_dbs = number_of_dbs + num_dbs_test / 2;
+
+	//create random names
+	for(j = 0; j<num_dbs_test; j++)
+	{
+		OpStatus::Ignore(names[j].Append("random-test-"));
+		OpStatus::Ignore(names[j].AppendUnsignedLong(op_rand()|0x40000000));
+		OpStatus::Ignore(names[j].AppendUnsignedLong(op_rand()|0x40000000));
+		OpStatus::Ignore(names[j].AppendUnsignedLong(op_rand()|0x40000000));
+	}
+
+	//first test
+	//create new dbs then release them immediately. Because they don't have a data file
+	//they should be immediately deleted
+	for(j = 0; j<num_dbs_test; j++)
+	{
+		verify(dbs[j] == NULL);
+
+		status = GetDatabase(ps_manager, type, origin, names[j].GetStorage(), TRUE, dbs + j);
+		verify(status != PS_Status::ERR_MAX_DBS_PER_ORIGIN);
+		verify_success(status);
+
+		verify(trs[j*2  ] == NULL);
+		verify(trs[j*2+1] == NULL);
+
+		trs[j*2  ] = dbs[j]->CreateTransactionSync(FALSE);
+		trs[j*2+1] = dbs[j]->CreateTransactionSync(FALSE);
+
+		RELEASE_AND_CLEAR(dbs[j]);
+		RELEASE_AND_CLEAR(trs[j*2]);
+		RELEASE_AND_CLEAR(trs[j*2+1]);
+	}
+
+	for(j = 0; j<num_dbs_test; j++)
+	{
+		RELEASE_AND_CLEAR(dbs[j]);
+		RELEASE_AND_CLEAR(trs[j*2]);
+		RELEASE_AND_CLEAR(trs[j*2+1]);
+	}
+
+	//second test, keep all references alive so we can
+	//test if the limit is overflown or not
+	for(j = 0; j<num_dbs_test; j++)
+	{
+		verify(dbs[j] == NULL);
+
+		status = GetDatabase(ps_manager, type, origin, names[j].GetStorage(), TRUE, dbs + j);
+		verify(status == PS_Status::ERR_MAX_DBS_PER_ORIGIN || OpStatus::IsSuccess(status));
+		if (status == PS_Status::ERR_MAX_DBS_PER_ORIGIN)
+			break;
+
+		verify(trs[j*2  ] == NULL);
+		verify(trs[j*2+1] == NULL);
+
+		trs[j*2  ] = dbs[j]->CreateTransactionSync(FALSE);
+		trs[j*2+1] = dbs[j]->CreateTransactionSync(FALSE);
+
+		RELEASE_AND_CLEAR(trs[j*2]);
+		RELEASE_AND_CLEAR(trs[j*2+1]);
+	}
+	verify(status == PS_Status::ERR_MAX_DBS_PER_ORIGIN);
+
+	for(j = 0; j<num_dbs_test; j++)
+	{
+		RELEASE_AND_CLEAR(dbs[j]);
+		RELEASE_AND_CLEAR(trs[j*2]);
+		RELEASE_AND_CLEAR(trs[j*2+1]);
+	}
+
+	//third test, same as above but no transactions
+	for(j = 0; j<num_dbs_test; j++)
+	{
+		verify(dbs[j] == NULL);
+
+		status = GetDatabase(ps_manager, type, origin, names[j].GetStorage(), TRUE, dbs + j);
+		verify(status == PS_Status::ERR_MAX_DBS_PER_ORIGIN || OpStatus::IsSuccess(status));
+		if (status == PS_Status::ERR_MAX_DBS_PER_ORIGIN)
+			break;
+	}
+	verify(status == PS_Status::ERR_MAX_DBS_PER_ORIGIN);
+}
+finally
+{
+	g_database_policies->SetOverridePolicy(NULL);
+	for(j = 0; j<num_dbs_test; j++)
+	{
+		RELEASE_AND_CLEAR(dbs[j]);
+		RELEASE_AND_CLEAR(trs[j*2]);
+		RELEASE_AND_CLEAR(trs[j*2+1]);
+	}
+}
+
+test("PSCommander")
+{
+#define callback_verify(e) do { if(!(e)){ ST_failed("Expression failed: '%s'", #e); return 0; } } while(0)
+	class TestEnumerator_0 : public PersistentStorageCommander::PS_Enumerator
+	{
+	public:
+		PS_Manager *m_mgr;
+		BOOL m_failed;
+		unsigned m_count;
+		TestEnumerator_0(PS_Manager *mgr) : m_mgr(mgr), m_failed(FALSE), m_count(0) {}
+		virtual void HandlePSInfo(const PersistentStorageCommander::PS_Info& info)
+		{
+			if (!m_failed)
+				m_failed = HandlePSInfoAux(info) == 0;
+		}
+		int HandlePSInfoAux(const PersistentStorageCommander::PS_Info& info)
+		{
+			m_count++;
+			callback_verify(info.m_context_id == SELFTEST_URLCTXID);
+			callback_verify(info.m_used_size == 0); // These storage areas are empty, this selftests does not fill in any data.
+			callback_verify(info.m_in_use); // The selftest increments the ref count, so the objects aren't dropped.
+			callback_verify(m_mgr->GetDescType(info.m_type.CStr()) == PS_ObjectTypes::OBJECT_TYPE_ENUM);
+
+			if (uni_str_eq("http://ADJH2345hkhg344507/", info.m_origin.CStr()))
+			{
+#ifdef DATABASE_STORAGE_SUPPORT
+				callback_verify(info.m_number_objects == 2);
+#else // DATABASE_STORAGE_SUPPORT
+				callback_verify(info.m_number_objects == 1);
+#endif // DATABASE_STORAGE_SUPPORT
+			}
+			else if (uni_str_eq("http://www.example.org:81/", info.m_origin.CStr()))
+			{
+				callback_verify(info.m_number_objects == 1);
+			}
+			else if (uni_str_eq("widget://wuid-38a3820e-8633-04f9-0dcb-8cac86334995", info.m_origin.CStr()))
+			{
+				callback_verify(info.m_number_objects == 1);
+			}
+			else
+				callback_verify(!"Unknown origin");
+			return 1;
+		}
+	} enumerator_0(ps_manager);
+	verify_success(ps_commander->EnumeratePersistentStorage(enumerator_0, SELFTEST_URLCTXID));
+	verify(!enumerator_0.m_failed);
+	verify(enumerator_0.m_count == num_origins);
+
+	class TestEnumerator_1 : public PersistentStorageCommander::PS_Enumerator
+	{
+	public:
+		PS_Manager *m_mgr;
+		BOOL m_failed;
+		unsigned m_count;
+		TestEnumerator_1(PS_Manager *mgr) : m_mgr(mgr), m_failed(FALSE), m_count(0) {}
+		virtual void HandlePSInfo(const PersistentStorageCommander::PS_Info& info)
+		{
+			if (!m_failed)
+				m_failed = HandlePSInfoAux(info) == 0;
+		}
+		int HandlePSInfoAux(const PersistentStorageCommander::PS_Info& info)
+		{
+			callback_verify(m_count == 0); // only one call
+			m_count++;
+			callback_verify(info.m_context_id == SELFTEST_URLCTXID);
+			callback_verify(info.m_used_size == 0); // These storage areas are empty, this selftests does not fill in any data.
+			callback_verify(info.m_in_use); // The selftest increments the ref count, so the objects aren't dropped.
+			callback_verify(m_mgr->GetDescType(info.m_type.CStr()) == PS_ObjectTypes::OBJECT_TYPE_ENUM);
+			callback_verify(uni_str_eq("http://ADJH2345hkhg344507/", info.m_origin.CStr()));
+#ifdef DATABASE_STORAGE_SUPPORT
+			callback_verify(info.m_number_objects == 2);
+#else // DATABASE_STORAGE_SUPPORT
+			callback_verify(info.m_number_objects == 1);
+#endif // DATABASE_STORAGE_SUPPORT
+			return 1;
+		}
+	} enumerator_1(ps_manager);
+	verify_success(ps_commander->EnumeratePersistentStorage(enumerator_1, SELFTEST_URLCTXID, UNI_L("http://ADJH2345hkhg344507/")));
+
+	class TestEnumerator_2 : public PersistentStorageCommander::PS_Enumerator
+	{
+	public:
+		BOOL m_called;
+		TestEnumerator_2() : m_called(FALSE){}
+		virtual void HandlePSInfo(const PersistentStorageCommander::PS_Info& info)
+		{
+			m_called = TRUE;
+		}
+	} enumerator_2;
+	verify_success(ps_commander->EnumeratePersistentStorage(enumerator_2, SELFTEST_URLCTXID, UNI_L("http://bad-origin/")));
+	verify(!enumerator_2.m_called);
+	verify_success(ps_commander->EnumeratePersistentStorage(enumerator_2, SELFTEST_URLCTXID + 10 , NULL));
+	verify(!enumerator_2.m_called);
+#undef callback_verify
+
+	ps_commander->DeleteWebDatabases(PersistentStorageCommander::ALL_CONTEXT_IDS);
+	ps_commander->DeleteAllData((URL_CONTEXT_ID)12345678);
+	ps_commander->DeleteWebStorage(PersistentStorageCommander::ALL_CONTEXT_IDS);
+	ps_commander->DeleteAllData(PersistentStorageCommander::ALL_CONTEXT_IDS);
+
+	ps_manager->FlushDeleteQueue(TRUE);
+}
+
+exit
+{
+	for(unsigned k = 0; k<num_dbs_items; k++)
+	{
+		RELEASE_AND_CLEAR(persistent_ptrs[k]);
+	}
+	//TRAP(status,ps_manager->DumpIndexL(UNI_L("finally")));
+	OP_DELETE(ps_commander);
+	OP_DELETE(ps_manager);
+}

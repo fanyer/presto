@@ -1,0 +1,598 @@
+/* -*- Mode: c++; indent-tabs-mode: nil; c-file-style: "gnu" -*- */
+
+group "XSLT.Simple";
+require XSLT_SUPPORT;
+
+include "modules/logdoc/optreecallback.h";
+include "modules/url/url2.h";
+include "modules/util/tempbuf.h";
+include "modules/xmlutils/xmlparser.h";
+include "modules/xmlutils/xmlserializer.h";
+include "modules/xmlutils/xmltokenhandler.h";
+include "modules/xmlutils/xmlutils.h";
+include "modules/xslt/xslt.h";
+include "modules/logdoc/htm_elm.h";
+include "modules/logdoc/logdoc.h";
+include "modules/doc/frm_doc.h";
+include "modules/logdoc/xmlenum.h";
+
+global
+{
+  // We don't want to be too strict in expected when testing for different things unrelated to exact output format
+  void adjust_for_optional_xml_declaration(const uni_char* expected, const uni_char*& produced)
+  {
+    if (expected != uni_strstr(expected, "<?xml version="))
+      {
+        // No xml_declaration in expected so remove it from produced if there is one
+        if (produced == uni_strstr(produced, "<?xml version="))
+          {
+            const uni_char* new_produced = uni_strstr(produced+10, "?>\n");
+            if (new_produced)
+              produced = new_produced + 3; // skip past ?>\n
+          }
+      }
+  }
+
+  BOOL is_equal_ignoring_linebreaks(const uni_char* expected, const uni_char* produced)
+  {
+    while (*expected && *produced)
+      {
+        if (*expected == '\r' || *expected == '\n')
+          {
+            if (*produced == '\r')
+              {
+                if (*(produced+1) != '\n')
+                  return FALSE; // Broken linebreak in produced
+                produced +=2;
+              }
+            else if (*produced == '\n')
+              produced++;
+            else
+              return FALSE; // Not a line break
+
+            if (*expected == '\r')
+              {
+                if (*(expected + 1) != '\n')
+                  return FALSE; // Broken linebreak in expected
+                expected +=2;
+              }
+            else
+              expected++;
+          }
+        else if (*expected != *produced)
+          return FALSE;
+        else
+          {
+            expected++;
+            produced++;
+          }
+      }
+
+    return *expected == *produced;
+  }
+
+  BOOL is_equal_ignoring_missing_whitespace(const uni_char* expected, const uni_char* produced)
+  {
+    // We accept extra whitespace in the hand produced expected
+    // result, and any sequence of whitespace matches any other
+    // (non-empty) sequence of whitespace
+    while (*expected && *produced)
+      {
+        if (XMLUtils::IsSpace(*produced))
+          {
+            if (!XMLUtils::IsSpace(*expected))
+              return FALSE;
+
+            while (XMLUtils::IsSpace(*produced))
+              produced++;
+            while (XMLUtils::IsSpace(*expected))
+              expected++;
+          }
+        else
+          {
+            while (XMLUtils::IsSpace(*expected))
+              expected++;
+
+            if (*expected != *produced)
+              return FALSE;
+
+            expected++;
+            produced++;
+          }
+      }
+
+    // Eat trailing whitespace
+    while (XMLUtils::IsSpace(*expected))
+      expected++;
+
+    return *expected == *produced;
+  }
+
+#define FULL_ERROR_OUTPUT
+
+  // TRUE = was error, FALSE = wasn't error after all
+  BOOL generate_diff_error_message(const uni_char* expected, const uni_char* produced, OpString8& error_message_obj)
+  {
+    const uni_char* expected_p = expected;
+    const uni_char* produced_p = produced;
+
+    while (*expected_p && *expected_p == *produced_p)
+      {
+        expected_p++;
+        produced_p++;
+      }
+
+    if (*expected_p == *produced_p)
+      {
+        error_message_obj.Set("strings compared unequal but no difference could be found");
+        return TRUE;
+      }
+
+    ptrdiff_t err_offset = expected_p - expected;
+
+#ifdef FULL_ERROR_OUTPUT
+    const int error_message_size = 500 + 4*uni_strlen(expected) + 4*uni_strlen(produced); // Expanded to UTF-8
+#else // FULL_ERROR_OUTPUT
+    const int error_message_size = 500;
+#endif // FULL_ERROR_OUTPUT
+    char* error_message_start = error_message_obj.Reserve(error_message_size);
+    if (!error_message_start) return TRUE;
+#ifdef FULL_ERROR_OUTPUT
+    OpString8 result_utf8, output_utf8;
+    OpStatus::Ignore(result_utf8.SetUTF8FromUTF16(produced));
+    OpStatus::Ignore(output_utf8.SetUTF8FromUTF16(expected));
+    *error_message_start = '\0';
+    op_strcat(error_message_start, "\nExpected: '");
+    if (!output_utf8.IsEmpty())
+      op_strcat(error_message_start, output_utf8.CStr());
+    op_strcat(error_message_start, "'\nProduced: '");
+    if (!result_utf8.IsEmpty())
+      op_strcat(error_message_start, result_utf8.CStr());
+    op_strcat(error_message_start, "'\nError: ");
+    char* error_message = error_message_start + op_strlen(error_message_start);
+#else
+    char* error_message = error_message_start;
+#endif // FULL_ERROR_OUTPUT
+    if (!*expected_p)
+      {
+        // We have stripped a line ending from the expected
+        // value. Just double check that it wasn't that line ending
+        // that was missing, because in that case it wasn't missing
+        // after all.
+        if (uni_str_eq(produced_p, "\r\n") || uni_str_eq(produced_p, "\n"))
+          return FALSE; // it was no error after all
+
+        // Don't use verify since we want to give a good description
+        // of the error
+        op_sprintf(error_message, "Produced text continued beyond what was expected. It should have been %d characters long but was %d characters. The first extra character was 0x%x.",
+                   (int) uni_strlen(produced),
+                   (int) err_offset,
+                   (int) *produced_p);
+
+        return TRUE;
+      }
+
+    if (!*produced_p)
+      {
+        // Don't use verify since we want to give a good description
+        // of the error
+        op_sprintf(error_message, "Produced text ended prematurely already after %d characters. It should have been %d characters long. The first missing character was 0x%x.",
+                   (int) err_offset,
+                   (int) uni_strlen(expected),
+                   (int) *expected_p);
+        return TRUE;
+      }
+
+    // Don't use verify since we want to give a good description of the error
+    op_sprintf(error_message, "Produced text differs from expected at pos %d. Expected char code 0x%x, got char code 0x%x",
+               (int) err_offset,
+               (int) *expected_p,
+               (int) *produced_p);
+
+    return TRUE;
+  }
+
+  class TestStringDataCollector
+    : public XSLT_Stylesheet::Transformation::StringDataCollector
+  {
+  public:
+    virtual OP_STATUS CollectStringData (const uni_char *string, unsigned string_length);
+    virtual OP_STATUS StringDataFinished () { return OpStatus::OK; }
+
+    const uni_char* GetResult () { return resulting_text.GetStorage(); }
+
+    operator TempBuffer & () { return resulting_text; }
+
+  private:
+    TempBuffer resulting_text;
+  };
+
+  /* virtual */ OP_STATUS
+  TestStringDataCollector::CollectStringData(const uni_char *string, unsigned string_length)
+  {
+    return resulting_text.Append(string, string_length);
+  }
+
+  BOOL ReadFile (TempBuffer &buffer, const OpString &filename)
+  {
+    OpFile file;
+
+    if (OpStatus::IsError (file.Construct (filename.CStr ())))
+      return FALSE;
+
+    if (OpStatus::IsError (file.Open (OPFILE_READ | OPFILE_TEXT)))
+      return FALSE;
+
+    while (!file.Eof ())
+      {
+        OpString line;
+
+        if (OpStatus::IsError (file.ReadUTF8Line (line)))
+          return FALSE;
+
+        if (OpStatus::IsError (buffer.Append (line.CStr())))
+          return FALSE;
+
+        if (OpStatus::IsError (buffer.Append ("\n")))
+          return FALSE;
+      }
+
+    return TRUE;
+  }
+
+  void TrimTrailingWhitespace (TempBuffer &buffer)
+  {
+    uni_char *storage = buffer.GetStorage ();
+    if (storage)
+      {
+        uni_char *end = storage + buffer.Length ();
+
+        while (end != storage && XMLUtils::IsSpace (end[-1]))
+          *--end = 0;
+      }
+  }
+
+  class Callback
+    : public OpTreeCallback
+  {
+  public:
+    BOOL called;
+    HTML_Element *element;
+
+    Callback () : called (FALSE), element (NULL) {}
+
+    virtual OP_STATUS ElementFound (HTML_Element *input)
+    {
+      called = TRUE;
+      element = input;
+      return OpStatus::OK;
+    }
+
+    virtual OP_STATUS ElementNotFound ()
+    {
+      called = TRUE;
+      return OpStatus::OK;
+    }
+
+    ~Callback()
+    {
+      if (element && element->Clean (state.doc))
+        element->Free (state.doc);
+    }
+  };
+
+  class XSLT_StylesheetParser_Callback
+    : public XSLT_StylesheetParser::Callback
+  {
+  public:
+    virtual OP_STATUS LoadOtherStylesheet (URL stylesheet_url, XMLTokenHandler *token_handler, BOOL is_import)
+    {
+      return OpStatus::ERR;
+    }
+  };
+
+  class XSLT_StylesheetTransformation_Callback
+    : public XSLT_Stylesheet::Transformation::Callback
+  {
+  public:
+    virtual void ContinueTransformation(XSLT_Stylesheet::Transformation *transformation)
+    {
+    }
+    virtual OP_STATUS LoadDocument(URL document_url, XMLTokenHandler *token_handler)
+    {
+      return OpStatus::ERR;
+    }
+  };
+
+  class XSLT_StylesheetParserOwner
+  {
+  public:
+    XSLT_StylesheetParserOwner(XSLT_StylesheetParser *p, XSLT_StylesheetParser_Callback *c) : xsltparser(p), xsltparser_callback(c) {}
+    ~XSLT_StylesheetParserOwner() { XSLT_StylesheetParser::Free(xsltparser); OP_DELETE (xsltparser_callback); }
+  private:
+    XSLT_StylesheetParser *xsltparser;
+    XSLT_StylesheetParser_Callback *xsltparser_callback;
+  };
+
+  class XSLT_StylesheetOwner
+  {
+  public:
+    XSLT_StylesheetOwner(XSLT_Stylesheet* p) : xsltparser(p) {}
+    ~XSLT_StylesheetOwner() { XSLT_Stylesheet::Free(xsltparser); }
+  private:
+    XSLT_Stylesheet* xsltparser;
+  };
+
+  class LogdocTreeAccessorOwner
+  {
+  public:
+    LogdocTreeAccessorOwner(XMLTreeAccessor* p) : tree(p) {}
+    ~LogdocTreeAccessorOwner() { LogicalDocument::FreeXMLTreeAccessor(tree); }
+  private:
+    XMLTreeAccessor* tree;
+  };
+
+  void ProcessWhitespace (LogicalDocument *logdoc, XSLT_Stylesheet *stylesheet, HTML_Element *parent, BOOL strip, BOOL preserve)
+  {
+    HTML_Element *iter = parent->Next (), *stop = static_cast<HTML_Element *> (parent->NextSibling ());
+    while (iter != stop)
+      {
+        if (Markup::IsRealElement(iter->Type ()))
+          {
+            const uni_char *xmlspace = iter->GetStringAttr (XMLA_SPACE, NS_IDX_XML);
+            if (xmlspace)
+              if (preserve ? uni_strcmp (xmlspace, "preserve") == 0 : uni_strcmp (xmlspace, "default") == 0)
+                {
+                  ProcessWhitespace (logdoc, stylesheet, iter, strip, !preserve);
+                  iter = static_cast<HTML_Element *> (parent->NextSibling ());
+                  continue;
+                }
+
+            XMLExpandedName name (iter);
+
+            if (!strip != !stylesheet->ShouldStripWhitespaceIn (name))
+              {
+                ProcessWhitespace (logdoc, stylesheet, iter, !strip, preserve);
+                iter = static_cast<HTML_Element *> (parent->NextSibling ());
+                continue;
+              }
+          }
+        else if (iter->IsText () && strip && !preserve)
+          {
+            HTML_Element *text_iter = iter, *next = 0;
+            BOOL strip_this = TRUE;
+
+            do
+              {
+                if (!text_iter->HasWhiteSpaceOnly ())
+                  strip_this = FALSE;
+                next = text_iter->Next ();
+                text_iter = text_iter->Suc ();
+              }
+            while (strip_this && text_iter && text_iter->IsText ());
+
+            if (strip_this)
+              {
+                HTML_Element *strip_iter = iter;
+
+                while (strip_iter != text_iter)
+                  {
+                    HTML_Element *next = strip_iter->Suc ();
+                    strip_iter->OutSafe (logdoc);
+                    if (strip_iter->Clean (logdoc))
+                      strip_iter->Free (logdoc);
+                    strip_iter = next;
+                  }
+              }
+
+            iter = next;
+            continue;
+          }
+
+        iter = iter->Next ();
+      }
+  }
+
+  void StripWhitespace(LogicalDocument *logdoc, XSLT_Stylesheet *stylesheet, HTML_Element *root)
+  {
+    ProcessWhitespace (logdoc, stylesheet, root, FALSE, FALSE);
+  }
+} // end globals
+
+table filenames_in (const char *) filelist "input" name "*.in";
+table filenames_transform (const char *) filelist "input" name "*.transform";
+table filenames_out (const char *) filelist "input" name "*.out";
+
+xml
+{
+  "<root>Dummy document</root>"
+}
+
+test ("Dummy test")
+{
+  /* Dummy test: multi tests can't wait for a document to finish loading; so
+     they are all skipped instead.  This dummy tests can wait for the document
+     to finish, and after it, the multi test will run correctly. */
+  verify (TRUE);
+}
+
+test ("Transformation: $(inputname8)")
+  multi filenames_in (inputname8);
+{
+  OpString inputname, stylesheetname, expected_outputname;
+
+  // number15 fails because of an xpath error (can't handle variables in patterns)
+  // avt08 fails because xmlns:http="xyz" and xmlns:http="http://xyz" are different namespaces (bug in testcase)
+  // avt08, key07, number15, sort06
+  //  verify(op_strstr(inputname8, "message")); // Skip all tests not working on text
+
+  inputname.Set (inputname8);
+  stylesheetname.Set (inputname8);
+  stylesheetname.Delete (stylesheetname.Length () - 2);
+  stylesheetname.Append (UNI_L ("transform"));
+  expected_outputname.Set (inputname8);
+  expected_outputname.Delete (expected_outputname.Length () - 2);
+  expected_outputname.Append (UNI_L ("out"));
+
+  TempBuffer input, stylesheetsrc, expected_output;
+
+  verify (ReadFile (input, inputname));
+  verify (ReadFile (stylesheetsrc, stylesheetname));
+  verify (ReadFile (expected_output, expected_outputname));
+
+  URL url;
+
+  OpAutoPtr<XSLT_StylesheetParser_Callback> xsltparser_callback (OP_NEW (XSLT_StylesheetParser_Callback, ()));
+  verify (xsltparser_callback.get ());
+
+  XSLT_StylesheetParser *xsltparser;
+  verify (OpStatus::IsSuccess (XSLT_StylesheetParser::Make (xsltparser, xsltparser_callback.get ())));
+
+  XSLT_StylesheetParserOwner xsltparser_owner(xsltparser, xsltparser_callback.release());
+
+  XMLTokenHandler *tokenhandler1;
+  verify(OpStatus::IsSuccess(XMLLanguageParser::MakeTokenHandler (tokenhandler1, xsltparser, NULL)));
+  OpAutoPtr<XMLTokenHandler> tokenhandler1_owner(tokenhandler1);
+
+  XMLParser *stylesheetparser;
+  verify(OpStatus::IsSuccess(XMLParser::Make (stylesheetparser, NULL, (MessageHandler *) NULL, tokenhandler1, url)));
+  OpAutoPtr<XMLParser> stylesheetparser_owner(stylesheetparser);
+
+  verify (stylesheetparser->Parse (stylesheetsrc.GetStorage (), stylesheetsrc.Length (), FALSE) == OpStatus::OK);
+  verify (stylesheetparser->IsFinished ());
+
+  XSLT_Stylesheet *stylesheet = NULL;
+  xsltparser->GetStylesheet (stylesheet);
+  verify(stylesheet);
+  XSLT_StylesheetOwner stylesheet_owner(stylesheet);
+
+  const XSLT_Stylesheet::OutputSpecification* output_spec;
+  output_spec = stylesheet->GetOutputSpecification();
+  verify(output_spec);
+
+  verify (output_spec->method == XSLT_Stylesheet::OutputSpecification::METHOD_TEXT ||
+          output_spec->method == XSLT_Stylesheet::OutputSpecification::METHOD_UNKNOWN ||
+          output_spec->method == XSLT_Stylesheet::OutputSpecification::METHOD_HTML ||
+          output_spec->method == XSLT_Stylesheet::OutputSpecification::METHOD_XML);
+
+  Callback callback;
+
+  XMLTokenHandler *tokenhandler2;
+  verify(OpStatus::IsSuccess(OpTreeCallback::MakeTokenHandler (tokenhandler2, state.doc->GetLogicalDocument (), &callback)));
+  OpAutoPtr<XMLTokenHandler> tokenhandler2_owner(tokenhandler2);
+
+  XMLParser *datainparser;
+  verify(OpStatus::IsSuccess(XMLParser::Make (datainparser, NULL, (MessageHandler *) NULL, tokenhandler2, url)));
+  OpAutoPtr<XMLParser> datainparser_owner(datainparser);
+
+  verify (datainparser->Parse (input.GetStorage (), input.Length (), FALSE) == OpStatus::OK);
+  verify (datainparser->IsFinished ());
+  verify (callback.called);
+  verify (callback.element);
+
+  StripWhitespace (state.doc->GetLogicalDocument (), stylesheet, callback.element);
+
+  XSLT_Stylesheet::Transformation* transform_in_progress;
+  XSLT_Stylesheet::Input transform_input;
+  XSLT_Stylesheet::OutputSpecification::Method output_method = output_spec->method;
+  XSLT_Stylesheet::OutputForm outputform = output_method == XSLT_Stylesheet::OutputSpecification::METHOD_UNKNOWN ? XSLT_Stylesheet::OUTPUT_DELAYED_DECISION : XSLT_Stylesheet::OUTPUT_STRINGDATA;
+
+  verify (OpStatus::IsSuccess (state.doc->GetLogicalDocument ()->CreateXMLTreeAccessor(transform_input.tree, transform_input.node, callback.element)));
+
+  LogdocTreeAccessorOwner tree_owner(transform_input.tree);
+
+  verify (OpStatus::IsSuccess (stylesheet->StartTransformation(transform_in_progress, transform_input, outputform)));
+
+  XSLT_StylesheetTransformation_Callback transform_callback;
+  transform_in_progress->SetCallback (&transform_callback);
+
+  TestStringDataCollector result;
+
+  if (output_method != XSLT_Stylesheet::OutputSpecification::METHOD_UNKNOWN)
+    transform_in_progress->SetStringDataCollector (&result, FALSE);
+
+  XSLT_Stylesheet::Transformation::Status transform_status;
+
+  do
+    {
+      transform_status = transform_in_progress->Transform();
+
+      if (transform_status == XSLT_Stylesheet::Transformation::TRANSFORM_NEEDS_OUTPUTHANDLER)
+        {
+          output_method = transform_in_progress->GetOutputMethod ();
+
+          transform_in_progress->SetDelayedOutputForm (XSLT_Stylesheet::OUTPUT_STRINGDATA);
+          transform_in_progress->SetStringDataCollector (&result, FALSE);
+
+          transform_status = XSLT_Stylesheet::Transformation::TRANSFORM_PAUSED;
+        }
+    }
+  while (transform_status == XSLT_Stylesheet::Transformation::TRANSFORM_PAUSED);
+
+  verify (transform_status == XSLT_Stylesheet::Transformation::TRANSFORM_FINISHED);
+  verify (OpStatus::IsSuccess (XSLT_Stylesheet::StopTransformation (transform_in_progress)));
+
+  transform_in_progress = NULL;
+
+  BOOL trimmed_whitespace;
+
+  if (output_method == XSLT_Stylesheet::OutputSpecification::METHOD_XML)
+    {
+      TrimTrailingWhitespace (result);
+      TrimTrailingWhitespace (expected_output);
+
+      trimmed_whitespace = TRUE;
+    }
+  else
+    trimmed_whitespace = FALSE;
+
+  const uni_char* expected = expected_output.GetStorage ();
+  if (!expected)
+    expected = UNI_L("");
+  const uni_char* produced = result.GetResult();
+  if (!produced)
+    produced = UNI_L("");
+
+  BOOL equal;
+  if (op_strstr(inputname8, "whitespace")) // Strict comparision
+    equal = is_equal_ignoring_linebreaks(expected, produced);
+  else
+    {
+      if (!op_strstr(inputname8, "output"))
+        adjust_for_optional_xml_declaration(expected, produced);
+      equal = is_equal_ignoring_missing_whitespace(expected, produced);
+    }
+
+  if (!equal)
+    {
+      OpString8 errormessage;
+      // if generate_diff_error_message returns FALSE, it was no error after all
+      verify(!generate_diff_error_message(expected, produced, errormessage),
+             errormessage.CStr());
+    }
+
+  // Run a second transform and make sure the result is the same
+  verify (OpStatus::IsSuccess (stylesheet->StartTransformation (transform_in_progress, transform_input, XSLT_Stylesheet::OUTPUT_STRINGDATA)));
+
+  transform_in_progress->SetCallback (&transform_callback);
+
+  TestStringDataCollector second_result;
+  transform_in_progress->SetStringDataCollector(&second_result, FALSE);
+
+  while ((transform_status = transform_in_progress->Transform()) == XSLT_Stylesheet::Transformation::TRANSFORM_PAUSED)
+    {}
+
+  verify (transform_status == XSLT_Stylesheet::Transformation::TRANSFORM_FINISHED);
+  verify (OpStatus::IsSuccess (XSLT_Stylesheet::StopTransformation(transform_in_progress)));
+
+  if (trimmed_whitespace)
+    TrimTrailingWhitespace (second_result);
+
+  if (result.GetResult ())
+    {
+      verify (second_result.GetResult ());
+      verify (uni_str_eq (result.GetResult (), second_result.GetResult()));
+    }
+  else
+    verify (!second_result.GetResult ());
+}

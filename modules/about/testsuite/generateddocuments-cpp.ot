@@ -1,0 +1,854 @@
+/* -*- Mode: c++; tab-width: 4; indent-tabs-mode: t; c-basic-offset: 4 -*-
+**
+** Copyright (C) 2006-2012 Opera Software ASA.  All rights reserved.
+**
+** This file is part of the Opera web browser.  It may not be distributed
+** under any circumstances.
+**
+** Peter Krefting
+*/
+
+group "about.generateddocuments.c++";
+require init;
+
+language c++;
+
+include "modules/url/url_api.h";
+include "modules/doc/frm_doc.h";
+include "modules/dochand/docman.h";
+include "modules/logdoc/logdoc.h";
+include "modules/xmlutils/xmlparser.h";
+include "modules/xmlutils/xmltokenhandler.h";
+include "modules/pi/system/OpLowLevelFile.h";
+include "modules/prefs/prefsmanager/collections/pc_network.h";
+include "modules/locale/locale-enum.h";
+
+include "modules/about/opblockedurlpage.h";
+include "modules/about/opclickjackingblock.h";
+include "modules/about/opcrossnetworkerror.h";
+include "modules/about/opgenerateddocument.h";
+include "modules/about/operaabout.h";
+include "modules/about/operablank.h";
+include "modules/about/operablanker.h";
+include "modules/about/operacache.h";
+include "modules/about/operacpu.h";
+include "modules/about/operadebugnet.h";
+include "modules/about/operadrives.h";
+include "modules/about/operafeeds.h";
+include "modules/about/operafraudwarning.h";
+include "modules/about/operahistory.h";
+include "modules/about/operahistorysearch.h";
+include "modules/about/operaperformance.h";
+include "modules/about/operaplugins.h";
+include "modules/about/operawebstorage.h";
+include "modules/about/operrorpage.h";
+include "modules/about/opfolderlisting.h";
+include "modules/about/opillegalhostpage.h";
+include "modules/about/oppageinfo.h";
+include "modules/about/opprivacymode.h";
+include "modules/about/opredirectpage.h";
+include "modules/about/opsuppressedurl.h";
+include "modules/about/opxmlerrorpage.h";
+
+// -- Class used for framework testing -----------------------------------
+
+global
+{
+#ifdef OPGENERATEDDOCUMENT_H
+	class SelfTestDocument
+		: public OpGeneratedDocument
+	{
+	public:
+		SelfTestDocument(URL url)
+			: OpGeneratedDocument(url, HTML5)
+			{}
+
+		virtual OP_STATUS GenerateData()
+		{
+			if (IsXML())
+				return OpStatus::ERR;
+			RETURN_IF_ERROR(OpenDocument(UNI_L("SelfTest"), UNI_L("http://example.org/"), FALSE));
+			RETURN_IF_ERROR(OpenBody(Str::S_GENERATED_BY_OPERA, UNI_L("selftest")));
+			RETURN_IF_ERROR(GeneratedByOpera());
+			return CloseDocument();
+		}
+	};
+#endif
+
+	class SelftestTokenHandler
+		: public XMLTokenHandler
+	{
+		virtual Result HandleToken(XMLToken & /* token */)
+		{
+			return RESULT_OK;
+		}
+	};
+}
+
+// -- A document to use for testing --------------------------------------
+
+html {
+	//!<html>
+	//! <head>
+	//!  <title>Testing the about module</title>
+	//! </head>
+	//! <body>
+	//!  <iframe src="http://www.opera.com/"></iframe>
+	//!  <img src="http://www.opera.com/img/operalogo.gif">
+	//! </body>
+	//!</html>
+}
+
+// -- Testing framework --------------------------------------------------
+
+subtest check_document(URL *tmp_url, const uni_char *extratext, const uni_char *notpresent, bool cachable, bool isxml)
+{
+	// Get the descriptor
+	URL_DataDescriptor * OP_MEMORY_VAR dd = tmp_url->GetDescriptor(NULL, FALSE, TRUE);
+	verify(dd);
+
+	// Extract the text
+	TempBuffer buffer;
+	BOOL more;
+	do
+	{
+		more = FALSE;
+		TRAPD(rc, dd->RetrieveDataL(more));
+		verify_success(rc);
+
+		// Save the actual text in a buffer
+		unsigned long bytesize = dd->GetBufSize();
+		verify_success(buffer.Append(reinterpret_cast<const uni_char *>(dd->GetBuffer()), UNICODE_DOWNSIZE(bytesize)));
+		dd->ConsumeData(bytesize);
+	} while (more);
+	verify_success(buffer.Append(static_cast<uni_char>('\0')));
+
+	// Skip BOM, if any
+	uni_char *p = buffer.GetStorage();
+	if (0xFEFF == *p)
+		++ p;
+	// output("\n======\n%s\n====== ", ST_down(p));
+
+	// Check that we have a DOCTYPE, and HTML, HEAD, TITLE and BODY elements.
+	if (isxml)
+	{
+		verify(uni_strstr(p, UNI_L("<?xml")) == p);
+		verify(uni_strstr(p, UNI_L("<!DOCTYPE")));
+	}
+	else
+	{
+		verify(uni_strstr(p, UNI_L("<!DOCTYPE")) == p);
+	}
+
+	verify(uni_strstr(p, UNI_L("<html dir")));
+	verify(uni_strstr(p, UNI_L("</html>")));
+
+	verify(uni_strstr(p, UNI_L("<head>")));
+	verify(uni_strstr(p, UNI_L("</head>")));
+
+	verify(uni_strstr(p, UNI_L("<title>")));
+	verify(uni_strstr(p, UNI_L("</title>")));
+
+	verify(uni_strstr(p, UNI_L("<body>")) || uni_strstr(p, UNI_L("<body id=")));
+	verify(uni_strstr(p, UNI_L("</body>")));
+
+	// Check for extra text we want to be sure is included
+	if (extratext)
+	{
+		verify(uni_strstr(p, extratext));
+	}
+	// And any extra text we want to be sure is not included
+	if (notpresent)
+	{
+		verify(!uni_strstr(p, notpresent));
+	}
+
+	// Check that document is cachable (or not)
+#ifndef RAMCACHE_ONLY
+	OpString cachefilename;
+	if (cachable)
+		verify(tmp_url->PrepareForViewing(TRUE, TRUE) == 0);
+	TRAPD(rc, tmp_url->GetAttributeL(URL::KFilePathName_L, cachefilename, TRUE));
+	verify_success(rc);
+#endif
+	if (cachable)
+	{
+		verify(!tmp_url->GetAttribute(URL::KCachePolicy_NoStore));
+#ifndef RAMCACHE_ONLY
+		if (g_pcnet->GetIntegerPref(PrefsCollectionNetwork::CacheToDisk))
+			verify(!cachefilename.IsEmpty());
+#endif
+	}
+	else
+	{
+		verify(tmp_url->GetAttribute(URL::KCachePolicy_NoStore));
+#ifndef RAMCACHE_ONLY
+		if (g_pcnet->GetIntegerPref(PrefsCollectionNetwork::CacheToDisk))
+			verify(cachefilename.IsEmpty());
+#endif
+	}
+}
+finally
+{
+	OP_DELETE(dd);
+}
+
+// -- Tests --------------------------------------------------------------
+
+test("OpGeneratedDocument framework")
+	require OPGENERATEDDOCUMENT_H;
+{
+	URL tmp_url = g_url_api->GetNewOperaURL();
+	SelfTestDocument page(tmp_url);
+	verify_success(page.GenerateData());
+	verify(check_document(&tmp_url, UNI_L("<title>SelfTest</title>"), NULL, false, false));
+}
+finally
+{
+	tmp_url.Unload();
+}
+
+test("OperaAbout")
+	require OPERA_URL_SUPPORT;
+{
+	URL tmp_url = g_url_api->GetNewOperaURL();
+	OperaAbout *page = OperaAbout::Create(tmp_url);
+	verify_success(page->GenerateData());
+	verify(check_document(&tmp_url, NULL, NULL, true, false));
+}
+finally
+{
+	OP_DELETE(page);
+	tmp_url.Unload();
+}
+
+test("OperaBlank")
+	require HAS_OPERABLANK;
+{
+	URL_DataDescriptor *dd = NULL;
+	URL tmp_url = g_url_api->GetNewOperaURL();
+	OperaBlank page(tmp_url);
+	verify_success(page.GenerateData());
+	dd = tmp_url.GetDescriptor(NULL, FALSE, TRUE);
+	// about:blank is an empty resource which can be represented either with no URL_DataDescriptor
+	// or with an empty URL_DataDescriptor.
+	if (dd)
+	{
+		BOOL more = FALSE;
+		TRAPD(rc, dd->RetrieveDataL(more));
+		verify_success(rc);
+		verify(!more);
+		unsigned long buffer_size = dd->GetBufSize();
+		verify(buffer_size == 0);
+	}
+}
+finally
+{
+	OP_DELETE(dd);
+	tmp_url.Unload();
+}
+
+test("OperaBlanker")
+	require SELFTEST;
+	require OPERA_URL_SUPPORT;
+{
+	URL_DataDescriptor *dd = NULL;
+
+	URL tmp_url = g_url_api->GetNewOperaURL();
+	OperaBlanker page(tmp_url);
+	verify_success(page.GenerateData());
+
+	// opera:blanker is an empty resource which can be represented either with no URL_DataDescriptor
+	// or with an empty URL_DataDescriptor.
+	dd = tmp_url.GetDescriptor(NULL, FALSE, TRUE);
+	if (dd)
+	{
+		BOOL more = FALSE;
+		TRAPD(rc, dd->RetrieveDataL(more));
+		verify_success(rc);
+		verify(!more);
+		verify(dd->GetBufSize() == 0);
+	}
+}
+finally
+{
+	tmp_url.Unload();
+	OP_DELETE(dd);
+}
+
+test("OperaCache")
+	require OPERA_URL_SUPPORT;
+	require ABOUT_OPERA_CACHE;
+{
+	URL tmp_url = g_url_api->GetNewOperaURL();
+	OperaCache page(tmp_url);
+	verify_success(page.GenerateData());
+	verify(check_document(&tmp_url, NULL, NULL, true, false));
+}
+finally
+{
+	tmp_url.Unload();
+}
+
+test("OperaCPU")
+	require CPUUSAGETRACKING;
+	require OPERA_URL_SUPPORT;
+{
+	URL tmp_url = g_url_api->GetNewOperaURL();
+	OperaCPU page(tmp_url);
+	verify_success(page.GenerateData());
+	verify(check_document(&tmp_url, NULL, NULL, true, false));
+}
+finally
+{
+	tmp_url.Unload();
+}
+
+test("OperaDrives")
+	require SYS_CAP_FILESYSTEM_HAS_MULTIPLE_DRIVES;
+	require _LOCALHOST_SUPPORT_;
+	require OPERA_URL_SUPPORT;
+{
+	URL tmp_url = g_url_api->GetNewOperaURL();
+	OperaDrives page(tmp_url);
+	verify_success(page.GenerateData());
+	verify(check_document(&tmp_url, NULL, NULL, true, false));
+}
+finally
+{
+	tmp_url.Unload();
+}
+
+test("OperaFeeds")
+	require WEBFEEDS_DISPLAY_SUPPORT;
+	require _LOCALHOST_SUPPORT_;
+{
+	URL tmp_url = g_url_api->GetNewOperaURL();
+	OperaFeeds page(tmp_url);
+	verify_success(page.GenerateData());
+	verify(check_document(&tmp_url, UNI_L("feedEntries"), NULL, true, true));
+}
+finally
+{
+	tmp_url.Unload();
+}
+
+test("OperaFraudWarning")
+	require TRUST_RATING;
+	require OPERA_URL_SUPPORT;
+{
+	URL tmp_url = g_url_api->GetNewOperaURL();
+	URL bad_url = g_url_api->GetURL("http://evil.site/");
+	OperaFraudWarning page(tmp_url, bad_url);
+	verify_success(page.GenerateData());
+	verify(check_document(&tmp_url, UNI_L("http://evil.site/"), NULL, true, false));
+}
+finally
+{
+	tmp_url.Unload();
+}
+
+test("OperaHistory")
+	require HISTORY_SUPPORT;
+	require OPERA_URL_SUPPORT;
+{
+	URL tmp_url = g_url_api->GetNewOperaURL();
+	OperaHistory page(tmp_url);
+	verify_success(page.GenerateData());
+	verify(check_document(&tmp_url, NULL, NULL, true, false));
+}
+finally
+{
+	tmp_url.Unload();
+}
+
+test("OperaHistorySearch")
+	require OPERAHISTORYSEARCH_URL;
+{
+	URL tmp_url = g_url_api->GetNewOperaURL();
+	OperaHistorySearch *page = OperaHistorySearch::Create(tmp_url);
+	verify(page);
+	verify_success(page->GenerateData());
+	verify(check_document(&tmp_url, NULL, NULL, true, false));
+}
+finally
+{
+	tmp_url.Unload();
+	OP_DELETE(page);
+}
+
+test("OperaPlugins")
+	require _PLUGIN_SUPPORT_;
+	require OPERA_URL_SUPPORT;
+{
+	URL tmp_url = g_url_api->GetNewOperaURL();
+	OperaPlugins page(tmp_url);
+	verify_success(page.GenerateData());
+	verify(check_document(&tmp_url, NULL, NULL, true, false));
+}
+finally
+{
+	tmp_url.Unload();
+}
+
+test("OpErrorPage")
+	require ERROR_PAGE_SUPPORT;
+{
+	const OpStringC errormsg(UNI_L("Custom Error Message Goes Here\n"));
+	URL tmp_url = g_url_api->GetNewOperaURL();
+	OpErrorPage *page;
+	URL ref_url;
+	verify_success(OpErrorPage::Create(&page, tmp_url, Str::NOT_A_STRING, &ref_url, errormsg, TRUE, NULL));
+	verify_success(page->GenerateData());
+	verify(check_document(&tmp_url, UNI_L("<p>Custom Error Message Goes Here</p>"), NULL, false, false));
+	verify(check_document(&tmp_url, UNI_L("<h1>"), NULL, false, false));
+
+#ifdef AB_ERROR_SEARCH_FORM
+	OpString formatted_search_key;
+	verify_success(formatted_search_key.Set("file://localhost/"));
+	verify_success(page->PreprocessUrl(formatted_search_key));
+	verify(formatted_search_key.IsEmpty());
+	verify_success(formatted_search_key.Set("http://www.opera.com"));
+	verify_success(page->PreprocessUrl(formatted_search_key));
+	verify_string(formatted_search_key, "http://www.opera.com");
+	verify_success(formatted_search_key.Set("http://u:p@f/g/h?q2"));
+	verify_success(page->PreprocessUrl(formatted_search_key));
+	verify_string(formatted_search_key, "http://u:*****@f/g/h?q2");
+#endif // AB_ERROR_SEARCH_FORM
+}
+finally
+{
+	tmp_url.Unload();
+	OP_DELETE(page);
+}
+
+test("OpFolderListing")
+{
+#if defined _LOCALHOST_SUPPORT_ || !defined NO_FTP_SUPPORT
+
+	URL tmp_url = g_url_api->GetNewOperaURL();
+	OpFolderListing page(tmp_url);
+	verify_success(page.GenerateData());
+#ifndef NO_FTP_SUPPORT
+	verify_success(page.WriteWelcomeMessage(UNI_L("Selftest")));
+#endif
+	time_t nowtime = op_time(NULL);
+	struct tm *nowtm = op_localtime(&nowtime);
+	verify_success(page.WriteEntry(UNI_L("foo"), UNI_L("foo.bar"), 0, OpFileInfo::FILE, 1024, nowtm));
+	verify_success(page.WriteEntry(UNI_L("foo"), UNI_L("foo.bar"), 0, OpFileInfo::DIRECTORY, 1024, nowtm));
+	verify_success(page.WriteEntry(UNI_L("foo"), UNI_L("foo.bar"), 0, OpFileInfo::SYMBOLIC_LINK, 1024, nowtm));
+	verify_success(page.EndFolderListing());
+
+	verify(check_document(&tmp_url, UNI_L("foo"), NULL, true, false));
+
+#endif
+}
+finally
+{
+#if defined _LOCALHOST_SUPPORT_ || !defined NO_FTP_SUPPORT
+	tmp_url.Unload();
+#endif
+}
+
+test("OpFolderListing: localhost")
+	require _LOCALHOST_SUPPORT_;
+{
+	// Set up directory path
+#ifdef SYS_CAP_FILESYSTEM_HAS_DRIVES
+	URL tmp_url = g_url_api->GetURL("file://localhost/C:/Users/All%20Users/Desktop/");
+#else
+	URL tmp_url = g_url_api->GetURL("file://localhost/home/Opera/.config/autostart/");
+#endif
+
+	// Create dummy folder lister
+	OpFolderListing page(tmp_url);
+	verify_success(page.GenerateData());
+	time_t nowtime = op_time(NULL);
+	struct tm *nowtm = op_localtime(&nowtime);
+	verify_success(page.WriteEntry(UNI_L("foo"), UNI_L("foo.bar"), 0, OpFileInfo::FILE, 1024, nowtm));
+	verify_success(page.WriteEntry(UNI_L("foo"), UNI_L("foo.bar"), 0, OpFileInfo::DIRECTORY, 1024, nowtm));
+	verify_success(page.WriteEntry(UNI_L("foo"), UNI_L("foo.bar"), 0, OpFileInfo::SYMBOLIC_LINK, 1024, nowtm));
+	verify_success(page.EndFolderListing());
+
+	// Check that we have the navigation paths
+#ifdef SYS_CAP_FILESYSTEM_HAS_DRIVES
+	verify(check_document(&tmp_url, UNI_L("href=\"file://localhost/C:/\">C:</a>/"), NULL, true, false));
+	verify(check_document(&tmp_url, UNI_L("href=\"file://localhost/C:/Users/\">Users</a>/"), NULL,  true, false));
+	verify(check_document(&tmp_url, UNI_L("href=\"file://localhost/C:/Users/All%20Users/\">All Users</a>/"), NULL, true, false));
+	verify(check_document(&tmp_url, UNI_L("href=\"file://localhost/C:/Users/All%20Users/Desktop/\">Desktop</a>/"), NULL, true, false));
+#else
+	verify(check_document(&tmp_url, UNI_L("href=\"file://localhost/\">/</a>"), NULL, true, false));
+	verify(check_document(&tmp_url, UNI_L("href=\"file://localhost/home/\">home</a>"), NULL, true, false));
+	verify(check_document(&tmp_url, UNI_L("href=\"file://localhost/home/Opera/\">Opera</a>"), NULL, true, false));
+	verify(check_document(&tmp_url, UNI_L("href=\"file://localhost/home/Opera/.config/\">.config</a>"), NULL, true, false));
+	verify(check_document(&tmp_url, UNI_L("href=\"file://localhost/home/Opera/.config/autostart/\">autostart</a>"), NULL, true, false));
+#endif
+}
+finally
+{
+	tmp_url.Unload();
+}
+
+test("OpFolderListing: ftp")
+	require FTP_SUPPORT;
+{
+	// Set up directory path
+	URL tmp_url = g_url_api->GetURL("ftp://ftp.opera.com/pub/opera/");
+
+	// Create dummy folder lister
+	OpFolderListing page(tmp_url);
+	verify_success(page.GenerateData());
+	time_t nowtime = op_time(NULL);
+	struct tm *nowtm = op_localtime(&nowtime);
+	verify_success(page.WriteEntry(UNI_L("foo"), UNI_L("foo.bar"), 0, OpFileInfo::FILE, 1024, nowtm));
+	verify_success(page.WriteEntry(UNI_L("foo"), UNI_L("foo.bar"), 0, OpFileInfo::DIRECTORY, 1024, nowtm));
+	verify_success(page.WriteEntry(UNI_L("foo"), UNI_L("foo.bar"), 0, OpFileInfo::SYMBOLIC_LINK, 1024, nowtm));
+	verify_success(page.EndFolderListing());
+
+	// Check that we have the navigation paths
+	verify(check_document(&tmp_url, UNI_L("href=\"ftp://ftp.opera.com/\""), NULL, true, false));
+	verify(check_document(&tmp_url, UNI_L("href=\"ftp://ftp.opera.com/pub/\""), NULL, true, false));
+	verify(check_document(&tmp_url, UNI_L("href=\"ftp://ftp.opera.com/pub/opera/\""), NULL, true, false));
+}
+finally
+{
+	tmp_url.Unload();
+}
+
+test("OpFolderListing: CORE-43698 link")
+	require _LOCALHOST_SUPPORT_;
+{
+	// Set up directory path
+#ifdef SYS_CAP_FILESYSTEM_HAS_DRIVES
+	URL tmp_url = g_url_api->GetURL("file://localhost/C:/Users/Opera/");
+#else
+	URL tmp_url = g_url_api->GetURL("file://localhost/home/Opera/");
+#endif
+
+	// Create dummy folder lister
+	OpFolderListing page(tmp_url);
+	verify_success(page.GenerateData());
+	time_t nowtime = op_time(NULL);
+	struct tm *nowtm = op_localtime(&nowtime);
+	verify_success(page.WriteEntry(UNI_L("X%E2%80%AEXX"), UNI_L("X\x202EXX"), 0, OpFileInfo::DIRECTORY, 1024, nowtm));
+	verify_success(page.EndFolderListing());
+
+	// Check that the file URL is escaped properly
+	verify(check_document(&tmp_url, UNI_L("href=\"X%E2%80%AEXX/\""), UNI_L("href=\"X\xFFFDXX/\""), true, false));
+	verify(check_document(&tmp_url, UNI_L(">X\xFFFDXX<"), UNI_L(">X%E2%80%AEXX<"), true, false));
+}
+finally
+{
+	tmp_url.Unload();
+}
+
+test("OpFolderListing: CORE-43698 title")
+	require _LOCALHOST_SUPPORT_;
+{
+	// Set up directory path
+#ifdef SYS_CAP_FILESYSTEM_HAS_DRIVES
+	URL tmp_url = g_url_api->GetURL("file://localhost/C:/Users/Opera/X%E2%80%AEXX");
+#else
+	URL tmp_url = g_url_api->GetURL("file://localhost/home/Opera/X%E2%80%AEXX");
+#endif
+
+	// Create dummy folder lister
+	OpFolderListing page(tmp_url);
+	verify_success(page.GenerateData());
+	time_t nowtime = op_time(NULL);
+	struct tm *nowtm = op_localtime(&nowtime);
+	verify_success(page.WriteEntry(UNI_L("PASS"), UNI_L("PASS"), 0, OpFileInfo::DIRECTORY, 1024, nowtm));
+	verify_success(page.EndFolderListing());
+
+	// Check that the file URL is escaped properly
+#ifdef SYS_CAP_FILESYSTEM_HAS_DRIVES
+	verify(check_document(&tmp_url, UNI_L("<title>C:/Users/Opera/X%E2%80%AEXX</title>"), UNI_L("<title>C:/Users/Opera/X\x202EXX</title>"), true, false));
+	verify(check_document(&tmp_url, UNI_L("href=\"file://localhost/C:/Users/Opera/X%E2%80%AEXX/\""), UNI_L("href=\"file://localhost/C:/Users/Opera/X\x202EXX/\""), true, false));
+#else
+	verify(check_document(&tmp_url, UNI_L("<title>/home/Opera/X%E2%80%AEXX</title>"), UNI_L("<title>/home/Opera/X\x202EXX</title>"), true, false));
+	verify(check_document(&tmp_url, UNI_L("href=\"file://localhost/home/Opera/X%E2%80%AEXX/\""), UNI_L("href=\"file://localhost/home/Opera/X\x202EXX/\""), true, false));
+#endif
+	verify(check_document(&tmp_url, UNI_L(">X%E2%80%AEXX<"), UNI_L(">X\x202EXX<"), true, false));
+}
+finally
+{
+	tmp_url.Unload();
+}
+
+
+test("OpIllegalHostPage")
+	require ERROR_PAGE_SUPPORT;
+{
+	URL tmp_url = g_url_api->GetNewOperaURL();
+	uni_char *s = OP_NEWA(uni_char, 4);
+	verify(s);
+	uni_strcpy(s, UNI_L("foo"));
+	OpIllegalHostPage page(tmp_url, s);
+	verify_success(page.GenerateData());
+	verify(check_document(&tmp_url, UNI_L("foo"), NULL, false, false));
+}
+finally
+{
+	tmp_url.Unload();
+	OP_DELETEA(s);
+}
+
+test("OpPageInfo")
+	require DOC_HAS_PAGE_INFO;
+{
+	URL tmp_url = g_url_api->GetNewOperaURL();
+	LogicalDocument logicaldoc(state.doc);
+	verify_success(logicaldoc.Init());
+
+	URL_InUse securl;
+	OpPageInfo page(tmp_url, state.doc, &logicaldoc, &securl);
+	verify_success(page.GenerateData());
+	verify(check_document(&tmp_url, UNI_L("Testing the about module"), NULL, true, false));
+
+#ifdef AB_USE_IMAGE_METADATA
+	for (size_t i = 0; i < IMAGE_METADATA_COUNT; ++i)
+	{
+		OpString s;
+		TRAPD(rc, g_languageManager->GetStringL(page.GetExifLocaleId(i), s));
+		verify_success(rc);
+		verify(s.HasContent());
+	}
+#endif // AB_USE_IMAGE_METADATA
+}
+finally
+{
+	tmp_url.Unload();
+}
+
+test("OpRedirectPage")
+{
+	URL tmp_url = g_url_api->GetNewOperaURL();
+	URL target_url = g_url_api->GetNewOperaURL();
+	OpRedirectPage page(tmp_url, &target_url);
+	verify_success(page.GenerateData());
+	verify(check_document(&tmp_url, NULL, NULL, true, false));
+}
+finally
+{
+	tmp_url.Unload();
+}
+
+test("OpSuppressedURL: download link")
+{
+	URL tmp_url = g_url_api->GetNewOperaURL();
+	URL target_url = g_url_api->GetNewOperaURL();
+	OpSuppressedURL page(tmp_url, target_url, TRUE);
+	verify_success(page.GenerateData());
+	verify(check_document(&tmp_url, NULL, NULL, true, false));
+}
+finally
+{
+	tmp_url.Unload();
+}
+
+test("OpSuppressedURL: MIME suppressed link")
+	require _MIME_SUPPORT_;
+{
+	URL tmp_url = g_url_api->GetNewOperaURL();
+	URL target_url = g_url_api->GetNewOperaURL();
+	OpSuppressedURL page(tmp_url, target_url, FALSE);
+	verify_success(page.GenerateData());
+	verify(check_document(&tmp_url, NULL, NULL, true, false));
+}
+finally
+{
+	tmp_url.Unload();
+}
+
+test("OpXmlErrorPage")
+{
+	XMLParser *parser = NULL;
+	SelftestTokenHandler *token_handler = OP_NEW(SelftestTokenHandler, ());
+	verify(token_handler);
+	verify_success(XMLParser::Make(parser, NULL, static_cast<MessageHandler *>(NULL), token_handler, URL()));
+	URL tmp_url = g_url_api->GetNewOperaURL();
+	OpXmlErrorPage page(tmp_url, parser);
+	verify_success(page.GenerateData());
+	verify(check_document(&tmp_url, NULL, NULL, false, false));
+}
+finally
+{
+	OP_DELETE(parser);
+	OP_DELETE(token_handler);
+}
+
+test("Sanitizing html code")
+{
+	OpString temp;
+
+	// empty string
+	temp.Set(UNI_L(""));
+	OpGeneratedDocument::StripHTMLTags(temp, temp.Length());
+	verify_string(temp, UNI_L(""));
+
+	// replacing BR with single space
+	temp.Set(UNI_L("foo<br>bar<br/>baz<br />"));
+	OpGeneratedDocument::StripHTMLTags(temp, temp.Length());
+	verify_string(temp, UNI_L("foo bar baz "));
+
+	// unwanted tag inside wanted
+	temp.Set(UNI_L("<a><h1>link1</h1></a>   foo"));
+	OpGeneratedDocument::StripHTMLTags(temp, temp.Length());
+	verify_string(temp, UNI_L("<a>link1</a>   foo"));
+
+	// closing brackets in attribute value
+	temp.Set(UNI_L("PA<a href=\"<\" foo=\">\" bar=\"><\">SS</a>"));
+	OpGeneratedDocument::StripHTMLTags(temp, temp.Length());
+	verify_string(temp, UNI_L("PA<a href=\"<\" foo=\">\" bar=\"><\">SS</a>"));
+
+	// sanitizing onevent attribute
+	temp.Set(UNI_L("I'm <a onclick=formatc>evil</a>"));
+	OpGeneratedDocument::StripHTMLTags(temp, temp.Length());
+	verify_string(temp, UNI_L("I'm <a xnclick=formatc>evil</a>"));
+
+	// misnested tags
+	temp.Set(UNI_L("foo<b>bar<a></b>foo</a><a>lin<b>k2</a></b>"));
+	OpGeneratedDocument::StripHTMLTags(temp, temp.Length());
+	verify_string(temp, UNI_L("foobar<a>foo</a><a>link2</a>"));
+
+	// different types of quotes, different tag case
+	temp.Set(UNI_L("foo<b>bar</b><a href=''>link1</a>,<A href=\"#\">link2</A>"));
+	OpGeneratedDocument::StripHTMLTags(temp, temp.Length());
+	verify_string(temp, UNI_L("foobar<a href=''>link1</a>,<A href=\"#\">link2</A>"));
+
+	// sanitizing javascript links
+	temp.Set(UNI_L("<a href=javascript:formatc>evil</a> <a href=\"javascript:formatc\">evil-w/quotes</a>"));
+	OpGeneratedDocument::StripHTMLTags(temp, temp.Length());
+	verify_string(temp, UNI_L("<a href=xavascript:formatc>evil</a> <a href=\"xavascript:formatc\">evil-w/quotes</a>"));
+}
+
+test("OpBlockedUrlPage")
+	require ERROR_PAGE_SUPPORT;
+	require URL_FILTER;
+{
+	URL tmp_url = g_url_api->GetNewOperaURL();
+	OpBlockedUrlPage document(tmp_url, NULL);
+	verify_success(document.GenerateData());
+	verify(check_document(&tmp_url, NULL, NULL, true, false));
+}
+finally
+{
+	tmp_url.Unload();
+}
+
+test("OpClickJackingBlock")
+{
+	URL tmp_url = g_url_api->GetNewOperaURL();
+	URL blocked_url = g_url_api->GetURL("http://block.site/");
+	OpClickJackingBlock document(tmp_url, blocked_url);
+	verify_success(document.GenerateData());
+	verify(check_document(&tmp_url, NULL, NULL, true, false));
+	verify(check_document(&tmp_url, UNI_L("<h2>http://block.site/</h2>"), NULL, true, false));
+}
+finally
+{
+	tmp_url.Unload();
+	blocked_url.Unload();
+}
+
+test("OpCrossNetworkError")
+	require ERROR_PAGE_SUPPORT;
+{
+	URL tmp_url = g_url_api->GetNewOperaURL();
+	URL blocked_url = g_url_api->GetURL("http://block.site/");
+	OpCrossNetworkError document(tmp_url, Str::S_MSG_CROSS_NETWORK_INTERNET_INTRANET, blocked_url);
+	verify_success(document.GenerateData());
+	verify(check_document(&tmp_url, NULL, NULL, true, false));
+	verify(check_document(&tmp_url, UNI_L("<h2>http://block.site/</h2>"), NULL, true, false));
+}
+finally
+{
+	tmp_url.Unload();
+	blocked_url.Unload();
+}
+
+test("OpGeneratedDocument AppendHTMLified")
+{
+	TempBuffer tmp_buf;
+	tmp_buf.Clear();
+	OpStringC s1(UNI_L("http://www.opera.com"));
+	verify_success(OpGeneratedDocument::AppendHTMLified(&tmp_buf, s1, s1.Length()));
+	verify_string(tmp_buf.GetStorage(), "http://www.opera.com");
+
+	tmp_buf.Clear();
+	OpStringC s2(UNI_L("<p>Paragraph</p>"));
+	verify_success(OpGeneratedDocument::AppendHTMLified(&tmp_buf, s2, s2.Length()));
+	verify_string(tmp_buf.GetStorage(), "&lt;p&gt;Paragraph&lt;/p&gt;");
+}
+finally
+{
+	tmp_buf.Clear();
+}
+
+test("OpIllegalHostPageURL_Generator")
+	require ERROR_PAGE_SUPPORT;
+{
+	URL tmp_url = g_url_api->GetNewOperaURL();
+	OpIllegalHostPageURL_Generator document;
+	verify_success(document.QuickGenerate(tmp_url, NULL));
+	verify(check_document(&tmp_url, NULL, NULL, false, false));
+}
+finally
+{
+	tmp_url.Unload();
+}
+
+test("OpPrivacyModePage")
+	require ABOUT_PRIVATE_BROWSING;
+{
+	URL tmp_url = g_url_api->GetNewOperaURL();
+	OpPrivacyModePage document(tmp_url, TRUE);
+	verify_success(document.GenerateData());
+	verify(check_document(&tmp_url, NULL, NULL, true, false));
+}
+finally
+{
+	tmp_url.Unload();
+}
+
+test("OperaDebugNet")
+	require OPERA_URL_SUPPORT;
+	require _OPERA_DEBUG_DOC_;
+{
+	URL tmp_url = g_url_api->GetNewOperaURL();
+	OperaDebugNet document(tmp_url);
+	verify_success(document.GenerateData());
+	verify(check_document(&tmp_url, NULL, NULL, true, false));
+}
+finally
+{
+	tmp_url.Unload();
+}
+
+test("OperaPerformance")
+	require OPERA_URL_SUPPORT;
+	require OPERA_PERFORMANCE;
+{
+	URL tmp_url = g_url_api->GetNewOperaURL();
+	OperaPerformance document(tmp_url);
+	verify_success(document.GenerateData());
+	verify(check_document(&tmp_url, NULL, NULL, true, false));
+}
+finally
+{
+	tmp_url.Unload();
+}
+
+test("OperaWebStorage")
+	require HAS_OPERA_WEBSTORAGE;
+	require DATABASE_STORAGE_SUPPORT;
+{
+	URL tmp_url = g_url_api->GetNewOperaURL();
+	OperaWebStorage document(tmp_url, OperaWebStorage::WEB_DATABASES);
+	verify_success(document.GenerateData());
+	verify(check_document(&tmp_url, NULL, NULL, true, false));
+}
+finally
+{
+	tmp_url.Unload();
+}

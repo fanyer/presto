@@ -1,0 +1,154 @@
+// -*- Mode: c++; tab-width: 4; indent-tabs-mode: t; c-basic-offset: 4 -*-
+group "libvega";
+
+require VEGA_SUPPORT;
+
+include "modules/util/opstring.h";
+include "modules/util/opfile/opfile.h";
+
+include "modules/libvega/vegarenderer.h";
+include "modules/libvega/vegapath.h";
+include "modules/libvega/vegatransform.h";
+
+include "modules/pi/OpBitmap.h";
+include "modules/img/decoderfactorypng.h";
+
+global
+{
+    int VEGA_MAX_RGBA_DIFF = 255;
+    // Somewhere between 15 and 40 dB difference
+    double VEGA_MAX_PSNR_DIFF = (15.0+3.0*VEGA_DEFAULT_QUALITY);
+    BOOL VEGA_GENERATE_REF = FALSE;
+    int psnr_limit = (int)op_pow(10., VEGA_MAX_PSNR_DIFF / 10.);
+}
+
+table png_files filelist "" name "*.png";
+
+foreach (FILE) from png_files
+{
+	/** FIXME: This will currently not test images and gradients. There might be some more stuff which is not tested. */
+	test("$(FILE)")
+	{
+		OpBitmap* bmp = 0;
+		VEGARenderer vega_renderer;
+		VEGAPath path, opath, dpath;
+		path.moveTo(VEGA_INTTOFIX(20),VEGA_INTTOFIX(20));
+		path.lineTo(VEGA_INTTOFIX(120),VEGA_INTTOFIX(120));
+		path.lineTo(VEGA_INTTOFIX(120),VEGA_INTTOFIX(20));
+		path.lineTo(VEGA_INTTOFIX(20),VEGA_INTTOFIX(120));
+		path.close(true);
+		path.setLineWidth(VEGA_INTTOFIX(20));
+		if (op_strstr(FILE, "miterjoin"))
+			path.setLineJoin(VEGA_LINEJOIN_MITER);
+		else if (op_strstr(FILE, "roundjoin"))
+			path.setLineJoin(VEGA_LINEJOIN_ROUND);
+		else
+			path.setLineJoin(VEGA_LINEJOIN_BEVEL);
+		path.setMiterLimit(VEGA_INTTOFIX(4));
+
+		if (op_strstr(FILE, "squarecap"))
+			path.setLineCap(VEGA_LINECAP_SQUARE);
+		else if (op_strstr(FILE, "roundcap"))
+			path.setLineCap(VEGA_LINECAP_ROUND);
+		else
+			path.setLineCap(VEGA_LINECAP_BUTT);
+
+		int width = 140;
+		int height = 140;
+		verify(OpStatus::IsSuccess(vega_renderer.Init(width, height)));
+
+		VEGA_FIX flatness = VEGA_FIXDIV2(VEGA_FIXDIV2(VEGA_FIXDIV2(VEGA_FIXDIV2(VEGA_INTTOFIX(1)))));
+		if (op_strstr(FILE, "dash"))
+		{
+			VEGA_FIX dash[2] = {VEGA_INTTOFIX(30), VEGA_INTTOFIX(30)};
+			verify(OpStatus::IsSuccess(path.createDash(&dpath, VEGA_INTTOFIX(5), 2, dash)));
+			verify(OpStatus::IsSuccess(dpath.createOutline(&opath, flatness, 0)));
+		}
+		else
+		{
+			verify(OpStatus::IsSuccess(path.createOutline(&opath, flatness, 0)));
+		}
+
+		if (op_strstr(FILE, "transform"))
+		{
+			VEGATransform trans, tmpt;
+			trans.loadTranslate(VEGA_INTTOFIX(50), VEGA_INTTOFIX(50));
+			tmpt.loadRotate(VEGA_INTTOFIX(45));
+			trans.multiply(tmpt);
+			tmpt.loadScale(VEGA_INTTOFIX(2), VEGA_INTTOFIX(2));
+			trans.multiply(tmpt);
+			tmpt.loadTranslate(VEGA_INTTOFIX(-50), VEGA_INTTOFIX(-50));
+			trans.multiply(tmpt);
+			opath.transform(&trans);
+		}
+
+		VEGARenderTarget* rt;
+		verify(OpStatus::IsSuccess(OpBitmap::Create(&bmp, width, height, FALSE, TRUE,0, 0, FALSE)));
+		vega_renderer.setColor(0xff000000);
+		verify(OpStatus::IsSuccess(vega_renderer.createBitmapRenderTarget(&rt, bmp)));
+		vega_renderer.setRenderTarget(rt);
+		vega_renderer.clear(0,0,width,height, 0xffffffff);
+		vega_renderer.fillPath(&opath);
+		vega_renderer.setRenderTarget(NULL);
+		VEGARenderTarget::Destroy(rt);
+
+		OP_STATUS status = DecoderFactoryPng::selftest_verify(FILE, bmp, 140, VEGA_MAX_RGBA_DIFF, psnr_limit, VEGA_GENERATE_REF);
+
+		if (OpStatus::IsError(status))
+		{
+		    OpString8 refimage_failed;
+		    refimage_failed.Set(FILE);
+		    refimage_failed.Insert(op_strlen(FILE) - 4, "_failed");
+		    DecoderFactoryPng::selftest_verify(refimage_failed.CStr(), bmp, 140, VEGA_MAX_RGBA_DIFF, psnr_limit, TRUE);
+		}
+
+		verify(OpStatus::IsSuccess(status));
+	}
+	finally
+	{
+		OP_DELETE(bmp);
+	}
+}
+
+test("format conversion")
+{
+	VEGASWBuffer buffer;
+	buffer.Create(2, 2);
+
+	UINT32 buf[4] = {
+		0x00000000, 0x00110000,
+		0x00002233, 0x44000055
+	};
+
+	VEGAPixelStore store;
+	store.buffer = buf;
+	store.format = VPSF_ARGB8888;
+	store.width = 2;
+	store.height = 2;
+	store.stride = store.width * 4;
+
+	buffer.CopyFromPixelStore(&store);
+
+	unsigned a, r, g, b;
+	unsigned a_ref, r_ref, g_ref, b_ref;
+
+	VEGAConstPixelAccessor accessor = buffer.GetConstAccessor(0, 0);
+	UINT8* buf8 = reinterpret_cast<UINT8*>(buf);
+	for (int i = 0; i < 4; i++)
+	{
+		a_ref = 0xa, r_ref = 0xa, g_ref = 0xa, b_ref = 0xa;
+		a = 0xa, r = 0xa, g = 0xa, b = 0xa;
+		VEGAFormatUnpack::ARGB8888_Unpack(buf8, a_ref, r_ref, g_ref, b_ref);
+		accessor.LoadUnpack(a, r, g, b);
+		verify(a_ref == a &&
+			   r_ref == r &&
+			   g_ref == g &&
+			   b_ref == b);
+		accessor++;
+		buf8 += 4;
+	}
+}
+finally
+{
+	buffer.Destroy();
+}

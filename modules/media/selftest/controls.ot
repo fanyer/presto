@@ -1,0 +1,357 @@
+/* -*- Mode: c++; tab-width: 4; indent-tabs-mode: t; c-basic-offset: 4; c-file-style: "stroustrup" -*-
+ *
+ * Copyright (C) 2009-2012 Opera Software ASA.  All rights reserved.
+ *
+ * This file is part of the Opera web browser.
+ * It may not be distributed under any circumstances.
+ */
+
+group "Media.Controls";
+
+require MEDIA_HTML_SUPPORT;
+
+include "modules/media/src/controls/mediaduration.h";
+include "modules/media/src/controls/mediafader.h";
+include "modules/media/src/controls/mediaslider.h";
+include "modules/media/src/controls/mediavolume.h";
+
+global
+{
+	class TestFaderListener : public FaderListener, public OpTimerListener
+	{
+	public:
+		TestFaderListener()
+			: m_pass_opacity(0),
+			  m_actual_opacity(UCHAR_MAX),
+			  m_pass_visibility(FALSE),
+			  m_actual_visibility(TRUE)
+		{
+			m_timeout.SetTimerListener(this);
+		}
+
+		void SetPassOpacity(UINT8 opacity)
+		{
+			m_pass_opacity = opacity;
+		}
+
+		void SetPassVisiblity(BOOL visible)
+		{
+			m_pass_visibility = visible;
+		}
+
+		void StartTest()
+		{
+			m_timeout.Start(1200);
+		}
+
+		/* virtual */
+		void OnOpacityChange(MediaControlsFader* fader, UINT8 opacity)
+		{
+			m_actual_opacity = opacity;
+		}
+
+		/* virtual */
+		void OnVisibilityChange(MediaControlsFader* fader, BOOL visible)
+		{
+			m_actual_visibility = visible;
+		}
+
+		/* virtual */
+		void OnTimeOut(OpTimer* timer)
+		{
+			if (m_pass_visibility != m_actual_visibility)
+			{
+				ST_failed ("Is %svisible, expected %svisible!", m_actual_visibility == TRUE ? "" : "not ",
+					m_pass_visibility ? "" : "not ");
+			}
+			else if (m_pass_opacity != m_actual_opacity)
+			{
+				ST_failed ("Has %d opacity, expected %d!", m_actual_opacity, m_pass_opacity);
+			}
+			else
+				ST_passed ();
+		}
+
+	private:
+		UINT8 m_pass_opacity, m_actual_opacity;
+		BOOL m_pass_visibility, m_actual_visibility;
+
+		OpTimer m_timeout;
+	};
+
+	TestFaderListener* m_test_fader_listener;
+	MediaControlsFader* m_fader;
+}
+
+setup
+{
+	m_test_fader_listener = OP_NEW (TestFaderListener, ());
+	m_fader = OP_NEW (MediaControlsFader, (m_test_fader_listener, 0, 200));
+}
+
+exit
+{
+	OP_DELETE (m_fader);
+	OP_DELETE (m_test_fader_listener);
+}
+
+table GenerateTimeString_Data (double, double, BOOL, const char*)
+{
+	{ 0,	0,		FALSE,	"0:00/0:00" },
+	{ 61,   3661,	FALSE,	"1:01/1:01:01" },
+	{ 61,   3661,	TRUE,	"0:00:00/0:00:00" },
+	{ 0,    600,	TRUE,	"00:00/00:00" },
+
+	{ 61,   op_nan(NULL),	FALSE,	"1:01" },
+	{ 61,   op_nan(NULL),	TRUE,	"0:00" }
+}
+
+test ("GenerateTimeString()") require undefined MEDIA_SIMPLE_CONTROLS;
+{
+	iterate (pos, duration, for_measure, res) from GenerateTimeString_Data
+	{
+		TempBuffer time_str;
+		verify_success(MediaTimeHelper::GenerateTimeString(time_str, pos, duration, for_measure));
+
+		if (!uni_str_eq(time_str.GetStorage(), ST_up(res)))
+		{
+			output ("Expected %s got %s\n", ST_down(res), ST_down(time_str.GetStorage()));
+			verify (FALSE);
+		}
+	}
+}
+
+/// Test visibility of audio controls with/without controls. CORE-23215.
+
+include "modules/layout/cascade.h";
+include "modules/style/src/css_values.h";
+
+html
+{
+	//! <audio />
+	//! <audio controls />
+}
+
+test ("Audio controls visibility")
+{
+	short res[] = { CSS_VALUE_none, CSS_VALUE_inline};
+
+	FramesDocument* doc = state.doc;
+	verify(doc != NULL);
+
+	HTML_Element* doc_root = doc->GetDocRoot();
+	verify(doc_root != NULL);
+
+	LogicalDocument* logdoc = state.doc->GetLogicalDocument();
+	verify(logdoc != NULL);
+
+	for (int i = 0; i < 2; i++)
+	{
+		HTML_Element* el = find_element("audio", i + 1);
+		verify (el != NULL);
+		Head props_list;
+		verify(LayoutProperties::CreateCascade(el, props_list, logdoc->GetHLDocProfile()));
+		LayoutProperties* lprops = (LayoutProperties*)props_list.Last();
+
+		short display_type = lprops->GetProps()->display_type;
+		props_list.Clear();
+		verify (display_type == res[i]);
+	}
+}
+
+/// Test fader functionality
+
+test ("Fader: fade in")
+	async;
+{
+	m_test_fader_listener->StartTest();
+
+	// Fade in
+	m_test_fader_listener->SetPassVisiblity(TRUE);
+	m_test_fader_listener->SetPassOpacity(200);
+
+	m_fader->FadeIn();
+}
+
+test ("Fader: fade out")
+	async;
+{
+	m_test_fader_listener->StartTest();
+
+	// Fade out
+	m_test_fader_listener->SetPassVisiblity(FALSE);
+	m_test_fader_listener->SetPassOpacity(0);
+
+	m_fader->FadeOut();
+}
+
+test ("Fader: delayed hide")
+	async;
+{
+	m_test_fader_listener->StartTest();
+
+	// Fade in
+	m_test_fader_listener->SetPassVisiblity(FALSE);
+	m_test_fader_listener->SetPassOpacity(0);
+
+	m_fader->DelayedHide();
+}
+
+subtest CalcRect(MediaSlider* slider, double start, double end, const OpRect& bounds, INT32 x, INT32 width)
+{
+	OpRect r = slider->DebugCalcRangeRect(bounds, start, end);
+
+	verify(r.x == x);
+	verify(r.y == bounds.y);
+	verify(r.width == width);
+	verify(r.height == bounds.height);
+}
+
+test ("MediaSlider: calculate ranges, basic")
+{
+	MediaSlider* slider;
+	verify_success(MediaSlider::Create(slider, MediaSlider::Progress));
+	OpAutoPtr<MediaSlider> anchor(slider);
+
+	slider->SetMinValue(0.0);
+	slider->SetMaxValue(12.0);
+
+	OpRect bounds(42, 0, 12, 1337);
+
+	for (UINT32 i = 0; i < 11; ++i)
+		verify(CalcRect(slider, i, i + 1, bounds, 42 + i, 1));
+}
+
+test ("MediaSlider: calculate ranges, zero slider")
+{
+	MediaSlider* slider;
+	verify_success(MediaSlider::Create(slider, MediaSlider::Progress));
+	OpAutoPtr<MediaSlider> anchor(slider);
+
+	slider->SetMinValue(100);
+	slider->SetMaxValue(100);
+
+	OpRect bounds(0, 0, 1000, 1337);
+	verify(slider->DebugCalcRangeRect(bounds, 0, 200).IsEmpty());
+}
+
+test ("MediaSlider: calculate ranges, negative minimum boundary")
+{
+	MediaSlider* slider;
+	verify_success(MediaSlider::Create(slider, MediaSlider::Progress));
+	OpAutoPtr<MediaSlider> anchor(slider);
+
+	slider->SetMinValue(-12.0);
+	slider->SetMaxValue(12.0);
+
+	OpRect bounds(0, 0, 48, 1337);
+
+	verify(CalcRect(slider, -12, -11, bounds, 0, 2));
+	verify(CalcRect(slider, -12, 0, bounds, 0, 24));
+	verify(CalcRect(slider, -12, 12, bounds, 0, 48));
+	verify(CalcRect(slider, -1, 1, bounds, 22, 4));
+	verify(CalcRect(slider, 2, 4, bounds, 28, 4));
+}
+
+test ("MediaSlider: calculate ranges, both boundaries negative")
+{
+	MediaSlider* slider;
+	verify_success(MediaSlider::Create(slider, MediaSlider::Progress));
+	OpAutoPtr<MediaSlider> anchor(slider);
+
+	slider->SetMinValue(-12.0);
+	slider->SetMaxValue(-6.0);
+
+	OpRect bounds(0, 0, 48, 1337);
+
+	verify(CalcRect(slider, -12, -11, bounds, 0, 8));
+	verify(CalcRect(slider, -12, -9, bounds, 0, 24));
+	verify(CalcRect(slider, -12, -6, bounds, 0, 48));
+	verify(CalcRect(slider, -9, -8, bounds, 24, 8));
+	verify(CalcRect(slider, -10, -6, bounds, 16, 32));
+	verify(CalcRect(slider, -6, -6, bounds, 48, 0));
+}
+
+test ("MediaSlider: calculate ranges, both boundaries positive")
+{
+	MediaSlider* slider;
+	verify_success(MediaSlider::Create(slider, MediaSlider::Progress));
+	OpAutoPtr<MediaSlider> anchor(slider);
+
+	slider->SetMinValue(12.0);
+	slider->SetMaxValue(24.0);
+
+	OpRect bounds(0, 42, 48, 1337);
+
+	verify(CalcRect(slider, 12, 13, bounds, 0, 4));
+	verify(CalcRect(slider, 12, 18, bounds, 0, 24));
+	verify(CalcRect(slider, 12, 24, bounds, 0, 48));
+	verify(CalcRect(slider, 16, 18, bounds, 16, 8));
+	verify(CalcRect(slider, 14, 24, bounds, 8, 40));
+	verify(CalcRect(slider, 24, 24, bounds, 48, 0));
+}
+
+test ("MediaSlider: one subpixel gap, two ranges")
+{
+	MediaSlider* slider;
+	verify_success(MediaSlider::Create(slider, MediaSlider::Progress));
+	OpAutoPtr<MediaSlider> anchor(slider);
+
+	slider->SetMinValue(0.0);
+	slider->SetMaxValue(10.0);
+
+	OpRect bounds(0, 42, 10, 42);
+
+	verify(CalcRect(slider, 0, 4.2, bounds, 0, 4));
+	verify(CalcRect(slider, 4.8, 10, bounds, 5, 5));
+}
+
+test ("MediaSlider: two subpixel gaps, one range")
+{
+	MediaSlider* slider;
+	verify_success(MediaSlider::Create(slider, MediaSlider::Progress));
+	OpAutoPtr<MediaSlider> anchor(slider);
+
+	slider->SetMinValue(0.0);
+	slider->SetMaxValue(10.0);
+
+	OpRect bounds(0, 42, 10, 42);
+
+	verify(CalcRect(slider, 0.2, 9.8, bounds, 1, 8));
+}
+
+test ("MediaSlider: lost subpixel range")
+{
+	MediaSlider* slider;
+	verify_success(MediaSlider::Create(slider, MediaSlider::Progress));
+	OpAutoPtr<MediaSlider> anchor(slider);
+
+	slider->SetMinValue(0.0);
+	slider->SetMaxValue(10.0);
+
+	OpRect bounds(0, 42, 10, 42);
+
+	verify(CalcRect(slider, 3.2, 3.8, bounds, 4, 0));
+}
+
+test ("MediaSlider: lost double-subpixel range")
+{
+	MediaSlider* slider;
+	verify_success(MediaSlider::Create(slider, MediaSlider::Progress));
+	OpAutoPtr<MediaSlider> anchor(slider);
+
+	slider->SetMinValue(0.0);
+	slider->SetMaxValue(10.0);
+
+	OpRect bounds(0, 42, 10, 42);
+
+	verify(CalcRect(slider, 3.2, 4.8, bounds, 4, 0));
+}
+
+test ("VolumeString")
+{
+	VolumeString vol;
+	verify(op_strcmp(vol.Get(0), "Media Volume 0") == 0);
+	verify(op_strcmp(vol.Get(50), "Media Volume 50") == 0);
+	verify(op_strcmp(vol.Get(100), "Media Volume 100") == 0);
+}

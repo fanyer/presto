@@ -1,0 +1,165 @@
+/*-*- Mode: c++; tab-width: 4; indent-tabs-mode: t; c-basic-offset: 4; c-file-style:"stroustrup" -*-
+**
+** Copyright (C) 2008 Opera Software ASA.  All rights reserved.
+**
+** This file is part of the Opera web browser.  It may not be distributed
+** under any circumstances.
+*/
+group "speeddial";
+require CORE_SPEED_DIAL_SUPPORT;
+
+include "modules/util/opstring.h";
+
+include "modules/bookmarks/bookmark_manager.h";
+include "modules/bookmarks/speeddial_manager.h";
+include "modules/bookmarks/speeddial.h";
+include "modules/bookmarks/speeddial_listener.h";
+include "modules/locale/oplanguagemanager.h";
+
+global
+{
+	class BookmarkTestListener : public BookmarkManagerListener,
+								 public OpSpeedDialListener
+	{
+	public:
+		BookmarkTestListener() : state(NoState) { }
+
+		virtual void OnBookmarksSaved(OP_STATUS ret, UINT32 operation_count)
+			{
+				if (OpStatus::IsSuccess(ret))
+				{
+					if (state == NoState)
+						state = Saved;
+					else if (state == SpeedDialChanged)
+					{
+						ST_passed();
+						state = NoState;
+					}
+					else if (state == SpeedDialRemoved)
+					{
+						ST_passed();
+						state = NoState;
+					}
+				}
+				else
+					ST_failed("Could not save bookmarks.\n");
+			}
+		virtual void OnBookmarksLoaded(OP_STATUS ret, UINT32 operation_count)
+			{
+			}
+#ifdef SUPPORT_DATA_SYNC
+		virtual void OnBookmarksSynced(OP_STATUS ret)
+			{
+			}
+#endif // SUPPORT_DATA_SYNC
+		virtual void OnBookmarkAdded(BookmarkItem *bookmark)
+			{
+			}
+		virtual OP_STATUS OnSpeedDialChanged(SpeedDial* speed_dial)
+			{
+				if (state == Saved)
+				{
+					ST_passed();
+					state = NoState;
+				}
+				else if (NoState)
+					state = SpeedDialChanged;
+				return OpStatus::OK;
+			}
+
+		virtual OP_STATUS OnSpeedDialRemoved(SpeedDial* speed_dial)
+			{
+				if (state == Saved)
+				{
+					state = NoState;
+					ST_passed();
+				}
+				else
+					state = SpeedDialRemoved;
+				return OpStatus::OK;
+			}
+	private:
+		enum State
+		{
+			SpeedDialChanged,
+			Saved,
+			SpeedDialRemoved,
+			NoState
+		};
+		int state;
+	};
+
+	BookmarkTestListener *listener;
+}
+
+setup
+{
+	listener = OP_NEW(BookmarkTestListener, ());
+}
+
+test("Setup")
+{
+	verify(listener);
+}
+
+test("Check speeddials")
+{
+	unsigned int i;
+	SpeedDial *speed_dial;
+	verify(g_speed_dial_manager);
+
+	for (i=0; i<9; i++)
+	{
+		speed_dial = g_speed_dial_manager->GetSpeedDial(i);
+		verify(speed_dial);
+		verify(speed_dial->IsEmpty());
+	}
+}
+
+test("Add speeddial")
+require success "Check speeddials";
+require success "Setup";
+async;
+{
+	g_bookmark_manager->RegisterBookmarkManagerListener(listener);
+	g_speed_dial_manager->AddSpeedDialListener(listener);
+	if (OpStatus::IsError(g_speed_dial_manager->SetSpeedDial(0, UNI_L("data:text/html,<title>ABCD</title>"))))
+		ST_failed("Could not set speeddial\n");
+	SpeedDial *speed_dial = g_speed_dial_manager->GetSpeedDial(0);
+	OpString url;
+	if (OpStatus::IsError(speed_dial->GetUrl(url)))
+		ST_failed("Could not get url\n");
+	if ((url.Compare("data:text/html,<title>ABCD</title>") != 0))
+		ST_failed("Url not correct\n");
+}
+
+test("Check title")
+require success "Add speeddial";
+{
+	SpeedDial *speed_dial = g_speed_dial_manager->GetSpeedDial(0);
+	verify(speed_dial);
+	OpString title;
+	verify(OpStatus::IsSuccess(speed_dial->GetTitle(title)));
+	verify(title.Compare("ABCD") == 0);
+}
+
+test("Delete speeddial")
+require success "Add speeddial";
+async;
+{
+	SpeedDial *speed_dial = g_speed_dial_manager->GetSpeedDial(0);
+	if (OpStatus::IsError(g_speed_dial_manager->SetSpeedDial(0, UNI_L(""))))
+		ST_failed("Could not set speeddial\n");
+	OpString url;
+	if (OpStatus::IsError(speed_dial->GetUrl(url)))
+		ST_failed("Could not get url\n");
+	if (!url.IsEmpty())
+		ST_failed("Url not empty\n");
+}
+
+exit
+{
+	g_bookmark_manager->UnregisterBookmarkManagerListener(listener);
+	g_speed_dial_manager->RemoveSpeedDialListener(listener);
+	OP_DELETE(listener);
+}

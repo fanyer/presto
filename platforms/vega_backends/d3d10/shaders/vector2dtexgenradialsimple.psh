@@ -1,0 +1,62 @@
+Texture2D tex1;
+Texture2D tex2;
+Texture2D tex3;
+
+SamplerState linearSampler1;
+SamplerState linearSampler2;
+SamplerState linearSampler3;
+
+cbuffer constants : register (b0)
+{
+	bool stencilComponentBased : packoffset (c0);
+	bool straightAlpha : packoffset (c1);
+	float uSrcY : packoffset(c2);
+	float3 uFocusPoint : packoffset (c3);
+	float3 uCenterPoint : packoffset (c4);
+};
+
+static const float3 lumfactors = float3(0.2125, 0.7154, 0.0721);
+
+float4 op_main(float4 pos : SV_POSITION, float4 diffuse : COLOR0, float2 texpos : TEXCOORD0, float2 texgenpos : TEXCOORD1, float2 texgenpos2 : TEXCOORD2) : SV_Target
+{
+	// see formula in modules/libvega/src/vegagradient.cpp
+	// as r0==0 we can skip many calculations containing the r-value, so we only
+	// need to deal with x and y here, as opposed to the general radial shader
+	float2 cd = uCenterPoint.xy - uFocusPoint.xy;
+	float2 pd = texpos - uFocusPoint.xy;
+
+	float offset;
+	float scale = tex3.Sample(linearSampler3, texgenpos2).a;
+
+	// This shader shouldn't be used if r0 != 0. Result undefined.
+	scale *= uFocusPoint.z < 0.001 ? 1.0 : 0.0;
+
+	float rr = uCenterPoint.z*uCenterPoint.z;
+	float pdp = dot(pd, pd);
+
+	if (uFocusPoint.x == uCenterPoint.x && uFocusPoint.y == uCenterPoint.y)
+	{
+		offset = sqrt(pdp/rr);
+	}
+	else
+	{
+		float ppc = pd.x*cd.y - pd.y*cd.x;
+		float pdc = dot(pd, cd);
+
+		offset = pdp / (pdc + sqrt(rr * pdp - ppc*ppc));
+	}
+
+	float4 stencil = tex2.Sample(linearSampler2, texgenpos);
+	if (stencilComponentBased)
+	{
+		float lum = dot(stencil.rgb, lumfactors);
+		stencil = float4(lum, lum, lum, lum);
+	}
+
+	// Same as "maskColor = straightAlpha ? 1.0 : scale", without conditional
+	float maskColor = max(float(straightAlpha), scale);
+	float4 mask = float4(maskColor, maskColor, maskColor, scale);
+
+	float4 color = tex1.Sample(linearSampler1, float2(offset, uSrcY))*stencil*mask*diffuse;
+	return color;
+}

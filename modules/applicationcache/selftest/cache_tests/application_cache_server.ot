@@ -1,0 +1,686 @@
+group "offline_app.update_algorithm"; // -*- Mode: c++; tab-width: 4; c-basic-offset: 4; -*-
+
+require init;
+language c++;
+
+include "core/pch.h";
+include "modules/security_manager/include/security_manager.h";
+include "modules/webserver/webserver-api.h";
+include "modules/webserver/webserver_resources.h";
+include "modules/webserver/webserver_request.h";
+include "modules/doc/frm_doc.h";
+include "modules/dochand/winman.h";
+include "modules/dom/domenvironment.h";
+
+// ARGH ARGH ARGH - this violates abstraction layers in a bad way. Very bad that nobody noticed before integration
+// All of this can be done without these includes but it requires rewriting a lot of code to use
+// public APIs in dom, ecmascript and ecmascript_utils. Since it's selftests and I don't have
+// time to do it, it will have to stay for now. But it was bad. We need to figure out how to
+// avoid similar errors in the future. argh.
+include "modules/dom/src/domenvironmentimpl.h";
+include "modules/dom/src/domhtml/htmlelem.h";
+include "modules/dom/src/domcore/domdoc.h";
+include "modules/dom/src/domobj.h";
+include "modules/dom/src/js/window.h";
+include "modules/dom/src/domwebserver/domwebserver.h";
+// END ARGH ARGH ARGH
+
+include "modules/viewers/viewers.h";
+include "modules/prefs/prefsmanager/collections/pc_js.h";
+include "modules/prefs/prefsmanager/collections/pc_core.h";
+include "modules/applicationcache/application_cache_manager.h";
+include "modules/applicationcache/selftest/cache_tests/self_test_storage.h";
+include "modules/windowcommander/src/WindowCommander.h";
+include "modules/windowcommander/src/WindowCommanderManager.h";
+include "modules/prefs/prefsmanager/collections/pc_network.h";
+include "modules/prefs/prefsmanager/collections/pc_webserver.h";
+
+/* This is a test system from application cache using javascript. The tests are in html files which
+ * are read up from "modules/applicationcache/selftest/cache_tests/data/public_html/tests/testindex.txt"
+ * Tests can be added here without recompile.
+ *
+ * Please read documentation in testindex.txt
+ *
+ * The format for testindex.txt is as follows:
+ * <test file>,<number of times to load the file>
+ *
+ * example:
+ * test.html,3
+ * test2.html,0
+ * test3.html
+ *
+ * This system set up a unite server which will publish the folder
+ * "modules/applicationcache/selftest/cache_tests/data/public_html" on the url path
+ * "http://localhost:port/applicationcache" where port normally is 8840. The unite server runs
+ * in the selftest html window opened up by selftest.
+ *
+ * We have loosen the security restrictions using OpSecurityManager::PrivilegedBlock
+ *
+ * Since the tests are run using window.open, the test windows have direct access
+ * to the webserver interface through 'window.opener.opera.io.webserver'. Thus the browser client
+ * can control the webserver directly in addition to performing normal http requests to the same server.
+ *
+ * If test windows add resources to the webserver, this should be done in the <body onload="setup();">, since
+ * since setup() are guaranteed to be run before the html document is parsed. Thus, the server will be ready
+ * to respond to requests, when the page starts loading.
+ *
+ * There is a timeout of 10 seconds, in case loading the test fails. The timeout can be extended by setting
+ * calling window.opener.resetTimeout(milliseconds);
+ *
+ * Success or failure is signaled back to the test system using  window.opener.verifyTest(window, success,reason_for_failure),
+ * where window is the window object in the test, success is a boolean and reason_for_failure is a text string
+ *
+ *
+ */
+
+require init;
+require WEBSERVER_SUPPORT;
+require APPLICATION_CACHE_SUPPORT;
+
+table tests_data filelist "data" name "*" recursively;
+
+html
+{
+//! <html><body> This window runs the webserver service http://localhost:port/applicationcache where port is typically 8840</html>
+}
+
+global
+{
+	int a;
+	OpSecurityManager::PrivilegedBlock g_webserver_privileged_block;
+	OpString g_public_html_directory;
+	DOM_Object *g_window;
+	WebSubServer *g_subserver;
+
+	const uni_char *g_service_name;
+	OpString g_service_url;
+
+	class ServerControl
+	{
+	public:
+		static int PauseWebserver(DOM_Object* this_object, ES_Value* argv, int argc, ES_Value* return_value, DOM_Runtime* origining_runtime)
+		{
+			OP_ASSERT(g_application_cache_ui_listener);
+			if (g_application_cache_ui_listener)
+			{
+				WebSubServer *subserver = g_webserver->WindowHasWebserverAssociation(g_application_cache_ui_listener->GetCurrentWindowId());
+
+				if (subserver)
+					g_webserver->CloseAllConnections();
+
+				if (g_webserver->GetCurrentMode() != WEBSERVER_LISTEN_NONE)
+				{
+					CALL_FAILED_IF_ERROR(g_webserver->ChangeListeningMode(WEBSERVER_LISTEN_NONE));
+				}
+			}
+			return ES_FAILED;
+		}
+
+		static int WakeupWebserver(DOM_Object* this_object, ES_Value* argv, int argc, ES_Value* return_value, DOM_Runtime* origining_runtime)
+		{
+			if ((g_webserver->GetCurrentMode() & WEBSERVER_LISTEN_DIRECT) == 0)
+			{
+				CALL_FAILED_IF_ERROR(g_webserver->ChangeListeningMode(WEBSERVER_LISTEN_DIRECT));
+			}
+			return ES_FAILED;
+		}
+
+		/* return TRUE if listening */
+		static int CheckServerStatus(DOM_Object* this_object, ES_Value* argv, int argc, ES_Value* return_value, DOM_Runtime* origining_runtime)
+		{
+			if (g_webserver->GetCurrentMode() & WEBSERVER_LISTEN_DIRECT)
+				DOM_Object::DOMSetBoolean(return_value, TRUE);
+			else
+				DOM_Object::DOMSetBoolean(return_value, FALSE);
+
+			return ES_VALUE;
+		}
+
+	};
+
+	class ApplicationCacheControl
+	{
+	public:
+
+		/* input: bool answer true/false */
+		static int setAnswerUICallbacks(DOM_Object* this_object, ES_Value* argv, int argc, ES_Value* return_value, DOM_Runtime* origining_runtime)
+		{
+			DOM_CHECK_ARGUMENTS("b");
+			g_application_cache_manager->SetSendUIEvents(argv[0].value.boolean);
+
+			DOM_EnvironmentImpl* environment = origining_runtime->GetEnvironment();
+			FramesDocument *frames_doc = environment->GetFramesDocument();
+
+			Window *window = frames_doc ? frames_doc->GetWindow() : NULL;
+			WindowCommander *window_commander = window ? window->GetWindowCommander() : NULL;
+
+			window_commander->SetApplicationCacheListener(g_application_cache_ui_listener);
+			return ES_FAILED;
+		}
+
+		static int setMaxQuotaPreference(DOM_Object* this_object, ES_Value* argv, int argc, ES_Value* return_value, DOM_Runtime* origining_runtime)
+		{
+			DOM_CHECK_ARGUMENTS("n");
+			TRAPD(err, g_pccore->WriteIntegerL(PrefsCollectionCore::DefaultApplicationCacheQuota, static_cast<int>(argv[0].value.number)));
+
+			CALL_FAILED_IF_ERROR(err);
+			return ES_FAILED;
+		}
+
+		static int onDownloadAppCacheReply(DOM_Object* this_object, ES_Value* argv, int argc, ES_Value* return_value, DOM_Runtime* origining_runtime)
+		{
+			DOM_CHECK_ARGUMENTS("nb");
+
+			g_application_cache_ui_listener->OnDownloadAppCacheReply(static_cast<UINT32>(argv[0].value.number), argv[1].value.boolean);
+
+			return ES_FAILED;
+		}
+
+		static int onCheckForNewAppCacheVersionReply(DOM_Object* this_object, ES_Value* argv, int argc, ES_Value* return_value, DOM_Runtime* origining_runtime)
+		{
+			DOM_CHECK_ARGUMENTS("nb");
+
+			g_application_cache_ui_listener->OnCheckForNewAppCacheVersionReply(static_cast<UINT32>(argv[0].value.number), argv[1].value.boolean);
+
+			return ES_FAILED;
+		}
+
+		static int onDownloadNewAppCacheVersionReply(DOM_Object* this_object, ES_Value* argv, int argc, ES_Value* return_value, DOM_Runtime* origining_runtime)
+		{
+			DOM_CHECK_ARGUMENTS("nb");
+
+			g_application_cache_ui_listener->OnDownloadNewAppCacheVersionReply(static_cast<UINT32>(argv[0].value.number), argv[1].value.boolean);
+
+			return ES_FAILED;
+		}
+
+		static int onQuotaReply(DOM_Object* this_object, ES_Value* argv, int argc, ES_Value* return_value, DOM_Runtime* origining_runtime)
+		{
+			DOM_CHECK_ARGUMENTS("nbn");
+
+			g_application_cache_ui_listener->OnQuotaReply(static_cast<UINT32>(argv[0].value.number), argv[1].value.boolean, static_cast<UINT32>(argv[2].value.number));
+
+			return ES_FAILED;
+		}
+
+		static int resetApplicationCacheUICallbacks(DOM_Object* this_object, ES_Value* argv, int argc, ES_Value* return_value, DOM_Runtime* origining_runtime)
+		{
+			g_application_cache_manager->SetSendUIEvents(FALSE);
+			if (g_application_cache_ui_listener)
+			{
+				g_application_cache_ui_listener->m_pending_install_callbacks.DeleteAll();
+				g_application_cache_ui_listener->m_pending_quota_callbacks.DeleteAll();
+
+				if (DOM_EnvironmentImpl* environment = origining_runtime->GetEnvironment())
+					if (FramesDocument *frames_doc = environment->GetFramesDocument())
+						frames_doc->GetWindow()->GetWindowCommander()->SetApplicationCacheListener(NULL);
+			}
+			return ES_FAILED;
+		}
+	};
+}
+
+exit
+{
+	// Clean up changes in preferences
+	TRAPD(err, g_pcjs->ResetIntegerL(PrefsCollectionJS::IgnoreUnrequestedPopups));
+
+	TRAP(err, g_pcnet->ResetIntegerL(PrefsCollectionNetwork::OfflineMode));
+	TRAP(err, g_pcnet->ResetIntegerL(PrefsCollectionNetwork::DocExpiry));
+	TRAP(err, g_pcnet->ResetIntegerL(PrefsCollectionNetwork::OtherExpiry));
+	TRAP(err, g_pcnet->ResetIntegerL(PrefsCollectionNetwork::FigsExpiry));
+	TRAP(err, g_prefsManager->CommitL());
+
+	RAISE_AND_RETURN_VOID_IF_ERROR(err);
+
+	// Webserver might have been destroyed already if closing Opera while tests are running.
+	if (g_webserver)
+	{
+		g_webserver->Stop();
+
+	}
+
+	OP_DELETE(g_application_cache_ui_listener);
+
+	// Reset the API listener
+	if (g_application_cache_manager)
+		g_application_cache_manager->SetSendUIEvents(TRUE);
+}
+
+setup
+{
+	if (!g_application_cache_manager)
+		return OpStatus::ERR;
+
+	// Replace the API's listener while performing selftest, so that we can test
+	// that we send the correct events
+	g_application_cache_manager->DeleteAllApplicationCacheGroups();
+
+	RETURN_IF_LEAVE(g_pcjs->WriteIntegerL(PrefsCollectionJS::IgnoreUnrequestedPopups, FALSE));
+
+	RETURN_IF_LEAVE(g_pcnet->WriteIntegerL(PrefsCollectionNetwork::OfflineMode, FALSE));
+	RETURN_IF_LEAVE(g_pcnet->WriteIntegerL(PrefsCollectionNetwork::DocExpiry, 0));
+	RETURN_IF_LEAVE(g_pcnet->WriteIntegerL(PrefsCollectionNetwork::OtherExpiry, 0));
+	RETURN_IF_LEAVE(g_pcnet->WriteIntegerL(PrefsCollectionNetwork::FigsExpiry, 0));
+
+	Viewer* viewer = g_viewers->FindViewerByMimeType(UNI_L("text/cache-manifest"));
+
+	if (!viewer)
+	{
+		viewer = OP_NEW(Viewer, ());
+		if (!viewer)
+			return OpStatus::ERR_NO_MEMORY;
+
+		RETURN_IF_ERROR(viewer->Construct(VIEWER_OPERA, URL_MANIFEST_CONTENT, UNI_L("text/cache-manifest"), UNI_L("mst")));
+		if (OpStatus::IsError(g_viewers->AddViewer(viewer)))
+		{
+			OP_DELETE(viewer);
+			return OpStatus::ERR_NO_MEMORY;
+		}
+	}
+	else
+	{
+		RETURN_IF_ERROR(viewer->AddExtension(UNI_L("mst")));
+	}
+
+	RETURN_IF_ERROR(viewer->AddExtension(UNI_L("manifest")));
+
+	g_window = NULL;
+	g_subserver = 0;
+	OpString tmp_storage;
+	g_public_html_directory.Set(g_folder_manager->GetFolderPathIgnoreErrors(OPFILE_SELFTEST_DATA_FOLDER, tmp_storage));
+	g_public_html_directory.Append("modules/applicationcache/selftest/cache_tests/data/public_html");
+
+	g_service_name = UNI_L("applicationcache");
+}
+
+test("Init webserver")
+	language c++;
+{
+	if (!g_webserver->IsRunning())
+	{
+		if (OpStatus::IsError(g_webserver->Start(WEBSERVER_LISTEN_DIRECT, g_pcwebserver->GetIntegerPref(PrefsCollectionWebserver::WebserverPort))))
+			ST_failed("Server could not start");
+	}
+
+	verify(g_webserver->GetCurrentMode() & WEBSERVER_LISTEN_DIRECT);
+	verify(g_webserver->IsRunning());
+
+	g_service_url.Wipe();
+}
+
+test("Init services")
+	language c++;
+	require success "Init webserver";
+{
+	/* HTML_Element *find_element( uni_char *elem, int nelm=1 )
+		HTML_Element *find_element( char *elem, int nelm=1 )*/
+	g_service_url.AppendFormat(UNI_L("http://localhost:%d/%s"), g_webserver->GetLocalListeningPort(), g_service_name);
+	verify(g_application_cache_ui_listener = OP_NEW(SelftestAppCacheListener, ()));
+
+	g_application_cache_ui_listener->SetCurrentWindowId(state.doc->GetWindow()->Id());
+
+	FramesDocument* doc = state.doc;
+	Window *window;
+
+	verify(doc);
+	verify(doc->GetWindow());
+	window = doc->GetWindow();
+
+	OpString storagePath;
+	verify(OpStatus::IsSuccess(g_folder_manager->GetFolderPath(OPFILE_TEMP_FOLDER, storagePath)));
+	verify(OpStatus::IsSuccess(storagePath.Append(UNI_L("webserver/self_test_service/"))));
+
+	verify(OpStatus::IsSuccess(WebSubServer::Make(g_subserver, g_webserver, window->Id(), storagePath, g_service_name, g_service_name, UNI_L("notgonnatellya!"), UNI_L("This is a test service for the SELFTEST system"), UNI_L("download url unknown"), TRUE)));
+
+	OP_STATUS status;
+
+	if (OpStatus::IsError(status = g_webserver->AddSubServer(g_subserver))) /* takes over g_subserver*/
+	{
+		OP_DELETE(g_subserver);
+		verify(status);
+	}
+
+	WebserverResourceDescriptor_Static *staticResource = WebserverResourceDescriptor_Static::Make(g_public_html_directory);
+	if (staticResource == NULL || OpStatus::IsError(g_subserver->AddSubserverResource(staticResource)))
+	{
+		OP_DELETE(staticResource);
+		verify(status);
+	}
+
+	OpString8 public_html_utf8;
+	verify(OpStatus::IsSuccess(public_html_utf8.Set(g_public_html_directory.CStr())));
+	output("\n         Unite webserver public folder: %s\n", public_html_utf8.CStr());
+
+	state.doc->ConstructDOMEnvironment();
+
+	DOM_EnvironmentImpl *environment = (DOM_EnvironmentImpl *) state.doc->GetDOMEnvironment();
+
+	g_window = environment->GetWindow();
+	verify(g_window != NULL);
+	verify(g_window->IsA(DOM_TYPE_WINDOW));
+	JS_Window *jswindow = static_cast<JS_Window*>(g_window);
+	verify(jswindow != NULL);
+
+	ES_Value value;
+	DOM_Object::DOMSetString(&value, g_service_url.CStr());
+	verify(OpStatus::IsSuccess(jswindow->Put(UNI_L("g_service_url"), value, FALSE)));
+
+	/* Custom javascript methods added to control the test system */
+	TRAPD(err, jswindow->AddFunctionL(ServerControl::PauseWebserver, "pauseWebserver"));
+	verify(OpStatus::IsSuccess(err));
+	TRAP(err, jswindow->AddFunctionL(ServerControl::WakeupWebserver, "wakeUpWebserver"));
+	verify(OpStatus::IsSuccess(err));
+
+	TRAP(err, jswindow->AddFunctionL(ServerControl::CheckServerStatus, "checkWebserverStatus"));
+	verify(OpStatus::IsSuccess(err));
+
+	TRAP(err, jswindow->AddFunctionL(ApplicationCacheControl::setAnswerUICallbacks, "setAnswerUICallbacks"));
+	verify(OpStatus::IsSuccess(err));
+
+	TRAP(err, jswindow->AddFunctionL(ApplicationCacheControl::setMaxQuotaPreference, "setMaxQuotaPreference"));
+	verify(OpStatus::IsSuccess(err));
+
+	TRAP(err, jswindow->AddFunctionL(ApplicationCacheControl::onDownloadAppCacheReply, "onDownloadAppCacheReply"));
+	verify(OpStatus::IsSuccess(err));
+
+	TRAP(err, jswindow->AddFunctionL(ApplicationCacheControl::onCheckForNewAppCacheVersionReply, "onCheckForNewAppCacheVersionReply"));
+	verify(OpStatus::IsSuccess(err));
+
+	TRAP(err, jswindow->AddFunctionL(ApplicationCacheControl::onDownloadNewAppCacheVersionReply, "onDownloadNewAppCacheVersionReply"));
+	verify(OpStatus::IsSuccess(err));
+
+	TRAP(err, jswindow->AddFunctionL(ApplicationCacheControl::onQuotaReply, "onQuotaReply"));
+	verify(OpStatus::IsSuccess(err));
+
+	TRAP(err, jswindow->AddFunctionL(ApplicationCacheControl::resetApplicationCacheUICallbacks, "resetApplicationCacheUICallbacks"));
+	verify(OpStatus::IsSuccess(err));
+
+	if (g_application_cache_manager)
+		g_application_cache_manager->SetSendUIEvents(FALSE);
+}
+
+test("Running applicationcache url tests")
+	async;
+	language ecmascript;
+	require success "Init services";
+{
+	var all_tests_succeeded = true;
+	var timeoutid = 0;
+	var test_url_array = [];
+	var event_listeners;
+	var test_index = 0;
+	var failed_tests_text = "\n";
+	var client_windows = {};
+	var timeout_val = 10000;
+
+	window.addEventListenerBackup = opera.io.webserver.addEventListener;
+
+	window.timeout_window = null;
+	window.successfull_tests_text = "\n";
+
+	// init and starts the tests
+	initAndRun();
+
+	// public functions:
+	function resetTimeout(cmilliseconds, cwindow)
+	{
+		if (timeoutid)
+			clearTimeout(timeoutid);
+		window.milliseconds = cmilliseconds
+		timeoutid = setTimeout(testTimedOut, cmilliseconds);
+		if (cwindow)
+			window.timeout_window = cwindow;
+	}
+
+	function setTimesToRepeat(number_of_times_to_repeat)
+	{
+		test_url_array[test_index][1] = number_of_times_to_repeat;
+	}
+
+	function verifyTest(cwindow, success, text)
+	{
+		if (!cwindow || cwindow.hasBeenClosed)
+			return;
+
+		cwindow.hasBeenClosed = true;
+		var evt = document.createEvent("Events");
+		evt.initEvent("verifyTestEvent", true,false);
+		evt.success = success;
+		evt.text = text;
+		evt.cwindow = cwindow;
+		evt.windowname = cwindow.name;
+
+		resetEnvironment(cwindow); // removes all event listeners
+
+		if (!cwindow.closed)
+			cwindow.close();
+		resetTimeout(timeout_val, cwindow);
+
+		window.dispatchEvent(evt);
+	}
+
+	function getTestCount()
+	{
+		return window.testCount;
+	}
+
+	function cleanEventListeners()
+	{
+		if (opera.io.webserver.event_listeners)
+		{
+			while (opera.io.webserver.event_listeners.length > 0)
+			{
+
+				l = opera.io.webserver.event_listeners.pop();
+				opera.io.webserver.removeEventListener(l.event,l.func,l.bubble);
+			}
+		}
+		opera.io.webserver.event_listeners = new Array();
+	}
+
+	function listenerObject()
+	{
+		this.event = 0;
+		this.func = 0;
+		this.bubble = 0;
+	}
+
+	// Private:
+	function initAndRun()
+	{
+		opera.io.webserver.event_listeners = new Array();
+		opera.io.webserver.addEventListenerBackup = addEventListener;
+
+		opera.io.webserver.addEventListener = function(event,func, bubble)
+		{
+			var ev = new Object();
+
+			ev.event = event;
+			ev.func = func;
+			ev.bubble = bubble;
+
+			opera.io.webserver.event_listeners.push(ev);
+			opera.io.webserver.addEventListenerBackup(event,func, bubble);
+		}
+
+		// makte the functions public:
+		window.resetTimeout =  resetTimeout;
+		window.setTimesToRepeat = setTimesToRepeat;
+		window.verifyTest = verifyTest;
+		window.getTestCount = getTestCount;
+
+		window.addEventListener("verifyTestEvent", VerifyTestListenerFunction, false);
+		populateTestArray();
+
+		window.testCount = 0;
+
+		if (test_url_array.length == 0)
+			ST_failed("No tests read", 'application_cache_server.ot', 0);
+		else
+			runTest(0,0);
+	}
+
+	function populateTestArray()
+	{
+		var req = new XMLHttpRequest();
+		req.open("GET", g_service_url +"/tests/testindex.txt", false);
+		req.timeout = timeout_val;
+		req.send();
+
+		verify(req.responseText != null);
+		verify(req.status == 200);
+
+		// Creating RegExp object as a workaround for selftest parsing script.
+		var crAndSpaceReg = new RegExp("( +|\\r)", "g");
+		var tests = req.responseText.replace(crAndSpaceReg, "").split("\n");
+
+		for (var index = 0; index < tests.length; index++)
+		{
+			var test = tests[index];
+
+			var comment_index = test.indexOf("#");
+
+			// Remove anything from hash to the end of line.
+			if (comment_index != -1)
+				test = test.slice(0, comment_index);
+
+			// We might have ended up with a blank line.
+			if (test.length == 0)
+				continue;
+
+			test = test.split(",");
+
+			// No URL.
+			if (test[0].length == 0)
+				continue;
+
+			// No repetition count.
+			if (test.length == 1 || test[1].length == 0)
+				test[1] = "0";
+
+			if (Number(test[1]) == "NaN")
+				continue;
+
+			if (test.length > 2)
+			{
+				if (timeoutid)
+					clearTimeout(timeoutid);
+				ST_failed("Format error at line: " + index, 'application_cache_server.ot', 0);
+			}
+
+			test[0] = g_service_url + "/tests/" + test[0];
+			test_url_array.push(test);
+		}
+	}
+
+	function resetEnvironment(cwindow)
+	{
+		cleanEventListeners();
+		resetApplicationCacheUICallbacks();
+		window.addEventListener("verifyTestEvent", VerifyTestListenerFunction, false);
+
+		if (cwindow)
+			resetTimeout(timeout_val, cwindow);
+		else
+			resetTimeout(timeout_val, null);
+	}
+
+	function VerifyTestListenerFunction(e)
+	{
+		if (client_windows[e.windowname])
+			client_windows[e.windowname] = null;
+		else
+			return;
+
+		var success = e.success;
+		var text = e.text;
+
+		if (timeoutid)
+			clearTimeout(timeoutid);
+
+		var run_count_str = "";
+		if (window.testCount > 0)
+		{
+			run_count_str = " " + window.testCount + ". reload";
+		}
+
+		if (!success)
+		{
+			all_tests_succeeded = false;
+			var outputtext = "    test: " + getTestPath(test_index) + run_count_str + "...Failed:" + text+ "\n";
+			output(outputtext);
+			failed_tests_text += outputtext;
+		}
+		else
+		{
+			var outputtext = "    test: " + getTestPath(test_index) + run_count_str + "...Passed\n";
+
+			output(outputtext);
+//			successfull_tests_text += outputtext;
+		}
+
+		if (window.testCount < test_url_array[test_index][1])
+		{
+			window.testCount++;
+		}
+		else
+		{
+			test_index++;
+			window.testCount = 0;
+		}
+
+		if (test_index < test_url_array.length)
+		{
+			runTest(test_index, window.testCount);
+		}
+		else
+		{
+			if (all_tests_succeeded)
+			{
+				ST_passed();
+			}
+			else
+			{
+				if (timeoutid)
+					clearTimeout(timeoutid);
+				ST_failed(failed_tests_text +"\n", 'application_cache_server.ot', 0);
+			}
+		}
+	}
+
+	function getTestPath(idx)
+	{
+		var tmp_testurl = test_url_array[idx][0];
+		return tmp_testurl.substr(g_service_url.length);
+	}
+
+	function testTimedOut()
+	{
+		window.verifyTest(window.timeout_window, false, "TIMEOUT: Test did not respond in time");
+	}
+
+	function runTest(current_index, repetition)
+	{
+		var client_window;
+
+		wakeUpWebserver();
+
+		if (!checkWebserverStatus())
+		{
+			ST_failed("Selftest Fatal: webserver is not listening.", 'application_cache_server.ot', 0);
+		}
+		resetEnvironment();
+		window.milliseconds = timeout_val;
+		client_window = window.open(test_url_array[current_index][0], current_index + "_" + repetition);
+
+		resetTimeout(window.milliseconds, client_window); // reset timeout to whatever was there before
+
+		if (client_window == null)
+		{
+			ST_failed("Test window did not open for test" + test_url_array[current_index][0], 'application_cache_server.ot', 0);
+		}
+
+		client_windows[client_window.name] = client_window;
+	}
+}

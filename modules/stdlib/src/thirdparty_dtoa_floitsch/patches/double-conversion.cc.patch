@@ -1,0 +1,284 @@
+--- new_clean/src/double-conversion.cc	2012-02-13 10:25:02.508138795 +0100
++++ new_patched/src/double-conversion.cc	2012-02-13 10:51:59.568127756 +0100
+@@ -169,17 +169,17 @@ bool DoubleToStringConverter::ToShortest
+   }
+ 
+   int decimal_point;
+   bool sign;
+   const int kDecimalRepCapacity = kBase10MaximalLength + 1;
+   char decimal_rep[kDecimalRepCapacity];
+   int decimal_rep_length;
+ 
+-  DoubleToAscii(value, mode, 0, decimal_rep, kDecimalRepCapacity,
++  DoubleToAscii(value, mode, 0, ROUND_NEAREST_AWAY_FROM_ZERO, decimal_rep, kDecimalRepCapacity,
+                 &sign, &decimal_rep_length, &decimal_point);
+ 
+   bool unique_zero = (flags_ & UNIQUE_ZERO) != 0;
+   if (sign && (value != 0.0 || !unique_zero)) {
+     result_builder->AddCharacter('-');
+   }
+ 
+   int exponent = decimal_point - 1;
+@@ -213,17 +213,17 @@ bool DoubleToStringConverter::ToFixed(do
+   // Find a sufficiently precise decimal representation of n.
+   int decimal_point;
+   bool sign;
+   // Add space for the '\0' byte.
+   const int kDecimalRepCapacity =
+       kMaxFixedDigitsBeforePoint + kMaxFixedDigitsAfterPoint + 1;
+   char decimal_rep[kDecimalRepCapacity];
+   int decimal_rep_length;
+-  DoubleToAscii(value, FIXED, requested_digits,
++  DoubleToAscii(value, FIXED, requested_digits, ROUND_NEAREST_AWAY_FROM_ZERO,
+                 decimal_rep, kDecimalRepCapacity,
+                 &sign, &decimal_rep_length, &decimal_point);
+ 
+   bool unique_zero = ((flags_ & UNIQUE_ZERO) != 0);
+   if (sign && (value != 0.0 || !unique_zero)) {
+     result_builder->AddCharacter('-');
+   }
+ 
+@@ -248,21 +248,21 @@ bool DoubleToStringConverter::ToExponent
+   bool sign;
+   // Add space for digit before the decimal point and the '\0' character.
+   const int kDecimalRepCapacity = kMaxExponentialDigits + 2;
+   ASSERT(kDecimalRepCapacity > kBase10MaximalLength);
+   char decimal_rep[kDecimalRepCapacity];
+   int decimal_rep_length;
+ 
+   if (requested_digits == -1) {
+-    DoubleToAscii(value, SHORTEST, 0,
++    DoubleToAscii(value, SHORTEST, 0, ROUND_NEAREST_AWAY_FROM_ZERO,
+                   decimal_rep, kDecimalRepCapacity,
+                   &sign, &decimal_rep_length, &decimal_point);
+   } else {
+-    DoubleToAscii(value, PRECISION, requested_digits + 1,
++    DoubleToAscii(value, PRECISION, requested_digits + 1, ROUND_NEAREST_AWAY_FROM_ZERO,
+                   decimal_rep, kDecimalRepCapacity,
+                   &sign, &decimal_rep_length, &decimal_point);
+     ASSERT(decimal_rep_length <= requested_digits + 1);
+ 
+     for (int i = decimal_rep_length; i < requested_digits + 1; ++i) {
+       decimal_rep[i] = '0';
+     }
+     decimal_rep_length = requested_digits + 1;
+@@ -296,17 +296,17 @@ bool DoubleToStringConverter::ToPrecisio
+   // Find a sufficiently precise decimal representation of n.
+   int decimal_point;
+   bool sign;
+   // Add one for the terminating null character.
+   const int kDecimalRepCapacity = kMaxPrecisionDigits + 1;
+   char decimal_rep[kDecimalRepCapacity];
+   int decimal_rep_length;
+ 
+-  DoubleToAscii(value, PRECISION, precision,
++  DoubleToAscii(value, PRECISION, precision, ROUND_NEAREST_AWAY_FROM_ZERO,
+                 decimal_rep, kDecimalRepCapacity,
+                 &sign, &decimal_rep_length, &decimal_point);
+   ASSERT(decimal_rep_length <= precision);
+ 
+   bool unique_zero = ((flags_ & UNIQUE_ZERO) != 0);
+   if (sign && (value != 0.0 || !unique_zero)) {
+     result_builder->AddCharacter('-');
+   }
+@@ -348,20 +348,31 @@ static BignumDtoaMode DtoaToBignumDtoaMo
+     case DoubleToStringConverter::FIXED:     return BIGNUM_DTOA_FIXED;
+     case DoubleToStringConverter::PRECISION: return BIGNUM_DTOA_PRECISION;
+     default:
+       UNREACHABLE();
+       return BIGNUM_DTOA_SHORTEST;  // To silence compiler.
+   }
+ }
+ 
++static BignumRoundingBias DtoaToBignumRoundingBias(
++    DoubleToStringConverter::RoundingBias bias) {
++  switch (bias) {
++    case DoubleToStringConverter::ROUND_NEAREST_AWAY_FROM_ZERO: return BIGNUM_ROUND_NEAREST_AWAY_FROM_ZERO;
++    case DoubleToStringConverter::ROUND_NEAREST_TO_EVEN: return BIGNUM_ROUND_NEAREST_TO_EVEN;
++    default:
++      UNREACHABLE();
++      return BIGNUM_ROUND_NEAREST_TO_EVEN; // To silence compiler.
++  }
++}
+ 
+ void DoubleToStringConverter::DoubleToAscii(double v,
+                                             DtoaMode mode,
+                                             int requested_digits,
++                                            RoundingBias rounding_bias,
+                                             char* buffer,
+                                             int buffer_length,
+                                             bool* sign,
+                                             int* length,
+                                             int* point) {
+   Vector<char> vector(buffer, buffer_length);
+   ASSERT(!Double(v).IsSpecial());
+   ASSERT(mode == SHORTEST || mode == SHORTEST_SINGLE || requested_digits >= 0);
+@@ -392,31 +403,33 @@ void DoubleToStringConverter::DoubleToAs
+     case SHORTEST:
+       fast_worked = FastDtoa(v, FAST_DTOA_SHORTEST, 0, vector, length, point);
+       break;
+     case SHORTEST_SINGLE:
+       fast_worked = FastDtoa(v, FAST_DTOA_SHORTEST_SINGLE, 0,
+                              vector, length, point);
+       break;
+     case FIXED:
+-      fast_worked = FastFixedDtoa(v, requested_digits, vector, length, point);
++      fast_worked = FastFixedDtoa(v, requested_digits, vector, length, point, rounding_bias);
+       break;
+     case PRECISION:
+       fast_worked = FastDtoa(v, FAST_DTOA_PRECISION, requested_digits,
+                              vector, length, point);
+       break;
+     default:
+       UNREACHABLE();
+       fast_worked = false;
+   }
+   if (fast_worked) return;
+ 
+   // If the fast dtoa didn't succeed use the slower bignum version.
+   BignumDtoaMode bignum_mode = DtoaToBignumDtoaMode(mode);
+-  BignumDtoa(v, bignum_mode, requested_digits, vector, length, point);
++  BignumRoundingBias bignum_bias = DtoaToBignumRoundingBias(rounding_bias);
++  *point = 0;
++  BignumDtoa(v, bignum_mode, requested_digits, vector, length, point, bignum_bias);
+   vector[*length] = '\0';
+ }
+ 
+ 
+ // Consumes the given substring from the iterator.
+ // Returns false, if the substring does not match.
+ static bool ConsumeSubString(const char** current,
+                              const char* end,
+@@ -583,16 +596,17 @@ double StringToDoubleConverter::StringTo
+   const char* end = input + length;
+ 
+   *processed_characters_count = 0;
+ 
+   const bool allow_trailing_junk = (flags_ & ALLOW_TRAILING_JUNK) != 0;
+   const bool allow_leading_spaces = (flags_ & ALLOW_LEADING_SPACES) != 0;
+   const bool allow_trailing_spaces = (flags_ & ALLOW_TRAILING_SPACES) != 0;
+   const bool allow_spaces_after_sign = (flags_ & ALLOW_SPACES_AFTER_SIGN) != 0;
++  const bool allow_scanf_nan_infinities = (flags_ & ALLOW_SCANF_NAN_INFINITIES) != 0;
+ 
+   // To make sure that iterator dereferencing is valid the following
+   // convention is used:
+   // 1. Each '++current' statement is followed by check for equality to 'end'.
+   // 2. If AdvanceToNonspace returned false then current == end.
+   // 3. If 'current' becomes equal to 'end' the function returns or goes to
+   // 'parsing_done'.
+   // 4. 'current' is not dereferenced after the 'parsing_done' label.
+@@ -631,41 +645,79 @@ double StringToDoubleConverter::StringTo
+     // Skip following spaces (if allowed).
+     if (!AdvanceToNonspace(&next_non_space, end)) return junk_string_value_;
+     if (!allow_spaces_after_sign && (current != next_non_space)) {
+       return junk_string_value_;
+     }
+     current = next_non_space;
+   }
+ 
+-  if (infinity_symbol_ != NULL) {
+-    if (*current == infinity_symbol_[0]) {
++  if (infinity_symbol_ != NULL || allow_scanf_nan_infinities) {
++    bool matched = false;
++    if (allow_scanf_nan_infinities) {
++      if (*current == 'i') {
++        const char *mark = current;
++        if (!ConsumeSubString(&current, end, "infinity")) {
++          current = mark;
++          if (!ConsumeSubString(&current, end, "inf")) {
++            return junk_string_value_;
++          }
++        }
++        matched = true;
++      }
++      else if (*current == 'I') {
++        const char *mark = current;
++        if (!ConsumeSubString(&current, end, "Infinity")) {
++          current = mark;
++          if (!ConsumeSubString(&current, end, "Inf")) {
++            return junk_string_value_;
++          }
++        }
++        matched = true;
++      }
++    }
++    else if (*current == infinity_symbol_[0]) {
+       if (!ConsumeSubString(&current, end, infinity_symbol_)) {
+         return junk_string_value_;
+       }
++      matched = true;
++    }
+ 
++    if (matched) {
+       if (!(allow_trailing_spaces || allow_trailing_junk) && (current != end)) {
+         return junk_string_value_;
+       }
+       if (!allow_trailing_junk && AdvanceToNonspace(&current, end)) {
+         return junk_string_value_;
+       }
+ 
+       ASSERT(buffer_pos == 0);
+       *processed_characters_count = current - input;
+       return sign ? -Double::Infinity() : Double::Infinity();
+     }
+   }
+ 
+-  if (nan_symbol_ != NULL) {
+-    if (*current == nan_symbol_[0]) {
++  if (nan_symbol_ != NULL || allow_scanf_nan_infinities) {
++    bool matched = false;
++    if (allow_scanf_nan_infinities) {
++      matched = *current == 'n' || *current == 'N';
++      if (*current == 'n' && !ConsumeSubString(&current, end, "nan")) {
++	return junk_string_value_;
++      }
++      else if (*current == 'N' && !ConsumeSubString(&current, end, "NaN")) {
++	return junk_string_value_;
++      }
++    }
++    else if (*current == nan_symbol_[0]) {
+       if (!ConsumeSubString(&current, end, nan_symbol_)) {
+         return junk_string_value_;
+       }
+-
++      matched = true;
++    }
++    if (matched) {
+       if (!(allow_trailing_spaces || allow_trailing_junk) && (current != end)) {
+         return junk_string_value_;
+       }
+       if (!allow_trailing_junk && AdvanceToNonspace(&current, end)) {
+         return junk_string_value_;
+       }
+ 
+       ASSERT(buffer_pos == 0);
+@@ -792,27 +844,29 @@ double StringToDoubleConverter::StringTo
+ 
+   // Parse exponential part.
+   if (*current == 'e' || *current == 'E') {
+     if (octal && !allow_trailing_junk) return junk_string_value_;
+     if (octal) goto parsing_done;
+     ++current;
+     if (current == end) {
+       if (allow_trailing_junk) {
++        current--;
+         goto parsing_done;
+       } else {
+         return junk_string_value_;
+       }
+     }
+     char sign = '+';
+     if (*current == '+' || *current == '-') {
+       sign = static_cast<char>(*current);
+       ++current;
+       if (current == end) {
+         if (allow_trailing_junk) {
++          current -= 2;
+           goto parsing_done;
+         } else {
+           return junk_string_value_;
+         }
+       }
+     }
+ 
+     if (current == end || *current < '0' || *current > '9') {

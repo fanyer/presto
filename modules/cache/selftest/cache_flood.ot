@@ -1,0 +1,157 @@
+/* -*- Mode: c++; tab-width: 4; indent-tabs-mode: t; c-basic-offset: 4 -*-
+**
+** Copyright (C) 2004-2006 Opera Software ASA.  All rights reserved.
+**
+** This file is part of the Opera web browser.  It may not be distributed
+** under any circumstances.
+**
+*/
+
+//
+// This selftest floods the main cache context in a few different ways.
+// Up to 1GB with large files, with large amounts of medium sized files and 
+// with large amounts of small files.
+//
+
+group "cache context flood";
+disabled;
+require init;
+require DYNAMIC_FOLDER_SUPPORT;
+require CACHE_FAST_INDEX;
+require DESKTOP_PROFILE;
+include "modules/cache/cache_int.h";
+include "modules/cache/cache_common.h";
+include "modules/dochand/winman.h";
+include "modules/content_filter/content_filter.h";
+include "modules/cache/cache_st_helpers.h";
+include "modules/prefs/prefsmanager/collections/pc_network.h";
+include "modules/cache/cache_selftest.h";
+
+global
+{
+	OpFileFolder defSizeFolder;
+	OpFileFolder custSizeFolder;
+	URL_CONTEXT_ID defSizeContext;
+	URL_CONTEXT_ID custSizeContext;
+	MessageHandler *mh;
+	WaitURLs *wait;
+	#ifdef URL_FILTER
+		URLFilter* urlfilter;
+	#endif
+
+	int oldCacheSize;
+	int kCacheSize;
+}
+
+
+setup
+{
+	// A bunch of stuff needed to be able to use the WaitURLs class to empty the cache.
+	defSizeContext = urlManager->GetNewContextID();
+	custSizeContext = urlManager->GetNewContextID();
+	mh = OP_NEW(MessageHandler, (NULL));
+	#ifdef URL_FILTER
+		urlfilter = OP_NEW(URLFilter, ());
+	#endif
+	
+	g_folder_manager->AddFolder(OPFILE_CACHE_FOLDER, UNI_L("flood_default_size"), &defSizeFolder);
+	CacheFileTest::DeleteCacheDir(defSizeFolder);
+	urlManager->AddContextL(defSizeContext, defSizeFolder, defSizeFolder, defSizeFolder, FALSE);
+	output("Created custom context: %d \n", defSizeContext);
+
+	g_folder_manager->AddFolder(OPFILE_CACHE_FOLDER, UNI_L("flood_custom_size"), &custSizeFolder);
+	CacheFileTest::DeleteCacheDir(custSizeFolder);
+	urlManager->AddContextL(custSizeContext, custSizeFolder, custSizeFolder, custSizeFolder, FALSE);
+	output("Created custom context: %d \n", custSizeContext);
+
+	OpMessage messages[]={MSG_URL_DATA_LOADED, MSG_URL_LOADING_FAILED, MSG_URLMAN_DELETE_SOMEFILES};
+	
+	wait = OP_NEW(WaitURLs, (defSizeFolder, custSizeFolder, mh));
+	mh->SetCallBackList(wait, 0, messages, 3);
+	
+	CacheHelpers::CloseUnusedWindows();
+	
+	// Record the cache limit and set a new cache limit of 1GB
+	kCacheSize = 1024 * 1024 * 1024;
+	oldCacheSize = g_pcnet->GetIntegerPref(PrefsCollectionNetwork::DiskCacheSize);
+	OP_MEMORY_VAR int newCacheSize = kCacheSize / 1024;
+	TRAPD(op_err, g_pcnet->WriteIntegerL(PrefsCollectionNetwork::DiskCacheSize, newCacheSize));
+}
+
+exit
+{
+	// Set the cache limit back to normal
+	OP_STATUS op_err;
+	TRAP(op_err, g_pcnet->WriteIntegerL(PrefsCollectionNetwork::DiskCacheSize, oldCacheSize));
+
+	mh->UnsetCallBacks(wait);
+	OP_DELETE(mh);
+	mh=NULL;
+	OP_DELETE(wait);
+	wait=NULL;
+	
+	#ifdef URL_FILTER
+		OP_DELETE(urlfilter);
+	#endif
+}
+
+// Helper test to clear out the cache.
+subtest EmptyCache()
+{
+	wait->SetExpectedSize(0, 0);
+	urlManager->EmptyDCache();
+
+	// Wait to delete the files
+	mh->PostDelayedMessage(MSG_URLMAN_DELETE_SOMEFILES, 0, 0, 1000);  
+}
+
+test("Context - Empty cache") async;
+{
+	EmptyCache();
+}
+
+test("Context - 1024 * 1MB files")
+{
+	// Release: <20s  
+	// Debug: <50s (<40s w no file writes)
+	CacheHelpers::CacheBogusURLs(0, 1024*1024, 1024*1024, 1024); 
+}
+
+test("Context - Empty cache") async;
+{
+	EmptyCache();
+}
+
+test("Context - 10,000 * 7-23B files")
+{
+	// Debug: <10s
+	// Release: ~1s
+	CacheHelpers::CacheBogusURLs(0, 7, 23, 10000); 
+}
+
+test("Context - Empty cache") async;
+{
+	EmptyCache();
+}
+
+test("Context - 10,000 * 509-1021B files")
+{
+	// Debug: <15s (<12s w no file writes)
+	// Release: ~1s
+	CacheHelpers::CacheBogusURLs(0, 509, 1021, 10000); 
+}
+
+test("Context - Empty cache") async;
+{
+	EmptyCache();
+}
+
+test("cleanup")
+{
+	verify(OpStatus::IsSuccess(CacheFileTest::DeleteCacheDir(defSizeFolder)));
+	urlManager->AddContextL(defSizeContext, defSizeFolder, defSizeFolder, defSizeFolder, FALSE);
+	output("Created custom context: %d \n", defSizeContext);
+
+	g_folder_manager->AddFolder(OPFILE_CACHE_FOLDER, UNI_L("context_custom_size"), &custSizeFolder);
+	verify(OpStatus::IsSuccess(CacheFileTest::DeleteCacheDir(custSizeFolder)));
+}

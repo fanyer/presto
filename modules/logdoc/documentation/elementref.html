@@ -1,0 +1,90 @@
+<html>
+<h1>HTML Element References</h1>
+<p>
+HTML Elements may live a turbulent life, where they are created, inserted into trees, moved and 
+deleted at various points.  And since references to HTML elements are often needed, it can be a pain to
+always keep up with all that happens to the HTML_Element object.  So to ease some of that pain ElementRef
+has been created.  It will be notified every time the HTML_Element is removed from a tree, inserted into a
+tree, or deleted.
+</p>
+
+<h2>HTML_Element ownership</h2>
+<p>The basic ownership model of an HTML_Element is that it is owned by the tree it is part of.  If it
+is removed from a tree it will be owned by whoever removed the element, and when it is created and before
+it has been inserted into a tree it is owned by the creator.  The special KeepAliveElementRef changes this
+a little, in that when the original owner of the element tries to delete it, KeepAliveElementRef(s) will
+take over the ownership and own it until the last KeepAliveElementRef no longer references it (in which case
+the element is deleted) or until it is inserted into a tree again.</p>
+
+<h2>How to use Element References</h2>
+<p>There are principally two basic ElementRefs you can use.  AutoNullElementRef which sets the pointer to
+NULL when the Element is deleted, and KeepAliveElementRef which prevents the Element from being deleted as long
+as at least one KeepAliveElementRef has a pointer to it.  Additionally these classes may be overriden if you want
+to do something more specific when something happens to the element.</p>
+
+<h3>AutoNullElementRef</h3>
+<p>This reference is very basic.  It will just set the reference to NULL if the Element is deleted. The user
+will then obviously have to check it for NULL before using it, if there is any chance the element may have been
+ deleted since it was last checked.</p>
+
+<h3>KeepAliveElementRef</h3>
+<p>KeepAliveElementRef is for those cases when you require the element to stay alive.  The reference will
+prevent the element from being deleted as long as the reference exists. However, do note that in the cases
+where the element would have been deleted, it will now just exist in a sort of limbo.  It will have been removed
+from the tree, and is unreachable except through the KeepAliveElementRef(s) still holding a reference to it.
+The reference only keeps the single element it references alive, not any other part of the tree it was part of
+(unlike elements which DOM have a reference to, which keep entire sub trees alive).
+</p>
+<p>
+If someone ("the real owner") has tried to delete the element, it will be deleted as soon as the
+last KeepAliveElementRef which had a reference to it stops referencing it.
+</p>
+<p>
+If an element which is only referenced by one or more KeepAliveElementRef is inserted into a tree again, then
+the KeepAliveElementRef(s) will relinquish ownership to the tree, and not try to delete the element. 
+</p>
+
+<h3>Subclassing ElementRef</h3>
+<p>If the existing sub classes of ElementRef doesn't do what you need, you can make your own.  If you intend to
+keep the element alive when someone tries to delete it, then you MUST subclass KeepAliveElementRef (it can of course 
+be indirect inheritance).</p>
+<p>Subclasses of ElementRef can implement OnDelete() which will be called when someone tries to delete the element,
+OnRemoved() which is called when someone removes the element from the tree and OnInsert() when the element
+is inserted into a tree.</p>
+
+<h2>Implementation details</h2>
+<p>This section is mostly for internal logdoc use to help explain and debug ElementRef issues.</p>
+
+<h3>What is an ElementRef?</h3>
+<p>It's a pointer to an HTML_Element, plus previous and next pointers to other ElementRefs.  The HTML_Element has
+a list of all ElementRefs that point to it (through a pointer to the first ElementRef), which it uses to notify
+the ElementRefs whenever the element is removed, deleted etc.</p>
+
+<h3>Where does the notifications happen?</h3>
+<p>Both OnRemove() and OnDelete() are called from HTML_Element::Clean().  Which one is called is decided by
+the going_to_delete parameter.  Everyone who intends to delete an HTML_Element should call Clean() before
+calling Free() (and only call Free() if Clean returns TRUE).  A call to Clean(), even with a TRUE going_to_delete
+parameter doesn't mean the element will be deleted now, only that the previous owner of the element doesn't need
+it anymore.</p>
+<p>OnInsert() is called from HTML_Element::ElementSignalInserted() and HTML_Element::DOMMoveToOtherDocument().</p>
+
+<h3>How KeepAliveElementRefs work and their ownership model</h3>
+<p>Until the original owner of an HTML_Element does Clean() a KeepAliveElementRef works just like other
+ElementRefs.  When Clean() is called (with going_to_delete = TRUE) all KeepAliveElementRefs which have a reference
+to the element will set their m_free_element_on_delete flag to TRUE.  When (if) the original owner calls
+Free(), the element will be prevented from actually being deleted as long as there is at least one
+KeepAliveElementRef which references it (by checking if the elements list of ElementsRefs is non-empty).</p>
+
+<p>If the element is inserted into a tree again, it is assumed the new tree takes over ownership of the element
+and the m_free_element_on_delete flag is reset to FALSE.</p>
+
+<p>Every time a KeepAliveElementRef stops referencing an element (by being deleted, or set to reference something
+else or NULL), and if its m_free_element_on_delete flag is set, it will try to delete the element by doing a regular
+call to Clean() before possibly calling Free().  If DOM still holds a reference to the element, then Clean
+will return FALSE, and the KeepAliveElementRef which lost the reference will not Free() it - DOM owns it. If Clean()
+returns TRUE then only KeepAliveElementRefs should have a reference to it.  If any other KeepAliveElementRefs
+still do, the element will again be prevented from being deleted in Free(), and the other KeepAliveElementRefs 
+now collectively owns the element.  Once the last KeepAliveElementRef stops referencing the element it will 
+actually be deleted in Free()... Unless DOM has gained a reference, or it has been inserted into the tree again,
+in which case the tree or DOM respectively still owns the element.</p>
+</html>

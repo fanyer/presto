@@ -1,0 +1,747 @@
+/* -*- Mode: c++; tab-width: 4; indent-tabs-mode: t; c-basic-offset: 4 -*-
+ *
+ * Copyright (C) 1995-2011 Opera Software ASA.  All rights reserved.
+ *
+ * This file is part of the Opera web browser.
+ * It may not be distributed under any circumstances.
+ */
+group "dochand.aitparser";
+require XML_AIT_SUPPORT;
+require init;
+
+include "modules/dochand/aitparser.h";
+include "modules/windowcommander/AITData.h";
+include "modules/url/url2.h";
+include "modules/url/url_api.h";
+include "modules/hardcore/timer/optimer.h";
+
+global
+{
+#define CHECK_SETUP_FAILED(x) if (OpStatus::IsError(x)) { ST_failed("Setup failed (OOM?)"); return; }
+#define CHECK_SETUP_FAILED_RETVAL(x) if (OpStatus::IsError(x)) { ST_failed("Setup failed (OOM?)"); return 0; }
+#define CHECK_NOT_NULL_RETVAL(x) if (!x) { ST_failed("Setup failed (OOM?)"); return 0; }
+
+#define XML_AIT_START "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"\
+		"<mhp:ServiceDiscovery xmlns:mhp=\"urn:dvb:mhp:2009\" xmlns:ipi=\"urn:dvb:metadata:iptv:sdns:2008-1\" xmlns:tva=\"urn:tva:metadata:2005\" xmlns:mpeg7=\"urn:tva:mpeg7:2005\" xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\" xsi:schemaLocation=\"urn:dvb:mhp:2009 mis_xmlait.xsd\">\n"\
+		"  <mhp:ApplicationDiscovery DomainName=\"ard.de\">\n"\
+		"    <mhp:ApplicationList>\n"
+#define XML_AIT_END "    </mhp:ApplicationList>\n"\
+		"  </mhp:ApplicationDiscovery>\n"\
+		"</mhp:ServiceDiscovery>\n"
+
+
+	BOOL TestAITParse(const char *xml_data, AITData &expected_data, BOOL return_if_fail=FALSE)
+	{
+		AITData ait_parse_data;
+		OpString xml;
+		if (OpStatus::IsError(xml.Set(xml_data)))
+		{
+			ST_failed("OOM at test setup");
+			return TRUE;
+		}
+		URL url = g_url_api->GetNewOperaURL();
+		url.SetAttributeL(URL::KMIME_ForceContentType, "application/vnd.dvb.ait+xml");
+		if (OpStatus::IsError(url.WriteDocumentData(URL::KNormal, xml_data)) ||
+			OpStatus::IsError(AITParser::Parse(url, ait_parse_data)))
+		{
+			ST_failed("TestAITParse failed");
+			return TRUE;
+		}
+
+		OpString8 err;
+		if (ait_parse_data.Compare(expected_data, err))
+			ST_passed();
+		else
+		{
+			 if (return_if_fail)
+			 {
+				 output("AITData does not match expected: %s", err.CStr());
+				 return FALSE;
+			 }
+			 else
+			 {
+				 ST_failed("AITData does not match expected: %s", err.CStr());
+			 }
+		}
+
+		return TRUE;
+	}
+
+
+	OP_STATUS CreateNewApplicationOnData(AITData *app_data)
+	{
+		AITApplication *app = OP_NEW(AITApplication, ());
+		if (!app ||
+			OpStatus::IsError(app_data->applications.Add(app)))
+		{
+			if (app)
+				OP_DELETE(app);
+			return OpStatus::ERR;
+		}
+		return OpStatus::OK;
+	}
+
+
+	OP_STATUS CreateNewTransportOnApplication(AITApplication *app)
+	{
+		AITApplicationTransport *t = OP_NEW(AITApplicationTransport, ());
+		if (!t ||
+			OpStatus::IsError(app->transports.Add(t)))
+		{
+			if (t)
+				OP_DELETE(t);
+			return OpStatus::ERR;
+		}
+		return OpStatus::OK;
+	}
+
+
+	OP_STATUS CreateNewBoundaryOnApplication(AITApplication *app, const char *boundary)
+	{
+		OpString *b = OP_NEW(OpString, ());
+		if (!b ||
+			OpStatus::IsError(b->Set(boundary)) ||
+			OpStatus::IsError(app->boundaries.Add(b)))
+		{
+			if (b)
+				OP_DELETE(b);
+			return OpStatus::ERR;
+		}
+		return OpStatus::OK;
+	}
+
+
+	void TestOrgId(const char *org_id, unsigned long expected_id)
+	{
+		OpString8 xml;
+		CHECK_SETUP_FAILED(xml.Set(XML_AIT_START));
+		CHECK_SETUP_FAILED(xml.Append(
+							   "      <mhp:Application>\n"
+							   "        <mhp:applicationIdentifier>\n"
+							   "          <mhp:orgId>\n"));
+		CHECK_SETUP_FAILED(xml.Append(org_id));
+		CHECK_SETUP_FAILED(xml.Append(
+							   "          </mhp:orgId>\n"
+							   "        </mhp:applicationIdentifier>\n"
+							   "      </mhp:Application>\n"));
+		CHECK_SETUP_FAILED(xml.Append(XML_AIT_END));
+
+		AITData expected_data;
+		CHECK_SETUP_FAILED(CreateNewApplicationOnData(&expected_data));
+		expected_data.applications.Get(0)->org_id = expected_id;
+
+		if (!TestAITParse(xml.CStr(), expected_data, TRUE))
+			ST_failed("set value of orgId when value=\'%s\' did not match expected value \'%ul\'", org_id, expected_id);
+	}
+
+
+	void TestAppId(const char *app_id, unsigned short expected_id)
+	{
+		OpString8 xml;
+		CHECK_SETUP_FAILED(xml.Set(XML_AIT_START));
+		CHECK_SETUP_FAILED(xml.Append(
+							   "      <mhp:Application>\n"
+							   "        <mhp:applicationIdentifier>\n"
+							   "          <mhp:appId>\n"));
+		CHECK_SETUP_FAILED(xml.Append(app_id));
+		CHECK_SETUP_FAILED(xml.Append(
+							   "          </mhp:appId>\n"
+							   "        </mhp:applicationIdentifier>\n"
+							   "      </mhp:Application>\n"));
+		CHECK_SETUP_FAILED(xml.Append(XML_AIT_END));
+
+		AITData expected_data;
+		CHECK_SETUP_FAILED(CreateNewApplicationOnData(&expected_data));
+		expected_data.applications.Get(0)->app_id = expected_id;
+
+		if (!TestAITParse(xml.CStr(), expected_data, TRUE))
+			ST_failed("set value of appId when value=\'%s\' did not match expected value \'%d\'", app_id, expected_id);
+	}
+
+
+	void TestControlCode(const char *control_code, AITApplicationDescriptor::ControlCode expected_code)
+	{
+		OpString8 xml;
+		CHECK_SETUP_FAILED(xml.Set(XML_AIT_START));
+		CHECK_SETUP_FAILED(xml.Append(
+							   "      <mhp:Application>\n"
+							   "        <mhp:applicationDescriptor>\n"
+							   "		  <mhp:controlCode>"));
+		CHECK_SETUP_FAILED(xml.Append(control_code));
+		CHECK_SETUP_FAILED(xml.Append(
+							   "          </mhp:controlCode>\n"
+							   "        </mhp:applicationDescriptor>\n"
+							   "      </mhp:Application>\n"));
+		CHECK_SETUP_FAILED(xml.Append(XML_AIT_END));
+
+		AITData expected_data;
+		CHECK_SETUP_FAILED(CreateNewApplicationOnData(&expected_data));
+		expected_data.applications.Get(0)->descriptor.control_code = expected_code;
+
+		if (!TestAITParse(xml.CStr(), expected_data, TRUE))
+			ST_failed("set value of control_code when value=\'%s\' did not match expected", control_code);
+	}
+
+
+	void TestVisibility(const char* visibility, AITApplicationDescriptor::Visibility expected_visibility)
+	{
+		OpString8 xml;
+		CHECK_SETUP_FAILED(xml.Set(XML_AIT_START));
+		CHECK_SETUP_FAILED(xml.Append(
+							   "      <mhp:Application>\n"
+							   "        <mhp:applicationDescriptor>\n"
+							   "		  <mhp:visibility>"));
+		CHECK_SETUP_FAILED(xml.Append(visibility));
+		CHECK_SETUP_FAILED(xml.Append(
+							   "          </mhp:visibility>\n"
+							   "        </mhp:applicationDescriptor>\n"
+							   "      </mhp:Application>\n"));
+		CHECK_SETUP_FAILED(xml.Append(XML_AIT_END));
+
+		AITData expected_data;
+		CHECK_SETUP_FAILED(CreateNewApplicationOnData(&expected_data));
+		expected_data.applications.Get(0)->descriptor.visibility = expected_visibility;
+
+		if (!TestAITParse(xml.CStr(), expected_data, TRUE))
+			ST_failed("set value of visibility when value=\'%s\' did not match expected", visibility);
+	}
+
+
+	void TestServiceBoundFlag(const char *service_bound, BOOL expected_flag)
+	{
+		OpString8 xml;
+		CHECK_SETUP_FAILED(xml.Set(XML_AIT_START));
+		CHECK_SETUP_FAILED(xml.Append(
+							   "      <mhp:Application>\n"
+							   "        <mhp:applicationDescriptor>\n"
+							   "		  <mhp:serviceBound>"));
+		CHECK_SETUP_FAILED(xml.Append(service_bound));
+		CHECK_SETUP_FAILED(xml.Append(
+							   "          </mhp:serviceBound>\n"
+							   "        </mhp:applicationDescriptor>\n"
+							   "      </mhp:Application>\n"));
+		CHECK_SETUP_FAILED(xml.Append(XML_AIT_END));
+
+		AITData expected_data;
+		CHECK_SETUP_FAILED(CreateNewApplicationOnData(&expected_data));
+		expected_data.applications.Get(0)->descriptor.service_bound = expected_flag;
+
+		if (!TestAITParse(xml.CStr(), expected_data, TRUE))
+			ST_failed("set value of service_bound when value=\'%s\' did not match expected value=\'%s\'", service_bound, expected_flag ? "TRUE" : "FALSE");
+	}
+
+
+	void TestPriority(const char *priority, unsigned char expected_priority)
+	{
+		OpString8 xml;
+		CHECK_SETUP_FAILED(xml.Set(XML_AIT_START));
+		CHECK_SETUP_FAILED(xml.Append(
+							   "      <mhp:Application>\n"
+							   "        <mhp:applicationDescriptor>\n"
+							   "		  <mhp:priority>"));
+		CHECK_SETUP_FAILED(xml.Append(priority));
+		CHECK_SETUP_FAILED(xml.Append(
+							   "          </mhp:priority>\n"
+							   "        </mhp:applicationDescriptor>\n"
+							   "      </mhp:Application>\n"));
+		CHECK_SETUP_FAILED(xml.Append(XML_AIT_END));
+
+		AITData expected_data;
+		CHECK_SETUP_FAILED(CreateNewApplicationOnData(&expected_data));
+		expected_data.applications.Get(0)->descriptor.priority = expected_priority;
+
+		if (!TestAITParse(xml.CStr(), expected_data, TRUE))
+			ST_failed("set value of priority when value=\'%s\' did not match expected value=\'%x\'", priority, expected_priority);
+	}
+
+
+	int TestMhpVersion(const char *mhp_version, AITApplicationMhpVersion *expected_version)
+	{
+
+		AITData expected_data;
+		if (OpStatus::IsError(CreateNewApplicationOnData(&expected_data)) ||
+			OpStatus::IsError(expected_data.applications.Get(0)->descriptor.mhp_versions.Add(expected_version)))
+		{
+			OP_DELETE(expected_version);
+			ST_failed("Setup failed (OOM?)");
+			return -1;
+		}
+
+		OpString8 xml;
+		CHECK_SETUP_FAILED_RETVAL(xml.Set(XML_AIT_START));
+		CHECK_SETUP_FAILED_RETVAL(xml.Append(
+									  "      <mhp:Application>\n"
+									  "        <mhp:applicationDescriptor>\n"
+									  "          <mhp:mhpVersion>\n"));
+		CHECK_SETUP_FAILED_RETVAL(xml.Append(mhp_version));
+		CHECK_SETUP_FAILED_RETVAL(xml.Append(
+									  "          </mhp:mhpVersion>\n"
+									  "        </mhp:applicationDescriptor>\n"
+									  "      </mhp:Application>\n"));
+		CHECK_SETUP_FAILED_RETVAL(xml.Append(XML_AIT_END));
+
+		if (!TestAITParse(xml.CStr(), expected_data, TRUE))
+			ST_failed("set value of MhpVersion \'%s\' did not match expected value", mhp_version);
+
+		return 0;
+	}
+
+
+	void TestApplicationUsageDescriptor(const char *application_usage_descriptor, int expected_usage)
+	{
+		OpString8 xml;
+		CHECK_SETUP_FAILED(xml.Set(XML_AIT_START));
+		CHECK_SETUP_FAILED(xml.Append(
+							   "      <mhp:Application>\n"
+							   "        <mhp:applicationUsageDescriptor>\n"
+							   "          <mhp:ApplicationUsage>\n"));
+		CHECK_SETUP_FAILED(xml.Append(application_usage_descriptor));
+		CHECK_SETUP_FAILED(xml.Append(
+							   "          </mhp:ApplicationUsage>\n"
+							   "        </mhp:applicationUsageDescriptor>\n"
+							   "      </mhp:Application>\n"));
+		CHECK_SETUP_FAILED(xml.Append(XML_AIT_END));
+
+		AITData expected_data;
+		CHECK_SETUP_FAILED(CreateNewApplicationOnData(&expected_data));
+		expected_data.applications.Get(0)->usage = expected_usage;
+
+		if (!TestAITParse(xml.CStr(), expected_data, TRUE))
+			ST_failed("set value of applicationUsageDescriptor when value=\'%s\' did not match expected value=\'%d\'", application_usage_descriptor, expected_usage);
+	}
+
+	void TestApplicationTransportHTTP(const char *base_url)
+	{
+		OpString8 xml;
+		CHECK_SETUP_FAILED(xml.Set(XML_AIT_START));
+		CHECK_SETUP_FAILED(xml.Append(
+							   "      <mhp:Application>\n"
+							   "        <mhp:applicationTransport xsi:type=\"mhp:HTTPTransportType\">\n"
+							   "          <mhp:URLBase>"));
+		CHECK_SETUP_FAILED(xml.Append(base_url));
+		CHECK_SETUP_FAILED(xml.Append(
+							   "          </mhp:URLBase>\n"
+							   "        </mhp:applicationTransport>\n"
+							   "      </mhp:Application>\n"));
+		CHECK_SETUP_FAILED(xml.Append(XML_AIT_END));
+
+		AITData expected_data;
+		CHECK_SETUP_FAILED(CreateNewApplicationOnData(&expected_data));
+		CHECK_SETUP_FAILED(CreateNewTransportOnApplication(expected_data.applications.Get(0)));
+		expected_data.applications.Get(0)->transports.Get(0)->protocol = 0x03;
+		CHECK_SETUP_FAILED(expected_data.applications.Get(0)->transports.Get(0)->base_url.Set(base_url));
+
+		TestAITParse(xml.CStr(), expected_data);
+
+		if (!TestAITParse(xml.CStr(), expected_data, TRUE))
+			ST_failed("set value of base_url when value=\'%s\' did not match expected value", base_url);
+	}
+
+
+	void TestApplicationTransportDVBTriplet(const char *dvb_triplet_content, unsigned short expected_orig_net_id,
+									unsigned short expected_ts_id, unsigned short expected_service_id)
+	{
+		OpString8 xml;
+		CHECK_SETUP_FAILED(xml.Set(XML_AIT_START));
+		CHECK_SETUP_FAILED(xml.Append(
+							   "      <mhp:Application>\n"
+							   "        <mhp:applicationTransport xsi:type=\"mhp:OCTransportType\">\n"
+							   "          <DVBTriplet "));
+		CHECK_SETUP_FAILED(xml.Append(dvb_triplet_content));
+		CHECK_SETUP_FAILED(xml.Append(
+							   "/>\n"
+							   "        </mhp:applicationTransport>\n"
+							   "      </mhp:Application>\n"));
+		CHECK_SETUP_FAILED(xml.Append(XML_AIT_END));
+
+		AITData expected_data;
+		CHECK_SETUP_FAILED(CreateNewApplicationOnData(&expected_data));
+		CHECK_SETUP_FAILED(CreateNewTransportOnApplication(expected_data.applications.Get(0)));
+		expected_data.applications.Get(0)->transports.Get(0)->protocol = 0x01;
+		expected_data.applications.Get(0)->transports.Get(0)->remote = TRUE;
+		expected_data.applications.Get(0)->transports.Get(0)->original_network_id = expected_orig_net_id;
+		expected_data.applications.Get(0)->transports.Get(0)->transport_stream_id = expected_ts_id;
+		expected_data.applications.Get(0)->transports.Get(0)->service_id = expected_service_id;
+
+		TestAITParse(xml.CStr(), expected_data);
+
+		if (!TestAITParse(xml.CStr(), expected_data, TRUE))
+			ST_failed("set values of DVBTriplet fields when value=\'%s\' did not match "
+					  "expected values \'%d\' \'%d\' \'%d\'", dvb_triplet_content,
+					  expected_orig_net_id, expected_ts_id, expected_service_id);
+	}
+
+
+	void TestApplicationTransportComponentTag(const char *component_tag, unsigned char expected_comp_tag)
+	{
+		OpString8 xml;
+		CHECK_SETUP_FAILED(xml.Set(XML_AIT_START));
+		CHECK_SETUP_FAILED(xml.Append(
+							   "      <mhp:Application>\n"
+							   "        <mhp:applicationTransport xsi:type=\"mhp:OCTransportType\">\n"
+							   "          <ComponentTag>"));
+		CHECK_SETUP_FAILED(xml.Append(component_tag));
+		CHECK_SETUP_FAILED(xml.Append(
+							   "          </ComponentTag>\n"
+							   "        </mhp:applicationTransport>\n"
+							   "      </mhp:Application>\n"));
+		CHECK_SETUP_FAILED(xml.Append(XML_AIT_END));
+
+		AITData expected_data;
+		CHECK_SETUP_FAILED(CreateNewApplicationOnData(&expected_data));
+		CHECK_SETUP_FAILED(CreateNewTransportOnApplication(expected_data.applications.Get(0)));
+		expected_data.applications.Get(0)->transports.Get(0)->protocol = 0x01;
+		expected_data.applications.Get(0)->transports.Get(0)->component_tag = expected_comp_tag;
+
+		TestAITParse(xml.CStr(), expected_data);
+
+		if (!TestAITParse(xml.CStr(), expected_data, TRUE))
+			ST_failed("set value of ComponentTag fieldes when value=\'%s\' did not match "
+					  "expected value \'%x\'", component_tag, expected_comp_tag);
+	}
+
+	void TestBoundaries(const char *boundaries, OpVector<OpString8> &expected_boundaries)
+	{
+		OpString8 xml;
+		CHECK_SETUP_FAILED(xml.Set(XML_AIT_START));
+		CHECK_SETUP_FAILED(xml.Append(
+							   "      <mhp:Application>\n"
+							   "        <mhp:applicationBoundary>\n"));
+		CHECK_SETUP_FAILED(xml.Append(boundaries));
+		CHECK_SETUP_FAILED(xml.Append(
+							   "        </mhp:applicationBoundary>\n"
+							   "      </mhp:Application>\n"));
+		CHECK_SETUP_FAILED(xml.Append(XML_AIT_END));
+
+		AITData expected_data;
+		CHECK_SETUP_FAILED(CreateNewApplicationOnData(&expected_data));
+
+
+		for (UINT32 i = 0; i < expected_boundaries.GetCount() ; i++)
+		{
+			CHECK_SETUP_FAILED(CreateNewBoundaryOnApplication(expected_data.applications.Get(0),
+															  expected_boundaries.Get(i)->CStr()));
+		}
+
+		TestAITParse(xml.CStr(), expected_data);
+
+		if (!TestAITParse(xml.CStr(), expected_data, TRUE))
+			ST_failed("set value of boundaries fieldes when value=\'%s\' did not match "
+					  "expected value", boundaries);
+	}
+}
+
+
+test("Test no data")
+{
+	const char *xml = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n";
+	AITData expected_data;
+	TestAITParse(xml, expected_data);
+}
+
+
+test("Test no application data")
+{
+	OpString8 xml;
+	CHECK_SETUP_FAILED_RETVAL(xml.Set(XML_AIT_START));
+	CHECK_SETUP_FAILED_RETVAL(xml.Append(
+								  "      <mhp:Application>\n"
+								  "      </mhp:Application>\n"));
+	CHECK_SETUP_FAILED_RETVAL(xml.Append(XML_AIT_END));
+
+	AITData expected_data;
+	CHECK_SETUP_FAILED_RETVAL(CreateNewApplicationOnData(&expected_data));
+
+	TestAITParse(xml.CStr(), expected_data);
+}
+
+
+test("Test empty application attributes")
+{
+	OpString8 xml;
+	CHECK_SETUP_FAILED_RETVAL(xml.Set(XML_AIT_START));
+	CHECK_SETUP_FAILED_RETVAL(xml.Append(
+								  "      <mhp:Application>\n"
+								  "        <mhp:appName></mhp:appName>\n"
+								  "        <mhp:applicationIdentifier></mhp:applicationIdentifier>\n"
+								  "        <mhp:applicationDescriptor></mhp:applicationDescriptor>\n"
+								  "        <mhp:applicationUsageDescriptor></mhp:applicationUsageDescriptor>\n"
+								  "        <mhp:applicationLocation></mhp:applicationLocation>\n"
+								  "      </mhp:Application>\n"));
+	CHECK_SETUP_FAILED_RETVAL(xml.Append(XML_AIT_END));
+
+	AITData expected_data;
+	CHECK_SETUP_FAILED_RETVAL(CreateNewApplicationOnData(&expected_data));
+
+	TestAITParse(xml.CStr(), expected_data);
+}
+
+
+test("Test string attributes in application data")
+{
+	OpString8 xml;
+	CHECK_SETUP_FAILED_RETVAL(xml.Set(XML_AIT_START));
+	CHECK_SETUP_FAILED_RETVAL(xml.Append(
+						   "      <mhp:Application>\n"
+						   "        <mhp:appName>Test application name</mhp:appName>\n"
+						   "        <mhp:applicationLocation>test_app</mhp:applicationLocation>\n"
+						   "      </mhp:Application>\n"));
+	CHECK_SETUP_FAILED_RETVAL(xml.Append(XML_AIT_END));
+
+	AITData expected_data;
+	CHECK_SETUP_FAILED_RETVAL(CreateNewApplicationOnData(&expected_data));
+	CHECK_SETUP_FAILED_RETVAL(expected_data.applications.Get(0)->name.Set("Test application name"));
+	CHECK_SETUP_FAILED_RETVAL(expected_data.applications.Get(0)->location.Set("test_app"));
+
+	TestAITParse(xml.CStr(), expected_data);
+}
+
+
+test("Test orgId  attribute")
+{
+	TestOrgId("", 0);
+	TestOrgId("0", 0);
+	TestOrgId("2", 2);
+	TestOrgId("99999", 99999);
+}
+
+
+test("Test appId  attribute")
+{
+	TestAppId("", 0);
+	TestAppId("0", 0);
+	TestAppId("12", 12);
+	TestAppId("65535", 65535);
+}
+
+
+test("Test controlCode attribute")
+{
+	TestControlCode("", AITApplicationDescriptor::CONTROL_CODE_UNKNOWN);
+	TestControlCode("mumbojumbo", AITApplicationDescriptor::CONTROL_CODE_UNKNOWN);
+	TestControlCode("AUTOSTART", AITApplicationDescriptor::CONTROL_CODE_AUTOSTART);
+	TestControlCode("PRESENT", AITApplicationDescriptor::CONTROL_CODE_PRESENT);
+	TestControlCode("KILL", AITApplicationDescriptor::CONTROL_CODE_KILL);
+	TestControlCode("DISABLED", AITApplicationDescriptor::CONTROL_CODE_DISABLED);
+}
+
+
+test("Test visibility attribute")
+{
+	TestVisibility("", AITApplicationDescriptor::VISIBILITY_UNKNOWN);
+	TestVisibility(" mumbo jumbo ", AITApplicationDescriptor::VISIBILITY_UNKNOWN);
+	TestVisibility("0", AITApplicationDescriptor::VISIBILITY_UNKNOWN);
+	TestVisibility("NOT_VISIBLE_ALL", AITApplicationDescriptor::VISIBILITY_NOT_VISIBLE_ALL);
+	TestVisibility("NOT_VISIBLE_USERS", AITApplicationDescriptor::VISIBILITY_NOT_VISIBLE_USERS);
+	TestVisibility("VISIBLE_ALL", AITApplicationDescriptor::VISIBILITY_VISIBLE_ALL);
+}
+
+
+test("Test serviceBound attribute")
+{
+	// default value is 'true' according to TS 102 809
+	TestServiceBoundFlag("", TRUE);
+	TestServiceBoundFlag("MumboJumbo", TRUE);
+	TestServiceBoundFlag("true", TRUE);
+	TestServiceBoundFlag("false", FALSE);
+	// case sensetive!
+	TestServiceBoundFlag("FALSE", TRUE);
+}
+
+
+test("Test priority attribute")
+{
+	//ipi:Hexadecimal8bit <xsd:pattern value="[0-9a-fA-F]{1,2}">
+
+	TestPriority("", 0);
+	TestPriority("mumbo..jumbo", 0);
+
+	TestPriority("0", 0x00);
+	TestPriority("1", 0x01);
+	TestPriority("9", 0x09);
+
+	TestPriority("10", 0x10);
+	TestPriority("19", 0x19);
+	TestPriority("a", 0x0a);
+	TestPriority("f", 0x0f);
+	TestPriority("bc", 0xbc);
+	TestPriority("FF", 0xff);
+
+/*  Validation supported yet!
+	TestPriority("419", 0);
+	TestPriority("-1", 0);
+	TestPriority("g", 0);
+	TestPriority("G", 0);
+*/
+}
+
+
+test("Test MhpVersion attributes")
+{
+	AITApplicationMhpVersion *expected_version;
+
+	expected_version = OP_NEW(AITApplicationMhpVersion, ());
+	CHECK_NOT_NULL_RETVAL(expected_version);
+	TestMhpVersion("", expected_version);
+
+	expected_version = OP_NEW(AITApplicationMhpVersion, ());
+	CHECK_NOT_NULL_RETVAL(expected_version);
+	TestMhpVersion(
+		"  <mhp:profile></mhp:profile>\n"
+		"  <mhp:versionMajor></mhp:versionMajor>\n"
+		"  <mhp:versionMinor></mhp:versionMinor>\n"
+		"  <mhp:versionMicro></mhp:versionMicro>\n", expected_version);
+
+	expected_version = OP_NEW(AITApplicationMhpVersion, ());
+	CHECK_NOT_NULL_RETVAL(expected_version);
+	expected_version->profile=1;
+	expected_version->version_major=2;
+	expected_version->version_minor=3;
+	expected_version->version_micro=4;
+	TestMhpVersion(
+		"  <mhp:profile>1</mhp:profile>\n"
+		"  <mhp:versionMajor>2</mhp:versionMajor>\n"
+		"  <mhp:versionMinor>3</mhp:versionMinor>\n"
+		"  <mhp:versionMicro>4</mhp:versionMicro>\n", expected_version);
+
+
+	expected_version = OP_NEW(AITApplicationMhpVersion, ());
+	CHECK_NOT_NULL_RETVAL(expected_version);
+	expected_version->profile=5;
+	expected_version->version_major=6;
+	expected_version->version_minor=7;
+	expected_version->version_micro=8;
+	TestMhpVersion(
+		"  <mhp:profile>5</mhp:profile>\n"
+		"  <mhp:versionMajor>6</mhp:versionMajor>\n"
+		"  <mhp:versionMinor>7</mhp:versionMinor>\n"
+		"  <mhp:versionMicro>8</mhp:versionMicro>\n", expected_version);
+}
+
+
+test("Test applicationUsageDescriptor attribute")
+{
+	TestApplicationUsageDescriptor("", 0);
+	TestApplicationUsageDescriptor("something", 0);
+	TestApplicationUsageDescriptor("urn:dvb:mhp:2009:digitalText", 1);
+}
+
+
+test("Test applicationTransport empty attributes")
+{
+	OpString8 xml;
+	CHECK_SETUP_FAILED_RETVAL(xml.Set(XML_AIT_START));
+	CHECK_SETUP_FAILED_RETVAL(xml.Append(
+						   "      <mhp:Application>\n"
+						   "        <mhp:applicationTransport xsi:type=\"mhp:HTTPTransportType\">\n"
+						   "        </mhp:applicationTransport>\n"
+						   "        <mhp:applicationTransport xsi:type=\"mhp:OCTransportType\">\n"
+						   "        </mhp:applicationTransport>\n"
+						   "        <mhp:applicationTransport>\n"
+						   "        </mhp:applicationTransport>\n"
+						   "      </mhp:Application>\n"));
+	CHECK_SETUP_FAILED_RETVAL(xml.Append(XML_AIT_END));
+
+	AITData expected_data;
+	CHECK_SETUP_FAILED_RETVAL(CreateNewApplicationOnData(&expected_data));
+	CHECK_SETUP_FAILED_RETVAL(CreateNewTransportOnApplication(expected_data.applications.Get(0)));
+	expected_data.applications.Get(0)->transports.Get(0)->protocol = 0x03;
+	CHECK_SETUP_FAILED_RETVAL(CreateNewTransportOnApplication(expected_data.applications.Get(0)));
+	expected_data.applications.Get(0)->transports.Get(1)->protocol = 0x01;
+	CHECK_SETUP_FAILED_RETVAL(CreateNewTransportOnApplication(expected_data.applications.Get(0)));
+
+	TestAITParse(xml.CStr(), expected_data);
+}
+
+
+test("Test HTTP applicationTransport URLBase attribute")
+{
+	TestApplicationTransportHTTP("");
+	TestApplicationTransportHTTP("http://a.url.of/some.kind");
+	TestApplicationTransportHTTP("randomvalue");
+}
+
+
+test("Test empty OC applicationTransport attributes")
+{
+	OpString8 xml;
+	CHECK_SETUP_FAILED_RETVAL(xml.Set(XML_AIT_START));
+	CHECK_SETUP_FAILED_RETVAL(xml.Append(
+						   "      <mhp:Application>\n"
+						   "        <mhp:applicationTransport xsi:type=\"mhp:OCTransportType\">\n"
+						   "          <DVBTriplet/>\n"
+						   "          <ComponentTag></ComponentTag>\n"
+						   "        </mhp:applicationTransport>\n"
+						   "      </mhp:Application>\n"));
+	CHECK_SETUP_FAILED_RETVAL(xml.Append(XML_AIT_END));
+
+	AITData expected_data;
+	CHECK_SETUP_FAILED_RETVAL(CreateNewApplicationOnData(&expected_data));
+	CHECK_SETUP_FAILED_RETVAL(CreateNewTransportOnApplication(expected_data.applications.Get(0)));
+	expected_data.applications.Get(0)->transports.Get(0)->protocol = 0x01;
+	expected_data.applications.Get(0)->transports.Get(0)->remote = TRUE;
+
+	TestAITParse(xml.CStr(), expected_data);
+}
+
+
+test("Test OC applicationTransport DvbTriplet attribute")
+{
+	TestApplicationTransportDVBTriplet("OrigNetId=\"1\" TSId=\"2\" ServiceId=\"3\"", 1, 2, 3);
+	TestApplicationTransportDVBTriplet("TSId=\"5\" ServiceId=\"6\" OrigNetId=\"4\"", 4, 5, 6);
+	TestApplicationTransportDVBTriplet("TSId=\"65535\" ServiceId=\"0\"", 0, 65535, 0);
+}
+
+
+test("Test OC applicationTransport ComponentTag attribute")
+{
+	TestApplicationTransportComponentTag("", 0x00);
+	TestApplicationTransportComponentTag("0", 0x00);
+	TestApplicationTransportComponentTag("1", 0x01);
+	TestApplicationTransportComponentTag("a", 0x0a);
+	TestApplicationTransportComponentTag("2b", 0x2b);
+	TestApplicationTransportComponentTag("ff", 0xff);
+}
+
+
+test("Test applicationBoundary attribute")
+{
+	OpVector<OpString8> expected_boundaries;
+
+	TestBoundaries("", expected_boundaries);
+	TestBoundaries("<BoundaryExtension></BoundaryExtension>\n", expected_boundaries);
+	TestBoundaries("<BoundaryExtension/>\n", expected_boundaries);
+
+	OpString8 b1;
+	CHECK_SETUP_FAILED_RETVAL(b1.Set("http://some.boundary/url"));
+	CHECK_SETUP_FAILED_RETVAL(expected_boundaries.Add(&b1));
+	TestBoundaries("<BoundaryExtension>http://some.boundary/url</BoundaryExtension>\n", expected_boundaries);
+
+	OpString8 b2;
+	CHECK_SETUP_FAILED_RETVAL(b2.Set("http://some.other.boundary/url"));
+	CHECK_SETUP_FAILED_RETVAL(expected_boundaries.Add(&b2));
+	TestBoundaries(
+		"<BoundaryExtension>http://some.boundary/url</BoundaryExtension>\n"
+		"<BoundaryExtension>http://some.other.boundary/url</BoundaryExtension>\n",
+		expected_boundaries);
+
+	OpString8 b3, b4, b5;
+	CHECK_SETUP_FAILED_RETVAL(b3.Set("url3"));
+	CHECK_SETUP_FAILED_RETVAL(expected_boundaries.Add(&b3));
+	CHECK_SETUP_FAILED_RETVAL(b4.Set("url4"));
+	CHECK_SETUP_FAILED_RETVAL(expected_boundaries.Add(&b4));
+	CHECK_SETUP_FAILED_RETVAL(b5.Set("url5"));
+	CHECK_SETUP_FAILED_RETVAL(expected_boundaries.Add(&b5));
+	TestBoundaries(
+		"<BoundaryExtension>http://some.boundary/url</BoundaryExtension>\n"
+		"<BoundaryExtension>http://some.other.boundary/url</BoundaryExtension>\n"
+		"<BoundaryExtension>url3</BoundaryExtension>\n"
+		"<BoundaryExtension>url4</BoundaryExtension>\n"
+		"<BoundaryExtension>url5</BoundaryExtension>\n",
+		expected_boundaries);
+
+}
+
+
+
+

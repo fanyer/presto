@@ -1,0 +1,383 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN" 
+          "http://www.w3.org/TR/html4/loose.dtd">
+<html>
+
+<head>
+<link rel=stylesheet href="../../../../coredoc/coredoc.css" />
+    <title>Rootstore server</title>
+</head>
+<body>
+<h1>The Extended Validation internal Logistics Bot (EViL-bot)</h1>
+
+<h3>About the server</h3>
+
+<p>The root store server is used to generate the files hosted by the certs.opera.com server. 
+These files contain information about which Certificate Autority certificates are authorized 
+as "pre-embedded" in Opera, as well as associated information, such as Extended Validation 
+information and certificates that are to be deleted or marked untrusted.</p>
+
+<p>To reduce the footprint of Opera's executable, as well as to increase the flexibility of 
+Opera's rootstore and reduce the delay between accepting a root and when it becomes available 
+to users, and need to ship new version with the new root(s), most of the roots are now (2008) 
+to be hosted in a central repository, certs.opera.com</p>
+
+<p>To reduce the attack surface for the system, it has the following attributes:</p>
+
+<ul>
+<li>All files being distributed are digitally signed by a RSA key that is at least 4096 bits long. 
+This key should be at least as strong as the keys of the certificates it is signing. A client must
+not accept a file from this system that does not verify.
+<ul>
+<li>TODO: Use Elliptic Curves Cryptography for the signtaure instead of RSA, as these will reduce the file footprint,
+as well as the CPU cost of signing and verifying the files.</li>
+<li>Rationale: We must do our best to prevent tampering with the files after they have been produced, and 
+we need to protect ourselves against the possibility that the public servers are compromised.</li>
+</ul></li>
+<li>The server will only be hosted on a TLS 1.0 (or later) server, using a 2048 bit RSA certificate, issued off 
+a recognized EV root.<ul><li>TODO: Use Authenticated only ciphers for the TLS communication.</li><li>Rationale: 
+Using a TLS server prevents replay attacks of old, but still valid files. Using an EV certificate is "necessary" 
+because the server will host our information about authorized EV roots. Using Authenticated-only ciphers will 
+increase the transparency of the data transfer, and as there is no sensitive data being transferred, encryption 
+is not really needed, only authentication (it may also slightly reduce the CPU cost)</li>
+</ul></li>
+<li>The production of the files should be performed on a server that is as separated from the network as 
+is practically possible<ul><li>Rationale: To be able to update the files automatically, the production 
+server must have direct unencrypted access to the signing keys; to reduce the likelyhood of a compromise 
+of this server it must be as separated as possible from the network, even an intranet. While a physically 
+and networkwise isolated machine would be ideal, this introduces a manual step into the process. A compromise 
+solution is then to have a non-Ethernet connection, e.g. a serial cable, between the production server and 
+a networked backend that forwards the files to the public servers.</li></ul></li>
+<li>The files must only be valid for a certain period of time, preferably 2-4 weeks, but less than 6 months, 
+and clients must not accept files that are not valid.
+<ul><li>Rationale: A limited validity period reduces the possibility of replay attacks, e.g. through compromised 
+TLS filtering proxies.</li></ul></li>
+<li>The list of EV-oids must only be valid for a certain period of time, preferably 2-4 weeks, but less than 6 months, 
+and less than the validity of the files, and clients must not accept files that are not valid. The validity period must 
+also not extend past the date at which the CA will loose the EV status, and must be reduced to an absolute minimum during 
+a grace period.
+<ul><li>Rationale: A limited validity period reduces the possibility of replay attacks, e.g. through compromised 
+TLS filtering proxies. EV OIDs are only valid for a limited period, depending on the result of an EV audit. Once the 
+CA moves out of this period, they enter a grace period where the get some time to get back in compliance, but during 
+this period information may become available that makes it necessary to remove the OIDs.</li></ul></li>
+</ul>
+
+<p>The above countermeasures are unable to counter these threats, and separate countermeasures
+    that are out of scope for this document must be taken to counter them:</p>
+<ul>
+<li>Compromised Opera executable where the signature check has been disabled</li>
+    <li>Compromised CVS respository</li>
+    <li>Renegade developers with CVS access</li>
+    <li>Renedade employees with physical access the to the production server(s)</li>
+    <li>Intruders that gain physical access to the production server(s)</li>
+
+</ul>
+
+<p>The current system is organized as follows:</p>
+<ul>
+<li>A production server (the "backmost"-end) that produces and signs the files. This
+    process is repeated every 6 hours.</li>
+    <li>A backend that fetches the produced files from the "backmost"-end and forwards them
+        to the public servers</li>
+    <li>One or more public frontends, secured with TLS using 2048 bit RSA key. This part
+        of the system must have enough capacity to serve all opera users at least once a
+        week</li>
+    <li>The Opera installation is coded to only open a single connection at a time to the
+        frontends to reduce load on the server.</li>
+</ul>
+
+<h3>Features of the system</h3>
+<ul>
+
+<li>A repository indexfile, listing all certificate files</li>
+    <li>An entry for a certificate may indicate that the certificate must be updated</li>
+    <li>An entry for a certficate may also indicate that another particular certificate
+        is required when that certificate is installed. This is particularly useful to push
+        EV releated roots, which are cross-signed by another root to make the chain acceptable
+        to clients without the new root.</li>
+    <li>The index may contain a list of certificates to be deleted.</li>
+    <li>The index may contain a list of certficates that are untrusted and should be added
+        to the list of untrusted certificates.</li>
+    <li>Each certificate file will contain the data for one or more certificates, data includes
+        name, the certificate and eventual EV information. If multiple certificates are
+        included they are either certificates that have the same ID, or certificates that
+        must be installed at the same time, due to the fact that they are either intermediates
+        or associated EV roots.</li>
+    <li>A list of roots that are authorized for EV, including the recogniozed EV-OIDs</li>
+</ul>
+<h3>Certificate IDs</h3>
+    <p>
+        A Certificate ID consists of a version number followed by the SHA-256 digest of
+        identifying data from a certificate. Two or more different certificate IDs exist for each certificate:</p>
+<ul>
+<li>Just the subject name (The client uses the issuer name)</li>
+    <li>The subject name and the public key</li>
+    <li>The subject name and an Authority &nbsp;key identifier.</li>
+</ul>
+    <p>
+        This variation allows multiple ways of finding a certificate, depending on what
+        data is available, e.g if the root is not available, the only thing you know is
+        the issuer name and maybe the Authority Key Identifier. Just the subject name is
+        not usually enough, as it is possible (but not recommended) that a certificate have
+        the same name as another, and only the public keys are different.</p>
+    <p>
+        The version number may be one byte or longer. The current version number is 0x01.
+        The version number identifies major changes in the fileformat and the signing key.
+        any given version of Opera can only recognize and retrieve a single version.</p>
+    <p>
+        In filenames the Certificate ID is encoded in hexadecimal for with the version number
+        hexencoded (uppercase letters) as a single block, followed immediately (without
+        any spacing characters) by the SHA-256 digest result coded in blocks of two bytes
+        (four hexadecimal digits) separated by "_" (underscore), and with ".xml" as the
+        extension. E.g. 010203_0405_0607_0809_0A0B_0C0D_0E0F_1011_1213_1415_1617_1819_1A1B_1C1D_1E1F_2021.xml</p>
+<h4>Version numbers</h4>
+<dl>
+<dt>0x01</dt>
+<dd>Debug version, not to be used by final version, but may be used by Technology Preview
+    and Alpha versions. Once a new version has been defined, this version must not be
+    hosted on the public servers. The signing key is a 4096 bit RSA key stored in the
+    rootstore module in the CVS repository. Signatures are encoded using PKCS #1.5</dd></dl>
+    <h3>
+        Fileformats</h3>
+    <h4>
+    </h4>
+    <h4>
+        General syntax</h4>
+    <p>
+        Each file consists of the xml header, verbatim as below, with the specified &lt;LF&gt;s</p>
+<pre>&lt;?xml version="1.0" encoding="utf-8" ?&gt;&lt;LF&gt;
+&lt;!-- [base64-encoded signature]&lt;LF&gt;
+--&gt;
+
+[XML content as specfied for each file]
+</pre>
+    <ul>
+<li>The first line and the comment-start tag MUST be present at the start of the file, exactly as outlined above.</li>
+        <li>The signature MUST be contained on a single line.</li>
+        <li>Content starting the line following the signature (after the LF), including the
+            comment end tag, are included in the calculation of the signature.</li>
+        <li>Textitems and values are always the first item after the start tag, and other content
+            that is not contained in a subelement will be ignored.</li>
+        <li>TODO: Add expiration info to signature.</li>
+    </ul>
+    <h4>
+        repository.xml</h4>
+    <dl>
+    <dt>Location and name</dt><dd>/&lt;version&gt;/repository.xml
+    </dd>
+    <dt>Structure</dt>
+    <dd>
+    <pre>&lt;repository&gt;
+&lt;repository-item&gt;[KeyID Hexadecimal form]
+    &lt;update-item&gt;[Expiration date ASN1 UTC Time or Generalized Time]&lt;/update-item&gt;
+    &lt;required-item&gt;[KeyID Hexadecimal form]&lt;/required-item&gt; 
+&lt;/repository-item&gt;
+&lt;delete-list&gt;
+    &lt;delete-item&gt;[KeyID Hexadecimal form]
+          &lt;delete-reason&gt;[Human readable explanation for the deletion]&lt;/delete-reason&gt;
+    &lt;/delete-item&gt;
+&lt;/delete-list&gt;
+&lt;untrusted-list&gt;
+    &lt;untrusted-item&gt;[KeyID Hexadecimal form]
+           &lt;untrusted-reason&gt;[Human readable explanation for the deletion]&lt;/untrusted-reason&gt;
+    &lt;/untrusted-item&gt;
+&lt;/untrusted-list&gt;
+&lt;/repository&gt; 
+</pre>
+    <dt>repository</dt>
+    <dd>Outer wrapper. Contains <em>repository-item</em>, <em>delete-list</em>
+        and <em>untrusted-list</em></dd>
+    <dt>repository-items</dt>
+    <dd>Specifies the ID of a repository item. May also contain <em>update-item</em> and <em>required-item</em> objects.</dd>
+    <dt>update-item</dt><dd>This certificate should be updated if the client have an old version of it. The value
+    of the field specifies the expiration date of the new certificate, as a copy of the xpiration field from the certificate 
+    (ASN.1 UTC or generalize time records). If the expiration date of the certificate stored by the client is earlier than
+    this date, the client should update it by downloading the identified certficate.</dd>
+    <dt>required-item</dt><dd>The value of this record is the ID of a certificate that the client SHOULD have if it has the 
+    certificate identified by the containing record. If it does not have the certificate identified by this record it should download it.</dd>
+    <dt>delete-list</dt>
+    <dd>Optional list of certificates that should be removed from the repository of an instance.
+    Each designate is indicated by the <em>delete-item</em> id. Deletion will only be
+    done if the certificate is "pre-shipped". This option SHOULD be used sparingly,
+    and only when users are in grave danger of being tricked by the use of such a certificate,
+    and in such cases the certificate should also be added to the untrusted list. A
+    possible second use is if a root was added to the repository by mistake.</dd>
+    <dt>delete-item</dt>
+    <dd>The certificate identified by this ID should be deleted if it was "pre-shipped". The
+    restriction to pre-shipped is due to the fact that users may install roots they
+    have authorized themselves; in such cases the user assumes responsibility for their
+    own actions. TODO: Implement restriction.</dd>
+    <dt>delete-reason</dt>
+    <dd>A short explanation of why the certificate is being deleted.</dd>
+    <dt>untrusted-list</dt>
+    <dd>Optional list of certificates that are to be added to the Untrusted certificate store in the instance.
+    Each such certificate is designated by an <em>untrusted-item</em> record, and if
+    the client does not have a certificate with the given ID &nbsp;in its untrusted
+    store, it should download the certificate and add it to the store. Files for these
+    certificates are located in the &lt;version&gt;/untrusted/ directory.</dd>
+    <dt>untrusted-item</dt>
+    <dd>The certificate identified by this ID should be added to the untrusted certificate store in the client if it is not already there.</dd>
+    <dt>untrusted-reason</dt>
+    <dd>This is a short explanation of why the certifiate is not trusted, and should be automatically blocked by clients.</dd>
+</dl>
+
+<h4>Certificate fields</h4>
+
+<p>This subsection details the fields that can be used to represent a certificate and associated data.</p>
+
+<dl>
+<dt>Location</dt>
+<dd>Inside a certificate encapsulating tag of a certificate file. See specific files.</dd>
+<dt>Format</dt>
+<dd><pre>&lt;issuer&gt;[text]&lt;/issuer&gt;
+&lt;shortname&gt;[Text]&lt;/shortname&gt;
+&lt;certificate-data&gt;[Base64 encoded data]&lt;/certificate-data&gt;
+&lt;ev-oid-text&gt;
+   &lt;ev-oid-entry&gt;[Object ID in numerical text form&lt;/ev-oid-entry&gt; 
+&lt;/ev-oid-text&gt;
+&lt;ev-oids&gt;[Base64 encoded data]&lt;/ev-oids&gt; </pre></dd>
+    <dt>issuer</dt>
+    <dd>This field contains the issuers name in a one-line format, e.g. "/C=JP/O=SECOM
+        Trust.net/OU=Security Communication RootCA1", generated from the subject field of
+        the certficate.</dd>
+    <dt>shortname</dt>
+    <dd>This optional field is a friendly name that
+            can be used to identify the certificate in the UI if the default name is too long
+            or not good enough.</dd>
+    <dt>certificate-data</dt>
+    <dd>This field contains the Base64
+            encoded binary data of the certificate. Whitespace to break the date into multiple
+            lines is permitted, and encouraged.</dd>
+    <dt>ev-oid-text</dt>
+    <dd>This is an optional
+            list of the EV OIDs recognized for the certificate. It may contain one or more <em>ev-oid-entry</em>
+    fields. The data are intended for human readers, to explain what is in the <em>ev-oids</em>
+    field.</dd>
+    <dt>ev-oid-entry</dt>
+    <dd>This field contain a single EV Object ID (OID) displayed
+            in the ASCII numerical form.</dd>
+    <dt>ev-oids</dt>
+    <dd>This field contains a sequence of EV-OIDs in DER format, followed by one or more signatures of the EV-OID sequence
+            encapsulated in OCTET STRING objects. At least one signature must be generated by
+            the key used to sign the containing file. TODO:
+        Add expiration data.</dd></dl>
+    <p>
+        &nbsp;</p>
+<h4>Certificate files</h4>
+
+<dl>
+<dt>Location</dt>
+<dd>Inside a file in the /&lt;version&gt;/roots folder of the repository.
+</dd>
+<dt>Format</dt>
+<dd><pre>&lt;certificates&gt; 
+   &lt;certificate&gt;
+       [Any Certificate fields]
+   &lt;/certificate&gt;
+&lt;/certificates&gt; </pre></dd>
+    <dt>certificates</dt><dd>This is the wrapper of one or more certificates, each
+        indicated by a <em>certificate</em> tag.</dd><dt>certificate</dt><dd>This field contains
+            a single certificate, as described in the certificate fields section. Any field
+            may be used, but the sequence MUST contain at least the <em>certificate-data</em>
+            tag. When processing this field the client must decode the certificate-data fields,
+            and add it, optionally overriding an older version of the certificate, and register
+            it in the appropriate authority or intermediate CA store with the shortname, warn
+            and deny flags (if any). If there are any EV OIDs supporting clients must register
+            them, provided they are valid, and remove registered EV OIDs if there are none in
+            this list.</dd></dl>
+    <p>
+        &nbsp;</p>
+
+<h4>Untrusted certificate files</h4>
+    <dl>
+        <dt>Location</dt>
+        <dd>
+            Inside a file in the /&lt;version&gt;/untrusted folder of the repository.
+        </dd>
+        <dt>Format</dt>
+        <dd>
+            <pre>&lt;untrusted-certificate&gt; 
+   &lt;subject&gt;[text]&lt;/subject&gt;
+   &lt;shortname&gt;[Text]&lt;/shortname&gt;
+   &lt;untrusted_reason&gt;[Text]&lt;/untrusted_reason&gt;
+   &lt;certificate-data&gt;[Base64 encoded data]&lt;/certificate-data&gt;   
+&lt;/untrusted-certificate&gt; </pre>
+        </dd>
+        <dt>untrusted-certificate</dt><dd>This field contains a single
+                certificate, as described in the certificate fields section. Only the <em>subject</em>, <em>shortname</em>,
+            <em>untrusted-reason</em> and <em>certificate-data</em> field be used,
+                but the sequence MUST contain at least the <em>certificate-data</em> tag. When processing
+                this field the client must decode the certificate-data fields, and add it to the untrusted
+            store, optionally overriding an older version of the certificate, with the specified
+            shortname in the entry. Some of these fields are explained in the certificate fields
+            section above.</dd><dt>subject</dt><dd>This field contains the issuers name in a one-line
+                format, e.g. "/C=JP/O=SECOM Trust.net/OU=Security Communication RootCA1", generated
+                from the subject field of the certficate. The reason it is called subject in this
+                file, and issuer in the other is that trusted certificate is always an issuer, while
+                in this case we are always dealing with a certificate issued to a subject.</dd><dt>untrusted-reason</dt><dd>This
+                    is a short explanation for why the certificate is not trusted. The shortname should
+                    contain an even shorter version of this.
+                </dd>
+    </dl>
+
+<h4>EV-OID file files</h4>
+    <dl>
+        <dt>Location</dt>
+        <dd>
+            /&lt;version&gt;/ev-oids.xml</dd><dt>Format</dt>
+        <dd>
+            <pre>&lt;ev-oid-list&gt;
+   &lt;issuer&gt;
+     &lt;issuer-name&gt; [text] &lt;/issuer-name&gt; 
+     &lt;issuer-id&gt; [Base64 encoded subject name] &lt;/issuer-id&gt; 
+     &lt;issuer-key&gt; [Base64 encoded SHA-1 hash of certificate's public key] &lt;/issuer-key&gt; 
+     &lt;ev-oid-text&gt;
+         &lt;ev-oid-entry&gt;[Object ID in numerical text form&lt;/ev-oid-entry&gt; 
+     &lt;/ev-oid-text&gt;
+     &lt;ev-oids&gt;[Base64 encoded data]&lt;/ev-oids&gt;
+   &lt;/issuer&gt;
+&lt;/ev-oid-list&gt;</pre>
+        </dd>
+        <dt>ev-oid-list</dt><dd>This contains a list of <em>issuer</em>s, each containing the
+            EV specification for one root certificate.</dd><dt>issuer</dt><dd>This contains the
+                data needed to identify the root, and the EV-OIDs associated with the root. When
+                reading this field the client must locate the root certificate with the given issuer-id
+                (subject name) and a public key that matches the issuer-key hash-id, and add the
+                associated EV OIDs to the entry. If a root prevsiously had EV OIDs associated with
+                it but does not have in the current version, the OIDs must be removed. The definition
+                of ev-oid-text and ev-oids is the same as in the above certificate fields defintions.</dd><dt>issuer-name</dt><dd>This field contains the issuers name in a one-line
+                format, e.g. "/C=JP/O=SECOM Trust.net/OU=Security Communication RootCA1", generated
+                from the subject field of the certficate.</dd><dt>issuer-id</dt><dd>This is a Base64
+                    encoding of the root certificate's subject name. This must be, together with the
+                    issuer-key field, a complete match with the certificate to be associated with OIDs.</dd><dt>issuer-key</dt><dd>This
+                        is a Base64 encoding of the SHA-1 digest of the certificate's public key. TODO:
+                        Change to using SHA-256?</dd></dl>
+    <h2>
+        File Generator system</h2>
+    <p>
+        The backmost-end, an almost isolated machine, runs a program called .... "program"
+        build the files in the repository. Prior to being run all files and directories
+        in the output directory must be deleted. After the program has run the content in
+        the output directory is copied to the public servers.</p>
+    <p>
+        The generator program uses OpenSSL to perform the cryptographic operations, as well
+        as many of the IO operations.</p>
+    <p>
+        The generators flow is as follows:</p>
+    <ul>
+        <li>The output folders are created</li>
+        <li>The signing keys are loaded</li>
+        <li>An internal &nbsp;list of the certificates, and which files they are to be written
+            to is created.</li>
+        <li>The repository index is written to a memory file for signing</li>
+        <li>For each item in the index a certificate file is created, signed and saved to disk</li>
+        <li>If there are any "delete" items, they are written to the repository index next</li>
+        <li>Last, all the Untrusted items are written to the repository index, and certificate
+            files for each added. TODO: what about duplicates?</li>
+        <li>Then each root that have been authorized for EV is listed in the EV-OIDs list.</li>
+    </ul>
+    <p>
+        In case of an error, the application will exit with an error code.</p>
+    <p>
+        &nbsp;</p>
+</body>
+</html>

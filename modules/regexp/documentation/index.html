@@ -1,0 +1,265 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN" 
+          "http://www.w3.org/TR/html4/loose.dtd">
+<html>
+
+<head>
+<link rel=stylesheet href="../../coredoc/coredoc.css" />
+<title>Regular Expression Engine</title>
+</head>
+
+<body>
+
+<h1>Regular Expression Engine</h1>
+
+$Id$
+
+<h2>Overview</h2>
+
+<p>The regexp module provides a regular expression compiler and a
+matcher engine.  Both correspond to regular expressions as defined by
+the ECMAScript specification, ES-262 3rd edition (<a
+href="http://www.ecma-international.org/publications/standards/Ecma-262.htm">download
+here</a>), plus some extensions (documented below).</p>
+
+<p>Compatibility with the ECMAScript specification is a nonnegotiable
+requirement: the ECMAScript engine uses the regexp module for its
+regular expression work.</p>
+
+<p>The current version, <b>fsa_1</b>, was extracted from the
+<b>linear_b_2</b> and <b>futhark</b> ECMAScript engines.  Its focus is
+on correctness, footprint, and low memory use, and not so much on
+performance.</p>
+
+
+<h2>Use cases</h2>
+
+<p>There are several use cases for this module:</p>
+<dl>
+<dt>ECMAScript regular expression matching
+
+<dd>Regular expressions are used extensively in scripting.  To support
+    scripting, the regexp module must support the standard, but must also
+	support common extensions, and must have good performance both for
+	compiling and executing regular expressions.
+
+<dt>Regular expression matching in M2
+
+<dd>No information is available right now about how M2 uses the regexp
+    engine
+
+<dt>Regular expression matching in Webforms
+
+<dd>No information is available right now about how Webforms uses the
+    regexp engine.
+
+</dl>
+
+
+<h2>APIs</h2>
+
+<p>The engine exports a convenient API for use by other modules that
+need to do basic regular expression matching, and a less convenient
+API for use by the ECMAScript engine.</p>
+
+<p><a href="api/index.html">Generated API documentation</a>, if you've run
+Doxygen on this module.</p>
+
+
+<h2>Features</h2>
+
+<p>There are no features used or defined by this module.</p>
+
+
+<h2>Subset engine</h2>
+
+<p>For footprint-constrained systems the module can be configured to
+use a subset engine.  This accepts a "useful" subset of the regular
+expression language, and saves a few KB of code.  However, if you use
+this you will run into sites that don't work, and perhaps other
+regressions.  The subset engine is not very well tested.</p>
+
+<p>The subset engine is controlled by TWEAK_REGEXP_SUBSET; see the
+file module.tweaks for more information.</p>
+
+
+<h2>Extensions</h2>
+
+<p>A brief summary of extensions:</p>
+<ul>
+
+<li>Backreferences out of range are treated as decimal escapes, ie, \9 is
+    the TAB character if the regexp has less than 9 submatches.
+
+<li>The characters "]", "{", and "}" stand for themselves in Atom contexts.
+
+<li>Octal escapes are implemented where needed, so \011 is the TAB character.
+    However, the interpretation that ES-262 2nd edition [sic!] gives to
+    escape sequences, where \44 is interpreted as octal, is not implemented,
+    even though Netscape^WMozilla^WFirefox implements it that way.
+
+<li>Hexadecimal and unicode escapes without the requisite number of digits 
+    (two and four, respectively) are treated as strings of characters.
+
+<li>Character set escapes are allowed inside character sets, eg [\w123].
+
+</ul>
+
+<p>For more information search the module sources for the string
+REGEXP_STRICT (this setting can be controlled by TWEAK_REGEXP_STRICT).
+Each extension is documented in the source.</p>
+
+
+<h2>Memory use</h2>
+
+<h3>Introduction</h3>
+
+<p>There are two APIs, the <code>OpRegExp</code> API and the
+<code>RegExp</code> API.  The former API is a simple wrapper around
+the latter.  It has no interfaces that Leave, and storage management
+is by simple deletion of the <code>OpRegExp</code> object.  For this
+reason, only the <code>RegExp</code> API will be covered in the
+following.  Most points apply to the <code>OpRegExp</code> API as
+well.</p>
+
+
+<h3>Flow</h3>
+
+<p>Regular expressions (<code>RegExp</code> objects) are simple
+abstract data types.  One is created by invoking
+<code>new&nbsp;RegExp</code> and then calling the <code>Init()</code>
+method on the object.  <code>RegExp</code> objects can be shared and
+contain a reference counter, initially 1.  When you want to delete it,
+just call <code>DecRef()</code> on the <code>RegExp</code> object.  If
+the counter is 0, the object will be deleted immediately.</p>
+
+<p>If the call to <code>Init()</code> fails for any reason then the
+<code>RegExp</code> cannot be used.  Delete it by calling
+<code>DecRef()</code>.</p>
+
+<p>If <code>Init()</code> succeeds, then the <code>RegExp</code>
+represents a compiled regular expression and it has some local
+heap-allocated data.  These data are deleted when the
+<code>RegExp</code> object is deleted.</p>
+
+<p>A <code>RegExp</code> object can then be used for multiple
+matchings.  Some heap memory is allocated during matching for working
+storage, but is always deallocated before the matcher returns.</p>
+
+
+<h3>OOM policies</h3>
+
+<p><code>TRAP/LEAVE</code> is used extensively for signalling OOM.
+This is convenient because most memory is allocated from a region data
+structure and not directly from the heap, so cleaning up the allocated
+memory after an OOM event is easy and cheap.</p>
+
+<p>(Client code that does not want to handle exceptions can use the
+<code>OpRegExp</code> API instead.)</p>
+
+
+<h3>Who is handling OOM?</h3>
+
+<p>OOM events are always returned from calls to the APIs as exceptions
+and must be handled on the outside, but the module cleans up after
+itself on the way out and there is no need to call any cleanup actions
+inside the module.</p>
+
+<p>Client code should be sure to delete regular expressions whose
+construction failed (by decrementing their reference counters on the
+<code>RegExp</code> object).  Regular expression matchings that fail
+due to OOM will not affect the <code>RegExp</code> objects, and the
+object may be used for subsequent matchings.</p>
+
+
+<h3>Heap memory usage</h3>
+
+<p>Heap memory is used during compilation and during matching.  The
+amount allocated during compilation is roughly proportional to the
+size, measured in characters, of the regular expression.  The amount
+allocated during matching is in the worst case proportional to the
+length of the input.  Some optimizations are possible to make the
+worst case less likely (the intensely curious are encouraged to read
+<a href="TODO">the to-do list</a>).</p>
+
+<p>FIXME: more here</p>
+
+
+<h3>Stack memory usage</h3>
+
+<p>Stack memory is used primarily during compilation.  The amount used
+is proportional to the nesting level of the regular expression:
+parenthesized subexpression are parsed by a new activation of the
+parser.  Most regular expressions are very shallow, so in practice
+this is not an issue.  It is however possible to construct regular
+expressions that will blow any stack on any computer.  The easiest way
+to fix this, should it be necessary, is to put a static bound on the
+number of nesting levels.</p>
+
+
+<h3>Static memory usage</h3>
+
+<p>The module has no global variables at this time and has no static
+data.  No data are cached on behalf of the module, and there are no
+data to free on exit.</p>
+
+
+<h3>Temporary buffers</h3>
+
+<p>The module does not use the tempbuffers from the memory manager.</p>
+
+
+<h3>Memory tuning</h3>
+
+<p>Memory usage (and performance) can be tuned by adjusting some of
+the obscure parameters in module.tweaks, but this should not generally
+be necessary.  See comments in module.tweaks.</p>
+
+
+<h3>Tests</h3>
+
+<p>Right now there are no selftests that test for leaks or OOM.
+However, some tests that can be used to test memory behavior are:</p>
+<ul>
+<li>Large expressions
+<li>Complicated expressions (involving many different operators and strings)
+</ul>
+<p>I plan to add some of these, and leak checks, to the selftests.</p>
+
+
+<h3>Coverage</h3>
+
+<p>Coverage can be had by running the ECMAScript test suite (even just
+the <code>RegExp</code> tests).  Eventually many of these will be
+moved into the regexp module and coverage can be had by running
+selftest.</p>
+
+
+<h3>Design choices</h3>
+
+<p>By allocating most objects from regions, we take the pressure off
+<code>malloc()</code> and reduce the storage needs (no object headers
+are needed).  Also, this simplifies memory management and virtually
+guarantees that leaks will not occur.</p>
+
+<p>The matcher engine uses some auxiliary data structures.  These too
+are allocated from regions, but in addition the objects in these
+regions are managed by a simple garbage collector (because liveness is
+very hard to track accurately).  See the implementation documentation
+for more information.</p>
+
+
+<h3>Suggestions and improvements</h3>
+
+<p>A number of issues are mentioned in <a href="TODO">the to-do
+list</a>.</p>
+
+
+<h2>Implementation</h2>
+
+<p>The implementation is described in general terms in a large comment
+block at the beginning of the file <a
+href="api/regexp__advanced__api_8cpp.html">regexp_advanced_api.cpp</a>.</p>
+
+
+</body>
+</html>

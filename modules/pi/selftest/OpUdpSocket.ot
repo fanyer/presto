@@ -1,0 +1,831 @@
+/* -*- Mode: c++; tab-width: 4; indent-tabs-mode: t; c-basic-offset: 4; c-file-style:"stroustrup" -*-
+**
+** Copyright (C) 1995-2009 Opera Software AS.  All rights reserved.
+**
+** This file is part of the Opera web browser.  It may not be distributed
+** under any circumstances.
+**
+*/
+
+group "pi.opudpsocket";
+require init;
+require OPUDPSOCKET;
+
+include "modules/hardcore/timer/optimer.h";
+include "modules/pi/network/OpUdpSocket.h";
+include "modules/pi/network/OpSocketAddress.h";
+include "modules/pi/network/OpNetworkInterface.h";
+include "modules/url/url_socket_wrapper.h";
+
+global
+{
+	int g_bind_port = 0x4f72;
+
+#define ASYNC_VERIFY(expr) do { if (!(expr)) { Failed(#expr, __FILE__, __LINE__); return; } } while (0)
+
+	class AsyncTest : public OpUdpSocketListener, public OpTimer, public OpTimerListener
+	{
+	private:
+		/** When TRUE, the test is supposed to time out. When FALSE, the test has failed if it times out. */
+		BOOL expect_timeout;
+
+		void OnTimeOut(OpTimer* timer)
+		{
+			ASYNC_VERIFY(!"Test unexpectedly timed out");
+		}
+
+	protected:
+		char* teststr;
+		char* buf;
+		unsigned int teststr_len;
+		unsigned int bufsize;
+
+		const int bind_port;
+
+		void Failed(const char* expr, const char* file, int line) {
+			char message[1000]; /* ARRAY OK 2009-02-16 mstensho */
+
+			if (op_strlen(expr) + op_strlen(file) + sizeof(line)*3 + 30 > sizeof(message))
+				ST_failed("failed");
+			else
+			{
+				op_sprintf(message, "%s:%d: false expression: %s\n", file, line, expr);
+				ST_failed(message);
+			}
+
+			OP_DELETE(this);
+		}
+		void Passed() { ST_passed(); OP_DELETE(this); }
+
+		virtual void StartTest() = 0;
+
+	public:
+		AsyncTest(BOOL expect_timeout = FALSE) :
+			expect_timeout(expect_timeout), teststr(0), buf(0), teststr_len(0), bufsize(0), bind_port(0x4f72)
+		{
+			SetTimerListener(this);
+		}
+
+		~AsyncTest()
+		{
+			op_free(teststr); OP_DELETEA(buf);
+		}
+
+		void Run()
+		{
+			bufsize = 100;
+			buf = OP_NEWA(char, bufsize);
+			ASYNC_VERIFY(buf);
+
+			ASYNC_VERIFY(teststr = op_strdup("Async hello!"));
+			teststr_len = op_strlen(teststr) + 1;
+
+			Start(500); // Start the timer.
+			StartTest();
+		}
+	};
+
+	class BindSendReceiveTest : public AsyncTest
+	{
+	private:
+		OpUdpSocket* socket1;
+		OpUdpSocket* socket2;
+		OpSocketAddress* bind_address;
+		OpSocketAddress* datagram_address;
+
+	public:
+		BindSendReceiveTest() :
+			socket1(0), socket2(0), bind_address(0), datagram_address(0) { }
+		~BindSendReceiveTest()
+		{
+			OP_DELETE(socket1); OP_DELETE(socket2); OP_DELETE(bind_address); OP_DELETE(datagram_address);
+		}
+
+		void StartTest()
+		{
+				// receiving socket
+			ASYNC_VERIFY(OpStatus::IsSuccess(SocketWrapper::CreateUDPSocket(&socket1, this, SocketWrapper::NO_WRAPPERS)));
+				// sending socket
+			ASYNC_VERIFY(OpStatus::IsSuccess(SocketWrapper::CreateUDPSocket(&socket2, 0, SocketWrapper::NO_WRAPPERS)));
+
+			ASYNC_VERIFY(OpStatus::IsSuccess(OpSocketAddress::Create(&datagram_address)));
+
+			ASYNC_VERIFY(OpStatus::IsSuccess(OpSocketAddress::Create(&bind_address)));
+			ASYNC_VERIFY(OpStatus::IsSuccess(bind_address->FromString(UNI_L("127.0.0.1"))));
+			bind_address->SetPort(bind_port);
+
+			// Bind socket1
+
+			ASYNC_VERIFY(OpStatus::IsSuccess(socket1->Bind(bind_address)));
+
+			// Send to the bound address on socket2
+
+			ASYNC_VERIFY(OpStatus::IsSuccess(socket2->Send(teststr, teststr_len, bind_address)));
+
+			// test continues in OnSocketDataReady().
+		}
+
+		void OnSocketDataReady(OpUdpSocket* socket)
+		{
+			ASYNC_VERIFY(socket == socket1);
+
+			// Receive data on socket1
+
+			unsigned int bytes_received;
+			ASYNC_VERIFY(OpStatus::IsSuccess(socket->Receive(buf, bufsize, datagram_address, &bytes_received)));
+
+			// Verify data
+
+			ASYNC_VERIFY(bytes_received == teststr_len);
+			ASYNC_VERIFY(!op_memcmp(buf, teststr, teststr_len));
+
+			// Verify that the remote host address is the same
+
+			ASYNC_VERIFY(datagram_address->IsHostEqual(bind_address));
+
+			// Verify that remote port number is non-zero
+
+			ASYNC_VERIFY(datagram_address->Port() != 0);
+
+			Passed();
+		}
+	};
+
+	class BindSendToSelfReceiveTest : public AsyncTest
+	{
+	private:
+		OpUdpSocket* socket1;
+		OpSocketAddress* bind_address;
+		OpSocketAddress* datagram_address;
+
+	public:
+		BindSendToSelfReceiveTest() :
+			socket1(0), bind_address(0), datagram_address(0) { }
+		~BindSendToSelfReceiveTest()
+		{
+			OP_DELETE(socket1); OP_DELETE(bind_address); OP_DELETE(datagram_address);
+		}
+
+		void StartTest()
+		{
+			ASYNC_VERIFY(OpStatus::IsSuccess(SocketWrapper::CreateUDPSocket(&socket1, this, SocketWrapper::NO_WRAPPERS)));
+
+			ASYNC_VERIFY(OpStatus::IsSuccess(OpSocketAddress::Create(&datagram_address)));
+
+			ASYNC_VERIFY(OpStatus::IsSuccess(OpSocketAddress::Create(&bind_address)));
+			ASYNC_VERIFY(OpStatus::IsSuccess(bind_address->FromString(UNI_L("127.0.0.1"))));
+			bind_address->SetPort(bind_port);
+
+			// Bind socket1
+
+			ASYNC_VERIFY(OpStatus::IsSuccess(socket1->Bind(bind_address)));
+
+			// Send to the bound address on socket1
+
+			ASYNC_VERIFY(OpStatus::IsSuccess(socket1->Send(teststr, sizeof(teststr), bind_address)));
+
+			// test continues in OnSocketDataReady().
+		}
+
+		void OnSocketDataReady(OpUdpSocket* socket)
+		{
+			ASYNC_VERIFY(socket == socket1);
+
+			// Receive data on socket1
+
+			unsigned int bytes_received;
+			ASYNC_VERIFY(OpStatus::IsSuccess(socket1->Receive(buf, bufsize, datagram_address, &bytes_received)));
+
+			// Verify data
+
+			ASYNC_VERIFY(bytes_received == sizeof(teststr));
+			ASYNC_VERIFY(!op_memcmp(buf, teststr, sizeof(teststr)));
+
+			// Verify remote address
+
+			ASYNC_VERIFY(datagram_address->IsEqual(bind_address));
+
+			Passed();
+		}
+	};
+
+	class BindMulticastSendReceiveTest : public AsyncTest
+	{
+	private:
+		OpUdpSocket* socket1;
+		OpUdpSocket* socket2;
+		OpSocketAddress* bind_address;
+		OpSocketAddress* datagram_address;
+
+	public:
+		BindMulticastSendReceiveTest() :
+			socket1(0), socket2(0), bind_address(0), datagram_address(0) { }
+		~BindMulticastSendReceiveTest()
+		{
+			OP_DELETE(socket1); OP_DELETE(socket2); OP_DELETE(bind_address); OP_DELETE(datagram_address);
+		}
+
+		void StartTest()
+		{
+			ASYNC_VERIFY(OpStatus::IsSuccess(SocketWrapper::CreateUDPSocket(&socket1, this, SocketWrapper::NO_WRAPPERS)));
+			ASYNC_VERIFY(OpStatus::IsSuccess(SocketWrapper::CreateUDPSocket(&socket2, 0, SocketWrapper::NO_WRAPPERS)));
+
+			ASYNC_VERIFY(OpStatus::IsSuccess(OpSocketAddress::Create(&datagram_address)));
+
+			ASYNC_VERIFY(OpStatus::IsSuccess(OpSocketAddress::Create(&bind_address)));
+			ASYNC_VERIFY(OpStatus::IsSuccess(bind_address->FromString(UNI_L("224.1.1.1"))));
+			bind_address->SetPort(bind_port);
+
+			// Bind socket1
+
+			ASYNC_VERIFY(OpStatus::IsSuccess(socket1->Bind(bind_address, OpUdpSocket::MULTICAST)));
+
+			// Send to the bound address on socket2
+
+			ASYNC_VERIFY(OpStatus::IsSuccess(socket2->Send(teststr, sizeof(teststr), bind_address, OpUdpSocket::MULTICAST)));
+
+			// test continues in OnSocketDataReady().
+		}
+
+		void OnSocketDataReady(OpUdpSocket* socket)
+		{
+			ASYNC_VERIFY(socket == socket1);
+
+			// Receive data on socket1
+
+			unsigned int bytes_received;
+			ASYNC_VERIFY(OpStatus::IsSuccess(socket1->Receive(buf, bufsize, datagram_address, &bytes_received)));
+
+			// Verify data
+
+			ASYNC_VERIFY(bytes_received == sizeof(teststr));
+			ASYNC_VERIFY(!op_memcmp(buf, teststr, sizeof(teststr)));
+
+			Passed();
+		}
+	};
+
+#ifdef PI_NETWORK_INTERFACE_MANAGER
+	class BindMulticastToSpecificInterfaceSendReceiveTest : public AsyncTest
+	{
+	private:
+		OpUdpSocket* socket1;
+		OpUdpSocket* socket2;
+		OpSocketAddress* bind_address;
+		OpSocketAddress* datagram_address;
+		OpSocketAddress* local_address;
+		OpNetworkInterfaceManager* interface_manager;
+
+	public:
+		BindMulticastToSpecificInterfaceSendReceiveTest() :
+			socket1(0), socket2(0), bind_address(0), datagram_address(0), local_address(0), interface_manager(0) { }
+		~BindMulticastToSpecificInterfaceSendReceiveTest()
+		{
+			OP_DELETE(socket1); OP_DELETE(socket2); OP_DELETE(bind_address); OP_DELETE(datagram_address); OP_DELETE(local_address); OP_DELETE(interface_manager);
+		}
+
+		OP_STATUS TryNextInterface()
+		{
+			OP_DELETE(socket1);
+			socket1 = 0;
+			OP_DELETE(socket2);
+			socket2 = 0;
+
+			BOOL found = FALSE;
+
+			while (OpNetworkInterface* i = interface_manager->GetNextInterface())
+			{
+				RETURN_IF_ERROR(OpStatus::IsSuccess(i->GetAddress(local_address)));
+
+				OpSocketAddressNetType net_type = local_address->GetNetType();
+
+				if (net_type == NETTYPE_PRIVATE || net_type == NETTYPE_PUBLIC)
+				{
+					found = TRUE;
+					break;
+				}
+			}
+
+			if (!found)
+				return OpStatus::ERR;
+
+			RETURN_IF_ERROR(SocketWrapper::CreateUDPSocket(&socket1, this, SocketWrapper::NO_WRAPPERS, local_address));
+			RETURN_IF_ERROR(SocketWrapper::CreateUDPSocket(&socket2, 0, SocketWrapper::NO_WRAPPERS, local_address));
+
+			RETURN_IF_ERROR(OpSocketAddress::Create(&datagram_address));
+
+			RETURN_IF_ERROR(OpSocketAddress::Create(&bind_address));
+			RETURN_IF_ERROR(bind_address->FromString(UNI_L("224.1.1.1")));
+			bind_address->SetPort(bind_port);
+
+			// Bind socket1
+
+			RETURN_IF_ERROR(socket1->Bind(bind_address, OpUdpSocket::MULTICAST));
+
+			// Send to the bound address on socket2
+
+			RETURN_IF_ERROR(socket2->Send(teststr, sizeof(teststr), bind_address, OpUdpSocket::MULTICAST));
+
+			return OpStatus::OK;
+		}
+
+		void StartTest()
+		{
+			ASYNC_VERIFY(OpStatus::IsSuccess(OpSocketAddress::Create(&local_address)));
+			ASYNC_VERIFY(OpStatus::IsSuccess(OpNetworkInterfaceManager::Create(&interface_manager, 0)));
+
+			ASYNC_VERIFY(OpStatus::IsSuccess(interface_manager->BeginEnumeration()));
+
+			ASYNC_VERIFY(OpStatus::IsSuccess(TryNextInterface()));
+
+			// test continues in OnTimeOut() or OnSocketDataReady().
+		}
+
+		void OnTimeOut(OpTimer* timer)
+		{
+			/* Timed out. Try next network interface. At least one of them
+			   should work, given that BindMulticastSendReceiveTest passed. */
+
+			ASYNC_VERIFY(OpStatus::IsSuccess(TryNextInterface()));
+		}
+
+		void OnSocketDataReady(OpUdpSocket* socket)
+		{
+			ASYNC_VERIFY(socket == socket1);
+
+			// Receive data on socket1
+
+			unsigned int bytes_received;
+			ASYNC_VERIFY(OpStatus::IsSuccess(socket1->Receive(buf, bufsize, datagram_address, &bytes_received)));
+
+			// Verify data
+
+			ASYNC_VERIFY(bytes_received == sizeof(teststr));
+			ASYNC_VERIFY(!op_memcmp(buf, teststr, sizeof(teststr)));
+
+			Passed();
+		}
+	};
+#endif // PI_NETWORK_INTERFACE_MANAGER
+
+	class BindSendBroadcastReceiveTest : public AsyncTest
+	{
+	private:
+		OpUdpSocket* socket1;
+		OpUdpSocket* socket2;
+		OpSocketAddress* bind_address;
+		OpSocketAddress* broadcast_address;
+		OpSocketAddress* datagram_address;
+
+	public:
+		BindSendBroadcastReceiveTest() :
+			socket1(0), socket2(0), bind_address(0), broadcast_address(0), datagram_address(0) { }
+		~BindSendBroadcastReceiveTest()
+		{
+			OP_DELETE(socket1); OP_DELETE(socket2); OP_DELETE(bind_address); OP_DELETE(broadcast_address); OP_DELETE(datagram_address);
+		}
+
+		void StartTest()
+		{
+			ASYNC_VERIFY(OpStatus::IsSuccess(SocketWrapper::CreateUDPSocket(&socket1, this, SocketWrapper::NO_WRAPPERS)));
+			ASYNC_VERIFY(OpStatus::IsSuccess(SocketWrapper::CreateUDPSocket(&socket2, 0, SocketWrapper::NO_WRAPPERS)));
+
+			ASYNC_VERIFY(OpStatus::IsSuccess(OpSocketAddress::Create(&datagram_address)));
+
+			ASYNC_VERIFY(OpStatus::IsSuccess(OpSocketAddress::Create(&bind_address)));
+			bind_address->SetPort(bind_port);
+
+			ASYNC_VERIFY(OpStatus::IsSuccess(OpSocketAddress::Create(&broadcast_address)));
+			ASYNC_VERIFY(OpStatus::IsSuccess(broadcast_address->FromString(UNI_L("255.255.255.255"))));
+			broadcast_address->SetPort(bind_port);
+
+			// Bind socket1
+
+			ASYNC_VERIFY(OpStatus::IsSuccess(socket1->Bind(bind_address)));
+
+			// Send to the bound address on socket2
+
+			ASYNC_VERIFY(OpStatus::IsSuccess(socket2->Send(teststr, sizeof(teststr), broadcast_address, OpUdpSocket::BROADCAST)));
+
+			// test continues in OnSocketDataReady().
+		}
+
+		void OnSocketDataReady(OpUdpSocket* socket)
+		{
+			ASYNC_VERIFY(socket == socket1);
+
+			// Receive data on socket1
+
+			unsigned int bytes_received;
+			ASYNC_VERIFY(OpStatus::IsSuccess(socket1->Receive(buf, bufsize, datagram_address, &bytes_received)));
+
+			// Verify data
+
+			ASYNC_VERIFY(bytes_received == sizeof(teststr));
+			ASYNC_VERIFY(!op_memcmp(buf, teststr, sizeof(teststr)));
+
+			Passed();
+		}
+	};
+
+	class BindReceiveTest : public AsyncTest
+	{
+	private:
+		OpUdpSocket* socket1;
+		OpSocketAddress* bind_address;
+		OpSocketAddress* datagram_address;
+
+	public:
+		BindReceiveTest() :
+			socket1(0), bind_address(0), datagram_address(0) { }
+		~BindReceiveTest()
+		{
+			OP_DELETE(socket1); OP_DELETE(bind_address); OP_DELETE(datagram_address);
+		}
+
+		void StartTest()
+		{
+			ASYNC_VERIFY(OpStatus::IsSuccess(SocketWrapper::CreateUDPSocket(&socket1, 0, SocketWrapper::NO_WRAPPERS)));
+
+			ASYNC_VERIFY(OpStatus::IsSuccess(OpSocketAddress::Create(&datagram_address)));
+
+			ASYNC_VERIFY(OpStatus::IsSuccess(OpSocketAddress::Create(&bind_address)));
+			ASYNC_VERIFY(OpStatus::IsSuccess(bind_address->FromString(UNI_L("127.0.0.1"))));
+			bind_address->SetPort(bind_port);
+
+			// Bind socket1
+
+			ASYNC_VERIFY(OpStatus::IsSuccess(socket1->Bind(bind_address)));
+
+			// test continues in OnTimeout() or OnSocketDataReady().
+		}
+
+		void OnTimeOut(OpTimer* timer)
+		{
+			// Try to receive data on socket1. There should be nothing there.
+
+			unsigned int bytes_received;
+			ASYNC_VERIFY(socket1->Receive(buf, bufsize, datagram_address, &bytes_received) == OpNetworkStatus::ERR_SOCKET_BLOCKING);
+
+			Passed();
+		}
+
+		void OnSocketDataReady(OpUdpSocket* socket)
+		{
+			ASYNC_VERIFY(!"Nothing has been sent, so nothing should be received");
+		}
+	};
+
+	class BindBroadcastSendUnicastReceiveTest : public AsyncTest
+	{
+	private:
+		OpUdpSocket* socket1;
+		OpUdpSocket* socket2;
+		OpSocketAddress* bind_address;
+		OpSocketAddress* local_address;
+		OpSocketAddress* datagram_address;
+
+	public:
+		BindBroadcastSendUnicastReceiveTest() :
+			socket1(0), socket2(0), bind_address(0), local_address(0), datagram_address(0) { }
+		~BindBroadcastSendUnicastReceiveTest()
+		{
+			OP_DELETE(socket1); OP_DELETE(socket2); OP_DELETE(bind_address); OP_DELETE(local_address); OP_DELETE(datagram_address);
+		}
+
+		void StartTest()
+		{
+			ASYNC_VERIFY(OpStatus::IsSuccess(SocketWrapper::CreateUDPSocket(&socket1, 0, SocketWrapper::NO_WRAPPERS)));
+			ASYNC_VERIFY(OpStatus::IsSuccess(SocketWrapper::CreateUDPSocket(&socket2, 0, SocketWrapper::NO_WRAPPERS)));
+
+			ASYNC_VERIFY(OpStatus::IsSuccess(OpSocketAddress::Create(&datagram_address)));
+
+			ASYNC_VERIFY(OpStatus::IsSuccess(OpSocketAddress::Create(&bind_address)));
+			ASYNC_VERIFY(OpStatus::IsSuccess(bind_address->FromString(UNI_L("255.255.255.255"))));
+			bind_address->SetPort(bind_port);
+
+			ASYNC_VERIFY(OpStatus::IsSuccess(OpSocketAddress::Create(&local_address)));
+			ASYNC_VERIFY(OpStatus::IsSuccess(local_address->FromString(UNI_L("127.0.0.1"))));
+			local_address->SetPort(bind_port);
+
+			// Bind socket1
+
+			ASYNC_VERIFY(OpStatus::IsSuccess(socket1->Bind(bind_address, OpUdpSocket::BROADCAST)));
+
+			// Send to localhost on socket2
+
+			ASYNC_VERIFY(OpStatus::IsSuccess(socket2->Send(teststr, sizeof(teststr), local_address)));
+
+			// test continues in OnTimeout() or OnSocketDataReady().
+		}
+
+		void OnTimeOut(OpTimer* timer)
+		{
+			// Try to receive data on socket1. There should be nothing there.
+
+			unsigned int bytes_received;
+			ASYNC_VERIFY(socket1->Receive(buf, bufsize, datagram_address, &bytes_received) == OpNetworkStatus::ERR_SOCKET_BLOCKING);
+
+			Passed();
+		}
+
+		void OnSocketDataReady(OpUdpSocket* socket)
+		{
+			ASYNC_VERIFY(!"Nothing has been broadcasted, so nothing should be received");
+		}
+	};
+
+	class BindSendReceiveSmallBufTest : public AsyncTest
+	{
+	private:
+		OpUdpSocket* socket1;
+		OpUdpSocket* socket2;
+		OpSocketAddress* bind_address;
+		OpSocketAddress* datagram_address;
+
+	public:
+		BindSendReceiveSmallBufTest() :
+			socket1(0), socket2(0), bind_address(0), datagram_address(0) { }
+		~BindSendReceiveSmallBufTest()
+		{
+			OP_DELETE(socket1); OP_DELETE(socket2); OP_DELETE(bind_address); OP_DELETE(datagram_address);
+		}
+
+		void StartTest()
+		{
+			bufsize = 4;
+
+			ASYNC_VERIFY(OpStatus::IsSuccess(SocketWrapper::CreateUDPSocket(&socket1, this, SocketWrapper::NO_WRAPPERS)));
+			ASYNC_VERIFY(OpStatus::IsSuccess(SocketWrapper::CreateUDPSocket(&socket2, 0, SocketWrapper::NO_WRAPPERS)));
+
+			ASYNC_VERIFY(OpStatus::IsSuccess(OpSocketAddress::Create(&datagram_address)));
+
+			ASYNC_VERIFY(OpStatus::IsSuccess(OpSocketAddress::Create(&bind_address)));
+			ASYNC_VERIFY(OpStatus::IsSuccess(bind_address->FromString(UNI_L("127.0.0.1"))));
+			bind_address->SetPort(bind_port);
+
+			// Bind socket1
+
+			ASYNC_VERIFY(OpStatus::IsSuccess(socket1->Bind(bind_address)));
+
+			// Send to the bound address on socket2
+
+			ASYNC_VERIFY(OpStatus::IsSuccess(socket2->Send(teststr, sizeof(teststr), bind_address)));
+
+			// test continues in OnSocketDataReady().
+		}
+
+		void OnSocketDataReady(OpUdpSocket* socket)
+		{
+			ASYNC_VERIFY(socket == socket1);
+
+			// Receive data on socket1. It is not expected to fit in the buffer, but that's fine.
+
+			unsigned int bytes_received;
+			ASYNC_VERIFY(OpStatus::IsSuccess(socket1->Receive(buf, bufsize, datagram_address, &bytes_received)));
+
+			// Verify data
+
+			ASYNC_VERIFY(bytes_received == bufsize);
+			ASYNC_VERIFY(!op_memcmp(buf, teststr, bufsize));
+
+			// Verify that the remote host address is the same
+
+			ASYNC_VERIFY(datagram_address->IsHostEqual(bind_address));
+
+			// Verify that remote port number is non-zero
+
+			ASYNC_VERIFY(datagram_address->Port() != 0);
+
+			// The data that didn't fit in the buffer should not be left in the queue.
+
+			ASYNC_VERIFY(socket1->Receive(buf, bufsize, datagram_address, &bytes_received) == OpNetworkStatus::ERR_SOCKET_BLOCKING);
+
+			Passed();
+		}
+	};
+}
+
+test("bind, send unicast and receive")
+	async;
+{
+	AsyncTest* test = OP_NEW(BindSendReceiveTest, ());
+
+	if (test)
+		test->Run();
+	else
+		ST_failed("out of memory");
+}
+
+test("bind, send unicast to self, receive from self")
+	async;
+{
+	AsyncTest* test = OP_NEW(BindSendToSelfReceiveTest, ());
+
+	if (test)
+		test->Run();
+	else
+		ST_failed("out of memory");
+}
+
+test("bind multicast, send and receive")
+	async;
+{
+	AsyncTest* test = OP_NEW(BindMulticastSendReceiveTest, ());
+
+	if (test)
+		test->Run();
+	else
+		ST_failed("out of memory");
+}
+
+test("bind multicast on specified interface, send and receive")
+	require PI_NETWORK_INTERFACE_MANAGER;
+	require success "bind multicast, send and receive";
+	async;
+{
+	AsyncTest* test = OP_NEW(BindMulticastToSpecificInterfaceSendReceiveTest, ());
+
+	if (test)
+		test->Run();
+	else
+		ST_failed("out of memory");
+}
+
+test("bind, send broadcast and receive")
+	async;
+{
+	AsyncTest* test = OP_NEW(BindSendBroadcastReceiveTest, ());
+
+	if (test)
+		test->Run();
+	else
+		ST_failed("out of memory");
+}
+
+test("bind, don't send anything, try to receive")
+	async;
+{
+	AsyncTest* test = OP_NEW(BindReceiveTest, ());
+
+	if (test)
+		test->Run();
+	else
+		ST_failed("out of memory");
+}
+
+test("bind broadcast, send unicast, try to receive")
+	async;
+{
+	AsyncTest* test = OP_NEW(BindBroadcastSendUnicastReceiveTest, ());
+
+	if (test)
+		test->Run();
+	else
+		ST_failed("out of memory");
+}
+
+test("bind, send and receive with a too small receive buffer")
+	async;
+{
+	AsyncTest* test = OP_NEW(BindSendReceiveSmallBufTest, ());
+
+	if (test)
+		test->Run();
+	else
+		ST_failed("out of memory");
+}
+
+test("binding the same socket twice")
+{
+	OpUdpSocket* socket1 = NULL;
+	OpSocketAddress* bind_address = NULL;
+
+	verify(OpStatus::IsSuccess(SocketWrapper::CreateUDPSocket(&socket1, 0, SocketWrapper::NO_WRAPPERS)));
+
+	verify(OpStatus::IsSuccess(OpSocketAddress::Create(&bind_address)));
+	verify(OpStatus::IsSuccess(bind_address->FromString(UNI_L("127.0.0.1"))));
+	bind_address->SetPort(g_bind_port);
+
+	// Bind socket1
+
+	verify(OpStatus::IsSuccess(socket1->Bind(bind_address)));
+
+	// Try to bind it again. Should fail.
+
+	verify(socket1->Bind(bind_address) == OpStatus::ERR);
+}
+finally
+{
+	OP_DELETE(socket1);
+	OP_DELETE(bind_address);
+}
+
+test("binding two sockets to the same address")
+{
+	OpUdpSocket* socket1 = NULL;
+	OpUdpSocket* socket2 = NULL;
+	OpSocketAddress* bind_address = NULL;
+
+	verify(OpStatus::IsSuccess(SocketWrapper::CreateUDPSocket(&socket1, 0, SocketWrapper::NO_WRAPPERS)));
+	verify(OpStatus::IsSuccess(SocketWrapper::CreateUDPSocket(&socket2, 0, SocketWrapper::NO_WRAPPERS)));
+
+	verify(OpStatus::IsSuccess(OpSocketAddress::Create(&bind_address)));
+	verify(OpStatus::IsSuccess(bind_address->FromString(UNI_L("127.0.0.1"))));
+	bind_address->SetPort(g_bind_port);
+
+	// Bind socket1
+
+	verify(OpStatus::IsSuccess(socket1->Bind(bind_address)));
+
+	/* Bind socket2 to the same address.  It is up to the implementation
+	   whether this is allowed or not, but it should either succeed, or produce
+	   an ERR_ADDRESS_IN_USE. */
+
+	OP_NETWORK_STATUS result = socket2->Bind(bind_address);
+	verify(OpStatus::IsSuccess(result) || result == OpNetworkStatus::ERR_ADDRESS_IN_USE);
+}
+finally
+{
+	OP_DELETE(socket1);
+	OP_DELETE(socket2);
+	OP_DELETE(bind_address);
+}
+
+test("binding to a low port number")
+{
+	OpUdpSocket* socket1 = NULL;
+	OpSocketAddress* bind_address = NULL;
+
+	verify(OpStatus::IsSuccess(SocketWrapper::CreateUDPSocket(&socket1, 0, SocketWrapper::NO_WRAPPERS)));
+
+	verify(OpStatus::IsSuccess(OpSocketAddress::Create(&bind_address)));
+	verify(OpStatus::IsSuccess(bind_address->FromString(UNI_L("127.0.0.1"))));
+	bind_address->SetPort(999); // Hopefully not a "well-known" port number
+
+	/* Bind socket1 to port 999. This is forbidden on some systems, unless you
+	   have administrator privileges. */
+
+	OP_NETWORK_STATUS result = socket1->Bind(bind_address);
+
+	verify(OpStatus::IsSuccess(result) || result == OpNetworkStatus::ERR_ACCESS_DENIED);
+}
+finally
+{
+	OP_DELETE(socket1);
+	OP_DELETE(bind_address);
+}
+
+test("receiving on an unbound socket")
+{
+	OpUdpSocket* socket1 = NULL;
+	OpSocketAddress* datagram_address = NULL;
+
+	const unsigned int bufsize = 100;
+	char* buf = OP_NEWA(char, bufsize);
+	verify(buf);
+
+	verify(OpStatus::IsSuccess(SocketWrapper::CreateUDPSocket(&socket1, 0, SocketWrapper::NO_WRAPPERS)));
+
+	verify(OpStatus::IsSuccess(OpSocketAddress::Create(&datagram_address)));
+
+	// Verify that attempting to receive packets on an unbound socket causes an error.
+
+	unsigned int bytes_received;
+	verify(socket1->Receive(buf, bufsize, datagram_address, &bytes_received) == OpStatus::ERR);
+}
+finally
+{
+	OP_DELETE(socket1);
+	OP_DELETE(datagram_address);
+	OP_DELETEA(buf);
+}
+
+test("send something extremely large")
+{
+	OpUdpSocket* socket1 = NULL;
+	OpSocketAddress* datagram_address = NULL;
+
+	const unsigned int bufsize = 500000;
+	char* buf = OP_NEWA(char, bufsize);
+	verify(buf);
+	op_memset(buf, 0, bufsize);
+
+	verify(OpStatus::IsSuccess(SocketWrapper::CreateUDPSocket(&socket1, 0, SocketWrapper::NO_WRAPPERS)));
+
+	verify(OpStatus::IsSuccess(OpSocketAddress::Create(&datagram_address)));
+	verify(OpStatus::IsSuccess(datagram_address->FromString(UNI_L("127.0.0.1"))));
+
+	/* No actual pass condition in this test. The following call to Send()
+	   should probably fail. This is currently undocumented in OpUdpSocket,
+	   however. So let's just check that it doesn't crash or anything like
+	   that. */
+
+	socket1->Send(buf, bufsize, datagram_address);
+}
+finally
+{
+	OP_DELETE(socket1);
+	OP_DELETE(datagram_address);
+	OP_DELETEA(buf);
+}

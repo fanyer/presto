@@ -1,0 +1,274 @@
+/* -*- Mode: c++; tab-width: 4; indent-tabs-mode: t; c-basic-offset: 4 -*-
+ *
+ * Copyright (C) 2012 Opera Software AS.  All rights reserved.
+ *
+ * This file is part of the Opera web browser.
+ * It may not be distributed under any circumstances.
+ */
+group "hardcore.logging.opsocketmessagelogger";
+
+require HC_MESSAGE_LOGGING;
+language c++;
+
+include "modules/hardcore/logging/OpSocketMessageLogger.h";
+include "modules/hardcore/tests/OpLogFormatterMock.h";
+include "modules/hardcore/tests/OpTypedMessageFake.h";
+include "modules/pi/selftest/OpSocketMock.h";
+include "modules/pi/network/OpSocketAddress.h";
+include "modules/util/OpSharedPtr.h";
+include "modules/opdata/OpStringStream.h";
+include "modules/util/opstring.h";
+include "modules/stdlib/include/opera_stdlib.h";
+
+global
+{
+	class AddressCreator
+	{
+	public:
+		static OpSharedPtr<OpSocketAddress> createAddress()
+		{
+			OpSocketAddress* socketAddressRawPtr = NULL;
+			if(OpStatus::IsError(OpSocketAddress::Create(&socketAddressRawPtr)))
+				OP_ASSERT(!"All tests may fail now due to this error");
+			return OpSharedPtr<OpSocketAddress>(socketAddressRawPtr);
+		}
+	};
+}
+
+test("No formatter given at construction")
+{
+	OpSocketMessageLogger logger((OpSharedPtr<OpLogFormatter>()));
+
+	// Not able to log.
+	verify(!logger.IsAbleToLog());
+
+	// Calling log functions has no visible effect, doesn't crash.
+	OpSharedPtr<OpTypedMessage> msg(OP_NEW(OpTypedMessageFake, ()));
+	logger.BeforeDispatch(msg.get());
+	logger.AfterDispatch(msg.get());
+	logger.Log(msg.get(), UNI_L("some action"));
+}
+
+subtest checkMessageSent(
+		OpSharedPtr<OpSocketMock> socketMock,
+		int expectedSendCalls,
+		const uni_char* expectedMessage)
+{
+	verify(socketMock->sendCalls == expectedSendCalls);
+	verify(socketMock->sendLastLen == uni_strlen(expectedMessage) * sizeof(uni_char));
+	verify_string(socketMock->sendLastData, expectedMessage);
+}
+
+subtest basicSetup(OpSocketMessageLogger& logger, OpSharedPtr<OpSocketMock> socketMock)
+{
+	// Setting a socket.
+	logger.SetSocket(socketMock);
+
+	// Logger sets itself as the listener.
+	verify(socketMock->listener == &logger);
+
+	// Still not able to log.
+	verify(!logger.IsAbleToLog());
+
+	// Connecting.
+	OpSharedPtr<OpSocketAddress> address = AddressCreator::createAddress();
+	verify_success(logger.Connect(*address));
+
+	// Still not able to log, connecting in progress.
+	verify(!logger.IsAbleToLog());
+
+	// Finally, the actual connection is made.
+	logger.OnSocketConnected(socketMock.get());
+
+	// The initial message is logged.
+	checkMessageSent(socketMock, 1, UNI_L("FormatBeginLogging result"));
+	socketMock->reset();
+}
+
+test("Basic configuration, everything OK")
+{
+	OpSocketMessageLogger logger(make_shared<OpLogFormatterMock>());
+
+	// Not able to log yet.
+	verify(!logger.IsAbleToLog());
+
+	// Calling log functions has no visible effect, doesn't crash.
+	OpSharedPtr<OpTypedMessage> msg(OP_NEW(OpTypedMessageFake, ()));
+	logger.BeforeDispatch(msg.get());
+	logger.AfterDispatch(msg.get());
+	logger.Log(msg.get(), UNI_L("some action"));
+
+	OpSharedPtr<OpSocketMock> socketMock = make_shared<OpSocketMock>();
+	basicSetup(logger, socketMock);
+	verify(logger.IsAbleToLog());
+}
+
+test("Connection attempt without a socket set")
+{
+	OpSocketMessageLogger logger(make_shared<OpLogFormatterMock>());
+	OpSharedPtr<OpSocketAddress> address = AddressCreator::createAddress();
+
+	verify(logger.Connect(*address) == OpStatus::ERR_NO_SUCH_RESOURCE);
+	verify(!logger.IsAbleToLog());
+}
+
+test("Connection failed instantly")
+{
+	OpSocketMessageLogger logger(make_shared<OpLogFormatterMock>());
+	OpSharedPtr<OpSocketAddress> address = AddressCreator::createAddress();
+	OpSharedPtr<OpSocketMock> socketMock = make_shared<OpSocketMock>();
+
+	// Setting a socket.
+	logger.SetSocket(socketMock);
+
+	// OpSocket::Connect() will return error.
+	socketMock->connectReturn = OpStatus::ERR;
+
+	// Connecting.
+	verify(logger.Connect(*address) == OpStatus::ERR);
+	verify(!logger.IsAbleToLog());
+}
+
+test("Connection failed after a while")
+{
+	OpSocketMessageLogger logger(make_shared<OpLogFormatterMock>());
+	OpSharedPtr<OpSocketAddress> address = AddressCreator::createAddress();
+	OpSharedPtr<OpSocketMock> socketMock = make_shared<OpSocketMock>();
+
+	// Setting a socket.
+	logger.SetSocket(socketMock);
+
+	// Connecting.
+	verify_success(logger.Connect(*address));
+
+	// There's an error.
+	logger.OnSocketConnectError(socketMock.get(), OpSocket::NETWORK_ERROR);
+	verify(!logger.IsAbleToLog());
+}
+
+test("Null pointers to messages")
+{
+	OpSocketMessageLogger logger(make_shared<OpLogFormatterMock>());
+	OpSharedPtr<OpSocketMock> socketMock = make_shared<OpSocketMock>();
+	basicSetup(logger, socketMock);
+
+	verify(logger.IsAbleToLog());
+
+	logger.BeforeDispatch(NULL);
+	logger.AfterDispatch(NULL);
+	logger.Log(NULL, NULL);
+
+	// Still able to continue.
+	verify(logger.IsAbleToLog());
+
+	// Nothing was sent.
+	verify(socketMock->sendCalls == 0);
+}
+
+test("Dispatch started log")
+{
+	OpSocketMessageLogger logger(make_shared<OpLogFormatterMock>());
+	OpSharedPtr<OpSocketMock> socketMock = make_shared<OpSocketMock>();
+	basicSetup(logger, socketMock);
+	verify(logger.IsAbleToLog());
+
+	OpSharedPtr<OpTypedMessage> msg(OP_NEW(OpTypedMessageFake, ()));
+
+	logger.BeforeDispatch(msg.get());
+
+	checkMessageSent(socketMock, 1, UNI_L("FormatStartedDispatching result OpTypedMessageFake"));
+	verify(logger.IsAbleToLog());
+}
+
+test("Dispatch finished log")
+{
+	OpSocketMessageLogger logger(make_shared<OpLogFormatterMock>());
+	OpSharedPtr<OpSocketMock> socketMock = make_shared<OpSocketMock>();
+	basicSetup(logger, socketMock);
+	verify(logger.IsAbleToLog());
+
+	OpSharedPtr<OpTypedMessage> msg(OP_NEW(OpTypedMessageFake, ()));
+
+	logger.AfterDispatch(msg.get());
+
+	checkMessageSent(socketMock, 1, UNI_L("FormatFinishedDispatching result OpTypedMessageFake"));
+	verify(logger.IsAbleToLog());
+}
+
+test("Action log")
+{
+	OpSocketMessageLogger logger(make_shared<OpLogFormatterMock>());
+	OpSharedPtr<OpSocketMock> socketMock = make_shared<OpSocketMock>();
+	basicSetup(logger, socketMock);
+	verify(logger.IsAbleToLog());
+
+	OpSharedPtr<OpTypedMessage> msg(OP_NEW(OpTypedMessageFake, ()));
+
+	logger.Log(msg.get(), UNI_L("Some action"));
+
+	checkMessageSent(socketMock, 1, UNI_L("FormatLog result Some action OpTypedMessageFake"));
+	verify(logger.IsAbleToLog());
+}
+
+test("Error while sending, immediate")
+{
+	OpSocketMessageLogger logger(make_shared<OpLogFormatterMock>());
+	OpSharedPtr<OpSocketMock> socketMock = make_shared<OpSocketMock>();
+	basicSetup(logger, socketMock);
+	verify(logger.IsAbleToLog());
+
+	// OpSocket::Send() will return an error.
+	socketMock->sendReturn = OpStatus::ERR;
+
+	OpSharedPtr<OpTypedMessage> msg = make_shared<OpTypedMessageFake>();
+	logger.Log(msg.get(), UNI_L("Some action"));
+
+	// Send was called.
+	checkMessageSent(socketMock, 1, UNI_L("FormatLog result Some action OpTypedMessageFake"));
+
+	// Logger disabled itself.
+	verify(!logger.IsAbleToLog());
+
+	// No more sends will be attempted.
+	logger.Log(msg.get(), UNI_L("Some action"));
+	verify(socketMock->sendCalls == 1);
+}
+
+test("Error while sending, async")
+{
+	OpSocketMessageLogger logger(make_shared<OpLogFormatterMock>());
+	OpSharedPtr<OpSocketMock> socketMock = make_shared<OpSocketMock>();
+	basicSetup(logger, socketMock);
+	verify(logger.IsAbleToLog());
+
+	OpSharedPtr<OpTypedMessage> msg = make_shared<OpTypedMessageFake>();
+	logger.Log(msg.get(), UNI_L("Some action"));
+
+	// Send was called.
+	checkMessageSent(socketMock, 1, UNI_L("FormatLog result Some action OpTypedMessageFake"));
+
+	// Everything seems fine...
+	verify(logger.IsAbleToLog());
+
+	logger.OnSocketSendError(socketMock.get(), OpSocket::NETWORK_ERROR);
+
+	// Logger disabled itself.
+	verify(!logger.IsAbleToLog());
+
+	// No more sends will be attempted.
+	logger.Log(msg.get(), UNI_L("Some action"));
+	verify(socketMock->sendCalls == 1);
+}
+
+test("End log")
+{
+	OpSharedPtr<OpSocketMock> socketMock = make_shared<OpSocketMock>();
+	{
+		OpSocketMessageLogger logger(make_shared<OpLogFormatterMock>());
+		basicSetup(logger, socketMock);
+		verify(logger.IsAbleToLog());
+		// End log should be done during destruction.
+	}
+
+	checkMessageSent(socketMock, 1, UNI_L("FormatEndLogging result"));
+}

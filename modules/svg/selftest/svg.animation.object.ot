@@ -1,0 +1,433 @@
+/* -*- Mode: c++; tab-width: 4; indent-tabs-mode: t; c-basic-offset: 4 -*-
+**
+** Copyright (C) 1995-2006 Opera Software ASA.  All rights reserved.
+**
+** This file is part of the Opera web browser.  It may not be distributed
+** under any circumstances.
+**
+*/
+
+group "svg.animation.object";
+
+require SVG_SUPPORT;
+require init;
+
+language c++;
+
+constant VALUE_EPSILON=0.001;
+
+include "modules/svg/src/svgpch.h";
+include "modules/svg/SVGManager.h";
+include "modules/svg/src/SVGImageImpl.h";
+include "modules/svg/src/SVGObject.h";
+include "modules/ecmascript_utils/esasyncif.h";
+include "modules/doc/frm_doc.h";
+include "modules/dochand/docman.h";
+include "modules/dochand/win.h";
+include "modules/hardcore/timer/optimer.h";
+
+global
+{
+	class CheckDocLoaded : public OpTimerListener,
+						   public ES_AsyncCallback
+	{
+		enum State {
+			BEFORE_LOADED,
+			DONE
+		};
+
+	public:
+
+		enum  {
+			SLICE_DELAY = 30,
+			TIMEOUT_LIMIT = 10000 // This is requested time, not wallclock time
+		};
+
+		CheckDocLoaded(FramesDocument* doc)
+		{
+		   state = BEFORE_LOADED;
+		   OpTimer *timer = OP_NEW(OpTimer, ());
+		   timer->SetTimerListener(this);
+		   timer->Start(SLICE_DELAY);
+		}
+		~CheckDocLoaded() {}
+
+	private:
+		virtual void OnTimeOut(OpTimer *timer)
+		{
+			Window * window = g_selftest.utils->GetWindow();
+			FramesDocument *doc = NULL;
+			DocumentManager *doc_man = window ? window->DocManager( ) : NULL;
+
+			if (!doc_man)
+			{
+				ST_failed("Failed to get document manager\n");
+				OP_DELETE(this);
+				return;
+			}
+
+			doc = doc_man->GetCurrentDoc( );
+			LogicalDocument *logdoc = doc ? doc->GetLogicalDocument() : NULL;
+
+			if (!doc || !logdoc)
+			{
+				ST_failed("Failed to get document\n");
+				OP_DELETE(this);
+				return;
+			}
+
+			if (state == BEFORE_LOADED)
+			{
+				BOOL doc_man_is_stable = doc && (doc_man->GetLoadStatus() == NOT_LOADING ||
+												 doc_man->GetLoadStatus() == DOC_CREATED);
+				if (doc->IsLoaded(FALSE) && doc_man_is_stable)
+				{
+					state = DONE;
+				}
+			}
+
+			if (state == DONE)
+			{
+				ST_passed();
+
+				OP_DELETE(timer);
+				OP_DELETE(this); // Note!
+				return;
+			}
+
+			if (test_duration > TIMEOUT_LIMIT)
+			{
+				ST_failed("Test timed out\n");
+			}
+			else
+			{
+				test_duration += SLICE_DELAY;
+				timer->Start(SLICE_DELAY);
+			}
+		}
+
+		virtual OP_STATUS HandleCallback(ES_AsyncOperation operation,
+										 ES_AsyncStatus status,
+										 const ES_Value &result) { return OpStatus::OK; }
+
+		State state;
+		int test_duration;
+	};
+}
+
+test("Flag preservation on Clone()")
+{
+	for (int type = SVGOBJECT_NUMBER; type < SVGOBJECT_UNKNOWN; type++)
+	{
+		SVGObject* obj = NULL;
+
+		// Skip object type that need not know about 'inherit' (and
+		// Vector) Skipping Number and Point (do they ever need to
+		// know about 'inherit'?)
+		if (type == SVGOBJECT_NUMBER ||
+			type == SVGOBJECT_POINT ||
+			type == SVGOBJECT_RECT ||
+			type == SVGOBJECT_ASPECT_RATIO ||
+			type == SVGOBJECT_VECTOR)
+			continue;
+
+		OP_STATUS status = SVGObject::Make(obj, (SVGObjectType)type);
+		verify(status == OpStatus::OK || status == OpSVGStatus::TYPE_ERROR);
+
+		if (status == OpStatus::OK)
+		{
+			obj->SetFlag(SVGOBJECTFLAG_INHERIT);
+
+			SVGObject* clone = obj->Clone();
+			verify(clone);
+			// Check more flags if appropriate
+			verify(clone->Flag(SVGOBJECTFLAG_INHERIT) ==
+				   obj->Flag(SVGOBJECTFLAG_INHERIT));
+
+			OP_DELETE(clone);
+		}
+		OP_DELETE(obj);
+	}
+}
+
+test("Object equality")
+{
+	for (int type = SVGOBJECT_NUMBER; type < SVGOBJECT_UNKNOWN; type++)
+	{
+		SVGObject* obj = NULL;
+
+		// Skip objecttypes that:
+		// 1) SVGObject::Make won't create (SVGVector)
+		// 2) Default values are not comparable
+		if (type == SVGOBJECT_VECTOR ||
+			type == SVGOBJECT_FONTSIZE)
+			continue;
+
+		OP_STATUS status = SVGObject::Make(obj, (SVGObjectType)type);
+		verify(status == OpStatus::OK || status == OpSVGStatus::TYPE_ERROR);
+
+		if (status == OpStatus::OK)
+		{
+			SVGObject* clone = obj->Clone();
+			BOOL is_equal = clone && obj->IsEqual(*clone);
+			verify(is_equal);
+
+			OP_DELETE(clone);
+		}
+		OP_DELETE(obj);
+	}
+}
+
+xml
+{
+//! <svg xmlns="http://www.w3.org/2000/svg"
+//!	 xmlns:xlink="http://www.w3.org/1999/xlink">
+//!  <script>
+//!    var status = {"ref":0, "a1":0, "a2":1, "a3":0, "a4":0, "a5":0, "a6":0};
+//!  </script>
+//!    <!-- Note: We have a known bug in that if the duration is 0 we don't send an endevent -->
+//!    <animate id="ref" begin="indefinite" dur="0.01s" onend="status[this.id]=1"/>
+//!
+//!	<rect style="fill: red; display: none">
+//!	  <set id="a1" attributeName="display" to="inline" begin="ref.end+0.5s" dur="1s" onend="status[this.id]=1"/>
+//!	  <set id="a2" attributeName="fill" to="black" begin="ref.end+1s" fill="freeze" onend="status[this.id]=0"/>
+//!	  <animate id="a3" attributeName="width" begin="ref.end+0.5s" values="320; 0; 320" dur="1s" onend="status[this.id]=1"/>
+//!	  <animate id="a4" attributeName="height" begin="ref.end+0.5s" values="240; 0; 240" dur="1s" onend="status[this.id]=1"/>
+//!	  <animate id="a5" attributeName="x" begin="ref.end+0.5s" values="0; 160; 0" dur="1s" onend="status[this.id]=1"/>
+//!	  <animate id="a6" attributeName="y" begin="ref.end+0.5s" values="0; 120; 0" dur="1s" onend="status[this.id]=1"/>
+//!	</rect>
+//! </svg>
+}
+
+test("CheckDocLoaded")
+	async;
+{
+	OP_NEW(CheckDocLoaded, (state.doc));
+}
+
+test("Animations enabled")
+{
+	HTML_Element* root = find_element("svg", 1);
+	verify(root);
+	SVGImageImpl* image = static_cast<SVGImageImpl*>(g_svg_manager->GetSVGImage(state.doc->GetLogicalDocument(), root));
+	verify(image);
+	verify(image->IsAnimationAllowed());
+}
+
+test("Setup")
+	require success "CheckDocLoaded";
+	require success "Animations enabled";
+	language ecmascript;
+{
+	verify(status["ref"] == 0);
+	verify(status["a1"] == 0);
+	verify(status["a2"] == 1);
+	verify(status["a3"] == 0);
+	verify(status["a4"] == 0);
+	verify(status["a5"] == 0);
+	verify(status["a6"] == 0);
+	document.getElementById("ref").beginElement();
+}
+
+test("Delay")
+	language ecmascript;
+	require success "Setup";
+	async;
+{
+	var id=setTimeout(function() { ST_passed(); }, 3000);
+	if(!id)
+		ST_failed("Failed to set timeout");
+}
+
+test("Test that end events are sent correctly")
+	language ecmascript;
+	require success "Delay";
+{
+	verify(status["ref"] == 1);
+	verify(status["a1"] == 1);
+	verify(status["a2"] == 1);
+	verify(status["a3"] == 1);
+	verify(status["a4"] == 1);
+	verify(status["a5"] == 1);
+	verify(status["a6"] == 1);
+}
+
+html
+{
+//! <html>
+//!   <head>
+//!     <title>Deferred tree</title>
+//! 	<style>
+//! 		.doc-border
+//! 		{
+//! 			stroke-dasharray: 2,2;
+//! 			stroke-width: 2;
+//! 			stroke: indianred;
+//! 			fill: none;
+//! 		}
+//! 	</style>
+//!     <script>
+//!         function makeTree()
+//!         {
+//!           const svgns="http://www.w3.org/2000/svg";
+//!           var svg = document.createElementNS(svgns, 'svg');
+//!           svg.setAttribute('width', '200px');
+//!           svg.setAttribute('height', '200px');
+//!           var rect = document.createElementNS(svgns, 'rect');
+//!           rect.setAttribute('x', '0');
+//!           rect.setAttribute('y', '0');
+//!           rect.setAttribute('width', '199');
+//!           rect.setAttribute('height', '199');
+//!           rect.setAttribute('class', 'doc-border');
+//!           var ellipse = document.createElementNS(svgns, 'ellipse');
+//!           ellipse.setAttribute('stroke-width', '1');
+//!           ellipse.setAttribute('stroke', 'black');
+//!           ellipse.setAttribute('fill', 'yellow');
+//!           ellipse.setAttribute('cx', '100');
+//!           ellipse.setAttribute('cy', '20');
+//!           ellipse.setAttribute('rx', '40');
+//!           ellipse.setAttribute('ry', '20');
+//!           var anim = document.createElementNS(svgns, 'animate');
+//!           anim.setAttribute('attributeName', 'cy');
+//!           anim.setAttribute('attributeType', 'XML');
+//!           anim.setAttribute('begin', '0s');
+//!           anim.setAttribute('from', '25');
+//!           anim.setAttribute('to', '170');
+//!           anim.setAttribute('dur', '10s');
+//!           anim.setAttribute('fill', 'freeze');
+//!           ellipse.appendChild(anim);
+//!           svg.appendChild(rect);
+//!           svg.appendChild(ellipse);
+//!           var target = document.getElementById('tree-container');
+//!           target.appendChild(svg);
+//!         }
+//!     </script>
+//!   </head>
+//!
+//!   <body onload="makeTree()">
+//!     <p id="tree-container"/>
+//!   </body>
+//! </html>
+}
+
+test("CheckDocLoaded#2")
+	async;
+{
+	OP_NEW(CheckDocLoaded, (state.doc));
+}
+
+test("Test animation on inserted tree")
+	require success "CheckDocLoaded#2";
+	require success "Animations enabled";
+	language ecmascript;
+	require SVG_FULL_11;
+	async;
+{
+	var e = document.getElementsByTagNameNS("http://www.w3.org/2000/svg", "ellipse");
+	if(!e[0])
+		ST_failed("Failed to find the ellipse element.");
+
+	var id = setTimeout(function() {
+			if(e[0].cy.animVal.value.toFixed(0) != 20) {
+				ST_passed()
+			} else {
+				ST_failed("animVal.value was " + e[0].cy.animVal.value.toFixed(0), "svg.animation.object.ot", 0);
+			}
+		}, 500); // verify that the animation is running
+	if(!id)
+		ST_failed("Failed to set timeout.");
+}
+
+test("Test animation on inserted tree (Tiny version)")
+	require success "CheckDocLoaded#2";
+	require success "Animations enabled";
+	language ecmascript;
+	require SVG_TINY_12;
+	async;
+{
+	var e = document.getElementsByTagNameNS("http://www.w3.org/2000/svg", "ellipse");
+	if(!e[0])
+		ST_failed("Failed to find the ellipse element.");
+
+	var id = setTimeout(function() {
+			if(e[0].getFloatPresentationTrait("cy").toFixed(0) != 20) {
+				ST_passed()
+			} else {
+				ST_failed("animVal.value was " + e[0].getFloatPresentationTrait("cy").toFixed(0), "svg.animation.object.ot", 0);
+			}
+		}, 500); // verify that the animation is running
+	if(!id)
+		ST_failed("Failed to set timeout.");
+}
+
+xml {
+//! <svg xmlns="http://www.w3.org/2000/svg">
+//!   <style>
+//!    .foo { fill: #00f }
+//!    .bar { fill: #0f0 }
+//!   </style>
+//!   <rect id="r" width="100%" height="100%" class="foo">
+//!     <set id="s" attributeName="class" to="bar" begin="indefinite" dur="3s"/>
+//!   </rect>
+//! </svg>
+}
+
+test("CheckDocLoaded#3")
+	async;
+{
+	OP_NEW(CheckDocLoaded, (state.doc));
+}
+
+test("Class start state")
+	require success "CheckDocLoaded#3";
+	require success "Animations enabled";
+	require SVG_DOM;
+	require SVG_TINY_12;
+	language ecmascript;
+{
+	var col = document.getElementById("r").getRGBColorPresentationTrait("fill");
+	verify(col.red == 0);
+	verify(col.blue == 255);
+	verify(col.green == 0);
+}
+
+test("Class attribute animation")
+	require success "CheckDocLoaded#3";
+	require success "Animations enabled";
+	require SVG_DOM;
+	require SVG_TINY_12;
+	language ecmascript;
+	async;
+{
+	document.getElementById("s").beginElement();
+	var id = setTimeout(function() {
+			var col = document.getElementById("r").getRGBColorPresentationTrait("fill");
+			if (col.red == 0 && col.green == 255 && col.blue == 0)
+				ST_passed();
+			else
+				ST_failed("No animation");
+		}, 500);
+
+	if (!id)
+		ST_failed("Failed to set timeout");
+}
+
+test("Class attribute animation finished")
+	require success "CheckDocLoaded#3";
+	require success "Animations enabled";
+	require SVG_DOM;
+	require SVG_TINY_12;
+	language ecmascript;
+	async;
+{
+	var id = setTimeout(function() {
+			var col = document.getElementById("r").getRGBColorPresentationTrait("fill");
+			if (col.red == 0 && col.green == 0 && col.blue == 255)
+				ST_passed();
+			else
+				ST_failed("No animation");
+		}, 3000);
+
+	if (!id)
+		ST_failed("Failed to set timeout");
+}

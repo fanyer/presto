@@ -1,0 +1,132 @@
+/* -*- Mode: c++; tab-width: 4; indent-tabs-mode: t; c-basic-offset: 4 -*-
+**
+** Copyright (C) 2004-2006 Opera Software ASA.  All rights reserved.
+**
+** This file is part of the Opera web browser.  It may not be distributed
+** under any circumstances.
+**
+*/
+
+group "cache free unused";
+require init;
+require DYNAMIC_FOLDER_SUPPORT;
+require CACHE_FAST_INDEX;
+require DESKTOP_PROFILE;
+include "modules/cache/cache_int.h";
+include "modules/cache/cache_common.h";
+include "modules/url/url_man.h";
+include "modules/dochand/winman.h";
+include "modules/cache/cache_st_helpers.h";
+include "modules/prefs/prefsmanager/collections/pc_network.h";
+include "modules/cache/cache_debug.h";
+include "modules/cache/cache_selftest.h";
+
+global
+{
+	OpFileFolder free_folder;
+	URL_CONTEXT_ID ctx_free;
+
+	int oldCacheSize;
+	int kCacheSize;
+
+	OpAutoVector<URL> testURLs;
+
+	int kNumURLs;
+}
+
+
+setup
+{
+#ifdef _DEBUG
+	kNumURLs = 10000;
+#else
+	//kNumURLs = 500000;   // Real testing
+	kNumURLs = 30000;	   // Quick testing
+#endif
+
+	ctx_free = urlManager->GetNewContextID();
+	
+	g_folder_manager->AddFolder(OPFILE_CACHE_FOLDER, UNI_L("free_unused"), &free_folder);
+	CacheFileTest::DeleteCacheDir(free_folder);
+	urlManager->AddContextL(ctx_free, free_folder, free_folder, free_folder, free_folder, FALSE);
+
+	//OpMessage messages[]={MSG_URL_DATA_LOADED, MSG_URL_LOADING_FAILED, MSG_URLMAN_DELETE_SOMEFILES};
+	
+	CacheHelpers::CloseUnusedWindows();
+	
+	// Record the cache limit and set a new cache limit of 90% of the urls we're going to cache.
+	kCacheSize = (int)(kNumURLs * 0.9f);
+	oldCacheSize = g_pcnet->GetIntegerPref(PrefsCollectionNetwork::DiskCacheSize);
+	OP_MEMORY_VAR int newCacheSize = kCacheSize / 1024;
+	TRAPD(op_err, g_pcnet->WriteIntegerL(PrefsCollectionNetwork::DiskCacheSize, newCacheSize));
+	
+	CacheTester::BlockPeriodicFreeUnusedResources();
+}
+
+exit
+{
+	// Set the cache limit back to normal
+	OP_STATUS op_err;
+	TRAP(op_err, g_pcnet->WriteIntegerL(PrefsCollectionNetwork::DiskCacheSize, oldCacheSize));
+
+	CacheTester::RestorePeriodicFreeUnusedResources();
+}
+
+test("Context - Caching loads of 1B files")
+timer;
+{
+	//CacheHelpers::CacheBogusURLs(0, 1, 1, kNumURLs, 0, &testURLs, 0, TRUE); 
+	CacheHelpers::CacheBogusURLs(ctx_free, 1, 1, kNumURLs, 0, &testURLs, 0, FALSE);
+}
+
+test("Context - count and check") timer;
+{
+	CacheTester::TestURLsSkip(ctx_free, 10000);
+}
+
+
+test("Context - Saving")
+timer; disabled;
+{
+	OP_STATUS op_err = OpStatus::OK;
+	TRAP(op_err, urlManager->WriteCacheIndexesL(FALSE, FALSE));
+	verify(OpStatus::IsSuccess(op_err));
+	//output("\nReleasing handles to the most recent half of the urls");
+	//testURLs.Remove(kNumURLs / 2 - 1, kNumURLs / 2);
+}
+
+test("Context - set in use") disabled;
+timer;
+{
+	//output("\nMake sure the oldest half of the urls can't be released");
+	for (UINT32 i = 0, len=testURLs.GetCount(); i < len; i++)
+		testURLs.Get(i)->GetRep()->IncUsed(1);
+}
+
+test("Loops on FreeUnusedResources") timer;
+{
+	output("\n");
+	
+	for(int i=0; i<50; i++)
+	{
+		DebugFreeUnusedResources dfur(1);
+		
+		BOOL b=urlManager->Cache_Manager::FreeUnusedResources(FALSE, &dfur);
+		
+		//if(i%20 == 0)
+		{
+			output("%d) end: %s - ", i, (b) ? "FALSE" : "TRUE");
+			dfur.OutputData();
+		}
+	}
+}
+
+test("cleanup 1") timer;
+{
+	urlManager->RemoveContext(ctx_free, TRUE);
+}
+
+test("cleanup 2") timer;
+{
+	verify(OpStatus::IsSuccess(CacheFileTest::DeleteCacheDir(free_folder)));
+}

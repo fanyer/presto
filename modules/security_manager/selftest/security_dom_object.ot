@@ -1,0 +1,355 @@
+/* -*- Mode: c++; tab-width: 4; indent-tabs-mode: t; c-basic-offset: 4 -*-
+**
+** Copyright 2009-2010 Opera Software ASA.  All rights reserved.
+**
+** This file is part of the Opera web browser.  It may not be distributed
+** under any circumstances.
+*/
+
+group "security_manager.security_dom_object";
+
+require SECMAN_DOMOBJECT_ACCESS_RULES;
+require GADGET_SUPPORT;
+
+include "modules/dochand/win.h";
+include "modules/gadgets/OpGadgetManager.h";
+include "modules/gadgets/gadget_selftest_utils.h";
+include "modules/security_manager/include/security_manager.h";
+include "modules/windowcommander/OpWindowCommander.h";
+include "modules/windowcommander/src/WindowCommander.h";
+
+global
+{
+	class TestPermissionListener : public OpPermissionListener
+	{
+	public:
+		TestPermissionListener() : m_ask_count(0) { }
+
+		/** Simulates user's answer in the permission dialog.
+		 *
+		 * For operation OPERATION_TYPE_SELFTEST_ALLOW it simulates the user saying "allow",
+		 * in all other cases it simulates "deny".
+		 *
+		 * Additionally the ask-count is increased by one, regardless of the answer.
+		 */
+		virtual void OnAskForPermission(OpWindowCommander* wic, PermissionCallback* callback)
+		{
+			if (callback->Type() == PermissionCallback::PERMISSION_TYPE_DOM_ACCESS_REQUEST)
+			{
+				++m_ask_count;
+				
+				DOMPermissionCallback* permission_callback = static_cast<DOMPermissionCallback*>(callback);
+				const int choices = permission_callback->AffirmativeChoices();
+				// Use the most persistent persistence type available
+				const PermissionCallback::PersistenceType persistence = 
+					(choices & PermissionCallback::PERSISTENCE_TYPE_NONE)
+						? PermissionCallback::PERSISTENCE_TYPE_NONE
+						: (choices & PermissionCallback::PERSISTENCE_TYPE_SESSION)
+							? PermissionCallback::PERSISTENCE_TYPE_SESSION
+							: PermissionCallback::PERSISTENCE_TYPE_ALWAYS;
+
+				if (permission_callback->GetOperation() == DOMPermissionCallback::OPERATION_TYPE_SELFTEST_ALLOW)
+					permission_callback->OnAllowed(persistence);
+				else
+					permission_callback->OnDisallowed(persistence);
+			}
+		}
+
+		virtual void OnAskForPermissionCancelled(OpWindowCommander* wic, PermissionCallback* callback) { }
+
+		// Returns the number of times OnAskForPermissionHas been called		
+		unsigned int GetAskCount() { return m_ask_count; }
+
+#ifdef WIC_SET_PERMISSION
+		virtual void OnUserConsentInformation(OpWindowCommander *commander, const OpVector<OpPermissionListener::ConsentInformation> &consent_information) {}
+		virtual void OnUserConsentError(OpWindowCommander *wic, OP_STATUS error) {}
+#endif // WIC_SET_PERMISSION
+
+	private:
+		unsigned int m_ask_count;
+	};
+
+	/** A security check callback performing pass/fail checks for the async tests.
+	 *
+	 * The class performs two checks in its OnSecurityCheckSuccess:
+	 * 1. whether the correct allow/deny response has been received
+	 * 2. whether the dialog asking for user permission has been requested
+	 *
+	 * The first case is checked based on success_on_allowed constructor parameter.
+	 *
+	 * The second check is performed in conjunction with TestPermissionListener's ask-count.
+	 * This check is only performed if permission_listener is provided to the constructor.
+	 */
+	class TestSecurityCheckCallback : public OpSecurityCheckCallback
+	{
+	public:
+		/** Constructor.
+		 *
+		 * @param success_on_allowed Whether to treat "allow" answer from security manager as success (otherwise "deny" is the success).
+		 * @param permission_listener Test permission listener that may be checked for permission dialog ask-count. If it is NULL, ask-count is not checked.
+		 * @param expected_ask_count What ask-count (see TestPermissionListener::GetAskCount) is to be expected.
+		 */
+		TestSecurityCheckCallback(BOOL success_on_allowed = TRUE, TestPermissionListener* permission_listener = NULL, unsigned int expected_ask_count = 0)
+			: m_success_on_allowed(success_on_allowed)
+			, m_permission_listener(permission_listener)
+			, m_expected_ask_count(expected_ask_count)
+		{
+		}
+		
+		virtual void OnSecurityCheckSuccess(BOOL allowed, ChoicePersistenceType /*type*/)
+		{
+			if (m_permission_listener && m_expected_ask_count != m_permission_listener->GetAskCount())
+			{
+				if (m_expected_ask_count > m_permission_listener->GetAskCount())
+					//ST_failed("Security check didn't ask the user while it should have (expected ask-count: %d, current ask-count: %d)", m_expected_ask_count, m_permission_listener->GetAskCount());
+					ST_failed("Security check didn't ask the user while it should have");
+				else
+					//ST_failed("Security check asked the user while it shouldn't have (expected ask-count: %d, current ask-count: %d)", m_expected_ask_count, m_permission_listener->GetAskCount());
+					ST_failed("Security check asked the user while it shouldn't have");
+					
+			}
+			else
+			{
+				if (allowed == m_success_on_allowed)
+					ST_passed();
+				else if (allowed)
+					ST_failed("Security check resulted in ALLOW while DENY was expected");
+				else
+					ST_failed("Security check resulted in DENY while ALLOW was expected");
+			}
+
+			OP_DELETE(this);
+		}
+
+		virtual void OnSecurityCheckError(OP_STATUS error)
+		{
+			ST_failed("Security check failed with error");
+			OP_DELETE(this);
+		}
+	private:
+		BOOL m_success_on_allowed;
+		TestPermissionListener* m_permission_listener;
+		unsigned int m_expected_ask_count;
+	};
+
+
+	// "Global" variables
+	GadgetSelftestUtils g_utils;
+	OpPermissionListener* g_old_permission_listener;
+	OpGadget* g_regular_gadget;
+	OpGadget* g_regular_gadget_with_feature;
+	OpGadget* g_jil_gadget_with_feature;
+	TestPermissionListener g_test_permission_listener;
+
+	OP_STATUS test_security_check(const char* operation_name, OpGadget* gadget, BOOL should_pass, BOOL should_ask)
+	{
+		OpSecurityContext source_context(gadget);
+		OpSecurityContext target_context(operation_name, NULL, NULL);
+
+		unsigned int current_ask_count = g_test_permission_listener.GetAskCount();
+		unsigned int expected_ask_count = should_ask ? current_ask_count + 1 : current_ask_count;
+
+		TestSecurityCheckCallback* callback = OP_NEW(TestSecurityCheckCallback, (should_pass, &g_test_permission_listener, expected_ask_count));
+		RETURN_OOM_IF_NULL(callback);
+		
+		return g_secman_instance->CheckSecurity(OpSecurityManager::DOM_ACCESS_PROPERTY, source_context, target_context, callback);
+	}
+}
+
+setup
+{
+	g_regular_gadget = NULL;
+	g_regular_gadget_with_feature = NULL;
+	g_jil_gadget_with_feature = NULL;
+	
+	g_old_permission_listener = state.GetWindow()->GetWindowCommander()->GetPermissionListener();
+	state.GetWindow()->GetWindowCommander()->SetPermissionListener(&g_test_permission_listener);
+
+	g_secman_instance->AddSecurityRule(OpSecurityManager_DOMObject::TRUST_DOMAIN_WIDGET_UNSIGNED,
+									   "selftest_rule_oneshot_allow",
+									   OpSecurityManager_DOMObject::ACCESS_ONE_SHOT,
+									   OpPermissionListener::DOMPermissionCallback::OPERATION_TYPE_SELFTEST_ALLOW);
+	g_secman_instance->AddSecurityRule(OpSecurityManager_DOMObject::TRUST_DOMAIN_WIDGET_UNSIGNED,
+									   "selftest_rule_oneshot_deny",
+									   OpSecurityManager_DOMObject::ACCESS_ONE_SHOT,
+									   OpPermissionListener::DOMPermissionCallback::OPERATION_TYPE_SELFTEST_DENY);
+
+	g_secman_instance->AddSecurityRule(OpSecurityManager_DOMObject::TRUST_DOMAIN_WIDGET_UNSIGNED,
+									   "selftest_rule_allow_feature",
+									   OpSecurityManager_DOMObject::ALLOWED,
+									   OpPermissionListener::DOMPermissionCallback::OPERATION_TYPE_SELFTEST_ALLOW);
+	g_secman_instance->AddFeatureRule(OpSecurityManager_DOMObject::FEATURE_SET_REGULAR,
+									  "selftest_rule_allow_feature",
+									  "opera:selftest/dummy_feature");
+	g_secman_instance->AddFeatureRule(OpSecurityManager_DOMObject::FEATURE_SET_JIL_1_0,
+									  "selftest_rule_allow_feature",
+									  "opera:selftest/jil_dummy_feature");
+									  
+	g_secman_instance->AddSecurityRule(OpSecurityManager_DOMObject::TRUST_DOMAIN_WIDGET_UNSIGNED,
+									   "selftest_rule_allow_jil_feature",
+									   OpSecurityManager_DOMObject::ALLOWED,
+									   OpPermissionListener::DOMPermissionCallback::OPERATION_TYPE_SELFTEST_ALLOW);									  
+ 	g_secman_instance->AddFeatureRule(OpSecurityManager_DOMObject::FEATURE_SET_JIL_1_0,
+									  "selftest_rule_allow_jil_feature",
+									  "opera:selftest/jil_dummy_feature");
+									  
+	g_secman_instance->AddSecurityRule(OpSecurityManager_DOMObject::TRUST_DOMAIN_WIDGET_UNSIGNED,
+									   "selftest_rule_allow_session",
+									   OpSecurityManager_DOMObject::ACCESS_SESSION,
+									   OpPermissionListener::DOMPermissionCallback::OPERATION_TYPE_SELFTEST_ALLOW);
+}
+
+exit
+{
+	state.GetWindow()->GetWindowCommander()->SetPermissionListener(g_old_permission_listener);
+	g_secman_instance->RemoveSecurityRule(OpSecurityManager_DOMObject::TRUST_DOMAIN_WIDGET_UNSIGNED, "selftest_rule_oneshot_allow");
+	g_secman_instance->RemoveSecurityRule(OpSecurityManager_DOMObject::TRUST_DOMAIN_WIDGET_UNSIGNED, "selftest_rule_oneshot_deny");
+	g_secman_instance->RemoveSecurityRule(OpSecurityManager_DOMObject::TRUST_DOMAIN_WIDGET_UNSIGNED, "selftest_rule_allow_feature");
+	g_secman_instance->RemoveFeatureRule(OpSecurityManager_DOMObject::FEATURE_SET_REGULAR, "selftest_rule_allow_feature");
+	g_secman_instance->RemoveFeatureRule(OpSecurityManager_DOMObject::FEATURE_SET_JIL_1_0, "selftest_rule_allow_feature");
+	
+	g_secman_instance->RemoveSecurityRule(OpSecurityManager_DOMObject::TRUST_DOMAIN_WIDGET_UNSIGNED, "selftest_rule_allow_jil_feature");
+	g_secman_instance->RemoveFeatureRule(OpSecurityManager_DOMObject::FEATURE_SET_JIL_1_0, "selftest_rule_allow_jil_feature");
+}
+
+table touch_widget_files1(const char *) filelist "security_dom_object_widget" recursively;
+
+test("Load regular gadget")
+	file regular_gadget_filename "security_dom_object_widget/config.xml";
+	async;
+{
+	OP_GADGET_STATUS status = g_utils.LoadGadgetForSelftest(regular_gadget_filename, URL_GADGET_INSTALL_CONTENT, &g_regular_gadget);
+
+	if (OpStatus::IsError(status))
+		ST_failed("Unable to install test widget, status: %d", status);
+	else if (status != OpGadgetStatus::OK_SIGNATURE_VERIFICATION_IN_PROGRESS)
+		ST_passed();
+}
+
+test("DOM_ACCESS_PROPERTY allow")
+	require success "Load regular gadget";
+	async;
+{
+	OP_STATUS security_check_status = test_security_check("selftest_rule_oneshot_allow", g_regular_gadget, TRUE, TRUE);
+	if (OpStatus::IsError(security_check_status))
+		ST_failed("CheckSecurity returned error");
+}
+
+test("DOM_ACCESS_PROPERTY deny")
+	require success "Load regular gadget";
+	async;
+{
+	OP_STATUS security_check_status = test_security_check("selftest_rule_oneshot_deny", g_regular_gadget, FALSE, TRUE);
+	if (OpStatus::IsError(security_check_status))
+		ST_failed("CheckSecurity returned error");
+}
+
+test("DOM_ACCESS_PROPERTY allow for unknown operation")
+	require success "Load regular gadget";
+	async;
+{
+	OP_STATUS security_check_status = test_security_check("unknown_rule", g_regular_gadget, TRUE, FALSE);
+	if (OpStatus::IsError(security_check_status))
+		ST_failed("CheckSecurity returned error");
+}
+
+test("DOM_ACCESS_PROPERTY allowed, missing a feature URI (regular feature set)")
+	require success "Load regular gadget";
+	async;
+{
+	OP_STATUS security_check_status = test_security_check("selftest_rule_allow_feature", g_regular_gadget, FALSE, FALSE);
+	if (OpStatus::IsError(security_check_status))
+		ST_failed("CheckSecurity returned error");
+}
+
+test("Unload regular gadget")
+	require success "Load regular gadget";
+{
+	g_utils.UnloadGadget();
+}
+
+table touch_widget_files2(const char *) filelist "security_dom_object_widget_feature" recursively;
+
+test("Load regular gadget with feature")
+	file regular_gadget_with_feature_filename "security_dom_object_widget_feature/config.xml";
+	async;
+{
+	OP_GADGET_STATUS status = g_utils.LoadGadgetForSelftest(regular_gadget_with_feature_filename, URL_GADGET_INSTALL_CONTENT, &g_regular_gadget_with_feature);
+
+	if (OpStatus::IsError(status))
+		ST_failed("Unable to install test widget, status: %d", status);
+	else if (status != OpGadgetStatus::OK_SIGNATURE_VERIFICATION_IN_PROGRESS)
+		ST_passed();
+}
+
+test("DOM_ACCESS_PROPERTY allowed, with a feature URI (regular feature set)")
+	require success "Load regular gadget with feature";
+	async;
+{
+	OP_STATUS security_check_status = test_security_check("selftest_rule_allow_feature", g_regular_gadget_with_feature, TRUE, FALSE);
+	if (OpStatus::IsError(security_check_status))
+		ST_failed("CheckSecurity returned error");
+}
+
+test("DOM_ACCESS_PROPERTY allowed, a missing JIL feature URI not enforced (regular feature set)")
+	require success "Load regular gadget with feature";
+	async;
+{
+	OP_STATUS security_check_status = test_security_check("selftest_rule_allow_jil_feature", g_regular_gadget_with_feature, TRUE, FALSE);
+	if (OpStatus::IsError(security_check_status))
+		ST_failed("CheckSecurity returned error");
+}
+
+test("Unload regular gadget with feature")
+	require success "Load regular gadget with feature";
+{
+	g_utils.UnloadGadget();
+}
+
+table touch_widget_files3(const char *) filelist "security_dom_object_jil_widget_feature" recursively;
+
+test("Load JIL gadget with feature")
+	require DOM_JIL_API_SUPPORT;
+	file jil_gadget_with_feature_filename "security_dom_object_jil_widget_feature/config.xml";
+	async;
+{
+	OP_GADGET_STATUS status = g_utils.LoadGadgetForSelftest(jil_gadget_with_feature_filename, URL_GADGET_INSTALL_CONTENT, &g_jil_gadget_with_feature);
+
+	if (OpStatus::IsError(status))
+		ST_failed("Unable to install test widget, status: %d", status);
+	else if (status != OpGadgetStatus::OK_SIGNATURE_VERIFICATION_IN_PROGRESS)
+		ST_passed();
+}
+
+test("DOM_ACCESS_PROPERTY allowed, with a JIL feature URI (JIL feature set)")
+	require success "Load JIL gadget with feature";
+	async;
+{
+	OP_STATUS security_check_status = test_security_check("selftest_rule_allow_feature", g_jil_gadget_with_feature, TRUE, FALSE);
+	if (OpStatus::IsError(security_check_status))
+		ST_failed("CheckSecurity returned error");
+}
+
+test("DOM_ACCESS_PROPERTY allowed, ask once per session. Stage 1")
+	require success "Load JIL gadget with feature";
+	async;
+{
+	OP_STATUS security_check_status = test_security_check("selftest_rule_allow_session", g_jil_gadget_with_feature, TRUE, TRUE);
+	if (OpStatus::IsError(security_check_status))
+		ST_failed("CheckSecurity returned error");
+}
+
+test("DOM_ACCESS_PROPERTY allowed, ask once per session. Stage 2")
+	require success "Load JIL gadget with feature";
+	async;
+{
+	OP_STATUS security_check_status = test_security_check("selftest_rule_allow_session", g_jil_gadget_with_feature, TRUE, FALSE);
+	if (OpStatus::IsError(security_check_status))
+		ST_failed("CheckSecurity returned error");
+}
+
+test("Unload regular gadget with feature")
+	require success "Load JIL gadget with feature";
+{
+	g_utils.UnloadGadget();
+}

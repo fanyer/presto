@@ -1,0 +1,248 @@
+/* -*- Mode: c++; tab-width: 4; indent-tabs-mode: t; c-basic-offset: 4 -*-
+ *
+ * Copyright (C) 1995-2008 Opera Software AS.  All rights reserved.
+ *
+ * This file is part of the Opera web browser.	It may not be distributed
+ * under any circumstances.
+ *
+ * @author Arjan van Leeuwen (arjanl)
+ */
+
+group "m2.store.store3";
+require M2_SUPPORT;
+
+include "adjunct/m2/src/engine/store/store3.h";
+include "adjunct/m2/src/engine/message.h";
+include "adjunct/m2/selftest/overrides/ST_MessageDatabase.h";
+include "adjunct/m2/src/engine/progressinfo.h";
+
+table Subjects(const uni_char*, const uni_char*)
+{
+	// Raw subject							Stripped subject
+	{ UNI_L("Hello you")					, UNI_L("Hello you")}
+	{ UNI_L("Re: Hello you")				, UNI_L("Hello you")}
+	{ UNI_L("Re: ")							, UNI_L("")}
+	{ UNI_L("Re:")							, UNI_L("")}
+	{ UNI_L("Svr: Hello you")				, UNI_L("Hello you")}
+	{ UNI_L("[BTS] Bug 1")					, UNI_L("Bug 1")}
+	{ UNI_L("[BTS] Commented: Bug 1")		, UNI_L("Bug 1")}
+	{ UNI_L("Re: [BTS] Updated: Bug 1")		, UNI_L("Bug 1")}
+	{ UNI_L("Re: [BTS] Updated: \x424")		, UNI_L("\x424")}
+	{ UNI_L("Re: [\x424] Updated: Bug 1")	, UNI_L("Bug 1")}
+	{ UNI_L("\x424: [BTS] Updated: Bug 1")	, UNI_L("Bug 1")}
+	{ UNI_L("\x424: [BTS] \x424: Bug 1")	, UNI_L("Bug 1")}
+	{ UNI_L("\x424: [BTS-2] \x424: Bug 1")	, UNI_L("Bug 1")}
+}
+
+global
+{
+	struct TestField1 : public ST_Field
+	{
+		TestField1(int pos) : m_pos(pos) {}
+		virtual INT64 &GetValueInternal(INT64 *val) const { *val = 0xd00da + m_pos; return *val; }
+		virtual BOOL IsVariableLength() const { return FALSE; }
+		virtual OP_STATUS GetStringValue(OpString& val) const { val.Empty(); return val.AppendFormat(UNI_L("dooda%d"), m_pos); }
+		virtual OP_STATUS GetStringValue(OpString8& val) const { val.Empty(); return val.AppendFormat("dooda%d", m_pos); }
+		virtual OP_STATUS SetValue(const INT64 &val) { return OpStatus::OK; }
+		virtual OP_STATUS SetStringValue(const uni_char *val) { return OpStatus::OK; }
+		virtual OP_STATUS SetStringValue(const char *val) { return OpStatus::OK; }
+		int m_pos;
+	};
+
+	struct TestField2 : public ST_Field
+	{
+		TestField2(int pos) : m_pos(pos) {}
+		virtual INT64 &GetValueInternal(INT64 *val) const { *val = 0xad00d + m_pos; return *val; }
+		virtual BOOL IsVariableLength() const { return FALSE; }
+		virtual OP_STATUS GetStringValue(OpString& val) const { val.Empty(); return val.AppendFormat(UNI_L("adood%d"), m_pos); }
+		virtual OP_STATUS GetStringValue(OpString8& val) const { val.Empty(); return val.AppendFormat("adood%d", m_pos); }
+		virtual OP_STATUS SetValue(const INT64 &val) { return OpStatus::OK; }
+		virtual OP_STATUS SetStringValue(const uni_char *val) { return OpStatus::OK; }
+		virtual OP_STATUS SetStringValue(const char *val) { return OpStatus::OK; }
+		int m_pos;
+	};
+
+	struct TestCursor : public ST_Cursor
+	{
+		virtual OP_STATUS Flush() { return OpStatus::OK; }
+		virtual ST_Field &GetField(int pos)
+		{
+			if (m_id == 0)
+				m_field.reset(OP_NEW(TestField1, (pos)));
+			else
+				m_field.reset(OP_NEW(TestField2, (pos)));
+			return *m_field;
+		}
+		virtual OP_STATUS Create() { return OpStatus::OK; }
+		virtual OP_STATUS Delete() { return OpStatus::OK; }
+		virtual OP_STATUS Goto(BSCursor::RowID id) { m_id = id; return OpStatus::OK; }
+		virtual BSCursor::RowID GetID() const { return m_id; }
+		virtual void SetStorage(ST_BlockStorage *table) {};
+		virtual OP_STATUS AddField(const char *name, int size) { return OpStatus::OK; }
+
+		OpAutoPtr<ST_Field> m_field;
+		BSCursor::RowID m_id;
+	};
+
+	struct DummyBlockStorage : public ST_BlockStorage
+	{
+		virtual void Close() {}
+		virtual OP_STATUS Clear(long blocksize) { return OpStatus::OK; }
+		virtual int GetBlockSize() { return M2_BS_BLOCKSIZE; }
+		virtual OpFileLength GetFileSize() { return M2_BS_BLOCKSIZE * 2; }
+		virtual BOOL IsStartBlock(OpFileLength pos) { return pos % M2_BS_BLOCKSIZE == 0; }
+		virtual BOOL InTransaction() { return FALSE; }
+		virtual OP_STATUS Commit() { return OpStatus::OK; }
+		virtual OP_STATUS Open(const uni_char* path, BlockStorage::OpenMode mode, long blocksize, int buffered_blocks, OpFileFolder folder) { return OpStatus::OK; }
+		virtual BOOL ReadUserHeader(unsigned offset, void *data, int len, int disk_len, int count) { message_gid_t last = 10; op_memcpy(data, &last, sizeof(last)); return TRUE; }
+		virtual OP_STATUS SetStartBlock(OpFileLength pos) { return OpStatus::OK; }
+		virtual OP_STATUS StartBlocksUpdated() { return OpStatus::OK; }
+		virtual BOOL WriteUserHeader(unsigned offset, const void *data, int len, int disk_len = 0, int count = 1) { return TRUE; }
+		virtual BlockStorage* GetBlockStorage() { return 0; };
+		virtual BlockStorage &GetGroupMember() { return *static_cast<BlockStorage*>(NULL); }
+	};
+
+	struct DummyMessageIDIndex : public ST_SingleBTree<Store::MessageIdKey>
+	{
+		virtual OP_STATUS Close() { return OpStatus::OK; }
+		virtual OP_STATUS Clear() { return OpStatus::OK; }
+		virtual OP_STATUS Insert(const Store::MessageIdKey &item, BOOL overwrite_existing = FALSE) { return OpStatus::OK; }
+		virtual SearchIterator<Store::MessageIdKey> *Search(const Store::MessageIdKey &item, SearchOperator oper) { return 0; }
+		virtual OP_BOOLEAN Delete(const Store::MessageIdKey &item) { return OpBoolean::IS_TRUE; }
+		virtual OP_STATUS Commit() { return OpStatus::OK; }
+		virtual OP_STATUS Open(const uni_char* path, BlockStorage::OpenMode mode, long blocksize, OpFileFolder folder) { return OpStatus::OK; }
+		virtual BlockStorage &GetGroupMember() { return *static_cast<BlockStorage*>(NULL); }
+	};
+
+	struct StoreHolder
+	{
+		StoreHolder(ProgressInfo* progress = 0)
+			: store(&message_db, OP_NEW(TestCursor, ()), OP_NEW(DummyBlockStorage, ()), OP_NEW(DummyMessageIDIndex, ()))
+		{
+			store.SetProgressKeeper(progress);
+			OpString error_msg;
+			OpStatus::Ignore(store.Init(error_msg));
+		}
+
+		ST_MessageDatabase message_db;
+		Store3 store;
+	};
+};
+
+test("MessageDatabase receives notification when messages are made available")
+{
+	StoreHolder holder;
+
+	holder.store.ReadData(0, 1);
+
+	verify(holder.message_db.m_message_id_available == 0xd00da + Store::STORE_M2_ID);
+}
+
+test("MessageDatabase receives notification when all messages are available")
+{
+	StoreHolder holder;
+	
+	holder.store.ReadData(0, 2);
+
+	verify(holder.message_db.m_all_messages_available);
+}
+
+test("Progress is kept when initializing")
+{
+	ProgressInfo progress;
+	StoreHolder holder(&progress);
+
+	verify(progress.GetCurrentAction() == ProgressInfo::LOADING_DATABASE);
+	verify(progress.GetCount() == 0);
+	verify(progress.GetTotalCount() == M2_BS_BLOCKSIZE * 2);
+}
+
+test("Progress is kept when reading data")
+{
+	ProgressInfo progress;
+	StoreHolder holder(&progress);
+
+	holder.store.ReadData(0, 1);
+
+	verify(progress.GetCurrentAction() == ProgressInfo::LOADING_DATABASE);
+	verify(progress.GetCount() == M2_BS_BLOCKSIZE);
+	verify(progress.GetTotalCount() == M2_BS_BLOCKSIZE * 2);
+}
+
+test("Progress is reset when finished")
+{
+	ProgressInfo progress;
+	StoreHolder holder(&progress);
+
+	holder.store.ReadData(0, 2);
+
+	verify(progress.GetCurrentAction() == ProgressInfo::NONE);
+}
+
+test("GetLastID returns highest ID")
+{
+	StoreHolder holder;
+
+	holder.store.ReadData(0, 2);
+
+	verify(holder.store.GetLastId() == 0xd00da + Store::STORE_M2_ID);
+};
+
+test("Check message availability")
+{
+	StoreHolder holder;
+	
+	holder.store.ReadData(0, 2);
+
+	verify(holder.store.MessageAvailable(0xd00da + Store::STORE_M2_ID));
+	verify(holder.store.MessageAvailable(0xad00d + Store::STORE_M2_ID));
+}
+
+test("Get message metadata from store")
+{
+	StoreHolder holder;
+	
+	holder.store.ReadData(0, 2);
+
+	Message message;
+	verify(OpStatus::IsSuccess(holder.store.GetMessage(message, 0xd00da + Store::STORE_M2_ID)));
+
+	// integer values
+    verify(message.GetAccountId() == (0xd00da & 0xffff) + Store::STORE_ACCOUNT_ID);
+	verify(message.GetId() == 0xd00da + Store::STORE_M2_ID);
+	verify(message.GetMessageSize() == 0xd00da + Store::STORE_SIZE);
+	verify(message.GetAllFlags() == 0xd00da + Store::STORE_FLAGS);
+	verify(message.GetParentId() == 0xd00da + Store::STORE_PARENT);
+	verify(message.GetRecvTime() == 0xd00da + Store::STORE_RECV_DATE);
+	time_t sent;
+	verify(OpStatus::IsSuccess(message.GetDateHeaderValue(Header::DATE, sent)) && sent == 0xd00da + Store::STORE_SENT_DATE);
+
+	// string values
+	Header::HeaderValue header;
+	uni_char expected_string[20];
+
+	uni_sprintf(expected_string, UNI_L("dooda%d"), Store::STORE_FROM);
+	verify(OpStatus::IsSuccess(message.GetHeaderValue(Header::FROM, header)) &&
+		   header == expected_string);
+
+	uni_sprintf(expected_string, UNI_L("dooda%d"), Store::STORE_TO);
+	verify(OpStatus::IsSuccess(message.GetHeaderValue(Header::TO, header)) &&
+		   header == expected_string);
+
+	uni_sprintf(expected_string, UNI_L("dooda%d"), Store::STORE_SUBJECT);
+	verify(OpStatus::IsSuccess(message.GetHeaderValue(Header::SUBJECT, header)) &&
+		   header == expected_string);
+
+	char internet_location[20];
+	sprintf(internet_location, "dooda%d", Store::STORE_INTERNET_LOCATION);
+	verify(message.GetInternetLocation() == internet_location);
+};
+
+foreach (raw_subject, expected_subject) from Subjects
+{
+	test("StripSubject works as expected")
+	{
+		OpStringC subject(raw_subject);
+		verify(Store3::StripSubject(subject).CompareI(expected_subject) == 0);
+	}
+}

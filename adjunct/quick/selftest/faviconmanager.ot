@@ -1,0 +1,137 @@
+/* -*- Mode: c++; tab-width: 4; indent-tabs-mode: t; c-basic-offset: 4 -*- */
+/* Espen Sand */
+
+group "quick.faviconmanager";
+require init;
+
+include "modules/hardcore/timer/optimer.h";
+//include "adjunct/desktop_util/selftest_utils/ST_FailTimer.h";
+include "adjunct/quick/managers/FavIconManager.h";
+include "adjunct/desktop_util/string/stringutils.h";
+include "modules/img/imagedump.h";
+include "modules/util/tempbuf.h";
+include "modules/pi/OpBitmap.h";
+
+language C++;
+
+global
+{
+	class IconLoadTestTimer : private OpTimerListener
+	{
+	public:
+		IconLoadTestTimer()
+		{ 
+			m_timer.SetTimerListener(this); 
+		}
+
+		void RunFor(unsigned step_ms, unsigned duration_ms, const OpString& document_url)
+		{ 
+			m_document_url.Set(document_url);	   
+			m_duration = duration_ms;
+			m_total = 0;
+			m_step = step_ms;
+			m_timer.Start(m_step); 
+		}
+
+		void Stop()
+		{ 
+			m_timer.Stop(); 
+		}
+
+	private:
+		virtual void OnTimeOut(OpTimer* timer)
+		{ 
+			m_total += m_step;
+			Image img = g_favicon_manager->Get(m_document_url.CStr(), FALSE);
+			if( img.IsEmpty() )
+			{
+				if( m_total > m_duration )
+				{
+					ST_failed("Timed out");
+				}
+				else
+				{
+					m_timer.Start(m_step);
+				}
+			}
+			else
+			{
+				ST_passed();
+			}
+		}
+
+	private:
+		OpTimer m_timer;
+		unsigned int m_duration;
+		unsigned int m_total;
+		unsigned int m_step;
+		OpString m_document_url;
+	};
+
+	IconLoadTestTimer loading_timer;
+}
+
+
+
+test("Test for valid favicon manager")
+{
+	verify(g_favicon_manager != 0);
+}
+
+test("Test for favicon url context for redir.opera.com")
+{
+	OpString favicon_url;
+	favicon_url.Set("http://redir.opera.com/favicons/amazon/favicon.ico");
+	
+	URL_CONTEXT_ID id = g_favicon_manager->GetURLContext(favicon_url);
+	verify(id != 0);
+}
+
+test("Test for favicon url context from normal domain")
+{
+	OpString favicon_url;	
+	favicon_url.Set("http://www.aftenposten.no/favicon.ico");
+	
+	URL_CONTEXT_ID id = g_favicon_manager->GetURLContext(favicon_url);
+	verify(id == 0);
+}
+
+test("Test for favicon url loading from redir.opera.com") async;
+{
+	OpString document_url;
+	document_url.Set("http://www.google.com");
+	OpString favicon_url;
+	favicon_url.Set("http://redir.opera.com/favicons/google/favicon.ico");
+	
+	g_favicon_manager->GetInternal(document_url, favicon_url);
+	
+	loading_timer.RunFor(1000, 10000, document_url);
+}
+
+test("Test adding favicon encoding/decoding")
+{
+	OpString url;
+	OpString8 icon, icon_decoded;
+	url.Set(UNI_L("http://www.opera.com/download/"));
+	icon.Set("iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAACKElEQVR42o1SS2sTURj9Ms/ENCE0rYtuUhqqthiZ0o2b6hSMi4I00NJm2ZW4jEt3/QvdSEtFwUdbVIhp2pXCEEN9YLXgRrOxgqhYA4EuuvB1PHdokr4MfnCYO+ece777zR2RA4VMJoZsdgoTE3lMTnoYH/cwNpYnn1OatCqMjDg0bWJ0FDsX0qic7EflRB92zrtAOg24bg1DQ5mjN7uu4xuGh/H19BkURLbnxVy4LeaNRyK16ql+YHAQGBgAUqmpwwGOs1k3lEJRXBX9Mum40opiuCW7DUgmgZ4eIJGoIRZrjkMhg95e3/AjkUBRLJBO7m2gOHR0AO3t4GZshcPXmgGdnbcIIB5HNRLFkpjr9e7NAHPju27it67jp6bhm4jyWL74yw56f0yKhoEtzagHRPYHGF5FNHxiv4/Eh0AAjSZVPegxEZ+JdzT9K2CN2kt6nhGvNVMFdPnie9323pB8RZRbBKxSW6FnmXgqoS+NgLJmTD/XbaxSKEqAAVblcIC5sUjtLj0PAjoesinp4754X8R5YYRxj+Idv4N/C/v+ugK5OWqzxJrZhpzINOljDcOybhWfGCHfsCSG6tS4phUxcwvkZlS4HqyfMLW3gWQ5T96wKmWmzwY0nsaAOraafZHr6+RK1Aqib58VuSQHrtkvCn03eZJ1K4q3VgyPOZaCeldQWreIS2u3tKjYOZGLVzjjvGbPKaj1bldH6h/uP0p9IGXu2n1GjjL9BRSeBC9ZGd17AAAAAElFTkSuQmCC");
+	unsigned char* buffer = NULL;
+	unsigned long len = 0;
+
+	verify(DecodeBase64(icon, buffer, len) == OpStatus::OK);
+	g_favicon_manager->Add(url, buffer, len);
+	OP_DELETEA(buffer);
+
+	TempBuffer tmp;
+	Image image = g_favicon_manager->Get(url.CStr());
+	OpBitmap *bitmap = image.GetBitmap(NULL);
+	verify(bitmap);
+	verify(OpStatus::IsSuccess(GetOpBitmapAsBase64PNG(bitmap, &tmp)));
+	verify(OpStatus::IsSuccess(icon_decoded.Set(tmp.GetStorage(), tmp.Length())));
+	verify(icon.Compare(icon_decoded) == 0);
+	image.ReleaseBitmap();
+}
+
+test("cleanup, gets run when async test ends") 
+{
+	loading_timer.Stop();
+}

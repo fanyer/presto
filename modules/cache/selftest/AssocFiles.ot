@@ -1,0 +1,844 @@
+group "cache.assoc_files"; // -*- Mode: C++; tab-width: 4; -*-
+
+require URL_ENABLE_ASSOCIATED_FILES;
+require undefined SEARCH_ENGINE_CACHE;
+require WEBSERVER_SUPPORT;
+
+include "modules/cache/cache_selftest.h";
+include "modules/cache/cache_st_helpers.h";
+include "modules/url/url2.h";
+include "modules/url/url_rep.h";
+include "modules/formats/url_dfr.h";
+include "modules/url/url_ds.h";
+include "modules/url/url2.h";
+include "modules/cache/cache_int.h";
+
+#include "cache_unite.oth";
+
+global
+{
+	UniteCacheTester uct;
+	MultiContext mctx;
+	URL_CONTEXT_ID ctx_assoc;
+	URL_CONTEXT_ID ctx_assoc2;
+	URL_CONTEXT_ID ctx_assoc3;
+	URL_CONTEXT_ID ctx_assoc4;
+	URL_CONTEXT_ID ctx_assoc5;
+	URL_CONTEXT_ID ctx_assoc6;
+	URL_CONTEXT_ID ctx_assoc_https;
+	URL_CONTEXT_ID ctx_full;
+	URL_CONTEXT_ID ctx_count;
+	URL url_assoc1;
+	URL url_assoc2;
+	URL url_assoc3;
+	URL url_assoc4;
+	URL url_assoc5;
+	URL url_assoc6;
+	URL url_assoc_emb;		// Used to simulate the restart
+	URL url_assoc_cnt;		// Used to simulate the restart
+	URL url_assoc_plain;	// Used to simulate the restart
+	URL url_assoc_emb2;		// Used to verify the restart
+	URL url_assoc_cnt2;		// Used to verify the restart
+	URL url_assoc_plain2;	// Used to verify the restart
+	URL url_multi_em_1;		// Used to verify multiple URLs (of the same type) with associated files
+	URL url_multi_em_2;		// Used to verify multiple URLs (of the same type)  with associated files
+	URL url_multi_em_3;		// Used to verify multiple URLs  (of the same type) with associated files
+	URL url_multi_cnt_1;	// Used to verify multiple URLs (of the same type) with associated files
+	URL url_multi_cnt_2;	// Used to verify multiple URLs (of the same type)  with associated files
+	URL url_multi_cnt_3;	// Used to verify multiple URLs  (of the same type) with associated files
+	URL url_multi_plain_1;	// Used to verify multiple URLs (of the same type) with associated files
+	URL url_multi_plain_2;	// Used to verify multiple URLs (of the same type)  with associated files
+	URL url_multi_plain_3;	// Used to verify multiple URLs  (of the same type) with associated files
+	URL url_multi_plain_crash; // Used to verify multiple URLs  (of the same type) with associated files
+	URL url_multi_plain_crash2; // Used to verify multiple URLs  (of the same type) with associated files
+	URL url_full_emb;		// Full tests
+	URL url_full_cnt;		// Full tests
+	URL url_full_plain;		// Full tests
+	URL url_full_emb2;		// Full tests
+	URL url_full_cnt2;		// Full tests
+	URL url_full_plain2;		// Full tests
+	URL url_full_HTTPS_emb;		// Full tests
+	URL url_full_HTTPS_cnt;		// Full tests
+	URL url_full_HTTPS_plain;		// Full tests
+	URL url_full_HTTPS_dl;		// Full tests
+	URL url_full_HTTPS_emb2;		// Full tests
+	URL url_full_HTTPS_cnt2;		// Full tests
+	URL url_full_HTTPS_plain2;		// Full tests
+	URL url_full_HTTPS_dl2;		// Full tests
+	URL url_full_FILE_emb;		// Full tests
+	URL url_full_FILE_cnt;		// Full tests
+	URL url_full_FILE_plain;		// Full tests
+	URL url_full_FILE_dl;		// Full tests
+	URL url_full_FILE_emb2;		// Full tests
+	URL url_full_FILE_cnt2;		// Full tests
+	URL url_full_FILE_plain2;		// Full tests
+	URL url_full_FILE_dl2;		// Full tests
+	URL url_assoc_https;
+	URL url_file;
+	OpFileFolder folder_assoc;		// Used for "Association" tests
+	OpFileFolder folder_assoc4;		// Used for "Association" tests
+	OpFileFolder folder_assoc5;		// Used for "Association" tests
+	OpFileFolder folder_full;		// Used for "Association" tests
+	OpFileFolder folder_count;		// Used for "Association" tests
+	CacheHelpers ch;
+	
+	// Return TRUE if the file has been created without problems
+	BOOL CreateAssociatedFile2(URL url, URL_CONTEXT_ID ctx, const char *content, URL::AssociatedFileType type)
+	{
+		OpFile *af;
+			
+		// Prevent "Cache-Control: no-cache" from expiring the page immediately (which prevent the URL from joining a container)...
+		url.SetAttribute(URL::KCachePolicy_AlwaysVerify, FALSE);
+		
+		af = url.CreateAssociatedFile(type);
+		
+		if(!af)
+			return FALSE;
+
+		if(OpStatus::IsError(af->Write(content, op_strlen(content)+1)))
+		{
+			ST_failed("Error writing the file");
+			OP_DELETE(af);
+			
+			return FALSE;
+		}
+		
+		af->Close();
+		OP_DELETE(af);
+		
+		return TRUE;
+	}
+}
+
+setup
+{
+	CacheTester::BlockPeriodicFreeUnusedResources();
+}
+
+exit
+{
+	CacheTester::RestorePeriodicFreeUnusedResources();
+}
+
+test("Create contexts")
+{
+	verify_success(mctx.CreateNewContext(ctx_assoc, UNI_L("t_assoc"), TRUE, &folder_assoc));	
+	verify_success(mctx.CreateNewContext(ctx_assoc3, UNI_L("t_assoc3"), TRUE, NULL));	
+	verify_success(mctx.CreateNewContext(ctx_assoc4, UNI_L("t_assoc4"), TRUE, &folder_assoc4));	
+	verify_success(mctx.CreateNewContext(ctx_assoc5, UNI_L("t_assoc5"), TRUE, &folder_assoc5));	
+	verify_success(mctx.CreateNewContext(ctx_assoc_https, UNI_L("t_assoc_s"), TRUE, NULL));	
+	verify_success(mctx.CreateNewContext(ctx_full, UNI_L("t_assoc_f"), TRUE, &folder_full));	
+	verify_success(mctx.CreateNewContext(ctx_count, UNI_L("t_assoc_c"), TRUE, &folder_count));	
+}
+
+
+subtest SaveAndRead(URL_CONTEXT_ID ctx)
+{
+	URL url;
+	DataFile_Record rec;
+	OpFile *af;
+	OpFileLength bytes_read;
+	FileName_Store fnstore(1);
+	char buf[4]; /* ARRAY OK 2009-04-20 lucav */
+	OP_STATUS status;
+
+	url = g_url_api->GetURL("http://cache.assoc_files.test/index.html", ctx);
+	url.WriteDocumentDataUniSprintf(UNI_L("<html><body></body></html>"));
+	url.WriteDocumentDataFinished();
+
+//	ds = url.GetRep()->GetDataStorage();
+//	TRAP(status, ds->CreateCacheL());
+//	verify(OpStatus::IsSuccess(status));
+
+	verify((af = url.CreateAssociatedFile(URL::Thumbnail)) != NULL);
+	af->Write("123", 4);
+	af->Close();
+	OP_DELETE(af);
+
+	TRAP(status, url.GetRep()->WriteCacheDataL(&rec));
+	verify(OpStatus::IsSuccess(status));
+
+	//TRAP(status, URL_Rep::CreateL(&rep, &rec, fnstore, OPFILE_CACHE_FOLDER, 0));
+	//verify(OpStatus::IsSuccess(status));
+
+	//URL url2(rep, "");
+
+	verify((af = url.OpenAssociatedFile(URL::Thumbnail)) != NULL);
+	af->Read(buf, 4, &bytes_read);
+	af->Close();
+	OP_DELETE(af);
+
+	verify(bytes_read == 4);
+	verify(op_strcmp("123", buf) == 0);
+}
+
+test("Empty main disk cache")
+async;
+{
+	mctx.EmptyDCache(0);
+}
+
+test("Empty disk cache for count test")
+async;
+{
+	mctx.EmptyDCache(ctx_count);
+}
+
+
+test("Test files count functions")
+{
+	int files_0=CacheHelpers::CheckDirectory(folder_count, TRUE);
+	
+	verify(files_0==0);
+	
+	CacheTester::TouchFiles(folder_count, 1, FALSE, NULL);
+	verify(files_0+1==CacheHelpers::CheckDirectory(folder_count, TRUE));
+	
+	CacheTester::TouchFiles(folder_count, 1, FALSE, UNI_L("g_0001"));
+	verify(files_0+2==CacheHelpers::CheckDirectory(folder_count, TRUE));
+	verify(files_0+2==CacheHelpers::CheckDirectory(folder_count, FALSE));
+	
+	CacheTester::TouchFiles(folder_count, 1, FALSE, UNI_L("assoc001"));
+	verify(files_0+3==CacheHelpers::CheckDirectory(folder_count, TRUE));
+	verify(files_0+2==CacheHelpers::CheckDirectory(folder_count, FALSE));
+	
+	OpString str;
+	OpString str2;
+	
+	str.AppendFormat(UNI_L("%s%c%s"), UNI_L("assoc001"), PATHSEPCHAR, UNI_L("sesn"));
+	CacheTester::TouchFiles(folder_count, 1, FALSE, str.CStr());
+	verify(files_0+4==CacheHelpers::CheckDirectory(folder_count, TRUE));
+	verify(files_0+2==CacheHelpers::CheckDirectory(folder_count, FALSE));
+	
+	str2.AppendFormat(UNI_L("%s%c%s"), UNI_L("assoc001"), PATHSEPCHAR, UNI_L("g_0001"));
+	CacheTester::TouchFiles(folder_count, 1, FALSE, str2.CStr());
+	verify(files_0+5==CacheHelpers::CheckDirectory(folder_count, TRUE));
+	verify(files_0+2==CacheHelpers::CheckDirectory(folder_count, FALSE));
+}
+
+test("DataStream test - ctx 0")
+{
+	verify(SaveAndRead(0));
+}
+
+test("DataStream test - ctx assoc")
+{
+	verify(SaveAndRead(ctx_assoc));
+}
+
+table TableSizes(char*, int, char*, BOOL, BOOL, URL &)
+{
+  { "[embedded NOT saved]", SIZE_EMBEDDED, "123_emb", TRUE, FALSE, url_assoc1},
+  { "[container NOT saved]", SIZE_CONTAINERS, "123_cnt", FALSE, FALSE, url_assoc2},
+  { "[plain NOT saved]", SIZE_PLAIN, "123_plain", FALSE, FALSE, url_assoc3},
+  { "[embedded SAVED]", SIZE_EMBEDDED, "123_embs", TRUE, TRUE, url_assoc4},
+  { "[container SAVED]", SIZE_CONTAINERS, "123_cnts", FALSE, TRUE, url_assoc5},
+  { "[plain SAVED]", SIZE_PLAIN, "123_plains", FALSE, TRUE, url_assoc6}
+}
+
+table TableSizesRestart(char*, int, char*, BOOL, URL &, URL &)
+{
+  { "[embedded]", SIZE_EMBEDDED, "123_emb", TRUE, url_assoc_emb, url_assoc_emb2},
+  { "[container]", SIZE_CONTAINERS, "123_cnt", FALSE, url_assoc_cnt, url_assoc_cnt2},
+  { "[plain]", SIZE_PLAIN, "123_plain", FALSE, url_assoc_plain, url_assoc_plain2},
+}
+
+// WARNING: each line needs a different URL, as it will be deleted
+table TableSizesFullCheck(char*, int, URL &, URLType, BOOL, BOOL)
+{
+  { "[HTTP embedded 1]", SIZE_EMBEDDED, url_full_emb, URL_HTTP, TRUE, TRUE},
+  { "[HTTP container 1]", SIZE_CONTAINERS, url_full_cnt, URL_HTTP, TRUE, TRUE},
+  { "[HTTP plain 1]", SIZE_PLAIN, url_full_plain, URL_HTTP, TRUE, TRUE},
+  
+  { "[HTTPS embedded 1]", SIZE_EMBEDDED, url_full_HTTPS_emb, URL_HTTPS, TRUE, TRUE},
+  { "[HTTPS container 1]", SIZE_CONTAINERS, url_full_HTTPS_cnt, URL_HTTPS, TRUE, TRUE},
+  { "[HTTPS plain 1]", SIZE_PLAIN, url_full_HTTPS_plain, URL_HTTPS, TRUE, TRUE},
+  { "[HTTPS download 1]", SIZE_PLAIN, url_full_HTTPS_dl, URL_HTTPS, FALSE, TRUE},
+
+  { "[FILE embedded 1]", SIZE_EMBEDDED, url_full_FILE_emb, URL_FILE, TRUE, TRUE},
+  { "[FILE container 1]", SIZE_CONTAINERS, url_full_FILE_cnt, URL_FILE, TRUE, TRUE},
+  { "[FILE plain 1]", SIZE_PLAIN, url_full_FILE_plain, URL_FILE, TRUE, TRUE},
+  { "[FILE download 1]", SIZE_PLAIN, url_full_FILE_dl, URL_FILE, FALSE, TRUE},
+  
+  { "[HTTP embedded 2]", SIZE_EMBEDDED, url_full_emb2, URL_HTTP, TRUE, FALSE},
+  { "[HTTP container 2]", SIZE_CONTAINERS, url_full_cnt2, URL_HTTP, TRUE, FALSE},
+  { "[HTTP plain 2]", SIZE_PLAIN, url_full_plain2, URL_HTTP, TRUE, FALSE},
+  
+  { "[HTTPS embedded 2]", SIZE_EMBEDDED, url_full_HTTPS_emb2, URL_HTTPS, TRUE, FALSE},
+  { "[HTTPS container 2]", SIZE_CONTAINERS, url_full_HTTPS_cnt2, URL_HTTPS, TRUE, FALSE},
+  { "[HTTPS plain 2]", SIZE_PLAIN, url_full_HTTPS_plain2, URL_HTTPS, TRUE, FALSE},
+  { "[HTTPS download 2]", SIZE_PLAIN, url_full_HTTPS_dl2, URL_HTTPS, FALSE, FALSE},
+  
+  { "[FILE embedded 2]", SIZE_EMBEDDED, url_full_FILE_emb2, URL_FILE, TRUE, FALSE},
+  { "[FILE container 2]", SIZE_CONTAINERS, url_full_FILE_cnt2, URL_FILE, TRUE, FALSE},
+  { "[FILE plain 2]", SIZE_PLAIN, url_full_FILE_plain2, URL_FILE, TRUE, FALSE},
+  { "[FILE download 2]", SIZE_PLAIN, url_full_FILE_dl2, URL_FILE, FALSE, FALSE}
+}
+
+table TableSizesMulti(char*, int, char*, char*, char*, BOOL, CacheType, URL &, URL &, URL &)
+{
+  { "[embedded]", SIZE_EMBEDDED, "123_emb_1", "123_emb_2", "123_emb_3", TRUE, TYPE_EMBEDDED, url_multi_em_1, url_multi_em_2, url_multi_em_3},
+  { "[container]", SIZE_CONTAINERS, "123_cnt_1", "123_cnt_2", "123_cnt_3", FALSE, TYPE_CONTAINER, url_multi_cnt_1, url_multi_cnt_2, url_multi_cnt_3},
+  { "[plain]", SIZE_PLAIN, "123_plain_1", "123_plain_2", "123_plain_3", FALSE, TYPE_PLAIN, url_multi_plain_1, url_multi_plain_2, url_multi_plain_3},
+}
+
+subtest CreateAssociatedFile(URL url, URL_CONTEXT_ID ctx, const char *content, BOOL save_all, BOOL embedded, URL::AssociatedFileType type)
+{
+	OpFile *af;
+
+	// Prevent "Cache-Control: no-cache" from expiring the page immediately (which prevent the URL from joining a container)...
+	url.SetAttribute(URL::KCachePolicy_AlwaysVerify, FALSE);
+
+	if(save_all)
+		CacheTester::WriteIndex(ctx);
+
+	verify(url.GetRep());
+	verify(url.GetRep()->GetDataStorage());
+	verify(url.GetRep()->GetDataStorage()->GetCacheStorage());
+	verify(url.GetRep()->GetDataStorage()->GetCacheStorage()->IsEmbeddable()==embedded);
+
+	//output("embedded 1: %d-%d ", url.GetRep()->GetDataStorage()->GetCacheStorage()->IsEmbeddable(), url.GetRep()->GetDataStorage()->GetCacheStorage()->IsEmbedded());
+	verify((af = url.CreateAssociatedFile(type)) != NULL);
+	//output("embedded 2: %d-%d ", url.GetRep()->GetDataStorage()->GetCacheStorage()->IsEmbeddable(), url.GetRep()->GetDataStorage()->GetCacheStorage()->IsEmbedded());
+	verify_success(af->Write(content, op_strlen(content)+1));
+	af->Close();
+	OP_DELETE(af);
+}
+
+subtest VerifyAssociatedFile(URL url, const char *expected_content, URL::AssociatedFileType type)
+{
+	OpFile *af;
+	char buf[256]; /* ARRAY OK 2010-10-25 lucav */
+	OpFileLength len, bytes_read;
+
+	verify((af = url.OpenAssociatedFile(type)) != NULL);
+	verify_success(af->GetFileLength(len));
+	verify(len == (OpFileLength)op_strlen(expected_content) + 1);
+	verify(len<=256);
+	verify_success(af->Read(buf, len, &bytes_read));
+	af->Close();
+	OP_DELETE(af);
+	
+	verify(bytes_read == len);
+	verify(op_strcmp(buf, expected_content) == 0);
+}
+
+foreach (descr, file_size, test_str, embedded, save_all, url_assoc) from TableSizes
+{
+	test("Loading single file test " descr)
+	async;
+	{
+		url_assoc=uct.JScreatePage(file_size, 1000, ctx_assoc);
+	}
+
+	test("Create Associate file " descr)
+	{
+		verify(CreateAssociatedFile(url_assoc, ctx_assoc, test_str, save_all, embedded, URL::Thumbnail));
+	}
+
+	test("Check Associate file - same url" descr)
+	{
+		verify(VerifyAssociatedFile(url_assoc, test_str, URL::Thumbnail));
+	}
+
+	test("Check Associate file - same context" descr)
+	{
+		URL url_assoc_ver=g_url_api->GetURL(url_assoc.GetAttribute(URL::KName).CStr(), ctx_assoc);
+
+		verify(VerifyAssociatedFile(url_assoc_ver, test_str, URL::Thumbnail));
+	}
+}
+
+// Create the URLs to simulate the restart
+foreach (descr, file_size, test_str, embedded, url_assoc, url_assoc2) from TableSizesRestart
+{
+	test("Create URL for restart - no associated files" descr)
+	async;
+	{
+		url_assoc=uct.JScreatePage(file_size, 1000, ctx_assoc);
+	}
+}
+
+test("Simulate restart")
+{
+	CacheTester::WriteIndex(ctx_assoc);
+	urlManager->Debug_AcceptOverlappingContexts();
+	// After the restart, a container will be deleted, so invariants need to be disabled
+	urlManager->FindContextManager(ctx_assoc)->SetInvariantsCheck(FALSE);
+	mctx.CreateNewContext(ctx_assoc2, folder_assoc, FALSE);
+}
+
+foreach (descr, file_size, test_str, embedded, save_all, url_assoc) from TableSizes
+{
+	test("Check Associate file - different context" descr)
+	{
+		URL url_assoc_ver=g_url_api->GetURL(url_assoc.GetAttribute(URL::KName).CStr(), ctx_assoc2);
+
+		verify(VerifyAssociatedFile(url_assoc_ver, test_str, URL::Thumbnail));
+	}
+}
+
+// Keep testing on the other context, to simulate a restart
+foreach (descr, file_size, test_str, embedded, url_assoc, url_assoc_2) from TableSizesRestart
+{
+	test("Create URLs for restart - different context" descr)
+	{
+		url_assoc_2=g_url_api->GetURL(url_assoc.GetAttribute(URL::KName).CStr(), ctx_assoc2);
+	}
+
+	test("Add associated files after restart" descr)
+	{
+		verify(CreateAssociatedFile(url_assoc_2, ctx_assoc2, test_str, FALSE, embedded, URL::Thumbnail));
+	}
+
+	test("Check Associate file - after restart - same URL" descr)
+	{
+		verify(VerifyAssociatedFile(url_assoc_2, test_str, URL::Thumbnail));
+	}
+
+	test("Check Associate file - after restart - same context" descr)
+	{
+		URL url_assoc_ver=g_url_api->GetURL(url_assoc.GetAttribute(URL::KName).CStr(), ctx_assoc2);
+
+		verify(VerifyAssociatedFile(url_assoc_ver , test_str, URL::Thumbnail));
+	}
+}
+
+// Test for multiple URLs (as containers could overlap...) BEFORE saving
+foreach (descr, file_size, test_str1, test_str2, test_str3, embedded, type, url_multi_1, url_multi_2, url_multi_3) from TableSizesMulti
+{
+	test("Create multi URLs - 1 - BS" descr)
+	async;
+	{
+		url_multi_1=uct.JScreatePage(file_size, 1000, ctx_assoc3);
+	}
+	
+	test("Create multi URLs - 2 - BS" descr)
+	async;
+	{
+		url_multi_2=uct.JScreatePage(file_size, 1000, ctx_assoc3);
+	}
+	
+	test("Create multi URLs - 3 - BS" descr)
+	async;
+	{
+		url_multi_3=uct.JScreatePage(file_size, 1000, ctx_assoc3);
+	}
+
+	test("Multi URLs - Add associated files - BS" descr)
+	{
+		verify(CreateAssociatedFile(url_multi_1, ctx_assoc3, test_str1, FALSE, embedded, URL::Thumbnail));
+		verify(CreateAssociatedFile(url_multi_2, ctx_assoc3, test_str2, FALSE, embedded, URL::Thumbnail));
+		verify(CreateAssociatedFile(url_multi_3, ctx_assoc3, test_str3, FALSE, embedded, URL::Thumbnail));
+	}
+
+	test("Multi URLs - Check Associate file - same URL - BS" descr)
+	{
+		verify(VerifyAssociatedFile(url_multi_1, test_str1, URL::Thumbnail));
+		verify(VerifyAssociatedFile(url_multi_2, test_str2, URL::Thumbnail));
+		verify(VerifyAssociatedFile(url_multi_3, test_str3, URL::Thumbnail));
+	}
+}
+
+// Test for multiple URLs (as containers could overlap...) AFTER saving
+foreach (descr, file_size, test_str1, test_str2, test_str3, embedded, type, url_multi_1, url_multi_2, url_multi_3) from TableSizesMulti
+{
+	test("Create multi URLs - 1 - AS" descr)
+	async;
+	{
+		url_multi_1=uct.JScreatePage(file_size, 5000, ctx_assoc4);
+	}
+	
+	test("Create multi URLs - 2 - AS" descr)
+	async;
+	{
+		url_multi_2=uct.JScreatePage(file_size, 5000, ctx_assoc4);
+	}
+	
+	test("Create multi URLs - 3 - AS" descr)
+	async;
+	{
+		url_multi_3=uct.JScreatePage(file_size, 5000, ctx_assoc4);
+	}
+	
+	// This thing is not as effective as hoped...
+	test("Set URLs in use")
+	{
+		url_multi_1.GetRep()->IncUsed(1);
+		url_multi_2.GetRep()->IncUsed(1);
+		url_multi_3.GetRep()->IncUsed(1);
+		
+		OP_ASSERT(url_multi_1.GetRep()->GetUsedCount()>0);
+		OP_ASSERT(url_multi_2.GetRep()->GetUsedCount()>0);
+		OP_ASSERT(url_multi_3.GetRep()->GetUsedCount()>0);
+	}
+	
+	test("Saving Multi URLs")
+	{
+		// Prevent "Cache-Control: no-cache" from expiring the page immediately (which prevent the URL from joining a container)...
+		url_multi_1.SetAttribute(URL::KCachePolicy_AlwaysVerify, FALSE);
+		url_multi_2.SetAttribute(URL::KCachePolicy_AlwaysVerify, FALSE);
+		url_multi_3.SetAttribute(URL::KCachePolicy_AlwaysVerify, FALSE);
+		
+		verify_success(CacheTester::SaveFiles(ctx_assoc4, TRUE));
+		CacheTester::VerifyType(url_multi_1, type);
+		CacheTester::VerifyType(url_multi_2, type);
+		CacheTester::VerifyType(url_multi_3, type);
+	}
+
+	test("Multi URLs - Add associated files - AS" descr)
+	{
+		output("Files: %d - ", CacheHelpers::CheckDirectory(folder_assoc4, TRUE));
+		verify(CreateAssociatedFile(url_multi_1, ctx_assoc4, test_str1, FALSE, embedded, URL::Thumbnail));
+		verify(CreateAssociatedFile(url_multi_2, ctx_assoc4, test_str2, FALSE, embedded, URL::Thumbnail));
+		verify(CreateAssociatedFile(url_multi_3, ctx_assoc4, test_str3, FALSE, embedded, URL::Thumbnail));
+		output("Files: %d - ", CacheHelpers::CheckDirectory(folder_assoc4, TRUE));
+	}
+
+	test("Multi URLs - Check Associate file - same URL - AS" descr)
+	{
+		verify(VerifyAssociatedFile(url_multi_1, test_str1, URL::Thumbnail));
+		verify(VerifyAssociatedFile(url_multi_2, test_str2, URL::Thumbnail));
+		verify(VerifyAssociatedFile(url_multi_3, test_str3, URL::Thumbnail));
+		output("Files: %d - ", CacheHelpers::CheckDirectory(folder_assoc4, TRUE));
+	}
+}
+
+test("Check files")
+{
+    // Delete one container
+	output("Files: %d - ", CacheHelpers::CheckDirectory(folder_assoc4, TRUE));
+	
+	int idx=mctx.CheckIndex(ctx_assoc4, TRUE);
+	int files=CacheHelpers::CheckDirectory(folder_assoc4, TRUE);
+	
+	output("Files: %d - ", CacheHelpers::CheckDirectory(folder_assoc4, TRUE));
+	
+	verify(idx==9);  // 9 URLS
+	verify(files==16);  // 9 URLs in 7 files (3 in the same container) + 9 associated files
+}
+
+test("Check delete")
+{
+	// Delete one embedded
+	CacheTester::BrutalDelete(&url_multi_em_1, FALSE);
+	verify_success(CacheTester::SaveFiles(ctx_assoc4, TRUE));
+	
+	int idx=mctx.CheckIndex(ctx_assoc4, TRUE);
+	int files=CacheHelpers::CheckDirectory(folder_assoc4, TRUE);
+	
+	//output("emb 1) idx: %d - files: %d\n", idx, files);
+	verify(idx==8);  // 8 URLS
+	verify(files==14);  // 8 URLs in 6 files (3 in the same container) + 8 associated files
+	
+	// Delete one container
+	url_multi_cnt_1.GetRep()->IncUsed(1);
+	url_multi_cnt_2.GetRep()->IncUsed(1);
+	url_multi_cnt_3.GetRep()->IncUsed(1);
+	OP_ASSERT(url_multi_cnt_1.GetRep()->GetUsedCount()>0);
+	OP_ASSERT(url_multi_cnt_2.GetRep()->GetUsedCount()>0);
+	OP_ASSERT(url_multi_cnt_3.GetRep()->GetUsedCount()>0);
+		
+	CacheTester::BrutalDelete(&url_multi_cnt_2, FALSE);
+	verify_success(CacheTester::SaveFiles(ctx_assoc4, TRUE));
+	
+	idx=mctx.CheckIndex(ctx_assoc4, TRUE);
+	files=CacheHelpers::CheckDirectory(folder_assoc4, TRUE);
+	
+	//output("cnt 1) idx: %d - files: %d\n", idx, files);
+	verify(idx==7);  // 7 URLS
+	verify(files==13);  // 7 URLs in 6 files (2 in the same container) + 7 associated files
+	
+	// Delete one plain file
+	CacheTester::BrutalDelete(&url_multi_plain_3, FALSE);
+	verify_success(CacheTester::SaveFiles(ctx_assoc4, TRUE));
+	
+	idx=mctx.CheckIndex(ctx_assoc4, TRUE);
+	files=CacheHelpers::CheckDirectory(folder_assoc4, TRUE);
+	
+	//output("plain 1) idx: %d - files: %d\n", idx, files);
+	verify(idx==6);  // 7 URLS
+	verify(files==11);  // 6 URLs in 5 files (2 in the same container) + 6 associated files
+	
+	// Delete the other containers
+	CacheTester::BrutalDelete(&url_multi_cnt_1, FALSE);
+	CacheTester::BrutalDelete(&url_multi_cnt_3, FALSE);
+	verify_success(CacheTester::SaveFiles(ctx_assoc4, TRUE));
+	
+	idx=mctx.CheckIndex(ctx_assoc4, TRUE);
+	files=CacheHelpers::CheckDirectory(folder_assoc4, TRUE);
+	
+	//output("emb 2) idx: %d - files: %d\n", idx, files);
+	verify(idx==4);  // 4 URLS
+	verify(files==8);  // 4 URLs in 4 files + 4 associated files
+}
+
+//////// In the next tests, we will simulate a crash (loading an index not coherent with the disk), to see if the 
+//////// associated files are properly deleted
+test("Restart delete check: create URL to keep")
+require success("Init - Start WebServer if required");
+async;
+{
+	url_multi_plain_crash=uct.JScreatePage(SIZE_PLAIN, 5000, ctx_assoc5);
+}
+
+test("Save URL on the index")
+{
+	verify_success(CacheTester::SaveFiles(ctx_assoc5, TRUE));
+	CacheTester::WriteIndex(ctx_assoc5);
+}
+
+test("Restart delete check: create URL to delete")
+require success("Init - Start WebServer if required");
+async;
+{
+	url_multi_plain_crash2=uct.JScreatePage(SIZE_PLAIN, 5000, ctx_assoc5);
+}
+
+test("Associate file and Simulate crash")
+require success("Init - Start WebServer if required");
+{
+	verify(CreateAssociatedFile(url_multi_plain_crash, ctx_assoc5, "crash_Thumb1", FALSE, FALSE, URL::Thumbnail));
+	verify(CreateAssociatedFile(url_multi_plain_crash, ctx_assoc5, "crash_ECMA1", FALSE, FALSE, URL::CompiledECMAScript));
+	verify(CreateAssociatedFile(url_multi_plain_crash2, ctx_assoc5, "crash_Thumb2", FALSE, FALSE, URL::Thumbnail));
+	verify(CreateAssociatedFile(url_multi_plain_crash2, ctx_assoc5, "crash_ECMA2", FALSE, FALSE, URL::CompiledECMAScript));
+
+	verify_success(CacheTester::SaveFiles(ctx_assoc5, FALSE));
+
+	// Create an intruder (simulate a very unfortunate residual)
+	OpFile file;
+	OpString str;
+
+	str.AppendFormat(UNI_L("assoc99%sg_000X%soprintru.der"), UNI_L(PATHSEP), UNI_L(PATHSEP));
+
+	verify_success(file.Construct(str.CStr(), folder_assoc5));
+	verify_success(file.Open(OPFILE_WRITE));
+	verify_success(file.Close());
+		
+	
+	int idx=mctx.CheckIndex(ctx_assoc5, FALSE);
+	int files=CacheHelpers::CheckDirectory(folder_assoc5, TRUE);
+	
+	verify(idx==1);
+	verify(files==7);
+
+	// Index not saved
+	urlManager->Debug_AcceptOverlappingContexts();
+	mctx.CreateNewContext(ctx_assoc6, folder_assoc5, FALSE);
+	// Force the deletion of the files
+	urlManager->DeleteFilesInDeleteList(TRUE);
+	
+	idx=mctx.CheckIndex(ctx_assoc6, FALSE);
+	files=CacheHelpers::CheckDirectory(folder_assoc5, TRUE);
+	
+	verify(idx==1);
+	verify(files==3);
+
+	verify(VerifyAssociatedFile(url_multi_plain_crash, "crash_Thumb1", URL::Thumbnail));
+	verify(VerifyAssociatedFile(url_multi_plain_crash, "crash_ECMA1", URL::CompiledECMAScript));
+}
+
+test("file:// (double) creation")
+file uni path_64 "64kb.fil";
+file uni path_bin "BinaryTest.fil";
+async;
+{
+	OpString str;
+	OpString8 str8;
+	OpString str2;
+	
+	str.AppendFormat(UNI_L("file://localhost%s%s"), path_64[0]==PATHSEPCHAR ? UNI_L(""):UNI_L(PATHSEP), path_64);
+	str.ReplaceAll(UNI_L(PATHSEP), UNI_L("/"));
+	str2.AppendFormat(UNI_L("file://localhost%s%s"), path_bin[0]==PATHSEPCHAR ? UNI_L(""):UNI_L(PATHSEP), path_bin);
+	str2.ReplaceAll(UNI_L(PATHSEP), UNI_L("/"));
+	str8.Set(str.CStr());
+	output("Accessing %s", str8.CStr()); 
+	url_file=urlManager->GetURL(str.CStr(), ctx_assoc5);
+	url_full_FILE_dl=urlManager->GetURL(str.CStr(), ctx_full);
+	url_full_FILE_dl2=urlManager->GetURL(str2.CStr(), ctx_full);
+	uct.SetExpectedTransferRange(0, 0);
+	uct.LoadNormalOK(url_file, NULL);
+}
+
+test("file:// Create Associate file ")
+{
+	verify(CreateAssociatedFile(url_file, ctx_assoc5, "File_Test", TRUE, FALSE, URL::Thumbnail));
+}
+
+test("file:// Check Associate file - same url")
+{
+	verify(VerifyAssociatedFile(url_file, "File_Test", URL::Thumbnail));
+}
+
+test("file:// Check Associate file - same context")
+{
+	URL url_assoc_ver=g_url_api->GetURL(url_file.GetAttribute(URL::KName).CStr(), ctx_assoc5);
+
+	verify(VerifyAssociatedFile(url_assoc_ver, "File_Test", URL::Thumbnail));
+}
+
+test("HTTPS: Loading single file")
+async;
+{
+	// Any HTTPS file is fine, as long as it does not require authentication
+	url_assoc_https=urlManager->GetURL("https://bugs.opera.com/static/operalogo-1.png", ctx_assoc_https);
+	
+	url_assoc_https.GetRep()->IncUsed(1);
+	uct.LoadNormalOK(url_assoc_https, NULL);
+}
+
+test("HTTPS: Create Associate file ")
+{
+	verify(url_assoc_https.Type()==URL_HTTPS);
+	verify(url_assoc_https.GetRep()->GetDataStorage());
+	verify(url_assoc_https.GetRep()->GetDataStorage()->GetCacheStorage());
+    verify(url_assoc_https.GetRep()->GetDataStorage()->GetCacheStorage()->GetCacheType()==URL_CACHE_TEMP);
+
+	// Thumbnails not allowed for HTTPS
+	verify(CreateAssociatedFile(url_assoc_https, ctx_assoc_https, "HTTPS_Test", TRUE, FALSE, URL::CompiledECMAScript));
+}
+
+test("HTTPS: Check Associate file - same url")
+{
+	verify(VerifyAssociatedFile(url_assoc_https, "HTTPS_Test", URL::CompiledECMAScript));
+}
+
+test("HTTPS: Check Associate file - same context")
+{
+	URL url_assoc_ver=g_url_api->GetURL(url_assoc_https.GetAttribute(URL::KName).CStr(), ctx_assoc_https);
+
+	verify(VerifyAssociatedFile(url_assoc_ver, "HTTPS_Test", URL::CompiledECMAScript));
+}
+
+test("File: creation for full tests 1")
+async;
+{
+    // url_full_FILE_dl has already been created, it only needs to load
+	uct.SetExpectedTransferRange(0, 0);
+	uct.LoadNormalOK(url_full_FILE_dl, NULL);
+}
+
+
+test("HTTPS: creation for full tests 1")
+async;
+{
+	// Any HTTPS file is fine, as long as it does not require authentication
+	url_full_HTTPS_dl=urlManager->GetURL("https://bugs.opera.com/static/operalogo-1.png", ctx_full);
+	
+	url_full_HTTPS_dl.GetRep()->IncUsed(1);
+	uct.LoadNormalOK(url_full_HTTPS_dl, NULL);
+}
+
+test("File: creation for full tests 2")
+async;
+{
+    // url_full_FILE_dl2 has already been created, it only needs to load
+	uct.SetExpectedTransferRange(0, 0);
+	uct.LoadNormalOK(url_full_FILE_dl2, NULL);
+}
+
+
+test("HTTPS: creation for full tests 2")
+async;
+{
+	// Any HTTPS file is fine, as long as it does not require authentication
+	url_full_HTTPS_dl2=urlManager->GetURL("https://bugs.opera.com/static/operalogo-2.png", ctx_full);
+	
+	url_full_HTTPS_dl2.GetRep()->IncUsed(1);
+	uct.LoadNormalOK(url_full_HTTPS_dl2, NULL);
+}
+
+// Execute several checks on all the combinations of HTTP, HTTPS and FILE; URLs are not downloaded but created with CacheBogusURLRetrieve() 
+foreach (descr, file_size, url_test, type, create_url, save) from TableSizesFullCheck
+{
+	test("Full test - " descr)
+	{
+		int files_0=CacheHelpers::CheckDirectory(folder_full, TRUE);
+		if(create_url)
+			url_test=ch.CacheBogusURLRetrieve(ctx_full, file_size, FALSE, TRUE, FALSE, type);
+		
+		if(save)
+			verify_success(CacheTester::SaveFiles(ctx_full, TRUE));
+		
+		int files_1=CacheHelpers::CheckDirectory(folder_full, TRUE);
+		int num_supported=0;
+		
+		// Test for up to 16 different type of associated files (this test is supposed to get also errors in future implementations that fail to implement everything)
+		for(int i=0; i<16; i++)
+		{
+			URL::AssociatedFileType assoc_type=(URL::AssociatedFileType)(1<<i);
+			OpString8 test_str;
+
+			test_str.AppendFormat("%s_%d", descr, i);
+			
+			int files_2=CacheHelpers::CheckDirectory(folder_full, TRUE);
+			BOOL b=CreateAssociatedFile2(url_test, ctx_full, test_str.CStr(), assoc_type);
+			
+			if(b) // Supported type
+			{
+				num_supported++;
+				verify(VerifyAssociatedFile(url_test, test_str.CStr(), (URL::AssociatedFileType)assoc_type));
+
+				int files_3=CacheHelpers::CheckDirectory(folder_full, TRUE);
+
+				// Creating an associated file can actually also save on the disk the cache file
+				// But HTTPS file can create Associated Files in memory
+				if(type==URL_HTTPS)
+					verify(files_3==files_2 || files_3==files_2+1 || files_3==files_2+2);
+				else
+					verify(files_3==files_2+1 || files_3==files_2+2);
+					
+				verify(files_3>=files_1+num_supported);
+			}
+			else
+				OP_ASSERT(files_2==CacheHelpers::CheckDirectory(folder_full, TRUE)); // If the associated file is not created, we are not supposed to save the previous file...
+		}
+		
+		// Check that the associated files are deleted as well
+		CacheTester::BrutalDelete(&url_test, FALSE);
+		
+		int files_4=CacheHelpers::CheckDirectory(folder_full, TRUE);
+		
+		if(files_4!=files_0)
+			output("Initial files: %d - Final files: %d\n", files_0, files_4);
+		
+		// For containers, it is acceptable that the cache file is still there (as the delete can be postponed)
+		if(file_size==SIZE_CONTAINERS)
+			verify(files_4==files_0 || files_4==files_0+1);
+		else
+			verify(files_4==files_0);
+		
+		output("Type: %s - Types supported: %d\n", descr, num_supported);
+	}
+}
+
+test("Restore WebServer if required")
+{
+	if(url_multi_em_1.GetRep())
+		url_multi_em_1.GetRep()->DecUsed(1);
+	if(url_multi_em_2.GetRep())
+		url_multi_em_2.GetRep()->DecUsed(1);
+	if(url_multi_em_3.GetRep())
+		url_multi_em_3.GetRep()->DecUsed(1);
+		
+	if(url_multi_cnt_1.GetRep())
+		url_multi_cnt_1.GetRep()->DecUsed(1);
+	if(url_multi_cnt_2.GetRep())
+		url_multi_cnt_2.GetRep()->DecUsed(1);
+	if(url_multi_cnt_3.GetRep())
+		url_multi_cnt_3.GetRep()->DecUsed(1);
+		
+	if(url_multi_plain_1.GetRep())
+		url_multi_plain_1.GetRep()->DecUsed(1);
+	if(url_multi_plain_2.GetRep())
+		url_multi_plain_2.GetRep()->DecUsed(1);
+	if(url_multi_plain_3.GetRep())
+		url_multi_plain_3.GetRep()->DecUsed(1);
+		
+	if(url_assoc_https.GetRep())
+		url_assoc_https.GetRep()->DecUsed(1);
+	
+	uct.StopWebServer();
+}
+
+// Generic test to simulate that all the kind of file (even new ones!) are properly created, read and deleted

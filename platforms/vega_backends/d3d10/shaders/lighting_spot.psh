@@ -1,0 +1,66 @@
+Texture2D srcTex;
+SamplerState srcSampler;
+
+cbuffer constants : register (b0)
+{
+	// Light source params
+	float3 light_color : packoffset (c0);
+	float3 light_position : packoffset (c1);
+	float light_kd : packoffset (c2);
+	float light_ks : packoffset (c3);
+	float light_specexp : packoffset (c4);
+
+	float surface_scale : packoffset (c5);
+
+	// Mix factors
+	float k1 : packoffset (c6);
+	float k2 : packoffset (c7);
+	float k3 : packoffset (c8);
+	float k4 : packoffset (c9);
+
+	float2 pixel_size : packoffset (c10); // 1/texture_width, 1/texture_height
+
+	// spot parameters
+	float3 spot_dir : packoffset (c11);
+	float spot_falloff : packoffset (c12);
+	float spot_coneangle : packoffset (c13);
+	float spot_specexp : packoffset (c14);
+	bool spot_has_cone : packoffset (c15);
+};
+
+static const float3 eye_vec = float3(0,0,1);
+
+float4 lighting_equation(float3 n_dot_l, float3 n_dot_h, float spot_att)
+{
+	float3 specular_color = saturate(light_color*spot_att*light_ks*pow(n_dot_h, light_specexp));
+	float3 diffuse_color = saturate(light_color*spot_att*light_kd*n_dot_l);
+
+	float alpha = max(specular_color.r, max(specular_color.g, specular_color.b));
+	float4 specular = float4(specular_color*alpha, alpha);
+	float4 diffuse = float4(diffuse_color, 1);
+
+	return saturate(k1*diffuse*specular + k2*diffuse + k3*specular + k4);
+}
+
+float4 op_main(float4 pos : SV_POSITION, float4 diffuse : COLOR0, float2 texpos : TEXCOORD0) : SV_Target
+{
+	float3 surf = (srcTex.Sample(srcSampler, texpos).xyz - float3(0.5,0.5,0)) * surface_scale;
+	float3 surf_pos = float3(texpos / pixel_size, surf.z);
+
+	float3 norm = normalize(float3(-surf.xy, 1));
+	
+	float3 l = normalize(light_position - surf_pos);
+
+	float n_dot_l = max(dot(norm, l), 0);
+	float n_dot_h = max(dot(norm, normalize(l+eye_vec)), 0);
+	float l_dot_s = max(-dot(l, normalize(spot_dir)), 0);
+
+	float spot_att = pow(l_dot_s, spot_specexp);
+	if (spot_has_cone)
+	{
+		spot_att = saturate(spot_att * (l_dot_s - spot_falloff) / (spot_coneangle - spot_falloff));
+	}
+	
+	return lighting_equation(n_dot_l, n_dot_h, spot_att);
+}
+

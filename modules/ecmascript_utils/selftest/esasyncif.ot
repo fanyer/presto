@@ -1,0 +1,1422 @@
+/* -*- Mode: c++; tab-width: 4; indent-tabs-mode: t; c-basic-offset: 4; -*-
+**
+** Copyright (C) 2002-2011 Opera Software ASA.  All rights reserved.
+**
+** This file is part of the Opera web browser.  It may not be distributed
+** under any circumstances.
+*/
+
+group "ESUtils.AsyncInterface";
+require init;
+require ESUTILS_ES_ENVIRONMENT_SUPPORT;
+
+include "modules/ecmascript_utils/esasyncif.h";
+include "modules/ecmascript_utils/esenvironment.h";
+include "modules/ecmascript_utils/essched.h";
+include "modules/ecmascript/ecmascript.h";
+include "modules/stdlib/include/double_format.h";
+
+global
+{
+	ES_Environment *g_esEnvironment;
+	ES_Object *g_lastObject;
+	ES_Object *g_lastObject2;
+
+	class ESU_SelftestCallback : public ES_AsyncCallback
+	{
+	private:
+		ES_Environment *environment;
+		ES_AsyncStatus expected_status;
+		ES_Value expected_result;
+		const char *custom_msg;
+		ES_Object **last_object;
+
+	public:
+		ESU_SelftestCallback(ES_Environment *environment, ES_AsyncStatus expected_status, const ES_Value &expected_result, const char *custom_msg = NULL, ES_Object **last_object = NULL)
+			: environment(environment), expected_status(expected_status), expected_result(expected_result), custom_msg(custom_msg), last_object(last_object)
+		{
+		}
+
+		OP_STATUS HandleCallback(ES_AsyncOperation operation, ES_AsyncStatus status, const ES_Value &result)
+		{
+			const char *status_name[5];
+
+			status_name[ES_ASYNC_SUCCESS] = "SUCCESS";
+			status_name[ES_ASYNC_FAILURE] = "FAILED";
+			status_name[ES_ASYNC_EXCEPTION] = "EXCEPTION";
+			status_name[ES_ASYNC_NO_MEMORY] = "NO_MEMORY";
+			status_name[ES_ASYNC_CANCELLED] = "CANCELLED";
+
+			if (expected_status != status)
+			{
+				ST_failed("wrong status, expected %s, got %s\n", status_name[expected_status], status_name[status]);
+				goto end;
+			}
+			else if (status == ES_ASYNC_SUCCESS)
+#ifdef ESUTILS_ASYNCIF_PROPERTIES_SUPPORT
+				if (operation != ES_ASYNC_SET_SLOT)
+#endif // ESUTILS_ASYNCIF_PROPERTIES_SUPPORT
+				{
+					BOOL types_match = TRUE, values_match = TRUE;
+					if (expected_result.type != result.type)
+						types_match = FALSE;
+					else switch (result.type)
+					{
+					case VALUE_BOOLEAN:
+						values_match = expected_result.value.boolean == result.value.boolean;
+						break;
+					case VALUE_NUMBER:
+						values_match = expected_result.value.number == result.value.number;
+						break;
+					case VALUE_STRING:
+						values_match = !expected_result.value.string || uni_strcmp(expected_result.value.string, result.value.string) == 0;
+						break;
+					case VALUE_OBJECT:
+						values_match = !expected_result.value.object || expected_result.value.object == result.value.object;
+					}
+					if (!types_match || !values_match)
+					{
+						if (types_match && custom_msg)
+							ST_failed((char *) custom_msg);
+						else
+						{
+							char *expected_result_formatted = FormatValue(expected_result);
+							char *result_formatted = FormatValue(result);
+							ST_failed("wrong result: expected %s, got %s\n", expected_result_formatted, result_formatted);
+							op_free(expected_result_formatted);
+							op_free(result_formatted);
+						}
+						goto end;
+					}
+					if (result.type == VALUE_OBJECT && last_object)
+					{
+						if (*last_object)
+							environment->GetRuntime()->Unprotect(*last_object);
+						*last_object = result.value.object;
+						environment->GetRuntime()->Protect(*last_object);
+					}
+				}
+
+			ST_passed();
+
+		end:
+			OP_DELETE(this);
+			return OpStatus::OK;
+		}
+
+		char *FormatValue(const ES_Value &value)
+		{
+			char *result = NULL, *tmp;
+
+			switch (value.type)
+			{
+			case VALUE_UNDEFINED:
+				return op_strdup("undefined");
+			case VALUE_NULL:
+				return op_strdup("null");
+			case VALUE_BOOLEAN:
+				if (value.value.boolean)
+					return op_strdup("true");
+				else
+					return op_strdup("false");
+			case VALUE_NUMBER:
+				result = OP_NEWA(char, 32);
+				OpDoubleFormat::ToString(result, value.value.number);
+				break;
+			case VALUE_STRING:
+				tmp = uni_down_strdup(value.value.string);
+				result = (char *) op_malloc(op_strlen(tmp) + 3);
+				op_sprintf(result, "\"%s\"", tmp);
+				op_free(tmp);
+				break;
+			case VALUE_OBJECT:
+				if (value.value.object)
+				{
+					tmp = (char *) ES_Runtime::GetClass(value.value.object);
+					result = (char *) op_malloc(op_strlen(tmp) + 10);
+					op_sprintf(result, "[object %s]", tmp);
+				}
+				else
+				{
+					result = (char *) op_malloc(op_strlen("[any object]") + 1);
+					op_sprintf(result, "[any object]");
+				}
+			}
+
+			return result;
+		}
+	};
+
+	class ESU_SelftestFunction_cancelThisThread
+		: public EcmaScript_Object
+	{
+	private:
+		ES_Environment *environment;
+
+	public:
+		ESU_SelftestFunction_cancelThisThread(ES_Environment *environment)
+			: environment(environment)
+		{
+		}
+
+		ES_GetState GetName(const uni_char* property_name, int property_code, ES_Value* value, ES_Runtime* origining_runtime)
+		{
+			environment->GetScheduler()->CancelThread(environment->GetScheduler()->GetCurrentThread());
+			return GET_FAILED;
+		}
+
+		ES_PutState PutName(const uni_char* property_name, int property_code, ES_Value* value, ES_Runtime* origining_runtime)
+		{
+			environment->GetScheduler()->CancelThread(environment->GetScheduler()->GetCurrentThread());
+			return PUT_SUCCESS;
+		}
+
+		int Call(ES_Object* this_object, ES_Value* argv, int argc, ES_Value* return_value, ES_Runtime* origining_runtime)
+		{
+			environment->GetScheduler()->CancelThread(environment->GetScheduler()->GetCurrentThread());
+			return ES_FAILED;
+		}
+	};
+
+	class ESU_SelftestFunction_outOfMemory
+		: public EcmaScript_Object
+	{
+	public:
+		ES_GetState GetName(const uni_char* property_name, int property_code, ES_Value* value, ES_Runtime* origining_runtime)
+		{
+			return GET_NO_MEMORY;
+		}
+
+		ES_PutState PutName(const uni_char* property_name, int property_code, ES_Value* value, ES_Runtime* origining_runtime)
+		{
+			return PUT_NO_MEMORY;
+		}
+
+		int Call(ES_Object* this_object, ES_Value* argv, int argc, ES_Value* return_value, ES_Runtime* origining_runtime)
+		{
+			return ES_NO_MEMORY;
+		}
+	};
+
+	class ESU_SelftestFunction_compareThisToGlobalObject
+		: public EcmaScript_Object
+	{
+	public:
+		int Call(ES_Object* this_object, ES_Value* argv, int argc, ES_Value* return_value, ES_Runtime* origining_runtime)
+		{
+			return_value->type = VALUE_BOOLEAN;
+			return_value->value.boolean = this_object == (ES_Object *) origining_runtime->GetGlobalObject();
+			return ES_VALUE;
+		}
+	};
+
+	class ESU_SelftestObject_hostProperties
+		: public EcmaScript_Object,
+		  public MessageObject,
+		  public ES_ThreadListener
+	{
+	private:
+		ES_Environment *environment;
+		ES_Value return_value;
+		ES_Thread *thread;
+		BOOL blocking;
+		BOOL exceptions;
+		BOOL success;
+
+		void Restart(ES_Object *this_object, ES_Value *value)
+		{
+			value->type = VALUE_OBJECT;
+			value->value.object = this_object;
+			g_main_message_handler->SetCallBack(this, MSG_ES_TIMEOUT, 0);
+			g_main_message_handler->PostDelayedMessage(MSG_ES_TIMEOUT, 0, 0, 100);
+			thread = environment->GetScheduler()->GetCurrentThread();
+			thread->Block();
+			thread->AddListener(this);
+		}
+
+	public:
+		ESU_SelftestObject_hostProperties(ES_Environment *environment, ES_Value return_value, BOOL blocking, BOOL exceptions)
+			: environment(environment), return_value(return_value), blocking(blocking), exceptions(exceptions), success(FALSE)
+		{
+		}
+
+		ES_GetState	GetIndex(int property_index, ES_Value* value, ES_Runtime* origining_runtime)
+		{
+			if (blocking)
+			{
+				Restart(GetNativeObject(), value);
+				return GET_SUSPEND;
+			}
+			else if (exceptions)
+			{
+				if (value)
+				{
+					value->type = VALUE_STRING;
+					value->value.string = UNI_L("got ya!");
+				}
+				return GET_EXCEPTION;
+			}
+			else
+			{
+				*value = return_value;
+				if (return_value.type == VALUE_OBJECT)
+					environment->GetRuntime()->Unprotect(return_value.value.object);
+				return GET_SUCCESS;
+			}
+		}
+
+		ES_GetState	GetIndexRestart(int property_index, ES_Value* value, ES_Runtime* origining_runtime, ES_Object* restart_object)
+		{
+			*value = return_value;
+			if (return_value.type == VALUE_OBJECT)
+				environment->GetRuntime()->Unprotect(return_value.value.object);
+			return GET_SUCCESS;
+		}
+
+		ES_GetState	GetName(const uni_char* property_name, int property_code, ES_Value* value, ES_Runtime* origining_runtime)
+		{
+			if (blocking)
+			{
+				Restart(GetNativeObject(), value);
+				return GET_SUSPEND;
+			}
+			else if (exceptions)
+			{
+				if (value)
+				{
+					value->type = VALUE_STRING;
+					value->value.string = UNI_L("got ya!");
+				}
+				return GET_EXCEPTION;
+			}
+			else
+			{
+				*value = return_value;
+				if (return_value.type == VALUE_OBJECT)
+					environment->GetRuntime()->Unprotect(return_value.value.object);
+				return GET_SUCCESS;
+			}
+		}
+
+		ES_GetState	GetNameRestart(const uni_char* property_name, int property_code, ES_Value* value, ES_Runtime* origining_runtime, ES_Object* restart_object)
+		{
+			*value = return_value;
+			if (return_value.type == VALUE_OBJECT)
+				environment->GetRuntime()->Unprotect(return_value.value.object);
+			return GET_SUCCESS;
+		}
+
+		ES_PutState	PutIndex(int property_index, ES_Value* value, ES_Runtime* origining_runtime)
+		{
+			if (blocking)
+			{
+				Restart(GetNativeObject(), value);
+				return PUT_SUSPEND;
+			}
+			else if (exceptions)
+			{
+				if (value)
+				{
+					value->type = VALUE_STRING;
+					value->value.string = UNI_L("got ya!");
+				}
+				return PUT_EXCEPTION;
+			}
+			else
+			{
+				success = TRUE;
+				return PUT_SUCCESS;
+			}
+		}
+
+		ES_PutState	PutIndexRestart(int property_index, ES_Value* value, ES_Runtime* origining_runtime, ES_Object* restart_object)
+		{
+			success = TRUE;
+			return PUT_SUCCESS;
+		}
+
+		ES_PutState	PutName(const uni_char* property_name, int property_code, ES_Value* value, ES_Runtime* origining_runtime)
+		{
+			if (blocking)
+			{
+				Restart(GetNativeObject(), value);
+				return PUT_SUSPEND;
+			}
+			else if (exceptions)
+			{
+				if (value)
+				{
+					value->type = VALUE_STRING;
+					value->value.string = UNI_L("got ya!");
+				}
+				return PUT_EXCEPTION;
+			}
+			else
+			{
+				success = TRUE;
+				return PUT_SUCCESS;
+			}
+		}
+
+		ES_PutState	PutNameRestart(const uni_char* property_name, int property_code, ES_Value* value, ES_Runtime* origining_runtime, ES_Object* restart_object)
+		{
+			success = TRUE;
+			return PUT_SUCCESS;
+		}
+
+		void HandleCallback(OpMessage msg, MH_PARAM_1 par1, MH_PARAM_2 par2)
+		{
+			g_main_message_handler->UnsetCallBacks(this);
+
+			if (thread)
+				thread->Unblock();
+		}
+
+		OP_STATUS Signal(ES_Thread *signalled_thread, ES_ThreadSignal signal)
+		{
+			OP_ASSERT(signalled_thread == thread);
+			switch (signal)
+			{
+			case ES_SIGNAL_FINISHED:
+			case ES_SIGNAL_FAILED:
+			case ES_SIGNAL_CANCELLED:
+				ES_ThreadListener::Remove();
+				thread = NULL;
+			}
+
+			return OpStatus::OK;
+		}
+	};
+}
+
+setup
+{
+	g_esEnvironment = NULL;
+	g_lastObject = NULL;
+    g_lastObject2 = NULL;
+}
+
+exit
+{
+	if (g_lastObject)
+		g_esEnvironment->GetRuntime()->Unprotect(g_lastObject);
+
+	if (g_lastObject2)
+		g_esEnvironment->GetRuntime()->Unprotect(g_lastObject2);
+
+	if (g_esEnvironment)
+		ES_Environment::Destroy(g_esEnvironment);
+}
+
+test("Setup")
+{
+	OP_STATUS status = ES_Environment::Create(g_esEnvironment);
+	verify(status == OpStatus::OK);
+	verify(g_esEnvironment != NULL);
+	verify(g_esEnvironment->Enabled());
+}
+
+test("Eval (undefined)")
+	async;
+	require success "Setup";
+{
+	/* Create callback. */
+	ES_Value expected_result;
+	expected_result.type = VALUE_UNDEFINED;
+	ES_AsyncCallback *callback = OP_NEW(ESU_SelftestCallback, (g_esEnvironment, ES_ASYNC_SUCCESS, expected_result));
+
+	OP_STATUS status = g_esEnvironment->GetAsyncInterface()->Eval(UNI_L("undefined;"), callback);
+	if (status != OpStatus::OK)
+		ST_failed("Eval failed: %d\n", status);
+}
+
+test("Eval (null)")
+	async;
+	require success "Setup";
+{
+	/* Create callback. */
+	ES_Value expected_result;
+	expected_result.type = VALUE_NULL;
+	ES_AsyncCallback *callback = OP_NEW(ESU_SelftestCallback, (g_esEnvironment, ES_ASYNC_SUCCESS, expected_result));
+
+	OP_STATUS status = g_esEnvironment->GetAsyncInterface()->Eval(UNI_L("null;"), callback);
+	if (status != OpStatus::OK)
+		ST_failed("Eval failed: %d\n", status);
+}
+
+test("Eval (true)")
+	async;
+	require success "Setup";
+{
+	/* Create callback. */
+	ES_Value expected_result;
+	expected_result.type = VALUE_BOOLEAN;
+	expected_result.value.boolean = TRUE;
+	ES_AsyncCallback *callback = OP_NEW(ESU_SelftestCallback, (g_esEnvironment, ES_ASYNC_SUCCESS, expected_result));
+
+	OP_STATUS status = g_esEnvironment->GetAsyncInterface()->Eval(UNI_L("true;"), callback);
+	if (status != OpStatus::OK)
+		ST_failed("Eval failed: %d\n", status);
+}
+
+test("Eval (false)")
+	async;
+	require success "Setup";
+{
+	/* Create callback. */
+	ES_Value expected_result;
+	expected_result.type = VALUE_BOOLEAN;
+	expected_result.value.boolean = FALSE;
+	ES_AsyncCallback *callback = OP_NEW(ESU_SelftestCallback, (g_esEnvironment, ES_ASYNC_SUCCESS, expected_result));
+
+	OP_STATUS status = g_esEnvironment->GetAsyncInterface()->Eval(UNI_L("false;"), callback);
+	if (status != OpStatus::OK)
+		ST_failed("Eval failed: %d\n", status);
+}
+
+test("Eval (10.0)")
+	async;
+	require success "Setup";
+{
+	/* Create callback. */
+	ES_Value expected_result;
+	expected_result.type = VALUE_NUMBER;
+	expected_result.value.number = 10;
+	ES_AsyncCallback *callback = OP_NEW(ESU_SelftestCallback, (g_esEnvironment, ES_ASYNC_SUCCESS, expected_result));
+
+	OP_STATUS status = g_esEnvironment->GetAsyncInterface()->Eval(UNI_L("10.0;"), callback);
+	if (status != OpStatus::OK)
+		ST_failed("Eval failed: %d\n", status);
+}
+
+test("Eval ('string')")
+	async;
+	require success "Setup";
+{
+	/* Create callback. */
+	ES_Value expected_result;
+	expected_result.type = VALUE_STRING;
+	expected_result.value.string = UNI_L("string");
+	ES_AsyncCallback *callback = OP_NEW(ESU_SelftestCallback, (g_esEnvironment, ES_ASYNC_SUCCESS, expected_result));
+
+	OP_STATUS status = g_esEnvironment->GetAsyncInterface()->Eval(UNI_L("'string';"), callback);
+	if (status != OpStatus::OK)
+		ST_failed("Eval failed: %d\n", status);
+}
+
+test("Eval (Object)")
+	async;
+	require success "Setup";
+{
+	/* Create callback. */
+	ES_Value expected_result;
+	expected_result.type = VALUE_OBJECT;
+	expected_result.value.object = g_esEnvironment->GetRuntime()->GetObjectPrototype();
+	ES_AsyncCallback *callback = OP_NEW(ESU_SelftestCallback, (g_esEnvironment, ES_ASYNC_SUCCESS, expected_result));
+
+	OP_STATUS status = g_esEnvironment->GetAsyncInterface()->Eval(UNI_L("Object.prototype;"), callback);
+	if (status != OpStatus::OK)
+		ST_failed("Eval failed: %d\n", status);
+}
+
+test("Eval (var objpro = Object.prototype)")
+	async;
+	require success "Setup";
+{
+	/* Create callback. */
+	ES_Value expected_result;
+	expected_result.type = VALUE_UNDEFINED;
+	ES_AsyncCallback *callback = OP_NEW(ESU_SelftestCallback, (g_esEnvironment, ES_ASYNC_SUCCESS, expected_result));
+
+	OP_STATUS status = g_esEnvironment->GetAsyncInterface()->Eval(UNI_L("var objpro = Object.prototype;"), callback);
+	if (status != OpStatus::OK)
+		ST_failed("Eval failed: %d\n", status);
+}
+
+test("GetSlot (<global>, 'objpro')")
+	async;
+	require ESUTILS_ASYNCIF_PROPERTIES_SUPPORT;
+	require success "Setup";
+	require success "Eval (var objpro = Object.prototype)";
+{
+	/* Create callback. */
+	ES_Value expected_result;
+	expected_result.type = VALUE_OBJECT;
+	expected_result.value.object = g_esEnvironment->GetRuntime()->GetObjectPrototype();
+	ES_AsyncCallback *callback = OP_NEW(ESU_SelftestCallback, (g_esEnvironment, ES_ASYNC_SUCCESS, expected_result));
+
+	OP_STATUS status = g_esEnvironment->GetAsyncInterface()->GetSlot(g_esEnvironment->GetGlobalObject(), UNI_L("objpro"), callback);
+	if (status != OpStatus::OK)
+		ST_failed("GetSlot failed: %d\n", status);
+}
+
+test("Eval (void (objpro[5] = Number.prototype))")
+	async;
+	require success "Setup";
+{
+	/* Create callback. */
+	ES_Value expected_result;
+	expected_result.type = VALUE_UNDEFINED;
+	ES_AsyncCallback *callback = OP_NEW(ESU_SelftestCallback, (g_esEnvironment, ES_ASYNC_SUCCESS, expected_result));
+
+	OP_STATUS status = g_esEnvironment->GetAsyncInterface()->Eval(UNI_L("void (objpro[5] = Number.prototype);"), callback);
+	if (status != OpStatus::OK)
+		ST_failed("Eval failed: %d\n", status);
+}
+
+test("GetSlot (objpro, 5)")
+	async;
+	require ESUTILS_ASYNCIF_PROPERTIES_SUPPORT;
+	require success "Setup";
+	require success "Eval (void (objpro[5] = Number.prototype))";
+{
+	/* Create callback. */
+	ES_Value expected_result;
+	expected_result.type = VALUE_OBJECT;
+	expected_result.value.object = g_esEnvironment->GetRuntime()->GetNumberPrototype();
+	ES_AsyncCallback *callback = OP_NEW(ESU_SelftestCallback, (g_esEnvironment, ES_ASYNC_SUCCESS, expected_result));
+
+	OP_STATUS status = g_esEnvironment->GetAsyncInterface()->GetSlot(g_esEnvironment->GetRuntime()->GetObjectPrototype(), 5, callback);
+	if (status != OpStatus::OK)
+		ST_failed("GetSlot failed: %d\n", status);
+}
+
+test("Eval (new Object)")
+	async;
+	require success "Setup";
+{
+	/* Create callback. */
+	ES_Value expected_result;
+	expected_result.type = VALUE_OBJECT;
+	expected_result.value.object = NULL;
+	ES_AsyncCallback *callback = OP_NEW(ESU_SelftestCallback, (g_esEnvironment, ES_ASYNC_SUCCESS, expected_result, NULL, &g_lastObject));
+
+	OP_STATUS status = g_esEnvironment->GetAsyncInterface()->Eval(UNI_L("new Object;"), callback);
+	if (status != OpStatus::OK)
+		ST_failed("Eval failed: %d\n", status);
+}
+
+test("SetSlot (<last object>, 'x', 10)")
+	async;
+	require ESUTILS_ASYNCIF_PROPERTIES_SUPPORT;
+	require success "Setup";
+	require success "Eval (new Object)";
+{
+	if (g_lastObject)
+	{
+		/* Create callback. */
+		ES_Value expected_result;
+		ES_AsyncCallback *callback = OP_NEW(ESU_SelftestCallback, (g_esEnvironment, ES_ASYNC_SUCCESS, expected_result));
+
+		ES_Value value;
+		value.type = VALUE_NUMBER;
+		value.value.number = 10;
+
+		OP_STATUS status = g_esEnvironment->GetAsyncInterface()->SetSlot(g_lastObject, UNI_L("x"), value, callback);
+		if (status != OpStatus::OK)
+			ST_failed("SetSlot failed: %d\n", status);
+	}
+	else
+		ST_failed("No last object stored");
+}
+
+test("SetSlot (<last object>, 'y', 'string')")
+	async;
+	require ESUTILS_ASYNCIF_PROPERTIES_SUPPORT;
+	require success "Setup";
+	require success "Eval (new Object)";
+{
+	if (g_lastObject)
+	{
+		/* Create callback. */
+		ES_Value expected_result;
+		ES_AsyncCallback *callback = OP_NEW(ESU_SelftestCallback, (g_esEnvironment, ES_ASYNC_SUCCESS, expected_result));
+
+		ES_Value value;
+		value.type = VALUE_STRING;
+		value.value.string = UNI_L("string");
+
+		OP_STATUS status = g_esEnvironment->GetAsyncInterface()->SetSlot(g_lastObject, UNI_L("y"), value, callback);
+		if (status != OpStatus::OK)
+			ST_failed("SetSlot failed: %d\n", status);
+	}
+	else
+		ST_failed("No last object stored");
+}
+
+test("Eval (x + y) with scope [<last object>]")
+	async;
+	require success "Setup";
+	require success "Eval (new Object)";
+	require success "SetSlot (<last object>, 'x', 10)";
+	require success "SetSlot (<last object>, 'y', 'string')";
+	require success "Eval ('string')";
+{
+	if (g_lastObject)
+	{
+		/* Create callback. */
+		ES_Value expected_result;
+		expected_result.type = VALUE_STRING;
+		expected_result.value.string = UNI_L("10string");
+		ES_AsyncCallback *callback = OP_NEW(ESU_SelftestCallback, (g_esEnvironment, ES_ASYNC_SUCCESS, expected_result));
+
+		ES_Object *scope_chain[1] = { g_lastObject };
+
+		OP_STATUS status = g_esEnvironment->GetAsyncInterface()->Eval(UNI_L("x + y"), scope_chain, 1, callback);
+		if (status != OpStatus::OK)
+			ST_failed("Eval failed: %d\n", status);
+	}
+	else
+		ST_failed("No last object stored");
+}
+
+test("Eval (new String('string'))")
+	async;
+	require success "Setup";
+{
+	/* Create callback. */
+	ES_Value expected_result;
+	expected_result.type = VALUE_OBJECT;
+	expected_result.value.object = NULL;
+	ES_AsyncCallback *callback = OP_NEW(ESU_SelftestCallback, (g_esEnvironment, ES_ASYNC_SUCCESS, expected_result, NULL, &g_lastObject));
+
+	OP_STATUS status = g_esEnvironment->GetAsyncInterface()->Eval(UNI_L("new String('string');"), callback);
+	if (status != OpStatus::OK)
+		ST_failed("Eval failed: %d\n", status);
+}
+
+test("Eval (new String('string'))")
+	async;
+	require success "Setup";
+{
+	/* Create callback. */
+	ES_Value expected_result;
+	expected_result.type = VALUE_OBJECT;
+	expected_result.value.object = NULL;
+	ES_AsyncCallback *callback = OP_NEW(ESU_SelftestCallback, (g_esEnvironment, ES_ASYNC_SUCCESS, expected_result, NULL, &g_lastObject));
+
+	OP_STATUS status = g_esEnvironment->GetAsyncInterface()->Eval(UNI_L("new String('string');"), callback);
+	if (status != OpStatus::OK)
+		ST_failed("Eval failed: %d\n", status);
+}
+
+test("Eval (String.prototype.slice)")
+	async;
+	require success "Setup";
+{
+	/* Create callback. */
+	ES_Value expected_result;
+	expected_result.type = VALUE_OBJECT;
+	expected_result.value.object = NULL;
+	ES_AsyncCallback *callback = OP_NEW(ESU_SelftestCallback, (g_esEnvironment, ES_ASYNC_SUCCESS, expected_result, NULL, &g_lastObject2));
+
+	OP_STATUS status = g_esEnvironment->GetAsyncInterface()->Eval(UNI_L("String.prototype.slice;"), callback);
+	if (status != OpStatus::OK)
+		ST_failed("Eval failed: %d\n", status);
+}
+
+test("CallFunction (<string>, <String.prototype.slice>, 2, 4)")
+	async;
+	require success "Setup";
+{
+	if (g_lastObject && g_lastObject2)
+	{
+		/* Create callback. */
+		ES_Value expected_result;
+		expected_result.type = VALUE_STRING;
+		expected_result.value.string = UNI_L("ri");
+		ES_AsyncCallback *callback = OP_NEW(ESU_SelftestCallback, (g_esEnvironment, ES_ASYNC_SUCCESS, expected_result));
+
+		ES_Value arguments[2];
+		arguments[0].type = VALUE_NUMBER;
+		arguments[0].value.number = 2;
+		arguments[1].type = VALUE_NUMBER;
+		arguments[1].value.number = 4;
+
+		OP_STATUS status = g_esEnvironment->GetAsyncInterface()->CallFunction(g_lastObject2, g_lastObject, 2, arguments, callback);
+		if (status != OpStatus::OK)
+			ST_failed("CallFunction failed: %d\n", status);
+	}
+	else
+		ST_failed("No last object stored");
+}
+
+test("Create compareThisToGlobalObject object")
+	require success "Setup";
+{
+	EcmaScript_Object *function = OP_NEW(ESU_SelftestFunction_compareThisToGlobalObject, ());
+	verify(function != NULL);
+	verify(   OpStatus::IsSuccess(function->SetFunctionRuntime(g_esEnvironment->GetRuntime(), UNI_L("compareThisToGlobalObject"), NULL, NULL))
+	       && g_esEnvironment->GetRuntime()->Protect(*function));
+	if (g_lastObject)
+		g_esEnvironment->GetRuntime()->Unprotect(g_lastObject);
+	g_lastObject = *function;
+}
+
+test("CallFunction (<compareThisToWindow>, null)")
+	async;
+	require success "Setup";
+{
+	if (g_lastObject)
+	{
+		/* Create callback. */
+		ES_Value expected_result;
+		expected_result.type = VALUE_BOOLEAN;
+		expected_result.value.boolean = TRUE;
+		ES_AsyncCallback *callback = OP_NEW(ESU_SelftestCallback, (g_esEnvironment, ES_ASYNC_SUCCESS, expected_result));
+
+		OP_STATUS status = g_esEnvironment->GetAsyncInterface()->CallFunction(g_lastObject, NULL, 0, NULL, callback);
+		if (status != OpStatus::OK)
+			ST_failed("CallFunction failed: %d\n", status);
+	}
+	else
+		ST_failed("No last object stored");
+}
+
+test("Eval (new String('string'))")
+	async;
+	require success "Setup";
+{
+	/* Create callback. */
+	ES_Value expected_result;
+	expected_result.type = VALUE_OBJECT;
+	expected_result.value.object = NULL;
+	ES_AsyncCallback *callback = OP_NEW(ESU_SelftestCallback, (g_esEnvironment, ES_ASYNC_SUCCESS, expected_result, NULL, &g_lastObject));
+
+	OP_STATUS status = g_esEnvironment->GetAsyncInterface()->Eval(UNI_L("new String('string');"), callback);
+	if (status != OpStatus::OK)
+		ST_failed("Eval failed: %d\n", status);
+}
+
+test("CallMethod (<string>, 'slice', 2, 4)")
+	async;
+	require success "Setup";
+	require success "Eval (new String('string'))";
+{
+	if (g_lastObject)
+	{
+		/* Create callback. */
+		ES_Value expected_result;
+		expected_result.type = VALUE_STRING;
+		expected_result.value.string = UNI_L("ri");
+		ES_AsyncCallback *callback = OP_NEW(ESU_SelftestCallback, (g_esEnvironment, ES_ASYNC_SUCCESS, expected_result));
+
+		ES_Value arguments[2];
+		arguments[0].type = VALUE_NUMBER;
+		arguments[0].value.number = 2;
+		arguments[1].type = VALUE_NUMBER;
+		arguments[1].value.number = 4;
+
+		OP_STATUS status = g_esEnvironment->GetAsyncInterface()->CallMethod(g_lastObject, UNI_L("slice"), 2, arguments, callback);
+		if (status != OpStatus::OK)
+			ST_failed("CallMethod failed: %d\n", status);
+	}
+	else
+		ST_failed("No last object stored");
+}
+
+test("CallMethod (<last object>, 'does-not-exist')")
+	async;
+	require success "Setup";
+{
+	if (g_lastObject)
+	{
+		/* Create callback. */
+		ES_Value expected_result;
+		expected_result.type = VALUE_UNDEFINED;
+		ES_AsyncCallback *callback = OP_NEW(ESU_SelftestCallback, (g_esEnvironment, ES_ASYNC_FAILURE, expected_result));
+
+		OP_STATUS status = g_esEnvironment->GetAsyncInterface()->CallMethod(g_lastObject, UNI_L("does-not-exist"), 0, NULL, callback);
+		if (status != OpStatus::OK)
+			ST_failed("CallMethod failed: %d\n", status);
+	}
+	else
+		ST_failed("No last object stored");
+}
+
+test("Create outOfMemory object")
+	require success "Setup";
+{
+	EcmaScript_Object *function = OP_NEW(ESU_SelftestFunction_outOfMemory, ());
+	verify(function != NULL);
+	verify(OpStatus::IsSuccess(function->SetFunctionRuntime(g_esEnvironment->GetRuntime(), UNI_L("outOfMemory"), NULL, NULL)));
+
+	ES_Value value;
+	value.type = VALUE_OBJECT;
+	value.value.object = *function;
+
+	verify(OpStatus::IsSuccess(g_esEnvironment->GetRuntime()->PutName(g_esEnvironment->GetGlobalObject(), UNI_L("outOfMemory"), value)));
+}
+
+test("Create cancelThisThread object")
+	require success "Setup";
+{
+	EcmaScript_Object *function = OP_NEW(ESU_SelftestFunction_cancelThisThread, (g_esEnvironment));
+	verify(function != NULL);
+	verify(OpStatus::IsSuccess(function->SetFunctionRuntime(g_esEnvironment->GetRuntime(), UNI_L("cancelThisThread"), NULL, NULL)));
+
+	ES_Value value;
+	value.type = VALUE_OBJECT;
+	value.value.object = *function;
+
+	verify(OpStatus::IsSuccess(g_esEnvironment->GetRuntime()->PutName(g_esEnvironment->GetGlobalObject(), UNI_L("cancelThisThread"), value)));
+}
+
+test("Eval/compilation error")
+	require success "Setup";
+{
+	OP_STATUS status = g_esEnvironment->GetAsyncInterface()->Eval(UNI_L("x y;"));
+	verify(status == OpStatus::ERR);
+}
+
+test("Eval/execution error")
+	async;
+	require success "Setup";
+{
+	/* Create callback. */
+	ES_Value expected_result;
+	ES_AsyncCallback *callback = OP_NEW(ESU_SelftestCallback, (g_esEnvironment, ES_ASYNC_FAILURE, expected_result));
+
+	OP_STATUS status = g_esEnvironment->GetAsyncInterface()->Eval(UNI_L("x;"), callback);
+	if (status != OpStatus::OK)
+		ST_failed("Eval failed: %d\n", status);
+}
+
+test("Eval/out of memory error")
+	async;
+	require success "Setup";
+	require success "Create outOfMemory object";
+{
+	/* Create callback. */
+	ES_Value expected_result;
+	ES_AsyncCallback *callback = OP_NEW(ESU_SelftestCallback, (g_esEnvironment, ES_ASYNC_NO_MEMORY, expected_result));
+
+	OP_STATUS status = g_esEnvironment->GetAsyncInterface()->Eval(UNI_L("outOfMemory.trigger;"), callback);
+	if (status != OpStatus::OK)
+		ST_failed("Eval failed: %d\n", status);
+}
+
+test("Eval/cancelled thread")
+	async;
+	require success "Setup";
+	require success "Create cancelThisThread object";
+{
+	/* Create callback. */
+	ES_Value expected_result;
+	ES_AsyncCallback *callback = OP_NEW(ESU_SelftestCallback, (g_esEnvironment, ES_ASYNC_CANCELLED, expected_result));
+
+	OP_STATUS status = g_esEnvironment->GetAsyncInterface()->Eval(UNI_L("cancelThisThread ();"), callback);
+	if (status != OpStatus::OK)
+		ST_failed("Eval failed: %d\n", status);
+}
+
+test("Eval (cancelThisThread)")
+	async;
+	require success "Setup";
+	require success "Create cancelThisThread object";
+{
+	/* Create callback. */
+	ES_Value expected_result;
+	expected_result.type = VALUE_OBJECT;
+	expected_result.value.object = NULL;
+	ES_AsyncCallback *callback = OP_NEW(ESU_SelftestCallback, (g_esEnvironment, ES_ASYNC_SUCCESS, expected_result, NULL, &g_lastObject));
+
+	OP_STATUS status = g_esEnvironment->GetAsyncInterface()->Eval(UNI_L("cancelThisThread;"), callback);
+	if (status != OpStatus::OK)
+		ST_failed("Eval failed: %d\n", status);
+}
+
+test("GetSlot/cancelled during property read")
+	async;
+	require ESUTILS_ASYNCIF_PROPERTIES_SUPPORT;
+	require success "Setup";
+	require success "Create cancelThisThread object";
+	require success "Eval (cancelThisThread)";
+{
+	/* Create callback. */
+	ES_Value expected_result;
+	ES_AsyncCallback *callback = OP_NEW(ESU_SelftestCallback, (g_esEnvironment, ES_ASYNC_CANCELLED, expected_result));
+
+	OP_STATUS status = g_esEnvironment->GetAsyncInterface()->GetSlot(g_lastObject, UNI_L("trigger"), callback);
+	if (status != OpStatus::OK)
+		ST_failed("GetSlot failed: %d\n", status);
+}
+
+test("SetSlot/cancelled during property write")
+	async;
+	require ESUTILS_ASYNCIF_PROPERTIES_SUPPORT;
+	require success "Setup";
+	require success "Create cancelThisThread object";
+	require success "Eval (cancelThisThread)";
+{
+	/* Create callback. */
+	ES_Value expected_result;
+	ES_AsyncCallback *callback = OP_NEW(ESU_SelftestCallback, (g_esEnvironment, ES_ASYNC_CANCELLED, expected_result));
+
+	ES_Value value;
+	value.type = VALUE_UNDEFINED;
+
+	OP_STATUS status = g_esEnvironment->GetAsyncInterface()->SetSlot(g_lastObject, UNI_L("trigger"), value, callback);
+	if (status != OpStatus::OK)
+		ST_failed("GetSlot failed: %d\n", status);
+}
+
+test("CallMethod/cancelled during property read")
+	async;
+	require success "Setup";
+	require success "Create cancelThisThread object";
+	require success "Eval (cancelThisThread)";
+{
+	if (g_lastObject)
+	{
+		/* Create callback. */
+		ES_Value expected_result;
+		expected_result.type = VALUE_UNDEFINED;
+		ES_AsyncCallback *callback = OP_NEW(ESU_SelftestCallback, (g_esEnvironment, ES_ASYNC_CANCELLED, expected_result));
+
+		OP_STATUS status = g_esEnvironment->GetAsyncInterface()->CallMethod(g_lastObject, UNI_L("trigger"), 0, NULL, callback);
+		if (status != OpStatus::OK)
+			ST_failed("CallMethod failed: %d\n", status);
+	}
+	else
+		ST_failed("No last object stored");
+}
+
+test("CallMethod/cancelled during call")
+	async;
+	require success "Setup";
+	require success "Create cancelThisThread object";
+	require success "Eval (cancelThisThread)";
+{
+	if (g_lastObject)
+	{
+		/* Create callback. */
+		ES_Value expected_result;
+		expected_result.type = VALUE_UNDEFINED;
+		ES_AsyncCallback *callback = OP_NEW(ESU_SelftestCallback, (g_esEnvironment, ES_ASYNC_CANCELLED, expected_result));
+
+		OP_STATUS status = g_esEnvironment->GetAsyncInterface()->CallMethod(g_esEnvironment->GetGlobalObject(), UNI_L("cancelThisThread"), 0, NULL, callback);
+		if (status != OpStatus::OK)
+			ST_failed("CallMethod failed: %d\n", status);
+	}
+	else
+		ST_failed("No last object stored");
+}
+
+test("CallFunction/cancelled during call")
+	async;
+	require success "Setup";
+	require success "Create cancelThisThread object";
+	require success "Eval (cancelThisThread)";
+{
+	if (g_lastObject)
+	{
+		/* Create callback. */
+		ES_Value expected_result;
+		expected_result.type = VALUE_UNDEFINED;
+		ES_AsyncCallback *callback = OP_NEW(ESU_SelftestCallback, (g_esEnvironment, ES_ASYNC_CANCELLED, expected_result));
+
+		OP_STATUS status = g_esEnvironment->GetAsyncInterface()->CallFunction(g_lastObject, NULL, 0, NULL, callback);
+		if (status != OpStatus::OK)
+			ST_failed("CallMethod failed: %d\n", status);
+	}
+	else
+		ST_failed("No last object stored");
+}
+
+test("GetSlot/blocked")
+	async;
+	require ESUTILS_ASYNCIF_PROPERTIES_SUPPORT;
+	require success "Setup";
+{
+	/* Create callback. */
+	ES_Value expected_result;
+	expected_result.type = VALUE_BOOLEAN;
+	expected_result.value.boolean = TRUE;
+	ES_AsyncCallback *callback = OP_NEW(ESU_SelftestCallback, (g_esEnvironment, ES_ASYNC_SUCCESS, expected_result));
+
+	EcmaScript_Object *object = OP_NEW(ESU_SelftestObject_hostProperties, (g_esEnvironment, expected_result, TRUE, FALSE));
+	if (!object || OpStatus::IsError(object->SetObjectRuntime(g_esEnvironment->GetRuntime(), g_esEnvironment->GetRuntime()->GetObjectPrototype(), "Object")))
+		ST_failed("Object creation failed");
+	else
+	{
+		OP_STATUS status = g_esEnvironment->GetAsyncInterface()->GetSlot(*object, UNI_L("slot"), callback);
+		if (status != OpStatus::OK)
+			ST_failed("GetSlot failed: %d\n", status);
+	}
+}
+
+test("SetSlot/blocked")
+	async;
+	require ESUTILS_ASYNCIF_PROPERTIES_SUPPORT;
+	require success "Setup";
+{
+	ES_Value expected_result;
+	expected_result.type = VALUE_UNDEFINED;
+
+	EcmaScript_Object *object = OP_NEW(ESU_SelftestObject_hostProperties, (g_esEnvironment, expected_result, TRUE, FALSE));
+	if (!object || OpStatus::IsError(object->SetObjectRuntime(g_esEnvironment->GetRuntime(), g_esEnvironment->GetRuntime()->GetObjectPrototype(), "Object")))
+		ST_failed("Object creation failed");
+	else
+	{
+		/* Create callback. */
+		ES_AsyncCallback *callback = OP_NEW(ESU_SelftestCallback, (g_esEnvironment, ES_ASYNC_SUCCESS, expected_result));
+
+		OP_STATUS status = g_esEnvironment->GetAsyncInterface()->SetSlot(*object, UNI_L("slot"), expected_result, callback);
+		if (status != OpStatus::OK)
+			ST_failed("GetSlot failed: %d\n", status);
+	}
+}
+
+test("Call/blocked during property read")
+	async;
+	require success "Setup";
+{
+	EcmaScript_Object *function = OP_NEW(EcmaScript_Object, ());
+	if (!function ||
+	    OpStatus::IsError(function->SetFunctionRuntime(g_esEnvironment->GetRuntime(), UNI_L("function"), NULL, NULL)) ||
+		!g_esEnvironment->GetRuntime()->Protect(*function))
+		ST_failed("Function creation failed");
+	else
+	{
+		ES_Value function_value;
+		function_value.type = VALUE_OBJECT;
+		function_value.value.object = *function;
+
+		EcmaScript_Object *object = OP_NEW(ESU_SelftestObject_hostProperties, (g_esEnvironment, function_value, TRUE, FALSE));
+		if (!object || OpStatus::IsError(object->SetObjectRuntime(g_esEnvironment->GetRuntime(), g_esEnvironment->GetRuntime()->GetObjectPrototype(), "Object")))
+			ST_failed("Object creation failed");
+		else
+		{
+			/* Create callback. */
+			ES_Value expected_result;
+			expected_result.type = VALUE_UNDEFINED;
+			ES_AsyncCallback *callback = OP_NEW(ESU_SelftestCallback, (g_esEnvironment, ES_ASYNC_SUCCESS, expected_result));
+
+			OP_STATUS status = g_esEnvironment->GetAsyncInterface()->CallMethod(*object, UNI_L("slot"), 0, NULL, callback);
+			if (status != OpStatus::OK)
+				ST_failed("GetSlot failed: %d\n", status);
+		}
+	}
+}
+
+test("Eval (outOfMemory)")
+	async;
+	require success "Setup";
+	require success "Create outOfMemory object";
+{
+	/* Create callback. */
+	ES_Value expected_result;
+	expected_result.type = VALUE_OBJECT;
+	expected_result.value.object = NULL;
+	ES_AsyncCallback *callback = OP_NEW(ESU_SelftestCallback, (g_esEnvironment, ES_ASYNC_SUCCESS, expected_result, NULL, &g_lastObject));
+
+	OP_STATUS status = g_esEnvironment->GetAsyncInterface()->Eval(UNI_L("outOfMemory;"), callback);
+	if (status != OpStatus::OK)
+		ST_failed("Eval failed: %d\n", status);
+}
+
+test("GetSlot/out of memory during property read")
+	async;
+	require ESUTILS_ASYNCIF_PROPERTIES_SUPPORT;
+	require success "Setup";
+	require success "Create cancelThisThread object";
+	require success "Eval (cancelThisThread)";
+{
+	/* Create callback. */
+	ES_Value expected_result;
+	ES_AsyncCallback *callback = OP_NEW(ESU_SelftestCallback, (g_esEnvironment, ES_ASYNC_NO_MEMORY, expected_result));
+
+	OP_STATUS status = g_esEnvironment->GetAsyncInterface()->GetSlot(g_lastObject, UNI_L("trigger"), callback);
+	if (status != OpStatus::OK)
+		ST_failed("GetSlot failed: %d\n", status);
+}
+
+test("SetSlot/out of memory during property write")
+	async;
+	require ESUTILS_ASYNCIF_PROPERTIES_SUPPORT;
+	require success "Setup";
+	require success "Create cancelThisThread object";
+	require success "Eval (cancelThisThread)";
+{
+	/* Create callback. */
+	ES_Value expected_result;
+	ES_AsyncCallback *callback = OP_NEW(ESU_SelftestCallback, (g_esEnvironment, ES_ASYNC_NO_MEMORY, expected_result));
+
+	OP_STATUS status = g_esEnvironment->GetAsyncInterface()->SetSlot(g_lastObject, UNI_L("trigger"), expected_result, callback);
+	if (status != OpStatus::OK)
+		ST_failed("GetSlot failed: %d\n", status);
+}
+
+test("Eval/exception propagation (undefined)")
+	async;
+	require success "Setup";
+{
+	/* Create callback. */
+	ES_Value expected_result;
+	expected_result.type = VALUE_UNDEFINED;
+	ES_AsyncCallback *callback = OP_NEW(ESU_SelftestCallback, (g_esEnvironment, ES_ASYNC_EXCEPTION, expected_result));
+
+	g_esEnvironment->GetAsyncInterface()->SetWantExceptions();
+	OP_STATUS status = g_esEnvironment->GetAsyncInterface()->Eval(UNI_L("throw undefined;"), callback);
+	if (status != OpStatus::OK)
+		ST_failed("Eval failed: %d\n", status);
+}
+
+test("Eval/exception propagation (null)")
+	async;
+	require success "Setup";
+{
+	/* Create callback. */
+	ES_Value expected_result;
+	expected_result.type = VALUE_NULL;
+	ES_AsyncCallback *callback = OP_NEW(ESU_SelftestCallback, (g_esEnvironment, ES_ASYNC_EXCEPTION, expected_result));
+
+	g_esEnvironment->GetAsyncInterface()->SetWantExceptions();
+	OP_STATUS status = g_esEnvironment->GetAsyncInterface()->Eval(UNI_L("throw null;"), callback);
+	if (status != OpStatus::OK)
+		ST_failed("Eval failed: %d\n", status);
+}
+
+test("Eval/exception propagation (true)")
+	async;
+	require success "Setup";
+{
+	/* Create callback. */
+	ES_Value expected_result;
+	expected_result.type = VALUE_BOOLEAN;
+	expected_result.value.boolean = TRUE;
+	ES_AsyncCallback *callback = OP_NEW(ESU_SelftestCallback, (g_esEnvironment, ES_ASYNC_EXCEPTION, expected_result));
+
+	g_esEnvironment->GetAsyncInterface()->SetWantExceptions();
+	OP_STATUS status = g_esEnvironment->GetAsyncInterface()->Eval(UNI_L("throw true;"), callback);
+	if (status != OpStatus::OK)
+		ST_failed("Eval failed: %d\n", status);
+}
+
+test("Eval/exception propagation (false)")
+	async;
+	require success "Setup";
+{
+	/* Create callback. */
+	ES_Value expected_result;
+	expected_result.type = VALUE_BOOLEAN;
+	expected_result.value.boolean = FALSE;
+	ES_AsyncCallback *callback = OP_NEW(ESU_SelftestCallback, (g_esEnvironment, ES_ASYNC_EXCEPTION, expected_result));
+
+	g_esEnvironment->GetAsyncInterface()->SetWantExceptions();
+	OP_STATUS status = g_esEnvironment->GetAsyncInterface()->Eval(UNI_L("throw false;"), callback);
+	if (status != OpStatus::OK)
+		ST_failed("Eval failed: %d\n", status);
+}
+
+test("Eval/exception propagation (10.0)")
+	async;
+	require success "Setup";
+{
+	/* Create callback. */
+	ES_Value expected_result;
+	expected_result.type = VALUE_NUMBER;
+	expected_result.value.number = 10;
+	ES_AsyncCallback *callback = OP_NEW(ESU_SelftestCallback, (g_esEnvironment, ES_ASYNC_EXCEPTION, expected_result));
+
+	g_esEnvironment->GetAsyncInterface()->SetWantExceptions();
+	OP_STATUS status = g_esEnvironment->GetAsyncInterface()->Eval(UNI_L("throw 10.0;"), callback);
+	if (status != OpStatus::OK)
+		ST_failed("Eval failed: %d\n", status);
+}
+
+test("Eval/exception propagation ('string')")
+	async;
+	require success "Setup";
+{
+	/* Create callback. */
+	ES_Value expected_result;
+	expected_result.type = VALUE_STRING;
+	expected_result.value.string = UNI_L("string");
+	ES_AsyncCallback *callback = OP_NEW(ESU_SelftestCallback, (g_esEnvironment, ES_ASYNC_EXCEPTION, expected_result));
+
+	g_esEnvironment->GetAsyncInterface()->SetWantExceptions();
+	OP_STATUS status = g_esEnvironment->GetAsyncInterface()->Eval(UNI_L("throw 'string';"), callback);
+	if (status != OpStatus::OK)
+		ST_failed("Eval failed: %d\n", status);
+}
+
+test("Eval/exception propagation (Object)")
+	async;
+	require success "Setup";
+{
+	/* Create callback. */
+	ES_Value expected_result;
+	expected_result.type = VALUE_OBJECT;
+	expected_result.value.object = g_esEnvironment->GetRuntime()->GetObjectPrototype();
+	ES_AsyncCallback *callback = OP_NEW(ESU_SelftestCallback, (g_esEnvironment, ES_ASYNC_EXCEPTION, expected_result));
+
+	g_esEnvironment->GetAsyncInterface()->SetWantExceptions();
+	OP_STATUS status = g_esEnvironment->GetAsyncInterface()->Eval(UNI_L("throw Object.prototype;"), callback);
+	if (status != OpStatus::OK)
+		ST_failed("Eval failed: %d\n", status);
+}
+
+test("Create throwException object")
+	require success "Setup";
+{
+	ES_Value expected_result;
+	EcmaScript_Object *object = OP_NEW(ESU_SelftestObject_hostProperties, (g_esEnvironment, expected_result, FALSE, TRUE));
+	if (!object ||
+		OpStatus::IsError(object->SetObjectRuntime(g_esEnvironment->GetRuntime(), g_esEnvironment->GetRuntime()->GetObjectPrototype(), "Object")) ||
+		!g_esEnvironment->GetRuntime()->Protect(*object))
+		ST_failed("Object creation failed");
+	else
+    {
+		if (g_lastObject)
+			g_esEnvironment->GetRuntime()->Unprotect(g_lastObject);
+		g_lastObject = *object;
+	}
+}
+
+test("GetSlot/exception propagation (<last object>, 'foo')")
+	async;
+	require ESUTILS_ASYNCIF_PROPERTIES_SUPPORT;
+	require success "Setup";
+	require success "Create throwException object";
+{
+	/* Create callback. */
+	ES_Value expected_result;
+	expected_result.type = VALUE_STRING;
+	expected_result.value.string = UNI_L("got ya!");
+	ES_AsyncCallback *callback = OP_NEW(ESU_SelftestCallback, (g_esEnvironment, ES_ASYNC_EXCEPTION, expected_result));
+
+	g_esEnvironment->GetAsyncInterface()->SetWantExceptions();
+	OP_STATUS status = g_esEnvironment->GetAsyncInterface()->GetSlot(g_lastObject, UNI_L("foo"), callback);
+	if (status != OpStatus::OK)
+		ST_failed("GetSlot failed: %d\n", status);
+}
+
+test("GetSlot/exception propagation (<last object>, 10)")
+	async;
+	require ESUTILS_ASYNCIF_PROPERTIES_SUPPORT;
+	require success "Setup";
+	require success "Create throwException object";
+{
+	/* Create callback. */
+	ES_Value expected_result;
+	expected_result.type = VALUE_STRING;
+	expected_result.value.string = UNI_L("got ya!");
+	ES_AsyncCallback *callback = OP_NEW(ESU_SelftestCallback, (g_esEnvironment, ES_ASYNC_EXCEPTION, expected_result));
+
+	g_esEnvironment->GetAsyncInterface()->SetWantExceptions();
+	OP_STATUS status = g_esEnvironment->GetAsyncInterface()->GetSlot(g_lastObject, 10, callback);
+	if (status != OpStatus::OK)
+		ST_failed("GetSlot failed: %d\n", status);
+}
+
+test("SetSlot/exception propagation (<last object>, 'foo', 'bar')")
+	async;
+	require ESUTILS_ASYNCIF_PROPERTIES_SUPPORT;
+	require success "Setup";
+	require success "Create throwException object";
+{
+	/* Create callback. */
+	ES_Value expected_result;
+	expected_result.type = VALUE_STRING;
+	expected_result.value.string = UNI_L("got ya!");
+	ES_AsyncCallback *callback = OP_NEW(ESU_SelftestCallback, (g_esEnvironment, ES_ASYNC_EXCEPTION, expected_result));
+
+	ES_Value value;
+	value.type = VALUE_STRING;
+	value.value.string = UNI_L("bar");
+
+	g_esEnvironment->GetAsyncInterface()->SetWantExceptions();
+	OP_STATUS status = g_esEnvironment->GetAsyncInterface()->SetSlot(g_lastObject, UNI_L("foo"), value, callback);
+	if (status != OpStatus::OK)
+		ST_failed("SetSlot failed: %d\n", status);
+}
+
+test("SetSlot/exception propagation (<last object>, 10, 'bar')")
+	async;
+	require ESUTILS_ASYNCIF_PROPERTIES_SUPPORT;
+	require success "Setup";
+	require success "Create throwException object";
+{
+	/* Create callback. */
+	ES_Value expected_result;
+	expected_result.type = VALUE_STRING;
+	expected_result.value.string = UNI_L("got ya!");
+	ES_AsyncCallback *callback = OP_NEW(ESU_SelftestCallback, (g_esEnvironment, ES_ASYNC_EXCEPTION, expected_result));
+
+	ES_Value value;
+	value.type = VALUE_STRING;
+	value.value.string = UNI_L("bar");
+
+	g_esEnvironment->GetAsyncInterface()->SetWantExceptions();
+	OP_STATUS status = g_esEnvironment->GetAsyncInterface()->SetSlot(g_lastObject, 10, value, callback);
+	if (status != OpStatus::OK)
+		ST_failed("SetSlot failed: %d\n", status);
+}
+
+test("CallMethod/exception propagation during property read")
+	async;
+	require success "Setup";
+	require success "Create throwException object";
+{
+	/* Create callback. */
+	ES_Value expected_result;
+	expected_result.type = VALUE_STRING;
+	expected_result.value.string = UNI_L("got ya!");
+	ES_AsyncCallback *callback = OP_NEW(ESU_SelftestCallback, (g_esEnvironment, ES_ASYNC_EXCEPTION, expected_result));
+
+	g_esEnvironment->GetAsyncInterface()->SetWantExceptions();
+	OP_STATUS status = g_esEnvironment->GetAsyncInterface()->CallMethod(g_lastObject, UNI_L("foo"), 0, NULL, callback);
+	if (status != OpStatus::OK)
+		ST_failed("CallMethod failed: %d\n", status);
+}
+
+test("Create exception throwing function")
+	async;
+	require success "Setup";
+{
+	/* Create callback. */
+	ES_Value expected_result;
+	expected_result.type = VALUE_OBJECT;
+	expected_result.value.object = NULL;
+	ES_AsyncCallback *callback = OP_NEW(ESU_SelftestCallback, (g_esEnvironment, ES_ASYNC_SUCCESS, expected_result));
+
+	OP_STATUS status = g_esEnvironment->GetAsyncInterface()->Eval(UNI_L("Object.prototype.f = function () { throw 'got ya!'; }"), callback);
+	if (status != OpStatus::OK)
+		ST_failed("Eval failed: %d\n", status);
+}
+
+test("CallMethod/exception propagation during call")
+	async;
+	require success "Setup";
+	require success "Create exception throwing function";
+{
+	/* Create callback. */
+	ES_Value expected_result;
+	expected_result.type = VALUE_STRING;
+	expected_result.value.string = UNI_L("got ya!");
+	ES_AsyncCallback *callback = OP_NEW(ESU_SelftestCallback, (g_esEnvironment, ES_ASYNC_EXCEPTION, expected_result, NULL, &g_lastObject));
+
+	g_esEnvironment->GetAsyncInterface()->SetWantExceptions();
+	OP_STATUS status = g_esEnvironment->GetAsyncInterface()->CallMethod(g_esEnvironment->GetRuntime()->GetObjectPrototype(), UNI_L("f"), 0, NULL, callback);
+	if (status != OpStatus::OK)
+		ST_failed("CallMethod failed: %d\n", status);
+}
+
+test("CallFunction/exception propagation during call")
+	async;
+	require success "Setup";
+	require success "Create exception throwing function";
+{
+	/* Create callback. */
+	ES_Value expected_result;
+	expected_result.type = VALUE_STRING;
+	expected_result.value.string = UNI_L("got ya!");
+	ES_AsyncCallback *callback = OP_NEW(ESU_SelftestCallback, (g_esEnvironment, ES_ASYNC_EXCEPTION, expected_result, NULL, &g_lastObject));
+
+	g_esEnvironment->GetAsyncInterface()->SetWantExceptions();
+	OP_STATUS status = g_esEnvironment->GetAsyncInterface()->CallFunction(g_lastObject, NULL, 0, NULL, callback);
+	if (status != OpStatus::OK)
+		ST_failed("CallMethod failed: %d\n", status);
+}

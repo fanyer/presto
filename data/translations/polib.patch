@@ -1,0 +1,171 @@
+--- polib-1.0.0.py	2012-10-22 10:19:27.000000000 +0200
++++ polib.py	2012-10-22 17:55:50.000000000 +0200
+@@ -405,7 +405,7 @@
+             self.fpath = fpath
+ 
+     def find(self, st, by='msgid', include_obsolete_entries=False,
+-             msgctxt=False):
++             msgctxt=False, scope=False):
+         """
+         Find the entry which msgid (or property identified by the ``by``
+         argument) matches the string ``st``.
+@@ -424,6 +424,9 @@
+         ``msgctxt``
+             string, allows to specify a specific message context for the
+             search.
++
++        ``scope``
++            string, allows to specify a specific scope for the search.
+         """
+         if include_obsolete_entries:
+             entries = self[:]
+@@ -433,9 +436,49 @@
+             if getattr(e, by) == st:
+                 if msgctxt and e.msgctxt != msgctxt:
+                     continue
++                if scope and scope not in e.scopes():
++                    continue
+                 return e
+         return None
+ 
++    def findall(self, pattern, by='msgid', include_obsolete_entries=False,
++             msgctxt=False, scope=False):
++        """
++        Find the list of entries for which msgid (or property identified by
++        the ``by`` argument) matches the regular expression ``pattern``.
++
++        Keyword arguments:
++
++        ``pattern``
++            regular expression, the string/pattern to search for.
++
++        ``by``
++            string, the property to use for comparison (default: ``msgid``).
++
++        ``include_obsolete_entries``
++            boolean, whether to also search in entries that are obsolete.
++
++        ``msgctxt``
++            string, allows to specify a specific message context for the
++            search.
++
++        ``scope``
++            string, allows to specify a specific scope for the search.
++        """
++        ret = []
++        if include_obsolete_entries:
++            entries = self[:]
++        else:
++            entries = [e for e in self if not e.obsolete]
++        for e in entries:
++            if getattr(e, by) and re.search(pattern, getattr(e, by)):
++                if msgctxt and e.msgctxt != msgctxt:
++                    continue
++                if scope and scope not in e.scopes():
++                    continue
++                ret.append(e)
++        return ret
++
+     def ordered_metadata(self):
+         """
+         Convenience method that returns an ordered version of the metadata
+@@ -632,6 +675,12 @@
+         """
+         return [e for e in self if e.obsolete]
+ 
++    def mismatched_entries(self, pattern, ordering='sequence'):
++        """
++        Convenience method that returns the list of mismatched entries.
++        """
++        return [e for e in self if e.mismatched(pattern, ordering)]
++
+     def merge(self, refpot):
+         """
+         Convenience method that merges the current pofile with the pot file
+@@ -908,7 +957,7 @@
+ 
+         ret = []
+         # comments first, if any (with text wrapping as xgettext does)
+-        comments = [('comment', '#. '), ('tcomment', '# ')]
++        comments = [('tcomment', '# '), ('comment', '#. ')]
+         for c in comments:
+             val = getattr(self, c[0])
+             if val:
+@@ -1021,6 +1070,27 @@
+     def __ne__(self, other):
+         return self.__cmp__(other) != 0
+ 
++    def description(self):
++        """
++        Unique to Opera and english.db:
++        Extract description from the comment, discarding scopes
++        """
++        if 'Scope:' in self.comment:
++            return re.sub(r'(?Lsum)(^.*)^Scope:(.*)$', r'\1', self.comment).rstrip('\n')
++        else:
++            return self.comment
++
++    def scopes(self):
++        """
++        Unique to Opera and english.db: Extract scopes from the comment
++        """
++        ret = []
++        if 'Scope:' in self.comment:
++            scope_line = re.sub(r'(?Lsum)(^.*)^Scope:(.*)$', r'\2', self.comment)
++            for scope in scope_line.split(','):
++                ret.append(scope.strip())
++        return ret
++
+     def translated(self):
+         """
+         Returns ``True`` if the entry has been translated or ``False``
+@@ -1037,6 +1107,33 @@
+             return True
+         return False
+ 
++    def mismatched(self, pattern, ordering='sequence'):
++        """
++        Returns ``True`` if the pattern does not match in msgid/msgstr
++        ``ordering`` is one of: ``sequence``, ``sorted``, ``set``
++        """
++        if not self.translated():
++            return False
++        if self.msgid_plural:
++            msgid = self.msgid_plural
++        else:
++            msgid = self.msgid
++        if self.msgstr_plural:
++            msgstrs = self.msgstr_plural.values()
++        else:
++            msgstrs = [ self.msgstr ]
++        for msgstr in msgstrs:
++            if ordering == 'sequence':
++                if re.findall(pattern, msgid) != re.findall(pattern, msgstr):
++                    return True
++            elif ordering == 'sorted':
++                if sorted(re.findall(pattern, msgid)) != sorted(re.findall(pattern, msgstr)):
++                    return True
++            elif ordering == 'set':
++                if set(re.findall(pattern, msgid)) != set(re.findall(pattern, msgstr)):
++                    return True
++        return False
++
+     def merge(self, other):
+         """
+         Merge the current entry with the given pot entry.
+@@ -1478,15 +1575,12 @@
+             self.current_entry.msgstr_plural[self.msgstr_index] += token
+         elif self.current_state == 'PP':
+             typ = 'previous_msgid_plural'
+-            token = token[3:]
+             self.current_entry.previous_msgid_plural += token
+         elif self.current_state == 'PM':
+             typ = 'previous_msgid'
+-            token = token[3:]
+             self.current_entry.previous_msgid += token
+         elif self.current_state == 'PC':
+             typ = 'previous_msgctxt'
+-            token = token[3:]
+             self.current_entry.previous_msgctxt += token
+         # don't change the current state
+         return False

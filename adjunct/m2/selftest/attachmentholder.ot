@@ -1,0 +1,340 @@
+/* -*- Mode: c++; tab-width: 4; c-basic-offset: 4 -*-
+ *
+ * Copyright (C) 1995-2010 Opera Software AS.  All rights reserved.
+ *
+ * This file is part of the Opera web browser.
+ * It may not be distributed under any circumstances.
+ *
+ * @author Arjan van Leeuwen (arjanl)
+ */
+
+group "m2.composer.attachmentholder";
+require M2_SUPPORT;
+
+include "adjunct/m2/src/composer/attachmentholder.h";
+include "adjunct/m2/src/composer/messageencoder.h";
+include "modules/util/opfile/opfile.h";
+include "adjunct/desktop_util/treemodel/simpletreemodel.h";
+include "modules/url/url_rep.h";
+include "adjunct/m2/src/engine/message.h";
+
+global
+{
+	message_gid_t test_id = 53741825;
+	OpString draftsdir;
+	#define TESTFILENAME "attachment.txt"
+
+	class MockMessageEncoder : public MessageEncoder
+	{
+	public:
+		virtual OP_STATUS AddAttachment(const OpStringC& attachment_path, const OpStringC& suggested_filename, const OpStringC8& charset)
+		{
+			Attachment* attachment = OP_NEW(Attachment, ());
+			attachment->attachment_path.Set(attachment_path);
+			attachment->suggested_filename.Set(suggested_filename);
+			attachment->charset.Set(charset);
+			return attachments.Add(attachment);
+		}
+
+		struct Attachment
+		{
+			OpString attachment_path;
+			OpString suggested_filename;
+			OpString8 charset;
+		};
+
+		OpAutoVector<Attachment> attachments;
+	};
+
+	void GetTestFilename(OpString& filename, const uni_char* suggested = UNI_L(TESTFILENAME))
+	{
+		filename.AppendFormat(UNI_L("%s%c%d%copr1-%s"), draftsdir.CStr(), PATHSEPCHAR, test_id, PATHSEPCHAR, suggested);
+		OpFile file;
+		file.Construct(filename.CStr());
+		filename.Set(file.GetFullPath());
+	}
+
+	void Cleanup()
+	{
+		OpFile dir;
+		dir.Construct(draftsdir.CStr());
+		dir.Delete();
+	}
+
+	struct TestHolder
+	{
+		SimpleTreeModel model;
+		AttachmentHolder attachments;
+		OpStringC draftsdir;
+
+		TestHolder(message_gid_t id, const OpStringC& drafts_dir)
+			: model(2)
+			, attachments(model)
+			, draftsdir(drafts_dir)
+		{
+			attachments.Init(id, draftsdir);
+		}
+
+		~TestHolder()
+		{
+			OpFile dir;
+			dir.Construct(draftsdir.CStr());
+			dir.Delete();
+		}
+	};
+};
+
+test("Setting up paths")
+	file uni draftspath "data/drafts";
+{
+	verify(OpStatus::IsSuccess(draftsdir.Set(draftspath)));
+}
+
+test("Attachments are encoded")
+	file uni filepath "data/attachment.txt";
+{
+	TestHolder h(test_id, draftsdir);
+
+	verify(OpStatus::IsSuccess(h.attachments.AddFromFile(filepath)));
+
+	MockMessageEncoder encoder;
+	verify(OpStatus::IsSuccess(h.attachments.EncodeForSending(encoder, "utf-8")));
+
+	OpString filename;
+	GetTestFilename(filename);
+	verify(encoder.attachments.GetCount() == 1);
+	verify(encoder.attachments.Get(0)->attachment_path == filepath);
+	verify(encoder.attachments.Get(0)->suggested_filename == UNI_L(TESTFILENAME));
+}
+
+test("Attachments from cache are encoded")
+	file uni filepath "data/attachment.txt";
+{
+	TestHolder h(test_id, draftsdir);
+
+	URL url = g_url_api->GetNewOperaURL();
+	verify(OpStatus::IsSuccess(h.attachments.AddFromCache(filepath, UNI_L("suggestion"), url, FALSE)));
+
+	MockMessageEncoder encoder;
+	verify(OpStatus::IsSuccess(h.attachments.EncodeForSending(encoder, "utf-8")));
+
+	verify(encoder.attachments.GetCount() == 1);
+	verify(encoder.attachments.Get(0)->attachment_path == filepath);
+	verify(encoder.attachments.Get(0)->suggested_filename == UNI_L("suggestion"));
+}
+
+test("URL_CONTENT_ID attachments from cache are not encoded")
+	file uni filepath "data/attachment.txt";
+{
+	TestHolder h(test_id, draftsdir);
+
+	URL url = g_url_api->GetURL("cid:opera123");
+	verify(OpStatus::IsSuccess(h.attachments.AddFromCache(filepath, UNI_L("suggestion"), url, FALSE)));
+
+	MockMessageEncoder encoder;
+	verify(OpStatus::IsSuccess(h.attachments.EncodeForSending(encoder, "utf-8")));
+
+	verify(encoder.attachments.GetCount() == 0);
+}
+
+test("Model is updated")
+	file uni filepath "data/attachment.txt";
+{
+	TestHolder h(test_id, draftsdir);
+
+	verify(OpStatus::IsSuccess(h.attachments.AddFromFile(filepath)));
+
+	verify(h.model.GetCount() == 1);
+	verify(h.model.GetItemString(0) && uni_strcmp(h.model.GetItemString(0), UNI_L(TESTFILENAME)) == 0);
+}
+
+test("Adding attachments by file copies file")
+	file uni filepath "data/attachment.txt";
+{
+	TestHolder h(test_id, draftsdir);
+
+	verify(OpStatus::IsSuccess(h.attachments.AddFromFile(filepath)));
+	verify(OpStatus::IsSuccess(h.attachments.Save(test_id)));
+
+	OpString filename;
+	GetTestFilename(filename);
+	OpFile file;
+	verify(OpStatus::IsSuccess(file.Construct(filename.CStr())));
+	BOOL exists = FALSE;
+	verify(OpStatus::IsSuccess(file.Exists(exists)) && exists);
+}
+
+test("Adding attachments from cache copies file")
+	file uni filepath "data/attachment.txt";
+{
+	TestHolder h(test_id, draftsdir);
+	URL url = g_url_api->GetNewOperaURL();
+
+	verify(OpStatus::IsSuccess(h.attachments.AddFromCache(filepath, UNI_L("suggestion"), url, FALSE)));
+	verify(OpStatus::IsSuccess(h.attachments.Save(test_id)));
+
+	OpString filename;
+	GetTestFilename(filename, UNI_L("suggestion"));
+	OpFile file;
+	verify(OpStatus::IsSuccess(file.Construct(filename.CStr())));
+	BOOL exists = FALSE;
+	verify(OpStatus::IsSuccess(file.Exists(exists)) && exists);
+}
+
+test("Attachments from cache are held in cache until saving")
+	file uni filepath "data/attachment.txt";
+{
+	TestHolder h(test_id, draftsdir);
+	URL url = g_url_api->GetNewOperaURL();
+
+	verify(OpStatus::IsSuccess(h.attachments.AddFromCache(filepath, UNI_L("suggestion"), url, FALSE)));
+	verify(url.GetRep());
+	verify(url.GetRep()->GetUsedCount() > 0);
+	
+	verify(OpStatus::IsSuccess(h.attachments.Save(test_id)));
+
+	verify(url.GetRep()->GetUsedCount() == 0);
+}
+
+test("URL_CONTENT_ID Attachments from cache are held indefinitely")
+	file uni filepath "data/attachment.txt";
+{
+	TestHolder h(test_id, draftsdir);
+	URL url = g_url_api->GetURL("cid:opera123");
+
+	verify(OpStatus::IsSuccess(h.attachments.AddFromCache(filepath, UNI_L("suggestion"), url, FALSE)));
+	verify(url.GetRep());
+	verify(url.GetRep()->GetUsedCount() > 0);
+	
+	verify(OpStatus::IsSuccess(h.attachments.Save(test_id)));
+	verify(url.GetRep()->GetUsedCount() > 0);
+
+	MockMessageEncoder encoder;
+	verify(OpStatus::IsSuccess(h.attachments.EncodeForSending(encoder, "utf-8")));
+	verify(url.GetRep()->GetUsedCount() > 0);
+}
+
+test("Can read previously created attachment folders")
+	file uni filepath "data/attachment.txt";
+{
+	TestHolder h(test_id, draftsdir);
+
+	verify(OpStatus::IsSuccess(h.attachments.AddFromFile(filepath)));
+	verify(OpStatus::IsSuccess(h.attachments.Save(test_id)));
+
+	TestHolder h2(test_id, draftsdir);
+
+	MockMessageEncoder encoder;
+	verify(OpStatus::IsSuccess(h2.attachments.EncodeForSending(encoder, "utf-8")));
+
+	OpString filename;
+	GetTestFilename(filename);
+	verify(encoder.attachments.GetCount() == 1);
+	verify(encoder.attachments.Get(0)->attachment_path == filename);
+	verify(encoder.attachments.Get(0)->suggested_filename == UNI_L(TESTFILENAME));
+
+	verify(h2.model.GetCount() == 1);
+	verify(h2.model.GetItemString(0) && uni_strcmp(h2.model.GetItemString(0), UNI_L(TESTFILENAME)) == 0);
+}
+
+test("Removing a previously added attachment removes file")
+	file uni filepath "data/attachment.txt";
+{
+	TestHolder h(test_id, draftsdir);
+
+	verify(OpStatus::IsSuccess(h.attachments.AddFromFile(filepath)));
+	verify(OpStatus::IsSuccess(h.attachments.Save(test_id)));
+	verify(OpStatus::IsSuccess(h.attachments.Remove(1)));
+
+	OpString filename;
+	GetTestFilename(filename);
+	OpFile file;
+	verify(OpStatus::IsSuccess(file.Construct(filename.CStr())));
+	BOOL exists = TRUE;
+	verify(OpStatus::IsSuccess(file.Exists(exists)) && !exists);
+}
+
+test("Removing a previously added attachment encodes correctly")
+	file uni filepath "data/attachment.txt";
+{
+	TestHolder h(test_id, draftsdir);
+
+	verify(OpStatus::IsSuccess(h.attachments.AddFromFile(filepath)));
+	verify(OpStatus::IsSuccess(h.attachments.Remove(1)));
+
+	MockMessageEncoder encoder;
+	verify(OpStatus::IsSuccess(h.attachments.EncodeForSending(encoder, "utf-8")));
+
+	verify(encoder.attachments.GetCount() == 0);
+}
+
+test("Removing a previously added attachment updates model")
+	file uni filepath "data/attachment.txt";
+{
+	TestHolder h(test_id, draftsdir);
+
+	verify(OpStatus::IsSuccess(h.attachments.AddFromFile(filepath)));
+	verify(OpStatus::IsSuccess(h.attachments.Remove(1)));
+
+	verify(h.model.GetCount() == 0);
+}
+
+test("Encode no attachments")
+{
+	TestHolder h(test_id, draftsdir);
+
+	MockMessageEncoder encoder;
+	verify(OpStatus::IsSuccess(h.attachments.EncodeForSending(encoder, "utf-8")));
+
+	verify(encoder.attachments.GetCount() == 0);
+}
+
+test("Can remove everything")
+	file uni filepath "data/attachment.txt";
+{
+	TestHolder h(test_id, draftsdir);
+
+	verify(OpStatus::IsSuccess(h.attachments.AddFromFile(filepath)));
+	verify(OpStatus::IsSuccess(h.attachments.Save(test_id)));
+	verify(OpStatus::IsSuccess(h.attachments.RemoveAll()));
+
+	MockMessageEncoder encoder;
+	verify(OpStatus::IsSuccess(h.attachments.EncodeForSending(encoder, "utf-8")));
+
+	verify(h.model.GetCount() == 0);
+	verify(encoder.attachments.GetCount() == 0);
+
+	OpString filename;
+	GetTestFilename(filename);
+	OpFile file;
+	verify(OpStatus::IsSuccess(file.Construct(filename.CStr())));
+	BOOL exists = TRUE;
+	verify(OpStatus::IsSuccess(file.Exists(exists)) && !exists);
+}
+
+test("Can get the suggested filename and attachment URL")
+	file uni filepath "data/attachment.txt";
+{
+	TestHolder h(test_id, draftsdir);
+	URL attachment_url;
+	OpString suggested_filename, uni_name;
+
+	verify(OpStatus::IsSuccess(h.attachments.AddFromFile(filepath)));
+
+	verify(h.attachments.GetCount() == 1);
+
+	verify(OpStatus::IsSuccess(h.attachments.GetAttachmentInfoByPosition(0, 5, suggested_filename, attachment_url)));
+
+	verify(suggested_filename == UNI_L(TESTFILENAME));
+	verify(attachment_url.GetContextId() == 5);
+	verify(OpStatus::IsSuccess(uni_name.Set(attachment_url.GetAttribute(URL::KUniName))));
+	verify(uni_strstr(uni_name, UNI_L(TESTFILENAME)) != NULL);
+
+	verify(OpStatus::IsSuccess(h.attachments.GetAttachmentInfoById(0, 5, suggested_filename, attachment_url)));
+
+	verify(suggested_filename == UNI_L(TESTFILENAME));
+	verify(attachment_url.GetContextId() == 5);
+	verify(OpStatus::IsSuccess(uni_name.Set(attachment_url.GetAttribute(URL::KUniName))));
+	verify(uni_strstr(uni_name, UNI_L(TESTFILENAME)) != NULL);
+
+}

@@ -1,0 +1,517 @@
+/* -*- Mode: c++; tab-width: 4; indent-tabs-mode: t; c-basic-offset: 4 -*-
+ *
+ * Copyright (C) 2008 Opera Software AS.  All rights reserved.
+ *
+ * This file is part of the Opera web browser.
+ * It may not be distributed under any circumstances.
+ */
+group "sqlite";
+
+require initialization;
+require SQLITE_SUPPORT;
+
+language c++;
+
+include "modules/sqlite/sqlite3.h";
+include "modules/util/opfile/opfile.h";
+
+global
+{
+	class AutoCloseSqlite3
+	{
+	public:
+		AutoCloseSqlite3 (sqlite3*& db) : m_db(db){}
+		~AutoCloseSqlite3() { if (m_db) sqlite3_close(m_db); m_db = NULL; }
+		sqlite3*& m_db;
+	};
+
+#define PROTECT_CLOSE(var) AutoCloseSqlite3 auto_close_##var(var)
+
+	class AutoFinalizeSqliteStmt3
+	{
+	public:
+		AutoFinalizeSqliteStmt3 (sqlite3_stmt*& stmt) : m_stmt(stmt){}
+		~AutoFinalizeSqliteStmt3() { if (m_stmt) sqlite3_finalize(m_stmt); m_stmt = NULL; }
+		sqlite3_stmt*& m_stmt;
+	};
+
+#define PROTECT_FINALIZE(var) AutoFinalizeSqliteStmt3 auto_finalize_##var(var)
+
+	static BOOL _verify_sqlite(int result, const char* msg, int line_number, const char* file, sqlite3* db)
+	{
+		if(result != SQLITE_OK)
+		{
+#define SQLITE_ERR_ENTRY(val) case val:result_desc = #val;break;
+			const char* result_desc = NULL;
+			switch(result)
+			{
+			SQLITE_ERR_ENTRY(SQLITE_ERROR)
+			SQLITE_ERR_ENTRY(SQLITE_INTERNAL)
+			SQLITE_ERR_ENTRY(SQLITE_PERM)
+			SQLITE_ERR_ENTRY(SQLITE_ABORT)
+			SQLITE_ERR_ENTRY(SQLITE_BUSY)
+			SQLITE_ERR_ENTRY(SQLITE_LOCKED)
+			SQLITE_ERR_ENTRY(SQLITE_NOMEM)
+			SQLITE_ERR_ENTRY(SQLITE_READONLY)
+			SQLITE_ERR_ENTRY(SQLITE_INTERRUPT)
+			SQLITE_ERR_ENTRY(SQLITE_IOERR)
+			SQLITE_ERR_ENTRY(SQLITE_CORRUPT)
+			SQLITE_ERR_ENTRY(SQLITE_NOTFOUND)
+			SQLITE_ERR_ENTRY(SQLITE_FULL)
+			SQLITE_ERR_ENTRY(SQLITE_CANTOPEN)
+			SQLITE_ERR_ENTRY(SQLITE_PROTOCOL)
+			SQLITE_ERR_ENTRY(SQLITE_EMPTY)
+			SQLITE_ERR_ENTRY(SQLITE_SCHEMA)
+			SQLITE_ERR_ENTRY(SQLITE_TOOBIG)
+			SQLITE_ERR_ENTRY(SQLITE_CONSTRAINT)
+			SQLITE_ERR_ENTRY(SQLITE_MISMATCH)
+			SQLITE_ERR_ENTRY(SQLITE_MISUSE)
+			SQLITE_ERR_ENTRY(SQLITE_NOLFS)
+			SQLITE_ERR_ENTRY(SQLITE_AUTH)
+			SQLITE_ERR_ENTRY(SQLITE_FORMAT)
+			SQLITE_ERR_ENTRY(SQLITE_RANGE)
+			SQLITE_ERR_ENTRY(SQLITE_NOTADB)
+			SQLITE_ERR_ENTRY(SQLITE_ROW)
+			SQLITE_ERR_ENTRY(SQLITE_DONE)
+#undef SQLITE_ERR_ENTRY
+			}
+			char buf[1000]={0}; /* ARRAY OK 2011-10-26 joaoe */
+			if (result_desc)
+				op_snprintf(buf,999,"\b\b\b%d: %s should return SQLITE_OK, value was %s, and message: '%s'",
+					line_number, msg, result_desc, sqlite3_errmsg(db));
+			else
+				op_snprintf(buf,999,"\b\b\b%d: %s should return SQLITE_OK, value was unknown (%d) and mesage '%s'",
+					line_number, msg, result, sqlite3_errmsg(db));
+			ST_failed(buf);
+		}
+		return result == SQLITE_OK;
+	}
+#define verify_sqlite(expr) while(!_verify_sqlite(expr,#expr,__LINE__,__FILE__,db)){return 1;}
+}
+
+test("Concurrency")
+{
+	sqlite3 *db = NULL;
+	PROTECT_CLOSE(db);
+
+	sqlite3_stmt *stmt = NULL;
+	PROTECT_FINALIZE(stmt);
+
+	sqlite3_stmt *stmt_2 = NULL;
+	PROTECT_FINALIZE(stmt_2);
+
+	sqlite3_value* value = NULL;
+
+	verify_sqlite(sqlite3_open(":memory:", &db));
+
+	verify_sqlite(sqlite3_exec(db, "BEGIN;", 0, 0, 0));
+	verify(sqlite3_get_autocommit(db) == 0);
+
+	verify_sqlite(sqlite3_exec(db, "CREATE TABLE tux (id INTEGER);", 0, 0, 0));
+	verify_sqlite(sqlite3_exec(db, "INSERT INTO tux values(10);", 0, 0, 0));
+	verify_sqlite(sqlite3_exec(db, "INSERT INTO tux values(20);", 0, 0, 0));
+
+	//1st statement
+	verify_sqlite(sqlite3_prepare_v2(db, "SELECT id FROM tux ORDER BY 1;", -1, &stmt, 0));
+
+	verify(sqlite3_step(stmt) == SQLITE_ROW);
+	verify(sqlite3_data_count(stmt)==1);
+	value = sqlite3_column_value(stmt, 0);
+	verify(value);
+	verify(sqlite3_value_type(value) == SQLITE_INTEGER);
+	verify(sqlite3_value_int(value) == 10);
+
+	sqlite3_stmt* stmt_temp;
+	verify_sqlite(sqlite3_prepare_v2(db, "INSERT INTO tux values(30);", -1, &stmt_temp, 0));
+	verify(sqlite3_step(stmt_temp) == SQLITE_DONE);
+	sqlite3_finalize(stmt_temp);
+	stmt_temp = NULL;
+
+	verify_sqlite(sqlite3_prepare_v2(db, "SELECT id FROM tux ORDER BY 1;", -1, &stmt_2, 0));
+
+	verify(sqlite3_step(stmt_2) == SQLITE_ROW);
+	verify(sqlite3_data_count(stmt_2)==1);
+	value = sqlite3_column_value(stmt_2, 0);
+	verify(value);
+	verify(sqlite3_value_type(value) == SQLITE_INTEGER);
+	verify(sqlite3_value_int(value) == 10);
+
+	verify(sqlite3_step(stmt) == SQLITE_ROW);
+	value = sqlite3_column_value(stmt, 0);
+	verify(value);
+	verify(sqlite3_value_type(value) == SQLITE_INTEGER);
+	verify(sqlite3_value_int(value) == 20);
+
+	verify(sqlite3_step(stmt) == SQLITE_DONE);
+
+	verify(sqlite3_step(stmt_2) == SQLITE_ROW);
+	verify(sqlite3_data_count(stmt_2)==1);
+	value = sqlite3_column_value(stmt_2, 0);
+	verify(value);
+	verify(sqlite3_value_type(value) == SQLITE_INTEGER);
+	verify(sqlite3_value_int(value) == 20);
+
+	//verify_sqlite(sqlite3_close(db)); -> SQLITE_BUSY
+	//db = NULL;
+
+	verify(sqlite3_step(stmt_2) == SQLITE_ROW);
+	verify(sqlite3_data_count(stmt_2)==1);
+	value = sqlite3_column_value(stmt_2, 0);
+	verify(value);
+	verify(sqlite3_value_type(value) == SQLITE_INTEGER);
+	verify(sqlite3_value_int(value) == 30);
+
+	verify(sqlite3_step(stmt_2) == SQLITE_DONE);
+}
+
+test("Create in-memory database")
+{
+	sqlite3 *db = NULL;
+	PROTECT_CLOSE(db);
+	verify(!sqlite3_open(":memory:", &db));
+	verify(!sqlite3_exec(db, "create table conga (id INTEGER PRIMARY KEY, data TEXT);", 0, 0, 0));
+}
+
+test("Create disk database")
+{
+	OpFile dbfile;
+	sqlite3 *db = NULL;
+	PROTECT_CLOSE(db);
+
+	dbfile.Construct(UNI_L("test1.db"), OPFILE_TEMP_FOLDER);
+
+	verify(OpStatus::IsSuccess(dbfile.Open(OPFILE_WRITE)));	// make sure the directory exsist
+	verify(OpStatus::IsSuccess(dbfile.Close()));			// and close it before trying to delete it
+	verify(OpStatus::IsSuccess(dbfile.Delete()));			// delete the file if it exists, just in case
+
+	verify_sqlite(sqlite3_open16(dbfile.GetFullPath(), &db));
+	verify_sqlite(sqlite3_exec(db, "create table conga (id INTEGER PRIMARY KEY, data TEXT);", 0, 0, 0));
+}
+finally
+{
+	dbfile.Delete();
+}
+
+test("Simple disk db insert and select")
+{
+	OpFile dbfile;
+
+	sqlite3 *db = NULL;
+	PROTECT_CLOSE(db);
+
+	sqlite3_stmt *stmt = NULL;
+	PROTECT_FINALIZE(stmt);
+
+	dbfile.Construct(UNI_L("test2.db"), OPFILE_TEMP_FOLDER);
+	verify(OpStatus::IsSuccess(dbfile.Open(OPFILE_WRITE)));	// make sure the directory exsist
+	verify(OpStatus::IsSuccess(dbfile.Close()));			// and close it before trying to delete it
+	verify(OpStatus::IsSuccess(dbfile.Delete()));			// delete the file if it exists, just in case
+
+	verify_sqlite(sqlite3_open16(dbfile.GetFullPath(), &db));
+
+	verify_sqlite(sqlite3_exec(db, "create table conga (id INTEGER PRIMARY KEY, data TEXT);", 0, 0, 0));
+	verify_sqlite(sqlite3_exec(db, "insert into conga (data) values ('bongo');", 0, 0, 0));
+
+	verify_sqlite(sqlite3_prepare_v2(db, "select data from conga", -1, &stmt, 0));
+
+	for (int i=0 ; i < 2 ; i++)
+	{
+		verify(sqlite3_step(stmt) == SQLITE_ROW);
+		verify(op_strcmp(sqlite3_column_name(stmt, 0), "data") == 0);
+		verify(op_strcmp((const char*)sqlite3_column_text(stmt, 0), "bongo") == 0);
+		verify(sqlite3_step(stmt) == SQLITE_DONE);
+		verify_sqlite(sqlite3_reset(stmt));
+	}
+}
+finally
+{
+	dbfile.Delete();
+}
+
+test("Simple in-memory db insert and select")
+{
+	sqlite3 *db = NULL;
+	PROTECT_CLOSE(db);
+
+	sqlite3_stmt *stmt = NULL;
+	PROTECT_FINALIZE(stmt);
+
+	verify_sqlite(sqlite3_open(":memory:", &db));
+
+	verify_sqlite(sqlite3_exec(db, "create table conga (id INTEGER PRIMARY KEY, data TEXT);", 0, 0, 0));
+	verify_sqlite(sqlite3_exec(db, "insert into conga (data) values ('bongo');", 0, 0, 0));
+
+
+	verify_sqlite(sqlite3_prepare_v2(db, "select data from conga", -1, &stmt, 0));
+
+	for (int i=0 ; i < 2 ; i++)
+	{
+		verify(sqlite3_step(stmt) == SQLITE_ROW);
+		verify(op_strcmp(sqlite3_column_name(stmt, 0), "data") == 0);
+		verify(op_strcmp((const char*)sqlite3_column_text(stmt, 0), "bongo") == 0);
+		verify(sqlite3_step(stmt) == SQLITE_DONE);
+		verify_sqlite(sqlite3_reset(stmt));
+	}
+}
+
+test("null values")
+{
+	sqlite3 *db = NULL;
+	PROTECT_CLOSE(db);
+
+	sqlite3_stmt *stmt = NULL;
+	PROTECT_FINALIZE(stmt);
+
+	const char* insert = "insert into conga (data) values (?);";
+
+	verify_sqlite(sqlite3_open(":memory:", &db));
+	verify_sqlite(sqlite3_exec(db, "create table conga (id INTEGER PRIMARY KEY, data TEXT);", 0, 0, 0));
+
+
+
+	verify_sqlite(sqlite3_prepare_v2(db, insert, op_strlen(insert), &stmt, NULL));
+
+	verify_sqlite(sqlite3_bind_text16(stmt, 1, UNI_L("a\0b"), 6, NULL));
+
+	verify(SQLITE_DONE == sqlite3_step(stmt));
+
+	verify_sqlite(sqlite3_prepare_v2(db, "select data from conga", -1, &stmt, 0));
+
+	for (int i=0 ; i < 2 ; i++)
+	{
+		verify(sqlite3_step(stmt) == SQLITE_ROW);
+		verify(op_strcmp(sqlite3_column_name(stmt, 0), "data") == 0);
+		verify(op_memcmp(sqlite3_column_text16(stmt, 0), UNI_L("a\0b"), 6) == 0);
+		verify(sqlite3_column_bytes16(stmt,0) == 6);
+		verify(sqlite3_step(stmt) == SQLITE_DONE);
+		verify_sqlite(sqlite3_reset(stmt));
+	}
+}
+
+test("Simple pragma memory")
+{
+	sqlite3 *db = NULL;
+	PROTECT_CLOSE(db);
+
+	sqlite3_stmt *stmt = NULL;
+	PROTECT_FINALIZE(stmt);
+
+	sqlite3_value* value = NULL;
+
+	const uni_char* pragma_1 = UNI_L("PRAGMA page_count;");
+	const uni_char* pragma_2 = UNI_L("PRAGMA page_size;");
+
+	verify_sqlite(sqlite3_open16(UNI_L(":memory:"), &db));
+
+	verify_sqlite(sqlite3_prepare16_v2(db, pragma_1, UNICODE_SIZE(uni_strlen(pragma_1)), &stmt, NULL));
+	verify(SQLITE_ROW == sqlite3_step(stmt));
+	verify(sqlite3_data_count(stmt)>=1);
+
+	value = sqlite3_column_value(stmt, 0);
+	verify(value);
+	verify(sqlite3_value_type(value)==SQLITE_INTEGER);
+	sqlite3_finalize(stmt);
+	stmt = NULL;
+
+	verify_sqlite(sqlite3_prepare16_v2(db, pragma_2, UNICODE_SIZE(uni_strlen(pragma_2)), &stmt, NULL));
+	verify(SQLITE_ROW == sqlite3_step(stmt));
+	verify(sqlite3_data_count(stmt)>=1);
+
+	value = sqlite3_column_value(stmt, 0);
+	verify(value);
+	verify(sqlite3_value_type(value)==SQLITE_INTEGER);
+	verify(sqlite3_value_int(value)!=0);
+}
+
+test("Simple pragma file")
+{
+	OpFile dbfile;
+
+	sqlite3 *db = NULL;
+	PROTECT_CLOSE(db);
+
+	sqlite3_stmt *stmt = NULL;
+	PROTECT_FINALIZE(stmt);
+
+	sqlite3_value* value = NULL;
+
+	verify(OpStatus::IsSuccess(dbfile.Construct(UNI_L("test2.db"), OPFILE_TEMP_FOLDER)));
+	verify(OpStatus::IsSuccess(dbfile.Open(OPFILE_WRITE)));	// make sure the directory exsist
+	verify(OpStatus::IsSuccess(dbfile.Close()));			// and close it before trying to delete it
+	verify(OpStatus::IsSuccess(dbfile.Delete()));			// delete the file if it exists, just in case
+
+	const uni_char* pragma_1 = UNI_L("PRAGMA page_count;");
+	const uni_char* pragma_2 = UNI_L("PRAGMA page_size;");
+
+	verify_sqlite(sqlite3_open16(dbfile.GetFullPath(), &db));
+
+	verify_sqlite(sqlite3_prepare16_v2(db, pragma_1, UNICODE_SIZE(uni_strlen(pragma_1)), &stmt, NULL));
+	verify(SQLITE_ROW == sqlite3_step(stmt));
+	verify(sqlite3_data_count(stmt)>=1);
+
+	value = sqlite3_column_value(stmt, 0);
+	verify(value);
+	verify(sqlite3_value_type(value)==SQLITE_INTEGER);
+	sqlite3_finalize(stmt);
+	stmt = NULL;
+
+	verify_sqlite(sqlite3_prepare16_v2(db, pragma_2, UNICODE_SIZE(uni_strlen(pragma_2)), &stmt, NULL));
+	verify(SQLITE_ROW == sqlite3_step(stmt));
+	verify(sqlite3_data_count(stmt)>=1);
+
+	value = sqlite3_column_value(stmt, 0);
+	verify(value);
+	verify(sqlite3_value_type(value)==SQLITE_INTEGER);
+	verify(sqlite3_value_int(value)!=0);
+}
+finally
+{
+	dbfile.Delete();
+}
+
+test("any byte in utf16 string")
+{
+	//test checks that any byte from 0 to 0xffff included, are not magically
+	//converted when saving in a TEXT column
+	sqlite3 *db = NULL;
+	PROTECT_CLOSE(db);
+
+	sqlite3_stmt *stmt = NULL;
+	PROTECT_FINALIZE(stmt);
+
+	sqlite3_value* value = NULL;
+
+	const char* create = "create table aaa(c TEXT);";
+	const uni_char* insert = UNI_L("insert into aaa values(?);");
+	const uni_char* select = UNI_L("select c from aaa;");
+
+	const static unsigned big_value_sz = 0x10000;
+	uni_char big_value[big_value_sz]; /* ARRAY OK joaoe 2010-01-03 */
+	for (unsigned k = 0; k < big_value_sz; k++)
+		big_value[k] = k;
+
+	OpFile dbfile;
+	verify(OpStatus::IsSuccess(dbfile.Construct(UNI_L("test2.db"), OPFILE_TEMP_FOLDER)));
+	verify(OpStatus::IsSuccess(dbfile.Open(OPFILE_WRITE)));	// make sure the directory exsist
+	verify(OpStatus::IsSuccess(dbfile.Close()));			// and close it before trying to delete it
+	verify(OpStatus::IsSuccess(dbfile.Delete()));			// delete the file if it exists, just in case
+
+	verify_sqlite(sqlite3_open16(dbfile.GetFullPath(), &db));
+
+	//create
+	verify_sqlite(sqlite3_exec(db, create, 0, 0, 0));
+
+	//insert
+	verify_sqlite(sqlite3_prepare16_v2(db, insert, UNICODE_SIZE(uni_strlen(insert)), &stmt, NULL));
+	verify_sqlite(sqlite3_bind_text16(stmt, 1, big_value, UNICODE_SIZE(big_value_sz), SQLITE_STATIC));
+	verify(SQLITE_DONE == sqlite3_step(stmt));
+	sqlite3_finalize(stmt);
+	stmt = NULL;
+
+	//select
+	verify_sqlite(sqlite3_prepare16_v2(db, select, UNICODE_SIZE(uni_strlen(select)), &stmt, NULL));
+		verify(SQLITE_ROW == sqlite3_step(stmt));
+		verify(sqlite3_data_count(stmt) >= 1);
+		value = sqlite3_column_value(stmt, 0);
+		verify(NULL != value);
+		verify(SQLITE_TEXT == sqlite3_value_type(value));
+		verify(UNICODE_SIZE(big_value_sz) == sqlite3_value_bytes16(value));
+		const void* p = sqlite3_value_text16(value);
+		verify(p != NULL);
+		verify(op_memcmp(p, big_value, UNICODE_SIZE(big_value_sz)) == 0);
+	sqlite3_finalize(stmt);
+	stmt = NULL;
+}
+finally
+{
+	dbfile.Delete();
+}
+
+test("sqlite readonly mem db")
+{
+	sqlite3 *db = NULL;
+	PROTECT_CLOSE(db);
+
+	sqlite3_stmt *stmt = NULL;
+	PROTECT_FINALIZE(stmt);
+
+	sqlite3_value* value = NULL;
+
+	const char* sql_1 = "select 1;";
+	const char* create_2 = "create table t(a integer);";
+
+	verify_sqlite(sqlite3_open_v2(":memory:", &db, SQLITE_OPEN_READONLY, NULL));
+
+	verify_sqlite(sqlite3_prepare_v2(db, sql_1, op_strlen(sql_1), &stmt, NULL));
+	verify(SQLITE_ROW == sqlite3_step(stmt));
+	verify(sqlite3_data_count(stmt)>=1);
+
+	value = sqlite3_column_value(stmt, 0);
+	verify(value);
+	verify(sqlite3_value_type(value)==SQLITE_INTEGER);
+	sqlite3_finalize(stmt);
+	stmt = NULL;
+
+	verify_sqlite(sqlite3_prepare_v2(db, create_2, op_strlen(create_2), &stmt, NULL));
+	verify(SQLITE_READONLY == sqlite3_step(stmt));
+}
+
+test("sqlite double row insert")
+{
+	sqlite3 *db = NULL;
+	PROTECT_CLOSE(db);
+
+	sqlite3_stmt *stmt = NULL;
+	PROTECT_FINALIZE(stmt);
+
+	const char* create_1 = "create table t(a integer);";
+	const char* insert_2 = "insert into t select 1 a union all select 2 b;";
+
+	verify_sqlite(sqlite3_open(":memory:", &db));
+
+	verify_sqlite(sqlite3_prepare_v2(db, create_1, op_strlen(create_1), &stmt, NULL));
+	verify(SQLITE_DONE == sqlite3_step(stmt));
+
+	verify_sqlite(sqlite3_prepare_v2(db, insert_2, op_strlen(insert_2), &stmt, NULL));
+	verify(SQLITE_DONE == sqlite3_step(stmt));
+	verify(2 == sqlite3_changes(db));
+}
+
+test("sqlite cancellation")
+{
+	sqlite3 *db = NULL;
+	PROTECT_CLOSE(db);
+
+	sqlite3_stmt *stmt = NULL;
+	PROTECT_FINALIZE(stmt);
+
+	int db_status;
+
+	struct X {
+		static int progress_hnd(void *d)
+		{
+			return 1;
+		}
+	};
+
+	//this test validates if the patch to allow sqlite to suspend is supported.
+
+	const uni_char* statement = UNI_L("create table t (id INTEGER PRIMARY KEY, data TEXT);");
+
+	verify_sqlite(sqlite3_open16(UNI_L(":memory:"), &db));
+
+	sqlite3_progress_handler(db, 0, NULL, NULL);
+
+	db_status = sqlite3_prepare16_v2(db, statement, UNICODE_SIZE(uni_strlen(statement)), &stmt, NULL);
+	verify_sqlite(db_status);
+
+	sqlite3_progress_handler(db, 1, X::progress_hnd, 0);
+
+	unsigned tries = 10000;
+	do{
+		db_status = sqlite3_step(stmt);
+	}while(db_status == SQLITE_INTERRUPT && tries--);
+
+	verify(SQLITE_DONE == db_status);
+}
+

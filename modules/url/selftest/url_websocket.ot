@@ -1,0 +1,249 @@
+group "url.websocket";
+
+language ecmascript;
+
+include "modules/prefs/prefsmanager/collections/pc_doc.h";
+
+require PREFS_WRITE;
+require WEBSOCKETS_SUPPORT;
+
+// NOTE: The complete testsuite is located at http://t/core/standards/websockets/js/runner.php
+
+html {
+  //! <html><head><title>WebSocket test</title></head>
+  //! <body>
+  //! The complete testsuite can be found <a href="http://t/core/standards/websockets/js/runner.php">here</a>
+  //! </body>
+  //! </html>
+}
+
+test("Set up global constants")
+{
+	baseServer = "ws://t:8007"
+	echoServer = baseServer + "/echo";
+}
+
+table invalidURIs(char*)
+{
+  { "ws:://example.com" },
+  { "ftp://example.com" },
+  { "http://example.com" },
+  { "wsup://example.com" }
+  { "ws://example.com#" }
+  { "ws://example.com#foo" }
+  { "://example.com" }
+  { "ws:example.com" }
+}
+
+table validURIs(char*)
+{
+  { "ws://example.com" },
+  { "wss://example.com" },
+  { "ws://example.com:80" },
+  { "wss://example.com:443" },
+  { "ws://example.com:8888" },
+  { "wss://example.com:8888" }
+}
+
+table restrictedURIs(char*)
+{
+  { "ws://example.com:21" },
+  { "ws://example.com:23" },
+  { "ws://example.com:25" },
+  { "ws://example.com:110" },
+  { "ws://example.com:995" }
+}
+
+global {
+	int pref_enable_websockets;
+}
+
+setup 
+{
+	pref_enable_websockets = g_pcdoc->GetIntegerPref(PrefsCollectionDoc::EnableWebSockets);	
+	g_pcdoc->WriteIntegerL(PrefsCollectionDoc::EnableWebSockets, 1);		
+}
+
+exit
+{
+	g_pcdoc->WriteIntegerL(PrefsCollectionDoc::EnableWebSockets, pref_enable_websockets);
+}
+
+test("Check for WebSocket interface")
+{
+	verify("WebSocket" in window);
+}
+
+
+test("Check valid URIs") require success "Check for WebSocket interface";
+{
+	foreach (uri) from validURIs
+	{
+		var res = 0;
+		try
+		{
+			ws = new WebSocket(uri);
+		}
+		catch(e)
+		{
+			res = e.code;
+		}
+		verify(res == 0);
+	}
+}
+
+test("Check invalid URIs") require success "Check for WebSocket interface";
+{
+	foreach (uri) from invalidURIs
+	{
+		var res = 0;
+		try
+		{
+			ws = new WebSocket(uri);
+		}
+		catch(e)
+		{
+			res = e.code;
+		}
+		verify(res == 12);
+	}
+}
+
+test("Check restricted ports") require success "Check for WebSocket interface";
+{
+	foreach (uri) from restrictedURIs
+	{
+		var res = 0;
+		try
+		{
+			ws = new WebSocket(uri);
+		}
+		catch(e)
+		{
+			res = e.code;
+		}
+		verify(res == 18);
+	}
+}
+
+test("One event per message") require success "Check for WebSocket interface"; async;
+{
+	ws = new WebSocket(echoServer);
+	ws.numEvents = 0;
+
+	ws.onerror = function()
+	{
+		clearTimeout(ws.timerId);
+		ST_failed("Error occurred when talking to server " + echoServer, "", 0);
+	}
+
+	ws.onmessage = function(e)
+	{
+		ws.numEvents++;
+		if (ws.numEvents == 3)
+		{
+			clearTimeout(ws.timerId);
+			ST_passed();
+		}
+	}
+
+	ws.onopen = function()
+	{
+		ws.send("01234");
+		ws.send("56789");
+		ws.send("ABCDE");
+	}
+
+	timeout = function()
+	{
+		if (ws.readyState == ws.CONNECTING)
+			ST_failed("Failed to connect to server " + echoServer, "", 0);
+		else if (ws.readyState == ws.OPEN)
+			ST_failed("Only " + ws.numEvents + " of 3 events triggered.", "", 0);
+		else
+			ST_failed("Connection closed by server " + echoServer, "", 0);
+	}
+
+	ws.timerId = setTimeout(timeout, 5000);
+}
+
+test("Send and receive buffers of different sizes") require success "Check for WebSocket interface"; async;
+{
+	ws = new WebSocket(echoServer);
+	recvCount = 0;
+	smallBuf = "";
+	mediumBuf = "";
+	largeBuf = "";
+	edgeCase1 = "1";
+	edgeCase2 = "";
+	edgeCase3 = "";
+	for (i = 0; i < 16; ++i)
+		smallBuf += i % 10;
+	for (i = 0; i < 8192; ++i)
+		mediumBuf += i % 10;
+	for (i = 0; i < 65536; ++i)
+		largeBuf += i % 10;
+	for (i = 0; i < 32765; ++i)
+		edgeCase2 += i % 10;
+	for (i = 0; i < 65534; ++i)
+		edgeCase3 += i % 10;
+
+	ws.onerror = function()
+	{
+		clearTimeout(timerId);
+		ST_failed("Error occurred when talking to server " + echoServer, "", 0);
+	}
+
+	ws.onmessage = function(e)
+	{
+		clearTimeout(timerId);
+		if (recvCount == 0) {
+			verify(e.data == smallBuf);
+		}
+		else if (recvCount == 1) {
+			verify(e.data == mediumBuf);
+		}
+		else if (recvCount == 2) {
+			verify(e.data == largeBuf);
+		}
+		else if (recvCount == 3) {
+			verify(e.data == edgeCase1);
+		}
+		else if (recvCount == 4) {
+			verify(e.data == edgeCase2);
+		}
+		else if (recvCount == 5) {
+			verify(e.data == edgeCase3);
+		}
+		if (++recvCount == 6)
+			ws.close();
+	}
+
+	ws.onopen = function()
+	{
+		ws.send(smallBuf);
+		ws.send(mediumBuf);
+		ws.send(largeBuf);
+		ws.send(edgeCase1);
+		ws.send(edgeCase2);
+		ws.send(edgeCase3);
+	}
+
+	ws.onclose = function()
+	{
+		verify(recvCount == 6);
+		ST_passed();
+	}
+
+	timeout = function()
+	{
+		if (ws.readyState == ws.CONNECTING)
+			ST_failed("Failed to connect to server " + echoServer, "", 0);
+		else if (ws.readyState == ws.OPEN)
+			ST_failed("No timely response from server " + echoServer, "", 0);
+		else
+			ST_failed("Connection closed by server " + echoServer, "", 0);
+	}
+
+	timerId = setTimeout(timeout, 5000);
+}

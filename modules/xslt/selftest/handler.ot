@@ -1,0 +1,624 @@
+/* -*- Mode: c++; indent-tabs-mode: nil; c-file-style: "gnu" -*- */
+
+group "XSLT.Handler";
+require XSLT_SUPPORT;
+
+include "modules/xslt/xslt.h";
+include "modules/xslt/src/xslt_tree.h";
+include "modules/xslt/src/xslt_handler.h";
+
+include "modules/encodings/detector/charsetdetector.h";
+include "modules/url/url2.h";
+include "modules/util/tempbuf.h";
+include "modules/encodings/utility/opstring-encodings.h";
+include "modules/xmlutils/xmlparser.h";
+include "modules/xmlutils/xmlserializer.h";
+include "modules/xmlutils/xmltokenhandler.h";
+include "modules/xmlutils/xmlutils.h";
+
+global
+{
+  class TestHandler
+    : public XSLT_Handler
+  {
+  private:
+    class StringDataCollector
+      : public XSLT_Stylesheet::Transformation::StringDataCollector
+    {
+    private:
+      TempBuffer &buffer;
+
+    public:
+      StringDataCollector (TempBuffer &buffer)
+        : buffer (buffer)
+      {
+      }
+
+      OP_STATUS Start ()
+      {
+        return buffer.Append ("!");
+      }
+
+      virtual OP_STATUS CollectStringData (const uni_char *string, unsigned string_length)
+      {
+        buffer.SetCachedLengthPolicy(TempBuffer::UNTRUSTED); // We move the '\0' around manually
+        buffer.GetStorage ()[buffer.Length () - 1] = '\0';
+        RETURN_IF_ERROR (buffer.Append (string, string_length));
+        return buffer.Append ("!");
+      }
+
+      virtual OP_STATUS StringDataFinished ()
+      {
+        if (buffer.Length () != 0)
+          buffer.GetStorage ()[buffer.Length () - 1] = 0;
+        return OpStatus::OK;
+      }
+    } string_data_collector;
+
+    class TreeCollector
+      : public XSLT_Handler::TreeCollector
+    {
+    private:
+      XSLT_Tree *tree;
+
+    public:
+      virtual ~TreeCollector ()
+      {
+        OP_DELETE (tree);
+      }
+
+      OP_STATUS Construct ()
+      {
+        return XSLT_Tree::Make (tree);
+      }
+
+      virtual XMLTokenHandler *GetTokenHandler ()
+      {
+        return tree;
+      }
+
+      virtual void StripWhitespace (XSLT_Stylesheet *stylesheet)
+      {
+        /* Not implemented.  Don't rely on this working in the actual tests.
+           There are other tests that test it works. */
+      }
+
+      virtual OP_STATUS GetTreeAccessor (XMLTreeAccessor *&tree_accessor)
+      {
+        tree_accessor = tree;
+        return OpStatus::OK;
+      }
+    };
+
+  public:
+    class Resource
+    {
+    public:
+      Resource (Resource **current_resource)
+        : data_offset (0),
+          parser (0),
+          next_resource (*current_resource),
+          current_resource (current_resource)
+      {
+        *current_resource = this;
+      }
+
+      ~Resource ()
+      {
+        OP_DELETE (parser);
+        if (current_resource)
+          *current_resource = next_resource;
+      }
+
+      static void Cancel (Resource *resource, XMLTokenHandler *token_handler)
+      {
+        Resource *previous_resource = 0;
+        while (resource && resource->token_handler != token_handler)
+          {
+            previous_resource = resource;
+            resource = resource->next_resource;
+          }
+        if (resource)
+          {
+            if (previous_resource)
+              {
+                previous_resource->next_resource = resource->next_resource;
+                resource->current_resource = 0;
+              }
+            OP_DELETE (resource);
+          }
+      }
+
+      OP_STATUS Start (const char *string)
+      {
+        return data.Set (string);
+      }
+
+      OP_STATUS Continue ()
+      {
+        unsigned consumed;
+        RETURN_IF_ERROR (parser->Parse (data.CStr () + data_offset, data.Length () - data_offset, FALSE, &consumed));
+        data_offset += consumed;
+        return OpStatus::OK;
+      }
+
+      BOOL HasName (const char *string)
+      {
+        return name.Compare (string) == 0;
+      }
+
+      BOOL IsStarted ()
+      {
+        return !data.IsEmpty ();
+      }
+
+      BOOL IsFinished ()
+      {
+        return parser->IsFinished ();
+      }
+
+      BOOL IsFailed ()
+      {
+        return parser->IsFailed () || parser->IsOutOfMemory ();
+      }
+
+      OpString name, data;
+      unsigned data_offset;
+      XMLParser *parser;
+      XMLTokenHandler *token_handler;
+
+    private:
+      Resource *next_resource, **current_resource;
+    };
+
+    XSLT_Tree *result_as_tree;
+    TempBuffer result_as_string_data;
+    const char *output_method, *message_type;
+    BOOL finished, aborted;
+    OpString message;
+    Resource *current_resource;
+
+    TestHandler ()
+      : string_data_collector (result_as_string_data),
+        result_as_tree (0),
+        output_method ("no output"),
+        message_type ("no message"),
+        finished (FALSE),
+        aborted (FALSE),
+        current_resource (0)
+    {
+    }
+
+    ~TestHandler ()
+    {
+      OP_DELETE (result_as_tree);
+    }
+
+    OP_STATUS PushResource (XMLTokenHandler *token_handler)
+    {
+      Resource *resource = OP_NEW (Resource, (&current_resource));
+      if (!resource ||
+          OpStatus::IsMemoryError (resource->name.Set ("<base>")) ||
+          OpStatus::IsMemoryError (XMLParser::Make (resource->parser, 0, static_cast<MessageHandler *> (0), token_handler, GetDocumentURL ())))
+        {
+          OP_DELETE (resource);
+          return OpStatus::ERR_NO_MEMORY;
+        }
+      return OpStatus::OK;
+    }
+
+    void CleanUp ()
+    {
+      while (current_resource)
+        OP_DELETE (current_resource);
+    }
+
+    virtual URL GetDocumentURL ()
+    {
+      return g_url_api->GetURL ("http://www.example.com/source.xml");
+    }
+
+    virtual OP_STATUS LoadResource (XSLT_Handler::ResourceType resource_type, URL resource_url, XMLTokenHandler *token_handler)
+    {
+      OpString url, normalized_url;
+
+      RETURN_IF_ERROR (resource_url.GetAttribute (URL::KUniName, url));
+
+      if (url.Find ("http://www.example.com/") != 0)
+        return OpStatus::ERR;
+
+      url.Delete (0, op_strlen ("http://www.example.com/"));
+
+      const char *prefix;
+
+      switch (resource_type)
+        {
+        case XSLT_Handler::RESOURCE_LINKED_STYLESHEET:
+          prefix = "linked/";
+          break;
+
+        case XSLT_Handler::RESOURCE_IMPORTED_STYLESHEET:
+          prefix = "imported/";
+          break;
+
+        case XSLT_Handler::RESOURCE_INCLUDED_STYLESHEET:
+          prefix = "included/";
+          break;
+
+        default:
+          prefix = "loaded/";
+        }
+
+      if (url.Find (prefix) != 0)
+        return OpStatus::ERR;
+
+      url.Delete (0, op_strlen (prefix));
+
+      Resource *resource = OP_NEW (Resource, (&current_resource));
+
+      if (!resource)
+        return OpStatus::ERR_NO_MEMORY;
+
+      if (OpStatus::IsMemoryError (resource->name.Set (url.CStr ())) ||
+          OpStatus::IsMemoryError (normalized_url.AppendFormat (UNI_L ("http://www.example.com/%s"), url.CStr ())) ||
+          OpStatus::IsMemoryError (XMLParser::Make (resource->parser, 0, static_cast<MessageHandler *> (0), token_handler, g_url_api->GetURL (normalized_url))))
+        {
+          OP_DELETE (resource);
+          return OpStatus::ERR_NO_MEMORY;
+        }
+
+      return OpStatus::OK;
+    }
+
+    virtual void CancelLoadResource (XMLTokenHandler *token_handler)
+    {
+      /* For coverage: */
+      XSLT_Handler::CancelLoadResource (token_handler);
+
+      Resource::Cancel (current_resource, token_handler);
+    }
+
+    virtual OP_STATUS StartCollectingSourceTree (XSLT_Handler::TreeCollector *&collector)
+    {
+      TreeCollector *tree_collector = OP_NEW (TreeCollector, ());
+
+      if (!tree_collector)
+        return OpStatus::ERR_NO_MEMORY;
+
+      RETURN_IF_ERROR (tree_collector->Construct ());
+
+      collector = tree_collector;
+      return OpStatus::OK;
+    }
+
+    virtual OP_STATUS OnXMLOutput (XMLTokenHandler *&token_handler, BOOL &destroy_when_finished)
+    {
+      /* For coverage: */
+      XSLT_Handler::OnXMLOutput (token_handler, destroy_when_finished);
+
+      RETURN_IF_ERROR (XSLT_Tree::Make (result_as_tree));
+
+      output_method = "xml";
+      token_handler = result_as_tree;
+      destroy_when_finished = FALSE;
+      return OpStatus::OK;
+    }
+
+    virtual OP_STATUS OnHTMLOutput (XSLT_Stylesheet::Transformation::StringDataCollector *&collector, BOOL &destroy_when_finished)
+    {
+      /* For coverage: */
+      XSLT_Handler::OnHTMLOutput (collector, destroy_when_finished);
+
+      RETURN_IF_ERROR (string_data_collector.Start ());
+
+      output_method = "html";
+      collector = &string_data_collector;
+      destroy_when_finished = FALSE;
+      return OpStatus::OK;
+    }
+
+    virtual OP_STATUS OnTextOutput (XSLT_Stylesheet::Transformation::StringDataCollector *&collector, BOOL &destroy_when_finished)
+    {
+      /* For coverage: */
+      XSLT_Handler::OnTextOutput (collector, destroy_when_finished);
+
+      RETURN_IF_ERROR (string_data_collector.Start ());
+
+      output_method = "text";
+      collector = &string_data_collector;
+      destroy_when_finished = FALSE;
+      return OpStatus::OK;
+    }
+
+    virtual void OnFinished ()
+    {
+      finished = TRUE;
+    }
+
+    virtual void OnAborted ()
+    {
+      aborted = TRUE;
+    }
+
+#ifdef XSLT_ERRORS
+    virtual OP_BOOLEAN HandleMessage (XSLT_Handler::MessageType type, const uni_char *message0)
+    {
+      /* For coverage: */
+      XSLT_Handler::HandleMessage (type, message0);
+
+      if (type == XSLT_Handler::MESSAGE_TYPE_ERROR)
+        message_type = "error";
+      else if (type == XSLT_Handler::MESSAGE_TYPE_WARNING)
+        message_type = "warning";
+      else
+        message_type = "message";
+
+      RETURN_IF_ERROR (message.Set (message0));
+
+      return OpBoolean::IS_TRUE;
+    }
+#endif // XSLT_ERRORS
+  };
+
+  OP_STATUS ConvertString (OpString &converted, const char *string)
+  {
+    const char *OP_MEMORY_VAR encoding = 0;
+    if (string[0] == '<' && string[1] == '?' && string[2] == 'x' && string[3] == 'm' && string[4] == 'l' && string[5] == ' ')
+      encoding = CharsetDetector::GetXMLEncoding (string, op_strlen (string));
+    else
+      encoding = "utf-8";
+    OP_STATUS status = SetFromEncoding (&converted, encoding, string, op_strlen (string));
+    int index;
+    while ((index = converted.Find ("\r\n")) != KNotFound)
+      converted.Delete (index, 1);
+    while ((index = converted.Find ("\r")) != KNotFound)
+      converted.CStr ()[index] = '\n';
+    return status;
+  }
+
+  OP_STATUS ParseTree (XSLT_Tree *&tree, const char *string)
+  {
+    OpString converted;
+    XMLParser *parser;
+
+    RETURN_IF_ERROR (ConvertString (converted, string));
+    RETURN_IF_ERROR (XSLT_Tree::Make (tree));
+    RETURN_IF_ERROR (XMLParser::Make (parser, 0, static_cast<MessageHandler *> (0), tree, URL ()));
+
+    OpAutoPtr<XMLParser> parser_anchor (parser);
+
+    RETURN_IF_ERROR (parser->Parse (converted.CStr (), converted.Length (), FALSE));
+
+    return parser->IsFinished () ? OpStatus::OK : OpStatus::ERR;
+  }
+
+  class TestPostMessageCallback
+    : public XSLT_HandlerTokenHandler::PostMessageCallback
+  {
+  public:
+    TestPostMessageCallback ()
+      : message_posted (FALSE),
+        start_transformation (FALSE)
+    {
+    }
+
+    BOOL message_posted, start_transformation;
+
+    virtual BOOL PostMessage (BOOL start_transformation0)
+    {
+      message_posted = TRUE;
+      start_transformation = start_transformation0;
+      return TRUE;
+    }
+  };
+}
+
+table testcases(const char *, const char *, const char *, const char *)
+{
+  /* Basic tests, mostly testing the framework itself, really. */
+  { "unstyled",    "xml",  #string "handler/unstyled.xml",       #string "handler/unstyled.xml"       }
+  { "simple xml",  "xml",  #string "handler/simple-xml.in.xml",  #string "handler/pass-xml.out.xml"   }
+  { "simple html", "html", #string "handler/simple-html.in.xml", #string "handler/pass-html.out.html" }
+  { "simple text", "text", #string "handler/simple-text.in.xml", #string "handler/pass-text.out.txt"  }
+  { "cdata html",  "html", #string "handler/cdata-html.in.xml", #string "handler/pass-cdata-html.out.html" }
+  { "import",      "xml",  #string "handler/import.in.xml",      #string "handler/pass-xml.out.xml"   }
+  { "include",     "xml",  #string "handler/include.in.xml",     #string "handler/pass-xml.out.xml"   }
+  { "document()",  "xml",  #string "handler/document.in.xml",    #string "handler/pass-xml.out.xml"   }
+  { "simplified",  "xml",  #string "handler/simplified.in.xml",  #string "handler/pass-xml.out.xml"   }
+
+  /* Tests testing conflict resolution/import precedence between template rules. */
+  { "import precedence #1",  "xml", #string "handler/importprecedence1.in.xml",  #string "handler/pass-xml.out.xml" }
+  { "import precedence #2",  "xml", #string "handler/importprecedence2.in.xml",  #string "handler/pass-xml.out.xml" }
+  { "import precedence #3",  "xml", #string "handler/importprecedence3.in.xml",  #string "handler/pass-xml.out.xml" }
+  { "import precedence #4",  "xml", #string "handler/importprecedence4.in.xml",  #string "handler/pass-xml.out.xml" }
+  { "import precedence #5",  "xml", #string "handler/importprecedence5.in.xml",  #string "handler/pass-xml.out.xml" }
+  { "import precedence #6",  "xml", #string "handler/importprecedence6.in.xml",  #string "handler/pass-xml.out.xml" }
+  { "import precedence #7",  "xml", #string "handler/importprecedence7.in.xml",  #string "handler/pass-xml.out.xml" }
+  { "import precedence #8",  "xml", #string "handler/importprecedence8.in.xml",  #string "handler/pass-xml.out.xml" }
+  { "import precedence #9",  "xml", #string "handler/importprecedence9.in.xml",  #string "handler/pass-xml.out.xml" }
+  { "import precedence #10", "xml", #string "handler/importprecedence10.in.xml", #string "handler/pass-xml.out.xml" }
+  { "import precedence #11", "xml", #string "handler/importprecedence11.in.xml", #string "handler/pass-xml.out.xml" }
+  { "import precedence #12", "xml", #string "handler/importprecedence12.in.xml", #string "handler/pass-xml.out.xml" }
+  { "import precedence #13", "xml", #string "handler/importprecedence13.in.xml", #string "handler/pass-xml.out.xml" }
+  { "import precedence #14", "xml", #string "handler/importprecedence14.in.xml", #string "handler/pass-xml.out.xml" }
+
+  /* Tests testing various aspects of document(). */
+  { "document() #1", "text", #string "handler/document1.in.xml", #string "handler/document1.out.txt" }
+  { "document() #2", "text", #string "handler/document2.in.xml", #string "handler/document2.out.txt" }
+  { "document() #3", "text", #string "handler/document3.in.xml", #string "handler/document3.out.txt" }
+  { "document() #4", "text", #string "handler/document4.in.xml", #string "handler/document4.out.txt" }
+  { "document() #5", "text", #string "handler/document5.in.xml", #string "handler/document5.out.txt" }
+  { "document() #6", "text", #string "handler/document6.in.xml", #string "handler/document6.out.txt" }
+
+  /* Tests testing number formatting. */
+  { "number format #1", "text", #string "handler/numberformat1.in.xml", #string "handler/numberformat1.out.txt" }
+}
+
+table resources(const char *, const char *)
+{
+  { "pass.xml",       #string "handler/pass.xml"       }
+  { "pass-xml.xsl",   #string "handler/pass-xml.xsl"   }
+  { "pass-html.xsl",  #string "handler/pass-html.xsl"  }
+  { "pass-text.xsl",  #string "handler/pass-text.xsl"  }
+  { "cdata-html.xsl", #string "handler/cdata-html.xsl" }
+  { "import.xsl",     #string "handler/import.xsl"     }
+  { "include.xsl",    #string "handler/include.xsl"    }
+  { "document.xsl",   #string "handler/document.xsl"   }
+  { "simplified.xsl", #string "handler/simplified.xsl" }
+
+  { "importprecedence1.xsl",   #string "handler/importprecedence1.xsl"   }
+  { "importprecedence2.xsl",   #string "handler/importprecedence2.xsl"   }
+  { "importprecedence2a.xsl",  #string "handler/importprecedence2a.xsl"  }
+  { "importprecedence3.xsl",   #string "handler/importprecedence3.xsl"   }
+  { "importprecedence3a.xsl",  #string "handler/importprecedence3a.xsl"  }
+  { "importprecedence3b.xsl",  #string "handler/importprecedence3b.xsl"  }
+  { "importprecedence4.xsl",   #string "handler/importprecedence4.xsl"   }
+  { "importprecedence4a.xsl",  #string "handler/importprecedence4a.xsl"  }
+  { "importprecedence4b.xsl",  #string "handler/importprecedence4b.xsl"  }
+  { "importprecedence5.xsl",   #string "handler/importprecedence5.xsl"   }
+  { "importprecedence5a.xsl",  #string "handler/importprecedence5a.xsl"  }
+  { "importprecedence5b.xsl",  #string "handler/importprecedence5b.xsl"  }
+  { "importprecedence5c.xsl",  #string "handler/importprecedence5c.xsl"  }
+  { "importprecedence5d.xsl",  #string "handler/importprecedence5d.xsl"  }
+  { "importprecedence6.xsl",   #string "handler/importprecedence6.xsl"   }
+  { "importprecedence7.xsl",   #string "handler/importprecedence7.xsl"   }
+  { "importprecedence7a.xsl",  #string "handler/importprecedence7a.xsl"  }
+  { "importprecedence8.xsl",   #string "handler/importprecedence8.xsl"   }
+  { "importprecedence8a.xsl",  #string "handler/importprecedence8a.xsl"  }
+  { "importprecedence8b.xsl",  #string "handler/importprecedence8b.xsl"  }
+  { "importprecedence9.xsl",   #string "handler/importprecedence9.xsl"   }
+  { "importprecedence9a.xsl",  #string "handler/importprecedence9a.xsl"  }
+  { "importprecedence9b.xsl",  #string "handler/importprecedence9b.xsl"  }
+  { "importprecedence10.xsl",  #string "handler/importprecedence10.xsl"  }
+  { "importprecedence10a.xsl", #string "handler/importprecedence10a.xsl" }
+  { "importprecedence10b.xsl", #string "handler/importprecedence10b.xsl" }
+  { "importprecedence10c.xsl", #string "handler/importprecedence10c.xsl" }
+  { "importprecedence10d.xsl", #string "handler/importprecedence10d.xsl" }
+  { "importprecedence11.xsl",  #string "handler/importprecedence11.xsl"  }
+  { "importprecedence11a.xsl", #string "handler/importprecedence11a.xsl" }
+  { "importprecedence11b.xsl", #string "handler/importprecedence11b.xsl" }
+  { "importprecedence12.xsl",  #string "handler/importprecedence12.xsl"  }
+  { "importprecedence12a.xsl", #string "handler/importprecedence12a.xsl" }
+  { "importprecedence12b.xsl", #string "handler/importprecedence12b.xsl" }
+  { "importprecedence13.xsl",  #string "handler/importprecedence13.xsl"  }
+  { "importprecedence13a.xsl", #string "handler/importprecedence13a.xsl" }
+  { "importprecedence13b.xsl", #string "handler/importprecedence13b.xsl" }
+  { "importprecedence14.xsl",  #string "handler/importprecedence14.xsl"  }
+  { "importprecedence14a.xsl", #string "handler/importprecedence14a.xsl" }
+  { "importprecedence14b.xsl", #string "handler/importprecedence14b.xsl" }
+  { "importprecedence14c.xsl", #string "handler/importprecedence14c.xsl" }
+
+  { "document1.xsl",  #string "handler/document1.xsl"  }
+  { "document1a.xml", #string "handler/document1a.xml" }
+  { "document1b.xml", #string "handler/document1b.xml" }
+  { "document1c.xml", #string "handler/document1c.xml" }
+  { "document2.xsl",  #string "handler/document2.xsl"  }
+  { "document2a.xml", #string "handler/document2a.xml" }
+  { "document2b.xml", #string "handler/document2b.xml" }
+  { "document2c.xml", #string "handler/document2c.xml" }
+  { "document3.xsl",  #string "handler/document3.xsl"  }
+  { "document3a.xml", #string "handler/document3a.xml" }
+  { "document3b.xml", #string "handler/document3b.xml" }
+  { "document3c.xml", #string "handler/document3c.xml" }
+  { "document4.xsl",  #string "handler/document4.xsl"  }
+  { "document4a.xml", #string "handler/document4a.xml" }
+  { "document4b.xml", #string "handler/document4b.xml" }
+  { "document4c.xml", #string "handler/document4c.xml" }
+  { "document5.xsl",  #string "handler/document5.xsl"  }
+  { "document5a.xml", #string "handler/document5a.xml" }
+  { "document5b.xml", #string "handler/document5b.xml" }
+  { "document5c.xml", #string "handler/document5c.xml" }
+  { "document6.xsl",  #string "handler/document6.xsl"  }
+  { "document6a.xml", #string "handler/document6a.xml" }
+  { "document6b.xml", #string "handler/document6b.xml" }
+  { "document6c.xml", #string "handler/document6c.xml" }
+
+  { "numberformat1.xsl", #string "handler/numberformat1.xsl" }
+}
+
+test ("XSLT_Handler: $(title)")
+  multi testcases(title, output_method, input, output);
+{
+  TestHandler handler;
+  TestPostMessageCallback post_message_cb;
+
+  XMLTokenHandler *token_handler = 0;
+  XSLT_Tree *expected_result = 0;
+
+  verify (OpStatus::IsSuccess (XSLT_Handler::MakeTokenHandler (token_handler, &handler)));
+  verify (OpStatus::IsSuccess (handler.PushResource (token_handler)));
+
+  static_cast<XSLT_HandlerTokenHandler *> (token_handler)->SetPostMessageCallback (&post_message_cb);
+
+  while (!handler.finished && !handler.aborted)
+    {
+      TestHandler::Resource *resource = handler.current_resource;
+
+      if (!resource)
+        {
+          /* When no linked stylesheet is found, the XSLT_Handler token handler
+             goes into pure bypass mode, and in that mode it never calls either
+             OnFinished() or OnFailed().  This is sort of a bug, I think, but
+             changing that probably requires changes to the XSLT integration
+             code in logdoc. */
+          verify (op_strcmp (title, "unstyled") == 0);
+          break;
+        }
+
+      if (post_message_cb.message_posted)
+        {
+          post_message_cb.message_posted = FALSE;
+          static_cast<XSLT_HandlerTokenHandler *> (token_handler)->HandleCallback (MSG_XSLT_CONTINUE_TRANSFORMATION, 0, post_message_cb.start_transformation);
+        }
+      else
+        {
+          if (!resource->IsStarted ())
+            if (resource->HasName ("<base>"))
+              verify (OpStatus::IsSuccess (ConvertString (resource->data, input)));
+            else
+              {
+                iterate (name, resource_data) from resources
+                  {
+                    if (resource->HasName (name))
+                      {
+                        verify (!resource->IsStarted ());
+                        verify (OpStatus::IsSuccess (ConvertString (resource->data, resource_data)));
+                      }
+                  }
+
+                verify (resource->IsStarted ());
+              }
+
+          resource->Continue ();
+
+          if (resource->IsFinished () || resource->IsFailed ())
+            OP_DELETE (resource);
+        }
+    }
+
+  verify (!handler.aborted);
+  verify (op_strcmp (output_method, handler.output_method) == 0);
+
+  if (op_strcmp (output_method, "xml") == 0)
+    {
+      verify (OpStatus::IsSuccess (ParseTree (expected_result, output)));
+      verify (XSLT_Tree::Compare (handler.result_as_tree, expected_result));
+    }
+  else
+    {
+      OpString result;
+      verify (OpStatus::IsSuccess (ConvertString (result, output)));
+      /* Let <EOF> in the result file signal where it really ends.  Workaround
+         for uncertainties about trailing whitespace. */
+      int index = result.Find ("<EOF>");
+      if (index != KNotFound)
+        result.Delete (index);
+      verify (uni_strcmp (handler.result_as_string_data.GetStorage (), result.CStr ()) == 0);
+    }
+}
+finally
+{
+  handler.CleanUp ();
+  OP_DELETE (token_handler);
+  OP_DELETE (expected_result);
+}

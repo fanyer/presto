@@ -1,0 +1,224 @@
+/* -*- Mode: c++; tab-width: 4; indent-tabs-mode: t; c-basic-offset: 4 -*- */
+group "url.header_reduction";
+
+require init;
+language c++;
+
+include "core/pch.h";
+include "modules/upload/upload.h";
+include "modules/url/url_api.h";
+include "modules/url/url_sn.h";
+include "modules/url/protocols/http1.h";
+
+// Test for actions:
+// 1. Header duplicate
+// 2. Header different
+// 3. Header removed
+// 4. Header added
+//
+// Make sure to handle:
+// 1. Disabled headers
+// 2. Enabled but empty headers
+
+// Header Expansion
+// Test:
+// 1. Expand with empty cache
+// 2. Expand with false negative
+// 3. Cached header added
+// 4. Cached header updated
+// 5. Cached header removed
+
+
+global
+{
+	Header_List* empty_list = NULL;
+	Header_List* long_list = NULL;
+	Header_List* short_list1 = NULL;
+	Header_List* short_list2 = NULL;
+	ServerName* server = NULL;
+	HTTP_1_1* http_conn = NULL;
+	char* buf = (char *) g_memory_manager->GetTempBuf2k();
+	const char* result_long_first = "GET: / HTTP/1.1\r\nUser-Agent: Opera/10\r\nHost: www.example.com\r\nAccept: text/html, application/xml;q=0.9\r\nReferer: www.other.example.com/start\r\nCookie: foobar\r\nCookie2: $Version=1\r\nConnection: Keep-Alive, TE\r\nTE: deflate, gzip, chunked, identity, trailers\r\n";
+	const char* result_long_long = "GET: / HTTP/1.1\r\n";
+	const char* result_long_clear = "GET: / HTTP/1.1\r\nUser-Agent: -\r\nHost: -\r\nAccept: -\r\nReferer: -\r\nCookie: -\r\nCookie2: -\r\nConnection: -\r\nTE: -\r\n";
+	const char* result_long_short1 = "GET: / HTTP/1.1\r\nHost: -\r\nAccept: text/html\r\nConnection: Keep-Alive\r\nReferer: -\r\nCookie: -\r\nCookie2: -\r\nTE: -\r\n";
+	const char* result_short1_clear = "GET: / HTTP/1.1\r\nUser-Agent: -\r\nAccept: -\r\nConnection: -\r\n";
+	const char* result_short1_first = "GET: / HTTP/1.1\r\nUser-Agent: Opera/10\r\nAccept: text/html\r\nConnection: Keep-Alive\r\n";
+	const char* result_short1_short2 = "GET: / HTTP/1.1\r\nUser-Agent: -\r\nHost: other.example.com\r\nReferer: www.other.example.com/start\r\nCookie: gazonk\r\nCookie2: $Version=1\r\nProxy-Connection: Keep-Alive\r\nAccept: -\r\nConnection: -\r\n";
+	const char* result_short2_long = "GET: / HTTP/1.1\r\nUser-Agent: Opera/10\r\nHost: www.example.com\r\nAccept: text/html, application/xml;q=0.9\r\nCookie: foobar\r\nConnection: Keep-Alive, TE\r\nTE: deflate, gzip, chunked, identity, trailers\r\nProxy-Connection: -\r\n";
+	
+	// Header Expansion
+	const char* input_empty = "";
+	const char* input_false_negative = "Content-Length: -\r\nContent-Type: -";
+	const char* input_long_header = "Content-Length: 999\r\nContent-Type: text/html\r\nContent-Encoding: deflate\r\nSet-Cookie: foo=bar; path=/; expires=Sat, 02-Nov-2019 10:20:15 GMT";
+	const char* input_short_header = "Cache-Control: no-cache";
+	const char* input_short_header_with_update = "Content-Length: 777\r\nContent-Type: image/gif";
+	const char* input_short_header_with_neg = "Cache-Control: -";
+	const char* input_with_update_neg_and_multi = "Content-Encoding: -\r\nContent-Length: 333\r\nSet-Cookie: a=b; path=/; expires=Sat, 02-Nov-2019 10:20:15 GMT; Set-Cookie: c=d; path=/; expires=Sat, 02-Nov-2019 10:20:15 GMT; Set-Cookie: e=f; path=/; expires=Sat, 02-Nov-2019 10:20:15 GMT";
+	
+	const char* result_empty = input_empty;
+	const char* result_false_negative = input_empty;
+	const char* result_long_header = input_long_header;
+	const char* result_short_header = "Content-Length: 999\r\nContent-Type: text/html\r\nContent-Encoding: deflate\r\nCache-Control: no-cache";
+	const char* result_short_header_with_update = "Content-Encoding: deflate\r\nCache-Control: no-cache\r\nContent-Length: 777\r\nContent-Type: image/gif";
+	const char* result_short_header_with_neg = "Content-Encoding: deflate\r\nContent-Length: 777\r\nContent-Type: image/gif";
+	const char* result_with_update_neg_and_multi = "Content-Type: image/gif\r\nContent-Length: 333\r\nSet-Cookie: a=b; path=/; expires=Sat, 02-Nov-2019 10:20:15 GMT; Set-Cookie: c=d; path=/; expires=Sat, 02-Nov-2019 10:20:15 GMT; Set-Cookie: e=f; path=/; expires=Sat, 02-Nov-2019 10:20:15 GMT";
+	const char* result_with_add_after_multi = "Content-Type: image/gif\r\nContent-Length: 333\r\nCache-Control: no-cache";
+}
+
+table long_header_list (const char*, const char*, BOOL)
+{
+	{"GET",			"/ HTTP/1.1",									TRUE},
+	{"User-Agent",	"Opera/10",										TRUE},
+	{"Host",		"www.example.com",								TRUE},
+	{"Accept",		"text/html, application/xml;q=0.9",				TRUE},
+	{"Referer",		"www.other.example.com/start",					TRUE},
+	{"Cookie",		"foobar",										TRUE},
+	{"Cookie2",		"$Version=1",									TRUE},
+	{"Connection",	"Keep-Alive, TE",								TRUE},
+	{"TE",			"deflate, gzip, chunked, identity, trailers",	TRUE}
+}
+
+table short_header_list1 (const char*, const char*, BOOL)
+{
+	{"GET",			"/ HTTP/1.1",		TRUE},
+	{"User-Agent",	"Opera/10",			TRUE},
+	{"Host",		"www.example.com",	FALSE},
+	{"Accept",		"text/html",		TRUE},
+	{"Connection",	"Keep-Alive",		TRUE},
+}
+
+table short_header_list2 (const char*, const char*, BOOL)
+{
+	{"GET",				"/ HTTP/1.1",					TRUE},
+	{"User-Agent",		"",								TRUE},
+	{"Host",			"other.example.com",			TRUE},
+	{"Referer",			"www.other.example.com/start",	TRUE},
+	{"Cookie",			"gazonk",						TRUE},
+	{"Cookie2",			"$Version=1",					TRUE},
+	{"Proxy-Connection","Keep-Alive",					TRUE},
+}
+
+setup
+{
+	Header_Item *item = NULL;
+	empty_list = OP_NEW_L(Header_List,());
+	item = empty_list->InsertHeaderL("GET",HEADER_INSERT_LAST,SEPARATOR_SPACE);
+	item->AddParameterL("/ HTTP/1.1");
+
+	long_list = OP_NEW_L(Header_List,());
+	iterate(header,parameter,enabled) from long_header_list
+	{
+		item = long_list->InsertHeaderL(header,HEADER_INSERT_LAST,SEPARATOR_COMMA);
+		if( op_strlen(parameter) > 0 )
+			item->AddParameterL(parameter);
+		item->SetEnabled(enabled);
+	}
+
+	short_list1 = OP_NEW_L(Header_List,());
+	iterate(header,parameter,enabled) from short_header_list1
+	{
+		item = short_list1->InsertHeaderL(header,HEADER_INSERT_LAST,SEPARATOR_COMMA);
+		if( op_strlen(parameter) > 0 )
+			item->AddParameterL(parameter);
+		item->SetEnabled(enabled);
+	}
+
+	short_list2 = OP_NEW_L(Header_List,());
+	iterate(header,parameter,enabled) from short_header_list2
+	{
+		item = short_list2->InsertHeaderL(header,HEADER_INSERT_LAST,SEPARATOR_COMMA);
+		if( op_strlen(parameter) > 0 )
+			item->AddParameterL(parameter);
+		item->SetEnabled(enabled);
+	}
+
+	server = g_url_api->GetServerName("localhost",TRUE);
+	http_conn = OP_NEW_L(HTTP_1_1,(g_main_message_handler, server, 80))
+
+}
+
+exit
+{
+	OP_DELETE(long_list);
+	OP_DELETE(short_list1);
+	OP_DELETE(short_list2);
+	OP_DELETE(empty_list);
+	OP_DELETE(http_conn);
+}
+
+table test_list_reduction(const char* testname, Header_List* list, const char* result)
+{
+	{ "Set up initial long list",		long_list,	result_long_first	},
+	{ "Complete reduction",				long_list,	result_long_long	},
+	{ "Clear reduction list",			empty_list,	result_long_clear	},
+	{ "Restore initial long list",		long_list,	result_long_first	},
+	{ "Partial reduction short list 1",	short_list1,result_long_short1	},
+	{ "Clear partially reduced list",	empty_list,	result_short1_clear	},
+	{ "Restore short list 1",	 		short_list1,result_short1_first	},
+	{ "Partial reduction short list 2",	short_list2,result_short1_short2},
+	{ "Partial reduction long list",	long_list,	result_short2_long	},
+}
+
+foreach (testname, list, result) from test_list_reduction
+{
+	test(testname)
+	require URL_TURBO_MODE_HEADER_REDUCTION;
+	{
+		http_conn->ReduceHeadersL(*list);
+		uint32 len = list->CalculateLength();
+		char* end = list->OutputHeaders(buf);
+		verify(((uint32)(end - buf) == len) && (op_strcmp(buf,result) == 0) );
+	}
+}
+
+table test_header_expansion(const char* testname, const char* input, const char* result)
+{
+	{ "Expand empty input",			input_empty,			result_empty },
+	{ "Expand with false negative",	input_false_negative,	result_false_negative },
+	{ "Expand long header",			input_long_header,		result_long_header },
+	{ "Expand cached items",		input_short_header,		result_short_header },
+	{ "Update cached items",		input_short_header_with_update, result_short_header_with_update },
+	{ "Remove cached items",		input_short_header_with_neg, result_short_header_with_neg },
+	{ "Update, and remove cached items and insert miltiple cookies",
+			input_with_update_neg_and_multi, result_with_update_neg_and_multi },
+	{ "Add new entry after multiple cookies",
+			input_short_header, result_with_add_after_multi }
+}
+
+foreach (testname, input, result) from test_header_expansion
+{
+	test(testname)
+	require URL_TURBO_MODE_HEADER_REDUCTION;
+	{
+		HeaderList inputHeaderList;
+		inputHeaderList.SetKeywordList(KeywordIndex_HTTP_MIME);
+		inputHeaderList.SetValueL(input);
+		HeaderList resultHeaderList;
+		resultHeaderList.SetKeywordList(KeywordIndex_HTTP_MIME);
+		resultHeaderList.SetValueL(result);
+
+		http_conn->ExpandResponseHeadersL(inputHeaderList);
+
+		BOOL lists_equal = TRUE;
+		if( inputHeaderList.Cardinal() != resultHeaderList.Cardinal() )
+			lists_equal = FALSE;
+		else
+		{
+			NameValue_Splitter* i = inputHeaderList.First();
+			NameValue_Splitter* r = resultHeaderList.First();
+			while ( i && r)
+			{
+				if( op_strcmp(i->Name(), r->Name()) || op_strcmp(i->Value(), r->Value()) )
+				{
+					lists_equal = FALSE;
+					break;
+				}
+				i = i->Suc();
+				r = r->Suc();
+			}
+		}
+
+		verify( lists_equal );
+	}
+}

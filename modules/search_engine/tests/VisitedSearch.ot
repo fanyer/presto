@@ -1,0 +1,3013 @@
+group "search_engine.visitedsearch";
+
+require VISITED_PAGES_SEARCH;
+
+include "modules/search_engine/VisitedSearch.h";
+include "modules/search_engine/tests/test_util.h";
+
+global
+{
+	VisitedSearch *msg_vs;
+
+#if defined SEARCH_ENGINE_LOG && (SEARCH_ENGINE_LOG & SEARCH_ENGINE_LOG_VISITEDSEARCH)
+	class VSLogPlayer
+	{
+	public:
+		VSLogPlayer(void)
+		{
+			m_log = NULL;
+		}
+		~VSLogPlayer(void)
+		{
+			Close();
+		}
+
+		OP_STATUS Open(const uni_char *vps_dir, const uni_char *log_fname)
+		{
+			RETURN_IF_ERROR(m_path.Set(vps_dir));
+			if ((m_log = SearchEngineLog::OpenLog(log_fname)) == NULL)
+				return OpStatus::ERR;
+			return OpStatus::OK;
+		}
+
+		void Close(void)
+		{
+			m_vps.Close();
+			if (m_log != NULL)
+			{
+				OP_DELETE(m_log);
+				m_log = NULL;
+			}
+		}
+
+		OP_BOOLEAN Step(void)
+		{
+			OP_BOOLEAN status;
+			int id_len, fname_len;
+			int i;
+			OpString fname;
+			const char *filenames[] = {FNAME_ACT, FNAME_ACT"-j", FNAME_ACT"-g",
+				FNAME_WB, FNAME_WB"-j", FNAME_WB"-g",
+				FNAME_META, FNAME_META"-j", FNAME_META"-g",
+				FNAME_BTREE, FNAME_BTREE"-j", FNAME_BTREE"-g",
+				FNAME_URL, FNAME_URL"-j", FNAME_URL"-g"};
+
+			if ((status = m_log->Read()) != OpBoolean::IS_TRUE)
+				return status;
+
+			id_len = op_strlen(m_log->Id());
+
+			for (i = sizeof(filenames) / sizeof(filenames[0]) - 1; i >= 0; --i)
+			{
+				fname_len = op_strlen(filenames[i]);
+
+				if (id_len > fname_len && op_strcmp(m_log->Id() + id_len - fname_len, filenames[i]) == 0)
+				{
+					fname.Set(m_path);
+					fname.AppendFormat(UNI_L("%c%.04i%c"), PATHSEPCHAR, op_atoi(m_log->Id()), PATHSEPCHAR);
+					fname.Append(filenames[i]);
+					RETURN_IF_ERROR(m_log->SaveData(fname));
+					return m_log->End() ? OpBoolean::IS_FALSE : OpBoolean::IS_TRUE;
+				}
+			}
+
+			// other messages should be handled here
+
+			OP_ASSERT(0);  // unrecognized message
+
+			return m_log->End() ? OpBoolean::IS_FALSE : OpBoolean::IS_TRUE;
+		}
+
+		OP_STATUS Play(void)
+		{
+			OP_BOOLEAN status;
+
+			while ((status = Step()) == OpBoolean::IS_TRUE)
+				;
+
+			return OpStatus::IsSuccess(status) ? OpStatus::OK : status;
+		}
+
+		VisitedSearch *Ptr(void) {return &m_vps;}
+
+	protected:
+		InputLogDevice *m_log;
+		VisitedSearch m_vps;
+		OpString m_path;
+	};
+#endif  // SEARCH_ENGINE_LOG
+}
+
+test("md.dat blocksize") disabled;
+	file uni vps_search_0000_md_dat "data/vps_search/0000/md.dat";
+{
+	BlockStorage bs;
+	OpFileLength pos, filesize;
+	int blocksize, dsize;
+	int blocks;
+	OpFileLength size;
+	OpFileLength histogram[4] = {0, 0, 0, 0};
+	int hc[4] = {0, 0, 0, 0};
+	BSCursor cursor(&bs);
+	unsigned url_c = 0, title_c = 0, fname_c = 0, thumbnail_c = 0, plaintext_c = 0;
+#define BL1  0
+#define BL14 1
+#define BL4  2
+#define BL4P 3
+
+	bs.Open(vps_search_0000_md_dat, BlockStorage::OpenRead);
+
+	RankIndex::SetupCursor(cursor);
+
+	blocksize = bs.GetBlockSize();
+	filesize = bs.GetFileSize();
+
+	size = 0;
+	blocks = 0;
+
+	for (pos = blocksize; pos < filesize; pos += blocksize)
+	{
+		if (bs.IsStartBlock(pos))
+		{
+			dsize = bs.DataLength(pos);
+			size += dsize;
+			++blocks;
+
+			if (dsize <= blocksize - 12)
+			{
+				histogram[BL1] += dsize;
+				++hc[BL1];
+			}
+			else if (dsize <= blocksize - 12 + 2 * (blocksize - 8))
+			{
+				histogram[BL14] += dsize;
+				++hc[BL14];
+			}
+			else if (dsize <= blocksize - 12 + 3 * (blocksize - 8))
+			{
+				histogram[BL4] += dsize;
+				++hc[BL4];
+			}
+			else {
+				histogram[BL4P] += dsize;
+				++hc[BL4P];
+			}
+
+			cursor.Goto(pos / blocksize);
+			url_c += cursor["url"].GetSize();
+			title_c += cursor["title"].GetSize();
+			fname_c += cursor["filename"].GetSize();
+			thumbnail_c += cursor["thumbnail"].GetSize();
+			plaintext_c += cursor["plaintext"].GetSize();
+		}
+	}
+
+	output("%i blocks of %i B, %i B in average\n", blocks, blocksize, (int)(size / blocks));
+	output("1 block     : %i (%i B)\n"
+		   "2 - 3 blocks: %i (%i B)\n"
+		   "4 blocks    : %i (%i B)\n"
+		   "more        : %i (%i B)\n",
+		   hc[BL1], hc[BL1] == 0 ? 0 : (int)(histogram[BL1] / hc[BL1]),
+		   hc[BL14], hc[BL14] == 0 ? 0 : (int)(histogram[BL14] / hc[BL14]),
+		   hc[BL4], hc[BL4] == 0 ? 0 : (int)(histogram[BL4] / hc[BL4]),
+		   hc[BL4P], hc[BL4P] == 0 ? 0 : (int)(histogram[BL4P] / hc[BL4P]));
+
+	output("average field sizes:\n"
+		"URL      : %i\n"
+		"title    : %i\n"
+		"fname    : %i\n"
+		"thumbnail: %i\n"
+		"plaintext: %i\n",
+		url_c / blocks,	title_c / blocks, fname_c / blocks,	thumbnail_c / blocks, plaintext_c / blocks);
+
+	bs.Close();
+}
+
+test("Feed") disabled;
+	file uni vs_"data/vs";
+{
+// this is not a test, it only prepares a few data to an index
+	VisitedSearch vs;
+	VisitedSearch::RecordHandle h;
+	int i;
+	OpString8 url;
+	OpString title;
+
+	vs.Open(vs_);
+	vs.Clear();
+
+	h = vs.CreateRecord("http://www.url1.org/", UNI_L("title of url1"));
+	vs.AddTextBlock(h,
+UNI_L("Nintendo Co., Ltd. started selling \"Nintendo DS Browser\" in Japan today via several dedicated Japanese online sales sites. Opera Software's full-featured browser enables Japanese gamers to surf all their favorite Web sites on the Nintendo DS or DS Lite."),
+		RANK_P);
+	vs.AddTextBlock(h, UNI_L("wordA wordB wordC wordD wordA"), RANK_P);
+	vs.AddTextBlock(h,
+UNI_L("The browser is sold as a separate DS card, just like Nintendo DS games, and will come with an extra memory expansion cartridge so that users can access full Internet content by utilizing Wi-Fi environments at home, Nintendo's dedicated Wi-Fi Stations and free accessing spots."),
+		RANK_P);
+	vs.AssociateThumbnail("http://www.url1.org/", "1", 1);
+	vs.CloseRecord(h);
+
+	op_msleep(1500);
+
+	h = vs.CreateRecord("http://www.url2.org/", UNI_L("title of url2"));
+	vs.AddTextBlock(h, UNI_L("wordA wordB wordC wordD"), RANK_H1);
+	vs.AssociateThumbnail("http://www.url2.org/", "12", 2);
+	vs.CloseRecord(h);
+
+	op_msleep(1500);
+
+	h = vs.CreateRecord("http://www.url3.org/");
+	vs.AddTextBlock(h, UNI_L("wordA wordB"), RANK_P);
+	vs.AssociateThumbnail("http://www.url3.org/", "123", 3);
+	vs.CloseRecord(h);
+
+	op_msleep(1500);
+
+	h = vs.CreateRecord("http://www.url4.org/", UNI_L("title of url4 wordA"));
+	vs.AddTextBlock(h, UNI_L("wordA wordB wordC wordD"), RANK_P);
+	vs.AssociateThumbnail("http://www.url4.org/", "1234", 4);
+	vs.CloseRecord(h);
+
+	vs.Flush();
+	vs.Commit();
+
+	for (i = 0; i < 50; ++i)
+	{
+		op_msleep(1500);
+
+		url.Empty();
+		url.AppendFormat("http://www.url%i.net/index.html", i);
+
+		title.Empty();
+		title.AppendFormat(UNI_L("url #%i"), i);
+
+		h = vs.CreateRecord(url, title);
+		vs.AddTextBlock(h, UNI_L("wordA wordB wordC wordD wordE"), 0.98F);
+		vs.CloseRecord(h);
+	}
+
+	vs.Flush();
+	vs.Commit();
+
+	vs.Close();
+}
+
+test("Insert")
+	file uni vs_             "data/vs";
+	file uni vs_0000         "data/vs/0000";
+	file uni vs_0000_w_ax    "data/vs/0000/w.axx";
+	file uni vs_0000_wb_vx   "data/vs/0000/wb.vx";
+	file uni vs_0000_md_dat  "data/vs/0000/md.dat";
+	file uni vs_0000_adoc_bx "data/vs/0000/adoc.bx";
+	file uni vs_0000_url_ax  "data/vs/0000/url.axx";
+{
+{
+	LEAKCHECK;
+	VisitedSearch vs;
+	VisitedSearch::RecordHandle h;
+	SearchIterator<VisitedSearch::Result> *res;
+	UINT32 r1, r2, r3, r4, r5;
+
+	verify(vs.Open(vs_) == OpStatus::OK);
+	verify_success(vs.Clear());
+
+	h = vs.CreateRecord("http://www.url.org/");
+
+	verify_success(vs.AddTextBlock(h, UNI_L("title of the document"), RANK_TITLE));
+	verify_success(vs.AddTextBlock(h, UNI_L("the text of\r\n the first paragraph"), RANK_P));
+
+	verify_success(vs.CloseRecord(h));
+
+	verify_success(vs.PreFlush());
+	verify_success(vs.Flush());
+	verify_success(vs.Commit());
+
+	res = vs.Search(UNI_L("notfound"));
+	if (res == NULL || !res->Empty())
+		r1 = (UINT32)-1;
+	else r1 = 0;
+	if (res != NULL)
+		OP_DELETE(res);
+
+	res = vs.Search(UNI_L("document"));
+	if (res == NULL || res->End())
+		r2 = 0;
+	else {
+		r2 = res->Get().id;
+		if (res->Next())
+			r2 = 0;
+		if (!res->End())
+			r2 = 0;
+	}
+	if (res != NULL)
+		OP_DELETE(res);
+
+	res = vs.Search(UNI_L("the"));
+	if (res == NULL || res->End())
+		r3 = 0;
+	else {
+		r3 = res->Get().id;
+		if (res->Next())
+			r3 = 0;
+		if (!res->End())
+			r3 = 0;
+	}
+	if (res != NULL)
+		OP_DELETE(res);
+
+	res = vs.Search(UNI_L("\r\n"));
+	if (res == NULL || res->End())
+		r4 = 0;
+	else {
+		r4 = res->Get().id;
+		if (res->Next())
+			r4 = 0;
+		if (!res->End())
+			r4 = 0;
+	}
+	if (res != NULL)
+		OP_DELETE(res);
+
+	res = vs.Search(UNI_L("the document"));
+	if (res == NULL || res->End())
+		r5 = 0;
+	else {
+		r5 = res->Get().id;
+		if (res->Next())
+			r5 = 0;
+		if (!res->End())
+			r5 = 0;
+	}
+	if (res != NULL)
+		OP_DELETE(res);
+
+	g_main_message_handler->RemoveDelayedMessage(MSG_VISITEDSEARCH_PREFLUSH, (MH_PARAM_1)&vs, 0);
+
+	verify_success(vs.Close());
+
+	delete_file(vs_0000_w_ax);
+	delete_file(vs_0000_wb_vx);
+	delete_file(vs_0000_md_dat);
+	delete_file(vs_0000_adoc_bx);
+	delete_file(vs_0000_url_ax);
+	delete_file(vs_0000);
+	delete_file(vs_);
+
+	verify(r1 == 0);
+	verify(r2 == 2);
+	verify(r3 == 2);
+	verify(r4 == 2);
+	verify(r5 == 2);
+}
+}
+
+test("CloseRecord conditions")
+	file uni vs_             "data/vs";
+	file uni vs_0000         "data/vs/0000";
+	file uni vs_0000_w_ax    "data/vs/0000/w.axx";
+	file uni vs_0000_wb_vx   "data/vs/0000/wb.vx";
+	file uni vs_0000_md_dat  "data/vs/0000/md.dat";
+	file uni vs_0000_adoc_bx "data/vs/0000/adoc.bx";
+	file uni vs_0000_url_ax  "data/vs/0000/url.axx";
+{
+	VisitedSearch vs;
+	VisitedSearch::RecordHandle h;
+	SearchIterator<VisitedSearch::Result> *res = NULL;
+	time_t t;
+
+	verify(vs.Open(vs_) == OpStatus::OK);
+	verify_success(vs.Clear());
+
+	h = vs.CreateRecord("http://www.url.org/");
+	t = op_time(NULL);
+
+	verify_success(vs.AddTitle(h, UNI_L("title of the document")));
+	verify_success(vs.AddTextBlock(h, UNI_L("the text of\r\n the first paragraph"), RANK_P));
+
+	verify_success(vs.CloseRecord(h));
+
+	verify_success(vs.Commit());
+
+	res = vs.Search(UNI_L(""));
+	verify(res != NULL && !res->Empty());
+
+	verify_string(res->Get().title, "title of the document");
+	verify(!res->Next());
+
+	OP_DELETE(res);
+	res = NULL;
+
+	op_msleep(1000);
+
+	h = vs.CreateRecord("http://www.url.org/");
+
+	verify_success(vs.AddTitle(h, UNI_L("title of the document")));
+	verify_success(vs.AddTextBlock(h, UNI_L("the text of\r\n the first paragraph"), RANK_P));
+
+	verify_success(vs.CloseRecord(h));
+
+	verify_success(vs.Commit());
+
+	res = vs.Search(UNI_L(""));
+	verify(res != NULL && !res->Empty());
+
+	verify_string(res->Get().title, "title of the document");
+	verify(res->Get().visited > t);
+	verify(!res->Next());
+
+	OP_DELETE(res);
+	res = NULL;
+
+	h = vs.CreateRecord("http://www.url.org/");
+
+	verify_success(vs.AddTitle(h, UNI_L("new title of the document")));
+	verify_success(vs.AddTextBlock(h, UNI_L("the text of\r\n the first paragraph"), RANK_P));
+
+	verify_success(vs.CloseRecord(h));
+
+	verify_success(vs.Commit());
+
+	res = vs.Search(UNI_L(""));
+	verify(res != NULL && !res->Empty());
+
+	verify_string(res->Get().title, "new title of the document");
+	verify(!res->Next());
+
+	OP_DELETE(res);
+	res = NULL;
+
+	h = vs.CreateRecord("http://www.duplicateurl.org/");
+
+	verify_success(vs.AddTitle(h, UNI_L("title of the document")));
+	verify_success(vs.AddTextBlock(h, UNI_L("the text of\r\n the first paragraph"), RANK_P));
+
+	verify_success(vs.CloseRecord(h));
+
+	verify_success(vs.PreFlush());
+
+	h = vs.CreateRecord("http://www.duplicateurl.org/");
+
+	verify_success(vs.AddTitle(h, UNI_L("title of the document")));
+	verify_success(vs.AddTextBlock(h, UNI_L("the text of\r\n the first paragraph"), RANK_P));
+
+	verify_success(vs.CloseRecord(h));
+
+	h = vs.CreateRecord("http://www.duplicateurl.org/main.php");
+
+	verify_success(vs.AddTitle(h, UNI_L("new title of the document")));
+	verify_success(vs.AddTextBlock(h, UNI_L("the text of\r\n the first paragraph"), RANK_P));
+
+	verify_success(vs.CloseRecord(h));
+
+	verify_success(vs.Flush());
+
+	h = vs.CreateRecord("http://www.duplicateurl.org/");
+
+	verify_success(vs.AddTitle(h, UNI_L("new title of the document")));
+	verify_success(vs.AddTextBlock(h, UNI_L("the text of\r\n the first paragraph"), RANK_P));
+
+	verify_success(vs.CloseRecord(h));
+
+	h = vs.CreateRecord("http://www.duplicateurl.org/main.php");
+
+	verify_success(vs.AddTitle(h, UNI_L("new title of the document")));
+	verify_success(vs.AddTextBlock(h, UNI_L("the text of\r\n the first paragraph"), RANK_P));
+
+	verify_success(vs.CloseRecord(h));
+
+	verify_success(vs.Commit());
+	verify_success(vs.Commit());
+
+	res = vs.Search(UNI_L("site:duplicateurl.org"));
+	verify(res != NULL && !res->Empty());
+
+	verify_string(res->Get().title, "new title of the document");
+	verify(res->Next());
+	verify_string(res->Get().title, "new title of the document");
+	verify(!res->Next());
+
+	OP_DELETE(res);
+	res = NULL;
+
+	if (res != NULL)
+		OP_DELETE(res);
+
+	verify_success(vs.Close());
+
+	delete_file(vs_0000_w_ax);
+	delete_file(vs_0000_wb_vx);
+	delete_file(vs_0000_md_dat);
+	delete_file(vs_0000_adoc_bx);
+	delete_file(vs_0000_url_ax);
+	delete_file(vs_0000);
+	delete_file(vs_);
+
+}
+
+test("Commit stages")
+	file uni vs_             "data/vs";
+	file uni vs_0000         "data/vs/0000";
+	file uni vs_0000_w_ax    "data/vs/0000/w.axx";
+	file uni vs_0000_wb_vx   "data/vs/0000/wb.vx";
+	file uni vs_0000_md_dat  "data/vs/0000/md.dat";
+	file uni vs_0000_adoc_bx "data/vs/0000/adoc.bx";
+	file uni vs_0000_url_ax  "data/vs/0000/url.axx";
+{
+	VisitedSearch vs;
+	VisitedSearch::RecordHandle h;
+	SearchIterator<VisitedSearch::Result> *res = NULL;
+
+	verify(vs.Open(vs_) == OpStatus::OK);
+	verify_success(vs.Clear());
+
+	h = vs.CreateRecord("http://www.url.org/");
+
+	verify_success(vs.AddTitle(h, UNI_L("title of the document")));
+	verify_success(vs.AddTextBlock(h, UNI_L("the text of\r\n the first paragraph"), RANK_P));
+
+	verify_success(vs.CloseRecord(h));
+
+	verify_success(vs.PreFlush(1));
+
+	res = vs.Search(UNI_L(""));
+	verify(res != NULL && !res->Empty());
+
+	verify_string(res->Get().title, "title of the document");
+	verify(!res->Next());
+
+	OP_DELETE(res);
+	res = NULL;
+
+	vs.AbortFlush();
+
+
+	h = vs.CreateRecord("http://www.url.org/");
+
+	verify_success(vs.AddTitle(h, UNI_L("title of the document")));
+	verify_success(vs.AddTextBlock(h, UNI_L("the text of\r\n the first paragraph"), RANK_P));
+
+	verify_success(vs.CloseRecord(h));
+
+	verify_success(vs.PreFlush());
+
+	res = vs.Search(UNI_L(""));
+	verify(res != NULL && !res->Empty());
+
+	verify_string(res->Get().title, "title of the document");
+	verify(!res->Next());
+
+	OP_DELETE(res);
+	res = NULL;
+
+	h = vs.CreateRecord("http://www.url.org/");
+
+	verify_success(vs.AddTitle(h, UNI_L("title of the document")));
+	verify_success(vs.AddTextBlock(h, UNI_L("the text of\r\n the first paragraph"), RANK_P));
+
+	verify_success(vs.CloseRecord(h));
+
+	verify_success(vs.PreFlush());
+	verify_success(vs.Flush(1));
+
+	res = vs.Search(UNI_L(""));
+	verify(res != NULL && !res->Empty());
+
+	verify_string(res->Get().title, "title of the document");
+	verify(!res->Next());
+
+	OP_DELETE(res);
+	res = NULL;
+
+	h = vs.CreateRecord("http://www.url.org/");
+
+	verify_success(vs.AddTitle(h, UNI_L("title of the document")));
+	verify_success(vs.AddTextBlock(h, UNI_L("the text of\r\n the first paragraph"), RANK_P));
+
+	verify_success(vs.CloseRecord(h));
+
+	verify_success(vs.Flush());
+
+	res = vs.Search(UNI_L(""));
+	verify(res != NULL && !res->Empty());
+
+	verify_string(res->Get().title, "title of the document");
+	verify(!res->Next());
+
+	OP_DELETE(res);
+	res = NULL;
+
+	if (res != NULL)
+		OP_DELETE(res);
+
+	verify_success(vs.Close());
+
+	delete_file(vs_0000_w_ax);
+	delete_file(vs_0000_wb_vx);
+	delete_file(vs_0000_md_dat);
+	delete_file(vs_0000_adoc_bx);
+	delete_file(vs_0000_url_ax);
+	delete_file(vs_0000);
+	delete_file(vs_);
+
+}
+
+test("stopword")
+	file uni vs_             "data/vs";
+	file uni vs_0000         "data/vs/0000";
+	file uni vs_0000_w_ax    "data/vs/0000/w.axx";
+	file uni vs_0000_wb_vx   "data/vs/0000/wb.vx";
+	file uni vs_0000_md_dat  "data/vs/0000/md.dat";
+	file uni vs_0000_adoc_bx "data/vs/0000/adoc.bx";
+	file uni vs_0000_url_ax  "data/vs/0000/url.axx";
+{
+{
+	LEAKCHECK;
+	VisitedSearch vs;
+	VisitedSearch::RecordHandle h;
+	SearchIterator<VisitedSearch::Result> *res;
+	int i;
+	OpString8 url;
+
+	verify(vs.Open(vs_) == OpStatus::OK);
+	verify_success(vs.Clear());
+
+	for (i = 0; i < 501; ++i)
+	{
+		url.Empty();
+		verify_success(url.AppendFormat("http://www.url%i.org/", i));
+		h = vs.CreateRecord(url.CStr());
+		verify_success(vs.AddTextBlock(h, UNI_L("title"), RANK_TITLE));
+		verify_success(vs.CloseRecord(h));
+	}
+
+	verify_success(vs.Commit());
+
+	h = vs.CreateRecord("http://www.urlA.org/");
+	verify_success(vs.AddTextBlock(h, UNI_L("title"), RANK_TITLE));
+	verify_success(vs.CloseRecord(h));
+
+	h = vs.CreateRecord("http://www.urlB.org/");
+	verify_success(vs.AddTextBlock(h, UNI_L("notitle"), RANK_TITLE));
+	verify_success(vs.CloseRecord(h));
+
+	verify_success(vs.Commit());
+
+	i = 0;
+	res = vs.Search(UNI_L("title"));
+
+	while (!res->End())
+	{
+		++i;
+		res->Next();
+	}
+
+	OP_DELETE(res);
+
+	g_main_message_handler->RemoveDelayedMessage(MSG_VISITEDSEARCH_PREFLUSH, (MH_PARAM_1)&vs, 0);
+	g_main_message_handler->RemoveDelayedMessage(MSG_VISITEDSEARCH_PREFLUSH, (MH_PARAM_1)&vs, 0);
+
+	verify_success(vs.Close());
+
+	delete_file(vs_0000_w_ax);
+	delete_file(vs_0000_wb_vx);
+	delete_file(vs_0000_md_dat);
+	delete_file(vs_0000_adoc_bx);
+	delete_file(vs_0000_url_ax);
+	delete_file(vs_0000);
+	delete_file(vs_);
+
+	verify(i == 503);
+}
+}
+
+test("VisitedSearch performance") disabled;
+	file uni vs_             "data/vs";
+	file uni vs_0000         "data/vs/0000";
+	file uni vs_0000_w_ax    "data/vs/0000/w.axx";
+	file uni vs_0000_wb_vx   "data/vs/0000/wb.vx";
+	file uni vs_0000_md_dat  "data/vs/0000/md.dat";
+	file uni vs_0000_adoc_bx "data/vs/0000/adoc.bx";
+	file uni vs_0000_url_ax  "data/vs/0000/url.axx";
+{
+{
+	LEAKCHECK;
+// 462 words, 245 are unique
+#define PARAGRAPH "If George Bush called you Kenny Boy and just"\
+" about everyone else you had met in your adult life called you Sir, you would"\
+" obviously be shocked and a little outraged at the thought of being locked"\
+" up. Kenneth Lay used to have an overdraft facility of $40m (Ã²1m). He lived"\
+" near the top of an exclusive condominium where there were staff to park the"\
+" car and bring in the shopping. The son of a preacher who goes to church"\
+" every Sunday, he is also convinced that God is behind him. I firmly believe"\
+" I'm innocent of the charges against me, he said after the verdict. We"\
+" believe that God in fact is in control, and indeed he does work all things"\
+" for good for those who love the Lord. It will be their last free summer for"\
+" a long time which is indeed a very sobering thought for every boardroom"\
+" Amanda Perry, juror Understandably therefore, a small crowd gathered outside"\
+" Houston's federal court as word got out that there was a verdict. And there"\
+" was a real buzz when it emerged that both Lay and his former chief"\
+" executive, Jeffrey Skilling, were guilty. I just wanted to see a little"\
+" history in the making, said a student of Spanish and psychology at Houston"\
+" university. I want to see justice prevail. Her friend, who studied law,"\
+" believed he was witnessing something very profound and beautiful. I love"\
+" justice, said Eduardo Martinez. This is something that feels so good for me."\
+" There was a sense of history in the making at the courtroom It seemed odd to"\
+" have armed and mounted police around when the criminals were suited, polite"\
+" and eager to talk. But this is Texas and it was time for a spectacle. Other"\
+" cops on bicycles added to the sense of theatre. One block away, audiences"\
+" have been enjoying a production of Agatha Christie's Witness for the"\
+" Prosecution - a reminder how gripping a courtroom drama can be, even when"\
+" the details are complicated. The Enron case was tedious at times but it"\
+" involved real men who are known to everyone in this town. They had also,"\
+" at one time, seduced corporate America, so the stakes were high. The"\
+" youngest juror, Amanda Perry, admitted there had been times when the"\
+" proceedings had dragged. I think some days we wished it would have moved a"\
+" little quicker, she said. But she was full of praise for the prosecution."\
+" Looking back they did an excellent job, she said, so that we could"\
+" understand Ken Lay and Jeffrey Skilling will have to make the most of this"\
+" summer. Enjoying their homes, families and golf. It will be their last free"\
+" summer for a long time which is indeed a very sobering thought for every"\
+" boardroom."
+
+	VisitedSearch vs;
+	VisitedSearch::RecordHandle h;
+	int i;
+	time_t start;
+	OpString paragraph;
+	OpString8 url;
+
+	verify_success(vs.Open(vs_));
+	verify_success(vs.Clear());
+
+	paragraph.SetFromUTF8(PARAGRAPH);
+
+	start = op_time(NULL);
+
+	for (i = 0; i < 496; ++i)
+	{
+		url.Set("http://www.url");
+		url.AppendFormat("%i.org", i);
+		h = vs.CreateRecord(url);
+		verify_success(vs.AddTextBlock(h, UNI_L("title"), RANK_TITLE));
+		verify_success(vs.AddTextBlock(h, paragraph, RANK_P));
+		verify_success(vs.CloseRecord(h));
+	}
+
+	i = 0;
+
+	while (vs.PreFlush(100) != OpBoolean::IS_TRUE)
+	{
+		++i;
+		op_msleep(100);
+	}
+
+	op_msleep(20000);
+
+	while (vs.Flush(100) != OpBoolean::IS_TRUE)
+	{
+		++i;
+		op_msleep(100);
+	}
+
+	op_msleep(20000);
+
+	verify_success(vs.Commit());
+
+	output("\nIndexing 496 files (each containing 245 unique words) took %i s   ", op_time(NULL) - start - 40 - i / 10);
+
+	g_main_message_handler->RemoveDelayedMessage(MSG_VISITEDSEARCH_PREFLUSH, (MH_PARAM_1)&vs, 0);
+
+	verify_success(vs.Close());
+
+	delete_file(vs_0000_w_ax);
+	delete_file(vs_0000_wb_vx);
+	delete_file(vs_0000_md_dat);
+	delete_file(vs_0000_adoc_bx);
+	delete_file(vs_0000_url_ax);
+	delete_file(vs_0000);
+	delete_file(vs_);
+}
+}
+
+test("Search")
+	file uni vs_             "data/vs";
+	file uni vs_0000         "data/vs/0000";
+	file uni vs_0000_w_ax    "data/vs/0000/w.axx";
+	file uni vs_0000_wb_vx   "data/vs/0000/wb.vx";
+	file uni vs_0000_md_dat  "data/vs/0000/md.dat";
+	file uni vs_0000_adoc_bx "data/vs/0000/adoc.bx";
+	file uni vs_0000_url_ax  "data/vs/0000/url.axx";
+{
+	VisitedSearch vs;
+	VisitedSearch::RecordHandle h;
+	SearchIterator<VisitedSearch::Result> *res;
+	int i;
+	int tsize;
+
+	res = NULL;
+
+	verify(vs.Open(vs_) == OpStatus::OK);
+	verify_success(vs.Clear());
+
+	h = vs.CreateRecord("http://www.url1.org/");
+	verify_success(vs.AddTextBlock(h, UNI_L("title"), RANK_TITLE));
+	verify_success(vs.AddTextBlock(h, UNI_L("wordA wordB wordC wordD wordA"), RANK_P));
+	verify_success(vs.AssociateThumbnail("http://www.url1.org/", "1", 1));
+	verify_success(vs.CloseRecord(h));
+
+	op_msleep(1000);
+
+	h = vs.CreateRecord("http://www.url2.org/");
+	verify_success(vs.AddTextBlock(h, UNI_L("title"), RANK_TITLE));
+	verify_success(vs.AddTextBlock(h, UNI_L("wordA wordB wordC wordD"), RANK_H1));
+	verify_success(vs.AssociateThumbnail("http://www.url2.org/", "12", 2));
+	verify_success(vs.CloseRecord(h));
+
+	op_msleep(1000);
+
+	h = vs.CreateRecord("http://www.url3.org/?query3");
+	verify_success(vs.AddTextBlock(h, UNI_L("title"), RANK_TITLE));
+	verify_success(vs.AddTextBlock(h, UNI_L("wordA wordB"), RANK_P));
+	verify_success(vs.AssociateThumbnail("http://www.url3.org/?query3", "123", 3));
+	verify_success(vs.CloseRecord(h));
+
+	op_msleep(1000);
+
+	h = vs.CreateRecord("http://www.url4.org/");
+	verify_success(vs.AddTextBlock(h, UNI_L("title wordA"), RANK_TITLE));
+	verify_success(vs.AddTextBlock(h, UNI_L("wordA wordB wordC wordD"), RANK_P));
+	verify_success(vs.AssociateThumbnail("http://www.url4.org/", "1234", 4));
+	verify_success(vs.CloseRecord(h));
+
+	verify_success(vs.Flush());
+	verify_success(vs.Commit());
+
+	res = vs.Search(UNI_L("wordA wordC"), VisitedSearch::RankSort);
+
+	verify(res != NULL);
+
+	i = 0;
+
+	while (!res->End())
+	{
+		tsize = res->Get().thumbnail_size;
+
+		switch (i)
+		{
+		case 0:
+			verify(tsize == 2);
+			break;
+		case 1:
+			verify(tsize == 4);
+			break;
+		case 2:
+			verify(tsize == 1);
+			break;
+		}
+
+		++i;
+		res->Next();
+	}
+
+	verify(i == 3);
+
+	OP_DELETE(res);
+
+	res = vs.Search(UNI_L("wordA wordC"), VisitedSearch::DateSort);
+
+	verify(res != NULL);
+
+	i = 0;
+
+	while (!res->End())
+	{
+		tsize = res->Get().thumbnail_size;
+
+		switch (i)
+		{
+		case 0:
+			verify(tsize == 4);
+			break;
+		case 1:
+			verify(tsize == 2);
+			break;
+		case 2:
+			verify(tsize == 1);
+			break;
+		}
+
+		++i;
+		res->Next();
+	}
+
+	verify(i == 3);
+
+	OP_DELETE(res);
+
+	res = vs.Search(UNI_L("url3 query3"), VisitedSearch::DateSort);
+
+	verify(res != NULL);
+
+	i = 0;
+
+	while (!res->End())
+	{
+		tsize = res->Get().thumbnail_size;
+		verify(tsize == 3);
+
+		++i;
+		res->Next();
+	}
+
+	verify(i == 1);
+
+	if (res != NULL)
+		OP_DELETE(res);
+
+	verify_success(vs.Close());
+
+	delete_file(vs_0000_w_ax);
+	delete_file(vs_0000_wb_vx);
+	delete_file(vs_0000_md_dat);
+	delete_file(vs_0000_adoc_bx);
+	delete_file(vs_0000_url_ax);
+	delete_file(vs_0000);
+	delete_file(vs_);
+}
+
+test("Phrase search") require SEARCH_ENGINE_PHRASESEARCH;
+	file uni vs_             "data/vs";
+	file uni vs_0000         "data/vs/0000";
+	file uni vs_0000_w_ax    "data/vs/0000/w.axx";
+	file uni vs_0000_wb_vx   "data/vs/0000/wb.vx";
+	file uni vs_0000_md_dat  "data/vs/0000/md.dat";
+	file uni vs_0000_adoc_bx "data/vs/0000/adoc.bx";
+	file uni vs_0000_url_ax  "data/vs/0000/url.axx";
+{
+	VisitedSearch vs;
+	VisitedSearch::RecordHandle h;
+	SearchIterator<VisitedSearch::Result> *res;
+	int i;
+	int tsize;
+
+	res = NULL;
+
+	verify(vs.Open(vs_) == OpStatus::OK);
+	verify_success(vs.Clear());
+
+	h = vs.CreateRecord("http://www.url1.org/");
+	verify_success(vs.AddTextBlock(h, UNI_L("title"), RANK_TITLE));
+	verify_success(vs.AddTextBlock(h, UNI_L("Hamlet: To be, or not to be, that is the question"), RANK_H1));
+	verify_success(vs.AssociateThumbnail("http://www.url1.org/", "1", 1));
+	verify_success(vs.CloseRecord(h));
+
+	h = vs.CreateRecord("http://www.url2.org/");
+	verify_success(vs.AddTextBlock(h, UNI_L("title"), RANK_TITLE));
+	verify_success(vs.AddTextBlock(h, UNI_L("The question is that: not to be, or to be. -Hamlet"), RANK_H2));
+	verify_success(vs.AssociateThumbnail("http://www.url2.org/", "12", 2));
+	verify_success(vs.CloseRecord(h));
+
+	h = vs.CreateRecord("http://www.url3.org/");
+	verify_success(vs.AddTextBlock(h, UNI_L("title"), RANK_TITLE));
+	verify_success(vs.AddTextBlock(h, UNI_L("To the question is: That Hamlet be, or not be"), RANK_H3));
+	verify_success(vs.AssociateThumbnail("http://www.url3.org/", "123", 3));
+	verify_success(vs.CloseRecord(h));
+
+	h = vs.CreateRecord("http://www.url4.org/");
+	verify_success(vs.AddTextBlock(h, UNI_L("title"), RANK_TITLE));
+	verify_success(vs.AddTextBlock(h, UNI_L("Question: Hamlet, is that not the... or be to?"), RANK_H4));
+	verify_success(vs.AssociateThumbnail("http://www.url4.org/", "1234", 4));
+	verify_success(vs.CloseRecord(h));
+
+	verify_success(vs.Flush());
+	verify_success(vs.Commit());
+
+	// Non-phrase, all documents match
+	res = vs.Search(UNI_L("to be or not to be"), VisitedSearch::RankSort, PhraseMatcher::AllPhrases);
+
+	verify(res != NULL);
+
+	i = 0;
+
+	while (!res->End())
+	{
+		tsize = res->Get().thumbnail_size;
+
+		switch (i)
+		{
+		case 0:
+			verify(tsize == 1);
+			break;
+		case 1:
+			verify(tsize == 2);
+			break;
+		case 2:
+			verify(tsize == 3);
+			break;
+		case 3:
+			verify(tsize == 4);
+			break;
+		}
+
+		++i;
+		res->Next();
+	}
+
+	verify(i == 4);
+
+	OP_DELETE(res);
+
+	// Phrase
+	res = vs.Search(UNI_L("\"to be or\""), VisitedSearch::RankSort, PhraseMatcher::AllPhrases);
+
+	verify(res != NULL);
+
+	i = 0;
+
+	while (!res->End())
+	{
+		tsize = res->Get().thumbnail_size;
+
+		switch (i)
+		{
+		case 0:
+			verify(tsize == 1);
+			break;
+		case 1:
+			verify(tsize == 2);
+			break;
+		}
+
+		++i;
+		res->Next();
+	}
+
+	verify(i == 2);
+
+	OP_DELETE(res);
+
+	// Special characters
+	res = vs.Search(UNI_L("be,"), VisitedSearch::RankSort, PhraseMatcher::AllPhrases);
+
+	verify(res != NULL);
+
+	i = 0;
+
+	while (!res->End())
+	{
+		tsize = res->Get().thumbnail_size;
+
+		switch (i)
+		{
+		case 0:
+			verify(tsize == 1);
+			break;
+		case 1:
+			verify(tsize == 2);
+			break;
+		case 2:
+			verify(tsize == 3);
+			break;
+		}
+
+		++i;
+		res->Next();
+	}
+
+	verify(i == 3);
+
+	OP_DELETE(res);
+
+	verify_success(vs.Close());
+
+	delete_file(vs_0000_w_ax);
+	delete_file(vs_0000_wb_vx);
+	delete_file(vs_0000_md_dat);
+	delete_file(vs_0000_adoc_bx);
+	delete_file(vs_0000_url_ax);
+	delete_file(vs_0000);
+	delete_file(vs_);
+}
+
+test("Search url with unicode hostname, CORE-27152")
+	file uni vs_             "data/vs";
+	file uni vs_0000         "data/vs/0000";
+	file uni vs_0000_w_ax    "data/vs/0000/w.axx";
+	file uni vs_0000_wb_vx   "data/vs/0000/wb.vx";
+	file uni vs_0000_md_dat  "data/vs/0000/md.dat";
+	file uni vs_0000_adoc_bx "data/vs/0000/adoc.bx";
+	file uni vs_0000_url_ax  "data/vs/0000/url.axx";
+{
+	VisitedSearch vs;
+	VisitedSearch::RecordHandle h;
+	SearchIterator<VisitedSearch::Result> *res = NULL;
+
+	verify_success(vs.Open(vs_));
+	verify_success(vs.Clear());
+
+	h = vs.CreateRecord("http://dahlstr\303\266m.net/", UNI_L("title"));
+	verify_success(vs.AddTextBlock(h, UNI_L("wordA wordB wordC wordD wordA"), RANK_P));
+	verify_success(vs.CloseRecord(h));
+	verify_success(vs.Commit());
+
+	res = vs.Search(UNI_L("dahlstr\366m"), VisitedSearch::RankSort);
+	verify(res != NULL);
+	verify(!res->End());
+
+	OP_DELETE(res);
+
+	verify_success(vs.Close());
+
+	delete_file(vs_0000_w_ax);
+	delete_file(vs_0000_wb_vx);
+	delete_file(vs_0000_md_dat);
+	delete_file(vs_0000_adoc_bx);
+	delete_file(vs_0000_url_ax);
+	delete_file(vs_0000);
+	delete_file(vs_);
+}
+
+test("Search ignoring soft-hyphen, CORE-8336")
+	file uni vs_             "data/vs";
+	file uni vs_0000         "data/vs/0000";
+	file uni vs_0000_w_ax    "data/vs/0000/w.axx";
+	file uni vs_0000_wb_vx   "data/vs/0000/wb.vx";
+	file uni vs_0000_md_dat  "data/vs/0000/md.dat";
+	file uni vs_0000_adoc_bx "data/vs/0000/adoc.bx";
+	file uni vs_0000_url_ax  "data/vs/0000/url.axx";
+{
+	VisitedSearch vs;
+	VisitedSearch::RecordHandle h;
+	SearchIterator<VisitedSearch::Result> *res = NULL;
+
+	verify(vs.Open(vs_) == OpStatus::OK);
+	verify_success(vs.Clear());
+
+	h = vs.CreateRecord("http://www.url1.org/", UNI_L("title"));
+	verify_success(vs.AddTextBlock(h, UNI_L("mich\255elle"), RANK_P));
+	verify_success(vs.CloseRecord(h));
+	verify_success(vs.Commit());
+
+	res = vs.Search(UNI_L("michel\255le"), VisitedSearch::RankSort);
+	verify(res != NULL);
+	verify(!res->End());
+
+	OP_DELETE(res);
+
+	verify_success(vs.Close());
+
+	delete_file(vs_0000_w_ax);
+	delete_file(vs_0000_wb_vx);
+	delete_file(vs_0000_md_dat);
+	delete_file(vs_0000_adoc_bx);
+	delete_file(vs_0000_url_ax);
+	delete_file(vs_0000);
+	delete_file(vs_);
+}
+
+table FineSegmentingTests(const char*, const char*)
+{
+	{ "http://t/fragment/#foo",                                                                      "fragment foo|fragment #foo" }
+	{ "http://t/path/foo",                                                                           "path/foo|path foo" }
+	{ "http://t/query/?foo=bar&baz",                                                                 "query foo=bar&baz|query foo|query bar|query baz" }
+	{ "http://t/apostrophe/foo'bar|http://t/apostrophe/?foo'bar|http://t/apostrophe/#foo'bar",       "apostrophe foo|apostrophe bar|apostrophe foo'bar" }
+	{ "http://t/camelcase/fooBar|http://t/camelcase/?fooBar|http://t/camelcase/#fooBar",             "camelcase foo|camelcase bar|camelcase foobar" }
+	{ "http://t/comma/foo,bar|http://t/comma/?foo,bar|http://t/comma/#foo,bar",                      "comma foo|comma bar|comma foo,bar" }
+	{ "http://t/dash/foo-bar|http://t/dash/?foo-bar|http://t/dash/#foo-bar",                         "dash foo|dash bar|dash foo-bar" }
+	{ "http://t/number/foo123bar|http://t/number/?foo123bar|http://t/number/#foo123bar",             "number foo|number 123|number bar|number foo123bar" }
+	{ "http://t/parenthesis/foo(bar)|http://t/parenthesis/?foo(bar)|http://t/parenthesis/#foo(bar)", "parenthesis foo|parenthesis bar|parenthesis foo(bar)" }
+	{ "http://t/plus/foo+bar|http://t/plus/?foo+bar|http://t/plus/#foo+bar",                         "plus foo|plus bar|plus foo+bar" }
+	{ "http://t/space/foo%20bar|http://t/space/?foo%20bar|http://t/space/#foo%20bar",                "space foo|space bar|space foo%20bar" }
+	{ "http://t/underscore/foo_bar|http://t/underscore/?foo_bar|http://t/underscore/#foo_bar",       "underscore foo|underscore bar|underscore foo_bar" }
+	{ "http://sitedash.foo-bar.com",                                                                 "sitedash foo|sitedash bar|sitedash foo-bar" }
+	{ "http://sitenumber.foo123bar.com",                                                             "sitenumber foo|sitenumber 123|sitenumber bar|sitenumber foo123bar" }
+	{ "http://sitecamelcase.fooBar.com",                                                             "!sitecamelcase foo|!sitecamelcase bar|sitecamelcase foobar" }
+}
+
+test("Search url with fine-grained word-segmenting, CORE-44206")
+	file uni vs_             "data/vs";
+	file uni vs_0000         "data/vs/0000";
+	file uni vs_0000_w_ax    "data/vs/0000/w.axx";
+	file uni vs_0000_wb_vx   "data/vs/0000/wb.vx";
+	file uni vs_0000_md_dat  "data/vs/0000/md.dat";
+	file uni vs_0000_adoc_bx "data/vs/0000/adoc.bx";
+	file uni vs_0000_url_ax  "data/vs/0000/url.axx";
+{
+	VisitedSearch vs;
+	VisitedSearch::RecordHandle h;
+	SearchIterator<VisitedSearch::Result> *res = NULL;
+	int errors = 0;
+
+	verify_success(vs.Open(vs_));
+	verify_success(vs.Clear());
+
+	iterate (url_list, query_list) from FineSegmentingTests
+	{
+		OpString8 url;
+		const char* p = url_list;
+		while (p && *p) {
+			const char *next = op_strchr(p, '|');
+			int len = (int)(next ? next-p : op_strlen(p));
+			url.Set(p, len);
+			p = next ? next+1 : NULL;
+			h = vs.CreateRecord(url.CStr(), UNI_L("title"));
+			verify_success(vs.AddTextBlock(h, UNI_L("wordA wordB wordC wordD wordA"), RANK_P));
+			verify_success(vs.CloseRecord(h));
+		}
+	}
+
+	verify_success(vs.Commit());
+
+	iterate (url_list, query_list) from FineSegmentingTests
+	{
+		int num_urls = 0;
+		OpString8 query8;
+		OpString query;
+		const char* p = url_list;
+		while (p && *p) {
+			num_urls++;
+			const char *next = op_strchr(p, '|');
+			p = next ? next+1 : NULL;
+		}
+		p = query_list;
+		while (p && *p) {
+			int expected_hits;
+			const char *next = op_strchr(p, '|');
+			int len = (int)(next ? next-p : op_strlen(p));
+			if (*p == '!')
+			{
+				query8.Set(p+1, len-1);
+				expected_hits = 0;
+			}
+			else
+			{
+				query8.Set(p, len);
+				expected_hits = num_urls;
+			}
+			p = next ? next+1 : NULL;
+
+			query.Set(query8);
+			res = vs.Search(query.CStr(), VisitedSearch::RankSort);
+			verify(res != NULL);
+			int num_hits = 0;
+			while (!res->End())
+			{
+				++num_hits;
+				res->Next();
+			}
+			OP_DELETE(res);
+
+			if (num_hits != expected_hits)
+			{
+				if (errors == 0)
+					output("\n");
+				errors++;
+				output("Expected %d hits for query \"%s\". Got %d\n", expected_hits, query8.CStr(), num_hits);
+			}
+		}
+	}
+
+	verify_success(vs.Close());
+
+	delete_file(vs_0000_w_ax);
+	delete_file(vs_0000_wb_vx);
+	delete_file(vs_0000_md_dat);
+	delete_file(vs_0000_adoc_bx);
+	delete_file(vs_0000_url_ax);
+	delete_file(vs_0000);
+	delete_file(vs_);
+
+	verify(errors == 0);
+}
+
+test("AllDoc search")
+	file uni vs_             "data/vs";
+	file uni vs_0000         "data/vs/0000";
+	file uni vs_0000_w_ax    "data/vs/0000/w.axx";
+	file uni vs_0000_wb_vx   "data/vs/0000/wb.vx";
+	file uni vs_0000_md_dat  "data/vs/0000/md.dat";
+	file uni vs_0000_adoc_bx "data/vs/0000/adoc.bx";
+	file uni vs_0000_url_ax  "data/vs/0000/url.axx";
+{
+	VisitedSearch vs;
+	VisitedSearch::RecordHandle h;
+	SearchIterator<VisitedSearch::Result> *res;
+	int i;
+	int id;
+	OpString8 url;
+
+	res = NULL;
+
+	verify(vs.Open(vs_) == OpStatus::OK);
+	verify_success(vs.Clear());
+
+	for (i = 0; i < 10; ++i)
+	{
+		verify_success(url.Set("http://www.url"));
+		verify_success(url.AppendFormat("%i.org", i));
+		h = vs.CreateRecord(url.CStr());
+		verify_success(vs.AddTextBlock(h, UNI_L("title"), RANK_TITLE));
+		verify_success(vs.AddTextBlock(h, UNI_L("content"), RANK_P));
+		verify_success(vs.CloseRecord(h));
+
+		verify_success(vs.Commit());
+	}
+
+	res = vs.Search(UNI_L(""));
+
+	verify(res != NULL && !res->Empty());
+
+	i = 10;
+	do {
+		--i;
+		verify(res->Get().url != NULL && op_strlen(res->Get().url) > 18);
+		id = op_atoi(res->Get().url + 14);
+		verify(id == i);
+	} while (res->Next());
+
+	verify(i == 0);
+
+	if (res != NULL)
+		OP_DELETE(res);
+
+	verify_success(vs.Close());
+
+	delete_file(vs_0000_w_ax);
+	delete_file(vs_0000_wb_vx);
+	delete_file(vs_0000_md_dat);
+	delete_file(vs_0000_adoc_bx);
+	delete_file(vs_0000_url_ax);
+	delete_file(vs_0000);
+	delete_file(vs_);
+}
+
+test("3 subindexes variable ranking")
+	file uni vs_             "data/vs";
+	file uni vs_0000         "data/vs/0000";
+	file uni vs_0000_w_ax    "data/vs/0000/w.axx";
+	file uni vs_0000_wb_vx   "data/vs/0000/wb.vx";
+	file uni vs_0000_md_dat  "data/vs/0000/md.dat";
+	file uni vs_0000_adoc_bx "data/vs/0000/adoc.bx";
+	file uni vs_0000_url_ax  "data/vs/0000/url.axx";
+	file uni vs_0001         "data/vs/0001";
+	file uni vs_0001_w_ax    "data/vs/0001/w.axx";
+	file uni vs_0001_wb_vx   "data/vs/0001/wb.vx";
+	file uni vs_0001_md_dat  "data/vs/0001/md.dat";
+	file uni vs_0001_adoc_bx "data/vs/0001/adoc.bx";
+	file uni vs_0001_url_ax  "data/vs/0001/url.axx";
+	file uni vs_0002         "data/vs/0002";
+	file uni vs_0002_w_ax    "data/vs/0002/w.axx";
+	file uni vs_0002_wb_vx   "data/vs/0002/wb.vx";
+	file uni vs_0002_md_dat  "data/vs/0002/md.dat";
+	file uni vs_0002_adoc_bx "data/vs/0002/adoc.bx";
+	file uni vs_0002_url_ax  "data/vs/0002/url.axx";
+	file uni vs_0003         "data/vs/0003";
+	file uni vs_0003_w_ax    "data/vs/0003/w.axx";
+	file uni vs_0003_wb_vx   "data/vs/0003/wb.vx";
+	file uni vs_0003_md_dat  "data/vs/0003/md.dat";
+	file uni vs_0003_adoc_bx "data/vs/0003/adoc.bx";
+	file uni vs_0003_url_ax  "data/vs/0003/url.axx";
+{
+	VisitedSearch vs;
+	VisitedSearch::RecordHandle h;
+	SearchIterator<VisitedSearch::Result> *res;
+	unsigned char *thumbnail;
+	uni_char *filename;
+	const char *slash;
+	OpString8 url;
+	int i, count;
+
+	res = NULL;
+
+	thumbnail = OP_NEWA(unsigned char, 8192);
+	filename = OP_NEWA(uni_char, 1024);
+
+	op_memset(thumbnail, 0x11, 8192);
+	op_memset(filename, 0x44, 2048);
+	filename[1023] = 0;
+
+	verify(vs.Open(vs_) == OpStatus::OK);
+	verify_success(vs.Clear());
+
+	vs.SetSubindexSize(1);
+
+	for (i = 1; i <= 150; ++i)
+	{
+		url.Empty();
+		verify_success(url.AppendFormat("%i/1", i));
+		h = vs.CreateRecord(url.CStr());
+		verify_success(vs.AddTextBlock(h, UNI_L("title"), RANK_TITLE));
+		verify_success(vs.AddTextBlock(h, UNI_L("wordA wordB wordC wordD wordA"), RANK_P * i / 150.0F));
+		verify_success(vs.AssociateThumbnail(url.CStr(), thumbnail, 8192));
+		verify_success(vs.AssociateFileName(url.CStr(), filename));
+		verify_success(vs.CloseRecord(h));
+
+		url.Empty();
+		verify_success(url.AppendFormat("%i/2", i));
+		h = vs.CreateRecord(url.CStr());
+		verify_success(vs.AddTextBlock(h, UNI_L("title"), RANK_TITLE));
+		verify_success(vs.AddTextBlock(h, UNI_L("wordA wordB wordD"), RANK_H1 * i / 150.0F));
+		verify_success(vs.AssociateThumbnail(url.CStr(), thumbnail, 8192));
+		verify_success(vs.AssociateFileName(url.CStr(), filename));
+		verify_success(vs.CloseRecord(h));
+
+		if (i % 50 == 0)
+			verify_success(vs.Commit());
+	}
+
+	res = vs.Search(UNI_L("wordA wordC"));
+
+	verify(res != NULL);
+
+	count = 0;
+	while (!res->End())
+	{
+		++count;
+
+		slash = op_strchr(res->Get().url, '/');
+		verify(slash != NULL);
+		verify(slash[1] == '1');
+
+		i = op_atoi(res->Get().url);
+
+		verify(i == count);
+
+		res->Next();
+
+		verify(res->Error() == OpStatus::OK);
+	}
+
+	verify(count == 150);
+
+	OP_DELETEA(filename);
+	OP_DELETEA(thumbnail);
+
+	if (res != NULL)
+		OP_DELETE(res);
+
+	verify_success(vs.Close());
+
+	delete_file(vs_0000_w_ax);
+	delete_file(vs_0000_wb_vx);
+	delete_file(vs_0000_md_dat);
+	delete_file(vs_0000_adoc_bx);
+	delete_file(vs_0000_url_ax);
+	delete_file(vs_0000);
+
+	delete_file(vs_0001_w_ax);
+	delete_file(vs_0001_wb_vx);
+	delete_file(vs_0001_md_dat);
+	delete_file(vs_0001_adoc_bx);
+	delete_file(vs_0001_url_ax);
+	delete_file(vs_0001);
+
+	delete_file(vs_0002_w_ax);
+	delete_file(vs_0002_wb_vx);
+	delete_file(vs_0002_md_dat);
+	delete_file(vs_0002_adoc_bx);
+	delete_file(vs_0002_url_ax);
+	delete_file(vs_0002);
+
+	delete_file(vs_0003_w_ax);
+	delete_file(vs_0003_wb_vx);
+	delete_file(vs_0003_md_dat);
+	delete_file(vs_0003_adoc_bx);
+	delete_file(vs_0003_url_ax);
+	delete_file(vs_0003);
+
+	delete_file(vs_);
+}
+
+test("3 subindexes fixed ranking")
+	file uni vs_             "data/vs";
+	file uni vs_0000         "data/vs/0000";
+	file uni vs_0000_w_ax    "data/vs/0000/w.axx";
+	file uni vs_0000_wb_vx   "data/vs/0000/wb.vx";
+	file uni vs_0000_md_dat  "data/vs/0000/md.dat";
+	file uni vs_0000_adoc_bx "data/vs/0000/adoc.bx";
+	file uni vs_0000_url_ax  "data/vs/0000/url.axx";
+	file uni vs_0001         "data/vs/0001";
+	file uni vs_0001_w_ax    "data/vs/0001/w.axx";
+	file uni vs_0001_wb_vx   "data/vs/0001/wb.vx";
+	file uni vs_0001_md_dat  "data/vs/0001/md.dat";
+	file uni vs_0001_adoc_bx "data/vs/0001/adoc.bx";
+	file uni vs_0001_url_ax  "data/vs/0001/url.axx";
+	file uni vs_0002         "data/vs/0002";
+	file uni vs_0002_w_ax    "data/vs/0002/w.axx";
+	file uni vs_0002_wb_vx   "data/vs/0002/wb.vx";
+	file uni vs_0002_md_dat  "data/vs/0002/md.dat";
+	file uni vs_0002_adoc_bx "data/vs/0002/adoc.bx";
+	file uni vs_0002_url_ax  "data/vs/0002/url.axx";
+	file uni vs_0003         "data/vs/0003";
+	file uni vs_0003_w_ax    "data/vs/0003/w.axx";
+	file uni vs_0003_wb_vx   "data/vs/0003/wb.vx";
+	file uni vs_0003_md_dat  "data/vs/0003/md.dat";
+	file uni vs_0003_adoc_bx "data/vs/0003/adoc.bx";
+	file uni vs_0003_url_ax  "data/vs/0003/url.axx";
+{
+	VisitedSearch vs;
+	VisitedSearch::RecordHandle h;
+	SearchIterator<VisitedSearch::Result> *res;
+	unsigned char *thumbnail;
+	uni_char *filename;
+	const char *slash;
+	OpString8 url;
+	int i, count;
+	unsigned pos;
+	TVector<int> ids;
+
+	res = NULL;
+
+	thumbnail = OP_NEWA(unsigned char, 8192);
+	filename = OP_NEWA(uni_char, 1024);
+
+	op_memset(thumbnail, 0x11, 8192);
+	op_memset(filename, 0x44, 2048);
+	filename[1023] = 0;
+
+	verify(vs.Open(vs_) == OpStatus::OK);
+	verify_success(vs.Clear());
+
+	vs.SetSubindexSize(1);
+
+	for (i = 1; i <= 150; ++i)
+	{
+		url.Empty();
+		verify_success(url.AppendFormat("%i/1", i));
+		h = vs.CreateRecord(url.CStr());
+		verify_success(vs.AddTextBlock(h, UNI_L("title"), RANK_TITLE));
+		verify_success(vs.AddTextBlock(h, UNI_L("wordA wordB wordC wordD wordA"), RANK_P));
+		verify_success(vs.AssociateThumbnail(url.CStr(), thumbnail, 8192));
+		verify_success(vs.AssociateFileName(url.CStr(), filename));
+		verify_success(vs.CloseRecord(h));
+
+		url.Empty();
+		verify_success(url.AppendFormat("%i/2", i));
+		h = vs.CreateRecord(url.CStr());
+		verify_success(vs.AddTextBlock(h, UNI_L("title"), RANK_TITLE));
+		verify_success(vs.AddTextBlock(h, UNI_L("wordA wordB wordD"), RANK_H1));
+		verify_success(vs.AssociateThumbnail(url.CStr(), thumbnail, 8192));
+		verify_success(vs.AssociateFileName(url.CStr(), filename));
+		verify_success(vs.CloseRecord(h));
+
+		if (i % 50 == 0)
+			verify_success(vs.Commit());
+	}
+
+	res = vs.Search(UNI_L("wordA wordC"));
+
+	verify(res != NULL);
+
+	count = 0;
+	while (!res->End())
+	{
+		++count;
+
+		slash = op_strchr(res->Get().url, '/');
+		verify(slash != NULL);
+		verify(slash[1] == '1');
+
+		i = op_atoi(res->Get().url);
+
+		verify(i >= 1 && i <= 150);
+
+		pos = ids.Search(i);
+		verify(pos >= ids.GetCount() || ids.Get(pos) != i);
+		verify_success(ids.Insert(i));
+
+		res->Next();
+
+		verify(res->Error() == OpStatus::OK);
+
+		verify(count <= 150);
+	}
+
+	verify(count == 150);
+
+	OP_DELETE(res);
+
+	ids.Clear();
+
+	res = vs.Search(UNI_L("wordA wordC"), VisitedSearch::DateSort);
+
+	verify(res != NULL);
+
+	count = 0;
+	while (!res->End())
+	{
+		++count;
+
+		slash = op_strchr(res->Get().url, '/');
+		verify(slash != NULL);
+		verify(slash[1] == '1');
+
+		i = op_atoi(res->Get().url);
+
+		verify(i >= 1 && i <= 150);
+
+		pos = ids.Search(i);
+		verify(pos >= ids.GetCount() || ids.Get(pos) != i);
+		verify_success(ids.Insert(i));
+
+		res->Next();
+
+		verify(res->Error() == OpStatus::OK);
+
+		verify(count <= 150);
+	}
+
+	verify(count == 150);
+
+	OP_DELETEA(filename);
+	OP_DELETEA(thumbnail);
+
+	if (res != NULL)
+		OP_DELETE(res);
+
+	verify_success(vs.Close());
+
+	delete_file(vs_0000_w_ax);
+	delete_file(vs_0000_wb_vx);
+	delete_file(vs_0000_md_dat);
+	delete_file(vs_0000_adoc_bx);
+	delete_file(vs_0000_url_ax);
+	delete_file(vs_0000);
+
+	delete_file(vs_0001_w_ax);
+	delete_file(vs_0001_wb_vx);
+	delete_file(vs_0001_md_dat);
+	delete_file(vs_0001_adoc_bx);
+	delete_file(vs_0001_url_ax);
+	delete_file(vs_0001);
+
+	delete_file(vs_0002_w_ax);
+	delete_file(vs_0002_wb_vx);
+	delete_file(vs_0002_md_dat);
+	delete_file(vs_0002_adoc_bx);
+	delete_file(vs_0002_url_ax);
+	delete_file(vs_0002);
+
+	delete_file(vs_0003_w_ax);
+	delete_file(vs_0003_wb_vx);
+	delete_file(vs_0003_md_dat);
+	delete_file(vs_0003_adoc_bx);
+	delete_file(vs_0003_url_ax);
+	delete_file(vs_0003);
+
+	delete_file(vs_);
+}
+
+test("size limit")
+	file uni vs_             "data/vs";
+	file uni vs_0000         "data/vs/0000";
+	file uni vs_0000_w_ax    "data/vs/0000/w.axx";
+	file uni vs_0000_wb_vx   "data/vs/0000/wb.vx";
+	file uni vs_0000_md_dat  "data/vs/0000/md.dat";
+	file uni vs_0000_adoc_bx "data/vs/0000/adoc.bx";
+	file uni vs_0000_url_ax  "data/vs/0000/url.axx";
+	file uni vs_0001         "data/vs/0001";
+	file uni vs_0001_w_ax    "data/vs/0001/w.axx";
+	file uni vs_0001_wb_vx   "data/vs/0001/wb.vx";
+	file uni vs_0001_md_dat  "data/vs/0001/md.dat";
+	file uni vs_0001_adoc_bx "data/vs/0001/adoc.bx";
+	file uni vs_0001_url_ax  "data/vs/0001/url.axx";
+	file uni vs_0002         "data/vs/0002";
+	file uni vs_0002_w_ax    "data/vs/0002/w.axx";
+	file uni vs_0002_wb_vx   "data/vs/0002/wb.vx";
+	file uni vs_0002_md_dat  "data/vs/0002/md.dat";
+	file uni vs_0002_adoc_bx "data/vs/0002/adoc.bx";
+	file uni vs_0002_url_ax  "data/vs/0002/url.axx";
+	file uni vs_0003         "data/vs/0003";
+	file uni vs_0003_w_ax    "data/vs/0003/w.axx";
+	file uni vs_0003_wb_vx   "data/vs/0003/wb.vx";
+	file uni vs_0003_md_dat  "data/vs/0003/md.dat";
+	file uni vs_0003_adoc_bx "data/vs/0003/adoc.bx";
+	file uni vs_0003_url_ax  "data/vs/0003/url.axx";
+{
+	VisitedSearch vs;
+	VisitedSearch::RecordHandle h;
+	SearchIterator<VisitedSearch::Result> *res;
+	unsigned char *thumbnail;
+	uni_char *filename;
+	OpString8 url;
+	int i, count;
+
+	res = NULL;
+
+	thumbnail = OP_NEWA(unsigned char, 8192);
+	filename = OP_NEWA(uni_char, 1024);
+
+	op_memset(thumbnail, 0x11, 8192);
+	op_memset(filename, 0x44, 2048);
+	filename[1023] = 0;
+
+	verify(vs.Open(vs_) == OpStatus::OK);
+	verify_success(vs.Clear());
+
+	vs.SetSubindexSize(1);
+	vs.SetMaxSize(2);
+
+	for (i = 1; i <= 150; ++i)
+	{
+		url.Empty();
+		verify_success(url.AppendFormat("%i/1", i));
+		h = vs.CreateRecord(url.CStr());
+		verify_success(vs.AddTextBlock(h, UNI_L("title"), RANK_TITLE));
+		verify_success(vs.AddTextBlock(h, UNI_L("wordA wordB wordC wordD wordA"), RANK_P * i / 150.0F));
+		verify_success(vs.AssociateThumbnail(url.CStr(), thumbnail, 8192));
+		verify_success(vs.AssociateFileName(url.CStr(), filename));
+		verify_success(vs.CloseRecord(h));
+
+		url.Empty();
+		verify_success(url.AppendFormat("%i/2", i));
+		h = vs.CreateRecord(url.CStr());
+		verify_success(vs.AddTextBlock(h, UNI_L("title"), RANK_TITLE));
+		verify_success(vs.AddTextBlock(h, UNI_L("wordA wordB wordD"), RANK_H1 * i / 150.0F));
+		verify_success(vs.AssociateThumbnail(url.CStr(), thumbnail, 8192));
+		verify_success(vs.AssociateFileName(url.CStr(), filename));
+		verify_success(vs.CloseRecord(h));
+
+		if (i % 50 == 0)
+			verify_success(vs.Commit());
+	}
+
+	verify_success(vs.Close());
+	verify_success(vs.Open(vs_));
+
+	res = vs.Search(UNI_L("wordA wordC"));
+
+	verify(res != NULL);
+
+	count = 0;
+	while (!res->End())
+	{
+		++count;
+
+		res->Next();
+
+		verify(res->Error() == OpStatus::OK);
+	}
+
+	verify(count == 50);
+
+	OP_DELETEA(filename);
+	OP_DELETEA(thumbnail);
+
+	if (res != NULL)
+		OP_DELETE(res);
+
+	verify_success(vs.Close());
+
+	delete_file(vs_0000_w_ax);
+	delete_file(vs_0000_wb_vx);
+	delete_file(vs_0000_md_dat);
+	delete_file(vs_0000_adoc_bx);
+	delete_file(vs_0000_url_ax);
+	delete_file(vs_0000);
+
+	delete_file(vs_0001_w_ax);
+	delete_file(vs_0001_wb_vx);
+	delete_file(vs_0001_md_dat);
+	delete_file(vs_0001_adoc_bx);
+	delete_file(vs_0001_url_ax);
+	delete_file(vs_0001);
+
+	delete_file(vs_0002_w_ax);
+	delete_file(vs_0002_wb_vx);
+	delete_file(vs_0002_md_dat);
+	delete_file(vs_0002_adoc_bx);
+	delete_file(vs_0002_url_ax);
+	delete_file(vs_0002);
+
+	delete_file(vs_0003_w_ax);
+	delete_file(vs_0003_wb_vx);
+	delete_file(vs_0003_md_dat);
+	delete_file(vs_0003_adoc_bx);
+	delete_file(vs_0003_url_ax);
+	delete_file(vs_0003);
+
+	delete_file(vs_);
+}
+
+test("size limit, missing CloseRecord, CORE-29064")
+	file uni vs_             "data/vs";
+	file uni vs_0000         "data/vs/0000";
+	file uni vs_0000_w_ax    "data/vs/0000/w.axx";
+	file uni vs_0000_wb_vx   "data/vs/0000/wb.vx";
+	file uni vs_0000_md_dat  "data/vs/0000/md.dat";
+	file uni vs_0000_adoc_bx "data/vs/0000/adoc.bx";
+	file uni vs_0000_url_ax  "data/vs/0000/url.axx";
+	file uni vs_0001         "data/vs/0001";
+	file uni vs_0001_w_ax    "data/vs/0001/w.axx";
+	file uni vs_0001_wb_vx   "data/vs/0001/wb.vx";
+	file uni vs_0001_md_dat  "data/vs/0001/md.dat";
+	file uni vs_0001_adoc_bx "data/vs/0001/adoc.bx";
+	file uni vs_0001_url_ax  "data/vs/0001/url.axx";
+	file uni vs_0002         "data/vs/0002";
+	file uni vs_0002_w_ax    "data/vs/0002/w.axx";
+	file uni vs_0002_wb_vx   "data/vs/0002/wb.vx";
+	file uni vs_0002_md_dat  "data/vs/0002/md.dat";
+	file uni vs_0002_adoc_bx "data/vs/0002/adoc.bx";
+	file uni vs_0002_url_ax  "data/vs/0002/url.axx";
+	file uni vs_0003         "data/vs/0003";
+	file uni vs_0003_w_ax    "data/vs/0003/w.axx";
+	file uni vs_0003_wb_vx   "data/vs/0003/wb.vx";
+	file uni vs_0003_md_dat  "data/vs/0003/md.dat";
+	file uni vs_0003_adoc_bx "data/vs/0003/adoc.bx";
+	file uni vs_0003_url_ax  "data/vs/0003/url.axx";
+{
+	VisitedSearch vs;
+	VisitedSearch::RecordHandle h, h1 = NULL;
+	SearchIterator<VisitedSearch::Result> *res;
+	unsigned char *thumbnail;
+	uni_char *filename;
+	OpString8 url;
+	int i, count;
+
+	res = NULL;
+
+	thumbnail = OP_NEWA(unsigned char, 8192);
+	filename = OP_NEWA(uni_char, 1024);
+
+	op_memset(thumbnail, 0x11, 8192);
+	op_memset(filename, 0x44, 2048);
+	filename[1023] = 0;
+
+	verify(vs.Open(vs_) == OpStatus::OK);
+	verify_success(vs.Clear());
+
+	vs.SetSubindexSize(1);
+	vs.SetMaxSize(2);
+
+	for (i = 1; i <= 150; ++i)
+	{
+		url.Empty();
+		verify_success(url.AppendFormat("%i/1", i));
+		h = vs.CreateRecord(url.CStr());
+		verify_success(vs.AddTextBlock(h, UNI_L("title"), RANK_TITLE));
+		verify_success(vs.AddTextBlock(h, UNI_L("wordA wordB wordC wordD wordA"), RANK_P * i / 150.0F));
+		verify_success(vs.AssociateThumbnail(url.CStr(), thumbnail, 8192));
+		verify_success(vs.AssociateFileName(url.CStr(), filename));
+		if (i != 1)
+			verify_success(vs.CloseRecord(h));
+		else
+			h1 = h; // Missing CloseRecord!
+
+		url.Empty();
+		verify_success(url.AppendFormat("%i/2", i));
+		h = vs.CreateRecord(url.CStr());
+		verify_success(vs.AddTextBlock(h, UNI_L("title"), RANK_TITLE));
+		verify_success(vs.AddTextBlock(h, UNI_L("wordA wordB wordD"), RANK_H1 * i / 150.0F));
+		verify_success(vs.AssociateThumbnail(url.CStr(), thumbnail, 8192));
+		verify_success(vs.AssociateFileName(url.CStr(), filename));
+		verify_success(vs.CloseRecord(h));
+
+		if (i % 50 == 0)
+			verify_success(vs.Commit());
+	}
+
+	res = vs.Search(UNI_L("wordA wordC"));
+
+	verify(res != NULL);
+
+	count = 0;
+	while (!res->End())
+	{
+		++count;
+
+		res->Next();
+
+		verify(res->Error() == OpStatus::OK);
+	}
+
+	vs.AbortRecord(h1); // Avoid memory leaks
+
+	OP_DELETEA(filename);
+	OP_DELETEA(thumbnail);
+
+	if (res != NULL)
+		OP_DELETE(res);
+
+	verify_success(vs.Close());
+
+	delete_file(vs_0000_w_ax);
+	delete_file(vs_0000_wb_vx);
+	delete_file(vs_0000_md_dat);
+	delete_file(vs_0000_adoc_bx);
+	delete_file(vs_0000_url_ax);
+	delete_file(vs_0000);
+
+	delete_file(vs_0001_w_ax);
+	delete_file(vs_0001_wb_vx);
+	delete_file(vs_0001_md_dat);
+	delete_file(vs_0001_adoc_bx);
+	delete_file(vs_0001_url_ax);
+	delete_file(vs_0001);
+
+	delete_file(vs_0002_w_ax);
+	delete_file(vs_0002_wb_vx);
+	delete_file(vs_0002_md_dat);
+	delete_file(vs_0002_adoc_bx);
+	delete_file(vs_0002_url_ax);
+	delete_file(vs_0002);
+
+	delete_file(vs_0003_w_ax);
+	delete_file(vs_0003_wb_vx);
+	delete_file(vs_0003_md_dat);
+	delete_file(vs_0003_adoc_bx);
+	delete_file(vs_0003_url_ax);
+	delete_file(vs_0003);
+
+	delete_file(vs_);
+
+	verify(count == 50);
+}
+
+test("Invalidation")
+	file uni vs_             "data/vs";
+	file uni vs_0000         "data/vs/0000";
+	file uni vs_0000_w_ax    "data/vs/0000/w.axx";
+	file uni vs_0000_wb_vx   "data/vs/0000/wb.vx";
+	file uni vs_0000_md_dat  "data/vs/0000/md.dat";
+	file uni vs_0000_adoc_bx "data/vs/0000/adoc.bx";
+	file uni vs_0000_url_ax  "data/vs/0000/url.axx";
+{
+	VisitedSearch vs;
+	VisitedSearch::RecordHandle h;
+	SearchIterator<VisitedSearch::Result> *res;
+
+	res = NULL;
+
+	verify(vs.Open(vs_) == OpStatus::OK);
+	verify_success(vs.Clear());
+
+	h = vs.CreateRecord("http://www.url1.org/");
+	verify_success(vs.AddTextBlock(h, UNI_L("title"), RANK_TITLE));
+	verify_success(vs.AddTextBlock(h, UNI_L("wordA wordB wordC wordD wordA"), RANK_P));
+	verify_success(vs.AssociateThumbnail("http://www.url1.org/", "1", 1));
+	verify_success(vs.CloseRecord(h));
+
+
+	h = vs.CreateRecord("http://www.url2.org/");
+	verify_success(vs.AddTextBlock(h, UNI_L("title"), RANK_TITLE));
+	verify_success(vs.AddTextBlock(h, UNI_L("wordA wordB wordC wordD"), RANK_H1));
+	verify_success(vs.AssociateThumbnail("http://www.url2.org/", "12", 2));
+	verify_success(vs.CloseRecord(h));
+
+	h = vs.CreateRecord("http://www.url3.org/");
+	verify_success(vs.AddTextBlock(h, UNI_L("title 1"), RANK_TITLE));
+	verify_success(vs.AddTextBlock(h, UNI_L("word1 word2 word3 word4"), RANK_H1));
+	verify_success(vs.AssociateThumbnail("http://www.url3.org/", "123", 3));
+	verify_success(vs.CloseRecord(h));
+
+	verify_success(vs.Commit());
+
+	h = vs.CreateRecord("http://www.url3.org/");
+	verify_success(vs.AddTextBlock(h, UNI_L("title 0"), RANK_TITLE));
+	verify_success(vs.AddTextBlock(h, UNI_L("wordi wordii wordiii wordiv"), RANK_H1));
+	verify_success(vs.AssociateThumbnail("http://www.url3.org/", "123", 3));
+	verify_success(vs.CloseRecord(h));
+
+	h = vs.CreateRecord("http://www.url3.org/");
+	verify_success(vs.AddTextBlock(h, UNI_L("title"), RANK_TITLE));
+	verify_success(vs.AddTextBlock(h, UNI_L("wordA wordB wordC wordD"), RANK_H1));
+	verify_success(vs.AssociateThumbnail("http://www.url3.org/", "123", 3));
+	verify_success(vs.CloseRecord(h));
+
+	verify_success(vs.Commit());
+
+	verify_success(vs.InvalidateUrl("http://www.url3.org/"));
+
+	res = vs.Search(UNI_L("wordA"));
+
+	verify(res != NULL && !res->End());
+
+	verify(res->Get().thumbnail_size == 2);
+
+	verify_success(vs.InvalidateResult(res->Get()));
+
+	OP_DELETE(res);
+
+	res = vs.Search(UNI_L("wordA"), VisitedSearch::DateSort);
+
+	verify(res != NULL && !res->End());
+
+	verify(res->Get().thumbnail_size == 1);
+
+	verify(!res->Next());
+
+	if (res != NULL)
+		OP_DELETE(res);
+
+	verify_success(vs.Close());
+
+	delete_file(vs_0000_w_ax);
+	delete_file(vs_0000_wb_vx);
+	delete_file(vs_0000_md_dat);
+	delete_file(vs_0000_adoc_bx);
+	delete_file(vs_0000_url_ax);
+	delete_file(vs_0000);
+	delete_file(vs_);
+}
+
+test("WordSearch")
+	file uni vs_             "data/vs";
+	file uni vs_0000         "data/vs/0000";
+	file uni vs_0000_w_ax    "data/vs/0000/w.axx";
+	file uni vs_0000_wb_vx   "data/vs/0000/wb.vx";
+	file uni vs_0000_md_dat  "data/vs/0000/md.dat";
+	file uni vs_0000_adoc_bx "data/vs/0000/adoc.bx";
+	file uni vs_0000_url_ax  "data/vs/0000/url.axx";
+{
+	VisitedSearch vs;
+	VisitedSearch::RecordHandle h;
+	uni_char *words[8];
+	int word_size = 8;
+	int word_count = 0;
+
+	verify(vs.Open(vs_) == OpStatus::OK);
+	verify_success(vs.Clear());
+
+	h = vs.CreateRecord("http://www.url1.org/", UNI_L("title1"));
+	verify_success(vs.AddTextBlock(h, UNI_L("tits"), RANK_P));
+	verify_success(vs.AssociateThumbnail("http://www.url1.org/", "1", 1));
+	verify_success(vs.CloseRecord(h));
+
+
+	h = vs.CreateRecord("http://www.url2.org/", UNI_L("title2"));
+	verify_success(vs.AddTextBlock(h, UNI_L("titan"), RANK_H1));
+	verify_success(vs.AssociateThumbnail("http://www.url2.org/", "12", 2));
+	verify_success(vs.CloseRecord(h));
+
+	verify_success(vs.Commit());
+
+	verify(vs.WordSearch(UNI_L("tit"), words, &word_size) == OpStatus::OK);
+	word_count = word_size;
+
+	verify(word_count == 4);
+
+	while (word_count > 0)
+	{
+		--word_count;
+		OP_DELETEA(words[word_count]);
+	}
+
+	verify_success(vs.Close());
+
+	delete_file(vs_0000_w_ax);
+	delete_file(vs_0000_wb_vx);
+	delete_file(vs_0000_md_dat);
+	delete_file(vs_0000_adoc_bx);
+	delete_file(vs_0000_url_ax);
+	delete_file(vs_0000);
+	delete_file(vs_);
+}
+
+test("Overwrite URL")
+	file uni vs_             "data/vs";
+	file uni vs_0000         "data/vs/0000";
+	file uni vs_0000_w_ax    "data/vs/0000/w.axx";
+	file uni vs_0000_wb_vx   "data/vs/0000/wb.vx";
+	file uni vs_0000_md_dat  "data/vs/0000/md.dat";
+	file uni vs_0000_adoc_bx "data/vs/0000/adoc.bx";
+	file uni vs_0000_url_ax  "data/vs/0000/url.axx";
+{
+	VisitedSearch vs;
+	VisitedSearch::RecordHandle h;
+	SearchIterator<VisitedSearch::Result> *res;
+
+	res = NULL;
+
+	verify(vs.Open(vs_) == OpStatus::OK);
+	verify_success(vs.Clear());
+
+	h = vs.CreateRecord("http://www.url1.org/");
+	verify_success(vs.AddTextBlock(h, UNI_L("title"), RANK_TITLE));
+	verify_success(vs.AddTextBlock(h, UNI_L("old content"), RANK_P));
+	verify_success(vs.AssociateThumbnail("http://www.url1.org/", "1", 1));
+	verify_success(vs.CloseRecord(h));
+
+
+	h = vs.CreateRecord("http://www.url1.org/");
+	verify_success(vs.AddTextBlock(h, UNI_L("title"), RANK_TITLE));
+	verify_success(vs.AddTextBlock(h, UNI_L("new content"), RANK_P));
+	verify_success(vs.AssociateThumbnail("http://www.url1.org/", "12", 2));
+	verify_success(vs.CloseRecord(h));
+
+	verify_success(vs.Commit());
+
+	h = vs.CreateRecord("http://www.url1.org/");
+	verify_success(vs.AddTextBlock(h, UNI_L("title"), RANK_TITLE));
+	verify_success(vs.AddTextBlock(h, UNI_L("even newer content"), RANK_P));
+	verify_success(vs.AssociateThumbnail("http://www.url1.org/", "123", 3));
+	verify_success(vs.CloseRecord(h));
+
+	verify_success(vs.Commit());
+
+	res = vs.Search(UNI_L("content"));
+
+	verify(res != NULL && !res->Empty());
+
+	verify(!res->Next());
+
+	if (res != NULL)
+		OP_DELETE(res);
+
+	verify_success(vs.Close());
+
+	delete_file(vs_0000_w_ax);
+	delete_file(vs_0000_wb_vx);
+	delete_file(vs_0000_md_dat);
+	delete_file(vs_0000_adoc_bx);
+	delete_file(vs_0000_url_ax);
+	delete_file(vs_0000);
+	delete_file(vs_);
+}
+
+test("thumbnails")
+	file uni vs_             "data/vs";
+	file uni vs_0000         "data/vs/0000";
+	file uni vs_0000_w_ax    "data/vs/0000/w.axx";
+	file uni vs_0000_wb_vx   "data/vs/0000/wb.vx";
+	file uni vs_0000_md_dat  "data/vs/0000/md.dat";
+	file uni vs_0000_adoc_bx "data/vs/0000/adoc.bx";
+	file uni vs_0000_url_ax  "data/vs/0000/url.axx";
+{
+	VisitedSearch vs;
+	VisitedSearch::RecordHandle h1, h2;
+	SearchIterator<VisitedSearch::Result> *res;
+	int bitmask;
+
+	res = NULL;
+
+	verify(vs.Open(vs_) == OpStatus::OK);
+	verify_success(vs.Clear());
+
+	h1 = vs.CreateRecord("http://www.url1.org/");
+	verify_success(vs.AddTextBlock(h1, UNI_L("title"), RANK_TITLE));
+	verify_success(vs.AddTextBlock(h1, UNI_L("old content"), RANK_P));
+	verify_success(vs.AssociateThumbnail("http://www.url1.org/", "1", 1));
+
+	h2 = vs.CreateRecord("http://www.url2.org/");
+	verify_success(vs.AddTextBlock(h2, UNI_L("title"), RANK_TITLE));
+	verify_success(vs.AddTextBlock(h2, UNI_L("new content"), RANK_P));
+	verify_success(vs.AssociateThumbnail("http://www.url2.org/", "12", 2));
+	verify_success(vs.CloseRecord(h2));
+	verify_success(vs.CloseRecord(h1));
+
+	h2 = vs.CreateRecord("http://www.url3.org/");
+	verify_success(vs.AddTextBlock(h2, UNI_L("title"), RANK_TITLE));
+	verify_success(vs.AddTextBlock(h2, UNI_L("new content"), RANK_P));
+	verify_success(vs.CloseRecord(h2));
+
+	h2 = vs.CreateRecord("http://www.url4.org/");
+	verify_success(vs.AddTextBlock(h2, UNI_L("title"), RANK_TITLE));
+	verify_success(vs.AddTextBlock(h2, UNI_L("new content"), RANK_P));
+	verify_success(vs.AssociateThumbnail("http://www.url4.org/", "1234", 4));
+	verify_success(vs.CloseRecord(h2));
+
+	verify_success(vs.Commit());
+
+	verify_success(vs.AssociateThumbnail("http://www.url3.org/", "123", 3));
+
+	verify_success(vs.Commit());
+
+	res = vs.Search(UNI_L("title"));
+
+	verify(res != NULL && !res->Empty());
+
+	bitmask = 0;
+	do {
+		bitmask |= 1 << (res->Get().thumbnail_size - 1);
+	} while (res->Next());
+
+	verify(bitmask == 15);
+
+	if (res != NULL)
+		OP_DELETE(res);
+
+	verify_success(vs.Close());
+
+	delete_file(vs_0000_w_ax);
+	delete_file(vs_0000_wb_vx);
+	delete_file(vs_0000_md_dat);
+	delete_file(vs_0000_adoc_bx);
+	delete_file(vs_0000_url_ax);
+	delete_file(vs_0000);
+	delete_file(vs_);
+}
+
+test("message handling init") delay post 360; disabled;
+	file uni vs_"data/vs";
+{
+	VisitedSearch::RecordHandle h;
+
+	msg_vs = OP_NEW(VisitedSearch, ());
+	verify(msg_vs != NULL);
+
+	if (msg_vs->Open(vs_) != OpStatus::OK)
+	{
+		OP_DELETE(msg_vs);
+		verify(0);
+	}
+	msg_vs->Clear();
+
+	h = msg_vs->CreateRecord("url");
+	msg_vs->AddTextBlock(h, UNI_L("text"), RANK_P);
+	if (msg_vs->CloseRecord(h) != OpStatus::OK)
+	{
+		msg_vs->AbortRecord(h);
+		OP_DELETE(msg_vs);
+		verify(0);
+	}
+
+	verify(1);
+}
+
+test("message handling test") require success "message handling init"; disabled;
+	file uni vs_             "data/vs";
+	file uni vs_0000         "data/vs/0000";
+	file uni vs_0000_w_ax    "data/vs/0000/w.axx";
+	file uni vs_0000_wb_vx   "data/vs/0000/wb.vx";
+	file uni vs_0000_md_dat  "data/vs/0000/md.dat";
+	file uni vs_0000_adoc_bx "data/vs/0000/adoc.bx";
+	file uni vs_0000_url_ax  "data/vs/0000/url.axx";
+{
+	SearchIterator<VisitedSearch::Result> *res;
+
+	res = msg_vs->Search(UNI_L("text"));
+
+	verify(res != NULL && !res->Empty());
+
+	if (res != NULL)
+		OP_DELETE(res);
+
+	OP_DELETE(msg_vs);
+
+	delete_file(vs_0000_w_ax);
+	delete_file(vs_0000_wb_vx);
+	delete_file(vs_0000_md_dat);
+	delete_file(vs_0000_adoc_bx);
+	delete_file(vs_0000_url_ax);
+	delete_file(vs_0000);
+	delete_file(vs_);
+}
+
+test("index size changed")
+	file uni vs_             "data/vs";
+	file uni vs_0000         "data/vs/0000";
+	file uni vs_0000_w_ax    "data/vs/0000/w.axx";
+	file uni vs_0000_wb_vx   "data/vs/0000/wb.vx";
+	file uni vs_0000_md_dat  "data/vs/0000/md.dat";
+	file uni vs_0000_adoc_bx "data/vs/0000/adoc.bx";
+	file uni vs_0000_url_ax  "data/vs/0000/url.axx";
+	file uni vs_0001         "data/vs/0001";
+	file uni vs_0001_w_ax    "data/vs/0001/w.axx";
+	file uni vs_0001_wb_vx   "data/vs/0001/wb.vx";
+	file uni vs_0001_md_dat  "data/vs/0001/md.dat";
+	file uni vs_0001_adoc_bx "data/vs/0001/adoc.bx";
+	file uni vs_0001_url_ax  "data/vs/0001/url.axx";
+{
+	VisitedSearch::RecordHandle h1;
+	SearchIterator<VisitedSearch::Result> *res = NULL;
+	int i;
+	const uni_char *random_chars =
+		UNI_L("lreqwg of3475u81 fjqwhf; uhfrq;r[1r-245 ljvgwer jhfo3tu[1 klgo;q'pfjkrpegu iogho3u0915u rgo;q3uy039ut[`	 iqerighig hegwyg8947yntkg hdgregh;g");
+	OpString8 url;
+
+	delete_file(vs_0001_w_ax);
+	delete_file(vs_0001_wb_vx);
+	delete_file(vs_0001_md_dat);
+	delete_file(vs_0001_adoc_bx);
+	delete_file(vs_0001_url_ax);
+	delete_file(vs_0001);
+	delete_file(vs_0000_w_ax);
+	delete_file(vs_0000_wb_vx);
+	delete_file(vs_0000_md_dat);
+	delete_file(vs_0000_adoc_bx);
+	delete_file(vs_0000_url_ax);
+	delete_file(vs_0000);
+	delete_file(vs_);
+
+	{
+		VisitedSearch vs;
+
+		vs.SetMaxSize(10);
+
+		verify_success(vs.Open(vs_));
+
+		h1 = vs.CreateRecord("http://www.url.org");
+		verify_success(vs.AddTextBlock(h1, UNI_L("text1 text2"), 0.5));
+		verify_success(vs.CloseRecord(h1));
+
+		h1 = vs.CreateRecord("http://www.url.info");
+		verify_success(vs.AddTextBlock(h1, UNI_L("text1 text2"), 0.5));
+		verify_success(vs.CloseRecord(h1));
+
+		for (i = 500; i >= 0; --i)
+		{
+			verify_success(url.Set("http://www."));
+			verify_success(url.AppendFormat("%i.xxx", i));
+			h1 = vs.CreateRecord(url.CStr());
+			verify_success(vs.AddTextBlock(h1, random_chars, 0.45F));
+			verify_success(vs.CloseRecord(h1));
+			if (i % 50 == 0)
+				verify_success(vs.Commit());
+		}
+
+		verify_success(vs.Commit());
+
+		res = vs.Search(UNI_L("text1"));
+		verify(res != NULL && !res->Empty());
+
+		vs.SetMaxSize(1);
+
+		verify(res->Get().url != NULL);
+		if (res->Next())
+			verify(res->Get().url != NULL);
+
+		OP_DELETE(res);
+		res = vs.Search(UNI_L("text1"));
+		verify(res != NULL && res->Empty());
+
+		h1 = vs.CreateRecord("http://www.url.net", UNI_L("Title"));
+		verify_success(vs.AddTextBlock(h1, UNI_L("text1 text2"), 0.5));
+
+		verify_success(vs.CloseRecord(h1));
+
+		verify_success(vs.Commit());
+
+		OP_DELETE(res);
+		res = vs.Search(UNI_L("text1"));
+		verify(res != NULL && !res->Empty());
+
+		verify_success(vs.Close());
+	}
+
+	if (res != NULL)
+		OP_DELETE(res);
+
+	delete_file(vs_0001_w_ax);
+	delete_file(vs_0001_wb_vx);
+	delete_file(vs_0001_md_dat);
+	delete_file(vs_0001_adoc_bx);
+	delete_file(vs_0001_url_ax);
+	delete_file(vs_0001);
+	delete_file(vs_0000_w_ax);
+	delete_file(vs_0000_wb_vx);
+	delete_file(vs_0000_md_dat);
+	delete_file(vs_0000_adoc_bx);
+	delete_file(vs_0000_url_ax);
+	delete_file(vs_0000);
+	delete_file(vs_);
+
+}
+
+test("AbortRecord")
+	file uni vs_             "data/vs";
+	file uni vs_0000         "data/vs/0000";
+	file uni vs_0000_w_ax    "data/vs/0000/w.axx";
+	file uni vs_0000_wb_vx   "data/vs/0000/wb.vx";
+	file uni vs_0000_md_dat  "data/vs/0000/md.dat";
+	file uni vs_0000_adoc_bx "data/vs/0000/adoc.bx";
+	file uni vs_0000_url_ax  "data/vs/0000/url.axx";
+{
+	VisitedSearch vs;
+	VisitedSearch::RecordHandle h1, h2;
+	SearchIterator<VisitedSearch::Result> *res;
+	int count;
+
+	verify(vs.Open(vs_) == OpStatus::OK);
+	verify_success(vs.Clear());
+
+	h1 = vs.CreateRecord("http://www.url.org/");
+
+	verify_success(vs.AddTextBlock(h1, UNI_L("title of the document"), RANK_TITLE));
+	verify_success(vs.AddTextBlock(h1, UNI_L("the text of\r\n the first paragraph"), RANK_P));
+
+	verify_success(vs.CloseRecord(h1));
+
+	h2 = vs.CreateRecord("http://www.url.net/");
+
+	verify_success(vs.AddTextBlock(h2, UNI_L("title of the second document"), RANK_TITLE));
+	verify_success(vs.AddTextBlock(h2, UNI_L("the text of\r\n the first paragraph"), RANK_P));
+
+	vs.AbortRecord(h2);
+
+	verify_success(vs.Commit());
+
+	count = 0;
+	res = vs.Search(UNI_L("title"));
+	count = 0;
+	if (res != NULL && !res->Empty())
+	{
+		++count;
+
+		while (res->Next())
+			++count;
+
+		if (OpStatus::IsError(res->Error()))
+			++count;
+	}
+
+	OP_DELETE(res);
+
+	g_main_message_handler->RemoveDelayedMessage(MSG_VISITEDSEARCH_PREFLUSH, (MH_PARAM_1)&vs, 0);
+
+	verify_success(vs.Close());
+
+	delete_file(vs_0000_w_ax);
+	delete_file(vs_0000_wb_vx);
+	delete_file(vs_0000_md_dat);
+	delete_file(vs_0000_adoc_bx);
+	delete_file(vs_0000_url_ax);
+	delete_file(vs_0000);
+	delete_file(vs_);
+
+	verify(count == 1);
+}
+
+test("FastPrefixSearch")
+	file uni vs_             "data/vs";
+	file uni vs_0000         "data/vs/0000";
+	file uni vs_0000_w_ax    "data/vs/0000/w.axx";
+	file uni vs_0000_wb_vx   "data/vs/0000/wb.vx";
+	file uni vs_0000_md_dat  "data/vs/0000/md.dat";
+	file uni vs_0000_adoc_bx "data/vs/0000/adoc.bx";
+	file uni vs_0000_url_ax  "data/vs/0000/url.axx";
+{
+	VisitedSearch vs;
+	VisitedSearch::RecordHandle h;
+	SearchIterator<VisitedSearch::Result> *res;
+	int count, empty1, empty2, single, not_prefix;
+
+	verify(vs.Open(vs_) == OpStatus::OK);
+	verify_success(vs.Clear());
+
+	h = vs.CreateRecord("http://www.url.org/");
+	verify_success(vs.AddTitle(h, UNI_L("title of the document")));
+	verify_success(vs.AddTextBlock(h, UNI_L("the text of\r\n the first paragraph"), RANK_P));
+	verify_success(vs.CloseRecord(h));
+
+	verify_success(vs.Commit());
+
+	h = vs.CreateRecord("http://www.url.org/");
+	verify_success(vs.AddTitle(h, UNI_L("title of the document")));
+	verify_success(vs.AddTextBlock(h, UNI_L("the text of the first paragraph"), RANK_P));
+	verify_success(vs.CloseRecord(h));
+
+	h = vs.CreateRecord("http://www.gliding.org/");
+	verify_success(vs.AddTitle(h, UNI_L("title of the document")));
+	verify_success(vs.AddTextBlock(h, UNI_L("a text about paraglides, one paragraph"), RANK_P));
+	verify_success(vs.CloseRecord(h));
+
+	h = vs.CreateRecord("http://www.paralympics.org/");
+	verify_success(vs.AddTitle(h, UNI_L("title of the document")));
+	verify_success(vs.AddTextBlock(h, UNI_L("text about olympics of the disabled"), RANK_P));
+	verify_success(vs.CloseRecord(h));
+
+	h = vs.CreateRecord("http://www.other.org/");
+	verify_success(vs.AddTitle(h, UNI_L("title of the document")));
+	verify_success(vs.AddTextBlock(h, UNI_L("this should not appear in the result"), RANK_P));
+	verify_success(vs.CloseRecord(h));
+
+	verify_success(vs.Commit());
+
+	count = 0;
+	res = vs.FastPrefixSearch(UNI_L("title text para"));
+	if (res != NULL && !res->Empty() && !OpStatus::IsError(res->Error()))
+	{
+		++count;
+
+		while (res->Next())
+			++count;
+	}
+
+	if (res != NULL && OpStatus::IsError(res->Error()))
+		count = 0;
+
+	OP_DELETE(res);
+
+	empty1 = 0;
+	res = vs.FastPrefixSearch(UNI_L(""));
+	if (res == NULL || !res->Empty() || OpStatus::IsError(res->Error()))
+		++empty1;
+
+	OP_DELETE(res);
+
+	empty2 = 0;
+	res = vs.FastPrefixSearch(UNI_L("empty"));
+	if (res == NULL || !res->Empty() || OpStatus::IsError(res->Error()))
+		++empty2;
+
+	OP_DELETE(res);
+
+	single = 0;
+	res = vs.FastPrefixSearch(UNI_L("text"));
+	if (res != NULL && !res->Empty() && !OpStatus::IsError(res->Error()))
+	{
+		++single;
+
+		while (res->Next())
+			++single;
+	}
+
+	if (res != NULL && OpStatus::IsError(res->Error()))
+		single = 0;
+
+	OP_DELETE(res);
+
+	not_prefix = 0;
+	res = vs.FastPrefixSearch(UNI_L("para "));
+	if (res == NULL || !res->Empty() || OpStatus::IsError(res->Error()))
+		++not_prefix;
+
+	OP_DELETE(res);
+
+	g_main_message_handler->RemoveDelayedMessage(MSG_VISITEDSEARCH_PREFLUSH, (MH_PARAM_1)&vs, 0);
+	g_main_message_handler->RemoveDelayedMessage(MSG_VISITEDSEARCH_PREFLUSH, (MH_PARAM_1)&vs, 0);
+
+	verify_success(vs.Close());
+
+	delete_file(vs_0000_w_ax);
+	delete_file(vs_0000_wb_vx);
+	delete_file(vs_0000_md_dat);
+	delete_file(vs_0000_adoc_bx);
+	delete_file(vs_0000_url_ax);
+	delete_file(vs_0000);
+	delete_file(vs_);
+
+	verify(count == 3);
+	verify(empty1 == 0);
+	verify(empty2 == 0);
+	verify(single == 3);
+	verify(not_prefix == 0);
+}
+
+test("FastPrefixSearch during flushing")
+	file uni vs_             "data/vs";
+	file uni vs_0000         "data/vs/0000";
+	file uni vs_0000_w_ax    "data/vs/0000/w.axx";
+	file uni vs_0000_wb_vx   "data/vs/0000/wb.vx";
+	file uni vs_0000_md_dat  "data/vs/0000/md.dat";
+	file uni vs_0000_adoc_bx "data/vs/0000/adoc.bx";
+	file uni vs_0000_url_ax  "data/vs/0000/url.axx";
+{
+	VisitedSearch vs;
+	VisitedSearch::RecordHandle h;
+	SearchIterator<VisitedSearch::Result> *res;
+	int count_pf, count_f;
+
+	verify(vs.Open(vs_) == OpStatus::OK);
+	verify_success(vs.Clear());
+
+	h = vs.CreateRecord("http://www.url.org/");
+	verify_success(vs.AddTitle(h, UNI_L("title of the document")));
+	verify_success(vs.AddTextBlock(h, UNI_L("the text of\r\n the first paragraph"), RANK_P));
+	verify_success(vs.CloseRecord(h));
+
+	verify_success(vs.Commit());
+
+	h = vs.CreateRecord("http://www.url.net/");
+	verify_success(vs.AddTitle(h, UNI_L("title of the document")));
+	verify_success(vs.AddTextBlock(h, UNI_L("the text of the first paragraph"), RANK_P));
+	verify_success(vs.CloseRecord(h));
+
+	verify_success(vs.PreFlush());
+
+	count_pf = 0;
+	res = vs.FastPrefixSearch(UNI_L("title text para"));
+	if (res != NULL && !res->Empty() && !OpStatus::IsError(res->Error()))
+	{
+		++count_pf;
+
+		while (res->Next())
+			++count_pf;
+	}
+
+	if (res != NULL && OpStatus::IsError(res->Error()))
+		count_pf = 0;
+
+	OP_DELETE(res);
+
+	verify_success(vs.Flush());
+
+	count_f = 0;
+	res = vs.FastPrefixSearch(UNI_L("title text para"));
+	if (res != NULL && !res->Empty() && !OpStatus::IsError(res->Error()))
+	{
+		++count_f;
+
+		while (res->Next())
+			++count_f;
+	}
+
+	if (res != NULL && OpStatus::IsError(res->Error()))
+		count_f = 0;
+
+	OP_DELETE(res);
+
+	verify_success(vs.Commit());
+
+	g_main_message_handler->RemoveDelayedMessage(MSG_VISITEDSEARCH_PREFLUSH, (MH_PARAM_1)&vs, 0);
+	g_main_message_handler->RemoveDelayedMessage(MSG_VISITEDSEARCH_PREFLUSH, (MH_PARAM_1)&vs, 0);
+
+	verify_success(vs.Close());
+
+	delete_file(vs_0000_w_ax);
+	delete_file(vs_0000_wb_vx);
+	delete_file(vs_0000_md_dat);
+	delete_file(vs_0000_adoc_bx);
+	delete_file(vs_0000_url_ax);
+	delete_file(vs_0000);
+	delete_file(vs_);
+
+	// the main purpose of this selftest is to verify that it doesn't crash or something like that
+	verify(count_pf > 0);
+	verify(count_f > 0);
+}
+
+test("FastPrefixSearch with cache")
+	file uni vs_             "data/vs";
+	file uni vs_0000         "data/vs/0000";
+	file uni vs_0000_w_ax    "data/vs/0000/w.axx";
+	file uni vs_0000_wb_vx   "data/vs/0000/wb.vx";
+	file uni vs_0000_md_dat  "data/vs/0000/md.dat";
+	file uni vs_0000_adoc_bx "data/vs/0000/adoc.bx";
+	file uni vs_0000_url_ax  "data/vs/0000/url.axx";
+{
+	VisitedSearch vs;
+	VisitedSearch::RecordHandle h;
+	SearchIterator<VisitedSearch::Result> *res;
+	int count, empty1, empty2, single, not_prefix;
+
+	verify(vs.Open(vs_) == OpStatus::OK);
+	verify_success(vs.Clear());
+
+	h = vs.CreateRecord("http://www.url.org/");
+	verify_success(vs.AddTitle(h, UNI_L("title of the document")));
+	verify_success(vs.AddTextBlock(h, UNI_L("the text of\r\n the first paragraph"), RANK_P));
+	verify_success(vs.CloseRecord(h));
+
+	verify_success(vs.Commit());
+
+	h = vs.CreateRecord("http://www.gliding.org/");
+	verify_success(vs.AddTitle(h, UNI_L("title of the document")));
+	verify_success(vs.AddTextBlock(h, UNI_L("a text about paraglides, one paragraph"), RANK_P));
+	verify_success(vs.CloseRecord(h));
+
+	h = vs.CreateRecord("http://www.paralympics.org/");
+	verify_success(vs.AddTitle(h, UNI_L("title of the document")));
+	verify_success(vs.AddTextBlock(h, UNI_L("text about olympics of the disabled"), RANK_P));
+	verify_success(vs.CloseRecord(h));
+
+	h = vs.CreateRecord("http://www.other.org/");
+	verify_success(vs.AddTitle(h, UNI_L("title of the document")));
+	verify_success(vs.AddTextBlock(h, UNI_L("this should not appear in the result"), RANK_P));
+	verify_success(vs.CloseRecord(h));
+
+	count = 0;
+	res = vs.FastPrefixSearch(UNI_L("title text para"));
+	if (res != NULL && !res->Empty() && !OpStatus::IsError(res->Error()))
+	{
+		++count;
+
+		while (res->Next())
+			++count;
+	}
+
+	if (res != NULL && OpStatus::IsError(res->Error()))
+		count = 0;
+
+	OP_DELETE(res);
+
+	empty1 = 0;
+	res = vs.FastPrefixSearch(UNI_L(""));
+	if (res == NULL || !res->Empty() || OpStatus::IsError(res->Error()))
+		++empty1;
+
+	OP_DELETE(res);
+
+	empty2 = 0;
+	res = vs.FastPrefixSearch(UNI_L("empty"));
+	if (res == NULL || !res->Empty() || OpStatus::IsError(res->Error()))
+		++empty2;
+
+	OP_DELETE(res);
+
+	single = 0;
+	res = vs.FastPrefixSearch(UNI_L("text"));
+	if (res != NULL && !res->Empty() && !OpStatus::IsError(res->Error()))
+	{
+		++single;
+
+		while (res->Next())
+			++single;
+	}
+
+	if (res != NULL && OpStatus::IsError(res->Error()))
+		single = 0;
+
+	OP_DELETE(res);
+
+	not_prefix = 0;
+	res = vs.FastPrefixSearch(UNI_L("para "));
+	if (res == NULL || !res->Empty() || OpStatus::IsError(res->Error()))
+		++not_prefix;
+
+	OP_DELETE(res);
+
+	g_main_message_handler->RemoveDelayedMessage(MSG_VISITEDSEARCH_PREFLUSH, (MH_PARAM_1)&vs, 0);
+	g_main_message_handler->RemoveDelayedMessage(MSG_VISITEDSEARCH_PREFLUSH, (MH_PARAM_1)&vs, 0);
+
+	verify_success(vs.Close());
+
+	delete_file(vs_0000_w_ax);
+	delete_file(vs_0000_wb_vx);
+	delete_file(vs_0000_md_dat);
+	delete_file(vs_0000_adoc_bx);
+	delete_file(vs_0000_url_ax);
+	delete_file(vs_0000);
+	delete_file(vs_);
+
+	verify(count == 3);
+	verify(empty1 == 0);
+	verify(empty2 == 0);
+	verify(single == 3);
+	verify(not_prefix == 0);
+}
+
+test("FastPrefixSearch with cache only")
+	file uni vs_             "data/vs";
+	file uni vs_0000         "data/vs/0000";
+	file uni vs_0000_w_ax    "data/vs/0000/w.axx";
+	file uni vs_0000_wb_vx   "data/vs/0000/wb.vx";
+	file uni vs_0000_md_dat  "data/vs/0000/md.dat";
+	file uni vs_0000_adoc_bx "data/vs/0000/adoc.bx";
+	file uni vs_0000_url_ax  "data/vs/0000/url.axx";
+{
+	VisitedSearch vs;
+	VisitedSearch::RecordHandle h;
+	SearchIterator<VisitedSearch::Result> *res;
+	int count, empty1, empty2, single, not_prefix;
+
+	verify(vs.Open(vs_) == OpStatus::OK);
+	verify_success(vs.Clear());
+
+	h = vs.CreateRecord("http://www.url.org/");
+	verify_success(vs.AddTitle(h, UNI_L("title of the document")));
+	verify_success(vs.AddTextBlock(h, UNI_L("the text of\r\n the first paragraph"), RANK_P));
+	verify_success(vs.CloseRecord(h));
+
+	h = vs.CreateRecord("http://www.url.xxx/");
+	verify_success(vs.AddTitle(h, UNI_L("xxx")));
+	verify_success(vs.AddTextBlock(h, UNI_L("next"), RANK_P));
+	verify_success(vs.CloseRecord(h));
+
+	count = 0;
+	res = vs.FastPrefixSearch(UNI_L("title text para"));
+	if (res != NULL && !res->Empty() && !OpStatus::IsError(res->Error()))
+	{
+		++count;
+
+		while (res->Next())
+			++count;
+	}
+
+	if (res != NULL && OpStatus::IsError(res->Error()))
+		count = 0;
+
+	OP_DELETE(res);
+
+	empty1 = 0;
+	res = vs.FastPrefixSearch(UNI_L(""));
+	if (res == NULL || !res->Empty() || OpStatus::IsError(res->Error()))
+		++empty1;
+
+	OP_DELETE(res);
+
+	empty2 = 0;
+	res = vs.FastPrefixSearch(UNI_L("title next para"));
+	if (res == NULL || !res->Empty() || OpStatus::IsError(res->Error()))
+		++empty2;
+
+	OP_DELETE(res);
+
+	single = 0;
+	res = vs.FastPrefixSearch(UNI_L("text"));
+	if (res != NULL && !res->Empty() && !OpStatus::IsError(res->Error()))
+	{
+		++single;
+
+		while (res->Next())
+			++single;
+	}
+
+	if (res != NULL && OpStatus::IsError(res->Error()))
+		single = 0;
+
+	OP_DELETE(res);
+
+	not_prefix = 0;
+	res = vs.FastPrefixSearch(UNI_L("para "));
+	if (res == NULL || !res->Empty() || OpStatus::IsError(res->Error()))
+		++not_prefix;
+
+	OP_DELETE(res);
+
+	g_main_message_handler->RemoveDelayedMessage(MSG_VISITEDSEARCH_PREFLUSH, (MH_PARAM_1)&vs, 0);
+	g_main_message_handler->RemoveDelayedMessage(MSG_VISITEDSEARCH_PREFLUSH, (MH_PARAM_1)&vs, 0);
+
+	verify_success(vs.Close());
+
+	delete_file(vs_0000_w_ax);
+	delete_file(vs_0000_wb_vx);
+	delete_file(vs_0000_md_dat);
+	delete_file(vs_0000_adoc_bx);
+	delete_file(vs_0000_url_ax);
+	delete_file(vs_0000);
+	delete_file(vs_);
+
+	verify(count == 1);
+	verify(empty1 == 0);
+	verify(empty2 == 0);
+	verify(single == 1);
+	verify(not_prefix == 0);
+}
+
+test("FastPrefixSearch, one incomplete word, with cache only")
+	file uni vs_             "data/vs";
+	file uni vs_0000         "data/vs/0000";
+	file uni vs_0000_w_ax    "data/vs/0000/w.axx";
+	file uni vs_0000_wb_vx   "data/vs/0000/wb.vx";
+	file uni vs_0000_md_dat  "data/vs/0000/md.dat";
+	file uni vs_0000_adoc_bx "data/vs/0000/adoc.bx";
+	file uni vs_0000_url_ax  "data/vs/0000/url.axx";
+{
+	VisitedSearch vs;
+	VisitedSearch::RecordHandle h;
+	SearchIterator<VisitedSearch::Result> *res;
+	int count;
+
+	verify(vs.Open(vs_) == OpStatus::OK);
+	verify_success(vs.Clear());
+
+	h = vs.CreateRecord("http://www.url.org/");
+	verify_success(vs.AddTitle(h, UNI_L("title of the document")));
+	verify_success(vs.AddTextBlock(h, UNI_L("the text of\r\n the first paragraph"), RANK_P));
+	verify_success(vs.CloseRecord(h));
+
+	h = vs.CreateRecord("http://www.paralympics.org/");
+	verify_success(vs.AddTitle(h, UNI_L("title of the document")));
+	verify_success(vs.AddTextBlock(h, UNI_L("text about olympics of the disabled"), RANK_P));
+	verify_success(vs.CloseRecord(h));
+
+	count = 0;
+	res = vs.FastPrefixSearch(UNI_L("para"));
+	if (res != NULL && !res->Empty() && !OpStatus::IsError(res->Error()))
+	{
+		++count;
+
+		while (res->Next())
+			++count;
+	}
+
+	if (res != NULL && OpStatus::IsError(res->Error()))
+		count = 0;
+
+	OP_DELETE(res);
+
+	g_main_message_handler->RemoveDelayedMessage(MSG_VISITEDSEARCH_PREFLUSH, (MH_PARAM_1)&vs, 0);
+	g_main_message_handler->RemoveDelayedMessage(MSG_VISITEDSEARCH_PREFLUSH, (MH_PARAM_1)&vs, 0);
+
+	verify_success(vs.Close());
+
+	delete_file(vs_0000_w_ax);
+	delete_file(vs_0000_wb_vx);
+	delete_file(vs_0000_md_dat);
+	delete_file(vs_0000_adoc_bx);
+	delete_file(vs_0000_url_ax);
+	delete_file(vs_0000);
+	delete_file(vs_);
+
+	verify(count == 2);
+}
+
+test("CreateRecord, Clear, CloseRecord (CORE-24268)")
+	file uni vs_             "data/vs";
+	file uni vs_0000         "data/vs/0000";
+	file uni vs_0000_w_ax    "data/vs/0000/w.axx";
+	file uni vs_0000_wb_vx   "data/vs/0000/wb.vx";
+	file uni vs_0000_md_dat  "data/vs/0000/md.dat";
+	file uni vs_0000_adoc_bx "data/vs/0000/adoc.bx";
+	file uni vs_0000_url_ax  "data/vs/0000/url.axx";
+{
+	VisitedSearch vs;
+	VisitedSearch::RecordHandle h1, h2;
+	SearchIterator<VisitedSearch::Result> *res;
+	OP_STATUS status1,status2;
+	int count;
+
+	verify(vs.Open(vs_) == OpStatus::OK);
+	verify_success(vs.Clear());
+
+	h1 = vs.CreateRecord("http://www.url.org/");
+
+	verify_success(vs.AddTextBlock(h1, UNI_L("title of the document"), RANK_TITLE));
+	verify_success(vs.AddTextBlock(h1, UNI_L("the text of\r\n the first paragraph"), RANK_P));
+
+	verify_success(vs.CloseRecord(h1));
+
+	h2 = vs.CreateRecord("http://www.url.net/");
+	verify_success(vs.AddTextBlock(h2, UNI_L("title of the second document"), RANK_TITLE));
+
+	/**/
+	verify_success(vs.Clear());
+	/**/
+	
+	status1 = vs.AddTextBlock(h2, UNI_L("the text of\r\n the first paragraph"), RANK_P);
+	status2 = vs.CloseRecord(h2);
+
+	verify_success(vs.Commit());
+
+	res = vs.Search(UNI_L("title"));
+	count = 0;
+	if (res != NULL && !res->Empty())
+	{
+		++count;
+
+		while (res->Next())
+			++count;
+
+		if (OpStatus::IsError(res->Error()))
+			++count;
+	}
+
+	OP_DELETE(res);
+
+	g_main_message_handler->RemoveDelayedMessage(MSG_VISITEDSEARCH_PREFLUSH, (MH_PARAM_1)&vs, 0);
+
+	verify_success(vs.Close());
+
+	delete_file(vs_0000_w_ax);
+	delete_file(vs_0000_wb_vx);
+	delete_file(vs_0000_md_dat);
+	delete_file(vs_0000_adoc_bx);
+	delete_file(vs_0000_url_ax);
+	delete_file(vs_0000);
+	delete_file(vs_);
+
+	verify(count == 0);
+	verify(OpStatus::IsError(status1));
+	verify(OpStatus::IsError(status2));
+}
+
+test("VisitedSearch::Result::Assign")
+{
+	VisitedSearch::Result result1;
+	VisitedSearch::Result result2;
+
+	const size_t TITLE_BUFFER_LEN = 6;
+	uni_char title[TITLE_BUFFER_LEN];  // ARRAY OK 2012-02-10 msimonides
+	uni_strcpy(title, UNI_L("Title"));
+
+	const size_t URL_BUFFER_LEN = 28;
+	char url[URL_BUFFER_LEN];  // ARRAY OK 2012-02-15 msimonides
+	op_strcpy(url, "http://opera.com/result_url");
+
+	result1.url = url;
+	result1.title = title;
+	result1.thumbnail = NULL;
+	result1.thumbnail_size = 0;
+	result1.filename = NULL;
+	result1.visited = 3600;
+	result1.ranking = 0.5;
+
+	result1.id = 1;
+	result1.invalid = FALSE;
+	result1.prev_idx = 0;
+	result1.prev = 1;
+	result1.next_idx = 2;
+	result1.next = 3;
+
+	verify_success(VisitedSearch::Result::Assign(&result2, &result1));
+
+	verify_string(result2.url, result1.url);
+	verify_string(result2.title, result1.title);
+
+	verify(result2.thumbnail == NULL);
+	verify(result2.thumbnail_size == result1.thumbnail_size);
+	verify(result2.filename == NULL);
+
+	verify(result2.visited == result1.visited);
+	verify(result2.ranking == result1.ranking);
+	verify(result2.id == result1.id);
+	verify(result2.invalid == result1.invalid);
+	verify(result2.prev_idx == result1.prev_idx);
+	verify(result2.prev == result1.prev);
+	verify(result2.next_idx == result1.next_idx);
+	verify(result2.next == result1.next);
+}
+finally {
+	VisitedSearch::Result::DeleteResult(&result2);
+}

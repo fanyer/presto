@@ -1,0 +1,147 @@
+/* -*- Mode: c++; tab-width: 4; indent-tabs-mode: t; c-basic-offset: 4; c-file-style:"stroustrup" -*-
+ *
+ * Copyright (C) 2012 Opera Software ASA.  All rights reserved.
+ *
+ * This file is part of the Opera web browser.
+ * It may not be distributed under any circumstances.
+ */
+
+group "pi.optimeinfo";
+require init;
+
+include "modules/pi/OpTimeInfo.h";
+
+global
+{
+	OpTimeInfo* time_info;
+}
+
+
+test("create/destroy") repeat 17; leakcheck;
+{
+	time_info = NULL;
+	OP_STATUS status = OpTimeInfo::Create(&time_info);
+	verify(OpStatus::IsSuccess(status) && time_info != NULL);
+	OP_DELETE(time_info);
+	time_info = NULL;
+}
+
+test("create")
+{
+	OP_STATUS status = OpTimeInfo::Create(&time_info);
+	verify(OpStatus::IsSuccess(status) && time_info != NULL);
+}
+
+test("GetWallClock (implementation check)") leakcheck; require success "create";
+{
+	int ms_not_zero = 0;
+	unsigned long seconds = 0;
+	unsigned long milliseconds = 0;
+
+	for (int i = 0; i<1000; ++i)
+	{
+		unsigned int last_seconds = seconds;
+		time_info->GetWallClock(seconds, milliseconds);
+		verify(seconds != 0);
+		verify(seconds >= last_seconds);
+		if (milliseconds != 0)
+			++ms_not_zero;
+	}
+
+	verify(ms_not_zero != 0); // it is unlikely that we will hit an even second 1000 times in a row.
+}
+
+test("GetWallClockMS (implementation check)") leakcheck; require success "create";
+{
+	double t = time_info->GetWallClockMS();
+	verify(t != 0);
+	verify(t>1000.0); // epoch will most likely be more than 1 s back.
+}
+
+test("GetWallClockResolution (implementation check)") leakcheck; require success "create";
+{
+	double resolution = time_info->GetWallClockResolution();
+	output("(got %f) ", resolution);
+	verify(resolution != 0.0);
+}
+
+test("GetTimeUTC") leakcheck; require success "create";
+{
+	double t = time_info->GetTimeUTC();
+	// This test is a kludge: it assumes you're running it in the same year you compiled it.
+	const time_t twentyten = 1262304000; // 2010-01-01 00:00:00
+	const int compiled = op_atoi(__DATE__+7); // Year of compilation
+	verify(compiled >= 2010 && compiled < 2100); // Update after the twenty-first century !
+	const int year = 9 * 24 * (400 * 365 + 97); // Gregorian year, in seconds.
+	const int run = static_cast<int>((t/1e3 - twentyten)/year + 2010); // Round down, to get "this year"
+	output("(got %f, in %d) ", t, run);
+	verify(run == compiled); // May be off for the last or first day or two of each year
+}
+
+test("GetRuntimeMS (is it monotonically increasing?)") leakcheck; require success "create";
+{
+	// Comparing floating point numbers isn't uncomplicated. This test
+	// has a history of failing randomly due to FPU registers having
+	// higher precision than doubles stored in memory (x86). When
+	// values were moved from the FPU register to RAM they were
+	// truncated and that truncation could actually make a number
+	// larger so that a comparision signalled an error when there was
+	// none. Fix in this testcase is to mark the variables as volatile
+	// to force them all into memory storage and (hopefully) the same
+	// precision. More info in CORE-25460.
+	volatile double t = time_info->GetRuntimeMS();
+	const double first_t = t;
+	verify(t > 0.0);
+	for (int i = 0 ; i < 17 || first_t == t ; ++i)
+	{
+		volatile double old_t = t;
+		t = time_info->GetRuntimeMS();
+		verify(t >= old_t);
+	}
+	verify(t > first_t);
+}
+
+test("GetTimeZone") leakcheck; require success "create";
+{
+	long tz = time_info->GetTimezone();
+	// Test that it's within the plausible range:
+	verify(tz <= 13 * 3600 && tz > -15 * 3600);
+	/* Actual time-zones exist from -14 to +12; some obscure Pacific islands
+	 * East of the date line use time-zones < -12 ! */
+
+	if (tz)
+	{
+		// Catch anyone who's measured it in hours or minutes instead of seconds:
+		verify(tz > 840 || tz < -840);
+	}
+
+	// Sanity constraint - always a multiple of 5 minutes:
+	verify(tz % 300 == 0);
+}
+
+test("DaylightSavingsTimeAdjustmentMS") leakcheck; require success "create";
+{
+	double summer = time_info->DaylightSavingsTimeAdjustmentMS(1119218400.0 * 1000); // 2005-06-20
+	double winter = time_info->DaylightSavingsTimeAdjustmentMS(1135378800.0 * 1000); // 2005-12-24
+	if (summer < winter)
+	{
+		double tmp = summer;
+		summer = winter;
+		winter = tmp;
+		output("(you seem to be in the Southern hemisphere) ");
+	}
+	else
+		output("(you seem to be in the Northern hemisphere) ");
+
+	if (summer - winter > 1e-3)
+		verify(op_fabs(summer - 3.6e6) < 1e-3);
+	else
+		output("(you seem to be in a DST-less time-zone) ");
+
+	verify(op_fabs(winter) < 1e-3);
+}
+
+exit
+{
+	OP_DELETE(time_info);
+}

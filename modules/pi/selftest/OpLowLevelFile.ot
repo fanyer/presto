@@ -1,0 +1,1648 @@
+/* -*- Mode: c++; tab-width: 4; indent-tabs-mode: t; c-basic-offset: 4; c-file-style:"stroustrup" -*-
+ *
+ * Copyright (C) 1995-2011 Opera Software ASA.  All rights reserved.
+ *
+ * This file is part of the Opera web browser.
+ * It may not be distributed under any circumstances.
+ */
+
+group "pi.oplowlevelfile";
+
+include "modules/pi/system/OpLowLevelFile.h";
+include "modules/pi/OpSystemInfo.h";
+include "modules/util/opfile/opfolder.h";
+
+global
+{
+	// Dynamically create a path for a testing file
+	OP_STATUS SetupPathString(OpString &str, const char* filename) {
+		RETURN_IF_ERROR(g_folder_manager->GetFolderPath(OPFILE_SELFTEST_DATA_FOLDER, str));
+		RETURN_IF_ERROR(str.AppendFormat(UNI_L("modules%cpi%cselftest%cdata%c"), PATHSEPCHAR, PATHSEPCHAR, PATHSEPCHAR, PATHSEPCHAR));
+		RETURN_IF_ERROR(str.Append(filename));
+		return OpStatus::OK;
+	}
+
+	OP_STATUS DeleteFile(const uni_char *name)
+	{
+		OpLowLevelFile *d;
+		RETURN_IF_ERROR(OpLowLevelFile::Create(&d, name));
+		OP_STATUS rv = d->Delete();
+		OP_DELETE(d);
+		return rv;
+	}
+
+	OP_STATUS OpenFile(OpLowLevelFile **f, const uni_char* path, int mode)
+	{
+		*f = NULL;
+		RETURN_IF_ERROR(OpLowLevelFile::Create(f, path));
+
+		OP_STATUS rv = (*f)->Open(mode);
+		if (OpStatus::IsError(rv))
+		{
+			OP_DELETE(*f);
+			*f = NULL;
+		}
+
+		return rv;
+	}
+
+	OP_STATUS CloseFile(OpLowLevelFile *f)
+	{
+		if (f == NULL)
+			return OpStatus::ERR_NULL_POINTER;
+
+		OP_STATUS st = f->Close();
+		OP_DELETE(f);
+		return st;
+	}
+
+	OpLowLevelFile* olf;
+}
+
+test("create object")
+{
+	OpString path;
+	OP_STATUS status = SetupPathString(path, "binfile1.bin");
+	verify_success(status);
+	status = OpLowLevelFile::Create(&olf, path.CStr());
+	verify(OpStatus::IsSuccess(status) && olf != NULL);
+}
+
+test("Exists") require success "create object";
+{
+	BOOL status = FALSE;
+	verify_success(olf->Exists(&status));
+	verify(status);
+}
+
+test("close without open") require success "create object";
+{
+	verify(!olf->IsOpen());
+
+	OP_STATUS status = olf->Close();
+	verify_success(status);
+
+	verify(!olf->IsOpen());
+
+	status = olf->Close();
+	verify_success(status);
+
+	verify(!olf->IsOpen());
+}
+
+test("IsOpen on closed file") require success "create object";
+{
+	verify(!olf->IsOpen());
+}
+
+test("simple SafeClose") require success "create object";
+{
+	verify(!olf->IsOpen());
+	verify_success(olf->SafeClose());
+	verify(!olf->IsOpen());
+
+	verify_success(olf->Open(OPFILE_WRITE));
+	verify(olf->IsOpen());
+
+	char c = 0;
+	verify_success(olf->Write(&c, 1));
+
+	verify_success(olf->SafeClose());
+	verify(!olf->IsOpen());
+
+	OpFileLength length;
+	verify_success(olf->GetFileLength(&length));
+	verify(length == 1);
+}
+finally
+{
+	olf->Close();
+	olf->Open(OPFILE_WRITE);
+	olf->Close();
+}
+
+test("CreateCopy") require success "create object";
+{
+	OpLowLevelFile* copy = NULL;
+
+	verify(!olf->IsOpen());
+	verify_success(olf->Open(OPFILE_READ));
+
+	copy = olf->CreateCopy();
+	verify(olf->IsOpen());
+	verify(!copy->IsOpen());
+
+	verify_success(copy->Open(OPFILE_READ));
+	verify(copy->IsOpen());
+
+	verify_success(olf->Close());
+}
+finally
+{
+	OP_DELETE(copy);
+}
+
+test("Bug#269900: Flush() on a closed file") require success "IsOpen on closed file";
+{
+	verify(!olf->IsOpen());
+	verify(OpStatus::IsError(olf->Flush()));
+}
+
+test("open") require success "create object";
+{
+	OP_STATUS status = olf->Open(OPFILE_READ);
+	verify_success(status);
+}
+
+test("IsOpen on open file") require success "open";
+{
+	verify(olf->IsOpen());
+}
+
+test("close after open") require success "open";
+{
+	OP_STATUS status = olf->Close();
+	verify_success(status);
+}
+
+test("IsOpen on open then closed file") require success "close after open";
+{
+	verify(!olf->IsOpen());
+}
+
+test("free object") require success "create object";
+{
+	OP_DELETE(olf);
+	olf = NULL;
+}
+
+test("open with allowed and disallowed modes") require success "free object"; leakcheck;
+{
+	UINT8 *disallowed_mode = 0;
+
+	const UINT8 modifier_flags[] = {
+		0,
+		OPFILE_TEXT,
+		OPFILE_COMMIT,
+		OPFILE_COMMIT | OPFILE_TEXT,
+		OPFILE_SHAREDENYREAD,
+		OPFILE_SHAREDENYREAD | OPFILE_TEXT,
+		OPFILE_SHAREDENYREAD | OPFILE_COMMIT,
+		OPFILE_SHAREDENYREAD | OPFILE_COMMIT | OPFILE_TEXT,
+		OPFILE_SHAREDENYWRITE,
+		OPFILE_SHAREDENYWRITE | OPFILE_TEXT,
+		OPFILE_SHAREDENYWRITE | OPFILE_COMMIT,
+		OPFILE_SHAREDENYWRITE | OPFILE_COMMIT | OPFILE_TEXT,
+		OPFILE_SHAREDENYWRITE | OPFILE_SHAREDENYREAD,
+		OPFILE_SHAREDENYWRITE | OPFILE_SHAREDENYREAD | OPFILE_TEXT,
+		OPFILE_SHAREDENYWRITE | OPFILE_SHAREDENYREAD | OPFILE_COMMIT,
+		OPFILE_SHAREDENYWRITE | OPFILE_SHAREDENYREAD | OPFILE_COMMIT | OPFILE_TEXT
+	};
+
+	OpString path;
+	OP_STATUS status = SetupPathString(path, "binfile2.bin");
+	verify_success(status);
+	status = OpLowLevelFile::Create(&olf, path.CStr());
+	verify(OpStatus::IsSuccess(status) && olf != NULL);
+	unsigned int mode_count = (OPFILE_SHAREDENYWRITE | OPFILE_SHAREDENYREAD | OPFILE_COMMIT | OPFILE_TEXT | OPFILE_UPDATE | OPFILE_APPEND | OPFILE_WRITE | OPFILE_READ) + 1;
+	unsigned int i;
+
+	disallowed_mode = OP_NEWA(UINT8, mode_count);
+	verify(disallowed_mode);
+
+	BOOL exists = FALSE;
+	verify_success(olf->Exists(&exists));
+	verify(exists);
+
+	op_memset(disallowed_mode, 0, mode_count);
+
+	for (i = 0; i < sizeof(modifier_flags); ++i)
+	{
+		disallowed_mode[modifier_flags[i]] = 1;
+		disallowed_mode[modifier_flags[i] | OPFILE_UPDATE | OPFILE_READ] = 1;
+		disallowed_mode[modifier_flags[i] | OPFILE_UPDATE | OPFILE_WRITE] = 1;
+		disallowed_mode[modifier_flags[i] | OPFILE_UPDATE | OPFILE_WRITE | OPFILE_READ] = 1;
+		disallowed_mode[modifier_flags[i] | OPFILE_UPDATE | OPFILE_APPEND] = 1;
+		disallowed_mode[modifier_flags[i] | OPFILE_UPDATE | OPFILE_APPEND | OPFILE_READ] = 1;
+		disallowed_mode[modifier_flags[i] | OPFILE_UPDATE | OPFILE_APPEND | OPFILE_WRITE] = 1;
+		disallowed_mode[modifier_flags[i] | OPFILE_UPDATE | OPFILE_APPEND | OPFILE_WRITE | OPFILE_READ] = 1;
+		disallowed_mode[modifier_flags[i] | OPFILE_APPEND | OPFILE_WRITE] = 1;
+		disallowed_mode[modifier_flags[i] | OPFILE_APPEND | OPFILE_WRITE | OPFILE_READ] = 1;
+		disallowed_mode[modifier_flags[i] | OPFILE_SHAREDENYREAD | OPFILE_READ] = 1;
+	}
+
+	for (i = 0; i < mode_count; ++i)
+	{
+		OP_STATUS result = olf->Open(i);
+		if (disallowed_mode[i])
+		{
+			verify(result == OpStatus::ERR);
+			verify(!olf->IsOpen());
+		}
+		else
+		{
+			verify(result == OpStatus::OK);
+			verify(olf->IsOpen());
+			verify_success(olf->Close());
+		}
+	}
+}
+finally
+{
+	OP_DELETE(olf);
+	olf = NULL;
+	OP_DELETEA(disallowed_mode);
+}
+
+test("OpFileInfo") require success "free object"; leakcheck;
+{
+	OpString path;
+	OP_STATUS status = SetupPathString(path, "binfile3.bin");
+	verify_success(status);
+	status = OpLowLevelFile::Create(&olf, path.CStr());
+	verify(OpStatus::IsSuccess(status) && olf != NULL);
+
+	OpFileInfo info;
+	info.flags = OpFileInfo::FULL_PATH | OpFileInfo::SERIALIZED_NAME | OpFileInfo::WRITABLE | OpFileInfo::OPEN | OpFileInfo::LENGTH | OpFileInfo::LAST_MODIFIED;
+
+	verify_success(olf->GetFileInfo(&info));
+	verify(uni_strcmp(info.full_path, olf->GetFullPath()) == 0);
+	verify(uni_strcmp(info.serialized_name, olf->GetSerializedName()) == 0);
+	// TODO: test vs OpSystemInfo::ExpandSystemVariblesInString()
+	verify(!info.open);
+	verify(info.open == olf->IsOpen());
+
+	// last:
+	verify_success(olf->Open(OPFILE_READ));
+	OpFileInfo info2;
+	info2.flags = OpFileInfo::FULL_PATH | OpFileInfo::SERIALIZED_NAME | OpFileInfo::WRITABLE | OpFileInfo::OPEN | OpFileInfo::LENGTH | OpFileInfo::LAST_MODIFIED;
+
+	verify_success(olf->GetFileInfo(&info2));
+	verify(info2.open);
+	verify(info2.open == olf->IsOpen());
+}
+finally
+{
+	OP_DELETE(olf);
+	olf = NULL;
+}
+
+table InfoChange(const char*, BOOL, BOOL, BOOL)
+{
+	{ "all",        TRUE,   TRUE,   TRUE },
+	{ "writable",   TRUE,   FALSE,  FALSE },
+	{ "modified",   FALSE,  TRUE,   FALSE },
+	{ "created",    FALSE,  FALSE,  TRUE }
+}
+foreach (name, canwrite, modified, created) from InfoChange
+{
+	test("ChangeFileInfo: " name) require SUPPORT_OPFILEINFO_CHANGE;
+	{
+		OpFileInfoChange change;
+		OpString path;
+		verify_success(SetupPathString(path, "binfile3.bin"));
+		verify_success(OpLowLevelFile::Create(&olf, path.CStr()));
+
+		OpFileInfo prior; // For use in unsupported's check on no change
+		prior.flags = OpFileInfo::WRITABLE | OpFileInfo::LAST_MODIFIED | OpFileInfo::CREATION_TIME;
+		verify_success(olf->GetFileInfo(&prior));
+ 
+		change.flags = (canwrite ? OpFileInfoChange::WRITABLE      : 0)
+			         | (modified ? OpFileInfoChange::LAST_MODIFIED : 0)
+			         | (created  ? OpFileInfoChange::CREATION_TIME : 0);
+
+		change.writable = FALSE;
+		change.last_modified = 1572566400; // November 1st 2019
+		change.creation_time = 216777600; // November 14th 1976
+
+		OP_STATUS result = olf->ChangeFileInfo(&change);
+
+		OpFileInfo info;
+		if (OpStatus::IsSuccess(result))
+		{
+			info.flags = prior.flags;
+			verify_success(olf->GetFileInfo(&info));
+			verify(info.writable == (canwrite ? change.writable : prior.writable));
+			verify(info.last_modified == (modified ? change.last_modified : prior.last_modified));
+			if (created || !canwrite)
+			{
+				/* Change to writable is a meta-data change, so may change
+				 * "creation" time; see OpFileInfoChange::creation_time spec. */
+				verify(info.creation_time == (created ? change.creation_time : prior.creation_time));
+			}
+
+			if (canwrite)
+			{
+				verify(!olf->IsWritable());
+
+				int oldflags = change.flags;
+
+				change.flags = OpFileInfoChange::WRITABLE;
+				change.writable = TRUE;
+				verify_success(olf->ChangeFileInfo(&change));
+
+				verify(olf->IsWritable());
+
+				info.flags = OpFileInfo::WRITABLE;
+				verify_success(olf->GetFileInfo(&info));
+				verify(info.writable);
+
+				change.flags = oldflags;
+			}
+
+			// Restore status quo ante:
+			change.writable = prior.writable;
+			change.last_modified = prior.last_modified;
+			change.creation_time = prior.creation_time;
+			verify_success(olf->ChangeFileInfo(&change));
+		}
+		else if (result != OpStatus::ERR_NOT_SUPPORTED) // failed
+			  verify(OpStatus::IsSuccess(result) || result == OpStatus::ERR_NOT_SUPPORTED);
+		else
+			output("(not supported by platform; that's OK) ");
+ 
+		// Verify nothing changed
+		info.flags = prior.flags;
+		verify_success(olf->GetFileInfo(&info));
+ 
+		verify(info.writable == prior.writable);
+		verify(info.last_modified == prior.last_modified);
+		if (OpStatus::IsSuccess(result) && (created || !canwrite))
+			verify(info.creation_time == prior.creation_time);
+
+	}
+	finally
+	{
+		OP_DELETE(olf);
+		olf = 0;
+	}
+}
+
+test("GetLocalizedPath") // coverage test
+{
+	OpString path;
+	verify_success(SetupPathString(path, "binfile3.bin"));
+	verify_success(OpLowLevelFile::Create(&olf, path.CStr()));
+
+	OpString text;
+	verify_success(text.Set("unmodified"));
+	OP_STATUS result = olf->GetLocalizedPath(&text);
+	if (OpStatus::IsSuccess(result))
+		verify(text.Compare("unmodified") != 0);
+	else // Defined list of return values:
+		verify(result == OpStatus::ERR_NO_MEMORY || result == OpStatus::ERR);
+}
+finally
+{
+	OP_DELETE(olf);
+	olf = 0;
+}
+
+test("Exists vs IsWritable: plain file")
+{
+	OpString path;
+	verify_success(SetupPathString(path, "non.existent"));
+	verify_success(OpLowLevelFile::Create(&olf, path.CStr()));
+
+	BOOL extant = TRUE;
+	verify(OpStatus::IsSuccess(olf->Exists(&extant)) && !extant);
+	verify(olf->IsWritable()); // we could create it if we wanted to
+}
+finally
+{
+	OP_DELETE(olf);
+	olf = 0;
+}
+
+test("Exists vs IsWritable: missing subdir")
+{
+	OpString path;
+	verify_success(SetupPathString(path, "non.existent/file.name"));
+	verify_success(OpLowLevelFile::Create(&olf, path.CStr()));
+
+	BOOL extant = TRUE;
+	verify(OpStatus::IsSuccess(olf->Exists(&extant)) && !extant);
+	verify(olf->IsWritable()); // we could create it if we wanted to
+}
+finally
+{
+	OP_DELETE(olf);
+	olf = 0;
+}
+
+test("Read() with bytes_read == NULL yields ERR_NULL_POINTER")
+{
+	OpLowLevelFile *f = 0;
+	char buf[5];
+
+	OpString path;
+	verify_success(g_folder_manager->GetFolderPath(OPFILE_HOME_FOLDER, path));
+	verify_success(path.Append("append.bin"));
+
+	// Create the file
+	verify_success(OpLowLevelFile::Create(&f, path));
+	verify(f);
+
+	// Delete if it exists
+	BOOL exists = FALSE;
+	verify_success(f->Exists(&exists));
+	if (exists)
+	{
+		verify_success(f->Delete());
+	}
+
+	// Open for append + read
+	verify_success(f->Open(OPFILE_OVERWRITE));
+	verify(f->IsOpen());
+
+	// Write some data
+	verify_success(f->Write("data", 14));
+
+	// Read some (not all) data from start
+	verify_success(f->SetFilePos(0, SEEK_FROM_START));
+	verify_status(f->Read(buf, 4, NULL), OpStatus::ERR_NULL_POINTER);
+}
+finally
+{
+	if (f)
+	{
+		OpStatus::Ignore(f->Close());
+		OpStatus::Ignore(f->Delete());
+		OP_DELETE(f);
+	}
+}
+
+test("Bug#222586: Append write at end of file")
+{
+	OpLowLevelFile *f = 0;
+	char buf[32]; /* ARRAY OK 2012-02-23 terjepe */
+
+	// Bug 222586
+	OpString path;
+	verify_success(g_folder_manager->GetFolderPath(OPFILE_HOME_FOLDER, path));
+	verify_success(path.Append("append.bin"));
+
+	// Create the file
+	verify_success(OpLowLevelFile::Create(&f, path));
+	verify(f);
+
+	// Delete if it exists
+	BOOL exists = FALSE;
+	verify_success(f->Exists(&exists));
+	if (exists)
+	{
+		verify_success(f->Delete());
+	}
+
+	// Open for append + read
+	verify_success(f->Open(OPFILE_APPEND | OPFILE_READ));
+	verify(f->IsOpen());
+
+	// Write some data
+	verify_success(f->Write("firstdatachunk", 14));
+
+	// Read some (not all) data from start
+	verify_success(f->SetFilePos(0, SEEK_FROM_START));
+	OpFileLength bytesread = 0;
+	verify_success(f->Read(buf, 5, &bytesread));
+	verify(bytesread == 5 && op_strncmp(buf, "first", 5) == 0);
+
+	// Between read and write, there must be an intervening SetFilePos()
+	verify_success(f->SetFilePos(5, SEEK_FROM_START));
+
+	// Write some more data, this should end up at the end of the file.
+	verify_success(f->Write("moreinformation", 15));
+
+	// Make sure the first string is intact
+	verify_success(f->SetFilePos(0, SEEK_FROM_START));
+	verify_success(f->Read(buf, 14, &bytesread));
+	// If this fails, Write() did not move to end of file
+	verify(bytesread == 14 && op_strncmp(buf, "firstdatachunk", 14) == 0);
+
+	// Make sure the whole file is correct
+	verify_success(f->SetFilePos(0, SEEK_FROM_START));
+	verify_success(f->Read(buf, 29, &bytesread));
+	verify(bytesread == 29 && op_strncmp(buf, "firstdatachunkmoreinformation", 29) == 0);
+}
+finally
+{
+	if (f)
+	{
+		OpStatus::Ignore(f->Close());
+		OpStatus::Ignore(f->Delete());
+		OP_DELETE(f);
+	}
+}
+
+test("Sharing")
+	disabled; // see bug#264278: You can only deny *other processes*.
+{
+	OpLowLevelFile *f1, *f2;
+	OpString path;
+	BOOL create, open, shread_ok, shread_err, shwrite_err;
+
+	verify_success(SetupPathString(path, "file.bin"));
+	DeleteFile(path.CStr());
+
+	create = OpStatus::IsSuccess(OpenFile(&f1, path.CStr(), OPFILE_WRITE));
+	create &= OpStatus::IsSuccess(CloseFile(f1));
+
+	open = OpStatus::IsSuccess(OpenFile(&f1, path.CStr(), OPFILE_UPDATE));
+	open &= OpStatus::IsSuccess(CloseFile(f1));
+
+	if ((shread_ok = OpStatus::IsSuccess(OpenFile(&f1, path.CStr(), OPFILE_READ | OPFILE_SHAREDENYWRITE))))
+	{
+		shread_ok = OpStatus::IsSuccess(OpenFile(&f2, path.CStr(), OPFILE_READ | OPFILE_SHAREDENYWRITE));
+
+		CloseFile(f2);
+		CloseFile(f1);
+	}
+
+	if ((shread_err = OpStatus::IsSuccess(OpenFile(&f1, path.CStr(), OPFILE_UPDATE | OPFILE_SHAREDENYREAD))))
+	{
+		shread_err = OpStatus::IsError(OpenFile(&f2, path.CStr(), OPFILE_READ | OPFILE_SHAREDENYWRITE));
+
+		CloseFile(f2);
+		CloseFile(f1);
+	}
+
+	if ((shwrite_err = OpStatus::IsSuccess(OpenFile(&f1, path.CStr(), OPFILE_UPDATE | OPFILE_SHAREDENYREAD | OPFILE_SHAREDENYWRITE))))
+	{
+		shwrite_err = OpStatus::IsError(OpenFile(&f2, path.CStr(), OPFILE_READ | OPFILE_SHAREDENYWRITE));
+		CloseFile(f2);
+
+		shwrite_err |= OpStatus::IsError(OpenFile(&f2, path.CStr(), OPFILE_WRITE | OPFILE_SHAREDENYREAD | OPFILE_SHAREDENYWRITE));
+		CloseFile(f2);
+
+		CloseFile(f1);
+	}
+
+	DeleteFile(path.CStr());
+
+	if (!shread_ok || !shread_err || !shwrite_err)
+		output("\nOpLowLevelFile doesn't support shared open ... ");
+
+	verify(create);
+	verify(open);
+	verify(shread_ok);
+	verify(shread_err);
+	verify(shwrite_err);
+}
+
+test("assumptive Flush") disabled;
+ /* This test is disabled because it makes assumptions both about I/O speed and
+	op_clock() resolution (which is 100Hz on my system). */
+{
+	OpLowLevelFile *f;
+	OpString path;
+	unsigned int i;
+	double ct, st, wt, ft;
+	char buf[256]; /* ARRAY OK 2009-02-16 mstensho */
+	OpFileLength pos;
+
+	verify_success(SetupPathString(path, "file.bin"));
+	DeleteFile(path.CStr());
+
+	verify_success(OpenFile(&f, path.CStr(), OPFILE_WRITE));
+
+	for (i = 0; i < sizeof(buf); ++i)
+		buf[i] = (char)i;
+
+	pos = 0;
+	ct = g_op_time_info->GetRuntimeMS();
+	wt = 0;
+	ft = 0;
+	for (i = 0; i < 16; ++i)
+	{
+		st = g_op_time_info->GetRuntimeMS();
+		f->Write(buf, sizeof(buf));
+		pos += sizeof(buf) / 2;
+		f->SetFilePos(pos);
+		f->Write(buf, sizeof(buf));
+		wt += g_op_time_info->GetRuntimeMS() - st;
+
+		st = g_op_time_info->GetRuntimeMS();
+		f->Flush();
+		ft += g_op_time_info->GetRuntimeMS() - st;
+	}
+
+	ct = g_op_time_info->GetRuntimeMS() - ct;
+	ct -= wt;
+
+	ct = (ct + ft) * 500 / 1000;
+
+	CloseFile(f);
+
+	DeleteFile(path.CStr());
+
+	if (ct > 98)
+		output("\nFlush is too slow. OpLowLevelFile does probably sync instead. ");
+
+	verify(ct <= 98);
+}
+
+test("assumptive SafeClose") disabled;
+ /* This test is disabled because it makes assumptions both about I/O speed and
+	op_clock() resolution (which is 100Hz on my system). */
+{
+	OpLowLevelFile *f;
+	OpString path;
+	unsigned int i;
+	double ct, st, wt, ft;
+	char buf[256]; /* ARRAY OK 2009-02-16 mstensho */
+	OpFileLength pos;
+
+	verify_success(SetupPathString(path, "file.bin"));
+	DeleteFile(path.CStr());
+
+	verify_success(OpenFile(&f, path.CStr(), OPFILE_WRITE));
+
+	for (i = 0; i < sizeof(buf); ++i)
+		buf[i] = (char)i;
+
+	pos = 0;
+	ct = g_op_time_info->GetRuntimeMS();
+	wt = 0;
+	ft = 0;
+	for (i = 0; i < 16; ++i)
+	{
+		st = g_op_time_info->GetRuntimeMS();
+		f->Write(buf, sizeof(buf));
+		pos += sizeof(buf) / 2;
+		f->SetFilePos(pos);
+		f->Write(buf, sizeof(buf));
+		wt += g_op_time_info->GetRuntimeMS() - st;
+
+		st = g_op_time_info->GetRuntimeMS();
+		f->SafeClose();
+		f->Open(OPFILE_UPDATE);
+		ft += g_op_time_info->GetRuntimeMS() - st;
+		f->SetFilePos(pos + sizeof(buf));
+	}
+
+	ct = g_op_time_info->GetRuntimeMS() - ct;
+	ct -= wt;
+
+	ct = (ct + ft) * 500 / 1000;
+
+	CloseFile(f);
+
+	DeleteFile(path.CStr());
+
+	if (ct <= 98)
+		output("\nSafeClose is pretty fast. OpLowLevelFile probably doesn't make sure that the data are on the metal. \n");
+
+	verify(ct > 98);
+}
+
+test("SetFileLength")
+{
+	OpLowLevelFile *f = NULL;
+	OpFileLength len;
+	OpString path;
+	signed char c;
+	int i;
+
+	verify_success(SetupPathString(path, "file.bin"));
+	DeleteFile(path.CStr());
+
+	verify_success(OpenFile(&f, path.CStr(), OPFILE_WRITE | OPFILE_READ));
+
+	c = 0;
+	for (i = 0; i < 96; ++i)
+	{
+		verify_success(f->Write(&c, 1));
+	}
+
+	verify_success(f->GetFileLength(&len));
+
+	verify(len == 96);
+
+	verify_success(f->Flush());
+
+	verify_success(f->SetFileLength(128));
+
+	verify_success(f->GetFileLength(&len));
+
+	verify(len == 128);
+
+	verify_success(f->SetFilePos(127));
+
+	verify(!f->Eof());
+
+	c = -1;
+
+	verify(OpStatus::IsSuccess(f->Read(&c, 1, &len)) && len == 1);
+
+	if (c == -1)
+	{
+		c = 0;
+
+		verify_success(f->SetFilePos(127));
+
+		verify(OpStatus::IsSuccess(f->Read(&c, 1, &len)) && len == 1);
+
+		verify(c != 0);
+	}
+
+	verify(OpStatus::IsSuccess(f->Read(&c, 1, &len)) && len == 0 && f->Eof());
+
+	verify_success(f->SetFileLength(64));
+
+	verify_success(f->GetFileLength(&len));
+
+	verify(len == 64);
+
+	verify_success(f->SetFilePos(63));
+
+	verify(OpStatus::IsSuccess(f->Read(&c, 1, &len)) && len == 1);
+
+	verify(OpStatus::IsSuccess(f->Read(&c, 1, &len)) && len == 0 && f->Eof());
+
+	verify_success(f->Close());
+}
+finally {
+	CloseFile(f);
+	DeleteFile(path.CStr());
+}
+
+test("SetFileLength wo/Flush")
+{
+	OpLowLevelFile *f = NULL;
+	OpFileLength len;
+	OpString path;
+	char c;
+	int i;
+
+	verify_success(SetupPathString(path, "file.bin"));
+	DeleteFile(path.CStr());
+
+	verify_success(OpenFile(&f, path.CStr(), OPFILE_WRITE | OPFILE_READ));
+
+	c = 0;
+	for (i = 0; i < 96; ++i)
+	{
+		verify_success(f->Write(&c, 1));
+	}
+
+	verify_success(f->SetFileLength(64));
+
+	verify_success(f->GetFileLength(&len));
+
+	verify(len == 64);
+}
+finally {
+	CloseFile(f);
+	DeleteFile(path.CStr());
+}
+
+test("make directory")
+{
+	OpString path;
+	OpLowLevelFile* dir = 0;
+	OpLowLevelFile* file = 0;
+	BOOL direxists;
+	OpFileInfo info;
+
+	verify_success(SetupPathString(path, "TestDir"));
+	verify_success(path.Append(PATHSEP));
+	verify_success(path.Append("subdir"));
+	verify_success(OpLowLevelFile::Create(&dir, path));
+
+	verify_success(path.Append(PATHSEP));
+	verify_success(path.Append("testfile.txt"));
+	verify_success(OpLowLevelFile::Create(&file, path));
+
+	verify_success(dir->MakeDirectory());
+	verify_success(dir->Exists(&direxists));
+	verify(direxists);
+
+	info.flags = OpFileInfo::MODE;
+	verify_success(dir->GetFileInfo(&info));
+	verify(info.mode == OpFileInfo::DIRECTORY);
+
+	verify_success(file->Open(OPFILE_WRITE));
+	verify_success(file->Close());
+	verify_success(file->Delete());
+}
+finally
+{
+	OP_DELETE(file);
+	OP_DELETE(dir);
+}
+
+test("delete directory") require success "make directory";
+{
+	OpLowLevelFile *outerdir = 0;
+	OpLowLevelFile *innerdir = 0;
+	OpString path;
+	BOOL direxists;
+
+	verify_success(SetupPathString(path, "TestDir"));
+	verify_success(OpLowLevelFile::Create(&outerdir, path));
+	verify_success(path.Append(PATHSEP));
+	verify_success(path.Append("subdir"));
+	verify_success(OpLowLevelFile::Create(&innerdir, path));
+
+	verify_success(innerdir->Exists(&direxists));
+	verify(direxists); // left over from test("make directory")
+	verify_success(innerdir->Delete());
+	verify_success(innerdir->Exists(&direxists));
+	verify(!direxists);
+}
+finally
+{
+	OP_DELETE(outerdir);
+	OP_DELETE(innerdir);
+}
+
+test("Eof")
+{
+	OpLowLevelFile* f = 0;
+	OpString path;
+	const char data[] = { 1, 2, 3, 4, 5 };
+	char *buf = OP_NEWA(char, sizeof(data) + 1);
+	OpFileLength bytes;
+
+	verify(buf);
+
+	buf[sizeof(data)] = 42;
+
+	verify_success(SetupPathString(path, "eoftest.bin"));
+	verify_success(OpLowLevelFile::Create(&f, path.CStr()));
+
+	f->Delete();
+
+	verify_success(f->Open(OPFILE_WRITE | OPFILE_READ));
+	verify(!f->Eof());
+
+	verify_success(f->Write(data, sizeof(data)));
+	verify(!f->Eof());
+
+	verify_success(f->SetFilePos(0));
+	verify(!f->Eof());
+
+	verify_success(f->SetFilePos(0, SEEK_FROM_END));
+	verify(!f->Eof());
+
+	verify_success(f->SetFilePos(sizeof(data)));
+	verify(!f->Eof());
+
+	verify_success(f->SetFilePos(0));
+	verify_success(f->Read(buf, sizeof(data), &bytes));
+	verify(bytes == sizeof(data));
+	verify(!f->Eof());
+
+	verify_success(f->Read(buf, 1, &bytes));
+	verify(bytes == 0);
+	verify(f->Eof());
+
+	verify_success(f->SetFilePos(0, SEEK_FROM_END));
+	verify(!f->Eof());
+
+	verify_success(f->Read(buf, 1, &bytes));
+	verify(bytes == 0);
+	verify(f->Eof());
+
+	verify_success(f->SetFileLength(sizeof(data)-1));
+	verify(!f->Eof());
+
+	verify(buf[sizeof(data)] == 42);
+}
+finally
+{
+	if (f)
+	{
+		f->Close();
+		f->Delete();
+		OP_DELETE(f);
+	}
+
+	OP_DELETEA(buf);
+}
+
+test("append")
+{
+	OpLowLevelFile* f = 0;
+	OpString path;
+	const char data[] = { 1, 2, 3, 4, 5 };
+	OpFileLength pos;
+	OpFileLength len;
+	BOOL exists;
+
+	verify_success(SetupPathString(path, "readappend.bin"));
+	verify_success(OpLowLevelFile::Create(&f, path.CStr()));
+
+	verify_success(f->Exists(&exists));
+	if (exists)
+		verify_success(f->Delete());
+	verify_success(f->Exists(&exists));
+	verify(!exists);
+
+	verify_success(f->Open(OPFILE_APPEND));
+	verify_success(f->Write(data, sizeof(data)));
+	verify_success(f->GetFilePos(&pos));
+	verify(pos == sizeof(data));
+	verify_success(f->Close());
+
+	verify_success(f->Open(OPFILE_WRITE));
+	verify_success(f->GetFilePos(&pos));
+	verify(pos == 0);
+	verify_success(f->Write(data, sizeof(data)));
+	verify_success(f->GetFilePos(&pos));
+	verify(pos == sizeof(data));
+	verify_success(f->Close());
+
+	verify_success(f->Open(OPFILE_APPEND));
+
+	verify_success(f->Write(data, sizeof(data)));
+	verify_success(f->GetFilePos(&pos));
+	verify(pos == sizeof(data) * 2);
+	verify_success(f->SetFilePos(0));
+	verify_success(f->GetFilePos(&pos));
+	verify(pos == 0);
+
+	verify_success(f->Write(data, sizeof(data)));
+	verify_success(f->GetFilePos(&pos));
+	verify(pos == sizeof(data) * 3);
+	verify_success(f->Close());
+
+	verify_success(f->GetFileLength(&len));
+	verify(len == sizeof(data) * 3);
+}
+finally
+{
+	if (f)
+	{
+		f->Close();
+		f->Delete();
+		OP_DELETE(f);
+	}
+}
+
+test("ReadLine")
+{
+	OpLowLevelFile *f = NULL;
+	OpString path;
+	unsigned int i;
+	const char *lines[4];
+
+	lines[0] = "This is line 1\n";
+	lines[1] = "This is line 2\n";
+	lines[2] = "This is line 3\n";
+	lines[3] = "This is the last line. Thanks for reading.\n";
+
+	verify_success(SetupPathString(path, "file.txt"));
+	RETURN_IF_ERROR(OpLowLevelFile::Create(&f, path.CStr()));
+	DeleteFile(path.CStr());
+
+	// Generate data:
+
+	verify_success(f->Open(OPFILE_WRITE | OPFILE_TEXT));
+
+	for (i = 0; i < ARRAY_SIZE(lines); i++)
+		verify_success(f->Write(lines[i], op_strlen(lines[i])));
+
+	verify_success(f->Close());
+
+	// Verify data:
+
+	verify_success(f->Open(OPFILE_READ | OPFILE_TEXT));
+
+	for (i = 0; i < ARRAY_SIZE(lines); i++)
+	{
+		char *buf;
+		verify_success(f->ReadLine(&buf));
+		ANCHOR_ARRAY(char, buf);
+		verify(op_strlen(buf) == op_strlen(lines[i]) - 1);
+		verify(!op_strncmp(buf, lines[i], op_strlen(buf)));
+	}
+
+	verify_success(f->Close());
+}
+finally
+{
+	OP_DELETE(f);
+	DeleteFile(path.CStr());
+}
+
+test("ReadLine EOF")
+{
+	OpLowLevelFile *f = NULL;
+	OpString path;
+	unsigned int i;
+	const char *lines[4];
+
+	lines[0] = "This is line 1\n";
+	lines[1] = "This is line 2\n";
+	lines[2] = "This is line 3\n";
+	lines[3] = "This is the last line. Thanks for reading.";
+
+	verify_success(SetupPathString(path, "file.txt"));
+	RETURN_IF_ERROR(OpLowLevelFile::Create(&f, path.CStr()));
+	DeleteFile(path.CStr());
+
+	// Generate data:
+
+	verify_success(f->Open(OPFILE_WRITE | OPFILE_TEXT));
+
+	for (i = 0; i < ARRAY_SIZE(lines); i++)
+		verify_success(f->Write(lines[i], op_strlen(lines[i])));
+
+	verify_success(f->Close());
+
+	// Verify data:
+
+	verify_success(f->Open(OPFILE_READ | OPFILE_TEXT));
+
+	for (i = 0; i < ARRAY_SIZE(lines) - 1; i++)
+	{
+		char *buf;
+		verify_success(f->ReadLine(&buf));
+		ANCHOR_ARRAY(char, buf);
+		verify(op_strlen(buf) == op_strlen(lines[i]) - 1);
+		verify(!op_strncmp(buf, lines[i], op_strlen(buf)));
+	}
+
+	char *buf;
+	verify_success(f->ReadLine(&buf));
+	ANCHOR_ARRAY(char, buf);
+	verify(op_strlen(buf) == op_strlen(lines[i]));
+	verify(!op_strncmp(buf, lines[i], op_strlen(buf)));
+	verify(f->Eof());
+
+	verify_success(f->Close());
+}
+finally
+{
+	OP_DELETE(f);
+	DeleteFile(path.CStr());
+}
+
+
+test("CopyContents")
+{
+	OpLowLevelFile *src_file = NULL;
+	OpLowLevelFile *dest_file = NULL;
+	OpString src_path;
+	OpString dest_path;
+	const char data[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZ12";
+	const unsigned int bufsize = sizeof(data);
+	const unsigned int record_count = 10000;
+	char* buf = NULL;
+	unsigned int i;
+	OpFileLength bytes_read;
+
+	verify_success(SetupPathString(src_path, "file.bin"));
+	RETURN_IF_ERROR(OpLowLevelFile::Create(&src_file, src_path.CStr()));
+	DeleteFile(src_path.CStr());
+
+	verify_success(SetupPathString(dest_path, "file2.bin"));
+	RETURN_IF_ERROR(OpLowLevelFile::Create(&dest_file, dest_path.CStr()));
+	DeleteFile(dest_path.CStr());
+
+	// Generate source file:
+
+	verify_success(src_file->Open(OPFILE_WRITE));
+
+	OP_STATUS result;
+	OpStatus::Ignore(result = OpStatus::OK);
+
+	for (i = 0; i < record_count; i++)
+		verify_success(src_file->Write(data, sizeof(data)));
+
+	verify_success(src_file->Close());
+
+	// Copy source file to destination file:
+
+	verify_success(dest_file->CopyContents(src_file));
+
+	// Verify contents of destination file:
+
+	verify_success(dest_file->Open(OPFILE_READ));
+
+	buf = OP_NEWA(char, bufsize);
+	verify(buf);
+
+	for (i = 0; i < record_count; i++)
+	{
+		verify_success(dest_file->Read(buf, bufsize, &bytes_read));
+		verify(bytes_read == bufsize);
+		verify(!op_memcmp(buf, data, bufsize));
+	}
+
+	verify_success(dest_file->Read(buf, 1, &bytes_read));
+
+	verify(bytes_read == 0);
+	verify(dest_file->Eof());
+
+	verify_success(dest_file->Close());
+}
+finally
+{
+	CloseFile(src_file);
+	CloseFile(dest_file);
+	DeleteFile(src_path.CStr());
+	DeleteFile(dest_path.CStr());
+	OP_DELETEA(buf);
+}
+
+test("SafeReplace")
+{
+	OpLowLevelFile *orig_file = NULL;
+	OpLowLevelFile *new_file = NULL;
+	OpString orig_path;
+	OpString new_path;
+	const char data[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZ12";
+	const unsigned int bufsize = sizeof(data);
+	const unsigned int record_count = 10000;
+	char* buf = NULL;
+	unsigned int i;
+	char c = 0;
+	BOOL exists;
+	OpFileLength bytes_read;
+
+	verify_success(SetupPathString(orig_path, "file.bin"));
+	RETURN_IF_ERROR(OpLowLevelFile::Create(&orig_file, orig_path.CStr()));
+	DeleteFile(orig_path.CStr());
+
+	verify_success(SetupPathString(new_path, "new_content.bin"));
+	RETURN_IF_ERROR(OpLowLevelFile::Create(&new_file, new_path.CStr()));
+	DeleteFile(new_path.CStr());
+
+	OP_STATUS result;
+	OpStatus::Ignore(result = OpStatus::OK);
+
+	// Generate "original" content:
+
+	verify_success(orig_file->Open(OPFILE_WRITE));
+	verify_success(orig_file->Write(&c, 1));
+	verify_success(orig_file->Close());
+
+	// Generate "new" content:
+
+	verify_success(new_file->Open(OPFILE_WRITE));
+
+	for (i = 0; i < record_count; i++)
+		verify_success(new_file->Write(data, sizeof(data)));
+
+	verify_success(new_file->Close());
+
+	// Replace contents of "original" file with "new" content:
+
+	verify_success(orig_file->SafeReplace(new_file));
+
+	verify_success(new_file->Exists(&exists));
+	verify(!exists);
+
+	// Verify contents:
+
+	verify_success(orig_file->Open(OPFILE_READ));
+
+	buf = OP_NEWA(char, bufsize);
+	verify(buf);
+
+	for (i = 0; i < record_count; i++)
+	{
+		verify_success(orig_file->Read(buf, bufsize, &bytes_read));
+		verify(bytes_read == bufsize);
+		verify(!op_memcmp(buf, data, bufsize));
+	}
+
+	verify_success(orig_file->Read(buf, 1, &bytes_read));
+
+	verify(bytes_read == 0);
+	verify(orig_file->Eof());
+
+	verify_success(orig_file->Close());
+}
+finally
+{
+	CloseFile(orig_file);
+	CloseFile(new_file);
+	DeleteFile(orig_path.CStr());
+	DeleteFile(new_path.CStr());
+	OP_DELETEA(buf);
+}
+
+test("CreateTempFile")
+{
+	OpLowLevelFile *f = NULL;
+	OpLowLevelFile *tmpfile1 = NULL;
+	OpLowLevelFile *tmpfile2 = NULL;
+	OpLowLevelFile *tmpfile3 = NULL;
+	OpString path;
+	const uni_char* tmp_prefix = UNI_L("hest");
+	char c = 0;
+	char *buf = NULL;
+	const unsigned int bufsize = 1024;
+	OpFileLength length;
+
+	buf = OP_NEWA(char, bufsize);
+	verify(buf);
+
+	verify_success(SetupPathString(path, "file.bin"));
+	RETURN_IF_ERROR(OpLowLevelFile::Create(&f, path.CStr()));
+	DeleteFile(path.CStr());
+
+	tmpfile1 = f->CreateTempFile(tmp_prefix);
+	verify(tmpfile1);
+
+	// The file must exist and be empty:
+
+	verify_success(tmpfile1->GetFileLength(&length));
+	verify(length == 0);
+
+	verify_success(tmpfile1->Open(OPFILE_WRITE));
+	verify_success(tmpfile1->Write(&c, 1));
+	verify_success(tmpfile1->Close());
+	verify_success(tmpfile1->Open(OPFILE_READ));
+	verify_success(tmpfile1->Read(buf, bufsize, &length));
+	verify(length == 1);
+	verify(tmpfile1->Eof());
+	verify_success(tmpfile1->Close());
+	verify_success(tmpfile1->GetFileLength(&length));
+	verify(length == 1);
+
+	tmpfile2 = f->CreateTempFile(tmp_prefix);
+	verify(tmpfile2);
+	verify(uni_strcmp(tmpfile1->GetFullPath(), tmpfile2->GetFullPath()));
+	verify_success(tmpfile2->Open(OPFILE_WRITE));
+
+	tmpfile3 = tmpfile2->CreateTempFile(tmp_prefix);
+	verify(tmpfile3);
+
+	verify(uni_strcmp(tmpfile1->GetFullPath(), tmpfile3->GetFullPath()));
+	verify(uni_strcmp(tmpfile2->GetFullPath(), tmpfile3->GetFullPath()));
+}
+finally
+{
+	OP_DELETEA(buf);
+	OP_DELETE(f);
+
+	if (tmpfile1)
+	{
+		tmpfile1->Close();
+		tmpfile1->Delete();
+		OP_DELETE(tmpfile1);
+	}
+
+	if (tmpfile2)
+	{
+		tmpfile2->Close();
+		tmpfile2->Delete();
+		OP_DELETE(tmpfile2);
+	}
+
+	if (tmpfile3)
+	{
+		tmpfile3->Close();
+		tmpfile3->Delete();
+		OP_DELETE(tmpfile3);
+	}
+
+	DeleteFile(path.CStr());
+}
+
+test("disk full")
+	// Warning: this test will attempt to fill your file system!
+	disabled;
+{
+	OpLowLevelFile *f = NULL;
+	OpLowLevelFile *f2 = NULL;
+	OpLowLevelFile *f3 = NULL;
+	OpLowLevelFile *f4 = NULL;
+	OpString path;
+	OpString path2;
+	OpString path3;
+	OpString path4;
+	const unsigned int bufsize = 32768;
+	char* buf = NULL;
+
+	verify_success(SetupPathString(path, "file.bin"));
+	RETURN_IF_ERROR(OpLowLevelFile::Create(&f, path.CStr()));
+	DeleteFile(path.CStr());
+
+	verify_success(SetupPathString(path2, "file2.bin"));
+	RETURN_IF_ERROR(OpLowLevelFile::Create(&f2, path2.CStr()));
+	DeleteFile(path2.CStr());
+
+	verify_success(SetupPathString(path3, "file3.bin"));
+	RETURN_IF_ERROR(OpLowLevelFile::Create(&f3, path3.CStr()));
+	DeleteFile(path3.CStr());
+
+	verify_success(SetupPathString(path4, "file4.bin"));
+	RETURN_IF_ERROR(OpLowLevelFile::Create(&f4, path4.CStr()));
+	DeleteFile(path4.CStr());
+
+	buf = OP_NEWA(char, bufsize);
+	verify(buf);
+	op_memset(buf, 0, bufsize);
+
+	// Generate a small file:
+
+	verify_success(f2->Open(OPFILE_WRITE));
+	verify_success(f2->Write(buf, bufsize));
+	verify_success(f2->Write(buf, bufsize));
+	verify_success(f2->Write(buf, bufsize));
+	verify_success(f2->Close());
+
+	// Fill the rest of the file system:
+
+	verify_success(f->Open(OPFILE_WRITE));
+
+	OP_STATUS result;
+	OpStatus::Ignore(result = OpStatus::OK);
+
+	do
+	{
+		result = f->Write(buf, bufsize);
+	}
+	while (OpStatus::IsSuccess(result));
+
+	verify(result == OpStatus::ERR_NO_DISK);
+
+	/* Verify that operations that require additional disk space fail (this
+	   test assumes that nobody else frees up space while it is running): */
+
+	result = f3->Open(OPFILE_WRITE);
+
+	if (OpStatus::IsSuccess(result))
+	{
+		result = f3->Write(buf, bufsize);
+		if (OpStatus::IsSuccess(result))
+			verify(f3->Flush() == OpStatus::ERR_NO_DISK);
+		else
+			verify(result == OpStatus::ERR_NO_DISK);
+	}
+	else
+		verify(result == OpStatus::ERR_NO_DISK);
+
+	verify(f4->CopyContents(f2) == OpStatus::ERR_NO_DISK);
+}
+finally
+{
+	CloseFile(f);
+	DeleteFile(path.CStr());
+	CloseFile(f2);
+	DeleteFile(path2.CStr());
+	CloseFile(f3);
+	DeleteFile(path3.CStr());
+	CloseFile(f4);
+	DeleteFile(path4.CStr());
+
+	OP_DELETEA(buf);
+}
+
+test("file not found")
+{
+	OpLowLevelFile *f = NULL;
+	OpLowLevelFile *f2 = NULL;
+	OpFileLength len;
+	OpString path;
+	OpString path2;
+
+	verify_success(SetupPathString(path, "file.bin"));
+	RETURN_IF_ERROR(OpLowLevelFile::Create(&f, path.CStr()));
+	DeleteFile(path.CStr());
+
+	verify_success(SetupPathString(path2, "file2.bin"));
+
+	verify_success(f->Close());
+	verify_success(f->SafeClose());
+	verify(f->Open(OPFILE_READ) == OpStatus::ERR_FILE_NOT_FOUND);
+
+#ifdef SUPPORT_OPFILEINFO_CHANGE
+	OpFileInfoChange file_change;
+	file_change.flags = OpFileInfoChange::WRITABLE;
+	verify(f->ChangeFileInfo(&file_change) == OpStatus::ERR_FILE_NOT_FOUND);
+#endif // SUPPORT_OPFILEINFO_CHANGE
+
+	verify(f->GetFileLength(&len) == OpStatus::ERR_FILE_NOT_FOUND);
+
+	verify(f->Delete() == OpStatus::ERR_FILE_NOT_FOUND);
+
+	f2 = f->CreateCopy();
+	verify(f2);
+
+	OP_DELETE(f2);
+	f2 = f->CreateTempFile(UNI_L("xxx"));
+	verify(f2);
+	OpStatus::IsSuccess(f2->Delete());
+
+	OP_DELETE(f2);
+	RETURN_IF_ERROR(OpLowLevelFile::Create(&f2, path.CStr()));
+	DeleteFile(path2.CStr());
+	verify(f2->CopyContents(f) == OpStatus::ERR_FILE_NOT_FOUND);
+	verify(f2->SafeReplace(f) == OpStatus::ERR_FILE_NOT_FOUND);
+}
+finally
+{
+	OP_DELETE(f);
+	OP_DELETE(f2);
+	DeleteFile(path.CStr());
+	DeleteFile(path2.CStr());
+}
+
+test("illegal operations on closed files")
+{
+	OpLowLevelFile *f = NULL;
+	OpFileLength pos;
+	OpString path;
+	char c = 0;
+	char* buf = NULL;
+
+	verify_success(SetupPathString(path, "file.bin"));
+	RETURN_IF_ERROR(OpLowLevelFile::Create(&f, path.CStr()));
+	DeleteFile(path.CStr());
+
+	verify(f->GetFilePos(&pos) == OpStatus::ERR);
+
+	verify(f->SetFilePos(0) == OpStatus::ERR);
+
+	verify(f->SetFileLength(7) == OpStatus::ERR);
+
+	verify(f->Write(&c, 1) == OpStatus::ERR);
+
+	verify(f->Read(&c, 1, &pos) == OpStatus::ERR);
+
+	verify(f->ReadLine(&buf) == OpStatus::ERR);
+
+	verify(f->Flush() == OpStatus::ERR);
+}
+finally
+{
+	OP_DELETE(f);
+}
+
+test("illegal operation on open files")
+{
+	OpLowLevelFile *f = NULL;
+	OpString path;
+	OpLowLevelFile *f2 = NULL;
+	OpString path2;
+	char c = 0;
+
+	verify_success(SetupPathString(path, "file.bin"));
+	RETURN_IF_ERROR(OpLowLevelFile::Create(&f, path.CStr()));
+	DeleteFile(path.CStr());
+
+	verify_success(SetupPathString(path2, "file2.bin"));
+	RETURN_IF_ERROR(OpLowLevelFile::Create(&f2, path2.CStr()));
+	DeleteFile(path2.CStr());
+
+	verify_success(f2->Open(OPFILE_WRITE));
+	verify_success(f2->Write(&c, 1));
+	verify_success(f2->Close());
+
+	verify_success(f->Open(OPFILE_WRITE));
+
+	// Now for the actual test:
+
+#ifdef SUPPORT_OPFILEINFO_CHANGE
+	OpFileInfoChange file_change;
+	file_change.flags = OpFileInfoChange::WRITABLE;
+	verify(f->ChangeFileInfo(&file_change) == OpStatus::ERR);
+#endif // SUPPORT_OPFILEINFO_CHANGE
+
+	verify(f->Delete() == OpStatus::ERR);
+
+	verify(f->CopyContents(f2) == OpStatus::ERR);
+
+	verify(f->SafeReplace(f2) == OpStatus::ERR);
+
+	verify_success(f->Close());
+	verify_success(f2->Open(OPFILE_READ));
+	verify(f->CopyContents(f2) == OpStatus::ERR);
+}
+finally
+{
+	CloseFile(f);
+	CloseFile(f2);
+	DeleteFile(path.CStr());
+	DeleteFile(path2.CStr());
+}
+
+test("OpLowLevelFile with trailing PATHSEP")
+	file uni testdir_path "";
+{
+	OpLowLevelFile* file = 0;
+
+	OpString testdir_path_with_trailing_slash;
+	verify_success(testdir_path_with_trailing_slash.Set(testdir_path));
+	verify(!testdir_path_with_trailing_slash.IsEmpty());
+	if (testdir_path_with_trailing_slash[testdir_path_with_trailing_slash.Length() - 1] != PATHSEPCHAR)
+	{
+		verify_success(testdir_path_with_trailing_slash.Append(PATHSEP));
+	}
+
+    OpLowLevelFile::Create(&file, testdir_path_with_trailing_slash.CStr());
+
+	OpString testdir_path_without_trailing_slash;
+	verify_success(testdir_path_without_trailing_slash.Set(file->GetFullPath()));
+	verify(!testdir_path_without_trailing_slash.IsEmpty());
+	verify(testdir_path_without_trailing_slash[testdir_path_without_trailing_slash.Length() - 1] != PATHSEPCHAR);
+}
+finally
+{
+    OP_DELETE(file);
+}
+
+test("OpLowLevelFile disk root with trailing PATHSEP")
+	require SYS_CAP_FILESYSTEM_HAS_MULTIPLE_DRIVES;
+{
+	OpLowLevelFile* file = 0;
+	OpString drive_letters;
+	const uni_char drive_letter = g_op_system_info->GetCurrentDriveLetter();
+	verify(drive_letter != 0);
+
+	OpString path;
+	verify_success(path.AppendFormat(UNI_L("%c:%c"), drive_letter, PATHSEPCHAR));
+
+    verify_success(OpLowLevelFile::Create(&file, path.CStr()));
+    verify_string(path, file->GetFullPath());
+}
+finally
+{
+    OP_DELETE(file);
+}
+
+test("OpLowLevelFile root with trailing PATHSEP")
+	require undefined SYS_CAP_FILESYSTEM_HAS_MULTIPLE_DRIVES;
+{
+	OpLowLevelFile* file = 0;
+	verify_success(OpLowLevelFile::Create(&file, UNI_L(PATHSEP)));
+
+	verify_string( UNI_L(PATHSEP), file->GetFullPath());
+}
+finally
+{
+    OP_DELETE(file);
+}
+
+test("Update file")
+{
+	OpLowLevelFile *f = 0;
+	char buf[32]; /* ARRAY OK 2012-02-23 terjepe */
+
+	OpString path;
+	verify_success(g_folder_manager->GetFolderPath(OPFILE_HOME_FOLDER, path));
+	verify_success(path.Append("update.bin"));
+
+	// Create the file
+	verify_success(OpLowLevelFile::Create(&f, path));
+	verify(f);
+
+	// Delete if it exists
+	BOOL exists = FALSE;
+	verify_success(f->Exists(&exists));
+	if (exists)
+	{
+		verify_success(f->Delete());
+	}
+
+	// Open for write
+	verify_success(f->Open(OPFILE_WRITE));
+	verify(f->IsOpen());
+
+	// Write some data
+	verify_success(f->Write("firstdatachunk", 14));
+	verify_success(f->Close());
+
+	verify_success(f->Open(OPFILE_UPDATE));
+	verify(f->IsOpen());
+
+	// Write some data into the beginning of the file. File size should not increase.
+	verify_success(f->Write("more_", 5));
+
+	OpFileLength len = 0;
+	verify_success(f->GetFileLength(&len));
+	verify(len == 14);
+
+	verify_success(f->SetFilePos(9, SEEK_FROM_START));
+
+	// Write some data that will move past the size of the file. File size should increase.
+	verify_success(f->Write("_was_written", 12));
+
+	verify_success(f->GetFileLength(&len));
+
+	verify(len == 21);
+
+	// Read all data from start
+	verify_success(f->SetFilePos(0, SEEK_FROM_START));
+	OpFileLength bytesread = 0;
+	verify_success(f->Read(buf, 21, &bytesread));
+	verify(bytesread == 21 && op_strncmp(buf, "more_data_was_written", 21) == 0);
+
+	signed char c;
+	verify(OpStatus::IsSuccess(f->Read(&c, 1, &len)) && len == 0 && f->Eof());
+}
+finally
+{
+	if (f)
+	{
+		OpStatus::Ignore(f->Close());
+		OpStatus::Ignore(f->Delete());
+		OP_DELETE(f);
+	}
+}

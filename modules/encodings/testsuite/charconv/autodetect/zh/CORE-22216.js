@@ -1,0 +1,26 @@
+//若須修改此檔,請至cm
+document.write("<li>國內要聞</li>");
+document.write("<li>社會新聞</li>");
+document.write("<li>地方新聞</li>");
+document.write("<li>兩岸台商</li>");
+document.write("<li>全球觀察</li>");
+document.write("<li>意見評論</li>");
+document.write("<li>財經產業</li>");
+document.write("<li>股市投資</li>");
+document.write("<li>基金理財</li>");
+document.write("<li>運動大聯盟</li>");
+document.write("<li>數位資訊</li>");
+document.write("<li>娛樂追星</li>");
+document.write("<li>消費流行</li>");
+document.write("<li>生活天氣</li>");
+document.write("<li>健康醫藥</li>");
+document.write("<li>旅遊休閒</li>");
+document.write("<li>校園博覽會</li>");
+document.write("<li>閱讀藝文</li>");
+if ( document.domain.indexOf("www.udn.com") == -1 ){
+document.write("<li>聯合書報攤</li>");
+document.write("<li>網路購物</li>");
+document.write("<li>數位閱讀</li>");
+document.write("<li>進修線上</li>");
+document.write("<li>職場行家</li>");
+}

@@ -1,0 +1,183 @@
+group "search_engine.btreestress";
+
+//disabled;
+
+require SEARCH_ENGINE;
+
+include "modules/search_engine/BTree.h";
+include "modules/search_engine/SingleBTree.h";
+include "modules/search_engine/tests/test_util.h";
+include "modules/search_engine/Vector.h";
+include "modules/memory/src/memory_memguard.h";
+
+global
+{
+
+class Data80 {
+public:
+	int d;
+	char u[76]; /* ARRAY OK 2010-09-24 roarl */
+	Data80(int a) : d(a) { op_memset(u, 0, 76); }
+	BOOL operator<(const Data80& r) const { return d < r.d; }
+};
+
+}
+
+test("long run 1024:80 SingleBTree") disabled;
+	file uni dbtreed_bt   "data/dbtreed.bt";
+	file uni dbtreed_bt_j "data/dbtreed.bt-j";
+	file uni dbtreed_bt_g "data/dbtreed.bt-g";
+{
+	SingleBTree<Data80> bt;
+	OpFileLength counter;
+	OP_STATUS status;
+
+	op_srand(1);
+
+	delete_file(dbtreed_bt);
+	delete_file(dbtreed_bt_j);
+	delete_file(dbtreed_bt_g);
+
+	verify_success(bt.Open(dbtreed_bt, BlockStorage::OpenReadWrite, 1024));
+
+	counter = 0;
+
+	while (bt.GetStorage()->GetFileSize() < 85899345/*92*/) {  // 8GB limit
+		Data80 to_insert(op_rand());
+		verify_success(bt.Insert(to_insert));
+
+		if (op_rand() % 3 == 0)
+		{
+			Data80 to_delete(op_rand());
+			status = bt.Search(to_delete);
+			if (status == OpBoolean::IS_TRUE || status == OpStatus::OK)
+				verify_success(bt.Delete(to_delete));
+		}
+
+		if (op_rand() % 50 == 0)
+		{
+			verify_success(bt.Commit());
+			verify(bt.CheckConsistency(2, TRUE) == OpBoolean::IS_TRUE);
+		}
+
+		++counter;
+	}
+
+	verify_success(bt.Commit());
+	verify(bt.CheckConsistency(2, TRUE) == OpBoolean::IS_TRUE);
+	verify_success(bt.Close());
+}
+
+test("long run 1024:80 SingleBTree, random OOM") disabled;
+	file uni dbtreed_bt   "data/dbtreed.bt";
+	file uni dbtreed_bt_j "data/dbtreed.bt-j";
+	file uni dbtreed_bt_g "data/dbtreed.bt-g";
+{
+	SingleBTree<Data80> bt;
+	OpFileLength counter, errors;
+	OP_STATUS status;
+
+	op_srand(1);
+
+	delete_file(dbtreed_bt);
+	delete_file(dbtreed_bt_j);
+	delete_file(dbtreed_bt_g);
+
+	verify_success(bt.Open(dbtreed_bt, BlockStorage::OpenReadWrite, 1024));
+
+	counter = 0;
+	errors = 0;
+
+	g_mem_guard->SetRandomOOM(TRUE);
+	while (bt.GetStorage()->GetFileSize() < 8589934/*592*/) {  // 8GB limit
+		status = bt.Insert(Data80(op_rand()));
+		if (OpStatus::IsError(status))
+			++errors;
+
+		if (op_rand() % 3 == 0)
+		{
+			Data80 to_delete(op_rand());
+			status = bt.Search(to_delete);
+			if (status == OpBoolean::IS_TRUE || status == OpStatus::OK)
+				status = bt.Delete(to_delete);
+			if (OpStatus::IsError(status))
+				++errors;
+		}
+
+		if (op_rand() % 50 == 0)
+		{
+			status = bt.Commit();
+			if (OpStatus::IsError(status))
+				++errors;
+		}
+
+		++counter;
+	}
+	g_mem_guard->SetRandomOOM(FALSE);
+
+	verify(bt.CheckConsistency(2, TRUE) == OpBoolean::IS_TRUE);
+	verify_success(bt.Close());
+}
+
+test("long run") disabled;
+	file uni dbtreed_bt   "data/dbtreed.bt";
+	file uni dbtreed_bt_j "data/dbtreed.bt-j";
+	file uni dbtreed_bt_g "data/dbtreed.bt-g";
+{
+	TPool<int> bp;
+	TBTree<int> *bt;
+	TVector<UINT32> list;
+	UINT32 bid;
+	OpFileLength counter, counter0x20;
+
+	op_srand(1);
+
+	delete_file(dbtreed_bt);
+	delete_file(dbtreed_bt_j);
+	delete_file(dbtreed_bt_g);
+
+	verify_success(bp.Open(dbtreed_bt, BlockStorage::OpenReadWrite, 128));
+
+	counter = 0;
+	counter0x20 = 0;
+
+	while (bp.GetStorage()->GetFileSize() < 858993/*4592*/) {  // 8GB limit
+		if ((unsigned)(op_rand()) % 1000 > list.GetCount() + 1)
+			bt = bp.CreateTree();
+		else
+			bt = bp.GetTree(list[op_rand() % list.GetCount()]);
+
+		verify(bt != NULL);
+
+		verify_success(bt->Insert(op_rand() % 0x10000));
+
+		if (op_rand() % 3 == 0)
+		{
+			bid = bt->GetId();
+
+			verify_success(bt->Delete(op_rand() % 0x10000));
+
+			if (bt->Empty())
+			{
+				list.DeleteByItem(bid);
+			}
+		}
+
+		verify_success(list.Insert(bt->GetId()));
+
+		if (bt->GetId() == 865)
+			++counter0x20;
+
+		OP_DELETE(bt);
+
+		if (op_rand() % 50 == 0)
+		{
+			verify_success(bp.Commit());
+		}
+
+		++counter;
+	}
+	verify_success(bp.Commit());
+	verify(bp.CheckConsistency() == OpBoolean::IS_TRUE);
+	verify_success(bp.Close());
+}

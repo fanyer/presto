@@ -1,0 +1,346 @@
+group "search_engine.lowlevelfile";
+
+include "modules/pi/system/OpLowLevelFile.h";
+include "modules/search_engine/Vector.h";
+include "modules/search_engine/tests/test_util.h";
+include "modules/util/tempbuf.h";
+
+// lingogilowlevelfile is seriously broken:
+// * Eof() doesn't work according to documentation
+// * SetFilePos to negative offsets with SEEK_FROM_CURRENT doesn't work
+
+test("sequential fragmentation") disabled;
+	file uni frag1_dat "data/frag1.dat";
+	file uni frag2_dat "data/frag2.dat";
+{
+	OpLowLevelFile *f1 = NULL, *f2 = NULL;
+	int i;
+	TempBuffer buf;
+	time_t start;
+	OpFileLength bread;
+
+#define NUM_BLOCKS (65536 * 4)
+
+	verify_success(buf.Expand(8192));  // 16K buffer
+
+	verify_success(OpLowLevelFile::Create(&f1, frag1_dat));
+	verify_success(OpLowLevelFile::Create(&f2, frag2_dat));
+
+	// slow, but it will make sure the file is fragmented
+	verify_success(f1->Open(OPFILE_READ | OPFILE_WRITE | OPFILE_COMMIT));
+	verify_success(f2->Open(OPFILE_READ | OPFILE_WRITE | OPFILE_COMMIT));
+
+	for (i = NUM_BLOCKS - 1; i >= 0; --i)
+	{
+		f1->Write(buf.GetStorage(), buf.GetCapacity() * sizeof(uni_char));
+		f1->Flush();
+		f2->Write(buf.GetStorage(), buf.GetCapacity() * sizeof(uni_char));
+		f2->Flush();
+	}
+
+	f1->SetFilePos(0);
+	op_time(&start);
+	for (i = NUM_BLOCKS - 1; i >= 0; --i)
+	{
+		f1->Read(buf.GetStorage(), buf.GetCapacity() * sizeof(uni_char), &bread);
+		verify(bread == buf.GetCapacity() * sizeof(uni_char));
+	}
+
+
+	output("\nfragmented: %i s\n", op_time(NULL) - start);
+
+	f2->Close();
+	f1->Close();
+
+	f2->Delete();
+	f1->Delete();
+
+	f1->Open(OPFILE_READ | OPFILE_WRITE | OPFILE_COMMIT);
+	f1->SetFileLength(NUM_BLOCKS * buf.GetCapacity() * sizeof(uni_char));
+
+	for (i = NUM_BLOCKS - 1; i >= 0; --i)
+		f1->Write(buf.GetStorage(), buf.GetCapacity() * sizeof(uni_char));
+	f1->Flush();
+
+	f1->SetFilePos(0);
+	op_time(&start);
+	for (i = NUM_BLOCKS - 1; i >= 0; --i)
+	{
+		f1->Read(buf.GetStorage(), buf.GetCapacity() * sizeof(uni_char), &bread);
+		verify(bread == buf.GetCapacity() * sizeof(uni_char));
+	}
+	output("\nnot fragmented: %i s\n", op_time(NULL) - start);
+
+	f1->Close();
+	f1->Delete();
+}
+finally {
+	OP_DELETE(f2);
+	OP_DELETE(f1);
+}
+
+test("random access fragmentation") disabled;
+	file uni frag1_dat "data/frag1.dat";
+	file uni frag2_dat "data/frag2.dat";
+{
+	OpLowLevelFile *f1 = NULL, *f2 = NULL;
+	int i;
+	TempBuffer buf;
+	time_t start;
+	OpFileLength bread;
+	TVector<OpFileLength> fpos;
+
+#define NUM_BLOCKS (65536 * 4)
+
+	verify_success(buf.Expand(8192));  // 16K buffer
+	verify_success(fpos.Reserve(NUM_BLOCKS));
+
+	verify_success(OpLowLevelFile::Create(&f1, frag1_dat));
+	verify_success(OpLowLevelFile::Create(&f2, frag2_dat));
+
+	// slow, but it will make sure the file is fragmented
+	verify_success(f1->Open(OPFILE_READ | OPFILE_WRITE | OPFILE_COMMIT));
+	verify_success(f2->Open(OPFILE_READ | OPFILE_WRITE | OPFILE_COMMIT));
+
+	fpos.Add(0);
+	for (i = NUM_BLOCKS - 1; i > 0; --i)
+		fpos.Insert(op_rand() % fpos.GetCount(), i * buf.GetCapacity() * sizeof(uni_char));
+
+	for (i = NUM_BLOCKS - 1; i >= 0; --i)
+	{
+		f1->Write(buf.GetStorage(), buf.GetCapacity() * sizeof(uni_char));
+		f1->Flush();
+		f2->Write(buf.GetStorage(), buf.GetCapacity() * sizeof(uni_char));
+		f2->Flush();
+	}
+
+	op_time(&start);
+	for (i = NUM_BLOCKS - 1; i >= 0; --i)
+	{
+		f1->SetFilePos(fpos[i]);
+		f1->Read(buf.GetStorage(), buf.GetCapacity() * sizeof(uni_char), &bread);
+		verify(bread == buf.GetCapacity() * sizeof(uni_char));
+	}
+
+
+	output("\nfragmented: %i s\n", op_time(NULL) - start);
+
+	f2->Close();
+	f1->Close();
+
+	f2->Delete();
+	f1->Delete();
+
+	f1->Open(OPFILE_READ | OPFILE_WRITE | OPFILE_COMMIT);
+	f1->SetFileLength(NUM_BLOCKS * buf.GetCapacity() * sizeof(uni_char));
+
+	for (i = NUM_BLOCKS - 1; i >= 0; --i)
+		f1->Write(buf.GetStorage(), buf.GetCapacity() * sizeof(uni_char));
+	f1->Flush();
+
+	op_time(&start);
+	for (i = NUM_BLOCKS - 1; i >= 0; --i)
+	{
+		f1->SetFilePos(fpos[i]);
+		f1->Read(buf.GetStorage(), buf.GetCapacity() * sizeof(uni_char), &bread);
+		verify(bread == buf.GetCapacity() * sizeof(uni_char));
+	}
+	output("\nnot fragmented: %i s\n", op_time(NULL) - start);
+
+	f1->Close();
+	f1->Delete();
+}
+finally {
+	OP_DELETE(f2);
+	OP_DELETE(f1);
+}
+
+test("setfilepos") disabled;
+	file uni frag1_dat "data/frag1.dat";
+{
+	OpLowLevelFile *f1 = NULL;
+	int i;
+	TempBuffer buf;
+	time_t start;
+	int offset;
+	OpFileLength bread;
+
+#define NUM_BLOCKS (65536 * 16)
+
+	verify_success(buf.Expand(8192));  // 16K buffer
+
+	verify_success(OpLowLevelFile::Create(&f1, frag1_dat));
+
+	// slow, but it will make sure the file is fragmented
+	verify_success(f1->Open(OPFILE_WRITE));
+
+	f1->SetFileLength(NUM_BLOCKS * buf.GetCapacity() * sizeof(uni_char));
+
+	for (i = NUM_BLOCKS - 1; i >= 0; --i)
+		f1->Write(buf.GetStorage(), buf.GetCapacity() * sizeof(uni_char));
+
+	f1->SafeClose();
+	verify_success(f1->Open(OPFILE_READ));
+
+	op_time(&start);
+	f1->SetFilePos(0);
+	for (i = NUM_BLOCKS - 1; i >= 0; --i)
+	{
+		f1->Read(buf.GetStorage(), buf.GetCapacity() * sizeof(uni_char), &bread);
+		verify(bread == buf.GetCapacity() * sizeof(uni_char));
+	}
+	output("\nsequential reading: %i s\n", op_time(NULL) - start);
+
+	op_time(&start);
+	for (i = 0; i < NUM_BLOCKS; ++i)
+	{
+		f1->SetFilePos(i * buf.GetCapacity() * sizeof(uni_char));
+		f1->Read(buf.GetStorage(), buf.GetCapacity() * sizeof(uni_char), &bread);
+		verify(bread == buf.GetCapacity() * sizeof(uni_char));
+	}
+	output("\nsequential SetFilePos: %i s\n", op_time(NULL) - start);
+
+	op_time(&start);
+	for (i = 0; i < NUM_BLOCKS; ++i)
+	{
+		offset = op_rand() % 128;
+		f1->SetFilePos(i * buf.GetCapacity() * sizeof(uni_char) + offset);
+		f1->Read(buf.GetStorage(), buf.GetCapacity() * sizeof(uni_char) - offset, &bread);
+		verify(bread == buf.GetCapacity() * sizeof(uni_char) - offset);
+	}
+	output("\nreal SetFilePos: %i s\n", op_time(NULL) - start);
+
+	f1->Close();
+	f1->Delete();
+}
+finally {
+	OP_DELETE(f1);
+}
+
+test("setfilepos on small blocks") disabled;
+	file uni frag1_dat "data/frag1.dat";
+{
+	OpLowLevelFile *f1 = NULL;
+	int i;
+	TempBuffer buf;
+	time_t start;
+	int offset;
+	OpFileLength bread;
+
+#define NUM_BLOCKS (65536 * 16)
+
+	verify_success(buf.Expand(2048));  // 16K buffer
+
+	verify_success(OpLowLevelFile::Create(&f1, frag1_dat));
+
+	// slow, but it will make sure the file is fragmented
+	verify_success(f1->Open(OPFILE_WRITE));
+
+	f1->SetFileLength(NUM_BLOCKS * buf.GetCapacity() * sizeof(uni_char));
+
+	for (i = NUM_BLOCKS - 1; i >= 0; --i)
+		f1->Write(buf.GetStorage(), buf.GetCapacity() * sizeof(uni_char));
+
+	f1->SafeClose();
+	verify_success(f1->Open(OPFILE_READ));
+
+	op_time(&start);
+	f1->SetFilePos(0);
+	for (i = NUM_BLOCKS - 1; i >= 0; --i)
+	{
+		f1->Read(buf.GetStorage(), buf.GetCapacity() * sizeof(uni_char), &bread);
+		verify(bread == buf.GetCapacity() * sizeof(uni_char));
+	}
+	output("\nsequential reading: %i s\n", op_time(NULL) - start);
+
+	op_time(&start);
+	for (i = 0; i < NUM_BLOCKS; ++i)
+	{
+		f1->SetFilePos(i * buf.GetCapacity() * sizeof(uni_char));
+		f1->Read(buf.GetStorage(), buf.GetCapacity() * sizeof(uni_char), &bread);
+		verify(bread == buf.GetCapacity() * sizeof(uni_char));
+	}
+	output("\nsequential SetFilePos: %i s\n", op_time(NULL) - start);
+
+	op_time(&start);
+	for (i = 0; i < NUM_BLOCKS; ++i)
+	{
+		offset = op_rand() % 128;
+		f1->SetFilePos(i * buf.GetCapacity() * sizeof(uni_char) + offset);
+		f1->Read(buf.GetStorage(), buf.GetCapacity() * sizeof(uni_char) - offset, &bread);
+		verify(bread == buf.GetCapacity() * sizeof(uni_char) - offset);
+	}
+	output("\nreal SetFilePos: %i s\n", op_time(NULL) - start);
+
+	f1->Close();
+	f1->Delete();
+}
+finally {
+	OP_DELETE(f1);
+}
+
+test("block update") disabled;
+	file uni frag1_dat "data/frag1.dat";
+{
+	OpLowLevelFile *f1 = NULL;
+	int i, j;
+	TempBuffer buf, block_buf;
+	time_t start;
+	OpFileLength bread, fpos;
+
+#define NUM_BLOCKS (65536 * 4)
+
+	verify_success(buf.Expand(8192));  // 16K buffer
+	verify_success(block_buf.Expand(32768));
+
+	verify_success(OpLowLevelFile::Create(&f1, frag1_dat));
+
+	// slow, but it will make sure the file is fragmented
+	verify_success(f1->Open(OPFILE_WRITE));
+
+	f1->SetFileLength(NUM_BLOCKS * buf.GetCapacity() * sizeof(uni_char));
+
+	for (i = NUM_BLOCKS - 1; i >= 0; --i)
+		f1->Write(buf.GetStorage(), buf.GetCapacity() * sizeof(uni_char));
+	f1->SafeClose();
+	verify_success(f1->Open(OPFILE_UPDATE));
+
+	op_time(&start);
+	f1->SetFilePos(0);
+	for (i = NUM_BLOCKS - 4; i >= 1; i -= 2)
+	{
+		f1->GetFilePos(&fpos);
+		f1->Read(buf.GetStorage(), buf.GetCapacity() * sizeof(uni_char), &bread);
+		verify(bread == buf.GetCapacity() * sizeof(uni_char));
+		buf.GetStorage()[0] ^= 0xFFFF;
+		buf.GetStorage()[buf.GetCapacity() - 1] ^= 0xFFFF;
+		f1->SetFilePos(fpos);
+		f1->Write(buf.GetStorage(), buf.GetCapacity() * sizeof(uni_char));
+		f1->SetFilePos(buf.GetCapacity() * sizeof(uni_char), SEEK_FROM_CURRENT);
+	}
+	output("\none by one update: %i s\n", op_time(NULL) - start);
+
+	op_time(&start);
+	f1->SetFilePos(0);
+	for (i = NUM_BLOCKS / 4 - 1; i >= 0; --i)
+	{
+		f1->GetFilePos(&fpos);
+		f1->Read(block_buf.GetStorage(), block_buf.GetCapacity() * sizeof(uni_char), &bread);
+		verify(bread == block_buf.GetCapacity() * sizeof(uni_char));
+		for (j = block_buf.GetCapacity() / buf.GetCapacity() / 2 - 1; j >= 0; --j)
+		{
+			block_buf.GetStorage()[j * 2 * buf.GetCapacity()] ^= 0xFFFF;
+			block_buf.GetStorage()[j * 2 * buf.GetCapacity() + buf.GetCapacity() - 1] ^= 0xFFFF;
+		}
+		f1->SetFilePos(fpos);
+		f1->Write(block_buf.GetStorage(), block_buf.GetCapacity() * sizeof(uni_char));
+	}
+	output("\nblock update: %i s\n", op_time(NULL) - start);
+
+	f1->Close();
+	f1->Delete();
+}
+finally {
+	OP_DELETE(f1);
+}
+

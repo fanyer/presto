@@ -1,0 +1,379 @@
+/* -*- mode: c++; tab-width: 4 -*-
+**
+** Copyright (C) 2009 Opera Software AS.  All rights reserved.
+**
+** This file is part of the Opera web browser.  It may not be distributed
+** under any circumstances.
+**
+** Test for Protocol Buffer wire format and proto types.
+**
+** Jan Borsodi
+*/
+
+group "protobuf.vector";
+
+require init;
+require PROTOBUF_SUPPORT;
+
+language c++;
+
+include "modules/protobuf/src/protobuf_vector.h"; // For OpProtobufValueVector
+
+global
+{
+	// Simple reference counted class to test value based copying
+	class RefCounted
+	{
+	public:
+		RefCounted()
+			: shared(NULL)
+		{}
+
+		RefCounted(const RefCounted &rhs)
+			: shared(NULL)
+		{
+			Assign(rhs);
+		}
+
+		~RefCounted()
+		{
+			Release();
+		}
+
+		OP_STATUS Construct(int value)
+		{
+			Release();
+			shared = OP_NEW(Shared, (value));
+			RETURN_OOM_IF_NULL(shared);
+			return OpStatus::OK;
+		}
+
+		RefCounted &operator =(const RefCounted &rhs)
+		{
+			if (&rhs != this)
+			{
+				Assign(rhs);
+			}
+			return *this;
+		}
+
+		BOOL operator ==(const RefCounted &rhs)
+		{
+			if (shared == rhs.shared)
+				return TRUE;
+
+			return (shared ? shared->value : 0) == (rhs.shared ? rhs.shared->value : 0);
+		}
+
+		BOOL operator !=(const RefCounted &rhs)
+		{
+			return !(*this == rhs);
+		}
+
+		unsigned GetCount() const { return shared ? shared->count : 0; }
+		int GetValue() const { return shared ? shared->value : 0; }
+
+	private:
+		void Assign(const RefCounted &rhs)
+		{
+			Release();
+			shared = rhs.shared;
+			if (shared)
+				++shared->count;
+		}
+
+		void Release()
+		{
+			if (shared)
+			{
+				OP_ASSERT(shared->count > 0);
+				--shared->count;
+				if (!shared->count)
+					OP_DELETE(shared);
+			}
+		}
+
+		struct Shared
+		{
+			Shared(int value)
+				: value(value)
+				, count(1)
+			{}
+			int value;
+			unsigned count;
+		} *shared;
+	};
+}
+
+test("Complex class: Adding and getting elements")
+{
+	int step_size = 10;
+	OpAutoPtr< OpProtobufValueVector<RefCounted> > vector( OP_NEW(OpProtobufValueVector<RefCounted>, (step_size)));
+	verify(vector.get());
+
+	RefCounted values[4];
+	for (int i = 0; i < 4; ++i)
+	{
+		verify_success(values[i].Construct(42 + i));
+		verify(values[i].GetCount() == 1);
+	}
+
+	// Add some items
+	for (int i = 0; i < 4; ++i)
+		verify_success(vector->Add(values[i]));
+
+	// Verify that ref-count has changed
+	for (int i = 0; i < 4; ++i)
+		verify(values[i].GetCount() > 1);
+
+	// Verify that Get returns correct value
+	for (int i = 0; i < 4; ++i)
+		verify(vector->Get(i).GetValue() == values[i].GetValue());
+
+	vector.reset(NULL);
+	// Verify that ref-count has reset, and value
+	for (int i = 0; i < 4; ++i)
+	{
+		verify(values[i].GetCount() == 1);
+		verify(values[i].GetValue() == 42 + i);
+	}
+}
+
+test("Complex class: Adding and finding elements")
+{
+	int step_size = 10;
+	OpAutoPtr< OpProtobufValueVector<RefCounted> > vector( OP_NEW(OpProtobufValueVector<RefCounted>, (step_size)));
+	verify(vector.get());
+
+	RefCounted values[5];
+	for (int i = 0; i < 5; ++i)
+	{
+		verify_success(values[i].Construct(42 + i));
+		verify(values[i].GetCount() == 1);
+	}
+
+	// Add some items, except the last one
+	for (int i = 0; i < 4; ++i)
+		verify_success(vector->Add(values[i]));
+
+	UINT32 idx;
+	idx = vector->Find(values[0]); // Find 42
+	verify(idx == 0);
+	idx = vector->Find(values[1]); // Find 43
+	verify(idx == 1);
+	idx = vector->Find(values[2]); // Find 44
+	verify(idx == 2);
+	idx = vector->Find(values[3]); // Find 45
+	verify(idx == 3);
+
+	verify_success(vector->Insert(1, values[4]));
+
+	idx = vector->Find(values[4]); // Find 46
+	verify(idx == 1);
+}
+
+test("Complex class: Growing vector")
+{
+	int step_size = 10;
+	OpAutoPtr< OpProtobufValueVector<RefCounted> > vector( OP_NEW(OpProtobufValueVector<RefCounted>, (step_size)));
+	verify(vector.get());
+
+	RefCounted original;
+	verify_success(original.Construct(42));
+	verify(original.GetCount() == 1);
+	// Add enough entries to trigger a Grow()
+	for (int i = 0; i < step_size + 1; ++i)
+		verify_success(vector->Add(original));
+	verify(original.GetCount() > 1);
+
+	vector.reset(NULL);
+	verify(original.GetCount() == 1);
+	verify(original.GetValue() == 42);
+}
+
+test("Complex class: Inserting elements")
+{
+	int step_size = 10;
+	OpAutoPtr< OpProtobufValueVector<RefCounted> > vector( OP_NEW(OpProtobufValueVector<RefCounted>, (step_size)));
+	verify(vector.get());
+
+	RefCounted original;
+	verify_success(original.Construct(42));
+	verify(original.GetCount() == 1);
+	// Add enough entries to trigger a Grow()
+	for (int i = 0; i < step_size + 1; ++i)
+		verify_success(vector->Add(original));
+
+	for (int i = 0; i < step_size + 1; ++i)
+		verify_success(vector->Insert(i, original));
+
+	verify(original.GetCount() >= 1);
+
+	vector.reset(NULL);
+	verify(original.GetCount() == 1);
+	verify(original.GetValue() == 42);
+}
+
+test("Complex class: Replacing elements")
+{
+	int step_size = 10;
+	OpAutoPtr< OpProtobufValueVector<RefCounted> > vector( OP_NEW(OpProtobufValueVector<RefCounted>, (step_size)));
+	verify(vector.get());
+
+	RefCounted original;
+	verify_success(original.Construct(42));
+	verify(original.GetCount() == 1);
+
+	RefCounted other;
+	verify_success(other.Construct(100));
+	verify(other.GetCount() == 1);
+
+	// Add enough entries to trigger a Grow()
+	for (int i = 0; i < step_size + 1; ++i)
+		verify_success(vector->Add(original));
+	verify(original.GetCount() > 1);
+
+	// Replace all elements with other
+	for (int i = 0; i < step_size + 1; ++i)
+		verify_success(vector->Replace(i, other));
+	verify(original.GetCount() == 1);
+	verify(other.GetCount() > 1);
+
+	vector.reset(NULL);
+	verify(original.GetCount() == 1);
+	verify(original.GetValue() == 42);
+	verify(other.GetCount() == 1);
+	verify(other.GetValue() == 100);
+}
+
+test("Complex class: Removing elements")
+{
+	int step_size = 10;
+	OpAutoPtr< OpProtobufValueVector<RefCounted> > vector( OP_NEW(OpProtobufValueVector<RefCounted>, (step_size)));
+	verify(vector.get());
+
+	RefCounted original;
+	verify_success(original.Construct(42));
+	verify(original.GetCount() == 1);
+	// Add some entries, do not trigger grow
+	for (int i = 0; i < step_size; ++i)
+		verify_success(vector->Add(original));
+
+	verify_success(vector->Remove(4, 1));
+
+	// Add more entries to trigger grow
+	for (int i = 0; i < 2; ++i)
+		verify_success(vector->Add(original));
+
+	// Remove entries to trigger shrink
+	verify_success(vector->Remove(1, 2));
+	for (int i = 0; i < step_size + 1; ++i)
+		verify_success(vector->Insert(i, original));
+
+	verify(original.GetCount() >= 1);
+
+	vector.reset(NULL);
+	verify(original.GetCount() == 1);
+	verify(original.GetValue() == 42);
+}
+
+test("Complex class: Removing by item match")
+{
+	int step_size = 10;
+	OpAutoPtr< OpProtobufValueVector<RefCounted> > vector( OP_NEW(OpProtobufValueVector<RefCounted>, (step_size)));
+	verify(vector.get());
+
+	RefCounted values[11];
+	BOOL found[11];
+	for (int i = 0; i < 11; ++i)
+	{
+		verify_success(values[i].Construct(42 + i));
+		verify(values[i].GetCount() == 1);
+		found[i] = FALSE;
+	}
+
+	// Add some entries, do not trigger grow
+	for (int i = 0; i < step_size; ++i)
+		verify_success(vector->Add(values[i]));
+
+	for (int i = 0; i < 11; ++i)
+		found[i] = vector->Find(values[i]) != -1;
+	
+	verify(found[0]);
+	verify(found[1]);
+	verify(found[2]);
+	verify(found[3]);
+	verify(found[4]);
+	verify(found[5]);
+	verify(found[6]);
+	verify(found[7]);
+	verify(found[8]);
+	verify(found[9]);
+	verify(!found[10]);
+
+	verify_success(vector->RemoveByItem(values[3])); // Remove 42 + 3
+
+	for (int i = 0; i < 11; ++i)
+		found[i] = vector->Find(values[i]) != -1;
+
+	verify(found[0]);
+	verify(found[1]);
+	verify(found[2]);
+	verify(!found[3]);
+	verify(found[4]);
+	verify(found[5]);
+	verify(found[6]);
+	verify(found[7]);
+	verify(found[8]);
+	verify(found[9]);
+	verify(!found[10]);
+
+	// Add more entries to trigger grow
+	verify_success(vector->Add(values[3]));
+	verify_success(vector->Add(values[10]));
+
+	for (int i = 0; i < 11; ++i)
+		found[i] = vector->Find(values[i]) != -1;
+
+	verify(found[0]);
+	verify(found[1]);
+	verify(found[2]);
+	verify(found[3]);
+	verify(found[4]);
+	verify(found[5]);
+	verify(found[6]);
+	verify(found[7]);
+	verify(found[8]);
+	verify(found[9]);
+	verify(found[10]);
+
+	verify_success(vector->RemoveByItem(values[4])); // Remove 42 + 4
+
+	for (int i = 0; i < 11; ++i)
+		found[i] = vector->Find(values[i]) != -1;
+
+	verify(found[0]);
+	verify(found[1]);
+	verify(found[2]);
+	verify(found[3]);
+	verify(!found[4]);
+	verify(found[5]);
+	verify(found[6]);
+	verify(found[7]);
+	verify(found[8]);
+	verify(found[9]);
+	verify(found[10]);
+
+	for (int i = 0; i < 11; ++i)
+	{
+		if (i == 4 )
+			verify(values[i].GetCount() == 1);
+		else
+			verify(values[i].GetCount() > 1);
+	}
+
+	vector.reset(NULL);
+
+	for (int i = 0; i < 11; ++i)
+		verify(values[i].GetCount() == 1);
+}

@@ -1,0 +1,509 @@
+/* -*- Mode: c++; tab-width: 4; indent-tabs-mode: t; c-basic-offset: 4 -*-
+ *
+ * Copyright (C) 2009 Opera Software AS.  All rights reserved.
+ *
+ * This file is part of the Opera web browser.
+ * It may not be distributed under any circumstances.
+ */
+
+ /*
+ Semi clone of opdatabase.ot,but here all tests are asynchronous
+ */
+
+group "database.opdatabase.timeouts";
+
+require init;
+require SUPPORT_DATABASE_INTERNAL;
+
+language c++;
+
+include "modules/database/opdatabase.h";
+include "modules/hardcore/timer/optimer.h";
+
+global
+{
+	PS_Manager *ps_manager;
+	OP_STATUS status;
+
+#undef SELFTEST_URLCTXID
+#define SELFTEST_URLCTXID 0
+#undef WEBDB_SELFTEST_ORIGIN
+#define WEBDB_SELFTEST_ORIGIN UNI_L("http://opera.selftest")
+
+#undef SQL_WRAP
+#define SQL_WRAP(s) SqlText(SqlText::CONST_16BIT, UNI_L(s), sizeof(s) - 1)
+
+	//each instance stores the status of a single test
+	class TestStatus;
+	List<TestStatus> all_status;
+	class TestStatusLinkBase : public ListElement<TestStatusLinkBase>
+	{
+	public:
+		TestStatus *test_status;
+		TestStatusLinkBase(TestStatus* _test_status) : test_status(_test_status) {}
+		~TestStatusLinkBase() {}
+	};
+	class TestStatus: public ListElement<TestStatus>, public OpTimer, public OpTimerListener
+	{
+		unsigned m_flags;
+		enum TestStatusFlags {IS_RUNNING=1,CAN_DELETE=2,BEGIN_DELETED=4};
+		BOOL GetFlag(unsigned flag) const{return (m_flags&flag)!=0;}
+		void SetFlag(unsigned flag) {m_flags|=flag;}
+		void UnsetFlag(unsigned flag) {m_flags&=~flag;}
+
+		List<TestStatusLinkBase> callbacks;
+		TestStatus* test_status;
+	public:
+		WSD_Database* m_db;
+		SqlTransaction* m_transaction;
+
+		TestStatus(List<TestStatus>* h) : m_flags(IS_RUNNING), test_status(this), m_db(NULL), m_transaction(NULL) {
+			Into(h);
+			SetTimerListener(this);
+			Start(10000); // Start the timer.
+		}
+		~TestStatus() {
+			OP_ASSERT(!GetFlag(BEGIN_DELETED));
+			SetFlag(BEGIN_DELETED);
+			Out();
+			Finish();
+			TestStatusLinkBase *n = callbacks.First(), *m;
+			while(n != NULL) {
+				m = n->Suc();
+				n->test_status = NULL;
+				n->Out();
+				OP_DELETE(n);
+				n = m;
+			}
+		}
+		static TestStatus* Create(List<TestStatus>* h)
+		{
+			return OP_NEW(TestStatus, (h));
+		}
+		virtual void OnTimeOut(OpTimer* timer) { OpStatus::Ignore(OnTimeOut()); }
+		OP_STATUS OnTimeOut();
+
+		void Finish() {
+			UnsetFlag(IS_RUNNING);
+			if (m_transaction != NULL) {
+				SqlTransaction *transaction = m_transaction;
+				m_transaction = NULL;
+				OpStatus::Ignore(transaction->Release());
+			}
+			if (m_db != NULL) {
+				WSD_Database *db = m_db;
+				m_db = NULL;
+				OpStatus::Ignore(db->Release());
+			}
+		}
+		BOOL IsTestRunning() const{
+			return GetFlag(IS_RUNNING);
+		}
+		void AddCallback(TestStatusLinkBase *callback) {
+			callback->Into(&callbacks);
+			callback->test_status = this;
+		}
+		void RemoveCallback(TestStatusLinkBase *callback) {
+			callback->test_status = NULL;
+			callback->Out();
+			if (!HasRunningCallbacks() && GetFlag(CAN_DELETE) )
+				if (!GetFlag(BEGIN_DELETED))
+					OP_DELETE(this);
+		}
+		BOOL HasRunningCallbacks() const{return callbacks.First() != NULL;}
+		unsigned NumberOfRunningCallbacks() const{return callbacks.Cardinal();}
+		void SetCanDelete() {
+			SetFlag(CAN_DELETE);
+			if (!IsTestRunning() || !HasRunningCallbacks() )
+				if (!GetFlag(BEGIN_DELETED))
+					OP_DELETE(this);
+		}
+	};
+	void DeleteAllStatus()
+	{
+		TestStatus* n = (TestStatus*)all_status.First();
+		while(n != NULL)
+		{
+			TestStatus *m = (TestStatus*)n->Suc();
+			n->Out();
+			n->SetCanDelete();
+			n = m;
+		}
+		OP_ASSERT(all_status.First() == NULL);
+	}
+
+	static BOOL _verify(BOOL b, unsigned line_number, const char *msg, TestStatus *test_status) {
+		if(!b && test_status != NULL && test_status->IsTestRunning()) {
+			test_status->Finish();
+			char buf[1000]={0}; /* ARRAY OK 2009-04-16 joaoe */
+			op_snprintf(buf,999,"\b\b\b%d: %s should be true", line_number, msg);
+			ST_failed(buf);
+		}
+		return b;
+	}
+
+	static BOOL _verify(const void* p, unsigned line_number, const char *msg, TestStatus *test_status) {
+		return _verify(p != NULL, line_number, msg, test_status);
+	}
+
+	static void IgnorePtr(const void*p) { }
+	static void IgnorePtr(int p) { }
+
+#undef verify
+#define verify(b) do{ \
+	if(!_verify(b,__LINE__,#b,test_status)) {return OpStatus::ERR;} }while(0)
+
+#undef verifyl
+#define verifyl(b) do{ \
+	if(!_verify(b,0       ,#b,test_status)) {return OpStatus::ERR;} }while(0)
+
+	OP_STATUS TestStatus::OnTimeOut()
+	{
+		verify(!"Test timed out");
+		return OpStatus::OK;
+	}
+
+
+//callback section common to success and error callbacks
+#undef CALLBACK_SECTION_START
+#define CALLBACK_SECTION_START(type, argument) \
+	class type : public SqlStatement::Callback, public TestStatusLinkBase { \
+		OP_STATUS status; \
+	public: \
+		type(TestStatus *_test_status) : TestStatusLinkBase(_test_status) { \
+			test_status->AddCallback(this);\
+		} \
+		virtual ~type() {}\
+		virtual void Discard() { \
+			if (test_status != NULL) { \
+				TestStatus* _test_status = test_status; \
+				if (_test_status->NumberOfRunningCallbacks()<=1) { \
+					_test_status->Finish(); \
+					ST_passed(); \
+				} \
+				_test_status->RemoveCallback(this);\
+				test_status = NULL; \
+			} \
+			OP_DELETE(static_cast<TestStatusLinkBase*>(this)); \
+		} \
+		virtual BOOL RequiresCaching() const{ return TRUE; } \
+		virtual OP_STATUS HandleCallback(SqlResultSet* result_set) { \
+			status = OpStatus::OK;\
+			if (test_status != NULL && test_status->IsTestRunning()) \
+				status = HandleCallbackCustom(result_set); \
+			OP_DELETE(result_set); \
+			return status; \
+		} \
+		virtual Window*	GetWindow() { return g_selftest.utils->GetWindow(); } \
+		virtual OpFileLength GetPreferredSize() { return 32000; } \
+		const uni_char* GetDisplayName() { return NULL; } \
+		virtual OP_STATUS HandleError(OP_STATUS error, const uni_char* error_message, BOOL is_fatal) { \
+			output("Error code: %d %S\n", error, error_message); \
+			OP_DELETEA(const_cast<uni_char*>(error_message)); \
+			verify(!"Error callback called"); \
+			return OpStatus::ERR; \
+		} \
+		OP_STATUS HandleCallbackCustom(SqlResultSet* result_set) {\
+			WSD_Database*& db = test_status->m_db; \
+			SqlTransaction*& transaction = test_status->m_transaction;\
+			if (transaction == NULL) return OpStatus::ERR; \
+			IgnorePtr(db);\
+			IgnorePtr(transaction);
+			//dbg_printf(#type "::HandleCallbackCustom(%d,%x)\n",argument,argument);
+
+#undef CALLBACK_SECTION_END
+#define CALLBACK_SECTION_END(type) return OpStatus::OK;}};
+
+//error callback section
+#undef CALLBACK_ERROR_SECTION_START
+#define CALLBACK_ERROR_SECTION_START(type, argument) \
+	class type : public SqlStatement::Callback, public TestStatusLinkBase { \
+		OP_STATUS status; \
+	public: \
+		type(TestStatus *_test_status) : TestStatusLinkBase(_test_status) { \
+			test_status->AddCallback(this);\
+		} \
+		virtual ~type() {}\
+		virtual void Discard() { \
+			if (test_status != NULL) { \
+				TestStatus* _test_status = test_status; \
+				if (_test_status->NumberOfRunningCallbacks()<=1) { \
+					_test_status->Finish(); \
+					ST_passed(); \
+				} \
+				_test_status->RemoveCallback(this);\
+				test_status = NULL; \
+			} \
+			OP_DELETE(static_cast<TestStatusLinkBase*>(this)); \
+		} \
+		virtual BOOL RequiresCaching() const{ return TRUE; } \
+		virtual OP_STATUS HandleCallback(SqlResultSet* result_set) { \
+			verify(!"Error callback should have been called instead"); \
+			OP_DELETE(result_set); \
+			return OpStatus::ERR; \
+		} \
+		virtual Window*	GetWindow() { return g_selftest.utils->GetWindow(); } \
+		virtual OpFileLength GetPreferredSize() { return 32000; } \
+		const uni_char* GetDisplayName() { return NULL; } \
+		virtual OP_STATUS HandleError(OP_STATUS error, const uni_char* error_message, BOOL is_fatal) { \
+			status = OpStatus::OK;\
+			if (test_status != NULL && test_status->IsTestRunning()) \
+				status = HandleErrorCustom(error, error_message); \
+			OP_DELETEA(const_cast<uni_char*>(error_message)); \
+			return status; \
+		} \
+		OP_STATUS HandleErrorCustom(OP_STATUS argument, const uni_char* error_message) { \
+			WSD_Database*& db = test_status->m_db; \
+			SqlTransaction*& transaction = test_status->m_transaction;\
+			if (transaction == NULL) return OpStatus::ERR; \
+			IgnorePtr(db);\
+			IgnorePtr(transaction);
+			//dbg_printf(#type "::HandleCallbackCustom(%d,%x)\n",argument,argument);
+
+#undef CALLBACK_ERROR_SECTION_END
+#define CALLBACK_ERROR_SECTION_END(type) CALLBACK_SECTION_END(type)
+
+#undef CALLBACK_OBJECT_DECL
+#define CALLBACK_OBJECT_DECL(type, var_name) \
+	type* var_name = OP_NEW(type, (test_status)); \
+	verify(var_name != NULL);
+
+#undef ASYNC_TEST_START
+#define ASYNC_TEST_START \
+	class ASYNC_TEST_WRAP_TEMP{\
+	public:\
+		static OP_STATUS do_test(PS_Manager *ps_manager, OpTestcasePolicy_1* test_case_policy_1, List<TestStatus>* all_status) { \
+			OP_STATUS status = OpStatus::OK;\
+			OpStatus::Ignore(status);\
+			TestStatus* test_status = TestStatus::Create(all_status); \
+			verifyl(test_status != NULL); \
+			WSD_Database*& db = test_status->m_db; \
+			SqlTransaction*& transaction = test_status->m_transaction; \
+			PS_Object* ps_obj; \
+			verifyl(OpStatus::IsSuccess(ps_manager->GetObject(PS_ObjectTypes::KWebDatabases,WEBDB_SELFTEST_ORIGIN,UNI_L("name"),FALSE,SELFTEST_URLCTXID,&ps_obj))); \
+			db = static_cast<WSD_Database*>(ps_obj); \
+			transaction = db->CreateTransactionAsync(FALSE); \
+			verifyl(transaction != NULL); \
+			test_case_policy_1->Reset(); \
+			IgnorePtr(db);\
+			IgnorePtr(transaction);
+
+#undef ASYNC_TEST_END
+#define ASYNC_TEST_END \
+			db->Release(); \
+			db = NULL; \
+			return OpStatus::OK;}}; \
+	OpStatus::Ignore(ASYNC_TEST_WRAP_TEMP::do_test(ps_manager,&test_case_policy_1,&all_status));
+
+#define SQL_LEN(s) (sizeof(s)-1)
+#define SQL(s) UNI_L(s)
+
+	class OpTestcasePolicy_1 : public OpDefaultGlobalPolicy
+	{
+	public:
+		OpTestcasePolicy_1(PS_Policy* parent = NULL) : OpDefaultGlobalPolicy(parent)
+		{
+			Reset();
+		}
+		void Reset()
+		{
+			m_timeout = OpDefaultGlobalPolicy::GetAttribute(KQueryExecutionTimeout, SELFTEST_URLCTXID, NULL);
+			m_max_size = OpDefaultGlobalPolicy::GetAttribute(KMaxResultSetSize, SELFTEST_URLCTXID, NULL);
+		}
+		virtual ~OpTestcasePolicy_1() {}
+		virtual unsigned        GetAttribute(SecAttrUint   attr, URL_CONTEXT_ID context_id, const uni_char* domain = NULL, const Window* window = NULL) const
+		{
+			switch(attr) {
+			case KQueryExecutionTimeout:
+				return m_timeout;
+			case KMaxResultSetSize:
+				return m_max_size;
+			}
+			return OpDefaultGlobalPolicy::GetAttribute(attr, context_id, domain, window);
+		}
+		unsigned m_timeout;
+		unsigned m_max_size;
+	};
+	OpTestcasePolicy_1 test_case_policy_1;
+
+
+//20*10 * 1024 -> 200 Kb (limit is 50 Kb)
+#define BIG_SELECT "select \
+	'01234567890123456789'|| \
+	'01234567890123456789'|| \
+	'01234567890123456789'|| \
+	'01234567890123456789'|| \
+	'01234567890123456789'|| \
+	\
+	'01234567890123456789'|| \
+	'01234567890123456789'|| \
+	'01234567890123456789'|| \
+	'01234567890123456789'|| \
+	'01234567890123456789'|| \
+	'' from \
+	(select 1 union all select 1), \
+	(select 1 union all select 1), \
+	(select 1 union all select 1), \
+	(select 1 union all select 1), \
+	(select 1 union all select 1), \
+	\
+	(select 1 union all select 1), \
+	(select 1 union all select 1), \
+	(select 1 union all select 1), \
+	(select 1 union all select 1), \
+	(select 1 union all select 1);"
+
+#define CREATE_TABLE "create table t(id integer);"
+#define INSERT_MANY_LINES "insert into t(id) \
+		select random() from \
+			(select 1 union all select 1), \
+			(select 1 union all select 1), \
+			(select 1 union all select 1), \
+			(select 1 union all select 1), \
+			(select 1 union all select 1), \
+			(select 1 union all select 1), \
+			(select 1 union all select 1), \
+			(select 1 union all select 1), \
+			(select 1 union all select 1), \
+			(select 1 union all select 1);"
+#define EVIL_SELECT_1 "select random() from t,t,t"
+#define EVIL_SELECT_2 "select random() from t,t,t order by 1"
+}
+
+setup
+{
+	DATABASE_MODULE_ADD_CONTEXT(0, OPFILE_PERSISTENT_STORAGE_FOLDER);
+}
+
+test("manager setup")
+{
+	verify_not_oom(ps_manager = PS_Manager::NewForSelfTest());
+}
+
+test("really big result set") async;
+{
+	ASYNC_TEST_START;
+
+	CALLBACK_ERROR_SECTION_START(SqlErrorCallbackFailed_1,error_code)
+
+		verify(error_code == PS_Status::ERR_RSET_TOO_BIG);
+
+	CALLBACK_ERROR_SECTION_END(SqlErrorCallbackFailed_1)
+	CALLBACK_OBJECT_DECL(SqlErrorCallbackFailed_1, error_cb1);
+
+	test_case_policy_1->m_max_size = 50000;
+	db->SetPolicy(test_case_policy_1);
+
+	verify(OpStatus::IsSuccess(transaction->ExecuteSql(SQL_WRAP(BIG_SELECT), NULL, error_cb1)));
+
+	ASYNC_TEST_END;
+}
+
+test("timeout 1000 lines no order") async; timer;
+{
+	ASYNC_TEST_START;
+
+	CALLBACK_SECTION_START(SqlCallback_1,result_set)
+
+		CALLBACK_SECTION_START(SqlCallback_2,result_set)
+
+			CALLBACK_SECTION_START(SqlCallback_3,result_set)
+
+				verify(result_set != NULL);
+				verify(!result_set->IsIterable());
+				verify(result_set->GetRowsAffected()==1024);
+
+				//insert callback - should error
+				CALLBACK_ERROR_SECTION_START(SqlErrorCallbackFailed_4,error_code)
+
+					verify(error_code == PS_Status::ERR_TIMED_OUT);
+
+				CALLBACK_ERROR_SECTION_END(SqlErrorCallbackFailed_4)
+				CALLBACK_OBJECT_DECL(SqlErrorCallbackFailed_4, error_cb4);
+
+				verify(OpStatus::IsSuccess(transaction->ExecuteSql(SQL_WRAP(EVIL_SELECT_1), NULL, error_cb4)));
+
+			CALLBACK_SECTION_END(SqlCallback_3)
+
+			CALLBACK_OBJECT_DECL(SqlCallback_3,cb3);
+
+			verify(OpStatus::IsSuccess(transaction->ExecuteSql(SQL_WRAP(INSERT_MANY_LINES), NULL, cb3)));
+
+		CALLBACK_SECTION_END(SqlCallback_2)
+
+		CALLBACK_OBJECT_DECL(SqlCallback_2,cb2);
+
+		verify(transaction->GetFlag(SqlTransaction::HAS_ROLLBACK_SEGMENT));
+
+		verify(OpStatus::IsSuccess(transaction->ExecuteSql(SQL_WRAP(CREATE_TABLE), NULL, cb2)));
+
+	CALLBACK_SECTION_END(SqlCallback_1)
+
+	CALLBACK_OBJECT_DECL(SqlCallback_1,cb1);
+
+	test_case_policy_1->m_timeout = 150;
+	db->SetPolicy(test_case_policy_1);
+
+	verify(OpStatus::IsSuccess(transaction->Begin(cb1)));
+
+	ASYNC_TEST_END;
+}
+
+
+test("timeout 1000 lines ordered") async; timer;
+{
+	ASYNC_TEST_START;
+
+	CALLBACK_SECTION_START(SqlCallback_1,result_set)
+
+		CALLBACK_SECTION_START(SqlCallback_2,result_set)
+
+			CALLBACK_SECTION_START(SqlCallback_3,result_set)
+
+				verify(result_set != NULL);
+				verify(!result_set->IsIterable());
+				verify(result_set->GetRowsAffected()==1024);
+
+				//insert callback - should error
+				CALLBACK_ERROR_SECTION_START(SqlErrorCallbackFailed_4,error_code)
+
+					verify(error_code == PS_Status::ERR_TIMED_OUT);
+
+				CALLBACK_ERROR_SECTION_END(SqlErrorCallbackFailed_4)
+
+				CALLBACK_OBJECT_DECL(SqlErrorCallbackFailed_4,error_cb4);
+
+				verify(OpStatus::IsSuccess(transaction->ExecuteSql(SQL_WRAP(EVIL_SELECT_2), NULL, error_cb4)));
+
+			CALLBACK_SECTION_END(SqlCallback_3)
+
+			CALLBACK_OBJECT_DECL(SqlCallback_3,cb3);
+
+			verify(OpStatus::IsSuccess(transaction->ExecuteSql(SQL_WRAP(INSERT_MANY_LINES), NULL, cb3)));
+
+		CALLBACK_SECTION_END(SqlCallback_2)
+
+		CALLBACK_OBJECT_DECL(SqlCallback_2,cb2);
+
+		verify(transaction->GetFlag(SqlTransaction::HAS_ROLLBACK_SEGMENT));
+
+		verify(OpStatus::IsSuccess(transaction->ExecuteSql(SQL_WRAP(CREATE_TABLE), NULL, cb2)));
+
+	CALLBACK_SECTION_END(SqlCallback_1)
+
+	CALLBACK_OBJECT_DECL(SqlCallback_1,cb1);
+
+	test_case_policy_1->m_timeout = 150;
+	db->SetPolicy(test_case_policy_1);
+
+	verify(OpStatus::IsSuccess(transaction->Begin(cb1)));
+
+	ASYNC_TEST_END;
+}
+
+exit
+{
+	//TRAP(status,ps_manager->DumpIndexL(UNI_L("Exit")));
+	OP_DELETE(ps_manager);
+	DeleteAllStatus();
+}

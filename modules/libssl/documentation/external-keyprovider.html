@@ -1,0 +1,121 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN" 
+          "http://www.w3.org/TR/html4/loose.dtd">
+<html>
+
+<head>
+<link rel=stylesheet href="../../coredoc/coredoc.css" />
+<title>External Client Certificate and Key Providers</title>
+</head>
+
+<body>
+
+<h1>External Client Certificate and Key Providers</h1>
+
+<h2>Introduction</h2>
+
+<p>This API provides the ability of products to configure SSL/TLS Client Authentication certificates and the associated Private Key
+for a given site, or based on the server's list of desired certificate issuer's.</p>
+
+<p>Currently the API is not able to support password protected Private Keys, only pre-enabled keys. The API will later be expanded to 
+support Smartcards, including those protected by login or PIN-codes.
+</p>
+
+<p>Historical note: This functionality was previously designed primarily as a Smartcard provider, but have been renamed and refurbished 
+to provide more general functionality. At the time of writing some of that code is still present, but disabled using #ifdefs, as it
+has not been updated to new functionality.
+</p>
+
+<h2>Design</h2>
+
+<p>The libssl module object contain the member LibSSL::m_external_clientkey_manager, which is a list of all registred providers. 
+When a SSL/TLS server requests a Client Certificate each provider in this list is asked to provide certificates and keys that are suitable for the server, 
+based on its name and/or the list of authorities the server specified in its request.</p>
+
+<p>The providers are based on the class SSL_KeyManager, defined in "modules/libssl/smartcard/smc_man.h", and this class provides the APIs necessary for 
+the operation of the implementation's provider.</p>
+
+<h3>SSL_KeyManager</h3>	
+
+<dl>
+<dt>GetAvailableKeys
+	<dd><p>Asks the provider to select and add the most suitable certificate and key pairs it have available for the
+		named server and/or the requested certificate issuers. Note that a provider does not need to check either of these, 
+		though it is recommended. The implementation should create a certificate list, and configure a SSL_PublicKeyCipher derived object (can be requested from 
+		g_ssl_api->CreatePublicKeyCipher()) to use a RSA private key (actual loading is done using the PublicKeyCipher::LoadAllKeys() API), then call the function 
+		SSL_KeyManager::SetupCertificateEntry to add the certificate.</p>
+		
+		<p>It is possible for the implementation to configure the SSL_PublicKeyCipher object to be used automatically, using the SSL_PublicKeyCipher::Set_UseAutomatically API.
+		NOTE: This option should be used cautiosly, since it disables the UI query to the user, and may reveal sensitive privacy-related information about the user. 
+		It should only be used against specific sites, not general sites.</p>
+		
+<dt>SetupCertificateEntry
+	<dd><p>Utility function that creates a key and certificate item and adds it to the list of such items. The function takes a certificate varvector list, a fully configured public key, 
+		and name information as arguments, then creates the item. The item takes ownership of the public key object.</p>
+<dt>AllowedCertificate
+	<dd><p>Utility function that allows the implementation to check if a issuer name (as a varvector) is in the list of issuer names provided by the server.</p>
+<dt>Register
+	<dd> <p>Registers the provider in the module's list of providers.</p>
+<dt>Unregister
+	<dd><p>Removes the provider from the module's list of providers. This is automatic when the object is destroyed.</p>
+</dl>
+
+<h2>OpenSSL based pseudo code implementation</h2>
+
+<pre>
+#include &quot;modules/url/url_sn.h&quot;
+#include &quot;modules/libssl/handshake/asn1certlist.h&quot;
+#include &quot;modules/libssl/smartcard/smc_man.h&quot;
+#include &quot;modules/libssl/methods/sslpubkey.h&quot;
+
+class MyCertAndKeyProvider : public SSL_KeyManager
+{
+	virtual OP_STATUS	GetAvailableKeys(SSL_CertificateHandler_ListHead *cipherlist,  SSL_DistinguishedName_list &amp;ca_names, ServerName *sn, uint16 port)
+	{
+		OP_ASSERT(cipherlist)
+		OP_ASSERT(sn);
+		
+		// Check hostname is correct ( can also be replaced with if(!AllowedCertificate(ca_names, MyCertificateIssuer)) 
+		if(sn-&gt;GetName().CompareI(&quot;myserver.example.com&quot;) != 0) || port != MyServerPort)
+			return OpStatus::OK; // 
+			
+		SSL_ASN1Cert_list certificate;
+		
+		// Set the number of certificates in the chain
+		certificate.Resize(2);
+		RETURN_IF_ERROR(certificate.GetOPStatus()); // Return if there was an error
+		// Set the client certificate
+		certificate[0].Set(MY_CLIENT_CERTIFICATE, ARRAY_SIZE(MY_CLIENT_CERTIFICATE));
+		// Set the client certificate's issuer's certificate
+		certificate[1].Set(MY_CLIENT_CERTIFICATE_ISSUER, ARRAY_SIZE(MY_CLIENT_CERTIFICATE_ISSUER));
+		RETURN_IF_ERROR(certificate.GetOPStatus());
+		
+		AutoPtr&lt;SSL_PublicKeyCipher&gt;  key(g_ssl_api-&gt;CreatePublicKeyCipher(SSL_RSA);
+		// Create an RSA Key 
+		
+		RETURN_OOM_IF_NULL(key.get()); // If allocation failed, return
+		
+		SSL_varvector32 private_key;
+		
+		// !!THIS IS NOT HOW YOU SHOULD DO IT IN REAL CODE!! IT SHOULD BE PASSWORD PROTECTED !!
+		private_key.Set(MY_PRIVATE_KEY, ARRAY_SIZE(MY_PRIVATE_KEY)); // set the private key, encoded in the PKCS format for the method (in this case RSA)
+		RETURN_IF_ERROR(private_key.GetOPStatus());
+		
+		key-&gt;LoadAllKeys(private_key); // Load the private key data into the key handler
+		RETURN_IF_ERROR(key-&gt;GetOPStatus());
+		
+		// Add the certificate and key to the list of available certificates, then return the status. 
+		// The key is released to the function, which will delete it if there is a failure
+		return SetupCertificateEntry(cipherlist, UNI_L(&quot;My Key&quot;), UNI_L(&quot;My Key&quot;), certificate, key.release())
+	}
+};
+
+// Construct the provider object
+MyCertAndKeyProvider provider;
+
+provider.Register(); // Register it
+
+provider.Unregister(); // Unregister it
+
+</pre>
+
+

@@ -1,0 +1,443 @@
+Javascript debugger protocol.
+$Id$
+
+
+Origins.
+
+The current XML protocol is based on the old "version 3" binary
+protocol, with a little bit of structuring.  See the end of this
+document for a critique.
+
+
+Flow.
+
+Control flow is on the pattern EVENT (COMMAND RESPONSE?)* COMMAND:
+Opera sends an event to the debugger, which may issue commands to
+Opera, some of which have responses, and finally issue a command to
+relinquish control until the next event.  The only command that
+relinquishes control is "continue".
+
+The initial event is "hello", which is sent once Opera discovers that
+a debugger is present.
+
+There is one exception to this scheme.  While the debugger is not in
+control it may send a "break" command to Opera to force it to stop
+execution and signal breakpoint events for all threads.
+
+
+Central data types and how they work.
+
+A "runtime" represents a document context in which threads execute.
+There is a one-to-one mapping between runtimes and HTML documents.
+
+A "thread" represents a thread of execution in a runtime.  A "parent"
+thread can be preempted by another "child" thread in order to respond
+to a priority event; the parent thread will not run again until the
+child thread has finished.
+
+A "script" is a pair (id, source code) where the id is globally unique
+and the source code is Unicode text.
+
+An "object" is represented by a globally unique ID that is assigned by
+the debuggee.  
+
+
+Events (messages from debuggee to debugger).
+
+  # hello: make contact with the debugger
+  #
+  #   version  is the protocol version the debuggee speaks, an integer
+  #                0   The current version
+  #   os       is the operating system on which the debuggee runs
+  #   platform is the hardware platform on which the debuggee runs
+  #   ua       is the user-agent string with which the debuggee is configured
+
+  <hello>
+    <protocol-version>{UNSIGNED}</protocol-version>
+	<operating-system>{STRING}</operating-system>
+	<architecture>{STRING}</architecture>
+	<user-agent>{STRING}</user-agent>
+  <hello>
+
+
+  # new-script: signal the availability of a new script
+  #
+  #   runtime is the ID for the runtime
+  #   script  is the ID for the script, assigned by the script engine
+  #   type    is the kind of script
+  #               1   Inline script
+  #               2   Event handler script
+  #               3   Linked script
+  #               4   Timeout script
+  #               5   Java (LiveConnect?)
+  #               6   Undetermined
+  #   
+  # A SCRIPT-DATA element must be present.  This is the source code for
+  # the new script, if available (and an empty string otherwise).
+  #
+  # A URI element may be present if type=3.  This is the origin of
+  # the script.
+
+  <new-script>
+    <runtime-id>{UNSIGNED}</runtime-id>
+	<script-id>{UNSIGNED}</script-id>
+	<script-type>{STRING}</script-type>
+    {SCRIPT-DATA}
+    {RUNTIME-STATS-VALUE}?
+    {URI}?
+  </new-script>
+
+
+  # threadStarted: signal the existence of a new thread
+  #
+  #   runtime is the ID for the runtime
+  #   thread  is the ID for the thread
+  #   parent  is the ID for the thread's parent thread, or 0
+  #   type    is the kind of thread, same as the type attribute on new-script
+  #
+  # An "event" element may be present if type=2.  This element specifies 
+  # the namespace for the event and the event type.
+
+  <threadStarted runtime={NUMBER} thread={NUMBER} parent={NUMBER} type={NUMBER}>
+    <event namespace={STRING} type={STRING} />?
+    {RUNTIME-STATS-VALUE}?
+  </threadStarted>
+
+
+  # threadFinished: signal the demise of a thread
+  #
+  #   runtime is the ID for the runtime
+  #   thread  is the ID for the thread
+  #   status  is an indicator of how the thread died, one of
+  #                  1  completed normally
+  #                  2  unhandled exception
+  #                  3  aborted by engine
+  #                  4  cancelled by scheduler
+  #
+  # A RETURN-VALUE element must be present if status=1, and is
+  # otherwise ignored.
+  #
+  # An EXCEPTION-VALUE element must be present if status=2, and
+  # is otherwise ignored.
+
+  <threadFinished runtime={NUMBER} thread={NUMBER} status={NUMBER}>
+    {RETURN-VALUE}?
+    {EXCEPTION-VALUE}?
+  </threadFinished>
+
+
+  # threadStoppedAt: signal that the thread has or is stopped for some reason
+  #
+  #   runtime is the ID for the runtime
+  #   thread  is the ID for the thread
+  #   script  is the ID of the script in which it is stopped
+  #   line    is the line on which it is stopped, or 0
+  #
+  # There is exactly one body element, which encodes both the reason for
+  # stopping and data associated with the stop:
+  #
+  #   A RETURN-VALUE element must be present if the thread stopped because it
+  #   had been set to run to the end of a function.
+  #
+  #   An EXCEPTION-VALUE element must be present if the thread stopped on
+  #   an exception.
+  #
+  #   A BREAKPOINT-VALUE element must be present if the thread stopped on
+  #   a breakpoint.
+  #
+  #   A HEAPSTATS-VALUE element must be present if the thread stopped on
+  #   a garbage collection.
+
+  <threadStoppedAt runtime={NUMBER} thread={NUMBER} script={NUMBER} line={NUMBER}>
+    {RETURN-VALUE}?
+    {EXCEPTION-VALUE}?
+    {BREAKPOINT-VALUE}?
+    {HEAPSTATS-VALUE}?
+  </threadStoppedAt>
+  
+
+  # evalReply: receive a reply from an eval command
+  #
+  #   tag    is the tag that was sent with the eval command
+  #   status is an indicator of how the evaluation went, as for threadFinished
+  #
+  # A RETURN-VALUE element must be present if status=1
+
+  <evalReply tag={NUMBER} status={NUMBER}>
+    {RETURN-VALUE}?
+  </evalReply>  
+
+
+  # examineReply: receive a reply from an examine command
+  #
+  #   tag is the tag that was sent with the examine command
+  #
+  # The reply may carry a set of objects.
+
+  <examineReply tag={NUMBER}>
+    {OBJECT}*
+  </examineReply>
+
+
+  # backtraceReply: receive a reply from a backtrace command
+  #
+  #   tag is the tag that was sent with the backtrace command
+  #
+  # The reply will carry a set of frames, in order from innermost
+  # (most recent) to outermost.
+
+  <backtraceReply tag={NUMBER}>
+    {FRAME}*
+  </backtraceReply>
+
+
+Commands (messages from debugger to debuggee).
+
+  # continue: continue execution of a stopped thread
+  #
+  #    runtime is the ID for the runtime
+  #    thread  is the ID for the thread
+  #    mode    is how to continue running: 
+  #                1  RUN        run until a stop is triggered
+  #                2  STEP-INTO  step into a function call
+  #                3  STEP-OVER  step over a function call
+  #                4  FINISH     run until the end of the function
+
+  <continue runtime={NUMBER} thread={NUMBER} mode={NUMBER} />
+
+
+  # eval: evaluate a script in a context
+  #
+  #    tag     is an identifier, evalReply will use it 
+  #    runtime is the ID for the runtime
+  #    thread  is the ID for the thread
+  #    frame   is the frame index in that thread
+  #
+  # There will always be at least one body element.
+  #
+  # If a SCRIPT-DATA element is present then it represents the script to
+  # be executed.
+  #
+  # If PROPERTY elements are present then they represent variables
+  # to set.
+
+  <eval tag={NUMBER} runtime={NUMBER} thread={NUMBER} frame={NUMBER}>
+    {SCRIPT-DATA}?
+    {PROPERTY}*
+  </eval>
+
+
+  # examineFrame: examine a stack frame
+  #
+  #    tag     is an identifier, examineReply will use it 
+  #    runtime is the ID for the runtime
+  #    thread  is the ID for the thread
+  #    frame   is the frame index in that thread
+  #
+  # The debuggee will send an examineReply message containing a single
+  # object, detailing the contents of the frame.  (Normally an object
+  # reference denoting the frame itself.)
+
+  <examineFrame tag={NUMBER} runtime={NUMBER} thread={NUMBER} frame={NUMBER} />
+
+
+  # examineObjects: examine a set of objects
+  #
+  #    tag     is an identifier, examineReply will use it 
+  #    runtime is the ID for the runtime
+  #
+  # Each of the "object" subelements carries one object ID to examine.
+  #
+  # The debuggee will reply with an examineReply message, containing
+  # information about all the objects.
+
+  <examineObjects tag={NUMBER} runtime={NUMBER} />
+    <object object={NUMBER} />*
+  </examine>
+
+
+  # addBreakpoint: Add a breakpoint
+  #
+  # One of the three subelements position, function, and element must
+  # be present.
+
+  <addBreakpoint breakpoint={NUMBER}>
+    <position script={NUMBER} line={NUMBER} />
+    <function function={NUMBER} />
+    <event ??? />
+  </addBreakpoint>
+
+
+  # removeBreakpoint: remove a previously set breakpoint
+  #
+  #    breakpoint  the ID of the breakpoint previously set
+  #
+  # There is no reply.
+
+  <removeBreakpoint breakpoint={NUMBER} />
+
+
+  # setConfiguration: change configuration in the debuggee
+  #
+  # One or more stopAt subelements should be present.  The configuration
+  # of the variable corresponding to the name of the subelement will be
+  # set to that element's value, normally 0 or 1.
+  #
+  # "what" is one of "script", "exception", "error", "abort", "gc"
+  #
+  # There is no reply.
+
+  <setConfiguration>
+    <stopAt what={STRING} value={NUMBER} /> +
+  </setConfiguration>
+ 
+
+  # backtrace: ask for a backtrace of a stopped thread
+  #
+  #    tag        an ID to use in backtraceReply
+  #    runtime    the ID of the runtime
+  #    thread     the ID of the thread
+  #    maxFrames  the maximum number of frames we want to see
+  #
+  # The debuggee will respond with a backtraceReply message.
+
+  <backtrace tag={NUMBER} runtime={NUMBER} thread={NUMBER} maxFrames={NUMBER} />
+
+
+Interrupts.
+
+  # break: send break command to debuggee
+  #
+  #    runtime is the ID for the runtime
+  #    thread  is the ID for the thread to stop
+  #
+  # Send this to the debuggee when not in the command loop, to force it
+  # to stop and send threadStoppedAt messages for all, with a breakpoint
+  # record with breakpoint="0".
+ 
+  <break runtime={NUMBER} thread={NUMBER} />
+
+
+Auxiliary data types.
+
+  SCRIPT-DATA:
+
+    <script>{TEXT}</script>
+
+  URI:
+
+    <uri>{TEXT}</uri>
+
+  OBJECT:
+
+    <object>
+      {OBJECT-VALUE}
+      {PROPERTY}*
+    </object>
+
+  PROPERTY:
+
+    <property> 
+      <name>{TEXT}</name> 
+      {VALUE-DATA} 
+    </property>
+
+  VALUE-DATA:
+
+    # type is one of:
+    #    1   number (text is string representation of floating-point data)
+    #    2   boolean (text is strings "true" and "false")
+    #    3   string
+    #    4   null (text is empty)
+    #    5   undefined (text is empty)
+    #    6   object (text is an objectValue record)
+  
+    <value type={NUMBER}>{TEXT}</value>
+
+  RETURN-VALUE:
+
+    # function is the function from which we are returning
+    # the VALUE-DATA represent the return value
+
+    <return function={NUMBER}> {VALUE-DATA} </return>
+
+  EXCEPTION-VALUE:
+
+    <exception> {VALUE-DATA} </exception>
+
+  BREAKPOINT-VALUE:
+
+    # breakpoint is the breakpoint ID
+
+    <breakpoint breakpoint={NUMBER} />
+
+  HEAPSTATS-VALUE:
+
+    <heapStats>
+      <loadFactor value={FLOAT} />
+      <numCollections value={NUMBER} />
+      <msCollecting value={NUMBER} />
+      <bytesHeapLimit value={NUMBER} />
+      <bytesAllocated value={NUMBER} />
+      <bytesReclaimed value={NUMBER} />
+      <bytesInHeap value={NUMBER} />
+      <bytesInHeapPeak value={NUMBER} />
+      <bytesLiveAfterGC value={NUMBER} />
+      <bytesFreeAfterGC value={NUMBER} />
+      <objectsLiveAfterGC value={NUMBER} />
+      <objectsFreeAfterGC value={NUMBER} />
+    </heapStats>
+
+  RUNTIME-STATS-VALUE:
+
+    <runtimeStats runtime={NUMBER}>
+      <window window={NUMBER} />
+      <framePath> {TEXT} </framePath>
+      <documentURI> {TEXT} </documentURI>
+    </runtimeStats>
+
+  OBJECT-VALUE
+  
+    # object is the object ID
+    # prototype is the prototype object ID or 0
+    # isCallable is 1 if this thing accepts [[Call]]
+    # isFunction is 1 if this thing is a function
+    # name is the function name if function, otherwise the class name
+  
+    <objectValue object={NUMBER} prototype={NUMBER} isCallable={NUMBER} isFunction={NUMBER} name={STRING} />
+  
+  FRAME:
+  
+    # here the nested object-value represents the function, arguments, and variables objects,
+    # in some unspecified order
+  
+    <frame function={NUMBER} arguments={NUMBER} variables={NUMBER} script={NUMBER} line={NUMBER}>
+      {OBJECT-VALUE}*
+    </frame>
+  
+  FLOAT: signed floating-point number
+  
+  NUMBER: unsigned integer
+  
+  TEXT: unicode text
+
+
+Critique.
+
+The protocol is a bit messy, especially the way in which runtime-stats
+are passed with newScript and threadStart.  This stems from the old
+protocol's use of "auxiliary data" to communicate related data tacked
+onto the end of a message, to avoid extra request-reply pairs that
+would be needed in most cases anyway.  In straight XML this means that
+the auxiliary data become children of some toplevel element.
+
+A better way would be to send these data when necessary, as now, but
+to package everything that is sent into a special "package" element,
+eg <package>
+     <newScript> ... </newScript>
+     <runtimeStats> ... </runtimeStats>
+   </package>
+The debugger would recognize "package" specially, and just pick it
+apart and process elements separately.
+
+

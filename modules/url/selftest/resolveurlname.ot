@@ -1,0 +1,108 @@
+/* -*- Mode: c++; tab-width: 4; indent-tabs-mode: t; c-basic-offset: 4 -*-
+**
+** Copyright (C) 2000-2012 Opera Software ASA.  All rights reserved.
+**
+** This file is part of the Opera web browser.  It may not be distributed
+** under any circumstances.
+**
+*/
+
+group "url.resolve.resolveurlname";
+
+require init;
+language c++;
+
+include "modules/url/url2.h";
+include "modules/formats/uri_escape.h";
+include "modules/pi/OpSystemInfo.h";
+include "modules/prefs/prefsmanager/collections/pc_network.h";
+include "modules/encodings/utility/opstring-encodings.h";
+
+subtest resolve_test(const uni_char *input, const uni_char *wanted)
+{
+	OpString result;
+	OP_MEMORY_VAR BOOL ok = FALSE;
+	TRAPD(rc, ok = g_url_api->ResolveUrlNameL(input, result, FALSE));
+	verify(ok);
+	verify_success(rc);
+	verify_string(result, wanted);
+
+	TRAP(rc, ok = g_url_api->ResolveUrlNameL(input, result, TRUE));
+	verify(ok);
+	verify_success(rc);
+	verify_string(result, wanted);
+}
+
+test("Base-line URL resolve")
+{
+	// Can't use table construct because of ifdefs
+	verify(resolve_test(UNI_L("www.opera.com"), UNI_L("http://www.opera.com")));
+#ifndef NO_FTP_SUPPORT
+	verify(resolve_test(UNI_L("ftp.opera.com"), UNI_L("ftp://ftp.opera.com")));
+#endif
+#ifdef SYS_CAP_FILESYSTEM_HAS_DRIVES
+	verify(resolve_test(UNI_L("c:\\mypath\\myfile"), UNI_L("file://localhost/c:/mypath/myfile")));
+#else
+	verify(resolve_test(UNI_L("/mypath/myfile"), UNI_L("file://localhost/mypath/myfile")));
+#endif
+	verify(resolve_test(UNI_L("//server/path"), UNI_L("file://server/path")));
+#ifndef NO_URL_OPERA
+	verify(resolve_test(UNI_L("about:"), UNI_L("opera:about")));
+#endif
+}
+
+test("Bug#230124")
+{
+	// Tests only work if "Use UTF-8 for URLs" is set.
+	BOOL patchprefs =
+		!g_pcnet->GetIntegerPref(PrefsCollectionNetwork::UseUTF8Urls);
+#ifdef PREFS_WRITE
+	if (patchprefs)
+	{
+		g_pcnet->WriteIntegerL(PrefsCollectionNetwork::UseUTF8Urls, TRUE);
+	}
+#else
+	verify(!patchprefs || !"Cannot test without changing prefs");
+#endif
+
+	OpString result;
+	const uni_char *input = UNI_L("http://example.com/\xE5?q=\xE5");
+	OP_MEMORY_VAR BOOL ok=FALSE;
+	TRAPD(rc, ok = g_url_api->ResolveUrlNameL(input, result, TRUE));
+	verify(ok);
+	verify(OpStatus::IsSuccess(rc));
+
+	const char *system_encoding = NULL;
+	TRAP(rc, system_encoding = g_op_system_info->GetSystemEncodingL());
+	verify(OpStatus::IsSuccess(rc));
+
+	if(system_encoding && *system_encoding &&
+		op_strcmp(system_encoding, "utf-8") != 0 /* skip if already utf-8 */)
+	{
+		// Check prefix
+		verify(result.Compare(UNI_L("http://example.com/\xE5?q=%"), 24) == 0);
+		// The rest should be in the system encoding
+		OpString8 s;
+		s.Set(result.CStr() + 23);
+		int len = UriUnescape::ReplaceChars(s.CStr(), UriUnescape::NonCtrlAndEsc);
+
+		OpString check;
+		SetFromEncodingL(&check, g_op_system_info->GetSystemEncodingL(), s, len);
+		verify(check.Compare(UNI_L("\xE5")) == 0);
+	}
+	else
+	{
+		verify(result.Compare(UNI_L("http://example.com/\xE5?q=\xE5")) == 0);
+	}
+
+}
+finally
+{
+	// Reset preferences
+#ifdef PREFS_WRITE
+	if (patchprefs)
+	{
+		g_pcnet->WriteIntegerL(PrefsCollectionNetwork::UseUTF8Urls, FALSE);
+	}
+#endif
+}

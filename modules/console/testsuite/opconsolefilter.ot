@@ -1,0 +1,349 @@
+/* -*- Mode: c++; tab-width: 4; indent-tabs-mode: t; c-basic-offset: 4 -*-
+**
+** Copyright (C) 2005-2007 Opera Software ASA.  All rights reserved.
+**
+** This file is part of the Opera web browser.  It may not be distributed
+** under any circumstances.
+**
+** Peter Karlsson
+*/
+
+group "console.opconsolefilter";
+require init;
+require OPERA_CONSOLE;
+
+include "modules/console/opconsoleengine.h";
+include "modules/console/opconsolefilter.h";
+include "modules/util/opstrlst.h";
+
+// -- Global variables ---------------------------------------------------
+
+global
+{
+	OpConsoleFilter *filter, *filter2;
+	OpConsoleEngine::Severity default_severity;
+}
+
+setup
+{
+	default_severity = static_cast<OpConsoleEngine::Severity>(-2);
+	filter = OP_NEW(OpConsoleFilter, (default_severity));
+	filter2 = NULL;
+}
+
+// -- Base tests ---------------------------------------------------------
+
+test("Getting default severity")
+{
+	verify(filter->GetDefaultSeverity() == default_severity);
+}
+
+test("Setting lowest id")
+{
+	verify(filter->GetLowestId() == 0);
+	filter->SetLowestId(42);
+	verify(filter->GetLowestId() == 42);
+}
+
+// -- Internal settings --------------------------------------------------
+
+test("Serializing and unserializing")
+	require CON_ENABLE_SERIALIZATION;
+{
+	OpConsoleFilter new_filter;
+	OpString new_filter_string, result;
+
+	for (int i = 0; i < int(OpConsoleEngine::SourceTypeLast); ++ i)
+	{
+		OpConsoleEngine::Severity sev =
+			static_cast<OpConsoleEngine::Severity>(i % (OpConsoleEngine::DoNotShow + 1));
+		OP_STATUS rc =
+			new_filter.SetOrReplace(static_cast<OpConsoleEngine::Source>(i),
+			                        sev);
+		verify(OpStatus::IsSuccess(rc));
+		verify(sev == new_filter.Get(static_cast<OpConsoleEngine::Source>(i)));
+	}
+
+	// Test serializing from the new filter
+	verify(OpStatus::IsSuccess(new_filter.GetFilter(new_filter_string)));
+
+	// Test unserializing from the string
+	filter->SetFilter(new_filter_string);
+
+	// Check that we got what we wanted
+	for (int j = 0; j < int(OpConsoleEngine::SourceTypeLast); ++ j)
+	{
+		OpConsoleEngine::Severity sev =
+			static_cast<OpConsoleEngine::Severity>(j % (OpConsoleEngine::DoNotShow + 1));
+		verify(sev == filter->Get(static_cast<OpConsoleEngine::Source>(j)));
+	}
+
+	// Check that unserializing gives the same string again
+	verify(OpStatus::IsSuccess(filter->GetFilter(result)));
+	verify(new_filter_string.Compare(result) == 0);
+}
+
+test("Copying")
+	require success "Serializing and unserializing";
+{
+	// Create a copy
+	OpConsoleFilter copy;
+	verify(OpStatus::IsSuccess(copy.Duplicate(filter)));
+
+	// Make sure it is identical
+	for (int i = 0; i < int(OpConsoleEngine::SourceTypeLast); ++ i)
+	{
+		verify(copy.Get(static_cast<OpConsoleEngine::Source>(i)) == 
+		       filter->Get(static_cast<OpConsoleEngine::Source>(i)));
+	}
+}
+
+test("Changing all severities at once")
+	require success "Serializing and unserializing";
+{
+	filter->SetAllExistingSeveritiesTo(OpConsoleEngine::Error);
+
+	for (int i = 0; i < static_cast<int>(OpConsoleEngine::SourceTypeLast); ++ i)
+	{
+		verify(filter->Get(static_cast<OpConsoleEngine::Source>(i)) == OpConsoleEngine::Error);
+	}
+}
+
+test("Changing individual entries")
+{
+	filter->SetOrReplace(OpConsoleEngine::EcmaScript, OpConsoleEngine::Verbose);
+	filter->SetOrReplace(OpConsoleEngine::Network,    OpConsoleEngine::Information);
+
+	verify(filter->Get(OpConsoleEngine::EcmaScript) == OpConsoleEngine::Verbose);
+	verify(filter->Get(OpConsoleEngine::Network)    == OpConsoleEngine::Information);
+}
+
+// -- Actual filtering ---------------------------------------------------
+
+test("Filtering")
+	require success "Setting lowest id";
+	require success "Changing individual entries";
+{
+	// On requested level
+	OpConsoleEngine::Message m1(OpConsoleEngine::EcmaScript, OpConsoleEngine::Verbose);
+	verify(!filter->DisplayMessage(41, &m1)); // Id too low
+	verify(!filter->DisplayMessage(42, &m1)); // Id match
+	verify( filter->DisplayMessage(43, &m1)); // Id above
+
+	// Over requested level
+	OpConsoleEngine::Message m2(OpConsoleEngine::EcmaScript, OpConsoleEngine::Information);
+	verify(!filter->DisplayMessage(41, &m2));
+	verify(!filter->DisplayMessage(42, &m2));
+	verify( filter->DisplayMessage(43, &m2));
+
+	// Below requested level
+	OpConsoleEngine::Message m3(OpConsoleEngine::Network, OpConsoleEngine::Verbose);
+	verify(!filter->DisplayMessage(41, &m3));
+	verify(!filter->DisplayMessage(42, &m3));
+	verify(!filter->DisplayMessage(43, &m3));
+}
+
+test("Clearing filter")
+	require success "Changing individual entries";
+	require success "Changing all severities at once";
+{
+	filter->Clear();
+	for (int i = 0; i < static_cast<int>(OpConsoleEngine::SourceTypeLast); ++ i)
+	{
+		verify(filter->Get(static_cast<OpConsoleEngine::Source>(i)) == default_severity);
+	}
+
+	// Should have no effect
+	filter->SetAllExistingSeveritiesTo(OpConsoleEngine::Critical);
+	for (int j = 0; j < static_cast<int>(OpConsoleEngine::SourceTypeLast); ++ j)
+	{
+		verify(filter->Get(static_cast<OpConsoleEngine::Source>(j)) == default_severity);
+	}
+}
+
+test("Getting default severity for those unset")
+	require success "Clearing filter";
+	require success "Changing individual entries";
+	require success "Changing all severities at once";
+{
+	// Set one and check that the others still return default
+	verify(OpStatus::IsSuccess(filter->SetOrReplace(OpConsoleEngine::EcmaScript, OpConsoleEngine::Verbose)));
+	for (int i = 0; i < static_cast<int>(OpConsoleEngine::SourceTypeLast); ++ i)
+	{
+		if (static_cast<OpConsoleEngine::Source>(i) != OpConsoleEngine::EcmaScript)
+		{
+			verify(filter->Get(static_cast<OpConsoleEngine::Source>(i)) == default_severity);
+		}
+	}
+
+	// Change all specified and check that only it changed
+	filter->SetAllExistingSeveritiesTo(OpConsoleEngine::Critical);
+	for (int j = 0; j < static_cast<int>(OpConsoleEngine::SourceTypeLast); ++ j)
+	{
+		if (static_cast<OpConsoleEngine::Source>(j) != OpConsoleEngine::EcmaScript)
+		{
+			verify(filter->Get(static_cast<OpConsoleEngine::Source>(j)) == default_severity);
+		}
+	}
+	verify(filter->Get(OpConsoleEngine::EcmaScript) == OpConsoleEngine::Critical);
+}
+
+// -- Host overrides -----------------------------------------------------
+
+table testdata(const char *, OpConsoleEngine::Severity, BOOL)
+{
+	// Test domain			Severity						Expected result
+	// -- Unfiltered --
+	{ "www.opera.com",		OpConsoleEngine::Verbose,		FALSE },
+	{ "www.opera.com",		OpConsoleEngine::Information,	FALSE },
+	{ "www.opera.com",		OpConsoleEngine::Critical,		TRUE },
+	// -- Filtered exactly --
+	{ "example.com",		OpConsoleEngine::Verbose,		TRUE },
+	{ "example.com",		OpConsoleEngine::Information,	TRUE },
+	{ "example.com",		OpConsoleEngine::Critical,		TRUE },
+	// -- Filtered as subdomain --
+	{ "bad.example.com",	OpConsoleEngine::Verbose,		TRUE },
+	{ "bad.example.com",	OpConsoleEngine::Information,	TRUE },
+	{ "bad.example.com",	OpConsoleEngine::Critical,		TRUE },
+	// -- Refiltered --
+	{ "www.example.com",	OpConsoleEngine::Verbose,		FALSE },
+	{ "www.example.com",	OpConsoleEngine::Information,	TRUE },
+	{ "www.example.com",	OpConsoleEngine::Critical,		TRUE },
+}
+
+subtest testdomainfiltering(OpConsoleFilter *filter)
+	require PREFS_HOSTOVERRIDE;
+{
+	int i = 0;
+	iterate (domain, severity, expected) from testdata
+	{
+		char url[1024]; /* ARRAY OK 2009-08-03 molsson */
+		op_snprintf(url, ARRAY_SIZE(url), "https://%s/foo/bar.html", domain);
+		OpConsoleEngine::Severity sev = severity; // Work around Brew compiler issue
+		OpConsoleEngine::Message m1(OpConsoleEngine::SelfTest, sev);
+		verify(OpStatus::IsSuccess(m1.url.Set(url)));
+		verify(filter->DisplayMessage(++ i, &m1) == expected);
+	}
+}
+
+test("Per-domain filtering")
+	require PREFS_HOSTOVERRIDE;
+{
+	verify((filter2 = OP_NEW(OpConsoleFilter, (OpConsoleEngine::Critical))));
+
+	// Set up per-domain settings
+	verify(OpStatus::IsSuccess(filter2->SetDomain(UNI_L("example.com"), OpConsoleEngine::Verbose)));
+	verify(filter2->Get(UNI_L("example.com"), TRUE) == OpConsoleEngine::Verbose);
+	verify(filter2->Get(UNI_L("example.com"), FALSE) == OpConsoleEngine::Verbose);
+	verify(filter2->Get(UNI_L("bad.example.com"), TRUE) == OpConsoleEngine::Critical);
+	verify(filter2->Get(UNI_L("bad.example.com"), FALSE) == OpConsoleEngine::Verbose);
+	verify(OpStatus::IsSuccess(filter2->SetDomain(UNI_L("www.example.com"), OpConsoleEngine::Information)));
+	verify(filter2->Get(UNI_L("www.example.com"), TRUE) == OpConsoleEngine::Information);
+	verify(filter2->Get(UNI_L("www.example.com"), FALSE) == OpConsoleEngine::Information);
+
+	verify(testdomainfiltering(filter2));
+}
+
+test("Serializing of per-domain settings")
+	require PREFS_HOSTOVERRIDE;
+	require success "Per-domain filtering";
+	require CON_ENABLE_SERIALIZATION;
+{
+	OpConsoleFilter new_filter;
+	OpString filter2_string, result;
+
+	// Test serializing from the filter
+	verify(OpStatus::IsSuccess(filter2->GetFilter(filter2_string)));
+
+	// Test unserializing from the string
+	new_filter.SetFilter(filter2_string);
+
+	// Check that we got what we wanted
+	verify(testdomainfiltering(&new_filter));
+
+	// Check that unserializing gives the same string again
+	verify(OpStatus::IsSuccess(new_filter.GetFilter(result)));
+	verify(filter2_string.Compare(result) == 0);
+}
+
+test("Retrieving list of overridden domains")
+	require PREFS_HOSTOVERRIDE;
+	require success "Per-domain filtering";
+{
+	OpString_list *p = filter2->GetOverriddenHosts();
+	verify(p);
+	verify(p->Count() == 2);
+
+	BOOL have1 = FALSE, have2 = FALSE;
+	for (int i = 0; i < 2; ++ i)
+	{
+		if (p->Item(i).Compare("example.com") == 0)
+		{
+			have1 = TRUE;
+		}
+		else if (p->Item(i).Compare("www.example.com") == 0)
+		{
+			have2 = TRUE;
+		}
+	}
+
+	verify(have1);
+	verify(have2);
+}
+finally
+{
+	OP_DELETE(p);
+}
+
+test("Duplication and per-domain filtering")
+	require PREFS_HOSTOVERRIDE;
+	require success "Retrieving list of overridden domains";
+{
+	// Create a copy
+	OpConsoleFilter copy;
+	OpString_list* p = 0;
+	verify(OpStatus::IsSuccess(copy.Duplicate(filter2)));
+
+	p = copy.GetOverriddenHosts();
+	verify(p != 0);
+	verify(p->Count() == 2);
+
+	BOOL have1 = FALSE;
+	BOOL have2 = FALSE;
+
+	for (int i = 0; i < 2; ++ i)
+	{
+		if (p->Item(i).Compare("example.com") == 0)
+		{
+			have1 = TRUE;
+		}
+		else if (p->Item(i).Compare("www.example.com") == 0)
+		{
+			have2 = TRUE;
+		}
+	}
+
+	verify(have1);
+	verify(have2);
+}
+finally
+{
+	OP_DELETE(p);
+}
+
+test("Removing per-domain filter")
+	require PREFS_HOSTOVERRIDE;
+	require success "Per-domain filtering";
+{
+	verify(filter2->Get(UNI_L("example.com"), TRUE) != filter2->GetDefaultSeverity());
+	verify(OpStatus::IsSuccess(filter2->RemoveDomain(UNI_L("example.com"))));
+	verify(filter2->Get(UNI_L("example.com"), TRUE) == filter2->GetDefaultSeverity());
+}
+
+// -- Global cleanup -----------------------------------------------------
+
+exit
+{
+	OP_DELETE(filter);
+	OP_DELETE(filter2);
+}

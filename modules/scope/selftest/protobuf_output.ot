@@ -1,0 +1,1481 @@
+/* -*- mode: c++; tab-width: 4 -*-
+**
+** Copyright (C) 2009 Opera Software AS.  All rights reserved.
+**
+** This file is part of the Opera web browser.  It may not be distributed
+** under any circumstances.
+**
+** Test for serializing native objects to output formats.
+**
+** Jan Borsodi
+*/
+
+group "protobuf.protocolbuffer_output";
+
+require init;
+require PROTOBUF_SUPPORT;
+
+language c++;
+
+include "modules/util/adt/bytebuffer.h";
+
+include "modules/protobuf/src/protobuf_utils.h";
+include "modules/protobuf/src/protobuf.h";
+include "modules/protobuf/src/protobuf_message.h";
+include "modules/protobuf/src/protobuf_output.h";
+include "modules/protobuf/src/protobuf_input.h";
+include "modules/protobuf/src/protobuf_ecmascript.h";
+include "modules/protobuf/src/protobuf_types.h";
+include "modules/protobuf/src/opvaluevector.h";
+
+include "modules/ecmascript/ecmascript.h";
+
+include "modules/scope/src/scope_test_service.h";
+
+// TODO: The JSON and ES tests should merge as they should produce the same output.
+
+global
+{
+	ES_Runtime *rt = NULL;
+	struct OtGlobals
+	{
+		OtGlobals() : runtime(NULL) {}
+		ES_Runtime *runtime;
+	} globals;
+
+	float ot_decode_float(UINT32 num)
+	{
+		union { float f; UINT32 i; };
+		i = num;
+		return f;
+	}
+
+	struct OtStringUtils
+	{
+		typedef const char Type;
+
+		static BOOL IsEqual(const char *a, const char *b, int len)
+		{
+			return op_strncmp(a, b, len) == 0;
+		}
+
+		static BOOL IsExpectedData(ByteBuffer &output, const char *expected_output, unsigned int size)
+		{
+			OpHeapArrayAnchor<char> tmp(output.Copy(TRUE));
+			if (tmp.Get() == NULL)
+				return FALSE;
+			return output.Length() == size && IsEqual(tmp.Get(), expected_output, MIN(size, output.Length()));
+		}
+	};
+
+	struct OtByteUtils
+	{
+		typedef const unsigned char Type;
+
+		static BOOL IsEqual(const char *a, const unsigned char *b, int len)
+		{
+			const unsigned char *tmp = reinterpret_cast<const unsigned char *>(a);
+			for (int i = 0; i < len; ++i)
+				if (*tmp++ != *b++)
+					return FALSE;
+			return TRUE;
+		}
+
+		static BOOL IsExpectedData(ByteBuffer &output, const unsigned char *expected_output, unsigned int size)
+		{
+			OpHeapArrayAnchor<char> tmp(output.Copy(FALSE));
+			if (tmp.Get() == NULL)
+				return FALSE;
+			return output.Length() == size && IsEqual(tmp.Get(), expected_output, MIN(size, output.Length()));
+		}
+	};
+
+	struct OtProtoUtils
+	{
+		static BOOL Compare(const ByteBuffer &buf, const char *expected, unsigned int expected_len)
+		{
+			if (buf.Length() != expected_len)
+				return FALSE;
+			char *tmp = buf.Copy(FALSE);
+			for (unsigned int i = 0; i < expected_len; ++i)
+			{
+				if (tmp[i] != expected[i])
+				{
+					OP_DELETEA(tmp);
+					return FALSE;
+				}
+			}
+			OP_DELETEA(tmp);
+			return TRUE;
+		}
+	};
+
+	BOOL OtFloatAlmostEqual(double a, double b, double maxrel)
+	{
+		if (a == b)
+			return TRUE;
+		return op_fabs((a - b) / b) <= maxrel;
+	}
+
+	struct OtJSON
+	{
+		typedef OpJSONInputStream InputType;
+		typedef OpJSONOutputStream OutputType;
+		typedef const char ExpectType;
+
+		OtJSON(OtGlobals &) {}
+
+		OP_STATUS Process(OpProtobufInstanceProxy &out_proxy, OpProtobufInstanceProxy &in_proxy, const char *expected_output, unsigned int size)
+		{
+			RETURN_IF_ERROR(Serialize(out_proxy));
+			RETURN_IF_ERROR(IsExpectedData(expected_output, size));
+			return Unserialize(in_proxy);
+		}
+
+		OP_STATUS Unserialize(OpProtobufInstanceProxy &in_proxy)
+		{
+			InputType istream;
+			TempBuffer input;
+			RETURN_IF_ERROR(OpProtobufUtils::ConvertUTF8toUTF16(input, output));
+			RETURN_IF_ERROR(istream.Construct(input.GetStorage(), input.Length()));
+			return istream.Read(in_proxy);
+		}
+
+		OP_STATUS Serialize(OpProtobufInstanceProxy &in_proxy)
+		{
+			OutputType ostream(output);
+			return ostream.Write(in_proxy);
+		}
+
+		BOOL IsExpectedData(const char *expected_output, unsigned int size)
+		{
+			return OtStringUtils::IsExpectedData(output, expected_output, size);
+		}
+
+		OP_STATUS SetSerializedData(const char *test_output, unsigned int size)
+		{
+			output.Clear();
+			return output.AppendBytes(test_output, size);
+		}
+
+		ByteBuffer output;
+	};
+
+	struct OtES
+	{
+		typedef OpESInputStream InputType;
+		typedef OpESOutputStream OutputType;
+		typedef const char ExpectType;
+
+		OtES(OtGlobals &globals) : g(globals), output(NULL) {}
+
+		OP_STATUS Process(OpProtobufInstanceProxy &out_proxy, OpProtobufInstanceProxy &in_proxy, const char *expected_output, unsigned int size)
+		{
+			RETURN_IF_ERROR(Serialize(out_proxy));
+			RETURN_IF_ERROR(IsExpectedData(expected_output, size));
+			return Unserialize(in_proxy);
+		}
+
+		OP_STATUS Unserialize(OpProtobufInstanceProxy &in_proxy)
+		{
+			OP_ASSERT(output);
+			InputType istream;
+			RETURN_IF_ERROR(istream.Construct(output, g.runtime));
+			return istream.Read(in_proxy);
+		}
+
+		OP_STATUS Serialize(OpProtobufInstanceProxy &out_proxy)
+		{
+			output = NULL;
+			OutputType ostream(output, g.runtime);
+			return ostream.Write(out_proxy);
+		}
+
+		BOOL IsExpectedData(const char *expected_output, unsigned int size)
+		{
+			OpESToJSON tojson;
+			ByteBuffer buf;
+			if (OpStatus::IsSuccess(tojson.Construct(output, g.runtime)) &&
+				OpStatus::IsSuccess(tojson.Write(buf)))
+			{
+				return OtStringUtils::IsExpectedData(buf, expected_output, size);
+			}
+			return FALSE;
+		}
+
+		OP_STATUS SetSerializedData(const char *test_output, unsigned int size)
+		{
+			output = NULL;
+			OpJSONToES toes(output, g.runtime);
+			ByteBuffer buf;
+			RETURN_IF_ERROR(buf.AppendBytes(test_output, size));
+			RETURN_IF_ERROR(toes.Construct(buf));
+			return toes.Read();
+		}
+
+		OtGlobals &g;
+		ES_Object *output;
+	};
+
+	struct OtXML
+	{
+		typedef OpXMLInputStream InputType;
+		typedef OpXMLOutputStream OutputType;
+		typedef const char ExpectType;
+
+		OtXML(OtGlobals &) {}
+
+		OP_STATUS Process(OpProtobufInstanceProxy &out_proxy, OpProtobufInstanceProxy &in_proxy, const char *expected_output, unsigned int size)
+		{
+			RETURN_IF_ERROR(Serialize(out_proxy));
+			RETURN_IF_ERROR(IsExpectedData(expected_output, size));
+			return Unserialize(in_proxy);
+		}
+
+		OP_STATUS Unserialize(OpProtobufInstanceProxy &in_proxy)
+		{
+			InputType istream;
+			OpAutoArray<char> input(output.Copy());
+			RETURN_IF_ERROR(istream.Construct(input.get(), output.Length()));
+			return istream.Read(in_proxy);
+		}
+
+		OP_STATUS Serialize(OpProtobufInstanceProxy &in_proxy)
+		{
+			OutputType ostream(output);
+			return ostream.Write(in_proxy);
+		}
+
+		BOOL IsExpectedData(const char *expected_output, unsigned int size)
+		{
+			return OtStringUtils::IsExpectedData(output, expected_output, size);
+		}
+
+		OP_STATUS SetSerializedData(const char *test_output, unsigned int size)
+		{
+			output.Clear();
+			return output.AppendBytes(test_output, size);
+		}
+
+		ByteBuffer output;
+	};
+
+	struct OtProtobuf
+	{
+		typedef OpProtobufInputStream InputType;
+		typedef OpProtobufOutputStream OutputType;
+		typedef const unsigned char ExpectType;
+
+		OtProtobuf(OtGlobals &) {}
+
+		OP_STATUS Process(OpProtobufInstanceProxy &out_proxy, OpProtobufInstanceProxy &in_proxy, const unsigned char *expected_output, unsigned int size)
+		{
+			RETURN_IF_ERROR(Serialize(out_proxy));
+			RETURN_IF_ERROR(IsExpectedData(expected_output, size));
+			return Unserialize(in_proxy);
+		}
+
+		OP_STATUS Unserialize(OpProtobufInstanceProxy &in_proxy)
+		{
+			InputType istream;
+			OpAutoArray<unsigned char> input(reinterpret_cast<unsigned char*>(output.Copy()));
+			RETURN_IF_ERROR(istream.Construct(input.get(), output.Length()));
+			return istream.Read(in_proxy);
+		}
+
+		OP_STATUS Serialize(OpProtobufInstanceProxy &in_proxy)
+		{
+			OpProtobufByteBufferOutputRange out_range(output);
+			OutputType ostream(&out_range);
+			return ostream.Write(in_proxy);
+		}
+
+		BOOL IsExpectedData(const unsigned char *expected_output, unsigned int size)
+		{
+			return OtByteUtils::IsExpectedData(output, expected_output, size);
+		}
+
+		OP_STATUS SetSerializedData(const unsigned char *test_output, unsigned int size)
+		{
+			output.Clear();
+			return output.AppendBytes(reinterpret_cast<const char *>(test_output), size);
+		}
+
+		ByteBuffer output;
+	};
+
+	// Adapter for OpProtobufOutputStream, only needed until all output classes uses an OpProtobufOutputRange
+	struct OtProtobufOutputStream
+		: public OpProtobufOutputStream
+	{
+		OtProtobufOutputStream(ByteBuffer &buffer)
+			: OpProtobufOutputStream(&out_range)
+			, out_range(buffer)
+		{
+		}
+
+		OpProtobufByteBufferOutputRange out_range;
+	};
+
+	OtScopeTestService_SI::Descriptors g_descriptors;
+}
+
+setup
+{
+}
+
+exit
+{
+	if (rt)
+	    rt->Detach();
+}
+
+test("Init")
+{
+	rt = OP_NEW(ES_Runtime, ());
+	verify_not_oom(rt);
+	verify_success(rt->Construct());
+	globals.runtime = rt;
+}
+
+test( "ES: Floating point" )
+	require success "Init";
+{
+	OtScopeTestService::FloatMessage msg;
+	msg.SetFuzzy(4.12f);
+	msg.SetPi(3.1415);
+	msg.SetSqr(4);
+	msg.SetSci(15000);
+
+	ES_Object* output = NULL;
+	OpESOutputStream ostream(output, rt);
+	OpProtobufInstanceProxy proxy(OtScopeTestService::FloatMessage::GetMessageDescriptor(&g_descriptors), reinterpret_cast<void *>(&msg));
+	verify(OpStatus::IsSuccess(ostream.Write(proxy)));
+
+	OtScopeTestService::FloatMessage msg_out;
+	OpProtobufInstanceProxy proxy_out(OtScopeTestService::FloatMessage::GetMessageDescriptor(&g_descriptors), reinterpret_cast<void *>(&msg_out));
+	OpESInputStream istream;
+	verify(OpStatus::IsSuccess(istream.Construct(output, rt)));
+	verify(OpStatus::IsSuccess(istream.Read(proxy_out)));
+
+	double maxrel = 0.00001;
+
+	verify(OtFloatAlmostEqual(msg_out.GetFuzzy(), 4.12,   maxrel));
+	verify(OtFloatAlmostEqual(msg_out.GetPi(),    3.1415, maxrel));
+	verify(OtFloatAlmostEqual(msg_out.GetSqr(),   4,      maxrel));
+	verify(OtFloatAlmostEqual(msg_out.GetSci(),   15000,  maxrel));
+}
+
+test( "ES: Serialize nested messages" )
+	require success "Init";
+{
+	OtScopeTestService::Outer msg;
+	msg.SetA(40);
+	msg.SetB(UNI_L("Fade to Black"));
+
+	OtScopeTestService::Outer::Inner &inner = msg.GetCRef();
+	inner.SetA(256);
+	inner.SetB(UNI_L("Enter Sandman"));
+	unsigned char bytes[4] = {0xca, 0xfe, 0xba, 0xbe};
+	inner.SetD((const char *)bytes, 4);
+	
+	inner.GetCRef().SetA(0x4000);
+
+	ES_Object* output = NULL;
+	OpESOutputStream ostream(output, rt);
+	OpProtobufInstanceProxy proxy(OtScopeTestService::Outer::GetMessageDescriptor(&g_descriptors), reinterpret_cast<void *>(&msg));
+	verify(OpStatus::IsSuccess(ostream.Write(proxy)));
+
+	OtScopeTestService::Outer msg_out;
+	OpProtobufInstanceProxy proxy_out(OtScopeTestService::Outer::GetMessageDescriptor(&g_descriptors), reinterpret_cast<void *>(&msg_out));
+	OpESInputStream istream;
+	verify(OpStatus::IsSuccess(istream.Construct(output, rt)));
+	verify(OpStatus::IsSuccess(istream.Read(proxy_out)));
+
+	verify(msg_out.GetA() == 40);
+	verify(msg_out.GetB().Compare(UNI_L("Fade to Black")) == 0);
+	verify(msg_out.GetC().GetA() == 256);
+	verify(msg_out.GetC().GetB().Compare(UNI_L("Enter Sandman")) == 0);
+	verify(msg_out.GetC().GetC().GetA() == 0x4000);
+	verify(OtProtoUtils::Compare(msg_out.GetC().GetD(), (const char *)bytes, 4));
+}
+
+test( "ES: Serialize optional fields" )
+	require success "Init";
+{
+	OtScopeTestService::Optional msg;
+	msg.SetA(-40);
+	// b is not set
+	{
+		OpAutoPtr<OpString> str1(new OpString());
+		verify(str1.get() != NULL);
+		verify(OpStatus::IsSuccess(str1->Set(UNI_L("Fade to Black"))));
+		verify(OpStatus::IsSuccess(msg.GetDListRef().Add(str1.get())));
+		str1.release();
+	}
+	{
+		OpAutoPtr<OpString> str1(new OpString());
+		verify(str1.get() != NULL);
+		verify(OpStatus::IsSuccess(str1->Set(UNI_L("Du Hast"))));
+		verify(OpStatus::IsSuccess(msg.GetDListRef().Add(str1.get())));
+		str1.release();
+	}
+	msg.AppendToCList(2);
+	msg.AppendToCList(3);
+	msg.AppendToCList(5);
+	// eList is not set
+	msg.SetF(OP_NEW(OtScopeTestService::Optional::OptionalInner, ()));
+	verify(msg.GetF() != NULL);
+	msg.GetF()->SetA(UNI_L("Magnetic"));
+	// g is not set
+
+	ES_Object* output = NULL;
+	OpESOutputStream ostream(output, rt);
+	OpProtobufInstanceProxy proxy(OtScopeTestService::Optional::GetMessageDescriptor(&g_descriptors), reinterpret_cast<void *>(&msg));
+	verify(OpStatus::IsSuccess(ostream.Write(proxy)));
+
+	OtScopeTestService::Optional msg_out;
+	OpProtobufInstanceProxy proxy_out(OtScopeTestService::Optional::GetMessageDescriptor(&g_descriptors), reinterpret_cast<void *>(&msg_out));
+	OpESInputStream istream;
+	verify(OpStatus::IsSuccess(istream.Construct(output, rt)));
+	verify(OpStatus::IsSuccess(istream.Read(proxy_out)));
+
+	verify(msg_out.GetA() == -40);
+	verify(!msg_out.HasB());
+	verify(msg_out.HasCList());
+	verify(msg_out.GetCList().GetCount() == 3);
+	verify(msg_out.GetCList().Get(0) == 2);
+	verify(msg_out.GetCList().Get(1) == 3);
+	verify(msg_out.GetCList().Get(2) == 5);
+	verify(msg_out.HasDList());
+	verify(msg_out.GetDList().GetCount() == 2);
+	verify(msg_out.GetDList().Get(0)->Compare(UNI_L("Fade to Black")) == 0);
+	verify(msg_out.GetDList().Get(1)->Compare(UNI_L("Du Hast")) == 0);
+	verify(!msg_out.HasEList());
+	verify(msg_out.HasF());
+	verify(msg_out.GetF()->GetA().Compare(UNI_L("Magnetic")) == 0);
+	verify(!msg_out.HasG());
+}
+
+/* JSON/XML/Proto tests */
+
+
+foreach (name, STREAM_CLS, TYPE_CLS, SIZE_FUNC, expected_data) from
+  {
+    {JSON, OpJSONOutputStream, OtStringUtils, op_strlen, "[4,286,31415,42,-200,1]"}
+   ,{XML,  OpXMLOutputStream,  OtStringUtils, op_strlen, "<IntegerMessage><runtimeID>4</runtimeID><objectID>286</objectID><windowID>31415</windowID><scriptID>42</scriptID><htmlID>-200</htmlID><isActive>1</isActive></IntegerMessage>"}
+   ,{PB,   OtProtobufOutputStream, OtByteUtils, sizeof,
+			{1 << 3 | OpProtobufWireFormat::VarInt, 4
+			,2 << 3 | OpProtobufWireFormat::Fixed32, 0x1e, 0x01, 0x00, 0x00 // 286
+			,3 << 3 | OpProtobufWireFormat::VarInt, 0xb7, 0xf5, 0x1 // 31415
+			,4 << 3 | OpProtobufWireFormat::VarInt, 84 // 84 = ZigZag(42)
+			,5 << 3 | OpProtobufWireFormat::Fixed32, 0x38, 0xff, 0xff, 0xff // -200
+			,6 << 3 | OpProtobufWireFormat::VarInt, 1
+			}
+	}
+  }
+{
+test("$(name): Integers")
+	require success "Init";
+{
+	OtScopeTestService::IntegerMessage msg;
+	msg.SetRuntimeID(4);
+	msg.SetObjectID(286);
+	msg.SetWindowID(31415);
+	msg.SetScriptID(42);
+	msg.SetHtmlID(-200);
+	msg.SetIsActive(TRUE);
+
+	ByteBuffer output;
+	STREAM_CLS ostream(output);
+	OpProtobufInstanceProxy proxy(OtScopeTestService::IntegerMessage::GetMessageDescriptor(&g_descriptors), reinterpret_cast<void *>(&msg));
+	verify(OpStatus::IsSuccess(ostream.Write(proxy)));
+
+	TYPE_CLS::Type expected_output[] = expected_data;
+	verify(TYPE_CLS::IsExpectedData(output, expected_output, SIZE_FUNC(expected_output)));
+}
+}
+
+foreach (name, STREAM_CLS, TYPE_CLS, SIZE_FUNC, expected_data) from
+  {
+    {JSON, OpJSONOutputStream, OtStringUtils, op_strlen, "[2147483647,2147483648,4294967295]"}
+   ,{XML,  OpXMLOutputStream,  OtStringUtils, op_strlen, "<UnsignedIntegerMessage><runtimeID>2147483647</runtimeID><objectID>2147483648</objectID><htmlID>4294967295</htmlID></UnsignedIntegerMessage>"}
+   ,{PB,   OtProtobufOutputStream, OtByteUtils, sizeof,
+			{1 << 3 | OpProtobufWireFormat::VarInt, 0xff, 0xff, 0xff, 0xff, 0x07 // 0x7ffffff
+			,2 << 3 | OpProtobufWireFormat::VarInt, 0x80, 0x80, 0x80, 0x80, 0x08 // 0x8000000
+			,3 << 3 | OpProtobufWireFormat::Fixed32, 0xff, 0xff, 0xff, 0xff // 0xffffffff
+			}
+	}
+  }
+{
+test("$(name): Unsigned 32bit Integers")
+	require success "Init";
+{
+	OtScopeTestService::UnsignedIntegerMessage msg;
+	msg.SetRuntimeID(2147483647u);
+	msg.SetObjectID(2147483648u);
+	msg.SetHtmlID(4294967295u);
+
+	ByteBuffer output;
+	STREAM_CLS ostream(output);
+	OpProtobufInstanceProxy proxy(OtScopeTestService::UnsignedIntegerMessage::GetMessageDescriptor(&g_descriptors), reinterpret_cast<void *>(&msg));
+	verify(OpStatus::IsSuccess(ostream.Write(proxy)));
+
+	TYPE_CLS::Type expected_output[] = expected_data;
+	verify(TYPE_CLS::IsExpectedData(output, expected_output, SIZE_FUNC(expected_output)));
+}
+}
+
+foreach (name, STREAM_CLS, TYPE_CLS, SIZE_FUNC, expected_data) from
+  {
+    {JSON, OpJSONOutputStream, OtStringUtils, op_strlen, "[0,0,2147483647,-1,-2147483648,0]"}
+   ,{XML,  OpXMLOutputStream,  OtStringUtils, op_strlen, "<IntegerMessage><runtimeID>0</runtimeID><objectID>0</objectID><windowID>2147483647</windowID><scriptID>-1</scriptID><htmlID>-2147483648</htmlID><isActive>0</isActive></IntegerMessage>"}
+   ,{PB,   OtProtobufOutputStream, OtByteUtils, sizeof,
+			{1 << 3 | OpProtobufWireFormat::VarInt, 0 // ignore this
+			,2 << 3 | OpProtobufWireFormat::Fixed32, 0,0,0,0 // ignore this
+			,3 << 3 | OpProtobufWireFormat::VarInt, 0xff, 0xff, 0xff, 0xff, 0x07 // 2147483647
+			,4 << 3 | OpProtobufWireFormat::VarInt, 0x03 // ZigZag(-1)
+			,5 << 3 | OpProtobufWireFormat::Fixed32, 0x00, 0x00, 0x00, 0x80 // -2147483648
+			,6 << 3 | OpProtobufWireFormat::VarInt, 0 // ignore this
+			}
+	}
+  }
+{
+test("$(name): Signed 32bit Integers")
+	require success "Init";
+{
+	OtScopeTestService::IntegerMessage msg;
+	msg.SetRuntimeID(0);
+	msg.SetObjectID(0);
+	msg.SetWindowID(2147483647);
+	msg.SetScriptID(-1);
+	msg.SetHtmlID(-2147483647 - 1);
+	msg.SetIsActive(FALSE);
+
+	ByteBuffer output;
+	STREAM_CLS ostream(output);
+	OpProtobufInstanceProxy proxy(OtScopeTestService::IntegerMessage::GetMessageDescriptor(&g_descriptors), reinterpret_cast<void *>(&msg));
+	verify(OpStatus::IsSuccess(ostream.Write(proxy)));
+
+	TYPE_CLS::Type expected_output[] = expected_data;
+	verify(TYPE_CLS::IsExpectedData(output, expected_output, SIZE_FUNC(expected_output)));
+}
+}
+
+// Note: There is no test case for Protocol Buffers for float values, hard to test across compilers
+foreach (name, STREAM_CLS, TYPE_CLS, SIZE_FUNC, expected_data) from
+  {
+    {JSON, OpJSONOutputStream, OtStringUtils, op_strlen, "[4.5,3.1415,4,15000]";}
+   ,{XML,  OpXMLOutputStream,  OtStringUtils, op_strlen, "<FloatMessage><fuzzy>4.5</fuzzy><pi>3.1415</pi><sqr>4</sqr><sci>15000</sci></FloatMessage>"}
+  }
+{
+test( "$(name): Floating point" )
+	require success "Init";
+{
+	OtScopeTestService::FloatMessage msg;
+	msg.SetFuzzy(4.5f);
+	msg.SetPi(3.1415);
+	msg.SetSqr(4);
+	msg.SetSci(15000);
+
+	ByteBuffer output;
+	STREAM_CLS ostream(output);
+	OpProtobufInstanceProxy proxy(OtScopeTestService::FloatMessage::GetMessageDescriptor(&g_descriptors), reinterpret_cast<void *>(&msg));
+	verify(OpStatus::IsSuccess(ostream.Write(proxy)));
+
+	TYPE_CLS::Type expected_output[] = expected_data;
+	verify(TYPE_CLS::IsExpectedData(output, expected_output, SIZE_FUNC(expected_output)));
+}
+}
+
+foreach (name, STREAM_CLS, TYPE_CLS, SIZE_FUNC, expected_data) from
+  {
+    {JSON, OpJSONOutputStream, OtStringUtils, op_strlen, "[\"Macroscopic level/Matter\",\"Molecular level\",\"\"]"}
+   ,{XML,  OpXMLOutputStream,  OtStringUtils, op_strlen, "<StringMessage><first>Macroscopic level/Matter</first><second>Molecular level</second><empty></empty></StringMessage>"}
+   ,{PB,   OtProtobufOutputStream, OtByteUtils, sizeof,
+			{1 << 3 | OpProtobufWireFormat::LengthDelimited, 24, 'M','a','c','r','o','s','c','o','p','i','c',' ','l','e','v','e','l','/','M','a','t','t','e','r'
+			,2 << 3 | OpProtobufWireFormat::LengthDelimited, 15, 'M','o','l','e','c','u','l','a','r',' ','l','e','v','e','l'
+			,3 << 3 | OpProtobufWireFormat::LengthDelimited, 0
+			}
+	}
+  }
+{
+test("$(name): Strings")
+	require success "Init";
+{
+	OtScopeTestService_SI::StringMessage msg;
+	msg.SetFirst("Macroscopic level/Matter");
+	msg.SetSecond("Molecular level");
+	// field 'empty' is empty
+
+	ByteBuffer output;
+	STREAM_CLS ostream(output);
+	OpProtobufInstanceProxy proxy(OtScopeTestService::StringMessage::GetMessageDescriptor(&g_descriptors), reinterpret_cast<void *>(&msg));
+	verify(OpStatus::IsSuccess(ostream.Write(proxy)));
+
+	TYPE_CLS::Type expected_output[] = expected_data;
+	verify(TYPE_CLS::IsExpectedData(output, expected_output, SIZE_FUNC(expected_output)));
+}
+}
+
+test("JSON: Long Strings")
+	require success "Init";
+{
+	uni_char long_string[1024*20 + 501 + 1];
+	char     long_string_expected[2 + 1024*20 + 501 + 8 + 1];
+	char    *tmp = NULL;
+	unsigned int i;
+	long_string_expected[0] = '[';
+	long_string_expected[1] = '\"';
+	for (i = 0; i < ARRAY_SIZE(long_string) - 1; ++i)
+	{
+		char c = (char)('0' + (i % 43));
+		long_string[i] = c;
+		long_string_expected[i+2] = c;
+	}
+	long_string[i] = '\0';
+	op_memcpy(long_string_expected + 2 + i, "\",\"\",\"\"]", 9);
+
+	OtScopeTestService_SI::StringMessage msg;
+	msg.SetFirst(long_string);
+	// fields 'second' and 'empty' are empty
+
+	ByteBuffer output;
+	OpJSONOutputStream ostream(output);
+	OpProtobufInstanceProxy proxy(OtScopeTestService::StringMessage::GetMessageDescriptor(&g_descriptors), reinterpret_cast<void *>(&msg));
+	verify(OpStatus::IsSuccess(ostream.Write(proxy)));
+
+	tmp = output.Copy(TRUE);
+	verify(op_strncmp(tmp, long_string_expected, op_strlen(long_string_expected)) == 0);
+}
+finally
+{
+	OP_DELETEA(tmp);
+}
+
+test("XML: Long Strings")
+	require success "Init";
+{
+	uni_char long_string[1024*20 + 501 + 1];
+	char     long_string_expected[22 + 1024*20 + 501 + 56 + 1];
+	char    *tmp = NULL;
+	unsigned int i;
+	char prefix[] = "<StringMessage><first>";
+	int prefix_len = op_strlen(prefix);
+	op_memcpy(long_string_expected, prefix, prefix_len);
+	for (i = 0; i < ARRAY_SIZE(long_string) - 1; ++i)
+	{
+		char c = (char)('A' + (i % 26));
+		long_string[i] = c;
+		long_string_expected[i + prefix_len] = c;
+	}
+	long_string[i] = '\0';
+	char suffix[] = "</first><second></second><empty></empty></StringMessage>";
+	int suffix_len = op_strlen(suffix);
+	op_memcpy(long_string_expected + prefix_len + i, suffix, suffix_len + 1);
+
+	OtScopeTestService_SI::StringMessage msg;
+	msg.SetFirst(long_string);
+	// fields 'second' and 'empty' are empty
+
+	ByteBuffer output;
+	OpXMLOutputStream ostream(output);
+	OpProtobufInstanceProxy proxy(OtScopeTestService::StringMessage::GetMessageDescriptor(&g_descriptors), reinterpret_cast<void *>(&msg));
+	verify(OpStatus::IsSuccess(ostream.Write(proxy)));
+
+	tmp = output.Copy(TRUE);
+	verify(op_strncmp(tmp, long_string_expected, op_strlen(long_string_expected)) == 0);
+}
+finally
+{
+	OP_DELETEA(tmp);
+}
+
+
+test("PB: Long Strings")
+	require success "Init";
+{
+	uni_char      long_string[1024*20 + 501 + 1];
+	unsigned char long_string_expected[4 + 1024*20 + 501 + 4] =
+	{1 << 3 | OpProtobufWireFormat::LengthDelimited, 0x80 + 117, 0x80 + 35, 1}; // size is 20981
+	unsigned char end_expected[] = 
+	{2 << 3 | OpProtobufWireFormat::LengthDelimited, 0
+	,3 << 3 | OpProtobufWireFormat::LengthDelimited, 0};
+	char    *tmp = NULL;
+	unsigned int i;
+	for (i = 0; i < ARRAY_SIZE(long_string) - 1; ++i)
+	{
+		char c = (char)('0' + (i % 43));
+		long_string[i] = c;
+		long_string_expected[i + 4] = c;
+	}
+	long_string[i] = '\0';
+	op_memcpy(long_string_expected + 4 + i, reinterpret_cast<char *>(&end_expected[0]), sizeof(end_expected));
+
+	OtScopeTestService_SI::StringMessage msg;
+	msg.SetFirst(long_string);
+	// fields 'second' and 'empty' are empty
+
+	ByteBuffer output;
+	OtProtobufOutputStream ostream(output);
+	OpProtobufInstanceProxy proxy(OtScopeTestService::StringMessage::GetMessageDescriptor(&g_descriptors), reinterpret_cast<void *>(&msg));
+	verify(OpStatus::IsSuccess(ostream.Write(proxy)));
+
+	tmp = output.Copy();
+	verify(OtByteUtils::IsEqual(tmp, long_string_expected, sizeof(long_string_expected)));
+}
+finally
+{
+	OP_DELETEA(tmp);
+}
+
+foreach (name, STREAM_CLS, TYPE_CLS, SIZE_FUNC, expected_data) from
+  {
+    {JSON, OpJSONOutputStream, OtStringUtils, op_strlen, "[\"yv66vg==\",\"\"]"}
+   ,{XML,  OpXMLOutputStream,  OtStringUtils, op_strlen, "<OnesAndZeroes><first>yv66vg==</first><empty></empty></OnesAndZeroes>"}
+   ,{PB,   OtProtobufOutputStream, OtByteUtils, sizeof,
+			{1 << 3 | OpProtobufWireFormat::LengthDelimited, 4, 0xca, 0xfe, 0xba, 0xbe
+			,2 << 3 | OpProtobufWireFormat::LengthDelimited, 0
+			}
+	}
+  }
+{
+test("$(name): Bin4ry")
+	require success "Init";
+{
+	OtScopeTestService_SI::OnesAndZeroes msg;
+	unsigned char bytes[4] = {0xca, 0xfe, 0xba, 0xbe};
+	msg.SetFirst((const char *)bytes, 4);
+	// field 'empty' is empty
+
+	ByteBuffer output;
+	STREAM_CLS ostream(output);
+	OpProtobufInstanceProxy proxy(OtScopeTestService::OnesAndZeroes::GetMessageDescriptor(&g_descriptors), reinterpret_cast<void *>(&msg));
+	verify(OpStatus::IsSuccess(ostream.Write(proxy)));
+
+	TYPE_CLS::Type expected_output[] = expected_data;
+	verify(TYPE_CLS::IsExpectedData(output, expected_output, SIZE_FUNC(expected_output)));
+}
+}
+
+foreach (name, STREAM_CLS, SIZE_FUNC, expected_data) from
+  {
+    {JSON, OtJSON,     op_strlen, "[\"Remote Viewing\",\"Chromosome Corrupt\",\"Stratus\",\"Tentacle Lullaby\",[\"data\",\"system\"],[\"cache\",\"sdcard\"]]"}
+    {ES,   OtES,       op_strlen, "[\"Remote Viewing\",\"Chromosome Corrupt\",\"Stratus\",\"Tentacle Lullaby\",[\"data\",\"system\"],[\"cache\",\"sdcard\"]]"}
+    {XML,  OtXML,      op_strlen, "<MixedStringType><type1>Remote Viewing</type1><type2>Chromosome Corrupt</type2><type3>Stratus</type3><type4>Tentacle Lullaby</type4><type5List><type5>data</type5><type5>system</type5></type5List><type6List><type6>cache</type6><type6>sdcard</type6></type6List></MixedStringType>"}
+    {PB,   OtProtobuf, sizeof,
+			{1 << 3 | OpProtobufWireFormat::LengthDelimited, 14, 'R','e','m','o','t','e',' ','V','i','e','w','i','n','g'
+			,2 << 3 | OpProtobufWireFormat::LengthDelimited, 18, 'C','h','r','o','m','o','s','o','m','e',' ','C','o','r','r','u','p','t'
+			,3 << 3 | OpProtobufWireFormat::LengthDelimited, 7,  'S','t','r','a','t','u','s'
+			,4 << 3 | OpProtobufWireFormat::LengthDelimited, 16, 'T','e','n','t','a','c','l','e',' ','L','u','l','l','a','b','y'
+			,5 << 3 | OpProtobufWireFormat::LengthDelimited, 4,  'd','a','t','a'
+			,5 << 3 | OpProtobufWireFormat::LengthDelimited, 6,  's','y','s','t','e','m'
+			,6 << 3 | OpProtobufWireFormat::LengthDelimited, 5,  'c','a','c','h','e'
+			,6 << 3 | OpProtobufWireFormat::LengthDelimited, 6,  's','d','c','a','r','d'
+			}
+	}
+  }
+{
+	test("$(name): Mixed string datatype")
+		require success "Init";
+	{
+		OtScopeTestService_SI::MixedStringType msg;
+		msg.SetType1("Remote Viewing", 14);
+		msg.SetType2("Chromosome Corrupt", 18);
+		msg.SetType3("Stratus", 7);
+		msg.SetType4("Tentacle Lullaby", 16);
+		msg.AppendToType5List("data", 4);
+		msg.AppendToType5List("system", 6);
+		msg.AppendToType6List("cache", 5);
+		msg.AppendToType6List("sdcard", 6);
+
+		STREAM_CLS io_stream(globals);
+		OpProtobufInstanceProxy out_proxy(OtScopeTestService::MixedStringType::GetMessageDescriptor(&g_descriptors), reinterpret_cast<void *>(&msg));
+		OtScopeTestService_SI::MixedStringType in_msg;
+		OpProtobufInstanceProxy in_proxy(OtScopeTestService::MixedStringType::GetMessageDescriptor(&g_descriptors), reinterpret_cast<void *>(&in_msg));
+		STREAM_CLS::ExpectType expected_output[] = expected_data;
+		verify_success(io_stream.Process(out_proxy, in_proxy, expected_output, SIZE_FUNC(expected_output)));
+
+		verify(in_msg.GetType1().Length() == 14);
+		verify_string(in_msg.GetType1(), "Remote Viewing");
+		verify(in_msg.GetType2().Length() == 18);
+		verify_string(in_msg.GetType2().GetStorage(), "Chromosome Corrupt");
+		verify(in_msg.HasType3());
+		verify(in_msg.GetType3().Length() == 7);
+		verify_string(in_msg.GetType3(), "Stratus");
+		verify(in_msg.HasType4());
+		verify(in_msg.GetType4().Length() == 16);
+		verify_string(in_msg.GetType4().GetStorage(), "Tentacle Lullaby");
+		verify(in_msg.GetType5List().GetCount() == 2);
+		verify(in_msg.GetType5List().Get(0)->Length() == 4);
+		verify_string(*in_msg.GetType5List().Get(0), "data");
+		verify(in_msg.GetType5List().Get(1)->Length() == 6);
+		verify_string(*in_msg.GetType5List().Get(1), "system");
+		verify(in_msg.GetType6List().GetCount() == 2);
+		verify(in_msg.GetType6List().Get(0)->Length() == 5);
+		verify_string(in_msg.GetType6List().Get(0)->GetStorage(), "cache");
+		verify(in_msg.GetType6List().Get(1)->Length() == 6);
+		verify_string(in_msg.GetType6List().Get(1)->GetStorage(), "sdcard");
+	}
+}
+
+foreach (name, STREAM_CLS, SIZE_FUNC, expected_data) from
+  {
+    {JSON, OtJSON,     op_strlen, "[\"yv66vg==\",\"ur4=\",\"yv66vg==\",\"ur4=\",[\"yv66vg==\",\"ur4=\"],[\"ur4=\",\"yv66vg==\"]]"}
+    {ES,   OtES,       op_strlen, "[\"yv66vg==\",\"ur4=\",\"yv66vg==\",\"ur4=\",[\"yv66vg==\",\"ur4=\"],[\"ur4=\",\"yv66vg==\"]]"}
+    {XML,  OtXML,      op_strlen, "<MixedByteType><type1>yv66vg==</type1><type2>ur4=</type2><type3>yv66vg==</type3><type4>ur4=</type4><type5List><type5>yv66vg==</type5><type5>ur4==</type5></type5List><type6List><type6>ur4=</type6><type6>yv66vg==</type6></type6List></MixedByteType>"}
+    {PB,   OtProtobuf, sizeof,
+			{1 << 3 | OpProtobufWireFormat::LengthDelimited, 4, 0xca, 0xfe, 0xba, 0xbe
+			,2 << 3 | OpProtobufWireFormat::LengthDelimited, 2, 0xba, 0xbe
+			,3 << 3 | OpProtobufWireFormat::LengthDelimited, 4, 0xca, 0xfe, 0xba, 0xbe
+			,4 << 3 | OpProtobufWireFormat::LengthDelimited, 2, 0xba, 0xbe
+			,5 << 3 | OpProtobufWireFormat::LengthDelimited, 4, 0xca, 0xfe, 0xba, 0xbe
+			,5 << 3 | OpProtobufWireFormat::LengthDelimited, 2, 0xba, 0xbe
+			,6 << 3 | OpProtobufWireFormat::LengthDelimited, 2, 0xba, 0xbe
+			,6 << 3 | OpProtobufWireFormat::LengthDelimited, 4, 0xca, 0xfe, 0xba, 0xbe
+			}
+	}
+  }
+{
+	test("$(name): Mixed byte datatype")
+		require success "Init";
+	{
+		OtScopeTestService_SI::MixedByteType msg;
+		unsigned char bytes[4] = {0xca, 0xfe, 0xba, 0xbe};
+		msg.SetType1((const char *)bytes, 4);
+		msg.SetType2((const char *)bytes + 2, 2);
+		msg.SetType3((const char *)bytes, 4);
+		msg.SetType4((const char *)bytes + 2, 2);
+		msg.AppendToType5List((const char *)bytes, 4);
+		msg.AppendToType5List((const char *)bytes + 2, 2);
+		msg.AppendToType6List((const char *)bytes + 2, 2);
+		msg.AppendToType6List((const char *)bytes, 4);
+
+		STREAM_CLS io_stream(globals);
+		OpProtobufInstanceProxy out_proxy(OtScopeTestService::MixedByteType::GetMessageDescriptor(&g_descriptors), reinterpret_cast<void *>(&msg));
+		OtScopeTestService_SI::MixedByteType in_msg;
+		OpProtobufInstanceProxy in_proxy(OtScopeTestService::MixedByteType::GetMessageDescriptor(&g_descriptors), reinterpret_cast<void *>(&in_msg));
+		STREAM_CLS::ExpectType expected_output[] = expected_data;
+		verify_success(io_stream.Process(out_proxy, in_proxy, expected_output, SIZE_FUNC(expected_output)));
+
+		verify(in_msg.GetType1().Length() == 4);
+		verify(in_msg.GetType2().Length() == 2);
+		verify(in_msg.HasType3());
+		verify(in_msg.GetType3().Length() == 4);
+		verify(in_msg.HasType4());
+		verify(in_msg.GetType4().Length() == 2);
+		verify(in_msg.GetType5List().GetCount() == 2);
+		verify(in_msg.GetType5List().Get(0)->Length() == 4);
+		verify(in_msg.GetType5List().Get(1)->Length() == 2);
+		verify(in_msg.GetType6List().GetCount() == 2);
+		verify(in_msg.GetType6List().Get(0).Length() == 2);
+		verify(in_msg.GetType6List().Get(1).Length() == 4);
+	}
+}
+
+foreach (name, STREAM_CLS, TYPE_CLS, SIZE_FUNC, expected_data) from
+  {
+    {JSON, OpJSONOutputStream, OtStringUtils, op_strlen, "[40,\"Fade to Black\",[256,\"Enter Sandman\",[16384],\"yv66vg==\"]]"}
+   ,{XML,  OpXMLOutputStream,  OtStringUtils, op_strlen, "<Outer><a>40</a><b>Fade to Black</b><c><a>256</a><b>Enter Sandman</b><c><a>16384</a></c><d>yv66vg==</d></c></Outer>"}
+   ,{PB,   OtProtobufOutputStream, OtByteUtils, sizeof,
+			{1 << 3 | OpProtobufWireFormat::VarInt, 40
+			,2 << 3 | OpProtobufWireFormat::LengthDelimited, 0xd, 'F','a','d','e',' ','t','o',' ','B','l','a','c','k'
+			,3 << 3 | OpProtobufWireFormat::LengthDelimited, 30 // InnerMessage size
+				// Start of InnerMessage
+				,1 << 3 | OpProtobufWireFormat::VarInt, 0x80, 0x02
+				,2 << 3 | OpProtobufWireFormat::LengthDelimited, 0xd, 'E','n','t','e','r',' ','S','a','n','d','m','a','n'
+				,3 << 3 | OpProtobufWireFormat::LengthDelimited, 4 // InnermostMessage size
+					// Start of InnermostMessage
+					,1 << 3 | OpProtobufWireFormat::VarInt, 0x80, 0x80, 0x01
+				,4 << 3 | OpProtobufWireFormat::LengthDelimited, 0x4, 0xca, 0xfe, 0xba, 0xbe
+			}
+    }
+  }
+{
+test( "$(name): Sub-Message" )
+	require success "Init";
+{
+	OtScopeTestService::Outer msg;
+	msg.SetA(40);
+	msg.SetB(UNI_L("Fade to Black"));
+
+	OtScopeTestService::Outer::Inner &inner = msg.GetCRef();
+	inner.SetA(256);
+	inner.SetB(UNI_L("Enter Sandman"));
+	unsigned char bytes[4] = {0xca, 0xfe, 0xba, 0xbe};
+	inner.SetD((const char *)bytes, 4);
+	
+	inner.GetCRef().SetA(0x4000);
+
+	ByteBuffer output;
+	STREAM_CLS ostream(output);
+	OpProtobufInstanceProxy proxy(OtScopeTestService::Outer::GetMessageDescriptor(&g_descriptors), reinterpret_cast<void *>(&msg));
+	verify(OpStatus::IsSuccess(ostream.Write(proxy)));
+
+	TYPE_CLS::Type expected_output[] = expected_data;
+	verify(TYPE_CLS::IsExpectedData(output, expected_output, SIZE_FUNC(expected_output)));
+}
+}
+
+foreach (name, STREAM_CLS, TYPE_CLS, SIZE_FUNC, expected_data) from
+  {
+    {JSON, OpJSONOutputStream, OtStringUtils, op_strlen, "[-40,null,[2,3,5],[\"Fade to Black\",\"Du Hast\"],[],[\"Magnetic\"]]"}
+   ,{XML,  OpXMLOutputStream,  OtStringUtils, op_strlen, "<Optional><a>-40</a><cList><c>2</c><c>3</c><c>5</c></cList><dList><d>Fade to Black</d><d>Du Hast</d></dList><f><a>Magnetic</a></f></Optional>"}
+   ,{PB,   OtProtobufOutputStream, OtByteUtils, sizeof,
+			{1 << 3 | OpProtobufWireFormat::VarInt, 0xd8, 0xff, 0xff, 0xff, 0xf
+			,3 << 3 | OpProtobufWireFormat::VarInt, 4 // zigzag(2)
+			,3 << 3 | OpProtobufWireFormat::VarInt, 6 // zigzag(3)
+			,3 << 3 | OpProtobufWireFormat::VarInt, 10 // zigzag(5)
+			,4 << 3 | OpProtobufWireFormat::LengthDelimited, 0xd, 'F','a','d','e',' ','t','o',' ','B','l','a','c','k'
+			,4 << 3 | OpProtobufWireFormat::LengthDelimited, 0x7, 'D','u',' ','H','a','s','t'
+			,6 << 3 | OpProtobufWireFormat::LengthDelimited, 0xa
+				,1 << 3 | OpProtobufWireFormat::LengthDelimited, 0x8, 'M','a','g','n','e','t','i','c'
+			}
+    }
+  }
+{
+test( "$(name): Serialize optional fields" )
+	require success "Init";
+{
+	OtScopeTestService::Optional msg;
+	//OpScopeBitFieldRef has_bits = msg.GetHasBits();
+	msg.SetA(-40);
+	{
+		OpAutoPtr<OpString> str1(new OpString());
+		verify(str1.get() != NULL);
+		verify(OpStatus::IsSuccess(str1->Set(UNI_L("Fade to Black"))));
+		verify(OpStatus::IsSuccess(msg.GetDListRef().Add(str1.get())));
+		str1.release();
+	}
+	{
+		OpAutoPtr<OpString> str1(new OpString());
+		verify(str1.get() != NULL);
+		verify(OpStatus::IsSuccess(str1->Set(UNI_L("Du Hast"))));
+		verify(OpStatus::IsSuccess(msg.GetDListRef().Add(str1.get())));
+		str1.release();
+	}
+	msg.AppendToCList(2);
+	msg.AppendToCList(3);
+	msg.AppendToCList(5);
+	msg.SetF(OP_NEW(OtScopeTestService::Optional::OptionalInner, ()));
+	verify(msg.GetF() != NULL);
+	msg.GetF()->SetA(UNI_L("Magnetic"));
+
+	ByteBuffer output;
+	STREAM_CLS ostream(output);
+	OpProtobufInstanceProxy proxy(OtScopeTestService::Optional::GetMessageDescriptor(&g_descriptors), reinterpret_cast<void *>(&msg));
+	verify(OpStatus::IsSuccess(ostream.Write(proxy)));
+
+	TYPE_CLS::Type expected_output[] = expected_data;
+	verify(TYPE_CLS::IsExpectedData(output, expected_output, SIZE_FUNC(expected_output)));
+}
+}
+
+foreach (name, STREAM_CLS, SIZE_FUNC, expected_data) from
+  {
+	 {JSON, OtJSON,     op_strlen, "[-40,null,[],[[null,[\"Fade to Black\",\"Du Hast\"]],[42],[null,[],[\"yv66vg==\"]]]]"}
+	,{ES,   OtES,       op_strlen, "[-40,null,[],[[null,[\"Fade to Black\",\"Du Hast\"]],[42],[null,[],[\"yv66vg==\"]]]]"}
+	,{XML,  OtXML,      op_strlen, "<Repeated><a>-40</a><dList><d><bList><b>Fade to Black</b><b>Du Hast</b></bList></d><d><a>42</a></d><d><cList><c>yv66vg==</c></cList></d></dList></Repeated>"}
+	,{PB,   OtProtobuf, sizeof,
+			{1 << 3 | OpProtobufWireFormat::VarInt, 0xd8, 0xff, 0xff, 0xff, 0xf
+			,4 << 3 | OpProtobufWireFormat::LengthDelimited, 24
+				// Start of first InnerMessage
+				,2 << 3 | OpProtobufWireFormat::LengthDelimited, 0xd, 'F','a','d','e',' ','t','o',' ','B','l','a','c','k'
+				,2 << 3 | OpProtobufWireFormat::LengthDelimited, 0x7, 'D','u',' ','H','a','s','t'
+			,4 << 3 | OpProtobufWireFormat::LengthDelimited, 2
+				// Start of second InnerMessage
+				,1 << 3 | OpProtobufWireFormat::VarInt, 42
+			,4 << 3 | OpProtobufWireFormat::LengthDelimited, 6
+				// Start of third InnerMessage
+				,3 << 3 | OpProtobufWireFormat::LengthDelimited, 0x4, 0xca, 0xfe, 0xba, 0xbe
+			}
+    }
+  }
+{
+test( "$(name): Serialize repeated sub-messages" )
+	require success "Init";
+{
+	OtScopeTestService::Repeated msg;
+	msg.SetA(-40);
+	OtScopeTestService::Repeated::RepeatedInner *submsg1 = msg.AppendNewDList();
+	verify(submsg1 != NULL);
+	OtScopeTestService::Repeated::RepeatedInner *submsg2 = msg.AppendNewDList();
+	verify(submsg2 != NULL);
+	OtScopeTestService::Repeated::RepeatedInner *submsg3 = msg.AppendNewDList();
+	verify(submsg3 != NULL);
+
+	// First sub message
+	verify(OpStatus::IsSuccess(submsg1->AppendToBList(UNI_L("Fade to Black"))));
+	verify(OpStatus::IsSuccess(submsg1->AppendToBList(UNI_L("Du Hast"))));
+
+	// Second sub message
+	submsg2->SetA(42);
+
+	// Third sub message
+	unsigned char bytes[4] = {0xca, 0xfe, 0xba, 0xbe};
+	verify(OpStatus::IsSuccess(submsg3->AppendToCList((const char *)bytes, 4)));
+
+	STREAM_CLS io_stream(globals);
+	OpProtobufInstanceProxy out_proxy(OtScopeTestService::Repeated::GetMessageDescriptor(&g_descriptors), reinterpret_cast<void *>(&msg));
+	OtScopeTestService::Repeated in_msg;
+	OpProtobufInstanceProxy in_proxy(OtScopeTestService::Repeated::GetMessageDescriptor(&g_descriptors), reinterpret_cast<void *>(&in_msg));
+	STREAM_CLS::ExpectType expected_output[] = expected_data;
+	verify_success(io_stream.Process(out_proxy, in_proxy, expected_output, SIZE_FUNC(expected_output)));
+
+	verify(in_msg.GetA() == -40);
+	verify(!in_msg.HasB());
+	verify(!in_msg.HasCList());
+	verify(in_msg.HasDList());
+	const OpProtobufMessageVector<OtScopeTestService::Repeated::RepeatedInner> &d_list = in_msg.GetDList();
+	verify(d_list.GetCount() == 3);
+
+	// First sub message
+	verify(!d_list.Get(0)->HasA());
+	verify(d_list.Get(0)->HasBList());
+	verify(!d_list.Get(0)->HasCList());
+	verify(in_msg.GetDList().Get(0)->GetBList().GetCount() == 2);
+	verify_string(*d_list.Get(0)->GetBList().Get(0), UNI_L("Fade to Black"));
+	verify_string(*d_list.Get(0)->GetBList().Get(1), UNI_L("Du Hast"));
+
+	// Second sub message
+	verify(d_list.Get(1)->HasA());
+	verify(!d_list.Get(1)->HasBList());
+	verify(!d_list.Get(1)->HasCList());
+	verify(d_list.Get(1)->GetA() == 42);
+
+	// Third sub message
+	verify(!d_list.Get(2)->HasA());
+	verify(!d_list.Get(2)->HasBList());
+	verify(d_list.Get(2)->HasCList());
+	verify(d_list.Get(2)->GetCList().GetCount() == 1);
+	verify(d_list.Get(2)->GetCList().Get(0)->Length() == 4);
+	verify(OtProtoUtils::Compare(*d_list.Get(2)->GetCList().Get(0), reinterpret_cast<char *>(bytes), 4));
+}
+}
+
+// NOTE: JSON does not support NaN and infinity
+foreach (name, STREAM_CLS, CHECK, SIZE_FUNC, expected_data) from
+  {
+    {ES,   OtES,       FALSE, sizeof, {0}}
+   ,{XML,  OtXML,      TRUE, op_strlen, "<RepeatedFloat><fuzzyList><fuzzy>NaN</fuzzy><fuzzy>NaN</fuzzy><fuzzy>NaN</fuzzy><fuzzy>Infinity</fuzzy><fuzzy>-Infinity</fuzzy></fuzzyList><piList><pi>NaN</pi><pi>NaN</pi><pi>NaN</pi><pi>Infinity</pi><pi>-Infinity</pi></piList></RepeatedFloat>"}
+   ,{PB,   OtProtobuf, TRUE,  sizeof,
+			{1 << 3 | OpProtobufWireFormat::Fixed32, 0xff, 0xff, 0xff, 0x7f // NaN
+			,1 << 3 | OpProtobufWireFormat::Fixed32, 0xff, 0xff, 0xff, 0x7f // Quiet NaN
+			,1 << 3 | OpProtobufWireFormat::Fixed32, 0xff, 0xff, 0xff, 0x7f // Signaling NaN
+			,1 << 3 | OpProtobufWireFormat::Fixed32, 0x00, 0x00, 0x80, 0x7f // +infinity
+			,1 << 3 | OpProtobufWireFormat::Fixed32, 0x00, 0x00, 0x80, 0xff // -infinity
+
+			,2 << 3 | OpProtobufWireFormat::Fixed64, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x7f // NaN
+			,2 << 3 | OpProtobufWireFormat::Fixed64, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x7f // Quiet NaN
+			,2 << 3 | OpProtobufWireFormat::Fixed64, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x7f // Signaling NaN
+			,2 << 3 | OpProtobufWireFormat::Fixed64, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xf0, 0x7f // +infinity
+			,2 << 3 | OpProtobufWireFormat::Fixed64, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xf0, 0xff // -infinity
+			}
+    }
+  }
+{
+test( "$(name): Serialize/Deserialize special floats" )
+	require success "Init";
+{
+	OtScopeTestService::RepeatedFloat out_msg;
+	out_msg.AppendToFuzzyList(ot_decode_float(0x7fffffffUL)); // NaN
+	out_msg.AppendToFuzzyList(ot_decode_float(0x7fe00000UL)); // Quiet NaN
+	out_msg.AppendToFuzzyList(ot_decode_float(0x7fa00000UL)); // Signaling NaN
+	out_msg.AppendToFuzzyList(ot_decode_float(0x7f800000UL)); // +infinity
+	out_msg.AppendToFuzzyList(ot_decode_float(0xff800000UL)); // -infinity
+
+	out_msg.AppendToPiList(op_implode_double(0x7fffffffUL, 0xffffffffUL)); // NaN
+	out_msg.AppendToPiList(op_implode_double(0x7ffc0000UL, 0x00000000UL)); // Quiet NaN
+	out_msg.AppendToPiList(op_implode_double(0x7ff40000UL, 0x00000000UL)); // Signaling NaN
+	out_msg.AppendToPiList(op_implode_double(0x7ff00000UL, 0x00000000UL)); // +infinity
+	out_msg.AppendToPiList(op_implode_double(0xfff00000UL, 0x00000000UL)); // -infinity
+
+	STREAM_CLS io_stream(globals);
+
+	OpProtobufInstanceProxy out_proxy(out_msg.GetMessageDescriptor(&g_descriptors), reinterpret_cast<void *>(&out_msg));
+	OtScopeTestService::RepeatedFloat in_msg;
+	OpProtobufInstanceProxy in_proxy(in_msg.GetMessageDescriptor(&g_descriptors), reinterpret_cast<void *>(&in_msg));
+	verify_success(io_stream.Serialize(out_proxy));
+	if (CHECK)
+	{
+		STREAM_CLS::ExpectType expected_output[] = expected_data;
+		verify(io_stream.IsExpectedData(expected_output, SIZE_FUNC(expected_output)));
+	}
+	verify_success(io_stream.Unserialize(in_proxy));
+
+	const OpValueVector<float> &floats = in_msg.GetFuzzyList();
+	verify( floats.GetCount() == 5 );
+	verify( op_isnan(floats.Get(0)) );
+	verify( op_isnan(floats.Get(1)) );
+	verify( op_isnan(floats.Get(2)) );
+	verify( op_isinf(floats.Get(3)) );
+	verify( op_signbit(floats.Get(3)) == 0 );
+	verify( op_isinf(floats.Get(4)) );
+	verify( op_signbit(floats.Get(4)) == 1 );
+
+	const OpValueVector<double> &doubles = in_msg.GetPiList();
+	verify( doubles.GetCount() == 5 );
+	verify( op_isnan(doubles.Get(0)) );
+	verify( op_isnan(doubles.Get(1)) );
+	verify( op_isnan(doubles.Get(2)) );
+	verify( op_isinf(doubles.Get(3)) );
+	verify( op_signbit(doubles.Get(3)) == 0 );
+	verify( op_isinf(doubles.Get(4)) );
+	verify( op_signbit(doubles.Get(4)) == 1 );
+}
+}
+
+// TODO: Investigate ES JSON exporter and see how it exports floats to ensure compatibility
+// NOTE: If any test fails when checking expected data it might be an idea to turn off checking and just rely on unserialization of expected data (CHECK=FALSE, ITER=2)
+foreach (name, STREAM_CLS, CHECK, ITER, SIZE_FUNC, expected_data) from
+  {
+    {JSON, OtJSON,     TRUE, 2, op_strlen, "[[0,-0,1.401298464324817e-45,1.1754942106924411e-38,1,-1,1.0000001192092896,3.4028234663852886e+38,1.1754943508222875e-38,-3.4028234663852886e+38,-1.1754943508222875e-38],[0,-0,5e-324,2.225073858507201e-308,1,-1,1.0000000000000002,1.7976931348623157e+308,2.2250738585072014e-308,-1.7976931348623157e+308,-2.2250738585072014e-308]]"}
+   ,{ES,   OtES,       TRUE, 2, op_strlen, "[[0,-0,1.401298464324817e-45,1.1754942106924411e-38,1,-1,1.0000001192092896,3.4028234663852886e+38,1.1754943508222875e-38,-3.4028234663852886e+38,-1.1754943508222875e-38],[0,-0,5e-324,2.225073858507201e-308,1,-1,1.0000000000000002,1.7976931348623157e+308,2.2250738585072014e-308,-1.7976931348623157e+308,-2.2250738585072014e-308]]"}
+   ,{XML,  OtXML,      TRUE, 2, op_strlen, "<RepeatedFloat><fuzzyList><fuzzy>0</fuzzy><fuzzy>-0</fuzzy><fuzzy>1.401298464324817e-45</fuzzy><fuzzy>1.1754942106924411e-38</fuzzy><fuzzy>1</fuzzy><fuzzy>-1</fuzzy><fuzzy>1.0000001192092896</fuzzy><fuzzy>3.4028234663852886e+38</fuzzy><fuzzy>1.1754943508222875e-38</fuzzy><fuzzy>-3.4028234663852886e+38</fuzzy><fuzzy>-1.1754943508222875e-38</fuzzy></fuzzyList><piList><pi>0</pi><pi>-0</pi><pi>5e-324</pi><pi>2.225073858507201e-308</pi><pi>1</pi><pi>-1</pi><pi>1.0000000000000002</pi><pi>1.7976931348623157e+308</pi><pi>2.2250738585072014e-308</pi><pi>-1.7976931348623157e+308</pi><pi>-2.2250738585072014e-308</pi></piList></RepeatedFloat>"}
+   ,{PB,   OtProtobuf, TRUE, 1, sizeof,
+			{1 << 3 | OpProtobufWireFormat::Fixed32, 0x00, 0x00, 0x00, 0x00 // Zero
+			,1 << 3 | OpProtobufWireFormat::Fixed32, 0x00, 0x00, 0x00, 0x80 // -0
+			,1 << 3 | OpProtobufWireFormat::Fixed32, 0x01, 0x00, 0x00, 0x00 // min subnormal number
+			,1 << 3 | OpProtobufWireFormat::Fixed32, 0xff, 0xff, 0x7f, 0x00 // max subnormal number
+			,1 << 3 | OpProtobufWireFormat::Fixed32, 0x00, 0x00, 0x80, 0x3f // 1
+			,1 << 3 | OpProtobufWireFormat::Fixed32, 0x00, 0x00, 0x80, 0xbf // -1
+			,1 << 3 | OpProtobufWireFormat::Fixed32, 0x01, 0x00, 0x80, 0x3f // >1
+			,1 << 3 | OpProtobufWireFormat::Fixed32, 0xff, 0xff, 0x7f, 0x7f // max float precision 3.4028234e38
+			,1 << 3 | OpProtobufWireFormat::Fixed32, 0x00, 0x00, 0x80, 0x00 // min float precision 1.18e-38
+			,1 << 3 | OpProtobufWireFormat::Fixed32, 0xff, 0xff, 0x7f, 0xff // -max float precision -3.4028234e38
+			,1 << 3 | OpProtobufWireFormat::Fixed32, 0x00, 0x00, 0x80, 0x80 // -min float precision -1.18e-38
+
+			,2 << 3 | OpProtobufWireFormat::Fixed64, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 // Zero
+			,2 << 3 | OpProtobufWireFormat::Fixed64, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x80 // -0
+			,2 << 3 | OpProtobufWireFormat::Fixed64, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 // min subnormal number
+			,2 << 3 | OpProtobufWireFormat::Fixed64, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x0f, 0x00 // max subnormal number
+			,2 << 3 | OpProtobufWireFormat::Fixed64, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xf0, 0x3f // 1
+			,2 << 3 | OpProtobufWireFormat::Fixed64, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xf0, 0xbf // -1
+			,2 << 3 | OpProtobufWireFormat::Fixed64, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0xf0, 0x3f // >1
+			,2 << 3 | OpProtobufWireFormat::Fixed64, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xef, 0x7f // max double precision
+			,2 << 3 | OpProtobufWireFormat::Fixed64, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0x00 // min double precision
+			,2 << 3 | OpProtobufWireFormat::Fixed64, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xef, 0xff // -max double precision
+			,2 << 3 | OpProtobufWireFormat::Fixed64, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0x80 // -min double precision
+			}
+    }
+  }
+{
+test( "$(name): Serialize/Deserialize floats" )
+	require success "Init";
+{
+	OtScopeTestService::RepeatedFloat out_msg;
+	out_msg.AppendToFuzzyList(ot_decode_float(0x00000000UL)); // Zero
+	out_msg.AppendToFuzzyList(ot_decode_float(0x80000000UL)); // -0
+	out_msg.AppendToFuzzyList(ot_decode_float(0x00000001UL)); // min subnormal number
+	out_msg.AppendToFuzzyList(ot_decode_float(0x007fffffUL)); // max subnormal number 
+	out_msg.AppendToFuzzyList(ot_decode_float(0x3f800000UL)); // 1
+	out_msg.AppendToFuzzyList(ot_decode_float(0xbf800000UL)); // -1
+	out_msg.AppendToFuzzyList(ot_decode_float(0x3f800001UL)); // >1
+	out_msg.AppendToFuzzyList(ot_decode_float(0x7f7fffffUL)); // max float precision 3.4028234e38
+	out_msg.AppendToFuzzyList(ot_decode_float(0x00800000UL)); // min float precision 1.18e-38
+	out_msg.AppendToFuzzyList(ot_decode_float(0xff7fffffUL)); // -max float precision -3.4028234e38
+	out_msg.AppendToFuzzyList(ot_decode_float(0x80800000UL)); // -min float precision -1.18e-38
+
+	out_msg.AppendToPiList(op_implode_double(0x00000000UL, 0x00000000UL)); // Zero
+	out_msg.AppendToPiList(op_implode_double(0x80000000UL, 0x00000000UL)); // -0
+	out_msg.AppendToPiList(op_implode_double(0x00000000UL, 0x00000001UL)); // min subnormal number
+	out_msg.AppendToPiList(op_implode_double(0x000fffffUL, 0xffffffffUL)); // max subnormal number
+	out_msg.AppendToPiList(op_implode_double(0x3ff00000UL, 0x00000000UL)); // 1
+	out_msg.AppendToPiList(op_implode_double(0xbff00000UL, 0x00000000UL)); // -1
+	out_msg.AppendToPiList(op_implode_double(0x3ff00000UL, 0x00000001UL)); // >1
+	out_msg.AppendToPiList(op_implode_double(0x7fefffffUL, 0xffffffffUL)); // max double precision
+	out_msg.AppendToPiList(op_implode_double(0x00100000UL, 0x00000000UL)); // min double precision
+	out_msg.AppendToPiList(op_implode_double(0xffefffffUL, 0xffffffffUL)); // -max double precision
+	out_msg.AppendToPiList(op_implode_double(0x80100000UL, 0x00000000UL)); // -min double precision
+
+	STREAM_CLS io_stream(globals);
+
+	OpProtobufInstanceProxy out_proxy(out_msg.GetMessageDescriptor(&g_descriptors), reinterpret_cast<void *>(&out_msg));
+	verify_success(io_stream.Serialize(out_proxy));
+	STREAM_CLS::ExpectType expected_output[] = expected_data;
+	if (CHECK)
+	{
+		verify(io_stream.IsExpectedData(expected_output, SIZE_FUNC(expected_output)));
+	}
+	// Two iterations, first one unserializes previous serialized output, second one unserializes expected output data
+	for (int i = 0; i < ITER; ++i)
+	{
+		OtScopeTestService::RepeatedFloat in_msg;
+		OpProtobufInstanceProxy in_proxy(in_msg.GetMessageDescriptor(&g_descriptors), reinterpret_cast<void *>(&in_msg));
+		if (i == 1)
+		{
+			verify_success(io_stream.SetSerializedData(expected_output, SIZE_FUNC(expected_output)));
+		}
+		verify_success(io_stream.Unserialize(in_proxy));
+
+		{
+			const OpValueVector<float> &floats= in_msg.GetFuzzyList();
+			verify( floats.GetCount() == 11 );
+			for (unsigned i = 0; i < 11; ++i)
+				verify( op_isfinite(floats.Get(i)) );
+			float num = floats.Get(0);
+			double maxrel = 0.00001;
+
+			verify( op_isintegral(num) );
+			verify( static_cast<int>(num) == 0 );
+			verify( op_signbit(num) == 0 );
+
+			num = floats.Get(1);
+			verify( op_isintegral(num) );
+			verify( static_cast<int>(num) == 0 );
+			verify( op_signbit(num) == 1 );
+
+			num = floats.Get(2);
+			verify( OtFloatAlmostEqual(num, out_msg.GetFuzzyList().Get(2), maxrel) );
+
+			num = floats.Get(3);
+			verify( OtFloatAlmostEqual(num, out_msg.GetFuzzyList().Get(3), maxrel) );
+
+			num = floats.Get(4);
+			verify( op_isintegral(num) );
+			verify( static_cast<int>(num) == 1 );
+
+			num = floats.Get(5);
+			verify( op_isintegral(num) );
+			verify( static_cast<int>(num) == -1 );
+
+			num = floats.Get(6);
+			verify( static_cast<int>(num) == 1 );
+			verify( OtFloatAlmostEqual(num, out_msg.GetFuzzyList().Get(6), maxrel) );
+
+			num = floats.Get(7);
+			verify( OtFloatAlmostEqual(num, out_msg.GetFuzzyList().Get(7), maxrel) );
+
+			num = floats.Get(8);
+			verify( OtFloatAlmostEqual(num, out_msg.GetFuzzyList().Get(8), maxrel) );
+
+			num = floats.Get(9);
+			verify( OtFloatAlmostEqual(num, out_msg.GetFuzzyList().Get(9), maxrel) );
+
+			num = floats.Get(10);
+			verify( OtFloatAlmostEqual(num, out_msg.GetFuzzyList().Get(10), maxrel) );
+		}
+
+		{
+			const OpValueVector<double> &doubles = in_msg.GetPiList();
+			verify( doubles.GetCount() == 11 );
+			for (unsigned i = 0; i < 11; ++i)
+				verify( op_isfinite(doubles.Get(i)) );
+			double num = doubles.Get(0);
+			double maxrel = 0.00001;
+
+			verify( op_isintegral(num) );
+			verify( static_cast<int>(num) == 0 );
+			verify( op_signbit(num) == 0 );
+
+			num = doubles.Get(1);
+			verify( op_isintegral(num) );
+			verify( static_cast<int>(num) == 0 );
+			verify( op_signbit(num) == 1 );
+
+			num = doubles.Get(2);
+			verify( OtFloatAlmostEqual(num, 5e-324, maxrel) );
+
+			num = doubles.Get(3);
+			verify( OtFloatAlmostEqual(num, 2.225073858507201e-308, maxrel) );
+
+			num = doubles.Get(4);
+			verify( op_isintegral(num) );
+			verify( static_cast<int>(num) == 1 );
+
+			num = doubles.Get(5);
+			verify( op_isintegral(num) );
+			verify( static_cast<int>(num) == -1 );
+
+			num = doubles.Get(6);
+			verify( static_cast<int>(num) == 1 );
+			verify( OtFloatAlmostEqual(num, 1.0000000000000002, maxrel) );
+
+			num = doubles.Get(7);
+			verify( OtFloatAlmostEqual(num, 1.7976931348623157e+308, maxrel) );
+
+			num = doubles.Get(8);
+			verify( OtFloatAlmostEqual(num, 2.2250738585072014e-308, maxrel) );
+
+			num = doubles.Get(9);
+			verify( OtFloatAlmostEqual(num, -1.7976931348623157e+308, maxrel) );
+
+			num = doubles.Get(10);
+			verify( OtFloatAlmostEqual(num, -2.2250738585072014e-308, maxrel) );
+		}
+	}
+}
+}
+
+foreach (name, STREAM_CLS, TYPE_CLS, SIZE_FUNC, expected_data) from
+  {
+    {JSON, OpJSONOutputStream, OtStringUtils, op_strlen, "[[[[[[42],[[1]]]]],[[[[31415],[[0]]]]]]]"}
+	,{XML,  OpXMLOutputStream,  OtStringUtils, op_strlen,
+	        "<MessageSizeProblem><subMessageList><subMessage><sameAddressList><sameAddress><firstMember><someValue>42</someValue></firstMember><secondMemberList><secondMember><isSet>1</isSet></secondMember></secondMemberList></sameAddress></sameAddressList></subMessage><subMessage><sameAddressList><sameAddress><firstMember><someValue>31415</someValue></firstMember><secondMemberList><secondMember><isSet>0</isSet></secondMember></secondMemberList></sameAddress></sameAddressList></subMessage></subMessageList></MessageSizeProblem>"}
+    ,{PB,   OtProtobufOutputStream, OtByteUtils, sizeof,
+			{// MessageSizeProblem
+			 // subMessageList[0]
+			 1 << 3 | OpProtobufWireFormat::LengthDelimited, 10
+				// subMessageList[0].sameAddressList[0]
+				,1 << 3 | OpProtobufWireFormat::LengthDelimited, 8
+					// subMessageList[0].sameAddressList[0].firstMember
+					,1 << 3 | OpProtobufWireFormat::LengthDelimited, 2
+						// subMessageList[0].sameAddressList[0].firstMember.someValue
+						,1 << 3 | OpProtobufWireFormat::VarInt, 42
+					// subMessageList[0].sameAddressList[0].secondMember[0]
+					,2 << 3 | OpProtobufWireFormat::LengthDelimited, 2
+						// subMessageList[0].sameAddressList[0].secondMember[0].isSet
+						,1 << 3 | OpProtobufWireFormat::VarInt, 1
+
+			 // subMessageList[1]
+			 ,1 << 3 | OpProtobufWireFormat::LengthDelimited, 12
+				// subMessageList[1].sameAddressList[0]
+				,1 << 3 | OpProtobufWireFormat::LengthDelimited, 10
+					// subMessageList[1].sameAddressList[0].firstMember
+					,1 << 3 | OpProtobufWireFormat::LengthDelimited, 4
+						// subMessageList[1].sameAddressList[0].firstMember.someValue
+						,1 << 3 | OpProtobufWireFormat::VarInt, 0xb7, 0xf5, 0x01 // 31415
+					// subMessageList[1].sameAddressList[0].secondMember[0]
+					,2 << 3 | OpProtobufWireFormat::LengthDelimited, 2
+						// subMessageList[1].sameAddressList[0].secondMember[0].isSet
+						,1 << 3 | OpProtobufWireFormat::VarInt, 0
+			}
+    }
+  }
+{
+test( "$(name): Serialize zero-offset sub-message" )
+	require success "Init";
+{
+	OtScopeTestService::MessageSizeProblem msg;
+
+	OtScopeTestService::MessageSizeProblem::SubMessage *sub = NULL;
+	OtScopeTestService::MessageSizeProblem::SubMessage::SameAddress *same = NULL;
+	OtScopeTestService::MessageSizeProblem::SubMessage::SameAddress::Other *other = NULL;
+
+	sub = msg.AppendNewSubMessageList();
+	verify(sub != NULL);
+	same = sub->AppendNewSameAddressList();
+	verify(same != NULL);
+	same->GetFirstMemberRef().SetSomeValue(42);
+	other = same->AppendNewSecondMemberList();
+	verify(other != NULL);
+	other->SetIsSet(TRUE);
+
+	sub = msg.AppendNewSubMessageList();
+	verify(sub != NULL);
+	same = sub->AppendNewSameAddressList();
+	verify(same != NULL);
+	same->GetFirstMemberRef().SetSomeValue(31415);
+	other = same->AppendNewSecondMemberList();
+	verify(other != NULL);
+	other->SetIsSet(FALSE);
+
+	ByteBuffer output;
+	STREAM_CLS ostream(output);
+	OpProtobufInstanceProxy proxy(OtScopeTestService::MessageSizeProblem::GetMessageDescriptor(&g_descriptors), reinterpret_cast<void *>(&msg));
+	verify(OpStatus::IsSuccess(ostream.Write(proxy)));
+
+	TYPE_CLS::Type expected_output[] = expected_data;
+	verify(TYPE_CLS::IsExpectedData(output, expected_output, SIZE_FUNC(expected_output)));
+}
+}
+
+foreach (NAME, EXPECTED_DATA, BITS_INPUT, IN_A, IN_B, IN_C, IN_D, IN_E, IN_F, IN_G, IN_H) from
+  {
+	  { Empty,
+		"[]",
+	    {0, 0, 0, 0, 0, 0, 0, 0},
+		0, "", {0}, "", 0, "", {0}, ""
+	  }
+	  { Integer,
+		"[42]",
+	    {1, 0, 0, 0, 0, 0, 0, 0},
+		42, "", {0}, "", 0, "", {0}, ""
+	  }
+	  { String,
+		"[null,\"42\"]",
+	    {0, 1, 0, 0, 0, 0, 0, 0},
+		0, "42", {0}, "", 0, "", {0}, ""
+	  }
+	  { Bytes,
+		"[null,null,\"yv66vg==\"]",
+	    {0, 0, 1, 0, 0, 0, 0, 0},
+		0, "", {0xca, 0xfe, 0xba, 0xbe}, "", 0, "", {0}, ""
+	  }
+	  { SubMessage,
+		"[null,null,null,[\"42\"]]",
+	    {0, 0, 0, 1, 0, 0, 0, 0},
+		0, "", {0}, "42", 0, "", {0}, ""
+	  }
+	  { IntegerList,
+		"[null,null,null,null,[42]]",
+	    {0, 0, 0, 0, 1, 0, 0, 0},
+		0, "", {0}, "", 42, "", {0}, ""
+	  }
+	  { StringList,
+		"[null,null,null,null,[],[\"42\"]]",
+	    {0, 0, 0, 0, 0, 1, 0, 0},
+		0, "", {0}, "", 0, "42", {0}, ""
+	  }
+	  { BytesList,
+		"[null,null,null,null,[],[],[\"yv66vg==\"]]",
+	    {0, 0, 0, 0, 0, 0, 1, 0},
+		0, "", {0}, "", 0, "", {0xca, 0xfe, 0xba, 0xbe}, ""
+	  }
+	  { SubMessageList,
+		"[null,null,null,null,[],[],[],[[\"42\"]]]",
+	    {0, 0, 0, 0, 0, 0, 0, 1},
+		0, "", {0}, "", 0, "", {0}, "42"
+	  }
+  }
+{
+test( "JSON: $(NAME): Ignore missing trailing fields" )
+	require success "Init";
+{
+	OtScopeTestService::MissingTrail msg;
+	bool bits[8] = BITS_INPUT;
+	if (bits[0])
+	{
+		msg.SetA(IN_A);
+	}
+	if (bits[1])
+	{
+		msg.SetB(IN_B);
+	}
+	if (bits[2])
+	{
+		unsigned char data[] = IN_C;
+		msg.SetC((char *)data, sizeof(data));
+	}
+	if (bits[3])
+	{
+		msg.NewD_L()->SetA(IN_D);
+	}
+
+	if (bits[4])
+	{
+		msg.AppendToEList(IN_E);
+	}
+	if (bits[5])
+	{
+		msg.AppendToFList(IN_F);
+	}
+	if (bits[6])
+	{
+		unsigned char data[] = IN_G;
+		msg.AppendToGList((char *)data, sizeof(data));
+	}
+	if (bits[7])
+	{
+		msg.AppendNewHList_L()->SetA(IN_H);
+	}
+
+	ByteBuffer output;
+	OpJSONOutputStream ostream(output);
+	OpProtobufInstanceProxy proxy(OtScopeTestService::MissingTrail::GetMessageDescriptor(&g_descriptors), reinterpret_cast<void *>(&msg));
+	verify(OpStatus::IsSuccess(ostream.Write(proxy)));
+
+	OtStringUtils::Type expected_output[] = EXPECTED_DATA;
+	verify(OtStringUtils::IsExpectedData(output, expected_output, op_strlen(expected_output)));
+}
+}

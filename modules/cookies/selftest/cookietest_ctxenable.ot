@@ -1,0 +1,186 @@
+/* -*- Mode: c++; tab-width: 4; indent-tabs-mode: t; c-basic-offset: 4 -*-
+**
+** Copyright (C) 2004-2006 Opera Software ASA.  All rights reserved.
+**
+** This file is part of the Opera web browser.  It may not be distributed
+** under any circumstances.
+**
+** Yngve N. Pettersen
+*/
+
+group "cookies context with enabled";
+require init;
+
+language c++;
+
+include "core/pch.h";
+include "modules/url/url_man.h";
+
+require PUBSUFFIX_ENABLED;
+require COOKIES_CONTROL_PER_CONTEXT;
+
+include "modules/cookies/cookie_man.h";
+include "modules/formats/hdsplit.h";
+include "modules/formats/argsplit.h";
+
+include "modules/pubsuffix/selftest/suffixiterator.h";
+
+global {
+
+	URL_CONTEXT_ID context_enabled=0;
+	URL_CONTEXT_ID context_disabled=0;
+	BOOL init_OK = FALSE;
+
+  const char *cookieheaders[] = {
+		"Set-Cookie: name1=value1; domain=\".invalid.com\"; path=\"/\"\r\n"
+		"Set-Cookie: name2=value2; domain=\".somewhere.invalid.com\"; path=\"/\"\r\n"
+		"Set-Cookie: name3=value3; domain=\".somewhere.invalid.no\"; path=\"/\"\r\n"
+  };
+}
+
+table urlset(const char *, BOOL, BOOL, BOOL)
+{
+  {"http://www.invalid.com/", TRUE, FALSE, FALSE},
+  {"http://www.somewhere.invalid.com/", TRUE, TRUE, FALSE},
+  {"http://www.somewhere.invalid.no/", FALSE, FALSE, TRUE},
+  {"http://www.invalid.no/", FALSE, FALSE, FALSE},
+  {"http://somewhere.invalid.no/", FALSE, FALSE, TRUE},
+  {"http://somewhere-else.invalid.no/", FALSE, FALSE, FALSE}
+}
+
+setup {
+
+	do{
+		context_enabled = urlManager->GetNewContextID();
+		if(context_enabled == 0)
+			break;
+		context_disabled = urlManager->GetNewContextID();
+		if(context_disabled == 0)
+			break;
+
+		TRAPD(op_err, urlManager->AddContextL(context_enabled, OPFILE_ABSOLUTE_FOLDER, OPFILE_ABSOLUTE_FOLDER, OPFILE_ABSOLUTE_FOLDER));
+		if(OpStatus::IsError(op_err))
+			break;
+		TRAP(op_err, urlManager->AddContextL(context_disabled, OPFILE_ABSOLUTE_FOLDER, OPFILE_ABSOLUTE_FOLDER, OPFILE_ABSOLUTE_FOLDER));
+		if(OpStatus::IsError(op_err))
+			break;
+
+		urlManager->SetCookiesEnabledForContext(context_enabled, TRUE);
+		urlManager->SetCookiesEnabledForContext(context_disabled, FALSE);
+		init_OK = TRUE;
+	}while(0);
+}
+
+exit {
+	if(context_enabled)
+		urlManager->RemoveContext(context_enabled);
+	if(context_disabled)
+		urlManager->RemoveContext(context_disabled);
+}
+
+test("Initialized")
+{
+	verify(init_OK);
+	verify(urlManager->GetCookiesEnabledForContext(context_enabled));
+	verify(!urlManager->GetCookiesEnabledForContext(context_disabled));
+}
+
+subtest SetURL(URL &url, const char *url_name, URL_CONTEXT_ID context)
+{
+	verify (url_name != NULL);
+
+	url = g_url_api->GetURL(url_name, context);
+
+	verify(!url.IsEmpty());
+}
+
+subtest SetCookie(URL &url, const char *cookie_hdr)
+{
+	verify(cookie_hdr != NULL);
+	verify(!url.IsEmpty());
+
+	HeaderList cookies(KeywordIndex_HTTP_MIME);
+
+	verify(OpStatus::IsSuccess(cookies.SetValue((char *) cookie_hdr)));
+
+	TRAPD(op_err, urlManager->HandleCookiesL(url.GetRep(), cookies, url.GetContextId()));
+	verify(OpStatus::IsSuccess(op_err));
+	urlManager->StartProcessingCookies();
+}
+
+subtest GetCookies(URL &url, const char **cookie_string)
+{
+	verify(cookie_string != NULL);
+
+	int version = 0;
+	int max_version = 0;
+	BOOL already_have_password = FALSE;
+	BOOL already_have_authentication = FALSE;
+	BOOL have_password = FALSE;
+	BOOL has_password = FALSE;
+	TRAPD(op_err, *cookie_string = urlManager->GetCookiesL(url.GetRep(), version, max_version, already_have_password, already_have_authentication, have_password, has_password, url.GetContextId()));
+	verify(OpStatus::IsSuccess(op_err));
+	//verify(*cookie_string != NULL);
+}
+
+subtest CheckCookie(const char *cookie_string, const char *name, const char *value, BOOL supposed_present)
+{
+	ParameterList args;
+
+	//verify(cookie_string != NULL);
+
+	verify(OpStatus::IsSuccess(args.SetValue(cookie_string, PARAM_SEP_SEMICOLON)));
+
+	Parameters *cookie =args.GetParameter(name);
+
+	if(supposed_present)
+	{
+		verify(cookie != NULL);
+		verify(cookie->GetValue().Compare(value) == 0);
+	}
+	else
+	{
+		verify(cookie == NULL);
+	}
+}
+
+test ("Cookie Enabled")
+	require success "Initialized";
+{
+	iterate (url_name, val1_set, val2_set, val3_set) from urlset
+	{
+		URL url = URL();
+
+		verify(SetURL(url, url_name, context_enabled));
+
+		verify(SetCookie(url, cookieheaders[0]));
+
+		const char *cookie_string = NULL;
+		verify(GetCookies(url, &cookie_string));
+
+		verify(CheckCookie(cookie_string, "name1", "value1", val1_set));
+		verify(CheckCookie(cookie_string, "name2", "value2", val2_set));
+		verify(CheckCookie(cookie_string, "name3", "value3", val3_set));
+	}
+}
+
+
+test ("Cookie Disabled")
+	require success "Initialized";
+{
+	iterate (url_name, val1_set, val2_set, val3_set) from urlset
+	{
+		URL url = URL();
+
+		verify(SetURL(url, url_name, context_disabled));
+
+		verify(SetCookie(url, cookieheaders[0]));
+
+		const char *cookie_string = NULL;
+		verify(GetCookies(url, &cookie_string));
+
+		verify(CheckCookie(cookie_string, "name1", "value1", FALSE));
+		verify(CheckCookie(cookie_string, "name2", "value2", FALSE));
+		verify(CheckCookie(cookie_string, "name3", "value3", FALSE));
+	}
+}

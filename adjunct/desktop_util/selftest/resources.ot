@@ -1,0 +1,225 @@
+/* -*- Mode: c++; tab-width: 4; indent-tabs-mode: t; c-basic-offset: 4 -*- */
+
+group "desktop_util.resources";
+
+include "adjunct/desktop_util/resources/ResourceFolders.h";
+include "adjunct/desktop_util/resources/ResourceUtils.h";
+include "modules/util/opfile/opmemfile.h";
+
+language C++;
+
+global
+{
+	int MemFile_Find(const OpMemFile* mem_file, const char* substr)
+	{
+		OpFileLength length = 0;
+		OpStatus::Ignore(mem_file->GetFileLength(length));
+		if (length == 0)
+			return KNotFound;
+		int index = OpStringC8(reinterpret_cast<char*>(mem_file->GetBuffer())).Find(substr);
+		if (index == KNotFound || index >= length)
+			return KNotFound;
+		return index;
+	}
+
+	size_t MemFile_Count(const OpMemFile* mem_file, const char* substr)
+	{
+		OpFileLength length = 0;
+		OpStatus::Ignore(mem_file->GetFileLength(length));
+		if (length == 0)
+			return 0;
+		size_t count = 0;
+		int substr_length = OpStringC8(substr).Length();
+		OpStringC8 str = OpStringC8(reinterpret_cast<char*>(mem_file->GetBuffer()));
+		size_t index = str.Find(substr, 0);
+		while (index != KNotFound && index < length)
+		{
+			++ count;
+			index = str.Find(substr, index + substr_length);
+		}
+		return count;
+	}
+
+	OP_STATUS MemFile_AddCountry(OpMemFile* file, OpStringC8 country, time_t last_timestamp, size_t count)
+	{
+		time_t timestamp = last_timestamp - (count - 1) * 24*60*60;
+		for (size_t i = 0; i < count; ++i)
+		{
+			OpString8 line;
+			RETURN_IF_ERROR(line.AppendFormat("%lu %s\n", timestamp, country.CStr()));
+			RETURN_IF_ERROR(file->Write(line.CStr(), line.Length()));
+			timestamp += 24*60*60;
+		}
+		return OpStatus::OK;
+	}
+}
+
+test ("GetFolder")
+{
+	OperaInitInfo test_init_info;
+	
+	test_init_info.default_folders[30].Set(PATHSEP "A folder" PATHSEP);
+	test_init_info.default_folder_parents[30] = OPFILE_ABSOLUTE_FOLDER;
+	test_init_info.default_folders[31].Set("A subfolder");
+	test_init_info.default_folder_parents[31] = (OpFileFolder)30;
+	test_init_info.default_folders[32].Set("A sub-subsubfolder" PATHSEP);
+	test_init_info.default_folder_parents[32] = (OpFileFolder)31;
+	
+	OpString result;
+	
+	verify_success(ResourceFolders::GetFolder((OpFileFolder)30, &test_init_info, result));
+	verify(result.Compare(PATHSEP "A folder" PATHSEP) == 0);
+	verify_success(ResourceFolders::GetFolder((OpFileFolder)31, &test_init_info, result));
+	verify(result.Compare(PATHSEP "A folder" PATHSEP "A subfolder" PATHSEP) == 0);
+	verify_success(ResourceFolders::GetFolder((OpFileFolder)32, &test_init_info, result));
+	verify(result.Compare(PATHSEP "A folder" PATHSEP "A subfolder" PATHSEP "A sub-subsubfolder" PATHSEP) == 0);
+}
+
+test ("AddAuCountry")
+{
+	const size_t SECS_IN_A_DAY = 24 * 60 * 60;
+
+	OpMemFile* file = OpMemFile::Create(NULL, 0);
+	verify(file);
+
+	// add country code to an empty file
+	verify_success(ResourceUtils::AddAuCountry(*file, UNI_L("pl")));
+	verify(MemFile_Find(file, " pl\n") != KNotFound);
+
+	// if country code == last country code it is not added if less than 1 day passed
+	verify_success(file->Close());
+	verify_success(ResourceUtils::AddAuCountry(*file, UNI_L("pl")));
+	verify(MemFile_Count(file, "pl\n") == 1);
+
+	// if country code != last country code then it is always added
+	verify_success(file->Close());
+	verify_success(ResourceUtils::AddAuCountry(*file, UNI_L("gb")));
+	verify(MemFile_Find(file, " pl\n") != KNotFound);
+	verify(MemFile_Find(file, " gb\n") != KNotFound);
+
+	// if country code == last country code it is added if at least 1 day passed
+	OP_DELETE(file);
+	file = OpMemFile::Create(NULL, 0);
+	verify(file);
+	verify_success(MemFile_AddCountry(file, "pl", g_timecache->CurrentTime() - SECS_IN_A_DAY - 1, 1));
+	verify_success(file->Close());
+	verify_success(ResourceUtils::AddAuCountry(*file, UNI_L("pl")));
+	verify(MemFile_Count(file, " pl\n") == 2);
+
+	// oldest entries should be removed when the number of lines in a file exceeds AU_COUNTRY_MAX_LINES
+	OP_DELETE(file);
+	file = OpMemFile::Create(NULL, 0);
+	verify(file);
+	verify_success(MemFile_AddCountry(file, "pl", g_timecache->CurrentTime() - 1, ResourceUtils::AU_COUNTRY_MAX_LINES * 2));
+	verify_success(file->Close());
+	verify_success(ResourceUtils::AddAuCountry(*file, UNI_L("gb")));
+	verify(MemFile_Count(file, "\n"), ResourceUtils::AU_COUNTRY_MAX_LINES);
+}
+finally
+{
+	OP_DELETE(file);
+}
+
+test ("DetermineAuCountry")
+{
+	const size_t SECS_IN_A_DAY = 24 * 60 * 60;
+
+	OpMemFile* file = OpMemFile::Create(NULL, 0);
+	verify(file);
+	OpString country;
+	time_t now = g_timecache->CurrentTime() - 1;
+	size_t count;
+
+	// empty file
+	verify_success(country.Set("pl"));
+	verify_success(ResourceUtils::DetermineAuCountry(PRODUCT_TYPE_OPERA, *file, country));
+	verify(country.IsEmpty());
+
+	// candidate country CC must satisfy the following conditions:
+	// 1) at least AU_COUNTRY_MIN_COUNT times in the file
+	// 2) at least AU_COUNTRY_MIN_PERCENTAGE of all entries in the file
+	// 3) at least AU_COUNTRY_MIN_DAYS between first and last report
+	// 4) at most AU_COUNTRY_MAX_DAYS_FROM_LAST_REPORT after last report
+
+	// all conditions met except 1st
+	verify_success(MemFile_AddCountry(file, "pl", now - ResourceUtils::AU_COUNTRY_MIN_DAYS * SECS_IN_A_DAY - 1, 1));
+	verify_success(MemFile_AddCountry(file, "pl", now, (ResourceUtils::AU_COUNTRY_MIN_COUNT > 2) ? ResourceUtils::AU_COUNTRY_MIN_COUNT - 2 : 0));
+	verify_success(ResourceUtils::DetermineAuCountry(PRODUCT_TYPE_OPERA, *file, country));
+	verify(country.IsEmpty());
+
+	// all conditions met except 3rd
+	OP_DELETE(file);
+	file = OpMemFile::Create(NULL, 0);
+	verify(file);
+	verify_success(MemFile_AddCountry(file, "pl", now, ResourceUtils::AU_COUNTRY_MIN_COUNT));
+	verify_success(ResourceUtils::DetermineAuCountry(PRODUCT_TYPE_OPERA, *file, country));
+	verify(ResourceUtils::AU_COUNTRY_MIN_DAYS > ResourceUtils::AU_COUNTRY_MIN_COUNT || country.IsEmpty());
+
+	// all conditions met except 4th
+	OP_DELETE(file);
+	file = OpMemFile::Create(NULL, 0);
+	verify(file);
+	count = ResourceUtils::AU_COUNTRY_MIN_DAYS - ResourceUtils::AU_COUNTRY_MAX_DAYS_FROM_LAST_REPORT - 1;
+	verify_success(MemFile_AddCountry(file, "pl", now - count * SECS_IN_A_DAY, ResourceUtils::AU_COUNTRY_MIN_DAYS - 1));
+	verify_success(MemFile_AddCountry(file, "pl", now - ResourceUtils::AU_COUNTRY_MAX_DAYS_FROM_LAST_REPORT * SECS_IN_A_DAY - 1, 1));
+	verify_success(ResourceUtils::DetermineAuCountry(PRODUCT_TYPE_OPERA, *file, country));
+	verify(country.IsEmpty());
+
+	// all conditions met, single country
+	OP_DELETE(file);
+	file = OpMemFile::Create(NULL, 0);
+	verify(file);
+	verify_success(MemFile_AddCountry(file, "pl", now - ResourceUtils::AU_COUNTRY_MIN_DAYS * SECS_IN_A_DAY - 1, 1));
+	verify_success(MemFile_AddCountry(file, "pl", now, ResourceUtils::AU_COUNTRY_MIN_COUNT - 1));
+	verify_success(ResourceUtils::DetermineAuCountry(PRODUCT_TYPE_OPERA, *file, country));
+	verify_string(country, UNI_L("pl"));
+
+	// all conditions met, two countries
+	// min number of "gb" entries to reach required percentage
+	count = (ResourceUtils::AU_COUNTRY_MIN_PERCENTAGE * ResourceUtils::AU_COUNTRY_MIN_COUNT) / (100 - ResourceUtils::AU_COUNTRY_MIN_PERCENTAGE) + 1;
+	verify_success(MemFile_AddCountry(file, "gb", now - ResourceUtils::AU_COUNTRY_MIN_DAYS * SECS_IN_A_DAY - 1, count - 1));
+	verify_success(MemFile_AddCountry(file, "gb", now, 1));
+	verify_success(ResourceUtils::DetermineAuCountry(PRODUCT_TYPE_OPERA, *file, country));
+	verify(country.Compare("gb") == 0 || country.Compare("pl") == 0 || ResourceUtils::AU_COUNTRY_MIN_PERCENTAGE == 100);
+}
+finally
+{
+	OP_DELETE(file);
+}
+
+test("CountryCodeToRegion")
+{
+	OpMemFile* file = OpMemFile::Create(NULL, 0);
+	verify(file);
+	OpString region, language;
+
+	// empty file -> region = country code
+	verify_success(ResourceUtils::CountryCodeToRegion(*file, UNI_L("pl"), region, language));
+	verify_string(region, UNI_L("pl"));
+
+	const char* region_ini = "[Region]\npl=eu\nRu=cis\n[Language]\nPL=pl\nua=uk\n";
+	verify_success(file->Write(region_ini, OpStringC8(region_ini).Length()));
+
+	// in region.ini -> return alias
+	verify_success(ResourceUtils::CountryCodeToRegion(*file, UNI_L("pl"), region, language));
+	verify_string(region, UNI_L("eu"));
+	verify_string(language, UNI_L("pl"));
+
+	// case shouldn't matter
+	verify_success(ResourceUtils::CountryCodeToRegion(*file, UNI_L("PL"), region, language));
+	verify_string(region, UNI_L("eu"));
+	verify_string(language, UNI_L("pl"));
+
+	verify_success(ResourceUtils::CountryCodeToRegion(*file, UNI_L("ru"), region, language));
+	verify_string(region, UNI_L("cis"));
+	verify(language.IsEmpty());
+
+	// not in region.ini -> region = country code
+	verify_success(ResourceUtils::CountryCodeToRegion(*file, UNI_L("ua"), region, language));
+	verify_string(region, UNI_L("ua"));
+	verify_string(language, UNI_L("uk"));
+}
+finally
+{
+	OP_DELETE(file);
+}

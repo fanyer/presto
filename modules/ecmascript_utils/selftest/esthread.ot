@@ -1,0 +1,395 @@
+/* -*- Mode: c++; tab-width: 4; indent-tabs-mode: t; c-basic-offset: 4; -*-
+**
+** Copyright (C) 2002 Opera Software AS.  All rights reserved.
+**
+** This file is part of the Opera web browser.  It may not be distributed
+** under any circumstances.
+*/
+
+group "ESUtils.Thread";
+require init;
+
+include "modules/ecmascript_utils/esthread.h";
+include "modules/ecmascript_utils/estimermanager.h";
+include "modules/ecmascript_utils/estimerevent.h";
+include "modules/ecmascript_utils/essched.h";
+include "modules/ecmascript/ecmascript.h";
+include "modules/doc/frm_doc.h";
+
+global
+{
+	class ESU_ThreadListener
+		: public ES_ThreadListener
+	{
+	public:
+		virtual OP_STATUS Signal(ES_Thread *thread, ES_ThreadSignal signal)
+		{
+			switch (signal)
+			{
+			case ES_SIGNAL_FINISHED:
+				ST_passed();
+				break;
+
+			case ES_SIGNAL_FAILED:
+				ST_failed("received unexpected signal: ES_SIGNAL_FAILED\n");
+				break;
+
+			case ES_SIGNAL_CANCELLED:
+				ST_failed("received unexpected signal: ES_SIGNAL_CANCELLED\n");
+				break;
+			}
+
+			return OpStatus::OK;
+		}
+	};
+
+	class ESU_TimeoutTimerEvent
+		: public ES_TimeoutTimerEvent
+	{
+	public:
+		ESU_TimeoutTimerEvent(ES_Program *program, ES_Runtime *runtime, double delay, BOOL is_repeating, unsigned count, ES_Thread *origin_thread)
+			: ES_TimeoutTimerEvent(runtime, delay, is_repeating, origin_thread),
+			  count(count),
+			  failed(FALSE)
+		{
+			SetProgram(program);
+		}
+
+		~ESU_TimeoutTimerEvent()
+		{
+			if (!failed)
+				ST_passed();
+		}
+
+		unsigned count;
+		BOOL failed;
+
+		virtual OP_STATUS Signal(ES_Thread *thread, ES_ThreadSignal signal)
+		{
+			ES_ThreadListener::Remove();
+			switch (signal)
+			{
+			case ES_SIGNAL_FINISHED:
+				if (IsRepeating())
+					if (--count == 0)
+						StopRepeating();
+
+				if (IsRepeating())
+					return GetTimerManager()->RepeatEvent(this);
+				else
+					GetTimerManager()->RemoveExpiredEvent(this);
+				break;
+
+			case ES_SIGNAL_FAILED:
+				ST_failed("received unexpected signal: ES_SIGNAL_FAILED\n");
+				failed = TRUE;
+				break;
+
+			case ES_SIGNAL_CANCELLED:
+				ST_failed("received unexpected signal: ES_SIGNAL_CANCELLED\n");
+				failed = TRUE;
+				break;
+			}
+			return OpStatus::OK;
+		}
+	};
+
+	class ESU_InterruptingThreadListener
+		: public ES_ThreadListener
+	{
+	public:
+		virtual OP_STATUS Signal(ES_Thread *thread, ES_ThreadSignal signal)
+		{
+			switch (signal)
+			{
+			case ES_SIGNAL_FAILED:
+				ST_failed("received unexpected signal: ES_SIGNAL_FAILED\n");
+				break;
+
+			case ES_SIGNAL_CANCELLED:
+				ST_failed("received unexpected signal: ES_SIGNAL_CANCELLED\n");
+				break;
+
+			case ES_SIGNAL_FINISHED:
+				ES_Thread *killer = OP_NEW(ESU_KillingThread, ());
+				if (!killer)
+					return OpStatus::ERR_NO_MEMORY;
+				OP_BOOLEAN result = thread->GetScheduler()->AddRunnable(killer, thread);
+				RETURN_IF_ERROR(result);
+				if (result == OpBoolean::IS_FALSE)
+					ST_failed("failed to add interrupting thread\n");
+				break;
+			}
+
+			return OpStatus::OK;
+		}
+	};
+
+	class ESU_KillingThread
+		: public ES_EmptyThread
+	{
+	public:
+		virtual OP_STATUS EvaluateThread()
+		{
+			if (!is_started)
+			{
+				is_started = TRUE;
+				return GetScheduler()->CancelThread(GetInterruptedThread()->GetInterruptedThread());
+			}
+			else
+			{
+				is_completed = TRUE;
+				return OpStatus::OK;
+			}
+		}
+	};
+
+	class ESU_PassingThread
+		: public ES_EmptyThread
+	{
+	public:
+		virtual OP_STATUS EvaluateThread()
+		{
+			is_completed = TRUE;
+			return OpStatus::OK;
+		}
+
+		virtual OP_STATUS Signal(ES_ThreadSignal signal)
+		{
+			ST_passed();
+			return ES_Thread::Signal(signal);
+		}
+	};
+}
+
+html
+{
+	"<html>"
+		"<head>"
+			"<script>/* This script is here to force the creation of a scripting environment in the document. */</script>"
+		"</head>"
+		"<body>"
+			"<div id='description'>initial document</div>"
+		"</body>"
+	"</html>"
+}
+
+test("Test 1")
+	async;
+{
+	URL url(g_url_api->GetURL("javascript:void(test1 = 'pass');"));
+	if (OpStatus::IsError(ES_JavascriptURLThread::Load(state.doc->GetESScheduler(), UNI_L("void(test1 = 'pass');"), url, TRUE, FALSE, FALSE, FALSE, NULL, FALSE, FALSE)))
+		ST_failed("ES_JavascriptURLThread::Load failed\n");
+	else
+	{
+		ES_Thread *thread = state.doc->GetESScheduler()->GetCurrentThread();
+		while (thread && thread->Type() != ES_THREAD_JAVASCRIPT_URL)
+			thread = (ES_Thread *) thread->Suc();
+		if (!thread)
+			ST_failed("failed to locate test thread\n");
+		else
+		{
+			if (uni_strcmp(thread->GetInfoString(), "Javascript URL thread: \"javascript:void(test1 = 'pass');\"") != 0)
+				ST_failed("thread's info string was incorrect\n");
+			else
+			{
+				ESU_ThreadListener *listener = OP_NEW(ESU_ThreadListener, ());
+				if (!listener)
+					ST_failed("failed to allocate listener (OOM)\n");
+				else
+					thread->AddListener(listener);
+			}
+		}
+	}
+}
+
+test("Test 1 roundup")
+	language ecmascript;
+	require success "Test 1";
+{
+	verify(window.description.firstChild.nodeValue == "initial document");
+	verify(window.test1 == "pass");
+}
+
+test("Test 2")
+	async;
+{
+	URL url(g_url_api->GetURL("javascript:'<html><head><script>test2 = \\'pass\\'</script></head><body><div id=\\'description\\'>generated document</div></body></html>';"));
+	if (OpStatus::IsError(ES_JavascriptURLThread::Load(state.doc->GetESScheduler(), UNI_L("'<html><head><script>test2 = \\'pass\\'</script></head><body><div id=\\'description\\'>generated document</div></body></html>';"), url, TRUE, FALSE, FALSE, FALSE, NULL, FALSE, FALSE, FALSE)))
+		ST_failed("ES_JavascriptURLThread::Load failed\n");
+	else
+	{
+		ES_Thread *thread = state.doc->GetESScheduler()->GetCurrentThread();
+		while (thread && thread->Type() != ES_THREAD_JAVASCRIPT_URL)
+			thread = (ES_Thread *) thread->Suc();
+		if (!thread)
+			ST_failed("failed to locate test thread\n");
+		else
+		{
+			if (uni_strcmp(thread->GetInfoString(), "Javascript URL thread: \"javascript:'<html><head><script>test2 = \\'pass\\'</script></head><body><div id=\\'description\\'>gener...\"") != 0)
+				ST_failed("thread's info string was incorrect\n");
+			else
+			{
+				ESU_ThreadListener *listener = OP_NEW(ESU_ThreadListener, ());
+				if (!listener)
+					ST_failed("failed to allocate listener (OOM)\n");
+				else
+					thread->AddListener(listener);
+			}
+		}
+	}
+}
+
+test("Test 2 round-up")
+	language ecmascript;
+	require success "Test 2";
+{
+	verify(window.description.firstChild.nodeValue == "generated document");
+	verify(window.test2 == 'pass');
+}
+
+test("Test 3")
+	async;
+{
+	ES_Thread *thread = OP_NEW(ES_EmptyThread, ());
+	if (!thread)
+		ST_failed("failed to allocate thread (OOM)\n");
+	else if (state.doc->GetESScheduler()->AddRunnable(thread) != OpBoolean::IS_TRUE)
+		ST_failed("failed to add thread to scheduler\n");
+	else
+	{
+		ESU_ThreadListener *listener = OP_NEW(ESU_ThreadListener, ());
+		if (!listener)
+			ST_failed("failed to allocate listener (OOM)\n");
+		else
+			thread->AddListener(listener);
+	}
+}
+
+html
+{
+	"<html>"
+		"<head>"
+			"<script>var test4 = 0;</script>"
+		"</head>"
+		"<body>"
+			"<div id='description'>test 4</div>"
+		"</body>"
+	"</html>"
+}
+
+test("Test 4")
+	async;
+{
+	ES_ProgramText program_text;
+	ES_Program *program;
+
+	program_text.program_text = UNI_L("++test4;");
+	program_text.program_text_length = uni_strlen(program_text.program_text);
+
+	ES_Runtime::CompileProgramOptions options;
+	options.program_is_function = TRUE;
+
+	OP_STATUS status = state.doc->GetESRuntime()->CompileProgram(&program_text, 1, &program, options);
+
+	if (OpStatus::IsError(status) || !program)
+		ST_failed("failed to compile program\n");
+	else
+	{
+		ES_Thread dummy_thread(NULL, NULL);
+		ES_TimerEvent *event = OP_NEW(ESU_TimeoutTimerEvent, (program, state.doc->GetESRuntime(), 1200, FALSE, 1, &dummy_thread));
+
+		if (!event)
+		{
+			ES_Runtime::DeleteProgram(program);
+			ST_failed("failed to allocate event (OOM)\n");
+		}
+		else if (state.doc->GetESScheduler()->GetTimerManager()->AddEvent(event) != OpStatus::OK)
+			ST_failed("failed to add event to timer manager\n");
+	}
+}
+
+test("Test 4 round-up")
+	language ecmascript;
+	require success "Test 4";
+{
+	verify(window.description.firstChild.nodeValue == "test 4");
+	verify(window.test4 == 1);
+}
+
+html
+{
+	"<html>"
+		"<head>"
+			"<script>var test5 = 0;</script>"
+		"</head>"
+		"<body>"
+			"<div id='description'>test 5</div>"
+		"</body>"
+	"</html>"
+}
+
+test("Test 5")
+	async;
+{
+	ES_ProgramText program_text;
+	ES_Program *program;
+
+	program_text.program_text = UNI_L("++test5;");
+	program_text.program_text_length = uni_strlen(program_text.program_text);
+
+	ES_Runtime::CompileProgramOptions options;
+	options.program_is_function = TRUE;
+	OP_STATUS status = state.doc->GetESRuntime()->CompileProgram(&program_text, 1, &program, options);
+
+	if (OpStatus::IsError(status) || !program)
+		ST_failed("failed to compile program\n");
+	else
+	{
+		ES_Thread dummy_thread(NULL, NULL);
+		ES_TimerEvent *event = OP_NEW(ESU_TimeoutTimerEvent, (program, state.doc->GetESRuntime(), 200.5, TRUE, 4, &dummy_thread));
+
+		if (!event)
+		{
+			ES_Runtime::DeleteProgram(program);
+			ST_failed("failed to allocate event (OOM)\n");
+		}
+		else if (state.doc->GetESScheduler()->GetTimerManager()->AddEvent(event) != OpStatus::OK)
+			ST_failed("failed to add event to timer manager\n");
+	}
+}
+
+test("Test 5 round-up")
+	language ecmascript;
+	require success "Test 5";
+{
+	verify(window.description.firstChild.nodeValue == "test 5");
+	verify(window.test5 == 4);
+}
+
+test("Test 6")
+	async;
+{
+	ES_ThreadScheduler *scheduler = state.doc->GetESScheduler();
+
+	ES_EmptyThread *empty1 = OP_NEW(ES_EmptyThread, ()), *empty2 = OP_NEW(ES_EmptyThread, ());
+	ESU_PassingThread *pass = OP_NEW(ESU_PassingThread, ());
+	ESU_InterruptingThreadListener *listener = OP_NEW(ESU_InterruptingThreadListener, ());
+
+	if (!empty1 || !empty2 || !pass || !listener)
+		ST_failed("OOM\n");
+
+	OP_BOOLEAN result1 = scheduler->AddRunnable(empty1);
+	if (result1 != OpBoolean::IS_TRUE)
+		ST_failed("failed to add thread\n");
+
+	OP_BOOLEAN result2 = scheduler->AddRunnable(empty2, empty1);
+	if (result2 != OpBoolean::IS_TRUE)
+		ST_failed("failed to add thread\n");
+
+	empty2->AddListener(listener);
+
+	OP_BOOLEAN result3 = scheduler->AddRunnable(pass);
+	if (result3 != OpBoolean::IS_TRUE)
+		ST_failed("failed to add thread\n");
+}

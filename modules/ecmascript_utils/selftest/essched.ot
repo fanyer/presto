@@ -1,0 +1,378 @@
+/* -*- Mode: c++; tab-width: 4; indent-tabs-mode: t; c-basic-offset: 4; -*-
+**
+** Copyright (C) 2002 Opera Software AS.  All rights reserved.
+**
+** This file is part of the Opera web browser.  It may not be distributed
+** under any circumstances.
+*/
+
+group "ESUtils.ThreadScheduler";
+require init;
+require ESUTILS_ES_ENVIRONMENT_SUPPORT;
+
+include "modules/hardcore/timer/optimer.h";
+include "modules/ecmascript_utils/esenvironment.h";
+include "modules/ecmascript_utils/esthread.h";
+include "modules/ecmascript_utils/essched.h";
+include "modules/dochand/win.h";
+include "modules/logdoc/htm_elm.h";
+
+global
+{
+	ES_Environment *g_esEnvironment1;
+	ES_Environment *g_esEnvironment2;
+	unsigned g_sequence;
+
+	class ESU_SelftestSequenceThread : public ES_Thread
+	{
+	private:
+		unsigned expected_sequence;
+		unsigned *current_sequence;
+		BOOL last;
+
+	public:
+		ESU_SelftestSequenceThread(unsigned expected_sequence, unsigned *current_sequence, BOOL last)
+			: ES_Thread(NULL), expected_sequence(expected_sequence), current_sequence(current_sequence), last(last)
+		{
+		}
+
+		virtual OP_STATUS EvaluateThread()
+		{
+			is_started = is_completed = TRUE;
+
+			if (expected_sequence == *current_sequence)
+				++*current_sequence;
+			else
+				*current_sequence = ~0u;
+
+			if (last)
+				if (*current_sequence != ~0u)
+					ST_passed();
+				else
+					ST_failed("Wrong sequence.");
+
+			return OpStatus::OK;
+		}
+
+		OP_STATUS Signal(ES_ThreadSignal signal)
+		{
+			switch (signal)
+			{
+			case ES_SIGNAL_FAILED:
+				if (last)
+					ST_failed("Thread failed.");
+				break;
+
+			case ES_SIGNAL_CANCELLED:
+				if (last)
+					ST_failed("Thread cancelled.");
+				break;
+			}
+
+			return ES_Thread::Signal(signal);
+		}
+	};
+
+	/**
+	   triggers timeouts until text content of elm matches desired (or
+	   timeout's triggered bail_count times)
+	 */
+	class WaitForTextObj : public OpTimerListener
+	{
+	public:
+		OpTimer m_timer;
+		HTML_Element* m_elm;
+		const uni_char* const m_desired;
+		const unsigned int m_desired_len;
+		uni_char* m_buffer;
+		unsigned int m_timeout;
+		int m_bail_count; // number of _restarts_ before bail
+		WaitForTextObj(HTML_Element* elm, const uni_char* desired, unsigned int timeout = 100, int bail_count = 10)
+			: m_elm(elm)
+			, m_desired(desired)
+			, m_desired_len(uni_strlen(desired))
+			, m_buffer(0)
+			, m_timeout(timeout)
+			, m_bail_count(bail_count)
+		{
+			// allocate buffer
+			m_buffer = OP_NEWA(uni_char, m_desired_len + 1);
+			if (!m_buffer)
+				ST_failed("failed to allocate buffer");
+			// start timeout
+			m_timer.SetTimerListener(this);
+			m_timer.Start(m_timeout);
+		}
+		~WaitForTextObj() { OP_DELETEA(m_buffer); }
+		virtual void OnTimeOut(OpTimer* timer)
+		{
+			// content match
+			if (m_elm->GetTextContent(m_buffer, m_desired_len + 1) == static_cast<int>(m_desired_len) && !uni_strcmp(m_buffer, m_desired))
+			{
+				OP_DELETE(this);
+				ST_passed();
+			}
+			else if (m_bail_count-- > 0)
+			{
+				m_timer.Start(m_timeout);
+			}
+			else
+			{
+				OP_DELETE(this);
+				ST_failed("too many iterations - bailing");
+			}
+		}
+	};
+	void WaitForText(HTML_Element* elm, const uni_char* desired)
+	{
+		if (!elm || !desired)
+			ST_failed("WaitForText must be passed an existing element and a desired text");
+		// NOTE: deletes itself in OnTimeOut
+		else if (!OP_NEW(WaitForTextObj, (elm, desired)))
+			ST_failed("OOM");
+	}
+}
+
+setup
+{
+	g_esEnvironment1 = NULL;
+	g_esEnvironment2 = NULL;
+}
+
+exit
+{
+	if (g_esEnvironment1)
+		ES_Environment::Destroy(g_esEnvironment1);
+
+	if (g_esEnvironment2)
+		ES_Environment::Destroy(g_esEnvironment2);
+}
+
+test("Setup")
+{
+	OP_STATUS status1 = ES_Environment::Create(g_esEnvironment1);
+	verify(status1 == OpStatus::OK);
+	verify(g_esEnvironment1 != NULL);
+	verify(g_esEnvironment1->Enabled());
+
+	OP_STATUS status2 = ES_Environment::Create(g_esEnvironment2);
+	verify(status2 == OpStatus::OK);
+	verify(g_esEnvironment2 != NULL);
+	verify(g_esEnvironment2->Enabled());
+}
+
+test("Sequence test (simple)")
+	async;
+	require success "Setup";
+{
+	g_sequence = 1;
+
+	ES_Thread *thread1 = OP_NEW(ESU_SelftestSequenceThread, (1, &g_sequence, FALSE));
+	ES_Thread *thread2 = OP_NEW(ESU_SelftestSequenceThread, (2, &g_sequence, TRUE));
+
+	if (g_esEnvironment1->GetScheduler()->AddRunnable(thread1) != OpBoolean::IS_TRUE ||
+		g_esEnvironment1->GetScheduler()->AddRunnable(thread2) != OpBoolean::IS_TRUE)
+	{
+		g_esEnvironment1->GetScheduler()->RemoveThreads(TRUE);
+		ST_failed("Threads not added correctly.");
+	}
+}
+
+test("Sequence test (interrupted #1)")
+	async;
+	require success "Setup";
+{
+	g_sequence = 1;
+
+	ES_Thread *thread1 = OP_NEW(ESU_SelftestSequenceThread, (1, &g_sequence, FALSE));
+	ES_Thread *thread2 = OP_NEW(ESU_SelftestSequenceThread, (2, &g_sequence, TRUE));
+
+	if (g_esEnvironment1->GetScheduler()->AddRunnable(thread2) != OpBoolean::IS_TRUE ||
+		g_esEnvironment1->GetScheduler()->AddRunnable(thread1, thread2) != OpBoolean::IS_TRUE)
+	{
+		g_esEnvironment1->GetScheduler()->RemoveThreads(TRUE);
+		ST_failed("Threads not added correctly.");
+	}
+}
+
+test("Sequence test (interrupted #2)")
+	async;
+	require success "Setup";
+{
+	g_sequence = 1;
+
+	ES_Thread *thread1 = OP_NEW(ESU_SelftestSequenceThread, (1, &g_sequence, FALSE));
+	ES_Thread *thread2 = OP_NEW(ESU_SelftestSequenceThread, (2, &g_sequence, FALSE));
+	ES_Thread *thread3 = OP_NEW(ESU_SelftestSequenceThread, (3, &g_sequence, TRUE));
+
+	if (g_esEnvironment1->GetScheduler()->AddRunnable(thread2) != OpBoolean::IS_TRUE ||
+		g_esEnvironment1->GetScheduler()->AddRunnable(thread1, thread2) != OpBoolean::IS_TRUE ||
+		g_esEnvironment1->GetScheduler()->AddRunnable(thread3) != OpBoolean::IS_TRUE)
+	{
+		g_esEnvironment1->GetScheduler()->RemoveThreads(TRUE);
+		ST_failed("Threads not added correctly.");
+	}
+}
+
+test("Sequence test (interrupted #3)")
+	async;
+	require success "Setup";
+{
+	g_sequence = 1;
+
+	ES_Thread *thread1 = OP_NEW(ESU_SelftestSequenceThread, (1, &g_sequence, FALSE));
+	ES_Thread *thread2 = OP_NEW(ESU_SelftestSequenceThread, (2, &g_sequence, FALSE));
+	ES_Thread *thread3 = OP_NEW(ESU_SelftestSequenceThread, (3, &g_sequence, TRUE));
+
+	if (g_esEnvironment1->GetScheduler()->AddRunnable(thread3) != OpBoolean::IS_TRUE ||
+		g_esEnvironment1->GetScheduler()->AddRunnable(thread2, thread3) != OpBoolean::IS_TRUE ||
+		g_esEnvironment1->GetScheduler()->AddRunnable(thread1, thread2) != OpBoolean::IS_TRUE)
+	{
+		g_esEnvironment1->GetScheduler()->RemoveThreads(TRUE);
+		ST_failed("Threads not added correctly.");
+	}
+}
+
+test("Sequence test (interrupted #4)")
+	async;
+	require success "Setup";
+{
+	g_sequence = 1;
+
+	ES_Thread *thread1 = OP_NEW(ESU_SelftestSequenceThread, (1, &g_sequence, FALSE));
+	ES_Thread *thread2 = OP_NEW(ESU_SelftestSequenceThread, (2, &g_sequence, FALSE));
+	ES_Thread *thread3 = OP_NEW(ESU_SelftestSequenceThread, (3, &g_sequence, FALSE));
+	ES_Thread *thread4 = OP_NEW(ESU_SelftestSequenceThread, (4, &g_sequence, TRUE));
+
+	if (g_esEnvironment1->GetScheduler()->AddRunnable(thread2) != OpBoolean::IS_TRUE ||
+		g_esEnvironment1->GetScheduler()->AddRunnable(thread1, thread2) != OpBoolean::IS_TRUE ||
+		g_esEnvironment1->GetScheduler()->AddRunnable(thread4) != OpBoolean::IS_TRUE ||
+		g_esEnvironment1->GetScheduler()->AddRunnable(thread3, thread4) != OpBoolean::IS_TRUE)
+	{
+		g_esEnvironment1->GetScheduler()->RemoveThreads(TRUE);
+		ST_failed("Threads not added correctly.");
+	}
+}
+
+test("Sequence test (interrupted foreign #1)")
+	async;
+	require success "Setup";
+{
+	g_sequence = 1;
+
+	ES_Thread *thread1 = OP_NEW(ESU_SelftestSequenceThread, (1, &g_sequence, FALSE));
+	ES_Thread *thread2 = OP_NEW(ESU_SelftestSequenceThread, (2, &g_sequence, TRUE));
+
+	if (g_esEnvironment1->GetScheduler()->AddRunnable(thread2) != OpBoolean::IS_TRUE ||
+		g_esEnvironment2->GetScheduler()->AddRunnable(thread1, thread2) != OpBoolean::IS_TRUE)
+	{
+		g_esEnvironment1->GetScheduler()->RemoveThreads(TRUE);
+		g_esEnvironment2->GetScheduler()->RemoveThreads(TRUE);
+		ST_failed("Threads not added correctly.");
+	}
+}
+
+test("Sequence test (interrupted foreign #2)")
+	async;
+	require success "Setup";
+{
+	g_sequence = 1;
+
+	ES_Thread *thread1 = OP_NEW(ESU_SelftestSequenceThread, (1, &g_sequence, FALSE));
+	ES_Thread *thread2 = OP_NEW(ESU_SelftestSequenceThread, (2, &g_sequence, FALSE));
+	ES_Thread *thread3 = OP_NEW(ESU_SelftestSequenceThread, (3, &g_sequence, TRUE));
+
+	if (g_esEnvironment1->GetScheduler()->AddRunnable(thread3) != OpBoolean::IS_TRUE ||
+		g_esEnvironment2->GetScheduler()->AddRunnable(thread2, thread3) != OpBoolean::IS_TRUE ||
+		g_esEnvironment1->GetScheduler()->AddRunnable(thread1, thread2) != OpBoolean::IS_TRUE)
+	{
+		g_esEnvironment1->GetScheduler()->RemoveThreads(TRUE);
+		g_esEnvironment2->GetScheduler()->RemoveThreads(TRUE);
+		ST_failed("Threads not added correctly.");
+	}
+}
+
+/*
+  tests interval reset (CORE-15637, CORE-15634) - after navigating to
+  a page in history, its OnInterval timers should be resumed. test is
+  in three steps:
+  * set up main document
+  * load dummy document and go back in history
+  * test that interval timer is started again
+ */
+// set up main document
+html
+{
+//! <html>
+//! <head>
+//! <script type="text/javascript">
+//! <!--
+//! const pend = "pending";
+//! var int = null; // handle to interval timer
+//! function onInterval()
+//! {
+//!   clearInterval(int);
+//!   int = null;
+//!   var p = document.getElementsByTagName('p')[0];
+//!   if (p.innerHTML == pend)
+//!     p.innerHTML = "PASS";
+//!   else // shouldn't happen
+//!     p.innerHTML = "FAIL";
+//! }
+//! window.onload = function() {
+//!   var p = document.getElementsByTagName('p')[0];
+//!   if (p.innerHTML == "") // first load
+//!     p.innerHTML = pend;
+//!   else // subsequent load - failure
+//!     p.innerHTML = "FAIL";
+//!   int = setInterval(onInterval, 1000);
+//! }
+//! //-->
+//! </script>
+//! <body>
+//! <p></p>
+//! </body>
+}
+test("interval reset setup#1") async;
+{
+	// load first page and wait until interval timer is started
+	WaitForText(find_element("p"), UNI_L("pending"));
+}
+
+// load dummy document that navigates back to main
+html
+{
+//! <html>
+//! <body>
+//! <p>dummy</p>
+//! </body>
+//! </html>
+}
+test("interval reset setup#2")
+require success "interval reset setup#1";
+{
+	// check that the second page is actually loaded
+	verify(state.doc);
+	HTML_Element* p = find_element("p");
+	verify(p);
+	verify(p->Type() == HE_P);
+	const int len = 5; // "dummy"
+	uni_char buf[len+1];
+	verify(p->GetTextContent(buf, len+1) == len && !uni_strcmp(buf, UNI_L("dummy")));
+	// go back in history
+	state.window->SetHistoryPrev();
+}
+test ("interval reset setup") async;
+require success "interval reset setup#2";
+{
+	// make sure interval hasn't triggered already
+	HTML_Element* p = find_element("p");
+	if (!p || p->Type() != HE_P)
+		ST_failed("failed to find p element");
+	const int len = 7; // "pending"
+	uni_char buf[len+1];
+	if (p->GetTextContent(buf, len+1) != len || uni_strcmp(buf, UNI_L("pending")))
+		ST_failed("interval already triggered");
+	// wait for interval
+	WaitForText(find_element("p"), UNI_L("PASS"));
+}

@@ -1,0 +1,200 @@
+/* -*- mode: c++; tab-width: 4; indent-tabs-mode: t; c-basic-offset: 4 -*- */
+
+group "autoproxy.built-ins.async";
+
+require SUPPORT_AUTO_PROXY_CONFIGURATION;
+require initialization;
+
+language c++;
+
+include "modules/url/url2.h";
+
+include "modules/url/protocols/scomm.h";
+include "modules/url/protocols/comm.h";
+include "modules/url/loadhandler/url_lh.h";
+
+include "modules/ecmascript/ecmascript.h";
+include "modules/autoproxy/autoproxy.h";
+
+global {
+	JSProxyConfig* apc;
+	JSProxyPendingContext* suspend;
+
+	class AutoProxySelftestPoller : public MessageObject
+	{
+	public:
+		AutoProxySelftestPoller(JSProxyConfig* apc, JSProxyPendingContext*& suspend) : apc(apc), suspend(suspend) {}
+		JSProxyConfig* apc;
+		JSProxyPendingContext*& suspend;
+
+		int tries;
+
+		virtual void HandleCallback(OpMessage msg, MH_PARAM_1 par1, MH_PARAM_2 lpar2)
+		{
+			if (!suspend)
+			{
+				ST_failed("Polling something without a suspend object");
+				return;
+			}
+			if (!apc)
+			{
+				ST_failed("Where is the apc?");
+			}
+			uni_char* result;
+			OP_STATUS res = apc->FindProxyForURL( suspend, &result);
+			if (OpStatus::IsError(res))
+			{
+				ST_failed("Resumed call to FindProxyURL failed");
+				return;
+			}
+
+			if (suspend->lookup_succeeded)
+			{
+				OP_DELETE(suspend);
+				suspend = NULL;
+				if (uni_str_eq(result , "OK"))
+					ST_passed();
+				else
+				{
+					OpString8 result8;
+					result8.SetUTF8FromUTF16(result);
+					ST_failed(result8.CStr() ? result8.CStr() : "OOM");
+				}
+				op_free(result);
+				return;
+			}
+
+			if (tries-- <= 0 || !g_main_message_handler->PostDelayedMessage(MSG_AUTOPROXY_SELFTEST_POLLER, 0, 0, 500))
+			{
+				OP_DELETE(suspend);
+				suspend = NULL;
+				ST_failed(tries <= 0 ? "Test timed out" : "Test failed to post message");
+				return;
+			}
+		}
+	};
+	AutoProxySelftestPoller* poller;
+
+	void TestAsyncFunction(const uni_char* test_url, const uni_char* test_host)
+	{
+		if (!apc)
+			ST_failed("No apc");
+		else if (suspend)
+			ST_failed("Already suspended");
+		else
+		{
+			uni_char *result;
+			OP_STATUS res = apc->FindProxyForURL( test_url, test_host, &result, &suspend );
+			if (res != 0)
+				ST_failed("FindProxyForURL failed with an error");
+			else if (!suspend)
+			{
+				BOOL passed = uni_str_eq( result, "OK" );
+				op_free(result);
+				if (passed)
+					ST_passed();
+				else
+				{
+					OpString8 result8;
+					result8.SetUTF8FromUTF16(result);
+					ST_failed(result8.CStr() ? result8.CStr() : "OOM");
+				}
+			}
+			else
+			{
+				// Start polling.
+				poller->tries = 10;
+				if (!g_main_message_handler->PostDelayedMessage(MSG_AUTOPROXY_SELFTEST_POLLER, 0, 0, 500))
+				{
+					OP_DELETE(suspend);
+					suspend = NULL;
+					ST_failed("Test failed to post message");
+				}
+			}
+		}
+	}
+}
+
+setup {
+	const char* js_source8 = #string "selftest_async.js";
+	TempBuffer js_source16;
+	apc = NULL;
+	suspend = NULL;
+	if (OpStatus::IsSuccess(js_source16.Append(js_source8)))
+	{
+		ES_ProgramText program_text;
+		program_text.program_text = js_source16.GetStorage();
+		program_text.program_text_length = js_source16.Length();
+		OP_STATUS stat;
+		apc = JSProxyConfig::Create( &program_text, 1, stat, NULL );
+
+		poller = OP_NEW(AutoProxySelftestPoller, (apc, suspend));
+		if (poller)
+			g_main_message_handler->SetCallBack(poller, MSG_AUTOPROXY_SELFTEST_POLLER, 0);
+		else
+		{
+			JSProxyConfig::Destroy(apc);
+			apc = NULL;
+		}
+	}
+}
+
+exit {
+	if (poller)
+	{
+		g_main_message_handler->UnsetCallBacks(poller);
+		OP_DELETE(poller);
+	}
+	JSProxyConfig::Destroy(apc);
+	OP_DELETE(suspend);
+}
+
+/* Each test is executed by sending in a test code to the proxy config
+   script; this triggers selection of a test internally, and the test
+   returns a string, either "OK" or "ERROR".
+   */
+
+test("isResolvable#1")
+	async;
+{
+	TestAsyncFunction( UNI_L("isResolvable"), UNI_L("1") );
+}
+
+test("isResolvable#2")
+	async;
+{
+	TestAsyncFunction( UNI_L("isResolvable"), UNI_L("2") );
+}
+
+
+test("localHostOrDomainIs#1")
+	async;
+{
+	TestAsyncFunction( UNI_L("localHostOrDomainIs"), UNI_L("1") );
+}
+
+test("localHostOrDomainIs#2")
+	async;
+{
+	TestAsyncFunction( UNI_L("localHostOrDomainIs"), UNI_L("2") );
+}
+
+test("localHostOrDomainIs#3")
+	async;
+{
+	TestAsyncFunction( UNI_L("localHostOrDomainIs"), UNI_L("3") );
+}
+
+test("localHostOrDomainIs#4")
+	async;
+{
+	TestAsyncFunction( UNI_L("localHostOrDomainIs"), UNI_L("4") );
+}
+
+test("dnsResolve#1")
+	async;
+{
+	TestAsyncFunction( UNI_L("dnsResolve"), UNI_L("1") );
+}
+
+

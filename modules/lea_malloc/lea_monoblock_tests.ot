@@ -1,0 +1,114 @@
+/* -*- Mode: c; tab-width: 4; c-basic-offset: 4 -*-
+ *
+ * Copyright (C) 2004-2006 Opera Software ASA.  All rights reserved.
+ *
+ * This file is part of the Opera web browser.
+ * It may not be distributed under any circumstances.
+ *
+ * Selftests for the SingleBlockHeap class in lea_monoblock
+ */
+group "lea_malloc.lea_monoblock";
+
+require LEA_MALLOC_MONOBLOCK;
+language c++;
+include "modules/lea_malloc/lea_monoblock.h";
+
+test("lea_monoblock_basic")
+{
+	const size_t mem_size = 1024 * 1024 ; // 1MB
+	const size_t total_size = mem_size + SingleBlockHeap::GetOverhead(); // Add overhead. This leaves exactly mem_size bytes to be managed
+	const size_t align = 2 * sizeof(size_t); // Alignment requirement on memory lump given to SingleBlockHeap
+	void *rawmem = op_malloc(total_size + align); // Allocate the needed memory from the system, plus padding to ensure proper alignment
+	verify(rawmem);
+	void *mem = (void *)(UINTPTR(rawmem) + ((align - (UINTPTR(rawmem) % align)) % align)); // Properly align mem within rawmem
+	const size_t approx_alloc_overhead = 40; // Number of extra bytes added to each allocation as overhead. Found by experimentation
+	const size_t test_alloc_num  = 10000; // Do this many test allocations
+	const size_t test_alloc_size = 50;    // ... each of this size
+	void *ptrs[test_alloc_num];
+	void *ptr = NULL;
+	size_t i = 0;
+
+	// Instantiate SingleBlockHeap into the memory allocated from the system
+	SingleBlockHeap *heap = new (mem) SingleBlockHeap(total_size);
+	verify(heap);
+	verify(heap->GetFreeMemory() == mem_size);
+	verify(heap->GetCapacity() == mem_size);
+	verify(!heap->Contains(NULL));
+
+	// Trying to allocate everything. Should fail, since malloc needs room for metadata
+	ptr = heap->malloc(mem_size);
+	verify(ptr == NULL);
+	verify(heap->GetFreeMemory() == mem_size);
+	verify(heap->GetCapacity() == mem_size);
+
+	// Should work if we leave room for the metadata
+	ptr = heap->malloc(mem_size - approx_alloc_overhead); 
+	verify(ptr != NULL);
+	verify(heap->GetFreeMemory() <= approx_alloc_overhead);
+	verify(heap->Contains(ptr));
+	verify(!heap->Contains(NULL));
+
+	// Release it
+	heap->free(ptr);
+	ptr = NULL;
+	verify(heap->GetFreeMemory() == mem_size);
+	verify(heap->GetCapacity() == mem_size);
+
+	// Should work the second time as well
+	ptr = heap->malloc(mem_size - approx_alloc_overhead);
+	verify(ptr != NULL);
+	verify(heap->GetFreeMemory() <= approx_alloc_overhead);
+	verify(heap->Contains(ptr));
+
+	// Give it up
+	heap->free(ptr);
+	ptr = NULL;
+	verify(heap->GetFreeMemory() == mem_size);
+	verify(heap->GetCapacity() == mem_size);
+
+	// Do test allocations
+	verify(test_alloc_num * test_alloc_size < mem_size);
+	verify(test_alloc_num * (test_alloc_size + approx_alloc_overhead) < mem_size);
+	for (i = 0; i < test_alloc_num; i++) {
+		ptrs[i] = heap->malloc(test_alloc_size);
+		verify(ptrs[i] != NULL);
+		verify(heap->Contains(ptrs[i]));
+	}
+	verify(heap->GetFreeMemory() <= mem_size - (test_alloc_num * test_alloc_size));
+
+	// Now try to allocate an outrageous chunk in the remaining space
+	ptr = heap->malloc(mem_size); 
+	verify(ptr == NULL);
+	verify(heap->GetFreeMemory() <= mem_size - (test_alloc_num * test_alloc_size));
+
+	// Ok, try something that should fit when heap is empty, but not now
+	verify(mem_size / 2 > heap->GetFreeMemory());
+	ptr = heap->malloc(mem_size / 2);
+	verify(ptr == NULL);
+
+	// Release them all
+	for (i = 0; i < test_alloc_num; i++) {
+		heap->free(ptrs[i]);
+		ptrs[i] = NULL;
+	}
+	verify(heap->GetFreeMemory() == mem_size);
+	verify(heap->GetCapacity() == mem_size);
+
+	void *p = heap->calloc(5, 10);
+	verify_not_oom(p);
+	/* and zero-fills: */
+	const unsigned char* const c = static_cast<unsigned char*>(p);
+	for (i = 0; i < 50; i++)
+		verify(!c[i]);
+	heap->free(p);
+
+	// The following delete should use SingleBlockHeap's operator delete
+	// which do not release mem to the system, just as the corresponding
+	// placement operator new didn't allocate memory from the system
+	delete heap;
+	// Therefore this next line should not cause a SEGFAULT
+	((int *)mem)[0] = 0xdeadbeef;
+
+	// Release the memory back to the system
+	op_free(rawmem);
+}

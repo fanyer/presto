@@ -1,0 +1,187 @@
+/* -*- Mode: c++; tab-width: 4; c-basic-offset: 4; -*-
+ *
+ * Copyright (C) 2011 Opera Software ASA.  All rights reserved.
+ *
+ * This file is part of the Opera web browser.
+ * It may not be distributed under any circumstances.
+ */
+
+group "hardcore.component.syncmessenger";
+language c++;
+require MESSAGELOOP_RUNSLICE_SUPPORT;
+
+include "modules/hardcore/component/OpSyncMessenger.h";
+include "modules/hardcore/src/generated/g_message_hardcore_messages.h";
+
+global
+{
+	/**
+	 * Simple message listener bouncing select messages back to the tests.
+	 */
+	class Responder
+		: public OpMessageListener
+	{
+	public:
+		OP_STATUS Construct();
+		OP_STATUS ProcessMessage(const OpTypedMessage* message);
+
+		OpMessageAddress GetAddress() { return m_channel.GetAddress(); }
+
+		bool GetNestedSyncActivated() { return m_is_nested_sync_activated; }
+		void SetNestedSyncActivated(bool value) { m_is_nested_sync_activated = value; }
+
+	private:
+		OpChannel m_channel;
+		bool m_is_nested_sync_activated;
+	} g_responder;
+
+	OP_STATUS Responder::Construct()
+	{
+		RETURN_IF_ERROR(m_channel.Construct());
+		RETURN_IF_ERROR(m_channel.AddMessageListener(this));
+		return OpStatus::OK;
+	}
+
+	OP_STATUS Responder::ProcessMessage(const OpTypedMessage* message)
+	{
+		if (message->GetType() == OpTextMessage::Type)
+		{
+			OpTextMessage* m = OpTextMessage::Cast(message);
+
+			if (m->GetText() == UNI_L("echo"))
+				return m->Reply(OpTextMessage::Create(m->GetText()));
+
+			if (m->GetText() == UNI_L("ignore"))
+				return OpStatus::OK;
+
+			if (m->GetText() == UNI_L("text followed by number"))
+			{
+				RETURN_IF_ERROR(m->Reply(OpTextMessage::Create(m->GetText())));
+				return m->Reply(OpNumberMessage::Create(29));
+			}
+
+			if (m->GetText() == UNI_L("nest"))
+			{
+				/* Create 10 msec delayed message, guaranteed to be delivered after the 1s timeout
+				 * set in test("Nested timeout"). */
+				OpTextMessage* message = OpTextMessage::Create(OpMessageAddress(), OpMessageAddress(), 10);
+				RETURN_OOM_IF_NULL(message);
+				RETURN_IF_ERROR(message->SetText(UNI_L("echo")));
+
+				SetNestedSyncActivated(true);
+
+				/* Send message with no timeout. */
+				OpSyncMessenger sync(g_component->CreateChannel(GetAddress()));
+				OP_STATUS s = sync.SendMessage(message);
+				switch(s)
+				{
+					case OpStatus::ERR_YIELD:
+						/* Correct behavior. Inner timeout forced by outer timeout. */
+						return OpStatus::OK;
+
+					case OpStatus::OK:
+						/* Forced timeout failed. This is a serious error. */
+						return OpStatus::ERR_OUT_OF_RANGE;
+
+					default:
+						/* Transmit failed or we experienced OOM. */
+						return s;
+				}
+			}
+		}
+
+		return OpStatus::ERR;
+	};
+}
+
+test("Channel creation")
+{
+	verify_success(g_responder.Construct());
+}
+
+test("Convenience path, channel OOM")
+{
+	OpSyncMessenger sync(NULL);
+	verify_status(OpStatus::ERR_NO_MEMORY, sync.SendMessage(OpNumberMessage::Create(0)));
+}
+
+test("Convenience path, message OOM")
+require success "Channel creation";
+{
+	OpSyncMessenger sync(g_component->CreateChannel(g_responder.GetAddress()));
+	verify_status(OpStatus::ERR_NO_MEMORY, sync.SendMessage(NULL));
+}
+
+test("Message exchange")
+require success "Channel creation";
+{
+	OpTextMessage* message = OpTextMessage::Create();
+	verify_not_oom(message);
+	verify_success(message->SetText(UNI_L("echo")));
+
+	OpSyncMessenger sync(g_component->CreateChannel(g_responder.GetAddress()));
+	verify_success(sync.SendMessage(message));
+
+	verify(OpTextMessage::Cast(sync.GetResponse())->GetText() == UNI_L("echo"));
+}
+
+test("Response type restriction")
+require success "Channel creation";
+{
+	OpTextMessage* message = OpTextMessage::Create();
+	verify_not_oom(message);
+	verify_success(message->SetText(UNI_L("text followed by number")));
+
+	OpSyncMessenger sync(g_component->CreateChannel(g_responder.GetAddress()));
+	sync.AcceptResponse(OpNumberMessage::Type);
+	verify_success(sync.SendMessage(message));
+
+	verify(sync.GetResponse()->GetType() == OpNumberMessage::Type);
+	verify(OpNumberMessage::Cast(sync.GetResponse())->GetNumber() == 29);
+
+}
+
+test("Response type restriction and extension")
+require success "Channel creation";
+{
+	OpTextMessage* message = OpTextMessage::Create();
+	verify_not_oom(message);
+	verify_success(message->SetText(UNI_L("text followed by number")));
+
+	OpSyncMessenger sync(g_component->CreateChannel(g_responder.GetAddress()));
+	sync.AcceptResponse(OpNumberMessage::Type);
+	sync.AcceptResponse(OpTextMessage::Type);
+	verify_success(sync.SendMessage(message));
+
+	verify(sync.GetResponse()->GetType() == OpTextMessage::Type);
+}
+
+test("Basic timeout")
+require success "Channel creation";
+{
+	OpTextMessage* message = OpTextMessage::Create();
+	verify_not_oom(message);
+	verify_success(message->SetText(UNI_L("ignore")));
+
+	OpSyncMessenger sync(g_component->CreateChannel(g_responder.GetAddress()));
+	verify_status(OpStatus::ERR_YIELD, sync.SendMessage(message, true, 1));
+}
+
+/*
+ * The purpose of this test is to verify that if two OpSyncMessengers::SendMessage() exist on the
+ * call stack and a timeout occurs in the OpSyncMessenger associated with the outer stack frame,
+ * then the OpSyncMessenger associated with the inner stack frame receives an immediate timeout,
+ * regardless of its time status.
+ */
+ test("Nested timeout")
+require success "Channel creation";
+{
+	OpTextMessage* message = OpTextMessage::Create();
+	verify_not_oom(message);
+	verify_success(message->SetText(UNI_L("nest")));
+
+	OpSyncMessenger sync(g_component->CreateChannel(g_responder.GetAddress()));
+	g_responder.SetNestedSyncActivated(false);
+	verify_status(OpStatus::ERR_YIELD, sync.SendMessage(message, true, 1));
+	verify(g_responder.GetNestedSyncActivated());
+}

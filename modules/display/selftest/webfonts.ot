@@ -1,0 +1,161 @@
+/* -*- Mode: c++; tab-width: 4; indent-tabs-mode: t; c-basic-offset: 4 -*- */
+
+group "display.webfonts";
+
+include "modules/display/styl_man.h";
+include "modules/display/webfont_manager.h";
+include "modules/display/sfnt_base.h";
+
+global
+{
+	OP_STATUS CreateFontInfo(const uni_char* family_name, OpFontInfo*& font_info, int& font_number)
+	{
+        // create fontinfo
+		OpFontInfo* fi = OP_NEW(OpFontInfo, ());
+		if (!fi)
+			return OpStatus::ERR_NO_MEMORY;
+
+        RETURN_IF_ERROR(fi->SetFace(family_name));
+
+        // create font number
+		int fn;
+		RETURN_IF_ERROR(styleManager->CreateFontNumber(family_name, fn));
+        OP_ASSERT(fn >= 0 && fn <= SHRT_MAX);
+        fi->SetFontNumber(fn);
+
+		font_info = fi;
+		font_number = fn;
+		return OpStatus::OK;
+	}
+
+	OP_STATUS WriteToURL(URL& url, const uni_char* path)
+	{
+		// load/map font file to memory
+		FontHandle fh;
+		RETURN_IF_ERROR(fh.LoadFile(path));
+
+		// write data
+		url = g_url_api->GetURL(path);
+		const char* content_type = "text/plain";
+		return url.WriteDocumentImage(content_type, reinterpret_cast<const char*>(fh.Data()), fh.Size());
+	}
+}
+
+
+table WebFonts filelist "fonts" name "MetaSerifScWeb-Book.ttf" or "MetaSerifScWeb-Book.woff";
+foreach (font8) from WebFonts
+{
+	test("WebFontManager::AddCSSWebFont - $(font8)") leakcheck;
+	{
+		int font_number = -1;
+		FramesDocument* frm_doc = state.doc;
+		HTML_Element* font_elm = NULL;
+		OpFontInfo* font_info = NULL;
+		OpFont* opfont = NULL;
+		URL url;
+		BOOL remove_webfont = FALSE;
+
+		const uni_char* family_name = UNI_L("__TestFace__");
+		const UINT8 font_weight = 4;
+		const OpFontInfo::FontType font_type = OpFontInfo::PLATFORM_WEBFONT;
+
+		OpString font;
+		verify(OpStatus::IsSuccess(font.Set(font8)));
+
+		// create font info and font number
+		verify_success(CreateFontInfo(family_name, font_info, font_number));
+		font_info->SetNormal(TRUE);
+		font_info->SetWeight(font_weight, 1);
+		font_info->SetFontType(font_type);
+
+		// write font data to url
+		verify_success(WriteToURL(url, font));
+
+		// check that adding a webfont to the webfont manager works as expected
+		verify_success(g_webfont_manager->AddCSSWebFont(url, frm_doc, font_elm, font_info));
+		remove_webfont = TRUE;
+
+		// check sanity of added font
+		verify(g_webfont_manager->HasFont(font_number));
+		verify(!g_webfont_manager->IsBeingDeleted(font_number, frm_doc));
+		opfont = g_webfont_manager->CreateFont(family_name, 12, font_weight, FALSE, FALSE, 0, frm_doc);
+		verify(opfont);
+		verify(opfont->Type() == font_type);
+		verify(opfont->StringWidth(UNI_L("biteme"), 6) > 0);
+
+		// removing the webfont should release font_number and delete font_info
+		verify(styleManager->GetFontInfo(font_number));
+		g_webfont_manager->RemoveCSSWebFont(frm_doc, font_elm, url);
+		remove_webfont = FALSE;
+		font_info = NULL;
+		verify(!styleManager->GetFontInfo(font_number));
+		font_number = -1;
+	}
+	finally
+	{
+		OP_DELETE(opfont);
+		if (remove_webfont)
+			g_webfont_manager->RemoveCSSWebFont(frm_doc, font_elm, url);
+		else
+			OP_DELETE(font_info);
+		if (font_number >= 0)
+			styleManager->ReleaseFontNumber(font_number);
+	}
+}
+
+
+test("WebFontManager::AddLocalFont") leakcheck;
+{
+	int font_number = -1;
+	FramesDocument* frm_doc = state.doc;
+	HTML_Element* font_elm = NULL;
+	OpFontInfo* font_info = NULL;
+	OpFont* opfont = NULL;
+	URL url;
+	OpFontManager::OpWebFontRef font_ref = 0;
+	BOOL remove_webfont = FALSE;
+
+	const uni_char* family_name = styleManager->GetFontFace(0);
+	const UINT8 font_weight = 4;
+	const OpFontInfo::FontType font_type = OpFontInfo::PLATFORM_LOCAL_WEBFONT;
+
+	// create font info and font number
+	verify(OpStatus::IsSuccess(CreateFontInfo(family_name, font_info, font_number)));
+	font_info->SetNormal(TRUE);
+	font_info->SetWeight(font_weight, 1);
+	font_info->SetFontType(font_type);
+
+	// check that adding a local webfont to the webfont manager works as expected
+	verify(OpStatus::IsSuccess(styleManager->GetFontManager()->GetLocalFont(font_ref, family_name)));
+	verify(OpStatus::IsSuccess(g_webfont_manager->AddLocalFont(frm_doc, font_info, font_ref)));
+	font_ref = 0;
+	remove_webfont = TRUE;
+
+	// check sanity of added font
+	verify(g_webfont_manager->HasFont(font_number));
+	verify(!g_webfont_manager->IsBeingDeleted(font_number, frm_doc));
+	opfont = g_webfont_manager->CreateFont(family_name, 12, font_weight, FALSE, FALSE, 0, frm_doc);
+	verify(opfont);
+	verify(opfont->Type() == font_type);
+	verify(opfont->StringWidth(UNI_L("biteme"), 6) > 0);
+
+	// removing the webfont should release font_number and delete font_info
+	verify(styleManager->GetFontInfo(font_number));
+	g_webfont_manager->RemoveCSSWebFont(frm_doc, font_elm, url);
+	remove_webfont = FALSE;
+	font_info = NULL;
+	verify(!styleManager->GetFontInfo(font_number));
+	font_number = -1;
+}
+finally
+{
+	OP_DELETE(opfont);
+	if (remove_webfont)
+		g_webfont_manager->RemoveCSSWebFont(frm_doc, font_elm, url);
+	if (font_ref)
+		styleManager->GetFontManager()->RemoveWebFont(font_ref);
+	if (!remove_webfont)
+		OP_DELETE(font_info);
+	if (font_number >= 0)
+		styleManager->ReleaseFontNumber(font_number);
+}

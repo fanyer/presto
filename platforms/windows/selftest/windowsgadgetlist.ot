@@ -1,0 +1,235 @@
+/* -*- Mode: c++; tab-width: 4; indent-tabs-mode: t; c-basic-offset: 4 -*-
+ *
+ * Copyright (C) 1995-2010 Opera Software AS.  All rights reserved.
+ *
+ * This file is part of the Opera web browser.	It may not be distributed
+ * under any circumstances.
+ *
+ * @author Wojciech Dzierzanowski (wdzierzanowski)
+ */
+
+group "windows.gadgetlist";
+
+require init;
+require MSWIN;
+require WIDGET_RUNTIME_SUPPORT;
+
+include "platforms/windows/WindowsGadgetList.h";
+include "platforms/windows/windows_ui/Registry.h";
+
+
+global
+{
+	const uni_char* TEST_KEY_NAME =
+			UNI_L("Software\\Opera Software\\selftest-windows.gadgetlist");
+
+	struct AppInfo
+	{
+		BOOL m_widget;
+		OpStringC m_declared_name;
+		OpStringC m_display_name;
+		OpStringC m_normalized_name;
+		OpStringC m_profile_name;
+		OpStringC m_dest_dir_path;
+	};
+
+	const AppInfo APP_INFOS[] = {
+		{TRUE, UNI_L("Widget 0 Declared Name"),
+				UNI_L("*Widget 0*"),
+				UNI_L("Widget 0"),
+				UNI_L("Widget 0 Profile Name"),
+				UNI_L("widget0")},
+		{FALSE, NULL,
+				UNI_L("App 0 Display Name"),
+				UNI_L("App 0"),
+				NULL,
+				UNI_L("app0")},
+		{TRUE, UNI_L("Widget 1 Declared Name"),
+				UNI_L("*Widget 1*"),
+				UNI_L("Widget 1"),
+				UNI_L("Widget 1 Profile Name"),
+				UNI_L("widget1")},
+		{FALSE, UNI_L("Widget 2 Declared Name"),
+				UNI_L("*Widget 2*"),
+				UNI_L("Widget 2"),
+				UNI_L("Widget 2 Profile Name"),
+				UNI_L("widget2")},
+		{FALSE, NULL,
+				UNI_L("App 1 Display Name"),
+				UNI_L("App 1"),
+				NULL,
+				UNI_L("app1")}
+	};
+
+	// Determine if the GadgetInstallerContext corresponds to a given AppInfo.
+	BOOL CheckContext(const GadgetInstallerContext& context,
+			const AppInfo& app_info, const OpStringC& path_prefix)
+	{
+		OpString app_path;
+		RETURN_VALUE_IF_ERROR(app_path.SetConcat(
+					path_prefix, app_info.m_dest_dir_path), FALSE);
+
+		return context.GetDeclaredName() == app_info.m_declared_name
+				&& context.m_display_name == app_info.m_display_name
+				&& context.m_normalized_name == app_info.m_normalized_name
+				&& context.m_profile_name == app_info.m_profile_name
+				&& context.m_dest_dir_path == app_path;
+	}
+
+	OP_STATUS Install(size_t i)
+	{
+		OpString app_key_name;
+		RETURN_IF_ERROR(app_key_name.SetConcat(TEST_KEY_NAME,
+					UNI_L("\\"), APP_INFOS[i].m_normalized_name));
+		if (!RegCreateKeyWithValue(HKEY_CURRENT_USER, app_key_name, UNI_L(""))
+				|| !OpRegWriteStrValue(HKEY_CURRENT_USER, app_key_name,
+						UNI_L("DisplayName"), APP_INFOS[i].m_display_name)
+				|| !OpRegWriteStrValue(HKEY_CURRENT_USER, app_key_name,
+						UNI_L("InstallLocation"),
+						APP_INFOS[i].m_dest_dir_path)
+				|| !(!APP_INFOS[i].m_widget	|| OpRegWriteDWORDValue(
+						HKEY_CURRENT_USER, app_key_name,
+						WindowsGadgetList::GetRegKeyMarkerValueName(), 1)))
+		{
+			return OpStatus::ERR;
+		}
+
+		return OpStatus::OK;
+	}
+
+	OP_STATUS Uninstall(size_t i)
+	{
+		OpString app_key_name;
+		RETURN_IF_ERROR(app_key_name.SetConcat(TEST_KEY_NAME,
+					UNI_L("\\"), APP_INFOS[i].m_normalized_name));
+		return ERROR_SUCCESS == RegDeleteKeyNT(HKEY_CURRENT_USER, app_key_name)
+				? OpStatus::OK : OpStatus::ERR;
+	}
+
+	WindowsGadgetList gadget_list;
+	time_t ref_time;
+}
+
+setup
+{
+	size_t i = 0;
+	if (RegCreateKeyWithValue(HKEY_CURRENT_USER, TEST_KEY_NAME, UNI_L("")))
+	{
+		for (i = 0; i < ARRAY_SIZE(APP_INFOS); ++i)
+		{
+			if (OpStatus::IsError(Install(i)))
+			{
+				break;
+			}
+		}
+	}
+	OP_ASSERT(ARRAY_SIZE(APP_INFOS) == i || !"Test set-up failed.");
+
+	ref_time = time(NULL);
+	OP_ASSERT(-1 != ref_time);
+}
+
+exit
+{
+	const BOOL ok =
+			ERROR_SUCCESS == RegDeleteKeyNT(HKEY_CURRENT_USER, TEST_KEY_NAME);
+	OP_ASSERT(ok || !"Test tear-down failed.");
+}
+
+
+test("Read gadget list")
+		file uni TEST_GADGET_PATH_PREFIX "data\\\\widgets\\\\";
+{
+	verify_success(gadget_list.Init(TEST_KEY_NAME, TEST_GADGET_PATH_PREFIX));
+
+	OpAutoVector<GadgetInstallerContext> gadgets;
+	verify_success(gadget_list.Read(gadgets));
+
+	size_t match_count = 0;
+	size_t exp_gadget_count = 0;
+	for (size_t i = 0; i < ARRAY_SIZE(APP_INFOS); ++i)
+	{
+		if (APP_INFOS[i].m_widget)
+		{
+			++exp_gadget_count;
+			for (size_t j = 0; j < gadgets.GetCount(); ++j)
+			{
+				if (CheckContext(*gadgets.Get(j), APP_INFOS[i],
+						TEST_GADGET_PATH_PREFIX))
+				{
+					OpString8 name;
+					name.Set(APP_INFOS[i].m_normalized_name);
+					printf("Matched gadget %s.\n", name.CStr());
+
+					++match_count;
+					break;
+				}
+			}
+		}
+	}
+
+	printf("Expected %d gadgets, listed: %d.\n",
+			exp_gadget_count, gadgets.GetCount());
+
+	verify(gadgets.GetCount() == exp_gadget_count);
+	verify(match_count == exp_gadget_count);
+}
+
+
+subtest VerifyListChanged(time_t ref_time)
+{
+	time_t mod_time = -1;
+	verify_success(gadget_list.GetModificationTime(mod_time));
+	verify(mod_time != -1);
+	verify(difftime(mod_time, ref_time) > 0);
+}
+
+subtest VerifyListUnchanged(time_t ref_time)
+{
+	time_t mod_time = -1;
+	verify_success(gadget_list.GetModificationTime(mod_time));
+	verify(mod_time != -1);
+	verify(difftime(mod_time, ref_time) <= 0);
+}
+
+
+table ListOperations(int, char*)
+{
+	{0, "noop"}
+	{-1, "Uninstall 0"}
+	{-3, "Uninstall 2"}
+	{0, "noop"}
+	{2, "Install 2"}
+	{0, "Install 0"}
+}
+
+foreach (oper, descr) from ListOperations
+{
+	test("Get gadget list modification time: after " descr) delay pre 1;
+	{
+		verify_success(gadget_list.Init(TEST_KEY_NAME));
+
+		OP_STATUS oper_result = OpStatus::OK;
+		if (oper > 0)
+		{
+			oper_result = Install(static_cast<size_t>(oper));
+		}
+		else if (oper < 0)
+		{
+			oper_result = Uninstall(static_cast<size_t>(-(oper + 1)));
+		}
+		OP_ASSERT(OpStatus::IsSuccess(oper_result));
+
+		if (oper != 0)
+		{
+			VerifyListChanged(ref_time);
+		}
+		else
+		{
+			VerifyListUnchanged(ref_time);
+		}
+
+		ref_time = time(NULL);
+		OP_ASSERT(-1 != ref_time);
+	}
+}

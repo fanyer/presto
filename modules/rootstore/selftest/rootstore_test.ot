@@ -1,0 +1,164 @@
+group "rootstore";
+require _SSL_SUPPORT_;
+require _NATIVE_SSL_SUPPORT_;
+require undefined _EXTERNAL_SSL_SUPPORT_;
+
+language c++;
+
+include "modules/libssl/sslv3.h";
+include "modules/libssl/sslopt.h";
+include "modules/url/tools/arrays.h";
+include "modules/rootstore/rootstore_api.h";
+include "modules/rootstore/selftest/rootstore_table_wrapper.h";
+include "modules/network_selftest/ssl_waitupdate.h";
+
+global {
+#ifdef LIBSSL_AUTO_UPDATE
+	SSL_WaitForPendingAutoUpdate update_waiter;
+#endif
+}
+
+subtest CheckItemPresent(SSL_Options *optionsManager, const DEFCERT_st *defcertitem)
+{
+	int i =0;
+	int match_count = 0;
+	SSL_CertificateItem *item=NULL;
+	
+	verify(optionsManager != NULL);
+	verify(defcertitem != NULL);
+	verify(defcertitem->dercert_data != NULL);
+	verify(defcertitem->dercert_len != 0);
+	
+	do{
+		item =	optionsManager->Find_Certificate(SSL_CA_Store, i++);
+		if(item && item->certificate.GetDirect() != NULL)
+		{
+			if(item->certificate.GetLength() == defcertitem->dercert_len && 
+				op_memcmp(item->certificate.GetDirect(), defcertitem->dercert_data, defcertitem->dercert_len ) == 0)
+			{
+				match_count++;
+				if(defcertitem->nickname)
+				  verify(item->cert_title.Compare(defcertitem->nickname) == 0);
+				verify(item->PreShipped);
+				verify((!item->WarnIfUsed && !defcertitem->def_warn) || (item->WarnIfUsed && defcertitem->def_warn));
+				verify((!item->DenyIfUsed && !defcertitem->def_deny) || (item->DenyIfUsed && defcertitem->def_deny));
+			}
+		}
+	}
+	while(item != NULL);
+	
+	i=0;
+	do{
+		item =	optionsManager->Find_Certificate(SSL_IntermediateCAStore, i++);
+		if(item && item->certificate.GetDirect() != NULL)
+		{
+			if(item->certificate.GetLength() == defcertitem->dercert_len && 
+				op_memcmp(item->certificate.GetDirect(), defcertitem->dercert_data, defcertitem->dercert_len ) == 0)
+			{
+				match_count++;
+				if(defcertitem->nickname)
+				  verify(item->cert_title.Compare(defcertitem->nickname) == 0);
+				verify(item->PreShipped);
+				verify((!item->WarnIfUsed && !defcertitem->def_warn) || (item->WarnIfUsed && defcertitem->def_warn));
+				verify((!item->DenyIfUsed && !defcertitem->def_deny) || (item->DenyIfUsed && defcertitem->def_deny));
+			}
+		}
+	}
+	while(item != NULL);
+	verify(match_count == 1);
+}
+
+test("Verify rootstore") leakcheck;
+{
+	LOCAL_DECLARE_CONST_ARRAY(DEFCERT_st, selftest_defcerts);
+    const DEFCERT_st *defcertitem;
+    const DEFCERT_st *defcertitem2;
+
+	TRAPD(op_err, LOCAL_CONST_ARRAY_INIT_L(selftest_defcerts));
+	
+	verify(OpStatus::IsSuccess(op_err));
+
+    for(defcertitem = selftest_defcerts; defcertitem->dercert_data != NULL; defcertitem++)
+    {
+		for(defcertitem2 = selftest_defcerts; defcertitem2->dercert_data != NULL; defcertitem2++)
+		{
+			if(defcertitem != defcertitem2)
+			{
+				if(defcertitem->dercert_len == defcertitem2->dercert_len &&
+						op_memcmp(defcertitem->dercert_data, defcertitem2->dercert_data, defcertitem->dercert_len) == 0)
+				{
+					verify(FALSE);
+				}
+			}
+		}
+    }
+    
+    verify(TRUE);
+}
+
+test("Initialize rootstore") leakcheck;
+{
+	LOCAL_DECLARE_CONST_ARRAY(DEFCERT_st, selftest_defcerts);
+    const DEFCERT_st *defcertitem;
+    SSL_Options * OP_MEMORY_VAR optionsManager=NULL;
+    size_t items = 0;
+
+	TRAPD(op_err, LOCAL_CONST_ARRAY_INIT_L(selftest_defcerts));
+	
+	verify(OpStatus::IsSuccess(op_err));
+
+	optionsManager = g_ssl_api->CreateSecurityManager(FALSE, OPFILE_ABSOLUTE_FOLDER);
+	verify(optionsManager != NULL);
+	optionsManager->Init(SSL_LOAD_CA_STORE | SSL_LOAD_INTERMEDIATE_CA_STORE);
+	
+	verify(OpStatus::IsSuccess(g_root_store_api->InitAuthorityCerts(optionsManager, 0)));
+	
+    for(defcertitem = selftest_defcerts; defcertitem->dercert_data != NULL; defcertitem++)
+    {
+		verify(CheckItemPresent(optionsManager, defcertitem));
+		items ++;
+    }
+	
+	verify(items == optionsManager->GetNumberTrustedCAs() + optionsManager->GetNumberIntermediateCAs());
+}
+finally
+{
+	OP_DELETE(optionsManager);
+}
+
+test("Multiple Initialize rootstore") leakcheck;
+{
+	LOCAL_DECLARE_CONST_ARRAY(DEFCERT_st, selftest_defcerts);
+    const DEFCERT_st *defcertitem;
+    SSL_Options * OP_MEMORY_VAR optionsManager=NULL;
+    size_t items = 0;
+
+	TRAPD(op_err, LOCAL_CONST_ARRAY_INIT_L(selftest_defcerts));
+	
+	verify(OpStatus::IsSuccess(op_err));
+
+	optionsManager = g_ssl_api->CreateSecurityManager(FALSE, OPFILE_ABSOLUTE_FOLDER);
+	verify(optionsManager != NULL);
+	optionsManager->Init(SSL_LOAD_CA_STORE | SSL_LOAD_INTERMEDIATE_CA_STORE);
+	
+	verify(OpStatus::IsSuccess(g_root_store_api->InitAuthorityCerts(optionsManager, 0)));
+	verify(OpStatus::IsSuccess(g_root_store_api->InitAuthorityCerts(optionsManager, 0)));
+	
+    for(defcertitem = selftest_defcerts; defcertitem->dercert_data != NULL; defcertitem++)
+    {
+		verify(CheckItemPresent(optionsManager, defcertitem));
+		items ++;
+    }
+	
+	verify(items == optionsManager->GetNumberTrustedCAs() + optionsManager->GetNumberIntermediateCAs());
+}
+finally
+{
+	OP_DELETE(optionsManager);
+}
+
+test("Flush auto updates") async;
+   require defined LIBSSL_AUTO_UPDATE;
+{
+	update_waiter.Activate();
+}

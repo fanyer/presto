@@ -1,0 +1,893 @@
+/* -*- Mode: c++; tab-width: 4; indent-tabs-mode: t; c-basic-offset: 4 -*-
+**
+** Copyright (C) 2004-2011 Opera Software ASA.  All rights reserved.
+**
+** This file is part of the Opera web browser.  It may not be distributed
+** under any circumstances.
+**
+** Yngve N. Pettersen
+*/
+group "cache size and save";
+require init;
+require CACHE_FAST_INDEX;
+include "modules/cache/cache_int.h";
+include "modules/cache/simple_stream.h";
+include "modules/cache/cache_common.h";
+
+include "modules/url/url_man.h";
+include "modules/url/url_rep.h";
+include "modules/url/url_ds.h";
+include "modules/prefs/prefsmanager/collections/pc_network.h";
+
+include "modules/network_selftest/justload.h";
+include "modules/network_selftest/scanpass.h";
+include "modules/cache/cache_st_helpers.h";
+include "modules/cache/cache_selftest.h";
+include "modules/prefs/prefsmanager/collections/pc_network.h";
+
+global {
+	URL checkURL;
+	URL_DocSelfTest_Manager *url_tests = NULL;
+	
+	#if CACHE_CONTAINERS_ENTRIES>0
+		#define _TEST_CACHE_CONTAINERS
+	#endif
+	
+	//int OOM_TEST_ALLOCATIONS = 100240;
+	//int OOM_TEST_SIZE = 1280*1024;
+	int OOM_TEST_ALLOCATIONS = 1024*10;
+	int OOM_TEST_SIZE = 4000;
+	
+	int CONTAINERS_DISK_THRESHOLD_SIZE = 512;
+	int CONTAINERS_TEST_SIZE = 4096;
+	int CONTAINERS_TEST_SIZE_ODD = 3103;
+	int CONTAINERS_TEST_FILES = 256;
+	int CONTAINERS_TEST_FILES_ODD = 337;
+	int PLAIN_TEST_SIZE = 32768;
+	int PLAIN_TEST_FILES = 64;
+	
+#ifdef DISK_CACHE_SUPPORT
+	class WaitURL: public MessageObject
+	{
+	private:
+		OpAutoVector<URL> urls;
+		OpString8 expected;
+		UINT32 loaded;
+		int num_urls;
+		int cur_id;
+		MessageHandler *mh;
+		URL empty_url;
+		URL_LoadPolicy policy;
+		int retries;
+		int old_count;
+		int old_global_count;
+		
+		URL CreateURL(UINT32 size)
+		{
+			OpString url_path;
+			
+			url_path.AppendFormat(UNI_L("http://testsuites.oslo.opera.com/core/networking/http/cache/data/cache.php?size=%d&type=text/javascript&id=001-%d"), size, cur_id++);
+			
+			return g_url_api->GetURL (url_path.CStr(), (URL_CONTEXT_ID)0);
+		}
+
+		URL CreateURL(UINT32 size, int id)
+		{
+			OpString url_path;
+			
+			url_path.AppendFormat(UNI_L("http://testsuites.oslo.opera.com/core/networking/http/cache/data/cache.php?size=%d&type=text/javascript&id=%d"), size, id);
+			
+			return g_url_api->GetURL (url_path.CStr(), (URL_CONTEXT_ID)0);
+		}
+
+	public:
+		WaitURL(MessageHandler *mh_obj) { loaded=0; num_urls=0; cur_id=0; mh=mh_obj; retries=10; old_count=-1; old_global_count=-1; }
+		
+		void Reset() { loaded=0; urls.DeleteAll(); retries=10; old_count=-1; old_global_count=-1; }
+		
+		OP_STATUS AddURL(UINT32 size, int num=1, BOOL load=TRUE)
+		{
+			for(int i=0; i<num; i++)
+			{
+				URL u=CreateURL(size);
+				RETURN_IF_ERROR(urls.Add(new URL(u)));
+				
+				if(load && OpStatus::IsError(urls.Get(urls.GetCount()-1)->LoadDocument(mh, empty_url, policy)))
+					ST_failed("Load Url %d failed!", urls.GetCount());
+			}
+			
+			return OpStatus::OK;
+		}
+
+		OP_STATUS AddURL(UINT32 size, int id, URL &u)
+		{
+			u=CreateURL(size, id);
+			RETURN_IF_ERROR(urls.Add(new URL(u)));
+			
+			if(OpStatus::IsError(urls.Get(urls.GetCount()-1)->LoadDocument(mh, empty_url, policy)))
+				ST_failed("Load Url %d failed!", urls.GetCount());
+			
+			return OpStatus::OK;
+		}
+
+
+		OP_STATUS LoadDocuments(UINT16 start=0, UINT16 end=65535)
+		{
+			for(UINT32 i=start; i<end && i<urls.GetCount(); i++)
+				RETURN_IF_ERROR(urls.Get(i)->LoadDocument(mh, empty_url, policy));
+				
+			return OpStatus::OK;
+		}
+		
+		OP_STATUS UpdateFiles(UINT16 start=0, UINT16 end=65535)
+		{
+			OP_MEMORY_VAR UINT32 i;
+			
+			for(i=start; i<end && i<urls.GetCount(); i++)
+			{
+				if(urls.Get(i)->GetRep() && urls.Get(i)->GetRep()->GetDataStorage())
+				{
+					urls.Get(i)->GetRep()->GetDataStorage()->MoveCacheToOld();
+						RETURN_IF_ERROR(urls.Get(i)->GetRep()->GetDataStorage()->CreateCache());
+				}
+			}
+			
+			return OpStatus::OK;
+		}
+		
+		OP_STATUS SetExpected(char *str) { return expected.Set(str); }
+		virtual void HandleCallback(OpMessage msg, MH_PARAM_1 par1, MH_PARAM_2 par2)
+		{
+			if(msg==MSG_URL_DATA_LOADED)
+			{
+				for(UINT32 i=0; i<urls.GetCount(); i++)
+				{
+					if((UINT32)urls.Get(i)->Id()==(UINT32)par1 && (UINT32)urls.Get(i)->Status(FALSE)==(UINT32)URL_LOADED)
+					{
+						loaded++;
+						if(urls.Get(i)->GetAttribute(URL::KHTTP_LastModified).IsEmpty())
+							urls.Get(i)->SetAttribute(URL::KHTTP_LastModified, "now...");  // Just to fool URL_DataStorage::Expired()
+						break;
+					}
+				}
+				
+				if(loaded>=urls.GetCount())
+					ST_passed();
+				
+				/*BOOL more;
+				OpString str16;
+				OpString8 str8;
+				URL_DataDescriptor *desc=url_load->GetDescriptor(NULL, URL::KFollowRedirect);
+				
+				desc->RetrieveData(more);
+				str16.Set((uni_char *)desc->GetBuffer(), desc->GetBufSize());
+				str8.Set(str16);
+				output("Page string: %s\n", str8.CStr());
+				
+				if(!str8.Compare(expected.CStr()))
+					ST_passed();
+				else
+					ST_failed("Page string wrong!");*/
+			}
+			else if(msg==MSG_URL_LOADING_FAILED)
+			{
+				ST_failed("Failure after %d correct loads.\n", loaded);
+			}
+			else if(msg==MSG_URLMAN_DELETE_SOMEFILES)
+			{
+				FileName_Store files_main(8191);
+		
+				files_main.Construct();
+				
+				Context_Manager::ReadDCacheDir(files_main, files_main, OPFILE_CACHE_FOLDER, TRUE, FALSE, NULL);
+
+				int global_count = (int)urlManager->GetNumFilesToDelete();
+				
+				if(old_count!=(int)files_main.LinkObjectCount() || global_count!=old_global_count)
+					retries=10;
+					
+				old_count=files_main.LinkObjectCount();
+				old_global_count = global_count;
+				
+				if((UINT32)files_main.LinkObjectCount()>0 && retries)
+				{
+					output("Deleting: still %d files in main dir - %d retries left - Total files to delete: %d\n", (UINT32)files_main.LinkObjectCount(), retries, global_count);
+					mh->PostDelayedMessage(MSG_URLMAN_DELETE_SOMEFILES, 0, 0, 1000);  // Wait to delete the files
+					retries--;
+				}
+				else
+				{
+					if((UINT32)files_main.LinkObjectCount()!=0)
+						ST_failed("Main directory contains %d files instead of 0!", files_main.LinkObjectCount());
+					else
+						ST_passed();
+				}
+			}
+		}
+	};
+#endif
+
+	void DeleteFileNames(FileName_Store *filenames)
+	{
+		#ifdef DISK_CACHE_SUPPORT
+			FileNameElement *elm;
+			
+			while((elm=(FileNameElement *)filenames->GetFirstLinkObject())!=NULL)
+			{
+				filenames->RemoveLinkObject(filenames->GetFirstLinkObject());
+				OP_DELETE(elm);
+			}
+		#endif
+	}
+	
+	URL empty_url;
+	URL_LoadPolicy policy;
+	#ifdef DISK_CACHE_SUPPORT
+		WaitURL *wait;
+		MessageHandler *mh;
+	#endif
+	int oldsize;
+	int pref_never_expire;
+	
+#ifdef DISK_CACHE_SUPPORT
+	MultiContext mctx; // Only used to automactially set the cache preferences to meaningful values for these tests
+#endif
+}
+
+setup 
+{
+	CacheTester::BlockPeriodicFreeUnusedResources();
+	
+	url_tests = OP_NEW(URL_DocSelfTest_Manager, ());
+	oldsize = g_pcnet->GetIntegerPref(PrefsCollectionNetwork::DiskCacheSize);
+	
+	/// During these tests, we don't want URLs with queries to be reloaded from the network
+	pref_never_expire=g_pcnet->GetIntegerPref(PrefsCollectionNetwork::AlwaysCheckNeverExpireGetQueries);
+	g_pcnet->WriteIntegerL(PrefsCollectionNetwork::AlwaysCheckNeverExpireGetQueries, 0);
+
+	#ifdef DISK_CACHE_SUPPORT
+		mh=OP_NEW(MessageHandler, (NULL));
+		wait=OP_NEW(WaitURL, (mh));
+	
+		OpMessage messages[]={MSG_URL_DATA_LOADED, MSG_URL_LOADING_FAILED, MSG_URLMAN_DELETE_SOMEFILES};
+	
+		mh->SetCallBackList(wait, 0, messages, 3);
+	#endif
+}
+
+exit
+{
+	OP_DELETE(url_tests);
+	#ifdef DISK_CACHE_SUPPORT
+		mh->UnsetCallBacks(wait);
+		OP_DELETE(mh);
+		mh=NULL;
+		OP_DELETE(wait);
+		wait=NULL;
+	#endif
+	url_tests = NULL;
+	
+	OP_STATUS op_err;
+	TRAP(op_err, g_pcnet->WriteIntegerL(PrefsCollectionNetwork::DiskCacheSize, oldsize));
+	
+	// Do a shutdown of the pending connections
+	urlManager->FreeUnusedResources(TRUE);
+	
+	CacheTester::RestorePeriodicFreeUnusedResources();
+
+	g_pcnet->WriteIntegerL(PrefsCollectionNetwork::AlwaysCheckNeverExpireGetQueries, pref_never_expire);
+}
+
+test("Initialized")
+{
+	verify(url_tests != NULL);
+}
+
+subtest AddJustLoadTest(URL_DocSelfTest_Batch *batch, const OpStringC8 &url, URL &ref_url)
+{
+	verify(batch != NULL);
+	verify(url.HasContent());
+
+	OpAutoPtr<JustLoad_Tester> test(OP_NEW(JustLoad_Tester, ()));
+	verify(test.get() != NULL);
+
+	verify(OpStatus::IsSuccess(test->Construct(url, ref_url,FALSE)));
+
+	verify(batch->AddTestCase(test.release()));
+}
+
+subtest AddBatch(URL_DocSelfTest_Batch *batch)
+{
+	verify(batch != NULL);
+	verify(url_tests->AddBatch(batch));
+}
+
+subtest Setup_MultipleTests(const OpStringC8 &batch_id, const OpStringC8 &baseurl, URL &ref_url, int count)
+{
+	OpAutoPtr<URL_DocSelfTest_Batch> batch(NULL);
+
+	URL_DocSelfTest_Batch *stb=OP_NEW(URL_DocSelfTest_Batch, ());
+
+	if(stb)
+		stb->Construct(g_main_message_handler);
+
+	batch.reset(stb);
+	verify(batch.get() != NULL);
+
+	batch->SetBatchID(batch_id);
+	int i;
+
+	for(i=0; i<count; i++)
+	{
+		OpString8 test_url;
+
+		test_url.Empty();
+		test_url.AppendFormat("%s?test=%d", baseurl.CStr(), i);
+
+		verify(AddJustLoadTest(batch.get(), test_url, ref_url));
+	}
+
+	verify(!batch->Empty());
+	verify(AddBatch(batch.release()));
+}
+
+subtest StartTestSet()
+{
+	verify(url_tests->SetLastBatch());
+}
+
+test("Fill the cache")
+	require success "Initialized";
+	async;
+{
+	URL empty;
+
+	if (!Setup_MultipleTests("[Cache Fill]", URLSelftestBase("simple/rfc2616.txt"), empty, MAX(MIN((oldsize*120+460*100-1) /(460*100), 50),8)) ||
+		!StartTestSet())
+		ST_failed("Could not start test set");
+}
+
+test("Save the cache")
+	require success "Initialized";
+{
+	//urlManager->FreeUnusedResources(TRUE);
+
+	TRAPD(op_err, urlManager->AutoSaveFilesL());
+	verify(OpStatus::IsSuccess(op_err));
+}
+
+test("Change cachesize and back")
+	require success "Initialized";
+{
+	OP_MEMORY_VAR int new_size = (oldsize > 200 ? oldsize - 200 : 40);
+	TRAPD(op_err, g_pcnet->WriteIntegerL(PrefsCollectionNetwork::DiskCacheSize, new_size));
+	verify(OpStatus::IsSuccess(op_err));
+
+	URL empty;
+
+	verify(Setup_MultipleTests("[Cache Fill]", URLSelftestBase("simple/rfc2616.txt"), empty, MAX(MIN((oldsize*120+460*100-1) /(460*100), 50),8)));
+
+	verify(StartTestSet());
+
+	urlManager->FreeUnusedResources(TRUE);
+
+/*
+#ifdef DISK_CACHE_SUPPORT
+#ifndef SEARCH_ENGINE_CACHE
+	urlManager->CheckRamCacheSize();
+	urlManager->CheckDCacheSize();
+#endif
+#endif
+*/
+	
+	TRAP(op_err, g_pcnet->WriteIntegerL(PrefsCollectionNetwork::DiskCacheSize, oldsize));
+	verify(OpStatus::IsSuccess(op_err));
+
+	verify(TRUE);	
+}
+
+test("Save the cache again")
+	require success "Initialized";
+{
+	TRAPD(op_err, urlManager->AutoSaveFilesL());
+	verify(OpStatus::IsSuccess(op_err));
+}
+
+subtest Setup_CacheList(const OpStringC8 &batch_id)
+{
+	OpAutoPtr<URL_DocSelfTest_Batch> batch(NULL);
+
+	batch.reset(OP_NEW(URL_DocSelfTest_Batch, ()));
+	verify(batch.get() != NULL);
+
+	batch->SetBatchID(batch_id);
+
+	OpAutoPtr<UniScanPass_SimpleTester> test(OP_NEW(UniScanPass_SimpleTester, ()));
+	verify(test.get() != NULL);
+
+	URL ref_url;
+	verify(OpStatus::IsSuccess(test->Construct("opera:cache", ref_url,UNI_L("</html>"), FALSE)));
+
+	verify(batch->AddTestCase(test.release()));
+
+	verify(!batch->Empty());
+	verify(AddBatch(batch.release()));
+}
+
+test ("Cache list generator")
+	require success "Initialized";
+	async;
+{
+	if (!Setup_CacheList("[Cache List]") ||
+		!StartTestSet())
+		ST_failed("Could not start test set");
+}
+
+test("Fill context to fool Empty DCache") require DISK_CACHE_SUPPORT;
+{
+	// Fill a context to try to fool EmptyDCache() waiting mechanism (Next tests should not timeout)
+	URL_CONTEXT_ID ctx_test=urlManager->GetNewContextID();
+	OpFileFolder test_folder;
+
+	g_folder_manager->AddFolder(OPFILE_CACHE_FOLDER, UNI_L("size_empty_test"),&test_folder);
+
+	urlManager->AddContextL(ctx_test, test_folder, test_folder, test_folder, test_folder, FALSE);
+
+	CacheHelpers::CacheBogusURLs(ctx_test, PLAIN_TEST_SIZE, PLAIN_TEST_SIZE, CACHE_NUM_FILES_PER_DELETELIST_PASS*13, 0);
+	// Put some also in the main context
+	CacheHelpers::CacheBogusURLs(0, PLAIN_TEST_SIZE, PLAIN_TEST_SIZE, CACHE_NUM_FILES_PER_DELETELIST_PASS*2, 0);
+}
+
+
+test("Empty DCache before 32KB disk size test") async; require DISK_CACHE_SUPPORT;
+{
+	urlManager->EmptyDCache();
+	mh->PostDelayedMessage(MSG_URLMAN_DELETE_SOMEFILES, 0, 0, 1000);  // Wait to delete the files
+}
+
+test("Load 2 MB in a 1 MB cache with 32 KB files")
+	require success "Initialized"; require DISK_CACHE_SUPPORT;
+{
+	OP_MEMORY_VAR int new_size = 1024;  // 1 MB cache
+	TRAPD(op_err, g_pcnet->WriteIntegerL(PrefsCollectionNetwork::DiskCacheSize, new_size));
+	
+	urlManager->EmptyDCache();
+	
+	CacheHelpers::CacheBogusURLs(0, PLAIN_TEST_SIZE, PLAIN_TEST_SIZE, PLAIN_TEST_FILES, 0);
+}
+
+test("Size check - 32 KB")require success "Initialized"; require DISK_CACHE_SUPPORT;
+{
+	// Save the files on disk
+	TRAPD(rc, urlManager->WriteCacheIndexesL(FALSE, FALSE));
+	
+	// Check the number of files (each file is of 32KB). The cache is supposed to be 2 MB==PLAIN_TEST_FILES files
+	FileName_Store filenames(8191);
+	
+	RETURN_IF_ERROR(filenames.Construct());
+	
+	Context_Manager::ReadDCacheDir(filenames, filenames, OPFILE_CACHE_FOLDER, TRUE, FALSE, NULL);
+	int num=filenames.LinkObjectCount();
+	int num_index=CacheHelpers::CheckIndex(OPFILE_CACHE_FOLDER);
+	
+	verify(num==PLAIN_TEST_FILES);
+	verify(num_index==PLAIN_TEST_FILES);  // All the files are real, no containers or embedded
+	
+	// Force the right size
+	TRAP(rc, urlManager->WriteCacheIndexesL(TRUE, TRUE));
+	
+	// Check the number of files. The cache is supposed to be 1 MB==32 files
+	DeleteFileNames(&filenames);
+		
+	Context_Manager::ReadDCacheDir(filenames, filenames, OPFILE_CACHE_FOLDER, TRUE, FALSE, NULL);
+	num=filenames.LinkObjectCount();
+		
+	verify(num==32);
+}
+
+test("Empty DCache before CheckDCacheSize")
+async;
+require DISK_CACHE_SUPPORT;
+require _DEBUG;
+require _TEST_CACHE_CONTAINERS;
+{
+	urlManager->EmptyDCache();
+	mh->PostDelayedMessage(MSG_URLMAN_DELETE_SOMEFILES, 0, 0, 1000);  // Wait to delete the files
+}
+
+test("Load 1 MB in a 0.5 MB cache with 4 KB files for CheckDCacheSize")
+require success "Initialized";
+require DISK_CACHE_SUPPORT;
+require _DEBUG;
+require _TEST_CACHE_CONTAINERS;
+timer;
+{
+	OP_MEMORY_VAR int new_size = CONTAINERS_DISK_THRESHOLD_SIZE-(CONTAINERS_TEST_SIZE_ODD/1024);  // A bit less than half a MB, it should force the deletion of an entire container
+	TRAPD(op_err, g_pcnet->WriteIntegerL(PrefsCollectionNetwork::DiskCacheSize, new_size));
+	
+	CacheHelpers::CacheBogusURLs(0, CONTAINERS_TEST_SIZE_ODD, CONTAINERS_TEST_SIZE_ODD, CONTAINERS_TEST_SIZE_ODD);
+}
+
+test("CheckDCacheSize test")
+require success "Initialized";
+require DISK_CACHE_SUPPORT;
+require _DEBUG;
+require _TEST_CACHE_CONTAINERS;
+{
+	TRAPD(rc, urlManager->WriteCacheIndexesL(FALSE, FALSE));
+	verify(urlManager->CheckInvariants());
+	//urlManager->CheckDCacheSize();
+	urlManager->FreeUnusedResources();
+	verify(urlManager->CheckInvariants());
+	TRAP(rc, urlManager->WriteCacheIndexesL(TRUE, TRUE));
+	verify(urlManager->CheckInvariants());
+	urlManager->FreeUnusedResources();
+	//urlManager->CheckDCacheSize();
+	verify(urlManager->CheckInvariants());
+}
+
+test("Empty DCache before 4KB disk size test")
+async;
+require DISK_CACHE_SUPPORT;
+require _TEST_CACHE_CONTAINERS;
+timer;
+{
+	urlManager->EmptyDCache();
+	mh->PostDelayedMessage(MSG_URLMAN_DELETE_SOMEFILES, 0, 0, 1000);  // Wait to delete the files
+}
+
+test("Load 1 MB in a 0.5 MB cache with 4 KB files for containers")
+require success "Initialized";
+require DISK_CACHE_SUPPORT;
+require _TEST_CACHE_CONTAINERS;
+timer;
+{
+	OP_MEMORY_VAR int new_size = CONTAINERS_DISK_THRESHOLD_SIZE-(CONTAINERS_TEST_SIZE/1024);  // A bit less than half a MB, it should force the deletion of an entire container
+	TRAPD(op_err, g_pcnet->WriteIntegerL(PrefsCollectionNetwork::DiskCacheSize, new_size));
+	
+	urlManager->EmptyDCache();
+	
+	CacheHelpers::CacheBogusURLs(0, CONTAINERS_TEST_SIZE, CONTAINERS_TEST_SIZE, CONTAINERS_TEST_FILES);
+}
+
+test("Size check - 4 KB for containers")
+require success "Initialized";
+require DISK_CACHE_SUPPORT;
+require _TEST_CACHE_CONTAINERS;
+{
+	// Save the files on disk
+	TRAPD(rc, urlManager->WriteCacheIndexesL(FALSE, FALSE));
+	
+	// Check the number of files (each file is of 4KB). The cache is supposed to be 1 MB==CONTAINERS_TEST_FILES files
+	FileName_Store filenames(8191);
+	
+	RETURN_IF_ERROR(filenames.Construct());
+	
+	Context_Manager::ReadDCacheDir(filenames, filenames, OPFILE_CACHE_FOLDER, TRUE, FALSE, NULL);
+	int num=filenames.LinkObjectCount();
+	int disk_size=CacheHelpers::ComputeDiskSize(&filenames);
+	int num_index=CacheHelpers::CheckIndex(OPFILE_CACHE_FOLDER);
+	
+	verify(num_index==CONTAINERS_TEST_FILES);
+	
+	// Containers use 3 bytes per entry, plus 2 bytes. For now I don't test the real number of entries
+	verify(disk_size>=1024*1024 && disk_size<=1024*1024+num*(2+3*CACHE_CONTAINERS_ENTRIES));
+	
+	// Force the right size
+	TRAP(rc, urlManager->WriteCacheIndexesL(TRUE, TRUE));
+	
+	// Check the number of files. The cache is supposed to be 0.5 MB==CONTAINERS_TEST_FILES/2 files
+	DeleteFileNames(&filenames);
+		
+	Context_Manager::ReadDCacheDir(filenames, filenames, OPFILE_CACHE_FOLDER, TRUE, FALSE, NULL);
+	num=filenames.LinkObjectCount();
+	disk_size=CacheHelpers::ComputeDiskSize(&filenames);
+	num_index=CacheHelpers::CheckIndex(OPFILE_CACHE_FOLDER);
+	
+	int max_cont_size=CACHE_CONTAINERS_CONTAINER_LIMIT;
+
+	if(CONTAINERS_TEST_SIZE*CACHE_CONTAINERS_ENTRIES<CACHE_CONTAINERS_CONTAINER_LIMIT)
+		max_cont_size=CONTAINERS_TEST_SIZE*CACHE_CONTAINERS_ENTRIES;
+		
+	int max_cont_files=max_cont_size/CONTAINERS_TEST_SIZE;
+	int expected_physical_files=CONTAINERS_TEST_FILES/2-max_cont_files;
+	int acceptable_files=num*max_cont_files;  // SubOptimal but acceptable number of files
+	int disk_desired_size=CONTAINERS_DISK_THRESHOLD_SIZE*1024-max_cont_size;
+		
+	// Containers use 3 bytes per entry, plus 2 bytes.
+	output("\nSize after cleaning: %d (%d KB - desired size: %d)- Files in index: %d vs %d vs %d- Files on disk: %d\nTest conatainers max size: %d - Max number of files in test containers: %d\n", disk_size, disk_size/1024, disk_desired_size/1024, num_index, acceptable_files, expected_physical_files, num, max_cont_size, max_cont_files);
+	
+	verify(acceptable_files<CONTAINERS_TEST_FILES/2);
+	verify(num_index==acceptable_files);
+	verify(disk_size==num*max_cont_size+num*(2+3*max_cont_files));
+	//verify(disk_size>=disk_desired_size && disk_size<=disk_desired_size+num*(2+3*max_cont_files));
+	//if((CONTAINERS_TEST_FILES/2/max_cont_files)*2*max_cont_files==CONTAINERS_TEST_FILES)
+	//	verify(disk_size==disk_desired_size+num*(2+3*max_cont_files));
+	//verify(num_index==expected_physical_files);
+	
+	verify(urlManager->CheckInvariants());
+}
+
+
+/*
+ * Test the different cache storage alternatives, make sure the content written to disk is
+ * correct when loaded again.
+ */
+table Table1(int, char*, int)
+{
+  { 150, "tiny", 66666 },
+  { CACHE_SMALL_FILES_SIZE + 64, "small", 66667 },
+  { CACHE_CONTAINERS_FILE_LIMIT + 64, "medium", 66668 },
+}
+
+test("Set cache quota to be large enough to hold our tests")
+{
+	OP_MEMORY_VAR int new_size = 1024 * 8;
+	TRAPD(op_err, g_pcnet->WriteIntegerL(PrefsCollectionNetwork::DiskCacheSize, new_size));
+}
+
+// for each of the context test cases do all the tests.
+foreach (dsize, desc, checkid) from Table1
+{
+	test("Empty DCache") async; require DISK_CACHE_SUPPORT;
+	{
+		urlManager->EmptyDCache();
+		mh->PostDelayedMessage(MSG_URLMAN_DELETE_SOMEFILES, 0, 0, 1000);  // Wait to delete the files
+	}
+
+	test("Load 100 " desc " urls") require success "Initialized"; require DISK_CACHE_SUPPORT;
+	{
+		urlManager->EmptyDCache();
+		
+		CacheHelpers::CacheBogusURLs(0, dsize, dsize, 100);
+	}
+
+	test("Verify index for " desc " urls")require success "Initialized";  require DISK_CACHE_SUPPORT;
+	{
+		// Save the files on disk
+		TRAPD(rc, urlManager->WriteCacheIndexesL(TRUE, TRUE));
+		
+		int num_index=CacheHelpers::CheckIndex(OPFILE_CACHE_FOLDER);
+		
+		verify(num_index==100);
+	}
+
+	test("Cache " desc " file")require success "Initialized";  async; require DISK_CACHE_SUPPORT;
+	{
+		wait->Reset();
+		wait->AddURL(dsize, checkid, checkURL);
+	}
+
+	test("Unload and reload " desc " file")require success "Initialized";  async; require DISK_CACHE_SUPPORT;
+	{
+		wait->Reset();
+		checkURL.Unload();
+		checkURL = URL();
+		wait->AddURL(dsize, checkid, checkURL);
+	}
+
+	test("Check content of " desc " file")require success "Initialized";  require DISK_CACHE_SUPPORT;
+	{
+		// Get the descriptor
+		OpStackAutoPtr<URL_DataDescriptor> dd(checkURL.GetDescriptor(NULL, FALSE, TRUE));
+		verify(dd.get() != NULL);
+
+		// Extract the text
+		TempBuffer buffer;
+		BOOL more;
+		do
+		{
+			more = FALSE;
+			TRAPD(opres, dd->RetrieveDataL(more));
+			verify(OpStatus::IsSuccess(opres));
+
+			// Save the actual text in a buffer
+			unsigned long bytesize = dd->GetBufSize();
+			verify(OpStatus::IsSuccess(buffer.Append(reinterpret_cast<const uni_char *>(dd->GetBuffer()), UNICODE_DOWNSIZE(bytesize))));
+			dd->ConsumeData(bytesize);
+		} while (more);
+
+		verify(OpStatus::IsSuccess(buffer.Append((uni_char)'\0')));
+
+		char *p = (char *)buffer.GetStorage();
+
+		char mimeType[31]; // ARRAY OK 2009-11-12 emoller
+		int size;
+		int result = op_sscanf(p, "This is a %30s file with %10d bytes..Call this file with for instance ?size=512&type=text/css to vary it.", mimeType, &size);
+		verify(result == 2);
+		verify(size == dsize);
+		verify(op_strcmp(mimeType, "text/javascript") == 0);
+		for (char *x = p + 138; x < p + dsize; ++x)
+			if (*x != 'x')
+			{
+				ST_failed("content of cached file invalid!");
+			}
+	}
+}
+/*
+ * End container storage alt tests.
+ */
+
+
+test("Empty DCache before containers update test") async; require DISK_CACHE_SUPPORT;
+{
+	urlManager->EmptyDCache();
+	mh->PostDelayedMessage(MSG_URLMAN_DELETE_SOMEFILES, 0, 0, 1000);  // Wait to delete the files
+}
+
+test("update tests - Load 2 files")
+	require success "Initialized"; async; require DISK_CACHE_SUPPORT;
+{
+	wait->Reset();
+	wait->AddURL(CONTAINERS_TEST_SIZE, 2); // Don't switch to CacheHelpers::CacheBogusURLs(), because wait->UpdateFiles() needs to be called
+}
+
+test("update tests - check")require success "Initialized"; require DISK_CACHE_SUPPORT;
+{
+	// Save the files on disk
+	TRAPD(rc, urlManager->WriteCacheIndexesL(FALSE, FALSE));
+	
+	// Check the number of files (each file is of 32KB). The cache is supposed to be 2 MB==PLAIN_TEST_FILES files
+	FileName_Store filenames(8191);
+	
+	RETURN_IF_ERROR(filenames.Construct());
+	
+	Context_Manager::ReadDCacheDir(filenames, filenames, OPFILE_CACHE_FOLDER, TRUE, FALSE, NULL);
+	int num=filenames.LinkObjectCount();
+	int num_index=CacheHelpers::CheckIndex(OPFILE_CACHE_FOLDER);
+	
+	#if CACHE_CONTAINERS_ENTRIES>0
+		verify(num==1);			// 1 container
+	#else
+		verify(num==2);			// 2 files
+	#endif
+	verify(num_index==2);	// 2 files
+	
+	// Update the files and destroy the old cache storage: the file need to stay on disk for now
+	wait->UpdateFiles();
+	
+	DeleteFileNames(&filenames);
+	Context_Manager::ReadDCacheDir(filenames, filenames, OPFILE_CACHE_FOLDER, TRUE, FALSE, NULL);
+	
+	num=filenames.LinkObjectCount();
+	#if CACHE_CONTAINERS_ENTRIES>0
+		verify(num==1);			// 1 container
+	#else
+		verify(num==0);			// 0 files
+	#endif
+	
+	// Save the files on disk, but alse remove the files marked as deleted
+	TRAP(rc, urlManager->WriteCacheIndexesL(FALSE, FALSE));
+	
+	DeleteFileNames(&filenames);
+	Context_Manager::ReadDCacheDir(filenames, filenames, OPFILE_CACHE_FOLDER, TRUE, FALSE, NULL);
+	
+	num=filenames.LinkObjectCount();
+	num_index=CacheHelpers::CheckIndex(OPFILE_CACHE_FOLDER);
+	
+	verify(num==0);			// No more containers now
+}
+
+test("Empty DCache before 20 MB test") async; require DISK_CACHE_SUPPORT;
+{
+	urlManager->EmptyDCache();
+	mh->PostDelayedMessage(MSG_URLMAN_DELETE_SOMEFILES, 0, 0, 1000);  // Wait to delete the files
+}
+
+test("Load 20 MB in a 10 MB cache with random files")
+	require success "Initialized";
+	require DISK_CACHE_SUPPORT;
+	timer;
+{
+	OP_MEMORY_VAR int new_size = 10240;  // 10 MB cache
+	TRAPD(op_err, g_pcnet->WriteIntegerL(PrefsCollectionNetwork::DiskCacheSize, new_size));
+	//int size=0;
+	int max_size=64536;
+	int min_size=4096;
+	
+	#if CACHE_CONTAINERS_ENTRIES>0
+		if(max_size<=CACHE_CONTAINERS_FILE_LIMIT)
+			ST_failed("max_size wrong");
+		#if CACHE_SMALL_FILES_SIZE>0
+			if(min_size<=CACHE_SMALL_FILES_SIZE)
+				ST_failed("min_size wrong: %d < %d", min_size, CACHE_SMALL_FILES_SIZE);
+		#endif
+	#endif
+	#if CACHE_SMALL_FILES_SIZE>0
+		if(min_size<=CACHE_SMALL_FILES_SIZE)
+			ST_failed("min_size wrong: %d < %d", min_size, CACHE_SMALL_FILES_SIZE);
+	#endif
+	
+	CacheHelpers::CacheBogusURLs(0, min_size, max_size, 0, 20*1024*1024);
+	
+	// Save the files on disk
+	verify_success(CacheTester::SaveFiles(0));
+	CacheTester::FlushContainers(0);
+	
+	// Check the number of files (each file is of 4KB). The cache is supposed to be 1 MB==CONTAINERS_TEST_FILES files
+	FileName_Store filenames(8191);
+	
+	RETURN_IF_ERROR(filenames.Construct());
+	
+	Context_Manager::ReadDCacheDir(filenames, filenames, OPFILE_CACHE_FOLDER, TRUE, FALSE, NULL);
+	int disk_size=CacheHelpers::ComputeDiskSize(&filenames);
+	
+	output("\nSize on disk before limit enforce: %d\n", disk_size/1024);
+	verify(disk_size>=20971520); // 20 MB
+}
+
+test("Size check - 10 MB limit")require success "Initialized";  require DISK_CACHE_SUPPORT;
+{
+	FileName_Store filenames(8191);
+	
+	RETURN_IF_ERROR(filenames.Construct());
+	
+	// Force the right size
+	TRAPD(rc, urlManager->WriteCacheIndexesL(TRUE, TRUE));
+	
+	// Check the number of files. The cache is supposed to be 0.5 MB==CONTAINERS_TEST_FILES/2 files
+	TRAP(rc, Context_Manager::ReadDCacheDir(filenames, filenames, OPFILE_CACHE_FOLDER, TRUE, FALSE, NULL));
+	int disk_size=CacheHelpers::ComputeDiskSize(&filenames);
+	int num=filenames.LinkObjectCount();
+	
+	output("\nSize on disk after limit enforce: %d\n", disk_size/1024);
+	
+	// Very permissive limit...
+	verify(disk_size<=10240*1024*1.05+num*(2+3*CACHE_CONTAINERS_ENTRIES));
+}
+
+test("Start Empty DCache before finishing") require DISK_CACHE_SUPPORT;
+{
+	urlManager->EmptyDCache();
+}
+
+// TODO: Check also for embedded files...
+
+/*test("step 1 - load FAIL") async;
+{
+	OpString str;
+	
+	str.Set("http://testsuites.oslo.opera.com/core/bts/interactive/CORE-16233/001-1.php");
+	
+	OpMessage messages[]={MSG_URL_DATA_LOADED, MSG_URL_LOADING_FAILED, MSG_URLMAN_DELETE_SOMEFILES};
+	
+	mh->SetCallBackList(wait, 0, messages, 3);
+	
+	wait->SetExpected("FAIL");
+	
+	url_load=g_url_api->GetURL(str.CStr(), (URL_CONTEXT_ID)0);
+	
+	if(OpStatus::IsError(url_load.LoadDocument(mh, empty_url, policy)))
+	  ST_failed("Load Url 1 failed!");
+}
+
+test("step 2 - OOM test")
+{
+	char *temp[OOM_TEST_ALLOCATIONS];
+	int i=0;
+	BOOL oom=FALSE;
+	
+	for(i=0; i<OOM_TEST_ALLOCATIONS; i++)
+	{
+	  temp[i]=OP_NEWA(char, OOM_TEST_SIZE);
+	  if(!temp[i])
+	  {
+		oom=TRUE;
+		break;
+	  }
+	}
+	
+	if(i==OOM_TEST_ALLOCATIONS)
+		i--;
+	  
+	for(; i>=0; i--)
+		OP_DELETEA(temp[i]);
+	
+	if(oom)
+		output("OOM detected");
+}
+
+test("Free urls")
+{
+	urlManager->FreeUnusedResources(TRUE);
+}*/

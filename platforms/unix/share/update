@@ -1,0 +1,532 @@
+#!/bin/bash
+function usage () {
+    echo "Usage: platforms/unix/share/update [ -h | {option}* | branch-name | pseudo-module ]"
+}
+# Author: Eddy.
+
+# <config>
+# Individual projects have good reasons for tweaking these first two functions:
+function pseudo_module_to_branch () {
+    # This function configures which branch each pseudo-module is presumed to want to use.
+    # It has to also cope if $1 is a branch name; it maps { branch-name | pseudo-module }
+    # to branch-name.  Hence the switch begins by handling branch names.
+    case $1 in
+	(core-1-linux-capo) echo $1;;
+	# Branch tags which match common pseudo-module patterns should pre-filter as above.
+	# opera-linux7 and before -- too old, will never be supported by this script.
+	(bolton|o76-unix|core-1-o76) echo o76_core1;;
+	(core-1-*) echo core-1;;
+	(core-2-*) echo core-2;;
+	(*-unix) echo $1 | sed -e 's/-unix$//';;
+	(*) echo $1;;
+    esac
+}
+
+function branch_to_old_unix_branch () {
+    # This function configures which branch of the old Unix module (code not yet
+    # broken out into sub-modules) to use with a given { branch-name | pseudo-module }.
+    # If the branch has a platforms/readme.txt, its entry for unix is preferred to this.
+    case "$1" in
+	(bolton|o76-unix|core-1-o76) echo o76_core1;;
+	# Many Unix projects are on HEAD: list them here
+	(core-*|home_media_gogi|home_media_qt) echo HEAD;;
+	(*) echo $1;;
+    esac
+}
+# </config>
+# Please discuss with Eddy before changing anything below this comment.
+
+# <util> Generic utilities:
+function warn () { echo "$@" >&2; }
+function debug () { true; }
+#function debug () { warn "$@"; }
+function die () {
+    warn "$@"
+    exit 1
+}
+function badarg () {
+    usage >&2
+    die "Unrecognised command-line option:" "$@"
+}
+
+# Formatted output:
+if type -t fmt >/dev/null 2>&1
+then
+    if [ "$COLUMNS" ]
+    then function format () { fmt -u --width "$COLUMNS"; }
+    else function format () { fmt -u; }
+    fi
+else
+    warn "You do not have coreutils' fmt installed; output may be a bit untidy."
+    function format () { cat; }
+fi
+
+# Random ordering (prepend random number to each line, sort, remove random number ;-)
+function randomize () {
+    # random: dd if=/dev/urandom bs=4 count=1 2>/dev/null | hexdump -e '/4 "%u"'
+    local line
+    while read line
+    do echo "$RANDOM $line" # RANDOM is bash magic, up to 64k.
+    done | sort -nk 1 | sed -e 's/^[0-9]* //'
+}
+# </util>
+
+# <help>
+function summary () { # -h
+    usage
+    echo -e '\n'\
+'Updates an Opera source tree using the Unix module.\n'\
+'Help options (produce output and exit):\n'\
+'  --usage		Usage summary\n'\
+'  -h			Options summary\n'\
+'  --help		Fuller help message\n'\
+'  --advise		A note on when to use this script\n'\
+'Active options:\n'\
+"  --no-core		Don't update outside platforms/\n"\
+"  --no-unix		Don't update platforms/unix/\n"\
+"  --no-plat		Don't update other platforms/*/\n"\
+'  --all-platforms	Check-out missing platforms (unless --no-plat)\n'\
+'  --mantle		Inherit core module set from the mantle module\n'\
+'  --root dir		Specify root of Opera source tree\n'\
+'  --unix tag		Use the given tag for the old unix module\n'\
+'  --bulk tag		Use the given tag for everything else\n'\
+'[ --branch ] name	Specify branch name or pseudo-module\n'\
+'This last is used to infer defaults for the previous two.'
+}
+
+function advise () { # --advise
+    echo -e "$@"\
+'While share/update is the right tool to get a source tree onto the\n'\
+'right tags, it is somewhat brutal to the CVS server; once your source\n'\
+'tree is on the right tags, it is better to do a plain "cvs up" except\n'\
+'when new modules are added to your project or you need to be sure\n'\
+'everything is on its right tags.  To avoid hammering the CVS server,\n'\
+'the share/update script now forces itself to take at least one second\n'\
+'over each module; even without that, a plain "cvs up" would be quicker.' | format
+}
+
+function full_help () { # --help
+    summary
+    advise '\n'
+    echo -e '\n'\
+'Core and the modularized parts of Unix are updated to the --bulk tag,\n'\
+'except for modules specified to be on HEAD by relevant readme.txt\n'\
+'on this tag; the old unix module is updated to the --unix tag.\n'\
+'If pseudo-module or branch is specified, it serves as default for both\n'\
+'tags, unless it is recognised by the script, in which case defaults\n'\
+'are inferred from it.\n'\
+'\n'\
+'If platforms/readme.txt exists on the --bulk tag, its tag for unix is\n'\
+'used as default for the --unix tag; and any other checked-out modules\n'\
+'will be updated to the --bulk tag, or to HEAD if readme.txt specifies\n'\
+'that.  Unless --all-platforms is specified, missing platforms are not\n'\
+'checked out.\n'\
+'\n'\
+'If you are using the mantle module you inherit the mantle core module set\n'\
+'by passing --mantle to this script. If doing so you should have no\n'\
+'readme.txt file on your branch. You override the base set in a file\n'\
+'named module_versions.txt. For more info see the mantle documentation.\n'\
+'\n'\
+'If CVS fails (as it sometimes does due to server issues), this script\n'\
+'retries thrice (even if the failure was due to conflicts, not server\n'\
+'issues), reporting status on error (tell Eddy which status you get in\n'\
+'each failure mode).  If you have the CVS_CLIENT_LOG environment variable\n'\
+'set (see CVS manual), the failure-handling shall report the contents\n'\
+'of $CVS_CLIENT_LOG.{in,out} before they get over-written by a later\n'\
+'cvs command.\n'\
+'\n'\
+'If your pseudo-module or branch needs special handling, please ask\n'\
+'Eddy about having this script modified suitably.' | format
+}
+# </help>
+
+# <update>
+#  <uputil> Update utilities:
+function oldmod () {
+    echo -e \
+'It is now better (and shall eventually become mandatory) to use the full\n'\
+"module-name, $1 rather than $2, in the readme.txt\n"\
+'of Unix components; the update script now handles the re-naming.  If you\n'\
+"really want module $2, not $1, in its component,\n"\
+"you should specify it as ./$2 in readme.txt" | format >&2
+}
+
+function report_logs () {
+    [ "$CVS_CLIENT_LOG" ] || return 0
+    [ -z "$*" ] || warn "$@"
+    warn "Sent to server: <in>"
+    cat "$CVS_CLIENT_LOG.in" >&2
+    warn "</in> Response from server: <out>"
+    cat "$CVS_CLIENT_LOG.out" >&2
+    warn "</out>"
+}
+
+function run_cvs () {
+    # We get server errors enough of the time to be a problem.
+    local bad=
+    for try in 1 2 3
+    do
+      cvs "$@"
+      # Test status the clunky way, so we can report it for debug.
+      status=$?
+      if [ $status -eq 0 ]
+      then
+	  [ -z "$bad" ] || report_logs "On success after $bad failure(s):"
+	  return 0
+      fi
+      # Chris reports $? as 1 on an EOF from server.
+      warn "CVS failed [$status] - pausing before re-try."
+      report_logs
+      bad=$try
+      sleep 1
+    done
+    warn 'CVS failed three times, giving up.'
+    warn 'Command was: cvs' "$@"
+    return 1
+}
+
+# 20 = 18 + 2; spatial_navigation is 18 long and we include '...' round it.
+# 42 is just "hopefully long enough" (plus 2, of course).
+# (Well, OK, I just like 42; I have actually seen a longer tag in use ...)
+function report () { printf "## %20s %s to %42s\\n" "'$2'" $1 "'$3'"; }
+
+# Count what needed our help:
+NEEDED=0
+# check_mod name full/name tag_patch_42
+function check_mod () {
+    local name="$1" full="$2" tag="$3"
+    if [ ! -d "$name" ]
+    then
+	NEEDED=$(( $NEEDED + 1 ))
+	report checkout "$full" "$tag"
+	return 1
+    elif [ -z "$tag" ]
+    then debug "No tag to conflict, no need for $1"
+    elif [ -f "$name/CVS/Tag" ]
+    then
+	if ! grep "^.$tag\$" "$name/CVS/Tag" >/dev/null 2>&1
+	then NEEDED=$(( $NEEDED + 1 ))
+	fi
+    elif [ "$tag" != HEAD ]
+    then NEEDED=$(( $NEEDED + 1 ))
+    else debug "HEAD on HEAD, no need for $1"
+    fi
+    report updating "$full" "$tag"
+    return 0
+}
+#  </uputil>
+#  <module>
+# NB: the sleep & ... wait %1 bracketing on the next few functions is to ensure
+# we don't hammer the server too hard; we'll only do one module per second.
+# We shall probably be able to remove this; sysadmin is investigating server issues.
+NAPTIME=1
+
+# Do the actual checkout or update of one module.
+function update_module () { # update_$each when each=module
+    sleep $NAPTIME &
+    local tag flags
+    if [ -z "$3" ]
+    then tag="$2"
+    elif [ -z "$2" -o "$2" = HEAD ]
+    then tag=HEAD
+    else tag="$3"
+    fi
+    [ "$tag" ] || tag=HEAD
+    if [ "$tag" = HEAD ]
+    then flags="-A"
+    else flags="-r $tag"
+    fi
+    local name
+    local full=$1
+    case $full in
+	# nice as it would be to use $(expr substr $1 6 \( length $1 \)), golem's expr isn't up to it:
+	(unix-*) name=$(echo $1 | sed -e 's/^unix-//');;
+	(*/*)	 name=$(basename $1);;
+	(selftest) rm -f selftest/module.sources; name=$1;;
+	(*)	 name=$1;;
+    esac
+    if check_mod $name $full $tag
+    then run_cvs up -dP $flags $name
+    else run_cvs co -d $name -P $flags $full
+    fi
+    wait %1 2>/dev/null
+}
+
+# Similar, but dealing with the Unix sub-module name munging:
+function update_unixmod () { # update_$each when each=unixmod
+    sleep $NAPTIME &
+    local tag flags
+    if [ -z "$3" -o "$3" = HEAD ]
+    then tag="$2"
+    elif [ -z "$2" -o "$2" = HEAD ]
+    then tag="HEAD"
+    else tag="$3"
+    fi
+    [ "$tag" ] || tag=HEAD
+    if [ "$tag" = HEAD ]
+    then flags="-A"
+    else flags="-r $tag"
+    fi
+    local name # directory name for module
+    local full # cvs repository module name
+    case $1 in
+	# nice as it would be to use $(expr substr $1 6 \( length $1 \)), golem's expr isn't up to it:
+	(unix-*) full=$1; name=$(echo $1 | sed -e 's/^unix-//');;
+	(*/*)	 full=$1; name=$(basename $1);;
+	(*)	 name=$1; full=unix-$1; oldmod $full $name;;
+    esac
+    if check_mod $name $full $tag
+    then run_cvs up -dP $flags $name
+    else run_cvs co -d $name -P $flags $full
+    fi
+    wait %1 2>/dev/null
+}
+#  </module>
+
+#  <readme>
+# conflict files...
+function conflict () {
+    # Check for (and abort on) conflict in any named file:
+    if grep -nHC 2 '^=======' "$@"
+    then die "Conflict detected.  Resolve and try again ..."
+    fi
+}
+
+# update_txt tag dir ect/ory ...
+function update_txt () {
+    sleep $NAPTIME &
+    local tag=$1
+    shift
+    local files
+    for arg
+    do if [ -d "$arg" ]; then files="$files $arg/readme.txt"; fi
+    done
+    if [ "$tag" = HEAD ]
+    then run_cvs up -A $files
+    elif [ -z "$tag" ]
+    then run_cvs up $files
+    else run_cvs up -r $tag $files
+    fi
+    files=$(ls $files 2>/dev/null)
+    [ -z "$files" ] || conflict $files
+    wait %1 2>/dev/null
+}
+
+# update_all each [tag]
+# Runs update_$each on each module in ./readme.txt
+function update_all () {
+    local each=$1
+    shift
+
+    sed -e 's/\#.*//' readme.txt | grep '[a-z]' | randomize |\
+    while read module tag cruft
+    do update_$each "$module" "$tag" "$@"
+       [ -z "$cruft" ] || \
+	   warn "Warning: malformed module line, $module has cruft at end of line: $cruft"
+    done
+}
+
+# update_platforms [tag [all]]
+function update_platforms () {
+    # Doesn't check out modules if absent, unless all is given, and skips unix:
+    sed -e 's/\#.*//' readme.txt | grep -v '^unix' | grep '[a-z]' | randomize |\
+    while read module tag cruft
+    do [ -z "$2" -a ! -d $module ] || update_module "$module" "$tag" "$1"
+       [ -z "$cruft" ] || \
+	   warn "Warning: malformed module line, $module has cruft at end of line: $cruft"
+    done
+}
+
+function unix_platform () {
+    grep -w '^unix' readme.txt | sed -e 's/\#.*//' | \
+    while read unix tag junk
+    do echo $tag
+      [ "$unix" = unix ] || warn "I got confused by what I read in platforms/readme.txt"
+      [ -z "$junk" ] || warn "Junk at end of unix line in platforms/readme.txt"
+      break
+    done
+}
+#  </readme>
+# </update>
+
+# <init> If variable gets set, it shall mean:
+# Don't update platforms/unix/:
+SkipUnix=
+# Don't update other platforms/*/:
+SkipPlatform=
+# Check out missing platforms (ignored if SkipPlatform is set):
+AllPlatforms=
+# Don't run modules/update.sh:
+SkipCore=
+# Tag to use for the old unix module:
+UnixTag=
+# Tag to use for everything else; modularized unix and core:
+MainTag=
+# (any branch with its own version of modules/update.sh can be used as MainTag).
+# Key to fall-backs for UnixTag and MainTag:
+Branch=
+# (it should be either a CVS pseudo-module name or a CVS branch tag on core).
+# Opera root directory:
+Root=
+# Start with getting the module set from Mantle
+Mantle=
+# </init>
+
+# <args>
+# Parse command line:
+for arg
+do
+  if [ "$toset" ]
+  then export $toset=$arg
+      toset=
+  else
+      case $arg in
+	  (--root) toset=Root;;
+	  (--bulk) toset=MainTag;;
+	  (--unix) toset=UnixTag;;
+	  (--branch) toset=Branch;;
+	  (--no-core) SkipCore=yes;;
+	  (--no-unix) SkipUnix=yes;;
+	  (--no-plat) SkipPlatform=yes;;
+	  (--all-platforms) AllPlatforms=yes;;
+	  (--mantle) Mantle=yes;;
+	  (-h) summary; exit 0;;
+	  (--help) full_help; exit 0;;
+	  (--advise) advise; exit 0;;
+	  (--usage) usage; exit 0;;
+	  (-*) badarg $arg;;
+	  (*)
+	      if [ -z "$Branch" ]
+	      then Branch=$arg
+	      else badarg $arg
+	      fi
+      esac
+  fi
+done
+[ -z "$toset" ] || die "Missing parameter to argument at end of command-line"
+# </args>
+
+# <setup>
+if [ "$Root" ]
+then cd "$Root/platforms" || die "Bad Opera root dir specified: --root $Root"
+else # Must be invoked with path, so we know where to cd to !
+    dir=$(dirname $0)
+    [ -z "$dir" ] || cd $dir || die "Unable to cd to script dir: $dir"
+    cd ../.. || die "Unable to cd to presumed Opera platforms/ dir: $dir/../.."
+fi
+[ -f unix/share/update ] || die -e "You need to run $0 with an explicit path,\n"\
+    "or from the directory in which it resides, or pass --root."
+# We're now in platforms/
+echo "## Updating all modules under" $(cd ..; pwd | sed -e "s!$HOME!~!")
+
+# Implement defaults for MainTag and UnixTag
+if [ "$Branch" ]
+then
+    # Provide default for MainTag
+    [ "$MainTag" ] || MainTag="$(pseudo_module_to_branch $Branch)"
+    run_cvs up -r "$Branch" readme.txt
+else
+    run_cvs up readme.txt
+fi
+# </setup>
+
+# <perform>
+# We're still in platforms/
+if [ -f readme.txt ]
+then
+    conflict readme.txt
+    [ "$UnixTag" ] || UnixTag=$(unix_platform)
+    # Update platforms *other* than Unix:
+    [ "$SkipPlatform" ] || update_platforms "$MainTag" $AllPlatforms
+else # Update to HEAD's version of readme.txt - and ignore it.
+    run_cvs up -A readme.txt
+    conflict readme.txt
+    [ "$UnixTag" ] || UnixTag="$(branch_to_old_unix_branch $Branch)"
+fi
+
+if [ -z "$SkipCore" ]
+then
+    (
+	cd ..
+	if [ "$MainTag" ]
+	then run_cvs up -dP -r "$MainTag" core
+	else run_cvs up -dP core
+	fi
+	update_txt "$MainTag" modules adjunct data
+    )
+
+    # Do adjunct first such that we have Mantle available if needed
+    cd ../adjunct && update_all module $MainTag
+
+    if [ "$Mantle" ]
+    then
+	echo "Making sure module_versions.txt is up to date."
+	cd ../modules
+	if [ "$MainTag" ]
+	then run_cvs up -r "$MainTag" module_versions.txt
+	else run_cvs up module_versions.txt
+	fi
+	conflict module_versions.txt
+	cd ../adjunct
+	echo "Creating modules/readme.txt based on base set."
+	mantle/tools/bin/create_module_list.pl --in mantle/modules.txt --diff ../modules/module_versions.txt --out ../modules/readme.txt \
+	    || die "Update aborted, create_module_list.pl failed."
+    fi
+
+    for d in modules data
+    do cd ../$d && update_all module $MainTag
+    done
+    # Return to platforms/
+    cd ../platforms
+fi
+
+if [ -z "$SkipUnix" ]
+then
+    check_mod unix 'Old Unix' $UnixTag
+    cd unix
+
+    # Update old Unix module fragments:
+    # snip things out of this list as we retire them ...
+    OldUnix='adjunct base build documentation plugins product tools'
+    if [ -z "$UnixTag" ]
+    then run_cvs up -dP $OldUnix; run_cvs up -ld
+    elif [ "$UnixTag" = HEAD ]
+    then run_cvs up -dP -A $OldUnix; run_cvs up -lAd
+    else run_cvs up -dP -r "$UnixTag" $OldUnix; run_cvs up -ldr "$UnixTag"
+    fi # note that we also have to up -l for the sake of files in the top-level directory.
+
+    update_txt "$MainTag" winsys framework proglet delivery share
+    subunix=
+    for d in winsys framework proglet delivery share
+    do [ -d $d ] && subunix="$subunix $d"
+    done
+
+    cd share
+    # Start out in share; and we'll end up back here:
+    for d in $subunix
+    do
+      echo Scanning $d
+      cd ../$d && update_all unixmod "$MainTag"
+    done
+else
+    cd unix/share
+fi
+# </perform>
+
+# <fin>
+# If a plain cvs up would have sufficed, say so:
+[ $NEEDED -eq 0 ] || warn "A plain 'cvs up' would probably have sufficed (see $0 --advise)."
+
+# Update self (update script) regardless of skip flags.
+# Do so *last*, and exec, so changes to this script don't cause grief !
+# Can't use run_cvs for this, as it's a function; exec needs a Real Command.
+if [ -z "$MainTag" ]
+then exec cvs up update
+elif [ "$MainTag" = HEAD ]
+then exec cvs up -A update
+else exec cvs up -r "$MainTag" update
+fi
+
+# We don't get here.
+die "Failed to exec cvs up of self at end"
+# </fin>

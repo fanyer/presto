@@ -1,0 +1,782 @@
+/* -*- Mode: c++; tab-width: 4; indent-tabs-mode: t; c-basic-offset: 4 -*-
+**
+** Copyright (C) 2009 Opera Software AS.  All rights reserved.
+**
+** This file is part of the Opera web browser.  It may not be distributed
+** under any circumstances.
+**
+** Test for service API in STP/1
+**
+** Jan Borsodi
+*/
+
+group "scope.service_api";
+
+require init;
+require SCOPE_SUPPORT;
+
+language c++;
+
+include "modules/scope/src/scope_test_service.h";
+include "modules/util/adt/bytebuffer.h";
+include "modules/scope/src/scope_service.h";
+include "modules/scope/src/scope_transport.h";
+
+global
+{
+	class OtScopeTestClient : public OpScopeClient
+	{
+	public:
+		OtScopeTestClient(OpScopeTPMessage::MessageType t)
+			: OpScopeClient(t)
+		{}
+
+		OP_STATUS Clear()
+		{
+			messages.Clear();
+			return OpStatus::OK;
+		}
+
+		unsigned Count() const
+		{
+			return messages.Cardinal();
+		}
+
+		OpScopeTPMessage *First() const
+		{
+			return static_cast<OpScopeTPMessage *>(messages.First());
+		}
+
+		void PopFirst(BOOL del = FALSE)
+		{
+			OpScopeTPMessage *msg = static_cast<OpScopeTPMessage *>(messages.First());
+			OP_ASSERT(msg);
+			if (!msg)
+				return;
+			msg->Out();
+			if (del)
+				OP_DELETE(msg);
+		}
+
+		virtual const uni_char *GetType() const { return UNI_L("test"); }
+
+		virtual OP_STATUS Receive( OpAutoPtr<OpScopeTPMessage> &message )
+		{
+			message->Into(&messages);
+			message.release();
+			return OpStatus::OK;
+		}
+
+		virtual OP_STATUS OnHostAttached(OpScopeHost * /*host*/)
+		{
+			return OpStatus::OK;
+		}
+
+		virtual OP_STATUS OnHostDetached(OpScopeHost * /*host*/)
+		{
+			return Clear();
+		}
+
+		virtual OP_STATUS OnHostMissing()
+		{
+			return OpStatus::OK;
+		}
+
+		virtual OP_STATUS Serialize(OpScopeTPMessage &to, const OpProtobufInstanceProxy &from, OpScopeTPHeader::MessageType type)
+		{
+			return OpScopeClient::SerializeDefault(to, from, type);
+		}
+
+		virtual OP_STATUS Parse(const OpScopeTPMessage &from, OpProtobufInstanceProxy &to, OpScopeTPError &error)
+		{
+			return OpScopeClient::ParseDefault(from, to, error);
+		}
+
+	private:
+		Head messages;
+	};
+
+	class OtScopeTestHost : public OpScopeHost
+	{
+	public:
+		OtScopeTestHost() {}
+		virtual ~OtScopeTestHost() {}
+
+		virtual const uni_char *GetType() const { return UNI_L("test"); }
+		virtual int GetVersion() const { return 1; }
+
+		virtual OP_STATUS Receive( OpScopeClient * /*client*/, OpAutoPtr<OpScopeTPMessage> &/*message*/)
+		{
+			return OpStatus::OK;
+		}
+
+		virtual OP_STATUS ConfigureClient( OpScopeClient * /*client*/, unsigned int /*tag*/, BOOL &/*immediate*/ )
+		{
+			return OpStatus::OK;
+		}
+
+		virtual OP_STATUS OnClientAttached(OpScopeClient * /*client*/)
+		{
+			return OpStatus::OK;
+		}
+
+		virtual OP_STATUS OnClientDetached(OpScopeClient * /*client*/)
+		{
+			return OpStatus::OK;
+		}
+	private:
+		OpScopeClient *client;
+	};
+
+	OtScopeTestService *test_service = NULL;
+	OpScopeService     *service = NULL;
+	OtScopeTestClient  *test_client= NULL;
+	OtScopeTestHost    *test_host= NULL;
+}
+
+
+/*
+TODO: Additional tests
+- Test with invalid input, should result in error
+- Test with optional fields, also test without sending them.
+- Test with missing required fields.
+*/
+
+setup
+{
+}
+exit
+{
+	if (test_host)
+		test_host->DetachClient();
+	OP_DELETE(test_client);
+	OP_DELETE(test_host);
+	OP_DELETE(test_service);
+}
+
+test("Init")
+{
+	service = test_service = OP_NEW(OtScopeTestService, ());
+	verify_not_oom(test_service);
+
+	test_host = OP_NEW(OtScopeTestHost, ());
+	verify_not_oom(test_host);
+
+	test_client = OP_NEW(OtScopeTestClient, (OpScopeTPMessage::JSON));
+	verify_not_oom(test_client);
+
+	verify_success(test_host->AttachClient(test_client));
+	test_service->SetClient(test_client);
+}
+
+// Tests that async commands handles internal errors properly
+test("Handle internal error in async command")
+	require success "Init";
+{
+	test_service->Clear();
+	test_client->Clear();
+
+	const OpScopeTPMessage *out = NULL;
+	ByteBuffer buffer;
+	OpScopeTPMessage msg(OpScopeTPMessage::STP_Call, service->GetName(), OtScopeTestService_SI::Command_AsyncCommand, OpScopeTPHeader::OK, 5, OpScopeTPMessage::Version_1);
+
+	OpProtobufUtils::Append(buffer, "[10]");
+	verify_success(msg.Construct(buffer, OpScopeTPHeader::JSON));
+	verify_success(service->OnReceive(test_client, msg));
+	verify(test_client->Count() == 1);
+	out = test_client->First();
+	verify(out != NULL);
+	verify(out->TransportType() == OpScopeTPMessage::STP_Response);
+	verify(out->Version() == OpScopeTPMessage::Version_1);
+	verify(out->Status()     == OpScopeTPHeader::OK);
+	verify_string(out->ServiceName(), service->GetName());
+	verify(out->CommandID()  == OtScopeTestService_SI::Command_AsyncCommand);
+	verify(out->Type()       == OpScopeTPHeader::JSON);
+	verify(out->Tag()        == 5);
+	const ByteBuffer *buf = out->Data();
+	verify(buf != NULL);
+	OpString out_data;
+	verify_success(OpScopeCopy(*buf, out_data));
+	verify_string(out_data, UNI_L("[20]"));
+	test_client->PopFirst(TRUE);
+
+	buffer.Clear();
+	OpProtobufUtils::Append(buffer, "[0]"); // Sending 0 triggers error
+	verify_success(msg.Construct(buffer, OpScopeTPHeader::JSON));
+	verify_success(service->OnReceive(test_client, msg));
+	verify(test_client->Count() == 1);
+	out = test_client->First();
+	verify(out != NULL);
+	verify(out->TransportType() == OpScopeTPMessage::STP_Error);
+	verify(out->Version() == OpScopeTPMessage::Version_1);
+	verify(out->Status()     == OpScopeTPHeader::InternalError);
+	verify_string(out->ServiceName(), service->GetName());
+	verify(out->CommandID()  == OtScopeTestService_SI::Command_AsyncCommand);
+	verify(out->Type()       == OpScopeTPHeader::JSON);
+	verify(out->Tag()        == 5);
+	test_client->PopFirst(TRUE);
+
+	// Send message again with same tag, should trigger missing cleanup of async response
+
+	buffer.Clear();
+	OpProtobufUtils::Append(buffer, "[0]"); // Sending 0 triggers error
+	verify_success(msg.Construct(buffer, OpScopeTPHeader::JSON));
+	verify_success(service->OnReceive(test_client, msg));
+	verify(test_client->Count() == 1);
+	out = test_client->First();
+	verify(out != NULL);
+	verify(out->TransportType() == OpScopeTPMessage::STP_Error);
+	verify(out->Version() == OpScopeTPMessage::Version_1);
+	verify(out->Status()     == OpScopeTPHeader::InternalError);
+	verify_string(out->ServiceName(), service->GetName());
+	verify(out->CommandID()  == OtScopeTestService_SI::Command_AsyncCommand);
+	verify(out->Type()       == OpScopeTPHeader::JSON);
+	verify(out->Tag()        == 5);
+}
+finally
+{
+	test_service->Clear();
+	test_client->Clear();
+}
+
+test("Handle error responses in async command")
+	require success "Init";
+{
+	test_service->Clear();
+	test_client->Clear();
+
+	const OpScopeTPMessage *out = NULL;
+	ByteBuffer buffer1;
+	OpScopeTPMessage msg1(OpScopeTPMessage::STP_Call, service->GetName(), OtScopeTestService_SI::Command_AsyncCommand, OpScopeTPHeader::OK, 5, OpScopeTPMessage::Version_1);
+	OpProtobufUtils::Append(buffer1, "[-1]"); // Causes command to behave like a real async command, a callback must be called to send response
+	verify_success(msg1.Construct(buffer1, OpScopeTPHeader::JSON));
+
+	ByteBuffer buffer2;
+	OpScopeTPMessage msg2(OpScopeTPMessage::STP_Call, service->GetName(), OtScopeTestService_SI::Command_AsyncCommand, OpScopeTPHeader::OK, 6, OpScopeTPMessage::Version_1);
+	OpProtobufUtils::Append(buffer2, "[-1]"); // Causes command to behave like a real async command, a callback must be called to send response
+	verify_success(msg2.Construct(buffer2, OpScopeTPHeader::JSON));
+
+	// Start two async commands, response will be handled below
+	verify_success(service->OnReceive(test_client, msg1));
+	unsigned command_tag1 = test_service->GetLastAsyncCommandTag();
+	verify_success(service->OnReceive(test_client, msg2));
+	unsigned command_tag2 = test_service->GetLastAsyncCommandTag();
+
+	// Trigger the second callback, 17 is the return value
+	verify_success(test_service->AsyncCommandCallback(command_tag2, 17));
+	// Trigger the first callback, 0 means send error response
+	verify_success(test_service->AsyncCommandCallback(command_tag1, 0));
+
+	verify(test_client->Count() == 2);
+
+	{
+		out = test_client->First();
+		verify(out != NULL);
+		verify(out->TransportType() == OpScopeTPMessage::STP_Response);
+		verify(out->Version() == OpScopeTPMessage::Version_1);
+		verify(out->Status()     == OpScopeTPHeader::OK);
+		verify_string(out->ServiceName(), service->GetName());
+		verify(out->CommandID()  == OtScopeTestService_SI::Command_AsyncCommand);
+		verify(out->Type()       == OpScopeTPHeader::JSON);
+		verify(out->Tag()        == 6); // 6 was the second call
+		const ByteBuffer *buf = out->Data();
+		verify(buf != NULL);
+		OpString out_data;
+		verify_success(OpScopeCopy(*buf, out_data));
+		verify_string(out_data, UNI_L("[17]"));
+	}
+
+	{
+		test_client->PopFirst(TRUE);
+		out = test_client->First();
+		verify(out != NULL);
+		verify(out->TransportType() == OpScopeTPMessage::STP_Error);
+		verify(out->Version() == OpScopeTPMessage::Version_1);
+		verify(out->Status()     == OpScopeTPHeader::InternalError);
+		verify_string(out->ServiceName(), service->GetName());
+		verify(out->CommandID()  == OtScopeTestService_SI::Command_AsyncCommand);
+		verify(out->Type()       == OpScopeTPHeader::JSON);
+		verify(out->Tag()        == 5); // 5 was the first call
+		const ByteBuffer *buf = out->Data();
+		verify(buf != NULL);
+		OpString out_data;
+		verify_success(OpScopeCopy(*buf, out_data));
+		verify_string(out_data, UNI_L("[\"Parsing failed while executing command\"]"));
+		test_client->PopFirst(TRUE);
+	}
+}
+finally
+{
+	test_service->Clear();
+	test_client->Clear();
+}
+
+test("Multiple active async commands")
+	require success "Init";
+{
+	test_service->Clear();
+	test_client->Clear();
+
+	const OpScopeTPMessage *out = NULL;
+	ByteBuffer buffer1;
+	OpScopeTPMessage msg1(OpScopeTPMessage::STP_Call, service->GetName(), OtScopeTestService_SI::Command_AsyncCommand, OpScopeTPHeader::OK, 5, OpScopeTPMessage::Version_1);
+	OpProtobufUtils::Append(buffer1, "[-1]"); // Causes command to behave like a real async command, a callback must be called to send response
+	verify_success(msg1.Construct(buffer1, OpScopeTPHeader::JSON));
+
+	ByteBuffer buffer2;
+	OpScopeTPMessage msg2(OpScopeTPMessage::STP_Call, service->GetName(), OtScopeTestService_SI::Command_AsyncCommand, OpScopeTPHeader::OK, 6, OpScopeTPMessage::Version_1);
+	OpProtobufUtils::Append(buffer2, "[-1]"); // Causes command to behave like a real async command, a callback must be called to send response
+	verify_success(msg2.Construct(buffer2, OpScopeTPHeader::JSON));
+
+	ByteBuffer buffer3;
+	OpScopeTPMessage msg3(OpScopeTPMessage::STP_Call, service->GetName(), OtScopeTestService_SI::Command_AsyncCommand, OpScopeTPHeader::OK, 7, OpScopeTPMessage::Version_1);
+	OpProtobufUtils::Append(buffer3, "[-1]"); // Causes command to behave like a real async command, a callback must be called to send response
+	verify_success(msg3.Construct(buffer3, OpScopeTPHeader::JSON));
+
+	// Start two async commands, response will be handled below
+	verify_success(service->OnReceive(test_client, msg1));
+	unsigned command_tag1 = test_service->GetLastAsyncCommandTag();
+	verify_success(service->OnReceive(test_client, msg2));
+	unsigned command_tag2 = test_service->GetLastAsyncCommandTag();
+	verify(command_tag1 == 1);
+	verify(command_tag2 == 2);
+
+	// Trigger the first callback, 1 is the return value
+	verify_success(test_service->AsyncCommandCallback(command_tag1, 1));
+	// Start thrid callback, the tag from the first call should now be free
+	verify_success(service->OnReceive(test_client, msg3));
+	unsigned command_tag3 = test_service->GetLastAsyncCommandTag();
+	verify(command_tag3 == 1);
+	// Trigger the third callback, 3 is the return value
+	verify_success(test_service->AsyncCommandCallback(command_tag3, 3));
+	// Trigger the second callback, 2 is the return value
+	verify_success(test_service->AsyncCommandCallback(command_tag2, 2));
+
+	verify(test_client->Count() == 3);
+
+	{
+		out = test_client->First();
+		verify(out != NULL);
+		verify(out->TransportType() == OpScopeTPMessage::STP_Response);
+		verify(out->Version() == OpScopeTPMessage::Version_1);
+		verify(out->Status()     == OpScopeTPHeader::OK);
+		verify_string(out->ServiceName(), service->GetName());
+		verify(out->CommandID()  == OtScopeTestService_SI::Command_AsyncCommand);
+		verify(out->Type()       == OpScopeTPHeader::JSON);
+		verify(out->Tag()        == 5); // 5 was the first call
+		const ByteBuffer *buf = out->Data();
+		verify(buf != NULL);
+		OpString out_data;
+		verify_success(OpScopeCopy(*buf, out_data));
+		verify_string(out_data, UNI_L("[1]"));
+	}
+
+	{
+		test_client->PopFirst(TRUE);
+		out = test_client->First();
+		verify(out != NULL);
+		verify(out->TransportType() == OpScopeTPMessage::STP_Response);
+		verify(out->Version() == OpScopeTPMessage::Version_1);
+		verify(out->Status()     == OpScopeTPHeader::OK);
+		verify_string(out->ServiceName(), service->GetName());
+		verify(out->CommandID()  == OtScopeTestService_SI::Command_AsyncCommand);
+		verify(out->Type()       == OpScopeTPHeader::JSON);
+		verify(out->Tag()        == 7); // 7 was the third call
+		const ByteBuffer *buf = out->Data();
+		verify(buf != NULL);
+		OpString out_data;
+		verify_success(OpScopeCopy(*buf, out_data));
+		verify_string(out_data, UNI_L("[3]"));
+	}
+
+	{
+		test_client->PopFirst(TRUE);
+		out = test_client->First();
+		verify(out != NULL);
+		verify(out->TransportType() == OpScopeTPMessage::STP_Response);
+		verify(out->Version() == OpScopeTPMessage::Version_1);
+		verify(out->Status()     == OpScopeTPHeader::OK);
+		verify_string(out->ServiceName(), service->GetName());
+		verify(out->CommandID()  == OtScopeTestService_SI::Command_AsyncCommand);
+		verify(out->Type()       == OpScopeTPHeader::JSON);
+		verify(out->Tag()        == 6); // 6 was the second call
+		const ByteBuffer *buf = out->Data();
+		verify(buf != NULL);
+		OpString out_data;
+		verify_success(OpScopeCopy(*buf, out_data));
+		verify_string(out_data, UNI_L("[2]"));
+	}
+}
+finally
+{
+	test_service->Clear();
+	test_client->Clear();
+}
+
+test( "Get data from service" )
+	require success "Init";
+{
+	test_service->Clear();
+	test_client->Clear();
+	test_service->data_value = 42;
+	test_service->data_name.Set(UNI_L("Deep Thought"));
+
+	OpScopeTPMessage msg(OpScopeTPMessage::STP_Call, service->GetName(), OtScopeTestService_SI::Command_GetData, OpScopeTPHeader::OK, 5, OpScopeTPMessage::Version_1);
+	verify(OpStatus::IsSuccess(msg.CreateEmptyData(OpScopeTPHeader::JSON)));
+	verify(OpStatus::IsSuccess(service->OnReceive(test_client, msg)));
+	verify(test_client->Count() == 1);
+	const OpScopeTPMessage *out = test_client->First();
+	verify(out != NULL);
+	verify(out->TransportType() == OpScopeTPMessage::STP_Response);
+	verify(out->Version() == OpScopeTPMessage::Version_1);
+	verify(out->Status()     == OpScopeTPHeader::OK);
+	verify(out->ServiceName().Compare(service->GetName()) == 0);
+	verify(out->CommandID()  == OtScopeTestService_SI::Command_GetData);
+	verify(out->Type()       == OpScopeTPHeader::JSON);
+	verify(out->Tag()        == 5);
+
+	const ByteBuffer *buf = out->Data();
+	verify(buf != NULL);
+	OpString out_data;
+	verify(OpStatus::IsSuccess(OpScopeCopy(*buf, out_data)));
+	verify(out_data.Compare(UNI_L("[42,\"Deep Thought\"]")) == 0);
+}
+finally
+{
+	test_service->Clear();
+	test_client->Clear();
+}
+
+test( "Set data in service" )
+	require success "Init";
+{
+	test_service->Clear();
+	test_client->Clear();
+
+	ByteBuffer buffer;
+	OpProtobufUtils::Append(buffer, "[31415,\"Easy as Pie\"]");
+	OpScopeTPMessage msg(OpScopeTPMessage::STP_Call, service->GetName(), OtScopeTestService_SI::Command_SetData, OpScopeTPHeader::OK, 10, OpScopeTPMessage::Version_1);
+	verify(OpStatus::IsSuccess(msg.Construct(buffer, OpScopeTPHeader::JSON)));
+	verify(OpStatus::IsSuccess(service->OnReceive(test_client, msg)));
+	verify(test_client->Count() == 1);
+	const OpScopeTPMessage *out = test_client->First();
+	verify(out != NULL);
+	verify(out->TransportType() == OpScopeTPMessage::STP_Response);
+	verify(out->Version() == OpScopeTPMessage::Version_1);
+	verify(out->Status()     == OpScopeTPHeader::OK);
+	verify(out->ServiceName().Compare(service->GetName()) == 0);
+	verify(out->CommandID()  == OtScopeTestService_SI::Command_SetData);
+	verify(out->Type()       == OpScopeTPHeader::JSON);
+	verify(out->Tag()        == 10);
+
+	const ByteBuffer *buf = out->Data();
+	verify(buf != NULL);
+	OpString out_data;
+	verify(OpStatus::IsSuccess(OpScopeCopy(*buf, out_data)));
+	verify(out_data.Compare(UNI_L("[]")) == 0);
+
+	verify(test_service->data_value == 31415);
+	verify(test_service->data_name.Compare(UNI_L("Easy as Pie")) == 0);
+}
+finally
+{
+	test_service->Clear();
+	test_client->Clear();
+}
+
+test( "Add values" )
+	require success "Init";
+{
+	test_service->Clear();
+	test_client->Clear();
+
+	ByteBuffer buffer;
+	OpProtobufUtils::Append(buffer, "[[31415,42,0]]");
+	OpScopeTPMessage msg(OpScopeTPMessage::STP_Call, service->GetName(), OtScopeTestService_SI::Command_Add, OpScopeTPHeader::OK, 11, OpScopeTPMessage::Version_1);
+	verify(OpStatus::IsSuccess(msg.Construct(buffer, OpScopeTPHeader::JSON)));
+	verify(OpStatus::IsSuccess(service->OnReceive(test_client, msg)));
+	verify(test_client->Count() == 1);
+	const OpScopeTPMessage *out = test_client->First();
+	verify(out != NULL);
+	verify(out->TransportType() == OpScopeTPMessage::STP_Response);
+	verify(out->Version() == OpScopeTPMessage::Version_1);
+	verify(out->Status()     == OpScopeTPHeader::OK);
+	verify(out->ServiceName().Compare(service->GetName()) == 0);
+	verify(out->CommandID()  == OtScopeTestService_SI::Command_Add);
+	verify(out->Type()       == OpScopeTPHeader::JSON);
+	verify(out->Tag()        == 11);
+
+	const ByteBuffer *buf = out->Data();
+	verify(buf != NULL);
+	OpString out_data;
+	verify(OpStatus::IsSuccess(OpScopeCopy(*buf, out_data)));
+	verify(out_data.Compare(UNI_L("[31457]")) == 0);
+}
+finally
+{
+	test_service->Clear();
+	test_client->Clear();
+}
+
+
+test( "No input/output" )
+	require success "Init";
+{
+	test_service->Clear();
+	test_client->Clear();
+
+	ByteBuffer buffer;
+	OpProtobufUtils::Append(buffer, "[]");
+	OpScopeTPMessage msg(OpScopeTPMessage::STP_Call, service->GetName(), OtScopeTestService_SI::Command_Nop, OpScopeTPHeader::OK, 12, OpScopeTPMessage::Version_1);
+	verify(OpStatus::IsSuccess(msg.Construct(buffer, OpScopeTPHeader::JSON)));
+	verify(OpStatus::IsSuccess(service->OnReceive(test_client, msg)));
+	verify(test_client->Count() == 1);
+	const OpScopeTPMessage *out = test_client->First();
+	verify(out != NULL);
+	verify(out->TransportType() == OpScopeTPMessage::STP_Response);
+	verify(out->Version() == OpScopeTPMessage::Version_1);
+	verify(out->Status()     == OpScopeTPHeader::OK);
+	verify(out->ServiceName().Compare(service->GetName()) == 0);
+	verify(out->CommandID()  == OtScopeTestService_SI::Command_Nop);
+	verify(out->Type()       == OpScopeTPHeader::JSON);
+	verify(out->Tag()        == 12);
+
+	const ByteBuffer *buf = out->Data();
+	verify(buf != NULL);
+	OpString out_data;
+	verify(OpStatus::IsSuccess(OpScopeCopy(*buf, out_data)));
+	verify(out_data.Compare(UNI_L("[]")) == 0);
+}
+finally
+{
+	test_service->Clear();
+	test_client->Clear();
+}
+
+test( "Trigger events" )
+	require success "Init";
+{
+	test_service->Clear();
+	test_client->Clear();
+
+	OtScopeTestService::Event evt;
+	evt.SetCurrentID(15);
+	verify(OpStatus::IsSuccess(test_service->SendOnEvent(evt)));
+	verify(test_client->Count() == 1);
+	const OpScopeTPMessage *out = test_client->First();
+	for (; out != NULL; out = reinterpret_cast<OpScopeTPMessage *>(out->Suc()))
+	{
+		verify(out != NULL);
+		verify(out->TransportType() == OpScopeTPMessage::STP_Event);
+		verify(out->Status()     == OpScopeTPHeader::OK);
+		verify(out->ServiceName().Compare(service->GetName()) == 0);
+		verify(out->CommandID()  == OtScopeTestService_SI::Command_OnEvent);
+		verify(out->Tag()        == 0);
+		verify(out->Type()       == OpScopeTPHeader::JSON);
+
+		const ByteBuffer *buf = out->Data();
+		verify(buf != NULL);
+		OpString out_data;
+		verify(OpStatus::IsSuccess(OpScopeCopy(*buf, out_data)));
+		if (out->Type() == OpScopeTPHeader::JSON)
+			verify(out_data.Compare(UNI_L("[15]")) == 0);
+		else if (out->Type() == OpScopeTPHeader::XML)
+			verify(out_data.Compare(UNI_L("<Event><currentID>15</currentID></Event>")) == 0);
+	}
+}
+finally
+{
+	test_service->Clear();
+	test_client->Clear();
+}
+
+test( "Send invalid service ID" )
+	require success "Init";
+{
+	test_service->Clear();
+	test_client->Clear();
+
+	OpScopeTPMessage msg(OpScopeTPMessage::STP_Call, UNI_L("invalid"), OtScopeTestService_SI::Command_GetData, OpScopeTPHeader::OK, 5, OpScopeTPMessage::Version_1);
+	verify(OpStatus::IsSuccess(msg.CreateEmptyData(OpScopeTPHeader::JSON)));
+	verify(OpStatus::IsSuccess(service->OnReceive(test_client, msg)));
+	verify(test_client->Count() == 1);
+	const OpScopeTPMessage *out = test_client->First();
+	verify(out != NULL);
+	verify(out->TransportType() == OpScopeTPMessage::STP_Error);
+	verify(out->Version() == OpScopeTPMessage::Version_1);
+	verify(out->Status()     == OpScopeTPHeader::InternalError);
+	verify(out->ServiceName().Compare(service->GetName()) == 0);
+	verify(out->CommandID()  == OtScopeTestService_SI::Command_GetData);
+	verify(out->Type()       == OpScopeTPHeader::JSON);
+	verify(out->Tag()        == 5);
+}
+finally
+{
+	test_service->Clear();
+	test_client->Clear();
+}
+
+test( "Send request using error status" )
+	require success "Init";
+{
+	test_service->Clear();
+	test_client->Clear();
+
+	for (int status = OpScopeTPHeader::MessageStatusMin; status < OpScopeTPHeader::MessageStatusMax; ++status)
+	{
+		if (status == OpScopeTPHeader::OK)
+			continue;
+		OpScopeTPMessage msg(OpScopeTPMessage::STP_Call, service->GetName(), OtScopeTestService_SI::Command_GetData, static_cast<OpScopeTPHeader::MessageStatus>(status), 5, OpScopeTPMessage::Version_1);
+		verify(OpStatus::IsSuccess(msg.CreateEmptyData(OpScopeTPHeader::JSON)));
+		verify(OpStatus::IsSuccess(service->OnReceive(test_client, msg)));
+		verify(test_client->Count() == 1);
+		const OpScopeTPMessage *out = test_client->First();
+		verify(out != NULL);
+		verify(out->TransportType() == OpScopeTPMessage::STP_Error);
+		verify(out->Version() == OpScopeTPMessage::Version_1);
+		verify(out->Status()     == OpScopeTPHeader::BadRequest);
+		verify(out->ServiceName().Compare(service->GetName()) == 0);
+		verify(out->CommandID()  == OtScopeTestService_SI::Command_GetData);
+		verify(out->Type()       == OpScopeTPHeader::JSON);
+		verify(out->Tag()        == 5);
+		test_client->Clear();
+	}
+}
+finally
+{
+	test_service->Clear();
+	test_client->Clear();
+}
+
+test( "Send non-existing command" )
+	require success "Init";
+{
+	test_service->Clear();
+
+	// Note: 65536 is a special reserved command ID in the test service
+	//       This command must not be defined in the service
+	OpScopeTPMessage msg(OpScopeTPMessage::STP_Call, service->GetName(), 65536, OpScopeTPHeader::OK, 5, OpScopeTPMessage::Version_1);
+	verify(OpStatus::IsSuccess(msg.CreateEmptyData(OpScopeTPHeader::JSON)));
+	verify(OpStatus::IsSuccess(service->OnReceive(test_client, msg)));
+	verify(test_client->Count() == 1);
+	const OpScopeTPMessage *out = test_client->First();
+	verify(out != NULL);
+	verify(out->TransportType() == OpScopeTPMessage::STP_Error);
+	verify(out->Version() == OpScopeTPMessage::Version_1);
+	verify(out->Status()     == OpScopeTPHeader::CommandNotFound);
+	verify(out->ServiceName().Compare(service->GetName()) == 0);
+	verify(out->CommandID()  == 65536);
+	verify(out->Type()       == OpScopeTPHeader::JSON);
+	verify(out->Tag()        == 5);
+}
+finally
+{
+	test_service->Clear();
+	test_client->Clear();
+}
+
+foreach (TYPE, data) from
+  {{JSON, "[\"Easy as Pie\",31415]"}
+  ,{XML, "<InData><runtimeID>Easy as Pie</runtimeID><title>31415</title></InData>"}
+  }
+{
+test( "Send invalid field types ($(TYPE))" )
+	require success "Init";
+{
+	test_service->Clear();
+	test_service->data_value = 42;
+	test_service->data_name.Set(UNI_L("Deep Thought"));
+	test_client->Clear();
+
+	ByteBuffer buffer;
+	// Here the two fields are swapped
+	OpProtobufUtils::Append(buffer, data);
+	OpScopeTPMessage msg(OpScopeTPMessage::STP_Call, service->GetName(), OtScopeTestService_SI::Command_SetData, OpScopeTPHeader::OK, 10, OpScopeTPMessage::Version_1);
+	verify(OpStatus::IsSuccess(msg.Construct(buffer, OpScopeTPHeader::TYPE)));
+	verify(OpStatus::IsSuccess(service->OnReceive(test_client, msg)));
+	verify(test_client->Count() == 1);
+	const OpScopeTPMessage *out = test_client->First();
+	verify(out != NULL);
+	verify(out->TransportType() == OpScopeTPMessage::STP_Error);
+	verify(out->Version() == OpScopeTPMessage::Version_1);
+	verify(out->Status()     == OpScopeTPHeader::BadRequest);
+	verify(out->ServiceName().Compare(service->GetName()) == 0);
+	verify(out->CommandID()  == OtScopeTestService_SI::Command_SetData);
+	verify(out->Type()       == OpScopeTPHeader::TYPE);
+	verify(out->Tag()        == 10);
+
+	// Make sure the service was not modified by the command
+	verify(test_service->data_value == 42);
+	verify(test_service->data_name.Compare(UNI_L("Deep Thought")) == 0);
+}
+finally
+{
+	test_service->Clear();
+	test_client->Clear();
+}
+}
+
+foreach (TYPE, INPUT, ERROR) from
+{
+  {JSON, "[\"Easy as Pie\"",
+          "[\"expected integer\",1,1,0]"}
+  ,{JSON, "[\"Easy as Pie",
+	      "[\"unexpected end-of-file\",1,13,0]"}
+  ,{JSON, "",
+	      "[\"expected opening square bracket\",1,0,0]"}
+  ,{JSON, "[1,,]",
+	      "[\"expected string\",1,3,0]"}
+  ,{JSON, "[,1]",
+	      "[\"expected integer\",1,1,0]"}
+  ,{XML,  "<InData><runtimeID>Easy as Pie</runtimeID><title>31415</title>",
+	      "<ErrorInfo><description>unexpected end-of-file</description><line>0</line><column>62</column></ErrorInfo>"}
+  ,{XML,  "<InData></runtimeID>Easy as Pie</runtimeID><title>31415</title>",
+	      "<ErrorInfo><description>mismatched end-tag</description><line>0</line><column>8</column></ErrorInfo>"}
+  ,{XML,  "<InData",
+	      "<ErrorInfo><description>unexpected end-of-file</description><line>0</line><column>1</column></ErrorInfo>"}
+  }
+{
+test( "Send invalid input ($(TYPE))" )
+	require success "Init";
+{
+	char *error = NULL;
+
+	test_service->Clear();
+	test_service->data_value = 42;
+	test_service->data_name.Set(UNI_L("Deep Thought"));
+	test_client->Clear();
+
+	ByteBuffer buffer;
+	// Here the two fields are swapped
+	const char data[] = INPUT;
+	OpProtobufUtils::Append(buffer, data);
+	OpScopeTPMessage msg(OpScopeTPMessage::STP_Call, service->GetName(), OtScopeTestService_SI::Command_SetData, OpScopeTPHeader::OK, 10, OpScopeTPMessage::Version_1);
+	verify(OpStatus::IsSuccess(msg.Construct(buffer, OpScopeTPHeader::TYPE)));
+	verify(OpStatus::IsSuccess(service->OnReceive(test_client, msg)));
+	verify(test_client->Count() == 1);
+	const OpScopeTPMessage *out = test_client->First();
+	verify(out != NULL);
+	verify(out->TransportType() == OpScopeTPMessage::STP_Error);
+	verify(out->Version() == OpScopeTPMessage::Version_1);
+	verify(out->Status()     == OpScopeTPHeader::BadRequest);
+	verify(out->ServiceName().Compare(service->GetName()) == 0);
+	verify(out->CommandID()  == OtScopeTestService_SI::Command_SetData);
+	verify(out->Type()       == OpScopeTPHeader::TYPE);
+	verify(out->Tag()        == 10);
+
+	error = out->Data()->Copy(TRUE);
+	verify(error != NULL);
+	const char *expected_error = ERROR;
+	verify(op_stricmp(error, expected_error) == 0);
+
+	// Make sure the service was not modified by the command
+	verify(test_service->data_value == 42);
+	verify(test_service->data_name.Compare(UNI_L("Deep Thought")) == 0);
+}
+finally
+{
+	OP_DELETEA(error);
+	test_service->Clear();
+	test_client->Clear();
+}
+}

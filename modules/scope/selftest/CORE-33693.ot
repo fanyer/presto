@@ -1,0 +1,133 @@
+/* -*- Mode: c++; tab-width: 4; indent-tabs-mode: t; c-basic-offset: 4 -*-
+**
+** Copyright (C) 2010-2011 Opera Software ASA.  All rights reserved.
+**
+** This file is part of the Opera web browser.  It may not be distributed
+** under any circumstances.
+*/
+
+group "scope.onnewscript";
+
+require init;
+require ECMASCRIPT_DEBUGGER;
+require PREFS_HAS_PREFSFILE;
+require PREFS_WRITE;
+include "modules/ecmascript_utils/esdebugger.h";
+include "modules/prefs/prefsmanager/collections/pc_js.h";
+include "modules/doc/frm_doc.h";
+include "modules/ecmascript_utils/esasyncif.h";
+include "modules/ecmascript_utils/essched.h";
+include "modules/windowcommander/OpWindowCommander.h";
+include "modules/selftest/src/doc_st_utils.h";
+
+include "modules/windowcommander/src/WindowCommander.h";
+
+global
+{
+	class ScriptDebugger :
+		public WaitUntilLoadedObj
+		, public ES_DebugListener // An instance of this class is attached to g_ecmaManager during the test.
+	{
+	public:
+		static void PerformTest(Window* win)
+		{
+			OpWindowCommander::OpenURLOptions options;
+			options.entered_by_user = TRUE;
+			if (OpStatus::IsError(win->GetWindowCommander()->OpenURL(UNI_L("http://www.opera.com/"), options)))
+			{
+				ST_failed("Failed to open URL");
+				return;
+			}
+
+			ScriptDebugger* debugger = OP_NEW(ScriptDebugger, ());
+			if (!debugger)
+			{
+				ST_failed("Out of memory");
+				return;
+			}
+
+			if (OpStatus::IsError(debugger->Construct()))
+			{
+				debugger->Abort();
+				ST_failed("Failed to initialize.");
+			}
+		}
+
+		~ScriptDebugger()
+		{
+			if (restore_settings)
+			{
+				g_ecmaManager->SetDebugListener(NULL);
+				OpStatus::Ignore(g_pcjs->WriteIntegerL(PrefsCollectionJS::UserJSEnabled, pref_user_js));
+				OpStatus::Ignore(g_pcjs->WriteStringL(PrefsCollectionJS::UserJSFiles, olduserjs.CStr()));
+			}
+		}
+
+		// ES_DebugListener part
+
+		virtual void NewScript(ES_Runtime *runtime, ES_DebugScriptData *data)
+		{
+			if (data->type == SCRIPT_TYPE_USER_JAVASCRIPT)  // got a browser-javascript
+			{
+				this->Abort(); // Deletes this!
+
+				if(data->url)
+					ST_passed(); // got an uri for the userjs, and since all userjs files has an actual file this is always true
+				else
+					ST_failed("got no uri for the userjs");
+			}
+		}
+
+		virtual void ParseError(ES_Runtime *runtime, ES_ErrorInfo *err){}
+		virtual void NewContext(ES_Runtime *runtime, ES_Context *context){}
+		virtual void DestroyContext(ES_Runtime *runtime, ES_Context *context){}
+		virtual void DestroyRuntime(ES_Runtime *runtime){}
+		virtual void DestroyObject(ES_Object *object){}
+		virtual void RuntimeCreated(ES_Runtime *runtime){}
+		virtual BOOL EnableDebugging(ES_Runtime *runtime) { return (runtime->GetFramesDocument() && runtime->GetFramesDocument()->GetWindow() == state.GetWindow()); }
+		virtual void EnterContext(ES_Runtime *runtime, ES_Context *context) { }
+		virtual void LeaveContext(ES_Runtime *runtime, ES_Context *context) { }
+		virtual EventAction HandleEvent(EventType type, unsigned int script_guid, unsigned int line_no)	{ return ESACT_CONTINUE; }
+
+	protected:
+
+		OP_STATUS Construct()
+		{
+			RETURN_IF_ERROR(g_folder_manager->GetFolderPath(OPFILE_SELFTEST_DATA_FOLDER, ourjs));
+			RETURN_IF_ERROR(ourjs.Append(UNI_L("modules/scope/selftest/testfiles/CORE-33693.js")));
+
+			// Get the initial values for these prefs.
+			pref_user_js = g_pcjs->GetIntegerPref(PrefsCollectionJS::UserJSEnabled);
+			const uni_char *userjs = g_pcjs->GetStringPref(PrefsCollectionJS::UserJSFiles);
+
+			RETURN_IF_ERROR(olduserjs.Set(userjs));
+
+			restore_settings = TRUE;
+
+			g_ecmaManager->SetDebugListener(this);
+			OpStatus::Ignore(g_pcjs->WriteIntegerL(PrefsCollectionJS::UserJSEnabled, 1));
+			OpStatus::Ignore(g_pcjs->WriteStringL(PrefsCollectionJS::UserJSFiles, ourjs.CStr()));
+
+			return OpStatus::OK;
+		}
+
+		ScriptDebugger() : restore_settings(FALSE) {}
+
+		int pref_user_js;
+		OpString olduserjs;
+		OpString ourjs;
+		BOOL restore_settings;
+	};
+}
+
+///////////////////////////////////////////////////////////////////////////////
+
+test("NewScript uri with User JS")
+	async;
+{
+	Window* win = state.GetWindow();
+	if (!win)
+		ST_failed("No test window!");
+	else
+		ScriptDebugger::PerformTest(win);
+}

@@ -1,0 +1,556 @@
+group "offline_app.manifest";
+
+include "modules/applicationcache/src/manifest_parser.h";
+include "modules/applicationcache/src/manifest_parser_impl.h";
+
+include "modules/applicationcache/selftest/manifest/constants.h";
+
+require APPLICATION_CACHE_SUPPORT;
+
+global {
+
+    #define MANIFEST_DEF_VALUE reinterpret_cast<Manifest*> (-1)
+
+    ManifestParser* CreateManifestParserStub () {
+        URL_CONTEXT_ID context_id = 0;
+
+        const OpStringC manifest_url_str = UNI_L (TEST_MANIFEST_URL);
+
+        URL manifest_url = g_url_api->GetURL (manifest_url_str, context_id);
+
+        ManifestParser* tmp_manifest_parser;
+        RETURN_VALUE_IF_ERROR (ManifestParser::BuildManifestParser (manifest_url, tmp_manifest_parser), NULL);
+
+        return tmp_manifest_parser;
+    }
+}
+
+subtest VerifyManifestSignFunction (const uni_char* const test_str, BOOL result) {
+    const OpStringC op_str (test_str);
+    verify (result == ManifestParserImpl::CheckMagicSign (test_str, op_str.Length ()));
+}
+
+table ValidManifests (const uni_char*const, const char*const) {
+    {   UNI_L ("CACHE MANIFEST "),    "there is no BOM"  },
+    {   UNI_L ("CACHE MANIFEST "),    "delimiter is SPACE" },
+    {   UNI_L ("CACHE MANIFEST\t"),   "delimiter is TAB" },
+    {   UNI_L ("CACHE MANIFEST\x0A"), "delimiter is LF" },
+    {   UNI_L ("CACHE MANIFEST\x0D"), "delimiter is CR" },
+    {   UNI_L ("CACHE MANIFEST \u19990\u30028\u12395\u12399\u24754\u12375\u12356\u29289\u35486"), "manifest with true UTF-8"},
+}
+
+table InvalidManifests (const uni_char*const, const char*const) {
+    {   UNI_L (""),                "empty string" }, 
+    {   UNI_L ("!CACHE MANIFEST"), "though string is OK, it starts with a wrong character '!'" },
+    {   UNI_L ("CACHE MANIFEST!"), "magic signs ends with '!' character" },
+    {   UNI_L ("CaCHE MANIFEST "), "magic sign is case sensitive" },
+    {   UNI_L ("CACHE MANIFESt "), "yet another wrong manifest" },
+    {   UNI_L ("CACHE  MANIFEST "),"extra space between 'CACHE' and 'MANIFEST'" },
+    {   UNI_L ("\u12461\u12515\u12483\u12471\u12517\u12364\u12289"), "UTF-8 content (on Japanese)" },
+    {   UNI_L ("CACHE"),           "incomplete sign" },
+    {   UNI_L ("CACHE M"),         "yet another incomplete sign" },
+}
+
+foreach (test_str, desc) from ValidManifests {
+    test ("Check Magic Sign: The sign is valid - " desc) leakcheck;
+    {
+// disable C4428 : universal-character-name encountered in source
+// ( see description at http://social.msdn.microsoft.com/Forums/en/vclanguage/thread/13ecfe21-d767-4e01-9092-3fd0eedd5675 )
+#ifdef _MSC_VER
+#pragma warning( push )
+#pragma warning( disable: 4428 )
+#endif	
+        verify(VerifyManifestSignFunction (test_str, TRUE));
+#ifdef _MSC_VER
+#pragma warning( pop )
+#endif
+    }
+}
+
+foreach (test_str, desc) from InvalidManifests {
+    test("Check Magic Sign: The sign is invalid - " desc) leakcheck;
+    {
+// disable C4428 : universal-character-name encountered in source
+// ( see description at http://social.msdn.microsoft.com/Forums/en/vclanguage/thread/13ecfe21-d767-4e01-9092-3fd0eedd5675 )
+#ifdef _MSC_VER
+#pragma warning( push )
+#pragma warning( disable: 4428 )
+#endif	
+        verify(VerifyManifestSignFunction (test_str, FALSE));
+#ifdef _MSC_VER
+#pragma warning( pop )
+#endif
+    }
+}
+
+table ValidSections (const uni_char*const, ManifestParserImpl::LineType, const char*const) {
+    {   UNI_L ("CACHE:"), ManifestParserImpl::CACHE_SECTION_DEF, "CACHE with colon" },
+    {   UNI_L ("NETWORK:"), ManifestParserImpl::NETWORK_SECTION_DEF, "NETWORK with colon" },
+    {   UNI_L ("FALLBACK:"), ManifestParserImpl::FALLBACK_SECTION_DEF, "FALLBACK with colon" },
+    {   UNI_L ("\t  FALLBACK:"), ManifestParserImpl::FALLBACK_SECTION_DEF, "leading space characters" },
+    {   UNI_L ("FALLBACK:     \t   "), ManifestParserImpl::FALLBACK_SECTION_DEF, "trailing space characters" },
+    {   UNI_L ("\t\t  \tFALLBACK: \t\t   "), ManifestParserImpl::FALLBACK_SECTION_DEF, "all around space characters" },
+}
+
+table InvalidSections (const uni_char*const, const char*const) {
+    {   UNI_L (":"),                   "there is just one column" },
+    {   UNI_L ("abc derf ghj:"),       "the line has trailing column (no trailing white spaces)" },
+    {   UNI_L ("    \t:\t\t\t    \t"), "the line has trailing column as well as leading and triling white spaces" },
+}
+
+subtest VerifyTokenFunction (const uni_char* const str, ManifestParserImpl::LineType line_type) {
+    const OpStringC test_str (str);
+    unsigned start_pos = 0;
+    unsigned length = test_str.Length ();
+    const ManifestParserImpl::LineType actual_line_type = ManifestParserImpl::AnalyzeLine (test_str.CStr (), start_pos, length);
+
+    verify (line_type == actual_line_type);
+}
+
+foreach (test_str, line_type, desc) from ValidSections {
+    test ("Check Section Parser: section is valid - " desc) leakcheck;
+    {
+        verify(VerifyTokenFunction (test_str, line_type));
+    }
+}
+
+foreach (test_str, desc) from InvalidSections {
+    test ("Check Section Parser: section is invalid - " desc) leakcheck;
+    {
+        verify(VerifyTokenFunction (test_str, ManifestParserImpl::UNKNOWN));
+    }
+}
+
+test ("Test of Chunk Data Parsing. Case 1: empty data") leakcheck;
+{
+    OpAutoPtr<ManifestParser> manifest_parser (CreateManifestParserStub ());
+
+    // test data - emtpy string
+    const uni_char*const empty_data = UNI_L ("");
+
+    unsigned parsed_chars = 0;
+
+    // when it is stated that it is not a last attempt to parse data
+    // then this line is ignored completly
+    const OP_STATUS status_ok = manifest_parser->Parse(empty_data, 0, FALSE, parsed_chars);
+
+    verify (OpStatus::OK == status_ok);
+    verify (0 == parsed_chars); // 0 characters must be parsed
+
+    // but when it is parsed a last part of the data
+    // and manifest signature is not defined, this is definitely a wrong manifest file
+    // and a set of different values should be returned
+    const OP_STATUS status_nok = manifest_parser->Parse(empty_data, 0, TRUE, parsed_chars);
+    verify (OpStatus::ERR == status_nok);
+    verify (0 == parsed_chars);
+}
+
+test ("Test of Chunk Data Parsing. Case 2: Nonempty Data & 1 Chunk") leakcheck;
+{
+    const OpAutoPtr<ManifestParser> manifest_parser (CreateManifestParserStub ());
+    verify (NULL != manifest_parser.get());
+
+    OpString manifest_data;
+    OP_STATUS status_ok = manifest_data.Set (
+            "CACHE MANIFEST\r" // a Mac OS new line (valid manifest header)
+            "/img/logo.png\n\r" // a good explicit cache resource and a Windows new line (CACHE def. section)
+            "/src/script.js\n" // yet another explicit recourse, but now with a Linux new line
+            // a valid explicit resource, but with a pseudo Windows line
+            // note, the resource will be excluded, because it has a different protocols that manifest itself
+            "https://www.opera.com:33/src/style.css\r\n"
+            "CACHE:\n" // Empty section with UNIX new line
+            "\r\n" // Empty line with Windows new line
+            "NETWORK:\r\n" // Yet another a Windows aka new line (with changed order of NL LF)
+            "/server.jsp?would-you-be-so-kind-to-give-me-a-user-id\n"
+            "a/b/c/i-am-not-a-url-at-all!" // this is a wrong section, but it is nit a URL!
+            "/zyu.foo" // a resource in NETWORK section (the previous ignored)
+            "/img/logo.png\n\r" // this must be excluded, because it has been already in CACHE section
+    );
+    verify_success(status_ok);
+
+    const unsigned manifest_data_size = static_cast<unsigned>(manifest_data.Length());
+
+    unsigned parsed_chars = 0;
+    status_ok = manifest_parser->Parse(manifest_data.CStr(), manifest_data_size, FALSE, parsed_chars);
+
+    verify(OpStatus::IsSuccess(status_ok));
+    verify (manifest_data_size == parsed_chars);
+
+    Manifest* tmp_manifest;
+    verify (OpStatus::IsSuccess (manifest_parser->BuildManifest(tmp_manifest)));
+    const OpAutoPtr<const Manifest> manifest (tmp_manifest);
+    verify (NULL != tmp_manifest);
+}
+
+test ("Test of Chunk Data Parsing. Case 3: Nonempty Data & 2 Chunks") leakcheck;
+{
+    const OpAutoPtr<ManifestParser>manifest_parser (CreateManifestParserStub ());
+    verify (NULL != manifest_parser.get());
+
+    OpString manifest_data_1;
+    OP_STATUS status = manifest_data_1. Set (
+            "CACHE MANIFEST\r" // Mac OS new line (valid manifest header)
+            "/img/logo.png\n\r" // Windows new line
+            "/src/scri" // these 8 characters will not be taken into consideration
+    );
+    verify_success(status);
+
+    OpString manifest_data_2;
+    status = manifest_data_2.Set (
+            "\r/src/script.js\n" // Linux new line
+            "/src/style.css\r\n" //
+            "CACHE:\n" // Empty header with UNIX new line
+            "\r\n"
+            "NETWORK:\r\n" // Yet another Windows aka (with changed order of NL LF)
+            "/server.jsp"
+    );
+    verify_success(status);
+
+    const unsigned manifest_data_size_1 = static_cast<unsigned>(manifest_data_1.Length());
+    const unsigned manifest_data_size_2 = static_cast<unsigned>(manifest_data_2.Length());
+
+    unsigned parsed_chars = 0;
+    const OP_STATUS status_ok_1 = manifest_parser->Parse(
+            manifest_data_1.CStr(),
+            manifest_data_size_1,
+            FALSE,
+            parsed_chars
+    );
+
+
+    verify (OpStatus::IsSuccess (status_ok_1));
+    verify (manifest_data_size_1 - 9 == parsed_chars);
+
+    const OP_STATUS status_ok_2 = manifest_parser->Parse (
+            manifest_data_2.CStr(),
+            manifest_data_size_2,
+            TRUE,
+            parsed_chars
+    );
+    verify (OpStatus::IsSuccess (status_ok_2));
+    verify (manifest_data_size_2 == parsed_chars);
+}
+
+subtest VerifyCorrectReturnValues (const uni_char*const manifest_data, BOOL is_valid_manifest) {
+    OpAutoPtr <ManifestParser> manifest_parser (CreateManifestParserStub ());
+    unsigned parsed_chars = 0;
+    const OpStringC tmp_manifest_data (manifest_data);
+
+    const OP_STATUS parse_status = manifest_parser->Parse(
+            tmp_manifest_data.CStr(),
+            tmp_manifest_data.Length(),
+            TRUE,
+            parsed_chars
+    );
+
+    if (is_valid_manifest) {
+        verify (OpStatus::OK == parse_status);
+        verify (static_cast<unsigned>(tmp_manifest_data.Length ()) == parsed_chars );
+    } else {
+        verify (OpStatus::ERR == parse_status);
+        // in wrong case number of parsed characters may vary
+    }
+
+
+    Manifest* tmp_manifest = MANIFEST_DEF_VALUE;
+    const OP_STATUS manifest_build_return = manifest_parser->BuildManifest(tmp_manifest);
+    const OpAutoPtr<Manifest> manifest(tmp_manifest);
+    if (is_valid_manifest) {
+        verify (OpStatus::OK == manifest_build_return);
+        verify (NULL != tmp_manifest);
+        verify (MANIFEST_DEF_VALUE != tmp_manifest);
+    } else {
+        verify (OpStatus::ERR == manifest_build_return);
+        verify (NULL == tmp_manifest);
+    }
+}
+
+/**
+ * Test that parser returns valid statuses
+ * The test verifies a set of additional cases those were a reasons of certain bugs, among them:
+ *  # when a parser parses the last chunk of data but a manifest is not valid,
+ *      then OpStatus::ERR should be returned;
+ *  # when a parser builds manifest, but its inner manifest object is NULL,
+ *      then OpStatus::ERR should be returned.
+ */
+test ("Test that parser returns a valid OP_STATUS for different cases") leakcheck;
+{
+    const uni_char*const valid_manifest = UNI_L (
+            "CACHE MANIFEST\n/img/logo.png"
+    );
+    verify(VerifyCorrectReturnValues (valid_manifest, TRUE));
+
+    const uni_char*const invalid_manifests[] = {
+            UNI_L (""), // empty string
+            UNI_L ("WRONG MAGIC SIGN"),
+            UNI_L ("CACHE MANIFEST*"), // wrong magic sign delimiter
+            UNI_L ("CACHE"), // short magic sign
+            UNI_L ("CACHE SOMETHING\n/img/logo.png") // quite long, but wrong manifest
+    };
+    for (unsigned ix = 0; ix < sizeof (invalid_manifests)/sizeof (const uni_char*); ix++) {
+        verify(VerifyCorrectReturnValues (invalid_manifests[ix], FALSE));
+    }
+}
+
+subtest ApplyIncrementParsing (
+        const uni_char*const manifest_data_str,
+        unsigned manifest_data_size,
+        unsigned increment,
+        ManifestParser*& manifest_parser
+) {
+    OP_ASSERT (NULL == manifest_parser); // prevent memory leak
+
+    OpAutoPtr <ManifestParser> manifest_parser_tmp (CreateManifestParserStub ());
+    verify (NULL != manifest_parser_tmp.get ());
+
+    unsigned inner_increment = increment;
+    unsigned offset = 0;
+
+    BOOL is_last = FALSE;
+
+    for (unsigned ix = 0; ix < manifest_data_size; ix++) {
+        unsigned parsed_chars = 0;
+
+        if (manifest_data_size <= offset + inner_increment) {
+            // the total number of data to be parsed should not be greater then
+            inner_increment = manifest_data_size - offset;
+            is_last = TRUE;
+        }
+
+        OP_ASSERT (manifest_data_size >= offset + inner_increment); // buffer overflow check
+
+        verify_success(manifest_parser_tmp->Parse (manifest_data_str + offset, inner_increment, is_last, parsed_chars));
+        // it may happen that some data are not sufficient to be parsed
+        //  so, next time, it is tried to put a bit more data
+        //  in other case (when data has been parsed) try to parse fixed (`increment') size
+        inner_increment = parsed_chars ? increment : inner_increment + increment;
+        offset += parsed_chars;
+
+        if (is_last) {
+            verify (manifest_data_size == offset);
+            output ("\t\t\t\tparsing with increment %u - OK\n", increment);
+            break;
+        }
+
+        OP_ASSERT (offset < manifest_data_size);
+    }
+
+    OP_ASSERT (is_last); //
+
+    manifest_parser = manifest_parser_tmp.release();
+}
+
+/**
+ * The test checks how a valid manifest file is checked when +1, +2, ... file_size are passed to the parser step by step.
+ *
+ * The test also verifies that the hash value in all cases remains the same (as the hash value for the completely parsed
+ * manifest at once).
+ *
+ * The test runs a bit slowly because it checks a lot of cases. The complexity of the test is almost ~ O (n^2).
+ */
+test ("Incremental parse test with hash value validation") leakcheck;
+{
+    OpString manifest_content;
+
+    const char*const manifest_str =
+            "CACHE MANIFEST\n"
+            "\n"
+            "CACHE:\n" // a set of white lines:
+            "\n"
+            " \n"
+            "  \n"
+            "   \n"
+            "    \n"
+            "   \n"
+            "  \n"
+            "\n"
+            "\n" // some resources:
+            "A.png\n" // UNIX new-line
+            "ABC.png \t\n"
+            "\r\n" // Windows new-line
+            "\n\r" // Pseudo Windows new-line
+            "\r" // Max new-line
+            "                       FALLBACK:\t\t\t        \r\n"
+            "NETWORK:\n"
+            "*\n"
+            "         " // no new line at all
+    ;
+    verify_success(manifest_content.Set (manifest_str));
+
+    // calculate only once to decrease time on size calculation
+    const unsigned manifest_content_size = static_cast<unsigned> (manifest_content.Length ());
+    OpString etalon_hash;
+
+    output ("\n");
+    for (unsigned ix = manifest_content_size; ix; ix--) {
+        OpAutoPtr <ManifestParser> manifest_parser;
+
+        ManifestParser* manifest_parser_tmp = NULL;
+        verify(
+            ApplyIncrementParsing (
+                manifest_content.CStr (),
+                manifest_content_size,
+                ix,
+                manifest_parser_tmp
+            )
+        );
+
+        manifest_parser.reset (manifest_parser_tmp);
+        verify (NULL != manifest_parser.get ());
+        Manifest* manifest_tmp = NULL;
+        verify_success(manifest_parser->BuildManifest (manifest_tmp));
+        OpAutoPtr <Manifest> manifest (manifest_tmp);
+
+        if (ix == manifest_content_size) {
+            verify_success(etalon_hash.Set (manifest->GetHash ()));
+        } else {
+            OP_ASSERT (etalon_hash.Length ()); // self test that etalon hash value was initialized
+            // hash values must be the same!
+            verify (0 == etalon_hash.Compare (manifest->GetHash ()));
+        }
+    }
+}
+
+test ("Test how two strings from a buffer are parsed when there is no a trailing `\0'") leakcheck;
+{
+    OpString manifest_content;
+
+    const char*const manifest_content_raw =
+            "CACHE MANIFEST\n"
+            "\n"
+            "\n"
+            "\n"
+            "\n"
+            "CACHE:\n"
+            "index2.html\n"
+            "picture1.jpg\n"
+            "picture2.jpg\n"
+            "\n"
+            "FALLBACK:\n"
+            "\n"
+            "NETWORK:\n"
+            "\n"
+            "\n"
+            "\n"
+            " \n"
+            " \n"
+            " \n"
+            "  \n"
+            "  \n"
+            "#" // this character will not be taken into account
+    ;
+
+    verify_success(manifest_content.Set (manifest_content_raw));
+
+    const uni_char*const manifest_content1 = manifest_content.CStr();
+
+    // substract one character that must not be taken into account
+    const unsigned manifest_content1_size = ::uni_strlen (manifest_content1) - 1;
+
+    // note, that there is no `\0' delimiter here!
+    const uni_char manifest_content2 [] = {static_cast<uni_char>(' '), static_cast<uni_char>(' ')};
+    const unsigned manifest_content2_size = sizeof (manifest_content2) / sizeof (uni_char);
+
+    OpAutoPtr<ManifestParser> manifest_parser (CreateManifestParserStub ());
+    verify (NULL != manifest_parser.get ());
+
+    unsigned parsed = 0;
+    verify_success(manifest_parser->Parse (manifest_content1, manifest_content1_size, FALSE, parsed));
+    verify (manifest_content1_size == parsed);
+
+    verify_success(manifest_parser->Parse (manifest_content2, manifest_content2_size, TRUE , parsed));
+    verify (manifest_content2_size == parsed);
+
+    Manifest* manifest_tmp;
+    verify_success(manifest_parser->BuildManifest (manifest_tmp));
+    OpAutoPtr <Manifest> manifest(manifest_tmp);
+    verify (NULL != manifest.get ());
+}
+
+subtest VerifyURLs (
+        const uni_char*const*const urls,
+        unsigned urls_size,
+        Manifest* manifest,
+        Manifest::SectionType section_type
+) {
+    for (unsigned ix = 0; ix < urls_size; ix++) {
+        BOOL result = FALSE;
+        switch (section_type) {
+            case Manifest::CACHE:
+                result = manifest->CheckCacheUrl (urls[ix]);
+            break;
+
+            case Manifest::FALLBACK:
+                const uni_char* tmp_ulr;
+                result = manifest->MatchFallback (urls[ix], tmp_ulr);
+            break;
+
+            case Manifest::NETWORK:
+                result = manifest->MatchNetworkUrl (urls[ix]);
+            break;
+        }
+
+        verify (TRUE == result);
+    }
+}
+
+/**
+ * The test case that section names are properly handled that is to say only
+ *  if the section name is trailed with `:' than this is a section name, in other case
+ *  this is a simple URL.
+ */
+test ("Test that section properly handled") leakcheck;
+{
+    OpString manifest_content;
+    const char*const manifest_content_raw =
+        "CACHE MANIFEST\n"
+        "\n"
+        "CACHE:\n"                  // section
+        "   NETWORK\n"
+        "\n"
+        "NETWORK:\n"                // section
+        "   CACHE\n"
+        "\n"
+        "FALLBACK:\n"               // section
+        "   FALLBACK NETWORK\n"
+        "   CACHE FALLBACK\n"
+    ;
+
+    verify_success(manifest_content.Set (manifest_content_raw));
+
+    OpString valid_cached_1, valid_cached_2;
+    verify_success(valid_cached_1.Set(TEST_BASE_URL "/NETWORK"));
+    verify_success(valid_cached_2.Set(TEST_BASE_URL "/FALLBACK"));
+    const uni_char*const VALID_CACHED [] = {
+        valid_cached_1,
+        valid_cached_2,
+    };
+
+    // nemespace matching
+    OpString valid_fallback_1, valid_fallback_2;
+    verify_success(valid_fallback_1.Set(TEST_BASE_URL "/FALLBACK-x-y-z"));
+    verify_success(valid_fallback_2.Set(TEST_BASE_URL "/CACHE--------1-2-3-4-5-6-7-8-9-0"));
+    const uni_char*const VALID_FALLBACK [] = {
+        valid_fallback_1,
+        valid_fallback_2,
+    };
+
+    OpString valid_network;
+    verify_success(valid_network.Set(TEST_BASE_URL "/CACHE"));
+    const uni_char*const VALID_NETWORK [] = {
+        valid_network
+    };
+
+    OpAutoPtr <ManifestParser> manifest_parser (CreateManifestParserStub ());
+    unsigned parsed_chars;
+    verify_success(manifest_parser->Parse (manifest_content, ::uni_strlen (manifest_content), TRUE, parsed_chars));
+
+    Manifest* tmp_manifest;
+    verify_success(manifest_parser->BuildManifest (tmp_manifest));
+    OpAutoPtr <Manifest> manifest (tmp_manifest);
+    verify (NULL != manifest.get ());
+
+    verify(VerifyURLs (VALID_CACHED, sizeof (VALID_CACHED) / sizeof (const uni_char*), manifest.get (), Manifest::CACHE));
+    verify(VerifyURLs (VALID_FALLBACK, sizeof (VALID_FALLBACK) / sizeof (const uni_char*), manifest.get (), Manifest::FALLBACK));
+    verify(VerifyURLs (VALID_NETWORK, sizeof (VALID_NETWORK) / sizeof (const uni_char*), manifest.get (), Manifest::NETWORK));
+}

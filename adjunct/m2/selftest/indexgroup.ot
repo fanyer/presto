@@ -1,0 +1,283 @@
+/* -*- Mode: c++; tab-width: 4; indent-tabs-mode: t; c-basic-offset: 4 -*-
+ *
+ * Copyright (C) 1995-2009 Opera Software AS.  All rights reserved.
+ *
+ * This file is part of the Opera web browser.	It may not be distributed
+ * under any circumstances.
+ *
+ * @author Alexander Remen(alexr)
+ */
+
+group "m2.indexgroup";
+require M2_SUPPORT;
+
+include "adjunct/m2/src/engine/index/indexgroup.h";
+include "adjunct/m2/src/engine/indexer.h";
+include "adjunct/m2/src/engine/engine.h";
+
+global
+{
+	Index* CreateTestIndex(index_gid_t id)
+	{
+		Index* index = OP_NEW(Index, ());
+		index->SetId(IndexTypes::LAST_CATEGORY + id);
+		MessageEngine::GetInstance()->GetIndexer()->NewIndex(index, 0);
+		return index;
+	}
+}
+
+test("Indexer exists")
+{
+	verify(MessageEngine::GetInstance() != 0);
+	verify(MessageEngine::GetInstance()->GetIndexer() != 0);
+};
+
+test("IndexGroups using UnionIndex work correctly") require success "Indexer exists";
+{
+	Index* index_0 = CreateTestIndex(0);
+	Index* index_1 = CreateTestIndex(1);
+
+	verify_success(index_0->NewMessage(1));
+	verify_success(index_0->NewMessage(2));
+	verify_success(index_0->NewMessage(3));
+
+	verify_success(index_1->NewMessage(4));
+	verify_success(index_1->NewMessage(5));
+	verify_success(index_1->NewMessage(6));
+
+	UnionIndexGroup union_group(IndexTypes::LAST_CATEGORY+2);
+	verify_success(union_group.AddIndex(index_0->GetId()));
+	verify_success(union_group.AddIndex(index_1->GetId()));
+
+	// {1,2,3} U {4,5,6} => {1,2,3,4,5,6}
+	Index* group_index = union_group.GetIndex();
+	verify(group_index->MessageCount() == 6);
+	verify(group_index->Contains(1));
+	verify(group_index->Contains(2));
+	verify(group_index->Contains(3));
+	verify(group_index->Contains(4));
+	verify(group_index->Contains(5));
+	verify(group_index->Contains(6));
+
+	// add messages to both indexes after creating the IndexGroup adds messages to the IndexGroup as well
+	
+	// {1,2,3,7} U {4,5,6} => {1,2,3,4,5,6,7}
+	verify_success(index_0->NewMessage(7));
+	verify(group_index->MessageCount() == 7);
+	verify(group_index->Contains(7));
+	
+	// {1,2,3,7} U {4,5,6,8} => {1,2,3,4,5,6,7,8}
+	verify_success(index_1->NewMessage(8));
+	verify(group_index->MessageCount() == 8);
+	verify(group_index->Contains(8));
+
+	// removing from one of the indexes should affect the IndexGroup
+	// {2,3,7} U {4,5,6,8} => {2,3,4,5,6,7,8}
+	verify_success(index_0->RemoveMessage(1));
+	verify(group_index->MessageCount() == 7);
+	verify(!group_index->Contains(1));
+
+	// {2,3,7} U {4,5,8} => {2,3,4,5,7,8}
+	verify_success(index_1->RemoveMessage(6));
+	verify(group_index->MessageCount() == 6);
+	verify(!group_index->Contains(6));
+
+	verify_success(MessageEngine::GetInstance()->GetIndexer()->RemoveIndex(index_0));
+	// {2,3,7} => {2,3,7}
+	verify(group_index->MessageCount() == 3);
+	verify_success(MessageEngine::GetInstance()->GetIndexer()->RemoveIndex(index_1));
+	// {} => {}
+	verify(group_index->MessageCount() == 0);
+
+	verify_success(MessageEngine::GetInstance()->GetIndexer()->RemoveIndex(group_index));
+}
+
+test("IndexGroups using ComplementIndex work correctly") require success "Indexer exists";
+{
+	Index* index_0 = CreateTestIndex(0);
+	Index* index_1 = CreateTestIndex(1);
+
+	verify_success(index_0->NewMessage(1));
+	verify_success(index_0->NewMessage(2));
+	verify_success(index_0->NewMessage(3));
+
+	verify_success(index_1->NewMessage(1));
+	verify_success(index_1->NewMessage(2));
+	verify_success(index_1->NewMessage(4));
+
+	ComplementIndexGroup complement_group(IndexTypes::LAST_CATEGORY+2);
+	verify_success(complement_group.SetBase(index_0->GetId()));
+	verify_success(complement_group.AddIndex(index_1->GetId()));
+
+	// {1,2,3} \ {1,2,4} => {3}
+	Index* group_index = complement_group.GetIndex();
+	verify(group_index->MessageCount() == 1);
+	verify(group_index->Contains(3));
+
+	// add messages to the indexes after creating the IndexGroup adds messages to the IndexGroup as well
+
+	// {1,2,3,5} \ {1,2,4} => {3,5}
+	verify_success(index_0->NewMessage(5));
+	verify(group_index->MessageCount() == 2);
+	verify(group_index->Contains(5));
+	
+	// {1,2,3,5} \ {1,2,4,5} => {3}
+	verify_success(index_1->NewMessage(5));
+	verify(group_index->MessageCount() == 1);
+	verify(!group_index->Contains(5));
+
+	// removing from one of the indexes should affect the IndexGroup
+
+	// {1,2,3,5} \ {1,2,4} => {3,5}
+	verify_success(index_1->RemoveMessage(5));
+	verify(group_index->MessageCount() == 2);
+	verify(group_index->Contains(5));
+
+	// {1,2,5} \ {1,2,4} => {5}
+	verify_success(index_0->RemoveMessage(3));
+	verify(group_index->MessageCount() == 1);
+	verify(!group_index->Contains(3));
+
+	verify_success(MessageEngine::GetInstance()->GetIndexer()->RemoveIndex(index_1));
+	verify_success(MessageEngine::GetInstance()->GetIndexer()->RemoveIndex(index_0));
+	verify_success(MessageEngine::GetInstance()->GetIndexer()->RemoveIndex(group_index));
+}
+
+test("IndexGroups using IntersectionIndex works correctly") require success "Indexer exists";
+{
+	Index* index_0 = CreateTestIndex(0);
+	Index* index_1 = CreateTestIndex(1);
+
+	verify_success(index_0->NewMessage(1));
+	verify_success(index_0->NewMessage(2));
+	verify_success(index_0->NewMessage(3));
+
+	verify_success(index_1->NewMessage(1));
+	verify_success(index_1->NewMessage(2));
+	verify_success(index_1->NewMessage(4));
+
+	IntersectionIndexGroup intersection_group(IndexTypes::LAST_CATEGORY+2);
+	verify_success(intersection_group.SetBase(index_0->GetId()));
+	verify_success(intersection_group.AddIndex(index_1->GetId()));
+	Index* group_index = intersection_group.GetIndex();
+	// {1,2,3} intersect {1,2,4} => {1,2}
+
+	verify(group_index->MessageCount() == 2);
+	verify(group_index->Contains(1));
+	verify(group_index->Contains(2));
+
+	// add messages to both indexes after creating the IndexGroup adds messages to the IndexGroup as well
+
+	// {1,2,3,5} intersect {1,2,4} => {1,2}
+	verify_success(index_0->NewMessage(5));
+
+	verify(group_index->MessageCount() == 2);
+	verify(group_index->Contains(1));
+	verify(group_index->Contains(2));
+	
+	// {1,2,3,5} intersect {1,2,4,5} => {1,2,5}
+	verify_success(index_1->NewMessage(5));
+	verify(group_index->MessageCount() == 3);
+	verify(group_index->Contains(1));
+	verify(group_index->Contains(2));
+	verify(group_index->Contains(5));
+	
+	// {1,2,3,5} intersect {1,2,4,5,6} => {1,2,5}
+	verify_success(index_1->NewMessage(6));
+	verify(group_index->MessageCount() == 3);
+	
+	// {1,2,3,5,6} intersect {1,2,4,5,6} => {1,2,5,6}
+	verify_success(index_0->NewMessage(6));
+	verify(group_index->MessageCount() == 4);
+	verify(group_index->Contains(1));
+	verify(group_index->Contains(2));
+	verify(group_index->Contains(5));
+	verify(group_index->Contains(6));
+	
+	// {1,2,3,5,6} intersect {1,2,4,5} => {1,2,5}
+	verify_success(index_1->RemoveMessage(6));
+	verify(group_index->MessageCount() == 3);
+	
+	// {1,2,3,5} intersect {1,2,4,5} => {1,2,5}
+	verify_success(index_0->RemoveMessage(6));
+	verify(group_index->MessageCount() == 3);
+
+	// {1,2,3} intersect {1,2,4,5} => {1,2}
+	verify_success(index_0->RemoveMessage(5));
+	verify(group_index->MessageCount() == 2);
+	verify(!group_index->Contains(5));
+
+	// {1,2,3} intersect {1,4,5} => {1}
+	verify_success(index_1->RemoveMessage(2));
+	verify(group_index->MessageCount() == 1);
+	verify(!group_index->Contains(2));
+
+	verify_success(MessageEngine::GetInstance()->GetIndexer()->RemoveIndex(index_1));
+	verify_success(MessageEngine::GetInstance()->GetIndexer()->RemoveIndex(index_0));
+	verify_success(MessageEngine::GetInstance()->GetIndexer()->RemoveIndex(group_index));
+}
+
+test("FolderIndexGroups work correctly") require success "Indexer exists";
+{
+	Index* index_0 = CreateTestIndex(0);
+	Index* index_1 = CreateTestIndex(1);
+
+	verify_success(index_0->NewMessage(1));
+	verify_success(index_0->NewMessage(2));
+	verify_success(index_0->NewMessage(3));
+
+	verify_success(index_1->NewMessage(4));
+	verify_success(index_1->NewMessage(5));
+	verify_success(index_1->NewMessage(6));
+
+	FolderIndexGroup folder_group(IndexTypes::LAST_CATEGORY+2);
+	index_0->SetParentId(IndexTypes::LAST_CATEGORY+2);
+	Index* group_index = folder_group.GetIndex();
+	// {1,2,3} => {1,2,3}
+	verify(group_index->MessageCount() == 3);
+	verify(group_index->Contains(1));
+	verify(group_index->Contains(2));
+	verify(group_index->Contains(3));
+	
+	index_1->SetParentId(IndexTypes::LAST_CATEGORY+2);
+	
+	// {1,2,3} U {4,5,6} => {1,2,3,4,5,6}
+	verify(group_index->MessageCount() == 6);
+	verify(group_index->Contains(4));
+	verify(group_index->Contains(5));
+	verify(group_index->Contains(6));
+
+	// add messages to both indexes after creating the IndexGroup adds messages to the IndexGroup as well
+	
+	// {1,2,3,7} U {4,5,6} => {1,2,3,4,5,6,7}
+	verify_success(index_0->NewMessage(7));
+	verify(group_index->MessageCount() == 7);
+	verify(group_index->Contains(7));
+	
+	// {1,2,3,7} U {4,5,6,8} => {1,2,3,4,5,6,7,8}
+	verify_success(index_1->NewMessage(8));
+	verify(group_index->MessageCount() == 8);
+	verify(group_index->Contains(8));
+
+	// removing from one of the indexes should affect the IndexGroup
+	// {2,3,7} U {4,5,6,8} => {2,3,4,5,6,7,8}
+	verify_success(index_0->RemoveMessage(1));
+	verify(group_index->MessageCount() == 7);
+	verify(!group_index->Contains(1));
+
+	// {2,3,7} U {4,5,8} => {2,3,4,5,7,8}
+	verify_success(index_1->RemoveMessage(6));
+	verify(group_index->MessageCount() == 6);
+	verify(!group_index->Contains(6));
+
+	index_1->SetParentId(IndexTypes::CATEGORY_LABELS);
+	// {2,3,7} => {2,3,7}
+	verify(group_index->MessageCount() == 3);
+	index_0->SetParentId(IndexTypes::CATEGORY_LABELS);
+	// {} => {}
+	verify(group_index->MessageCount() == 0);
+
+	verify_success(MessageEngine::GetInstance()->GetIndexer()->RemoveIndex(index_1));
+	verify_success(MessageEngine::GetInstance()->GetIndexer()->RemoveIndex(index_0));
+	verify_success(MessageEngine::GetInstance()->GetIndexer()->RemoveIndex(group_index));
+}

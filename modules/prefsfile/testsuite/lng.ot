@@ -1,0 +1,346 @@
+/* -*- Mode: c++; tab-width: 4; indent-tabs-mode: t; c-basic-offset: 4 -*-
+**
+** Copyright (C) 2003-2007 Opera Software ASA.  All rights reserved.
+**
+** This file is part of the Opera web browser.  It may not be distributed
+** under any circumstances.
+**
+** Peter Karlsson
+*/
+
+group "prefsfile.ini.lng";
+require PREFS_HAS_LNG;
+require initialization; // needs TableManager
+
+include "modules/prefsfile/prefsfile.h";
+include "modules/prefsfile/accessors/lng.h";
+include "modules/prefsfile/accessors/lnglight.h";
+include "modules/util/excepts.h";
+include "modules/util/opfile/opfile.h";
+include "modules/util/opfile/opmemfile.h";
+
+// -- Global variables ---------------------------------------------------
+
+global
+{
+#ifdef PREFS_HAS_PREFSFILE
+	PrefsFile *pfp;
+#endif
+#ifdef PREFS_HAS_LNGLIGHT
+	LangAccessorLight lng;
+#endif
+	OpFile *ofp;
+
+	long int test_dbversion = 666;
+}
+
+setup
+{
+#ifdef PREFS_HAS_PREFSFILE
+	pfp = NULL;
+#endif
+	ofp = NULL;
+#ifdef UPGRADE_SUPPORT
+	test_dbversion = PF_LNG_CUTOFF;
+#endif
+}
+
+// -- Tests --------------------------------------------------------------
+
+test("Checking configuration")
+	require PREFS_HAS_LNGLIGHT;
+{
+	// Make sure the BUILDNUMSUFFIX was configured properly
+	verify(op_strcmp(BUILDNUMSUFFIX, "undefined") || !"See TWEAK_PF_BUILDNUMSUFFIX in modules/prefsfile/module.tweaks");
+}
+
+// Create the file used in all the tests
+
+test("Creating test language file")
+{
+	static const char lng[] =
+		//!; Opera language file version 2.0
+		//!; This file is part of the Opera web browser.  It may not be distributed
+		//!; under any circumstances.
+		//!; Copyright © 2003-2007 Opera Software ASA. All rights reserved.
+		//!
+		//![Info]
+		//!Language="test"
+		//!LanguageName="selftest"
+		//!Charset="us-ascii"
+		//!Build.Win=42
+#ifdef PREFS_HAS_LNGLIGHT
+		"Build." BUILDNUMSUFFIX "=42\n"
+#endif
+		//!Version.Win=9.0
+#ifdef PREFS_HAS_LNGLIGHT
+		"Version." BUILDNUMSUFFIX "=9.0\n"
+#endif
+		//!DB.Version=%ld
+		//!
+		//![Translation]
+		//!1="Newline\n"
+		//!2="Tab\t"
+		//!3="CR\r"
+		//!4="Hex\x22"
+		//!5="Backslash\\"
+		//!6="\\\x22\r\t\n"
+		//!
+		;
+
+	char *newlngbuf = NULL;
+
+	int newlngbuf_size = sizeof(lng) + 32;
+	newlngbuf = OP_NEWA(char, newlngbuf_size); /* ARRAY OK 2009-06-16 molsson */
+	verify(newlngbuf);
+	op_snprintf(newlngbuf, newlngbuf_size, lng, test_dbversion);
+
+	verify((ofp = OP_NEW(OpFile, ())));
+	verify(OpStatus::IsSuccess(
+		ofp->Construct(UNI_L("created.lng"),
+					   OPFILE_HOME_FOLDER)));
+	verify(OpStatus::IsSuccess(ofp->Open(OPFILE_WRITE)));
+	verify(OpStatus::IsSuccess(ofp->Write(newlngbuf, op_strlen(newlngbuf))));
+	verify(OpStatus::IsSuccess(ofp->Close()));
+}
+finally
+{
+	OP_DELETEA(newlngbuf);
+}
+
+// Regular LNG tests through PrefsFile
+
+test("PrefsFile::ConstructL")
+	require PREFS_HAS_PREFSFILE;
+	require success "Creating test language file";
+{
+	pfp = OP_NEW(PrefsFile, (PREFS_LNG));
+	TRAPD(rc, pfp->ConstructL());
+	verify(OpStatus::IsSuccess(rc));
+}
+
+test("PrefsFile::SetFileL")
+	require PREFS_HAS_PREFSFILE;
+	require success "PrefsFile::ConstructL";
+{
+	TRAPD(rc, pfp->SetFileL(ofp));
+	verify(OpStatus::IsSuccess(rc));
+
+	OpFileDescriptor *dp = pfp->GetFile();
+	verify(dp != NULL);
+}
+
+test("PrefsFile::LoadAllL")
+	require PREFS_HAS_PREFSFILE;
+	require success "PrefsFile::SetFileL";
+{
+	OP_MEMORY_VAR OP_STATUS rc = OpStatus::OK;
+	TRAPD(rc2, rc = pfp->LoadAllL());
+	verify(OpStatus::IsSuccess(rc2));
+	verify(OpStatus::IsSuccess(rc));
+}
+
+
+table prefsdata(const uni_char *, const uni_char *, const uni_char *)
+{
+	{ UNI_L("Info"), UNI_L("Language"), UNI_L("test") },
+	{ UNI_L("Info"), UNI_L("LanguageName"), UNI_L("selftest") },
+	{ UNI_L("Info"), UNI_L("Charset"), UNI_L("us-ascii") },
+	{ UNI_L("Info"), UNI_L("Build.Win"), UNI_L("42") },
+	{ UNI_L("Info"), UNI_L("Version.Win"), UNI_L("9.0") },
+
+	{ UNI_L("Translation"), UNI_L("1"), UNI_L("Newline\n") },
+	{ UNI_L("Translation"), UNI_L("2"), UNI_L("Tab\t") },
+	{ UNI_L("Translation"), UNI_L("3"), UNI_L("CR\r") },
+	{ UNI_L("Translation"), UNI_L("4"), UNI_L("Hex\x22") },
+	{ UNI_L("Translation"), UNI_L("5"), UNI_L("Backslash\\") },
+	{ UNI_L("Translation"), UNI_L("6"), UNI_L("\\\x22\r\t\n") },
+}
+
+test("PrefsFile::ReadStringL (OpStringC, uni_char key)")
+	require PREFS_HAS_PREFSFILE;
+	require success "PrefsFile::LoadAllL";
+{
+	OpStringC s;
+	OP_STATUS rc;
+
+	iterate(section, key, value) from prefsdata
+	{
+		TRAP(rc, s = pfp->ReadStringL(section, key));
+		verify(OpStatus::IsSuccess(rc));
+		verify(s.Compare(value) == 0);
+	}
+}
+
+test("PrefsFile::ReadStringL (OpString, uni_char key)")
+	require PREFS_HAS_PREFSFILE;
+	require success "PrefsFile::LoadAllL";
+{
+	OpString s;
+	OP_STATUS rc;
+
+	iterate(section, key, value) from prefsdata
+	{
+		TRAP(rc, pfp->ReadStringL(section, key, s));
+		verify(OpStatus::IsSuccess(rc));
+		verify(s.Compare(value) == 0);
+	}
+}
+
+test("PrefsFile::ReadStringL (OpStringC, ASCII key)")
+	require PREFS_HAS_PREFSFILE;
+	require success "PrefsFile::LoadAllL";
+{
+	OpStringC s;
+
+	iterate(section, key, value) from prefsdata
+	{
+		if (!uni_str_eq(section, "Section3")) // Section3 has non-ASCII keys
+		{
+			const char *section8 = ST_down(section);
+			const char *key8     = ST_down(key);
+			TRAPD(rc, s = pfp->ReadStringL(section8, key8));
+			verify(OpStatus::IsSuccess(rc));
+			verify(s.Compare(value) == 0);
+		}
+	}
+}
+
+test("PrefsFile::ReadStringL (OpString, ASCII key)")
+	require PREFS_HAS_PREFSFILE;
+	require success "PrefsFile::LoadAllL";
+{
+	OpString s;
+
+	iterate(section, key, value) from prefsdata
+	{
+		if (!uni_str_eq(section, "Section3")) // Section3 has non-ASCII keys
+		{
+			const char *section8 = ST_down(section);
+			const char *key8     = ST_down(key);
+			TRAPD(rc, pfp->ReadStringL(section8, key8, s));
+			verify(OpStatus::IsSuccess(rc));
+			verify(s.Compare(value) == 0);
+		}
+	}
+}
+
+test("PrefsFile::IsSection")
+	require PREFS_HAS_PREFSFILE;
+	require success "PrefsFile::LoadAllL";
+{
+	iterate(section, key, value) from prefsdata
+	{
+		verify(pfp->IsSection(section));
+	}
+}
+
+test("PrefsFile::IsKey")
+	require PREFS_HAS_PREFSFILE;
+	require success "PrefsFile::LoadAllL";
+{
+	iterate(section, key, value) from prefsdata
+	{
+		verify(pfp->IsKey(section, key));
+	}
+}
+
+// Tests for LangAccessor
+test("LangAccessor::IsRecognizedLanguageFile (positive)")
+	require UPGRADE_SUPPORT;
+{
+	// Our test file should pass
+	verify(LangAccessor::IsRecognizedLanguageFile(ofp));
+}
+
+test("LangAccessor::IsRecognizedLanguageFile (negative)")
+	require UPGRADE_SUPPORT;
+	require undefined HAVE_NO_OPMEMFILE;
+{
+	OpMemFile *ofp1 = NULL;
+	OpMemFile *ofp2 = NULL;
+
+	// Wrong header version
+	static const unsigned char wronghdrversion[] =
+		//!; Opera language file version 2.1
+		;
+	ofp1 = OpMemFile::Create(wronghdrversion, static_cast<long>(sizeof wronghdrversion));
+	verify(!LangAccessor::IsRecognizedLanguageFile(ofp1));
+
+#if PF_LNG_CUTOFF > 0
+	// Wrong database version
+	static const unsigned char wrongdbversion[] =
+		"\xEF\xBB\xBF" /* UTF-8 BOM */
+		//!; Opera language file version 2.0
+		//!; This file is part of the Opera web browser.  It may not be distributed
+		//!; under any circumstances.
+		//!; Copyright © 2003-2007 Opera Software ASA. All rights reserved.
+		//!
+		//![Info]
+		//!Language="test"
+		//!LanguageName="selftest"
+		//!Charset="us-ascii"
+		//!Build.Win=42
+		//!Version.Win=9.0
+		//!DB.Version=0
+		;
+	ofp2 = OpMemFile::Create(wrongdbversion, static_cast<long>(sizeof wrongdbversion));
+	verify(!LangAccessor::IsRecognizedLanguageFile(ofp2));
+#endif
+}
+finally
+{
+	OP_DELETE(ofp1);
+	OP_DELETE(ofp2);
+}
+
+// Tests for LangAccessorLight
+
+test("LangAccessorLight::LoadL")
+	require success "Creating test language file";
+	require PREFS_HAS_LNGLIGHT;
+{
+	TRAPD(rc, lng.LoadL(ofp, NULL));
+	verify(OpStatus::IsSuccess(rc));
+}
+
+test("LangAccessorLight::GetFileInfo")
+	require PREFS_HAS_LNGLIGHT;
+	require success "LangAccessorLight::LoadL";
+{
+	OpString langcode, langname, build;
+	OP_STATUS rc = lng.GetFileInfo(langcode, langname, build);
+	verify(OpStatus::IsSuccess(rc));
+	verify(langcode.Compare("test") == 0);
+	verify(langname.Compare("selftest") == 0);
+	verify(build.Compare("42") == 0);
+}
+
+test("LangAccessorLight::GetDatabaseVersion")
+	require PREFS_HAS_LNGLIGHT;
+	require success "LangAccessorLight::LoadL";
+{
+	OpString dbversion;
+	OP_STATUS rc = lng.GetDatabaseVersion(dbversion);
+	verify(OpStatus::IsSuccess(rc));
+	long int read_dbversion = uni_strtol(dbversion.CStr(), NULL, 10);
+	verify(read_dbversion == test_dbversion);
+}
+
+// -- Global cleanup -----------------------------------------------------
+
+exit
+{
+#ifdef PREFS_HAS_PREFSFILE
+	OP_DELETE(pfp);
+#endif
+
+	// Remove the generated file
+	BOOL exists = FALSE;
+	ofp->Exists(exists);
+	if (exists)
+	{
+		ofp->Delete();
+	}
+	OP_DELETE(ofp);
+}

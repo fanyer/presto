@@ -1,0 +1,508 @@
+/* -*- Mode: c++; tab-width: 4; indent-tabs-mode: t; c-basic-offset: 4 -*- */
+group "libfreetype";
+
+require USE_FREETYPE;
+require FT_INTERNAL_FREETYPE;
+
+include "modules/libfreetype/include/ft2build.h";
+include "modules/libfreetype/include/freetype/tttables.h";
+include "modules/libfreetype/include/freetype/freetype.h";
+include "modules/libfreetype/include/freetype/ftoutln.h";
+include "modules/libgogi/mde_config.h";
+include "modules/img/decoderfactorypng.h";
+include "modules/pi/OpBitmap.h";
+include "modules/util/opstring.h";
+
+global
+{
+    // set to TRUE to regenerate image data
+    BOOL RegenerateImageData = FALSE;
+
+    BOOL IsInitialized = FALSE;
+    FT_Library library;
+
+    /*
+     * fetches font name. allocates memory for storage, to be cleaned by caller.
+     */
+    OP_STATUS GetFontName( const char* x, char*& n )
+    {
+	const char* end = op_strchr( x, '.' );
+	if ( end )
+	    end = op_strchr( end+1, '.' );
+	if ( !end )
+	    return OpStatus::ERR;
+	int len = end - x;
+	n = OP_NEWA(char, len+1);
+	if ( !n )
+	    return OpStatus::ERR_NO_MEMORY;
+	op_memcpy( n, x, len );
+	n[ len ] = 0;
+	return OpStatus::OK;
+    }
+    /*
+     * fetches glyph name by seeking from the end of the string. returns a pointer
+     * to the character following the second-to-last '.'.
+     */
+    const char* GetGlyphName( const char* x )
+    {
+	const char* c = op_strrchr( x, '.' );
+	if ( !c || c == x )
+	    return 0;
+	--c;
+	while ( c > x && *c != '.' )
+	    --c;
+	return c > x ? c+1 : 0;
+    }
+
+    /* compares glyph data in rendered_glyph with the data in refimage. if contents
+     * mismatch, writes data in rendered_glyph to file.
+     */
+    OP_STATUS VerifyGlyph( const char* refimage, OpBitmap* rendered_glyph,
+			   BOOL generate = FALSE )
+    {
+	const UINT32 Height = rendered_glyph->Height();
+	OP_STATUS status = DecoderFactoryPng::verify( refimage,
+						      rendered_glyph,
+						      Height, 5, 0,
+						      generate );
+	if ( OpStatus::IsError(status) )
+	{
+	    output( "\nfailed to verify '%s'\n", refimage );
+	    OpString8 refimage_failed;
+	    refimage_failed.Set(refimage);
+	    refimage_failed.Insert(op_strlen(refimage) - 4, "_failed");
+	    DecoderFactoryPng::verify( refimage_failed.CStr(),
+				       rendered_glyph,
+				       Height, 5, 0,
+				       TRUE);
+	}
+	return status;
+    }
+
+    /*
+     * creates an OpBitmap and fills it with the rendered glyph.
+     */
+    OP_STATUS MakeBitmap( FT_Bitmap ftbitmap, OpBitmap** bitmap )
+    {
+	const UINT32
+	    W = ftbitmap.width,
+	    H = ftbitmap.rows;
+	const INT32 Pitch = ftbitmap.pitch;
+	OP_STATUS status = OpBitmap::Create( bitmap, W, H );
+	RETURN_IF_ERROR( status );
+	UINT32* line = OP_NEWA(UINT32, W);
+	if ( !line )
+	{
+	    OP_DELETE(*bitmap);
+	    return OpStatus::ERR_NO_MEMORY;
+	}
+	unsigned char* s = ftbitmap.buffer;
+	if ( Pitch < 0 )
+	    s -= (H-1)*Pitch;
+	for ( UINT32 y = 0; y < H; ++y )
+	{
+	    for ( UINT32 x = 0; x < W; ++x )
+		line[x] = MDE_RGBA(255-s[x], 255-s[x], 255-s[x], 255);
+	    s += Pitch;
+	    status = (*bitmap)->AddLine( line, y );
+	    if ( OpStatus::IsError( status ) )
+	    {
+		OP_DELETE(*bitmap);
+		break;
+	    }
+	}
+	OP_DELETEA(line);
+	return status;
+    }
+
+
+    void GetGlyphIndex( const char* glyph_str, UINT32& id, BOOL& transform, BOOL& boldify, BOOL& isCharIdx )
+    {
+	isCharIdx = FALSE;
+	transform = boldify = FALSE;
+	start:
+	switch ( *glyph_str )
+	{
+	case 'b':
+		++glyph_str;
+		boldify = TRUE;
+		goto start;
+		break;
+
+	case 't':
+		++glyph_str;
+		transform = TRUE;
+		goto start;
+		break;
+
+	case 'c': // interpret as char
+	    id = glyph_str[1];
+	    break;
+
+	case 'i': // interpret as (hex) glyph index
+	    isCharIdx = TRUE;
+		/* fall through */
+	case 'u': // interpret as (hex) unicode point
+	    if ( op_sscanf( glyph_str+1, "%x.png", &id ) != 1 )
+	    {
+		output( "warning: failed to scan hex value (%%x.png in '%s') - using 0\n", glyph_str+1 );
+		id = 0;
+	    }
+	    break;
+
+	default:
+	    output( "\nunsupported glyph identifier: '%c'\n", *glyph_str );
+	    id = 0; // id 0 is "missing"
+	    isCharIdx = TRUE;
+	}
+    }
+}
+
+/*
+ * initializes freetype
+ */
+setup
+{
+    IsInitialized = FT_Init_FreeType( &library ) == 0;
+}
+
+/*
+ * shuts down freetype
+ */
+exit
+{
+    FT_Done_FreeType( library );
+}
+
+/*
+ * compares rendered glyphs with reference images. to generate a reference
+ * image, create an empty file with the appropriate name and run test with
+ * RegenerateImageData = TRUE.
+ *
+ * naming convention
+ *
+ * <font name>.render.<glyph>.png
+ * font name is the name of a font that freetype can load. the font file
+ * itself should be present in the glyphs/ directory.
+ *
+ * glyph denotes the glyph to render. format can be:
+ *
+ * - c<ascii character> - direct ascii character, i.e. ca will render 'a'
+ * - u<unicode hex value> - hexadecimal unicode point, i.e. u903 will render
+ *   greek capital letter omega
+ * - i<glyph index hex value> - hexadecimal glpyh index, i.e. i1 will render
+ *   the first character in the font
+ *
+ * if glyph starts with t, transformations will be applied. i.e. tca will
+ * render 'a' using transformations; tu2dc will render small tilde using
+ * transformations.
+ *
+ * if glyph starts with b, boldification will be applied.
+ */
+table glyphs( const char* ) filelist "glyphs" name "*.render.*.png";
+test( "render glyph $(file_name)" )
+    multi glyphs( file_name );
+{
+    FT_Face face = 0;
+    char* font_file = 0;
+
+    // fetch font file name
+    verify ( GetFontName( file_name, font_file ) == OpStatus::OK );
+    verify( font_file );
+
+    // fetch glyph name
+    const char* glyph_str = GetGlyphName( file_name );
+    verify ( glyph_str > file_name );
+
+    // load font
+    verify ( IsInitialized );
+    const UINT32 Index = 0;
+    int e = FT_New_Face( library, font_file, Index, &face );
+    if ( e )
+    {
+	output( "\nfailed to load face '%s' (error status is %d)\n", font_file, e );
+    }
+
+    verify( !e );
+
+    // set font size
+    const UINT32 Height = 12; // pixel height
+    verify ( !FT_Set_Pixel_Sizes( face, 0, Height ) );
+
+    // get character id
+    UINT32 id;
+    BOOL transform, boldify, isCharIdx;
+    GetGlyphIndex( glyph_str, id, transform, boldify, isCharIdx );
+    if ( !isCharIdx )
+	id = FT_Get_Char_Index( face, id );
+
+    if ( id != 0) // id 0 is "missing"
+    {
+	// apply transformation
+	if (transform)
+	{
+	    FT_Matrix transform;
+	    transform.xx = 1 << 16;
+	    transform.xy = (1 << 14);
+	    transform.yx = (1 << 13);
+	    transform.yy = 1 << 16;
+	    FT_Set_Transform( face, &transform, 0 );
+	}
+
+
+	// render glyph
+    if (boldify)
+	{
+		verify ( !FT_Load_Glyph(face, id, FT_LOAD_DEFAULT | FT_LOAD_NO_BITMAP) );
+		verify ( face->glyph->format == FT_GLYPH_FORMAT_OUTLINE );
+		const FT_Pos amount = (Height << 6) / 21; // 26.6 fixpoint representation
+		verify ( !FT_Outline_Embolden(&face->glyph->outline, amount) );
+		verify ( !FT_Render_Glyph(face->glyph, FT_LOAD_TARGET_MODE(FT_LOAD_RENDER)) );
+	}
+	else
+	{
+		verify ( !FT_Load_Glyph( face, id, FT_LOAD_RENDER ) && "render glyph" );
+	}
+
+	// remove transformation
+	if (transform)
+	{
+	    FT_Set_Transform( face, 0, 0 );
+	}
+
+	// create bitmap
+	OpBitmap* bitmap;
+	verify ( OpStatus::IsSuccess( MakeBitmap( face->glyph->bitmap, &bitmap ) ) );
+
+	// verify
+	OP_STATUS status =  VerifyGlyph( file_name, bitmap,
+					 RegenerateImageData );
+
+	// cleanup
+	OP_DELETE(bitmap);
+
+	// check status
+	verify ( OpStatus::IsSuccess( status ) );
+    }
+}
+finally
+{
+    // unload font
+    FT_Done_Face( face );
+    // delete font file string
+    OP_DELETEA(font_file);
+}
+
+/*
+ * outline test - renders glyph, copies the outline into a new outline, renders it
+ * and compares the result to a pre-generated image. will generate image if
+ * RegenerateImageData is TRUE.
+ *
+ * <font name>.outline.<glyph>.png
+ * font name is the name of a font that freetype can load. the font file
+ * itself should be present in the glyphs/ directory.
+ *
+ * glyph denotes the glyph to render. format can be:
+ *
+ * - c<ascii character> - direct ascii character, i.e. ca will render 'a'
+ * - u<unicode hex value> - hexadecimal unicode point, i.e. u903 will render
+ *   greek capital letter omega
+ * - i<glyph index hex value> - hexadecimal glpyh index, i.e. i1 will render
+ *   the first character in the font
+ *
+ * if glyph starts with t, transformations will be applied. i.e. tca will
+ * render 'a' using transformations; tu2dc will render small tilde using
+ * transformations.
+ *
+ * if glyph starts with b, boldification will be applied.
+ */
+table outline_glyphs( const char* ) filelist "glyphs" name "*.outline.*.png";
+test( "outline glyph $(file_name)" )
+multi outline_glyphs( file_name );
+{
+    FT_Face face = 0; 
+    char* font_file = 0;
+
+    // fetch font file name
+    verify ( GetFontName( file_name, font_file ) == OpStatus::OK );
+    verify( font_file );
+
+    // fetch glyph name
+    const char* glyph_str = GetGlyphName( file_name );
+    verify ( glyph_str > file_name );
+
+    // load font
+    const UINT32 Index = 0;
+    verify( IsInitialized );
+    int e = FT_New_Face( library, font_file, Index, &face );
+    if ( e )
+    {
+	output( "\nfailed to load face '%s' (error status is %d)\n", font_file, e );
+    }
+
+    verify( !e );
+
+    // find out which glyph to use
+    UINT32 id;
+    BOOL transform, boldify, isCharIdx;
+    GetGlyphIndex( glyph_str, id, transform, boldify, isCharIdx );
+    if ( !isCharIdx )
+	id = FT_Get_Char_Index( face, id );
+
+    if ( id != 0 ) // 0 is "missing"
+    {
+	const UINT32 Height = 12; // pixel height
+	verify ( !FT_Set_Pixel_Sizes( face, 0, Height ) );
+
+	// load glyph and fetch its outline
+	e = FT_Load_Glyph( face, id, FT_LOAD_DEFAULT | FT_LOAD_NO_BITMAP );
+	if ( e )
+	{
+	    output("\nfailed to load char #%x for font %s\n", id, font_file );
+	}
+	verify( !e );
+
+	FT_Outline loaded = face->glyph->outline;
+
+	// create new outline
+	FT_Outline created;
+	e = FT_Outline_New( library, loaded.n_points, loaded.n_contours, &created );
+	if ( e )
+	{
+	    output("\nfailed to create outline (error code is %d)\n", e);
+	}
+	verify( !e );
+
+	// copy loaded glyph outline to newly created outline
+	e = FT_Outline_Copy( &loaded, &created );
+	if ( e )
+	{
+	    output("\nfailed to copy outline (error code is %d)\n", e);
+	}
+	verify( !e );
+
+	// create bitmap
+	FT_Bitmap ftbitmap;
+	ftbitmap.rows = Height;
+	ftbitmap.width = Height;
+	ftbitmap.pitch = ftbitmap.width;
+	const UINT32 buf_size = ftbitmap.rows*ftbitmap.pitch;
+	ftbitmap.buffer = OP_NEWA(unsigned char, buf_size);
+	verify( ftbitmap.buffer );
+	op_memset( ftbitmap.buffer, 0, buf_size );
+	ftbitmap.num_grays = 256;
+	ftbitmap.pixel_mode = FT_PIXEL_MODE_GRAY;
+	ftbitmap.palette_mode = 0;
+	ftbitmap.palette = 0;
+
+	FT_Pos yoffs = ((-face->descender * Height) << 6) / face->units_per_EM;
+	FT_Outline_Translate( &created, 0, yoffs );
+
+	// transform
+	if ( transform )
+	{
+	    FT_Matrix transform;
+	    transform.xx = 1 << 16;
+	    transform.xy = (1 << 14);
+	    transform.yx = (1 << 13);
+	    transform.yy = 1 << 16;
+	    FT_Outline_Transform( &created, &transform );
+	}
+
+    if (boldify)
+	{
+		const FT_Pos amount = (Height << 6) / 21; // 26.6 fixpoint representation
+		verify ( !FT_Outline_Embolden(&created, amount) );
+	}
+
+	// render to bitmap
+  	e = FT_Outline_Get_Bitmap( library, &created, &ftbitmap );
+	if ( e )
+	{
+	    OP_DELETEA(ftbitmap.buffer);
+	    output( "\nfailed to render outline (error code is %d)\n", e );
+	}
+	verify( !e );
+
+	// create OpBitmap
+	OpBitmap* bitmap;
+	OP_STATUS status = MakeBitmap( ftbitmap, &bitmap );
+
+	// cleanup outline and freetype bitmap
+	FT_Outline_Done( library, &created );
+	OP_DELETEA(ftbitmap.buffer);
+
+	// verify that the OpBitmap was created
+	verify ( status == OpStatus::OK );
+
+	// compare with stored image
+	status =  VerifyGlyph( file_name, bitmap, RegenerateImageData );
+
+	// cleanup
+	OP_DELETE(bitmap);
+
+	// check status
+	verify ( OpStatus::IsSuccess( status ) );
+    }
+}
+finally
+{
+    // unload font
+    FT_Done_Face( face );
+    // delete font file string
+    OP_DELETEA(font_file);
+}
+
+/*
+ * tests fetching glyph names from fonts
+ */
+table glyph_names( int, const char* )
+{
+    { 'a', "a" },
+    { 'X', "X" },
+}
+table fonts( const char* ) filelist "glyphs" name "*.ttf" or "*.TTF";
+test( "glyph names - $(font)" )
+multi fonts( font );
+{
+    FT_Face face = 0;
+    const UINT32 Index = 0;
+    int e = FT_New_Face( library, font, Index, &face );
+    if ( e )
+    {
+	output( "\nfailed to load face '%s' (error status is %d)\n", font, e );
+    }
+
+    verify( !e );
+
+    if ( FT_HAS_GLYPH_NAMES( face ) )
+    {
+	iterate ( uid, name ) from glyph_names
+	{
+
+	    const UINT32 buf_size = 1024; // should be enough
+	    char buf[buf_size]; // ARRAY OK 2011-12-15 ed
+
+	    // fetch glyph index
+	    unsigned int gid = FT_Get_Char_Index( face, uid );
+	    if ( gid == 0 ) // not in font
+		continue;
+
+	    int e = FT_Get_Glyph_Name( face, gid, buf, buf_size );
+	    if ( e )
+	    {
+		output( "\nfailed to obtain glyph name for glyph U+%x in font %s (error status is %d)\n",
+			uid, font, e );
+	    }
+	    verify( !e );
+	    int comp = op_strcmp( name, buf );
+	    if ( comp )
+	    {
+		output( "\nname mismatch for char U+%x in font %s: expected '%s', got '%s'\n",
+			uid, font, name, buf );
+	    }
+	    verify( !comp );
+	}
+    }
+    FT_Done_Face( face );
+}

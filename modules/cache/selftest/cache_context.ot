@@ -1,0 +1,775 @@
+/* -*- Mode: c++; tab-width: 4; indent-tabs-mode: t; c-basic-offset: 4 -*-
+**
+** Copyright (C) 2004-2006 Opera Software ASA.  All rights reserved.
+**
+** This file is part of the Opera web browser.  It may not be distributed
+** under any circumstances.
+**
+** Luca Venturi
+*/
+
+group "cache context";
+require init;
+require DISK_CACHE_SUPPORT;
+require DYNAMIC_FOLDER_SUPPORT;
+require CACHE_FAST_INDEX;
+include "modules/cache/simple_stream.h";
+include "modules/cache/cache_int.h";
+include "modules/cache/cache_common.h";
+include "modules/url/url_man.h";
+include "modules/url/url_rep.h";
+include "modules/dochand/winman.h";
+include "modules/content_filter/content_filter.h";
+include "modules/cache/cache_st_helpers.h";
+include "modules/cache/cache_selftest.h";
+include "modules/prefs/prefsmanager/collections/pc_network.h";
+
+global
+{
+	int SMALL_SIZE = 63;
+	int MEDIUM_SIZE = 4095;
+	int BIG_SIZE = 65535;
+	int FILES_MAIN = 3;
+	int FILES_CUSTOM = 5;
+	
+	#define NUM_CONTEXTS 100
+
+	URL CreateURL(UINT32 size, URL_CONTEXT_ID context)
+	{
+		OpString url_path;
+		
+		url_path.AppendFormat(UNI_L("http://testsuites.oslo.opera.com/core/networking/http/cache/data/cache.php?size=%d&type=text/javascript&id=001-%d"), size, cur_id++);
+		
+		return g_url_api->GetURL (url_path.CStr(), context);
+	}
+	
+	OpFileFolder custom_folder;
+	OpFileFolder custom_folder2;
+	URL_CONTEXT_ID ctx;
+	URL_CONTEXT_ID ctx2;
+	URL_CONTEXT_ID ctx3;
+	URL_CONTEXT_ID ctx_app;
+	URL test_url;
+	UINT32 cur_id;
+	MessageHandler *mh;
+	WaitURLs *wait;
+	int expectedMain;    // Files expectedMain in the main directory
+	int expectedCustom;  // Files expectedMain in the test directory
+	CacheHelpers ch;
+	#ifdef URL_FILTER
+		URLFilter* urlfilter;
+	#endif
+	
+	MultiContext *mctx;
+}
+
+
+setup
+{
+	mctx=OP_NEW(MultiContext, (TRUE));
+	ctx=urlManager->GetNewContextID();
+	mctx->CreateNewContext(ctx_app, UNI_L("empty_app"), TRUE, NULL);
+	ctx2=0;
+	ctx3=0;
+	mh=OP_NEW(MessageHandler, (NULL));
+	#ifdef URL_FILTER
+		urlfilter = OP_NEW(URLFilter, ());
+	#endif
+	
+	g_folder_manager->AddFolder(OPFILE_CACHE_FOLDER, UNI_L("context_test"),&custom_folder);
+	g_folder_manager->AddFolder(OPFILE_CACHE_FOLDER, UNI_L("context_test2"),&custom_folder2);
+	
+	CacheFileTest::DeleteCacheDir(custom_folder);
+	CacheFileTest::DeleteCacheDir(custom_folder2);
+
+	urlManager->AddContextL(ctx, custom_folder, custom_folder, custom_folder, custom_folder, FALSE);
+	urlManager->FindContextManager(ctx)->SetCacheSize(1024*1024);
+		
+	output("Created a new Context: %d \n", ctx);
+	
+	expectedMain=FILES_MAIN;
+	expectedCustom=FILES_CUSTOM;
+	
+	if (CACHE_SMALL_FILES_SIZE>SMALL_SIZE)
+	{
+		// Remove embedded files
+		expectedMain--;
+		expectedCustom--;
+		
+		if (CACHE_CONTAINERS_ENTRIES>0 && CACHE_CONTAINERS_FILE_LIMIT>MEDIUM_SIZE && CACHE_CONTAINERS_CONTAINER_LIMIT>MEDIUM_SIZE*2)
+			expectedCustom--;  // Two files in the same container
+	}
+	else
+	{
+		if (CACHE_CONTAINERS_ENTRIES>0 && CACHE_CONTAINERS_FILE_LIMIT>MEDIUM_SIZE)
+		{
+			if (CACHE_CONTAINERS_CONTAINER_LIMIT>MEDIUM_SIZE*2+SMALL_SIZE)
+				expectedCustom-=2;   // Three files in the same container
+			else if (CACHE_CONTAINERS_CONTAINER_LIMIT>MEDIUM_SIZE+SMALL_SIZE)
+				expectedCustom--;	// Two files in the same container
+		}
+	}
+	
+	OpMessage messages[]={MSG_URL_DATA_LOADED, MSG_URL_LOADING_FAILED, MSG_URLMAN_DELETE_SOMEFILES};
+	
+	wait=OP_NEW(WaitURLs, (custom_folder, custom_folder2, mh));
+	mh->SetCallBackList(wait, 0, messages, 3);
+	
+	CacheTester::BlockPeriodicFreeUnusedResources();
+}
+
+exit
+{
+	OP_DELETE(mctx);
+	mh->UnsetCallBacks(wait);
+	OP_DELETE(mh);
+	mh=NULL;
+	OP_DELETE(wait);
+	wait=NULL;
+	
+	#ifdef URL_FILTER
+		OP_DELETE(urlfilter);
+	#endif
+	
+	CacheTester::RestorePeriodicFreeUnusedResources();
+}
+
+// Close all the windows but the last selftest, to free the URLs in use
+test("Close Other Windows")
+{
+	CacheHelpers::CloseUnusedWindows();
+}
+
+test("Check cache dimension")
+{
+	int size=g_pcnet->GetIntegerPref(PrefsCollectionNetwork::DiskCacheSize);
+	
+	verify(size>=256);  // The size cannot be too small... 256KB it's just a check for a small but reasonable value
+}
+
+test("OpAutoStringHashTable")
+{
+	OpAutoStringHashTable<OpString> cnt_test;
+	OpString tests[2];
+	
+	tests[0].Set("test");
+	tests[1].Set("test2");
+	
+	if(OpStatus::IsError(cnt_test.Add(tests[0].CStr(), tests)))
+		ST_failed("1st add failed!");
+	if(OpStatus::IsError(cnt_test.Add(tests[1].CStr(), tests+1)))
+		ST_failed("2nd add failed!");
+		
+	OpHashIterator *iter=cnt_test.GetIterator();
+	OpHashIterator *iter2=cnt_test.GetIterator();
+	int n=0;
+			
+	// Try an asynchronous iterator overlapping...
+	if(iter2 && OpStatus::IsSuccess(iter2->First()))
+	{
+		if(iter && OpStatus::IsSuccess(iter->First()))
+		{
+			do
+			{
+				OpString *ptr=(OpString *)iter->GetData();
+				
+				verify(ptr && !ptr->Compare(tests[n].CStr()));
+				
+				if(OpStatus::IsError(cnt_test.Remove(tests[n].CStr(), &ptr)))
+						ST_failed("Error on Remove %d", n);
+				verify(ptr && !ptr->Compare(tests[n].CStr()));
+				n++;
+			}
+			while(OpStatus::IsSuccess(iter->Next()));
+		}
+		
+		n=0;
+	
+		do
+		{
+			OpString *ptr=(OpString *)iter2->GetData();
+			
+			verify(ptr && !ptr->Compare(tests[n].CStr()));
+			
+			if(OpStatus::IsSuccess(cnt_test.Remove(tests[n].CStr(), &ptr)))
+					ST_failed("Record %d removed twice!", n);
+
+			n++;
+		}
+		while(OpStatus::IsSuccess(iter2->Next()));
+	}
+	
+	OP_DELETE(iter);
+	OP_DELETE(iter2);
+}
+
+// Empty the main and the test cache
+test("Context - Empty DCache") async;
+{
+	wait->SetExpectedFiles(0, 0);
+	urlManager->EmptyDCache();
+	mh->PostDelayedMessage(MSG_URLMAN_DELETE_SOMEFILES, 0, 0, 1000);  // Wait to delete the files
+}
+
+// Count the files in the directory
+test("Context - check if directories are empty")
+{
+	TRAPD(rc, urlManager->WriteCacheIndexesL(TRUE, FALSE));
+	
+	int num_main=CacheHelpers::CheckDirectory(OPFILE_CACHE_FOLDER);
+	int num_custom=CacheHelpers::CheckDirectory(custom_folder);	
+	
+	output("\nFiles found on main directory: %d\n", num_main);
+	if(num_main!=0)
+		ST_failed("Main file count wrong 1: %d vs %d", num_main, 0);
+
+	output("Files found on test directory: %d\n", num_custom);
+	if(num_custom!=0)  
+		ST_failed("Custom file count wrong 1: %d vs %d", num_custom, 0);
+}
+
+// Put files in the main cache, 5 in the context cache
+test("Context - Put Files")
+{
+	/*wait->AddURL(SMALL_SIZE, 0);
+	wait->AddURL(MEDIUM_SIZE, 0);
+	wait->AddURL(BIG_SIZE, 0);
+	wait->AddURL(SMALL_SIZE, ctx);
+	wait->AddURL(MEDIUM_SIZE, ctx);
+	wait->AddURL(MEDIUM_SIZE, ctx);
+	wait->AddURL(BIG_SIZE, ctx);
+	wait->AddURL(BIG_SIZE, ctx);
+	wait->Reload();*/
+	
+	ch.CacheBogusURL(0, SMALL_SIZE);
+	ch.CacheBogusURL(0, MEDIUM_SIZE);
+	ch.CacheBogusURL(0, BIG_SIZE);
+	ch.CacheBogusURL(ctx, SMALL_SIZE);
+	ch.CacheBogusURL(ctx, MEDIUM_SIZE);
+	ch.CacheBogusURL(ctx, MEDIUM_SIZE);
+	ch.CacheBogusURL(ctx, BIG_SIZE, 999991);  // For filtering
+	ch.CacheBogusURL(ctx, BIG_SIZE, 999992);  // For filtering
+}
+
+// Count the files in the directory
+test("Context - count directory files")
+{
+	TRAPD(rc, urlManager->WriteCacheIndexesL(TRUE, FALSE));
+	
+	int num_main=CacheHelpers::CheckDirectory(OPFILE_CACHE_FOLDER);
+	int num_custom=CacheHelpers::CheckDirectory(custom_folder);
+	
+	output("\nFiles found on main directory: %d\n", num_main);
+	if(num_main!=expectedMain)
+		ST_failed("Main file count wrong 2: %d vs %d", num_main, expectedMain);
+	
+	output("Files found on custom directory: %d\n", num_custom);
+	if(num_custom!=expectedCustom)  
+		ST_failed("Custom file count wrong 2: %d vs %d", num_custom, expectedCustom);
+}
+
+// Count the files in the index
+test("Context - count index files")
+{
+	// The index should have all the entries, not just the one on disk
+	int n1=CacheHelpers::CheckIndex(OPFILE_CACHE_FOLDER);
+	int n2=CacheHelpers::CheckIndex(custom_folder);
+	
+	output("\nFiles in the main index 11: %d\n", n1);
+	output("Files in the custom index 11: %d\n", n2);
+	
+	verify(n1==FILES_MAIN);
+	verify(n2==FILES_CUSTOM);
+}
+
+// Empty the main and the test cache, but leaving two files in the test directory
+test("Context - Partial Empty DCache") async; require URL_FILTER;
+{
+	if(OpStatus::IsError(urlfilter->AddURLString(UNI_L("*99999*"), TRUE, NULL)))
+		ST_failed("URL 1 not added");
+		
+	if(OpStatus::IsError(urlfilter->AddURLString(UNI_L("*.*"), FALSE, NULL)))
+		ST_failed("URL 2 not added");
+		
+	urlManager->SetEmptyDCacheFilter(urlfilter, ctx);
+	
+	wait->SetExpectedFiles(0, 2);
+	urlManager->EmptyDCache();
+	mh->PostDelayedMessage(MSG_URLMAN_DELETE_SOMEFILES, 0, 0, 1000);  // Wait to delete the files
+}
+
+// Count the files in the directory
+test("Context - partial count directory files")
+{
+	TRAPD(rc, urlManager->WriteCacheIndexesL(TRUE, FALSE));
+	
+	int num_main=CacheHelpers::CheckDirectory(OPFILE_CACHE_FOLDER);
+	int num_custom=CacheHelpers::CheckDirectory(custom_folder);
+	
+	output("\nFiles found on main directory: %d\n", num_main);
+	if(num_main!=0)
+		ST_failed("Main file count wrong 3: %d vs %d", num_main, 0);
+	
+	output("Files found on test directory: %d\n", num_custom);
+	if(num_custom!=2)  
+		ST_failed("Custom file count wrong 3: %d vs %d", num_custom, 2);
+}
+
+// Count the files in the index
+test("Context - partial count index files")
+{
+	// The index should have all the entries, not just the one on disk
+	int n1=CacheHelpers::CheckIndex(OPFILE_CACHE_FOLDER);
+	int n2=CacheHelpers::CheckIndex(custom_folder);
+	
+	output("\nFiles in the main index 12: %d\n", n1);
+	output("Files in the custom index 12: %d\n", n2);
+	
+	verify(n1==0);
+	verify(n2==2);	
+}
+
+// Empty the main and the test cache
+test("Context - Final Empty DCache") async; require URL_FILTER;
+{
+	urlManager->SetEmptyDCacheFilter(NULL, ctx);
+	
+	wait->SetExpectedFiles(0, 0);
+	urlManager->EmptyDCache();
+	mh->PostDelayedMessage(MSG_URLMAN_DELETE_SOMEFILES, 0, 0, 1000);  // Wait to delete the files
+}
+
+// Count the files in the directory
+test("Context - final count directory files")
+{
+	TRAPD(rc, urlManager->WriteCacheIndexesL(TRUE, FALSE));
+	
+	int num_main=CacheHelpers::CheckDirectory(OPFILE_CACHE_FOLDER);
+	int num_custom=CacheHelpers::CheckDirectory(custom_folder);
+	
+	output("\nFiles found on main directory: %d\n", num_main);
+	if(num_main!=0)
+		ST_failed("Main file count wrong 4: %d vs %d", num_main, 0);
+	
+	output("Files found on test directory: %d\n", num_custom);
+	if(num_custom!=0)  
+		ST_failed("Custom file count wrong 4: %d vs %d", num_custom, 0);
+}
+
+// Count the files in the index
+test("Context - Final count index files")
+{
+	// The index should have all the entries, not just the one on disk
+	int n1=CacheHelpers::CheckIndex(OPFILE_CACHE_FOLDER);
+	int n2=CacheHelpers::CheckIndex(custom_folder);
+	
+	output("\nFiles in the main index 13: %d\n", n1);
+	output("Files in the custom index 13: %d\n", n2);
+	
+	verify(n1==0);
+	verify(n2==0);
+}
+
+// Create a new context and put one file in it
+test("Context - Fill context before Remove") async;
+{
+	ctx2=urlManager->GetNewContextID();
+	urlManager->Debug_AcceptOverlappingContexts();
+	urlManager->AddContextL(ctx2, custom_folder, custom_folder, custom_folder, custom_folder, FALSE);
+	urlManager->FindContextManager(ctx2)->SetCacheSize(1024*1024);
+	test_url=CreateURL(BIG_SIZE, ctx2);
+	wait->ClearURLs();
+	if(OpStatus::IsError(wait->AddURL(test_url)))
+		ST_failed("URL not added");
+		
+	wait->Reload();
+}
+
+// Count the files in the directory
+test("Context - count new context directory files")
+{
+	// Lock the URL to trigger the bug on RemoveContext()
+	URL_InUse uu;
+	
+	uu.SetURL(test_url);
+	
+	test_url.Access(TRUE);
+	test_url.GetRep()->IncUsed(1);
+	test_url.GetRep()->IncRef();
+	
+	urlManager->Debug_SimulateRemoveContextBug(TRUE);
+
+	TRAPD(rc, urlManager->WriteCacheIndexesL(TRUE, FALSE));
+	
+	int num_custom=CacheHelpers::CheckDirectory(custom_folder);
+	
+	output("Files found on test directory 2: %d\n", num_custom);
+	if(num_custom!=1)  
+		ST_failed("Custom file count wrong: %d vs %d", num_custom, 1);
+}
+
+// Count the files in the index
+test("Context - count new context index files")
+{
+	// The index should have all the entries, not just the one on disk
+	int n2=CacheHelpers::CheckIndex(custom_folder);
+	
+	output("Files in the custom index 14: %d\n", n2);
+	
+	// Dec the refs again so the URL will get released.
+	test_url.GetRep()->DecUsed(1);
+	test_url.GetRep()->DecRef();
+
+	verify(n2 == 1);
+}
+
+// Create other context and remove all of them
+test("Remove contexts")
+{
+	URL_CONTEXT_ID new_ctx[NUM_CONTEXTS];  /* ARRAY OK 2009-07-22 lucav */
+	
+	for(int i=0; i<NUM_CONTEXTS; i++)
+	{
+		new_ctx[i]=urlManager->GetNewContextID();
+		
+		urlManager->Debug_AcceptOverlappingContexts();
+		urlManager->AddContextL(new_ctx[i], custom_folder, custom_folder, custom_folder, custom_folder, FALSE);
+		urlManager->FindContextManager(new_ctx[i])->SetCacheSize(1024*1024);
+	}
+	
+	output("Added %d contexts\n", NUM_CONTEXTS);
+	
+	urlManager->RemoveContext(ctx2, TRUE); // Trigger the "lock bug"
+	urlManager->RemoveContext(ctx, TRUE);
+	
+	urlManager->Debug_SimulateRemoveContextBug(FALSE);
+	
+	for(int i=0; i<100; i++)
+	{
+		urlManager->RemoveContext(new_ctx[i], TRUE);
+	}
+	
+	output("Removed %d contexts, from %d to %d\n", NUM_CONTEXTS+1, new_ctx[0], new_ctx[99]);
+}
+
+// Create a new context and put one file in it
+test("Context 3 - Fill context before Remove") async;
+{
+	ctx3=urlManager->GetNewContextID();
+	urlManager->AddContextL(ctx3, custom_folder2, custom_folder2, custom_folder2, custom_folder2, FALSE);
+	urlManager->FindContextManager(ctx3)->SetCacheSize(1024*1024);
+	test_url=CreateURL(BIG_SIZE, ctx3);
+	wait->ClearURLs();
+	if(OpStatus::IsError(wait->AddURL(test_url)))
+		ST_failed("URL not added");
+	wait->Reload();
+}
+
+// Count the files in the directory
+test("Context 3 - count new context directory files")
+{
+	// Lock the URL to trigger the bug on RemoveContext()
+	URL_InUse uu;
+	
+	uu.SetURL(test_url);
+	
+	TRAPD(rc, urlManager->WriteCacheIndexesL(TRUE, FALSE));
+	
+	int num_custom2=CacheHelpers::CheckDirectory(custom_folder2);
+	
+	output("Files found on test directory 3: %d\n", num_custom2);
+	if(num_custom2!=1)  
+		ST_failed("Custom file count wrong: %d vs %d", num_custom2, 1);
+}
+
+// Empty the main and the test cache
+test("Context 3 - Empty DCache") async;
+{
+	wait->ClearURLs();
+	wait->SetExpectedFiles(0, 0);
+	urlManager->EmptyDCache(ctx3);
+	mh->PostDelayedMessage(MSG_URLMAN_DELETE_SOMEFILES, 0, 0, 1000);  // Wait to delete the files
+}
+
+// Count the files in the directory
+test("Context 3 - count new context directory files")
+{
+	// Lock the URL to trigger the bug on RemoveContext()
+	int num_custom2=CacheHelpers::CheckDirectory(custom_folder2);
+	
+	output("Files found on test directory 3: %d\n", num_custom2);
+	if(num_custom2!=0)  
+		ST_failed("Custom file count wrong: %d vs %d", num_custom2, 0);
+}
+
+
+test("Try to delete the indexes again")
+{
+	// Remove the contexts (the index will be deleted)
+	urlManager->RemoveContext(ctx2, TRUE);
+	urlManager->RemoveContext(ctx, TRUE);
+}
+
+test("RemoveContext(): empty")
+{
+	URL_CONTEXT_ID ctx_rem;
+	OpFileFolder folder_rem;
+	
+	verify_success(mctx->CreateNewContext(ctx_rem, UNI_L("rem_empty"), TRUE, &folder_rem));
+	
+	URL url_t=ch.CacheBogusURLRetrieve(ctx_rem, BIG_SIZE);
+	
+	// Save the index
+	verify_success(CacheTester::WriteIndex(ctx_rem));
+	
+	// Check the index
+	int num=CacheHelpers::CheckIndex(folder_rem, TRUE);
+	
+	verify(num==1);
+	
+	// Save the files
+	CacheTester::SaveFiles(ctx_rem);
+	
+	// Check the number of files
+	num=CacheHelpers::CheckDirectory(folder_rem);
+	verify(num==1);
+	
+	// Remove context and index
+	verify(mctx->ForgetContext(ctx_rem, TRUE, TRUE));
+	urlManager->RemoveContext(ctx_rem, TRUE);
+	urlManager->DeleteFilesInDeleteList(TRUE); // Technically speaking, after an EmptyDCache() we should wait...
+	
+	// Check that the index is no longer existing
+	num=CacheHelpers::CheckIndex(folder_rem, TRUE);
+	verify(num==-1);
+	
+	// Check that no files are left
+	num=CacheHelpers::CheckDirectory(folder_rem);
+	verify(num==0);
+}
+
+test("RemoveContext(): NOT empty")
+{
+	URL_CONTEXT_ID ctx_rem;
+	OpFileFolder folder_rem;
+	
+	verify_success(mctx->CreateNewContext(ctx_rem, UNI_L("rem_not_empty"), TRUE, &folder_rem));
+	
+	URL url_t=ch.CacheBogusURLRetrieve(ctx_rem, BIG_SIZE);
+	
+	// Save the index
+	verify_success(CacheTester::WriteIndex(ctx_rem));
+	
+	// Check the index
+	int num=CacheHelpers::CheckIndex(folder_rem, TRUE);
+	
+	verify(num==1);
+	
+	// Save the files
+	CacheTester::SaveFiles(ctx_rem);
+	
+	// Check the number of files
+	num=CacheHelpers::CheckDirectory(folder_rem);
+	verify(num==1);
+	
+	// Remove context and index
+	verify(mctx->ForgetContext(ctx_rem, TRUE, TRUE));
+	urlManager->RemoveContext(ctx_rem, FALSE);
+	urlManager->DeleteFilesInDeleteList(TRUE); // Technically speaking, after an EmptyDCache() we should wait...
+	
+	// Check that the index is still there
+	num=CacheHelpers::CheckIndex(folder_rem, TRUE);
+	verify(num==1);
+	
+	// Check that the file is still there
+	num=CacheHelpers::CheckDirectory(folder_rem);
+	verify(num==1);
+}
+
+test("RemoveContext(): empty with OPFILE_ABSOLUTE_FOLDER")
+{
+	URL_CONTEXT_ID ctx_rem;
+	OpFileFolder folder=OPFILE_CACHE_FOLDER;
+
+	// Create a context that is not supposed to be saved
+	verify_success(mctx->CreateNewContext(ctx_rem, OPFILE_ABSOLUTE_FOLDER, FALSE, NULL));
+
+	int num_files=CacheHelpers::CheckDirectory(folder);      // Original number of files
+	int num_idx=CacheHelpers::CheckIndex(folder, TRUE);  // Original number of URLs in the index
+	
+	URL url_t=ch.CacheBogusURLRetrieve(ctx_rem, BIG_SIZE);
+	
+	// Save the index
+	verify_success(CacheTester::WriteIndex(ctx_rem));
+	
+	// Check the index (no changes, as it is using OPFILE_ABSOLUTE_FOLDER)
+	int num=CacheHelpers::CheckIndex(folder, TRUE);
+	
+	verify(num==num_idx);
+	
+	// Save the files
+	CacheTester::SaveFiles(ctx_rem);
+	
+	// Check the number of files
+	num=CacheHelpers::CheckDirectory(folder);
+	
+	verify(num==num_files+1); // File actually saved iun the proper directory
+	
+	// Remove context and index
+	verify(mctx->ForgetContext(ctx_rem, TRUE, TRUE));
+	urlManager->RemoveContext(ctx_rem, TRUE);
+	urlManager->DeleteFilesInDeleteList(TRUE); // Technically speaking, after an EmptyDCache() we should wait...
+	
+	// Check that nothing changed in the index
+	num=CacheHelpers::CheckIndex(folder, TRUE);
+	verify(num==num_idx);
+	
+	// Check that nothing changed in the files
+	num=CacheHelpers::CheckDirectory(folder);
+	verify(num==num_files);
+}
+
+// Problem (as in DSK-309863):
+// - context with multiple files
+// - context removed (index save, with multiple files)
+// - some files are still pending, the context is not really removed
+// - index saved (no files, as the pending URLs are temporary, and the other are gone)
+test("Remove Context with a pending URL + FreeUnusedResources() check")
+{
+	URL_CONTEXT_ID ctx_rem;
+	OpFileFolder folder_rem;
+	
+	verify_success(mctx->CreateNewContext(ctx_rem, UNI_L("rem_not_empty2"), TRUE, &folder_rem));
+	
+	URL *url_t1=OP_NEW(URL, (ch.CacheBogusURLRetrieve(ctx_rem, BIG_SIZE)));
+	URL *url_t2=OP_NEW(URL, (ch.CacheBogusURLRetrieve(ctx_rem, BIG_SIZE)));
+	URL_InUse use1(*url_t1);
+	Context_Manager *ctx_mgr=urlManager->FindContextManager(ctx_rem);
+	
+	verify(ctx_mgr);
+	
+	// Save the index
+	verify_success(CacheTester::WriteIndex(ctx_rem));
+	
+	// Check the index
+	int num=CacheHelpers::CheckIndex(folder_rem, TRUE);
+	
+	verify(num==2);
+	
+	// Save the files
+	CacheTester::SaveFiles(ctx_rem);
+	
+	// Check the number of files
+	num=CacheHelpers::CheckDirectory(folder_rem);
+	verify(num==2);
+	
+	// Remove context and index
+	verify(mctx->ForgetContext(ctx_rem, TRUE, TRUE));
+	urlManager->IncrementContextReference(ctx_rem);
+	verify(!CacheTester::IsContextManagerFrozen(ctx_rem));
+	urlManager->RemoveContext(ctx_rem, FALSE);
+	verify(CacheTester::IsContextManagerFrozen(ctx_rem));
+	urlManager->DeleteFilesInDeleteList(TRUE); // Technically speaking, after an EmptyDCache() we should wait...
+
+	
+	// Check that file and index are still there
+	num=CacheHelpers::CheckIndex(folder_rem, TRUE);
+	verify(num==2);
+	num=CacheHelpers::CheckDirectory(folder_rem);
+	verify(num==2);
+	
+	// Save index (if the context is not in the freeze list, this could delete everything...)
+	verify_success(CacheTester::WriteIndex(ctx_rem));
+	
+	// Check that file and index are still there
+	num=CacheHelpers::CheckIndex(folder_rem, TRUE);
+	verify(num==2);
+	num=CacheHelpers::CheckDirectory(folder_rem);
+	verify(num==2);
+	
+	verify(urlManager->FindContextManager(ctx_rem));
+	urlManager->FreeUnusedResources(TRUE); // It should NOT remove the context manager
+	verify(urlManager->FindContextManager(ctx_rem));
+	
+	// Check that file and index are still there
+	num=CacheHelpers::CheckIndex(folder_rem, TRUE);
+	verify(num==2);
+	num=CacheHelpers::CheckDirectory(folder_rem);
+	verify(num==2);
+	
+	use1.UnsetURL();
+	OP_DELETE(url_t1);
+	OP_DELETE(url_t2);
+	
+	// Check that file and index are still there
+	num=CacheHelpers::CheckIndex(folder_rem, TRUE);
+	verify(num==2);
+	num=CacheHelpers::CheckDirectory(folder_rem);
+	verify(num==2);
+	
+	verify(urlManager->FindContextManager(ctx_rem));
+	urlManager->FreeUnusedResources(TRUE); // It should NOT remove the context manager
+	verify(urlManager->FindContextManager(ctx_rem));
+	
+	// Check that file and index are still there
+	num=CacheHelpers::CheckIndex(folder_rem, TRUE);
+	verify(num==2);
+	num=CacheHelpers::CheckDirectory(folder_rem);
+	verify(num==2);
+	
+	urlManager->DecrementContextReference(ctx_rem);	// It should be 0, but no delete performed automatically
+	verify(urlManager->FindContextManager(ctx_rem));
+	
+	// Check that file and index are still there
+	num=CacheHelpers::CheckIndex(folder_rem, TRUE);
+	verify(num==2);
+	num=CacheHelpers::CheckDirectory(folder_rem);
+	verify(num==2);
+	
+	verify(urlManager->FindContextManager(ctx_rem));
+	urlManager->FreeUnusedResources(TRUE); // It should remove the context manager
+	verify(!urlManager->FindContextManager(ctx_rem));
+	
+	// Check that file and index are still there
+	num=CacheHelpers::CheckIndex(folder_rem, TRUE);
+	verify(num==2);
+	num=CacheHelpers::CheckDirectory(folder_rem);
+	verify(num==2);
+}
+
+/// Tests that URLs marked as application cache are not removed
+test("Application cache")
+{
+	URL url1 = ch.CacheBogusURLRetrieve(ctx_app, SMALL_SIZE);
+	URL url2 = ch.CacheBogusURLRetrieve(ctx_app, SMALL_SIZE);
+	URL url3 = ch.CacheBogusURLRetrieve(ctx_app, SMALL_SIZE);
+
+	url2.SetAttribute(URL::KIsApplicationCacheURL, TRUE);
+
+	verify_success(CacheTester::SaveFiles(ctx_app));
+
+	verify(CacheTester::CheckURLsInStore(ctx_app) == 3);
+
+	verify((URLCacheType) url1.GetAttribute(URL::KCacheType) == URL_CACHE_DISK && url1.GetRep()->GetDataStorage() && url1.GetRep()->GetDataStorage()->GetCacheStorage());
+	verify((URLCacheType) url2.GetAttribute(URL::KCacheType) == URL_CACHE_DISK && url2.GetRep()->GetDataStorage() && url2.GetRep()->GetDataStorage()->GetCacheStorage());
+	verify((URLCacheType) url3.GetAttribute(URL::KCacheType) == URL_CACHE_DISK && url3.GetRep()->GetDataStorage() && url3.GetRep()->GetDataStorage()->GetCacheStorage());
+
+	// While there are not the right conditions to delete the URLs at ths stage, URLs selected will be marked as temporary,
+	// so testing the type is good enogh
+	mctx->EmptyDCache(ctx_app);
+
+	verify(CacheTester::CheckURLsInStore(ctx_app) == 3);
+
+	verify(url1.GetAttribute(URL::KCacheType) == 0 && !url1.GetRep()->GetDataStorage());
+	verify((URLCacheType) url2.GetAttribute(URL::KCacheType) == URL_CACHE_DISK && url2.GetRep()->GetDataStorage() && url2.GetRep()->GetDataStorage()->GetCacheStorage());
+	verify(url3.GetAttribute(URL::KCacheType) == 0 && !url3.GetRep()->GetDataStorage());
+
+	/// Delete also application cache URLs
+	mctx->EmptyDCache(ctx_app, TRUE);
+
+	verify(CacheTester::CheckURLsInStore(ctx_app) == 3);
+
+	verify(url1.GetAttribute(URL::KCacheType) == 0 && !url1.GetRep()->GetDataStorage());
+	verify(url2.GetAttribute(URL::KCacheType) == 0 && !url2.GetRep()->GetDataStorage());
+	verify(url3.GetAttribute(URL::KCacheType) == 0 && !url3.GetRep()->GetDataStorage());
+}

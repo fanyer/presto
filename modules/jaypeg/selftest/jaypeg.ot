@@ -1,0 +1,369 @@
+group "jaypeg";
+
+require undefined LIBJPEG_SUPPORT;
+
+include if defined(JAYPEG_ENCODE_SUPPORT) "modules/jaypeg/jayencoder.h";
+include if defined(JAYPEG_ENCODE_SUPPORT) "modules/jaypeg/jayencodeddata.h";
+include "modules/img/image.h";
+include "modules/img/decoderfactoryjpg.h";
+include "modules/img/decoderfactorypng.h";
+include "modules/util/opstring.h";
+include "modules/util/opfile/opfile.h";
+
+
+global{
+#if defined(JAYPEG_LOW_QUALITY_SCALE) || defined(JAYPEG_FAST_BUT_LOSSY)
+	// Only measure psnr if rendering images in low quality
+	#define MAX_RGBA_DIFF 255
+	#define MAX_PSNR_DIFF 300 // 25dB
+#else
+	#define MAX_RGBA_DIFF 3
+	#define MAX_PSNR_DIFF 0
+#endif
+	#define GENERATE_NEW FALSE
+	// Decoder factory used to load the jpeg images.
+	DecoderFactoryJpg dfj;
+	/** A decoder listener which will save the image internaly and later 
+	  * send it to the tga decoder factory for verification. */
+	class SelftestDecoderListener : public ImageDecoderListener{
+	public:
+		SelftestDecoderListener() : imgdata(NULL), allDone(FALSE), numLines(0){}
+		~SelftestDecoderListener(){if(imgdata)OP_DELETEA(imgdata);}
+
+		void OnLineDecoded(void* data, INT32 line, INT32 lineHeight){
+			if( !imgdata ){
+				return;
+			}
+			for( unsigned int i = 0; i < width; ++i )
+				imgdata[line*width+i] = ((UINT32*)data)[i];
+			++numLines;
+		}
+		BOOL OnInitMainFrame(INT32 width, INT32 height){
+			this->width = width;
+			this->height = height;
+			imgdata = OP_NEWA(UINT32, width*height);
+			if( !imgdata )
+				return FALSE;
+			// set opaque black pixels all over the place, pretty useless 
+			// unless you write the image to a tga
+			for (int p = 0; p < width*height; ++p)
+				imgdata[p] = 0xff000000;
+			return TRUE;
+		}
+		void OnNewFrame(const ImageFrameData& image_frame_data){
+			bpp = image_frame_data.bits_per_pixel;
+		}
+		void OnAnimationInfo(INT32 nrOfRepeats){}
+		void OnDecodingFinished(){allDone = TRUE;}
+		// numLines will be greater than height for progressive images
+		BOOL isDone(){return allDone&&numLines>=height;}
+
+#ifdef IMAGE_METADATA_SUPPORT
+	    void OnMetaData(ImageMetaData id, const char* data) {}
+#endif // IMAGE_METADATA_SUPPORT
+
+#ifdef EMBEDDED_ICC_SUPPORT
+		void OnICCProfileData(const UINT8* data, unsigned datalen) {}
+#endif // EMBEDDED_ICC_SUPPORT
+
+            static  SelftestDecoderListener *decode_image(ImageDecoderFactory *imgDecFac, 
+                                                          const void *buf, const size_t size)
+            {
+                SelftestDecoderListener *imgDecListener;
+                ImageDecoder *imgDec;
+                OpFile imgFile;
+
+                imgDecListener = OP_NEW(SelftestDecoderListener, ());
+                if (!imgDecListener)
+                    return NULL;
+                imgDec = imgDecFac->CreateImageDecoder(imgDecListener);
+                if (!imgDec)
+                {
+                    OP_DELETE(imgDecListener);
+                    return NULL;
+                }
+
+                // decode data
+                int decodedBytes;
+                if (OpStatus::IsError(imgDec->DecodeData((BYTE*)buf, size, FALSE, decodedBytes)))
+                {
+                    OP_DELETE(imgDecListener);
+                    imgDecListener = 0;
+                }
+                OP_DELETE(imgDec);
+                return imgDecListener;
+            }
+
+
+	static  SelftestDecoderListener *decode_image(ImageDecoderFactory *imgDecFac, 
+			const char *fname, int nb,
+			unsigned int blockSize){
+		SelftestDecoderListener *imgDecListener;
+		ImageDecoder *imgDec;
+		OpFile imgFile;
+		OpStringS file_name;
+		int decodedBytes, len, toRead;
+		char *data = NULL;
+
+		imgDecListener = OP_NEW(SelftestDecoderListener, ());
+		if (!imgDecListener)
+			return NULL;
+		imgDec = imgDecFac->CreateImageDecoder(imgDecListener);
+		if (!imgDec)
+		{
+			OP_DELETE(imgDecListener);
+			return NULL;
+		}
+	
+		// open file
+		if (OpStatus::IsError(file_name.SetFromUTF8(fname)))
+		{
+			OP_DELETE(imgDec);
+			OP_DELETE(imgDecListener);
+			return NULL;
+		}
+		if (OpStatus::IsError(imgFile.Construct(file_name)))
+		{
+			OP_DELETE(imgDec);
+			OP_DELETE(imgDecListener);
+			return NULL;
+		}
+		if (OpStatus::IsError(imgFile.Open(OPFILE_READ)))
+		{
+			OP_DELETE(imgDec);
+			OP_DELETE(imgDecListener);
+			return NULL;
+		}
+		
+
+		OpFileLength flen;
+		if (OpStatus::IsError(imgFile.GetFileLength(flen)))
+		{
+			imgFile.Close();
+			OP_DELETE(imgDec);
+			OP_DELETE(imgDecListener);
+			return NULL;
+		}
+		toRead = (long)flen;
+	
+		if( nb > 0 && nb < toRead )
+			toRead = nb;
+		data = OP_NEWA(char, blockSize);
+		if (!data)
+		{
+			imgFile.Close();
+			OP_DELETE(imgDec);
+			OP_DELETE(imgDecListener);
+			return NULL;
+		}
+		while( toRead > 0 ){
+			len = (unsigned int)toRead<blockSize?toRead:blockSize;
+			// read data
+			OpFileLength bytes_read;
+			if (OpStatus::IsError(imgFile.Read(data, len, &bytes_read)) || bytes_read != static_cast<OpFileLength>(len))
+			{
+				OP_DELETEA(data);
+				imgFile.Close();
+				OP_DELETE(imgDec);
+				OP_DELETE(imgDecListener);
+				return NULL;
+			}
+			// decode data
+			if (OpStatus::IsError(imgDec->DecodeData((BYTE*)data, len, toRead>len, decodedBytes)))
+			{
+				OP_DELETEA(data);
+				imgFile.Close();
+				OP_DELETE(imgDec);
+				OP_DELETE(imgDecListener);
+				return NULL;
+			}
+			if(len <= decodedBytes){
+				if (nb > 0 && len == toRead)
+				{
+					// The last block was not possible to decode since the indata size was limited
+					decodedBytes = 0;
+				}
+				else
+				{
+					output("To small chunk\n");
+					OP_DELETEA(data);
+					imgFile.Close();
+					OP_DELETE(imgDec);
+					OP_DELETE(imgDecListener);
+					return NULL;
+				}
+			}
+			len -= decodedBytes;
+			imgFile.SetFilePos(-decodedBytes, SEEK_FROM_CURRENT);
+			toRead -= len;
+		}
+
+		OP_DELETEA(data);
+		imgFile.Close();
+		OP_DELETE(imgDec);
+		return imgDecListener;
+	}
+	UINT32 getWidth(){return width;}
+	UINT32 getHeight(){return height;}
+	UINT32* getData(){return imgdata;}
+	UINT32 getDecodedLines(){return numLines;}
+	private:
+		UINT32 *imgdata;
+		BOOL allDone;
+		unsigned int numLines;
+		UINT32 width, height, bpp;
+		UINT32 smallDiff;
+	};
+
+#ifdef JAYPEG_ENCODE_SUPPORT
+	class SelftestEncoderListener : public JayEncodedData{
+        public:
+	    SelftestEncoderListener() : m_buf(0), m_size(0), m_offs(0) {}
+	    ~SelftestEncoderListener() { op_free(m_buf); }
+	    OP_STATUS dataReady(const void* data, unsigned int datalen)
+	    {
+		RETURN_IF_ERROR(grow(m_offs + datalen));
+		op_memcpy(m_buf + m_offs, data, datalen);
+		m_offs += datalen;
+                return OpStatus::OK;
+	    }
+            void get(UINT8*& data, size_t& size) { data = m_buf; size = m_offs; }
+
+	    OP_STATUS grow(size_t size)
+	    {
+		if (size <= m_size)
+		    return OpStatus::OK;
+		OP_ASSERT(size);
+		UINT8* tmp = reinterpret_cast<UINT8*>(op_realloc(m_buf, size));
+		if (!tmp)
+		    return OpStatus::ERR_NO_MEMORY;
+		m_size = size;
+		m_buf = tmp;
+		return OpStatus::OK;
+	    }
+
+        private:
+	    UINT8* m_buf;
+	    size_t m_size;
+	    size_t m_offs;
+	};
+#endif // JAYPEG_ENCODE_SUPPORT
+}
+
+table jpeg_files(char *) filelist "tests" name "*.jpg" recursively;
+table jpeg_reference_files(char *) filelist "tests" name "*.png" recursively;
+
+foreach (FILE) from jpeg_files
+{
+	test("$(FILE)") leakcheck;{
+		// open ref image
+		SelftestDecoderListener *jpg = NULL;
+		char *tn = op_strdup(FILE);
+		char *t = op_strrchr(tn, '.');
+		op_strcpy(t, ".png");
+
+
+		jpg = SelftestDecoderListener::decode_image(&dfj, FILE, -1, 2048);
+		verify(jpg!=NULL);
+		verify(jpg->isDone());
+		verify(OpStatus::IsSuccess(DecoderFactoryPng::verify(tn, jpg->getWidth(), jpg->getHeight(), jpg->getWidth()*4, jpg->getData(), jpg->getHeight(), MAX_RGBA_DIFF, MAX_PSNR_DIFF, GENERATE_NEW)));
+		OP_DELETE(jpg);
+		jpg = SelftestDecoderListener::decode_image(&dfj, FILE, -1, 1024);
+		verify(jpg!=NULL);
+		verify(jpg->isDone());
+		verify(OpStatus::IsSuccess(DecoderFactoryPng::verify(tn, jpg->getWidth(), jpg->getHeight(), jpg->getWidth()*4, jpg->getData(), jpg->getHeight(), MAX_RGBA_DIFF, MAX_PSNR_DIFF)));
+		// Only test partially decoded images if they are sequential
+		// since for sequential we can simply verify the decoded part of the 
+		// image but that won't work for progressive as they get better 
+		// and better
+		if( op_strstr(FILE, "-prog") == NULL )
+		{
+			OP_DELETE(jpg);
+			jpg = SelftestDecoderListener::decode_image(&dfj, FILE, 1000, 1024);
+			verify(jpg!=NULL);
+			verify(OpStatus::IsSuccess(DecoderFactoryPng::verify(tn, jpg->getWidth(), jpg->getHeight(), jpg->getWidth()*4, jpg->getData(), jpg->getDecodedLines(), MAX_RGBA_DIFF, MAX_PSNR_DIFF)));
+			OP_DELETE(jpg);
+			jpg = SelftestDecoderListener::decode_image(&dfj, FILE, 1000, 2048);
+			verify(jpg!=NULL);
+			verify(OpStatus::IsSuccess(DecoderFactoryPng::verify(tn, jpg->getWidth(), jpg->getHeight(), jpg->getWidth()*4, jpg->getData(), jpg->getDecodedLines(), MAX_RGBA_DIFF, MAX_PSNR_DIFF)));
+			OP_DELETE(jpg);
+
+			jpg = SelftestDecoderListener::decode_image(&dfj, FILE, 1500, 1024);
+			verify(jpg!=NULL);
+			verify(OpStatus::IsSuccess(DecoderFactoryPng::verify(tn, jpg->getWidth(), jpg->getHeight(), jpg->getWidth()*4, jpg->getData(), jpg->getDecodedLines(), MAX_RGBA_DIFF, MAX_PSNR_DIFF)));
+			OP_DELETE(jpg);
+			jpg = SelftestDecoderListener::decode_image(&dfj, FILE, 1500, 2048);
+			verify(jpg!=NULL);
+			verify(OpStatus::IsSuccess(DecoderFactoryPng::verify(tn, jpg->getWidth(), jpg->getHeight(), jpg->getWidth()*4, jpg->getData(), jpg->getDecodedLines(), MAX_RGBA_DIFF, MAX_PSNR_DIFF)));
+		}
+	} finally {
+		op_free(tn);
+		OP_DELETE(jpg);
+	}
+}
+
+// apparently the jpeg encoder is not yet in a testable state
+/*
+foreach (FILE) from jpeg_files
+{
+    test("encode - $(FILE)")
+	require JAYPEG_ENCODE_SUPPORT;
+    {
+        char* ref = op_strdup(FILE);
+        char* t = op_strrchr(ref, '.');
+        op_strcpy(t, ".png");
+
+        // decode FILE
+	SelftestDecoderListener *jpg = NULL;
+	jpg = SelftestDecoderListener::decode_image(&dfj, FILE, -1, 2048);
+	verify(jpg!=NULL);
+	verify(jpg->isDone());
+
+	const UINT32 iw = jpg->getWidth();
+	const UINT32 ih = jpg->getHeight();
+	const UINT32* id = jpg->getData();
+
+        // re-encode FILE
+	JayEncoder enc;
+	SelftestEncoderListener el;
+        verify(OpStatus::IsSuccess(el.grow(4*iw*ih))); // probably enough so that no growth is needed later
+	verify(OpStatus::IsSuccess(enc.init("jfif", 100, iw, ih, &el)));
+        for (UINT32 y = 0; y < ih; ++y)
+            verify(OpStatus::IsSuccess(enc.encodeScanline(id + y*iw)));
+
+        UINT8* ed;
+        size_t es;
+        el.get(ed, es);
+
+        // decode re-encoded FILE
+        OP_DELETE(jpg);
+	jpg = SelftestDecoderListener::decode_image(&dfj, ed, es);
+	verify(jpg!=NULL);
+	verify(jpg->isDone());
+
+	const UINT32 ow = jpg->getWidth();
+	const UINT32 oh = jpg->getHeight();
+	const UINT32* od = jpg->getData();
+
+        // compare results
+        OP_STATUS status = DecoderFactoryPng::selftest_verify(ref, ow, oh, ow*4, const_cast<UINT32*>(od), oh, MAX_RGBA_DIFF, MAX_PSNR_DIFF);
+        if (OpStatus::IsError(status))
+        {
+            const int baselen = t - ref;
+            char* fname = OP_NEWA(char, baselen + 12);
+            verify(fname);
+            fname[baselen + 11] = 0;
+            op_strcpy(fname, ref);
+            op_strcpy(fname + baselen, "_failed.png");
+            DecoderFactoryPng::selftest_verify(fname, ow, oh, ow*4, const_cast<UINT32*>(od), oh, MAX_RGBA_DIFF, MAX_PSNR_DIFF, TRUE);
+            OP_DELETEA(fname);
+        }
+        verify(OpStatus::IsSuccess(status));
+    }
+    finally
+    {
+        op_free(ref);
+        OP_DELETE(jpg);
+    }
+}
+*/

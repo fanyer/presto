@@ -1,0 +1,474 @@
+/* -*- Mode: c++; tab-width: 4; indent-tabs-mode: t; c-basic-offset: 4 -*-
+ *
+ * Copyright (C) 2002-2012 Opera Software AS.  All rights reserved.
+ *
+ * This file is part of the Opera web browser.
+ * It may not be distributed under any circumstances.
+ */
+
+group "minpng";
+
+include "modules/minpng/minpng.h";
+include "modules/img/image.h";
+include "modules/util/opfile/opfile.h";
+
+require INTERNAL_PNG_SUPPORT;
+constant MAX_BLOCK_SIZE=1024*5;
+
+global {
+	const char *basename( const char *x )
+	{
+		const char *y = x;
+		while( *x++ )
+			if( *x == '/' || *x == '\\')
+				y = x+1;
+		return y;
+	}
+
+// Hack to make sure everything compiles on the BREW compiler
+public:
+
+	class Animation;
+
+	class Frame
+	{
+		RGBAGroup *data;
+		OpRect rect;
+		Frame *next;
+		DisposalMethod disposal_method;
+		int duration;
+		BOOL blend;
+		Animation *animation;
+
+	public:
+		OpRect Rect() { return rect; }
+		RGBAGroup *Data() { return data; }
+		Frame *Next() { return next; }
+		void SetNext(Frame *frame) { next = frame; }
+		BOOL IsAPNG() { return animation && animation->IsAPNG(); }
+		~Frame() { OP_DELETEA(data); }
+		Frame() : data(NULL), next(NULL), animation(NULL) {}
+		BOOL Init(Animation *animation, OpRect rect, DisposalMethod disposal_method, int duration, BOOL blend )
+		{
+			this->rect = rect;
+			data = OP_NEWA(RGBAGroup, rect.width*rect.height);
+			this->disposal_method = disposal_method;
+			this->animation = animation;
+			this->duration = duration;
+			this->blend = blend;
+			if( !data )
+				return FALSE;
+			return TRUE;
+		}
+
+		void AddLine( int y, PngRes *res )
+		{
+			unsigned int w = rect.width;
+			if(res->image_frame_data_pal)
+			{
+				for(unsigned int x=0;x<w;x++)
+				{
+					RGBAGroup *dest = data + y*w + x;
+					int index = res->image_data.indexed[(y-res->first_line)*w + x];
+					UINT8 *rgb = &res->image_frame_data_pal[index*3];
+					if(res->has_transparent_col && res->transparent_index == index)
+						dest->a = 0;
+					else
+						dest->a = 255;
+					dest->r = rgb[0];
+					dest->g = rgb[1];
+					dest->b = rgb[2];
+				}
+			}
+			else
+				op_memcpy( data+y*w, res->image_data.rgba+(y-res->first_line)*w, w*sizeof(RGBAGroup) );
+		}
+
+		BOOL operator ==( Frame &oi )
+		{
+			if(!oi.rect.Equals(rect) ||
+				IsAPNG() && (oi.disposal_method != disposal_method || oi.duration != duration || oi.blend != blend))
+				return FALSE;
+			if( op_memcmp( oi.data, data, rect.width*rect.height*sizeof(RGBAGroup) ) )
+			{
+				for( int ii=0; ii<rect.width*rect.height; ii++ )
+				{
+					if(!data[ii].a && !oi.data[ii].a)
+						continue;
+					if(*((UINT32*)(data+ii)) != *((UINT32*)(oi.data+ii)))
+						return FALSE;
+				}
+			}
+			return TRUE;
+		}
+
+		BOOL operator !=( Frame &oi ) {
+			return !(*this == oi);
+		}
+
+	};
+
+	class Animation
+	{
+		Frame *first_frame,*last_frame;
+		unsigned int mainframe_x,mainframe_y;
+		unsigned int num_iterations,num_frames;
+		BOOL is_apng;
+
+	public:
+		unsigned int Width() { return mainframe_x; }
+		unsigned int Height() { return mainframe_y; }
+		unsigned int Iterations() { return num_iterations; }
+		unsigned int FrameCount() { return num_frames; }
+		BOOL IsAPNG() { return is_apng; }
+
+		~Animation()
+		{
+			Frame *frame = first_frame, *tmp;
+			while(frame)
+			{
+				tmp = frame->Next();
+				OP_DELETE(frame);
+				frame = tmp;
+			}
+		}
+		Animation() : first_frame(NULL), last_frame(NULL), num_frames(0) {}
+		BOOL Init( int mainframe_x, int mainframe_y, int num_iterations, BOOL is_apng )
+		{
+			this->mainframe_x = mainframe_x;
+			this->mainframe_y = mainframe_y;
+			this->num_iterations = num_iterations;
+			this->is_apng = is_apng;
+			return TRUE;
+		}
+
+		void AddFrame( Frame *frame )
+		{
+			num_frames++;
+			if(first_frame == NULL)
+			{
+				first_frame = frame;
+				last_frame = frame;
+			}
+			else
+			{
+				last_frame->SetNext(frame);
+				last_frame = frame;
+			}
+		}
+
+		BOOL operator ==( Animation &oa )
+		{
+			if( mainframe_x != oa.mainframe_x || mainframe_y != oa.mainframe_y ||
+				(is_apng && (num_iterations != oa.num_iterations || num_frames != oa.num_frames)) ||
+				is_apng != oa.is_apng)
+			{
+				return FALSE;
+			}
+			Frame *f = first_frame;
+			Frame *of = oa.first_frame;
+			while(f != NULL)
+			{
+				if(*f != *of)
+					return FALSE;
+				f = f->Next();
+				of = of->Next();
+			}
+			return TRUE;
+		}
+
+		BOOL operator !=( Animation &oa ) {
+			return !(*this == oa);
+		}
+
+	};
+
+private:
+	enum FT {
+		SIZE='s',APNG='a',BACKGROUND='b',MP_TRANSPARENT='t',GAMMA='g',FILTER='f',PALETTE='p',
+		ANCILLARY='c',	ORDER='o',COMPRESSION='z',CORRUPTED='x',
+	};
+	enum CT { gray=0, rgb=2, palette=3, graya=4, rgba=6 };
+
+}
+
+table png_files(const char*) filelist "tests" name "*.png";
+table png_reference_files(const char*) filelist "tests" name "*.ref";
+
+
+subtest REF_READ_AND_VERIFY(OpFile &fd, void *ptr, int len)
+{
+	OpFileLength num_read;
+	fd.Read(ptr,len,&num_read);
+	verify(len >= 0 && num_read == (unsigned int)len);
+}
+
+subtest REF_READ_INT32(OpFile &fd, void *dst_32_bit)
+{
+#define M_NTOHL(X) ((((unsigned char *)&(X))[0]<<24)|(((unsigned char *)&(X))[1]<<16)|(((unsigned char *)&(X))[2]<<8)|(((unsigned char *)&(X))[3]))
+	unsigned int val;
+	verify(REF_READ_AND_VERIFY(fd,&val,4));
+	*((unsigned int*)dst_32_bit) = M_NTOHL(val);
+}
+
+
+subtest decode_file( const char *x, int nbytes )
+{
+	int i; // VC++ compatible..
+	int ret_val = PngRes::ILLEGAL_DATA;
+	Animation animation;
+	Animation ref_animation;
+
+	PngFeeder feeder;
+	PngRes result;
+
+	minpng_init_feeder( &feeder );
+	minpng_init_result( &result );
+
+	OpFile fd;
+	uni_char* ux = uni_up_strdup(x);
+	verify(ux);
+
+	fd.Construct(ux);
+	BOOL exists;
+	verify (OpStatus::IsSuccess(fd.Exists(exists)) && exists);
+	fd.Open(OPFILE_READ);
+	op_free(ux);
+
+	const char *p = basename( x );
+	FT feature = (FT)p[0];
+	char *of = NULL;
+	unsigned char buffer[MAX_BLOCK_SIZE+1]; /* ARRAY OK 2007-11-21 timj */
+	BOOL finished=FALSE, failed=FALSE;
+
+	int frame_index = -1;
+	BOOL main_recorded = FALSE;
+	Frame *current_frame = 0;
+	while( !fd.Eof() )
+	{
+		OpFileLength num_read;
+		fd.Read(buffer, nbytes, &num_read);
+
+		feeder.data = buffer;
+		feeder.len = (unsigned int)num_read;
+		if( !finished && feeder.len > 0 )
+		{
+			int again = 1;
+			while( again )
+			{
+				ret_val = minpng_decode( &feeder, &result );
+				switch( ret_val )
+				{
+					case PngRes::OK:
+						finished = TRUE;
+						// fall-through
+					case PngRes::NEED_MORE:
+						again=FALSE;
+						// fall-through
+					case PngRes::AGAIN:
+						if( result.lines && result.draw_image)
+						{
+							if(!main_recorded)
+							{
+								main_recorded = TRUE;
+#if defined(APNG_SUPPORT)
+								verify(animation.Init(result.mainframe_x,result.mainframe_y,result.num_iterations,result.num_frames > 1));
+#else
+								verify(animation.Init(result.mainframe_x,result.mainframe_y,1,FALSE));
+#endif
+							}
+#ifdef APNG_SUPPORT
+							verify(result.num_frames > 1 == animation.IsAPNG());
+#endif
+							if(result.frame_index != frame_index)
+							{
+								verify(result.frame_index == frame_index+1);
+#if !defined(APNG_SUPPORT)
+								verify(result.frame_index == 0);
+#endif
+								current_frame = OP_NEW(Frame, ());
+								verify(current_frame != NULL);
+#if defined(APNG_SUPPORT)
+								verify(current_frame->Init(&animation, result.rect,result.disposal_method,result.duration,result.blend));
+#else
+								verify(current_frame->Init(&animation, result.rect,DISPOSAL_METHOD_DO_NOT_DISPOSE,0,TRUE));
+#endif
+								animation.AddFrame(current_frame);
+								frame_index = result.frame_index;
+							}
+							verify( result.rect.width && result.rect.height );
+							verify(current_frame->Rect().Equals(result.rect));
+							for( i = 0; i<(int)result.lines; i++ )
+							{
+								verify( (int)(i+result.first_line) < (int)(result.rect.height) );
+								current_frame->AddLine( i+result.first_line, &result );
+							}
+						}
+						break;
+					case PngRes::OOM_ERROR:
+					case PngRes::ILLEGAL_DATA:
+						again = 0;
+						failed = TRUE;      // This is OK for some of the images.
+						finished = TRUE;
+						break;
+				}
+				minpng_clear_result( &result );
+			}
+		}
+	}
+	fd.Close();
+	// Read reference image/animation.
+	of = op_strdup( x );
+	for( i = op_strlen(of)-1; i>0; i-- )
+	{
+		if( of[i] == '.' ) {
+			op_memcpy( of+i+1, "ref", 3 );
+			break;
+		}
+	}
+	ux = uni_up_strdup(of);
+	fd.Construct(ux);
+	op_free(ux);
+	if( finished && OpStatus::IsSuccess(fd.Open(OPFILE_READ)))
+	{
+		OpRect rect;
+		unsigned int mainframe_x,mainframe_y;
+		if(feature == APNG)
+		{
+			unsigned char buf[4]; /* ARRAY OK 2007-11-21 timj */
+			DisposalMethod disposal_method;
+			int duration,num_frames,num_iterations;
+			BOOL blend,skip;
+			verify(REF_READ_AND_VERIFY(fd,buf,4));
+			verify(buf[0] == 'R' && buf[1] == 'E' && buf[2] == 'F' && buf[3] == '\0');
+			verify(REF_READ_INT32(fd,&mainframe_x));
+			verify(REF_READ_INT32(fd,&mainframe_y));
+			verify(REF_READ_INT32(fd,&num_frames));
+			verify(REF_READ_INT32(fd,&num_iterations));
+#ifdef APNG_SUPPORT
+			verify(ref_animation.Init(mainframe_x,mainframe_y,num_iterations,TRUE));
+#else
+			verify(ref_animation.Init(mainframe_x,mainframe_y,1,FALSE));
+			num_frames = 1;
+			verify(!animation.IsAPNG());
+#endif
+			for(i=0;i<num_frames;i++)
+			{
+				verify(REF_READ_INT32(fd,&rect.x));
+				verify(REF_READ_INT32(fd,&rect.y));
+				verify(REF_READ_INT32(fd,&rect.width));
+				verify(REF_READ_INT32(fd,&rect.height));
+				verify(REF_READ_INT32(fd,&duration));
+				verify(REF_READ_INT32(fd,&skip));
+				verify(REF_READ_INT32(fd,&blend));
+				verify(REF_READ_INT32(fd,&disposal_method));
+				if(disposal_method == 1)
+					disposal_method = DISPOSAL_METHOD_RESTORE_BACKGROUND;
+				else if(disposal_method == 2)
+					disposal_method = DISPOSAL_METHOD_RESTORE_PREVIOUS;
+				else
+					disposal_method = DISPOSAL_METHOD_DO_NOT_DISPOSE;
+				if(skip)
+					continue;
+				current_frame = OP_NEW(Frame, ());
+				verify(current_frame != NULL);
+				verify(current_frame->Init(&ref_animation,rect,disposal_method,duration,blend));
+				verify(REF_READ_AND_VERIFY(fd,current_frame->Data(),rect.width*rect.height*sizeof(RGBAGroup)));
+				ref_animation.AddFrame(current_frame);
+			}
+		}
+		else
+		{
+			verify(!animation.IsAPNG());
+			verify(REF_READ_INT32(fd,&mainframe_x));
+			verify(REF_READ_INT32(fd,&mainframe_y));
+			verify(mainframe_x == animation.Width() && mainframe_y == animation.Height());
+			verify(ref_animation.Init(mainframe_x,mainframe_y,1,FALSE));
+			rect.Set(0,0,mainframe_x,mainframe_y);
+			current_frame = OP_NEW(Frame, ());
+			verify(current_frame != NULL);
+			verify(current_frame->Init(&ref_animation,rect,DISPOSAL_METHOD_DO_NOT_DISPOSE,0,TRUE));
+			verify(REF_READ_AND_VERIFY(fd,current_frame->Data(),rect.width*rect.height*sizeof(RGBAGroup)));
+			ref_animation.AddFrame(current_frame);
+		}
+		fd.Close();
+	}
+	else
+		ref_animation.Init(0,0,DISPOSAL_METHOD_DO_NOT_DISPOSE,TRUE);
+	op_free( of );
+	of = NULL;
+
+//	CT color_type = (CT)(p[4]-'0');
+//  char param = (p[1]<<8) | p[2];
+//	BOOL interlaced = p[3]=='i';
+#ifdef MINPNG_NO_16BIT_SUPPORT
+	int depth = op_atoi( p+6 );
+#endif // MINPNG_NO_16BIT_SUPPORT
+
+	unsigned int param_i = op_atoi( p+1 );
+
+	if( feature != CORRUPTED )
+	{
+		verify( finished );
+		verify( failed == FALSE );
+	}
+
+#ifdef MINPNG_NO_16BIT_SUPPORT
+	if( depth != 16 )
+#endif
+#ifdef MINPNG_NO_GAMMA_SUPPORT
+	// The gamma support is a feature that can be turned
+	// off, thus:
+	if( feature != GAMMA )
+		// FIXME: Should really test that the reference is _close_ to
+		// the image even when gamma is available. Currently this test
+		// will fail even if the floating-point arithmetics differs
+		// only slightly.
+		//
+#endif
+#ifdef MINPNG_NO_FILTER_SUPPORT
+		if( feature != FILTER ) // Ditto
+#endif
+		switch( feature )
+		{
+		case SIZE:
+			verify( animation.Width() == animation.Height() );
+			verify( animation.Width() == param_i );
+			/* Fallthrough. Also check the actual image data */
+		case APNG:
+		case BACKGROUND:
+		case MP_TRANSPARENT:
+		case FILTER:
+		case PALETTE:
+		case ANCILLARY:
+		case ORDER:
+		case GAMMA:
+		case COMPRESSION:
+			if( ref_animation.Width() )
+				verify( ref_animation == animation );
+			break;
+		case CORRUPTED:
+			break;
+		}
+}
+finally
+{
+	minpng_clear_result( &result );
+	minpng_clear_feeder( &feeder );
+	fd.Close();
+}
+
+table sizes
+{
+	5000:"5k",	512, 128, 65, 20, 11, 5, 3,	2, 1,
+}
+
+
+foreach(size) from sizes
+{
+  test( "$(FILE) ($(size)b block)" )
+	multi png_files(FILE);
+  {
+	  verify(decode_file(FILE, size));
+  }
+}

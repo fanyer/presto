@@ -1,0 +1,226 @@
+/* -*- Mode: c++; tab-width: 4; c-basic-offset: 4 -*-
+ *
+ * Copyright (C) 1995-2010 Opera Software AS.  All rights reserved.
+ *
+ * This file is part of the Opera web browser.
+ * It may not be distributed under any circumstances.
+ *
+ * @author Arjan van Leeuwen (arjanl)
+ */
+
+group "quix.UnixOpFileChooser";
+require _UNIX_DESKTOP_;
+
+include "platforms/quix/desktop_pi_impl/UnixDesktopFileChooser.h";
+include "platforms/quix/toolkits/ToolkitFileChooser.h";
+include "modules/pi/OpLocale.h";
+include "modules/prefs/prefsmanager/collections/pc_unix.h";
+
+table ActionMap(DesktopFileChooserRequest::Action, ToolkitFileChooser::DialogType)
+{
+	{ DesktopFileChooserRequest::ACTION_FILE_OPEN, ToolkitFileChooser::FILE_OPEN },
+	{ DesktopFileChooserRequest::ACTION_FILE_OPEN_MULTI, ToolkitFileChooser::FILE_OPEN_MULTI },
+	{ DesktopFileChooserRequest::ACTION_FILE_SAVE, ToolkitFileChooser::FILE_SAVE },
+	{ DesktopFileChooserRequest::ACTION_FILE_SAVE_PROMPT_OVERWRITE, ToolkitFileChooser::FILE_SAVE_PROMPT_OVERWRITE },
+	{ DesktopFileChooserRequest::ACTION_DIRECTORY, ToolkitFileChooser::DIRECTORY }
+}
+
+global
+{
+	class TestToolkitFileChooser : public ToolkitFileChooser
+	{
+	public:
+		TestToolkitFileChooser() : m_inited(false), m_dialog_type(FILE_OPEN), m_default_filter(0), m_fixed_extensions(false), m_opened_dialog(false), m_show_hidden(true) {}
+		virtual void InitDialog() { m_inited = true; }
+		virtual void SetDialogType(DialogType type) { m_dialog_type = type; }
+		virtual void SetCaption(const char* caption) { m_caption.SetFromUTF8(caption); }
+		virtual void SetInitialPath(const char* path) { m_path.SetFromUTF8(path); }
+		virtual void SetFixedExtensions(bool fixed) { m_fixed_extensions = fixed; }
+		virtual void OpenDialog(X11Types::Window parent, ToolkitFileChooserListener* result_listener) { m_opened_dialog = true; }
+		virtual void Cancel() {}
+		virtual void Destroy() {}
+		virtual void SetDefaultFilter(int id) { m_default_filter = id; }
+		virtual void ShowHiddenFiles(bool show_hidden) { m_show_hidden = show_hidden; }
+		virtual void AddFilter(int id, const char* media_type)
+		{
+			OpFileSelectionListener::MediaType* filter = OP_NEW(OpFileSelectionListener::MediaType, ());
+			filter->media_type.SetFromUTF8(media_type);
+			m_filters.Add(filter);
+		}
+		virtual void AddExtension(int id, const char* extension)
+		{
+			OpFileSelectionListener::MediaType* filter = m_filters.Get(id);
+			OpString* ext = OP_NEW(OpString, ());
+			ext->SetFromUTF8(extension);
+			filter->file_extensions.Add(ext);
+		}
+		virtual int GetFileCount() { return 1; }
+		virtual const char* GetFileName(int index) { return "/test"; }
+		virtual const char* GetActiveDirectory() { return "/testdir"; }
+		virtual int GetSelectedFilter() { return 1; }
+
+		bool m_inited;
+		DialogType m_dialog_type;
+		OpString m_caption;
+		OpString m_path;
+		OpAutoVector<OpFileSelectionListener::MediaType> m_filters;
+		int m_default_filter;
+		bool m_fixed_extensions;
+		bool m_opened_dialog;
+		bool m_show_hidden;
+	};
+
+	class TestListener : public DesktopFileChooserListener
+	{
+	public:
+		TestListener() : file_count(0), selected_filter(-1) {}
+		virtual void OnFileChoosingDone(DesktopFileChooser* chooser, const DesktopFileChooserResult& result)
+		{
+			file_count = result.files.GetCount();
+			if (file_count >= 1)
+				file.Set(*result.files.Get(0));
+			active_directory.Set(result.active_directory);
+			selected_filter = result.selected_filter;
+		}
+
+		int file_count;
+		OpString file;
+		OpString active_directory;
+		int selected_filter;
+	};
+
+	struct FileChooserHolder
+	{
+		FileChooserHolder() : toolkit_chooser(), chooser(&toolkit_chooser) {}
+		TestListener listener;
+		DesktopFileChooserRequest request;
+		TestToolkitFileChooser toolkit_chooser;
+		UnixDesktopFileChooser chooser;
+	};
+};
+
+test("Initializes toolkit dialog")
+{
+	FileChooserHolder h;
+
+	verify(OpStatus::IsSuccess(h.chooser.Execute(0, &h.listener, h.request)));
+
+	verify(h.toolkit_chooser.m_inited);
+}
+
+test("forwards call to put up dialog")
+{
+	FileChooserHolder h;
+
+	verify(OpStatus::IsSuccess(h.chooser.Execute(0, &h.listener, h.request)));
+	h.chooser.HandleCallback(MSG_FILE_CHOOSER_SHOW, (MH_PARAM_1)&h.chooser, 0);
+
+	verify(h.toolkit_chooser.m_opened_dialog);
+}
+
+test("forwards action details")
+{
+	FileChooserHolder h;
+
+	iterate (desktop_action, dialog_type ) from ActionMap
+	{
+		h.request.action = desktop_action;
+		verify(OpStatus::IsSuccess(h.chooser.Execute(0, &h.listener, h.request)));
+
+		verify(h.toolkit_chooser.m_dialog_type == dialog_type);
+	}
+}
+
+test("forwards caption as UTF-8")
+{
+	FileChooserHolder h;
+
+	verify(OpStatus::IsSuccess(h.request.caption.Set(UNI_L("\x20\x9999\x20\x9999\x20\x9999"))));
+	verify(OpStatus::IsSuccess(h.chooser.Execute(0, &h.listener, h.request)));
+
+	verify(h.request.caption == h.toolkit_chooser.m_caption);
+}
+
+test("forwards initial path")
+{
+	FileChooserHolder h;
+
+	verify(OpStatus::IsSuccess(h.request.initial_path.Set(UNI_L("/usr/\x9999"))));
+	verify(OpStatus::IsSuccess(h.chooser.Execute(0, &h.listener, h.request)));
+
+	verify(h.request.initial_path == h.toolkit_chooser.m_path);
+}
+
+test("sets hidden files settings")
+{
+	FileChooserHolder h;
+
+	verify(OpStatus::IsSuccess(h.chooser.Execute(0, &h.listener, h.request)));
+
+	verify(h.toolkit_chooser.m_show_hidden == g_pcunix->GetIntegerPref(PrefsCollectionUnix::FileSelectorShowHiddenFiles));
+}
+
+test("forwards requested extension filters")
+{
+	FileChooserHolder h;
+
+	verify(OpStatus::IsSuccess(h.request.extension_filters.Add(OP_NEW(OpFileSelectionListener::MediaType, ()))));
+	verify(OpStatus::IsSuccess(h.request.extension_filters.Get(0)->media_type.Set(UNI_L("media type 1"))));
+	verify(OpStatus::IsSuccess(h.request.extension_filters.Get(0)->file_extensions.Add(OP_NEW(OpString, ()))));
+	verify(OpStatus::IsSuccess(h.request.extension_filters.Get(0)->file_extensions.Get(0)->Set(UNI_L("ext1"))));
+	verify(OpStatus::IsSuccess(h.request.extension_filters.Get(0)->file_extensions.Add(OP_NEW(OpString, ()))));
+	verify(OpStatus::IsSuccess(h.request.extension_filters.Get(0)->file_extensions.Get(1)->Set(UNI_L("ext2"))));
+	verify(OpStatus::IsSuccess(h.request.extension_filters.Add(OP_NEW(OpFileSelectionListener::MediaType, ()))));
+	verify(OpStatus::IsSuccess(h.request.extension_filters.Get(1)->media_type.Set(UNI_L("media type 2"))));
+	verify(OpStatus::IsSuccess(h.request.extension_filters.Get(1)->file_extensions.Add(OP_NEW(OpString, ()))));
+	verify(OpStatus::IsSuccess(h.request.extension_filters.Get(1)->file_extensions.Get(0)->Set(UNI_L("ext3"))));
+	h.request.initial_filter = 1;
+	verify(OpStatus::IsSuccess(h.chooser.Execute(0, &h.listener, h.request)));
+
+	verify(h.toolkit_chooser.m_filters.GetCount() == 2);
+	verify(h.toolkit_chooser.m_filters.Get(0)->media_type == UNI_L("media type 1"));
+	verify(h.toolkit_chooser.m_filters.Get(0)->file_extensions.GetCount() == 2);
+	verify(*h.toolkit_chooser.m_filters.Get(0)->file_extensions.Get(0) == UNI_L("ext1"));
+	verify(*h.toolkit_chooser.m_filters.Get(0)->file_extensions.Get(1) == UNI_L("ext2"));
+	verify(h.toolkit_chooser.m_filters.Get(1)->media_type == UNI_L("media type 2"));
+	verify(h.toolkit_chooser.m_filters.Get(1)->file_extensions.GetCount() == 1);
+	verify(*h.toolkit_chooser.m_filters.Get(1)->file_extensions.Get(0) == UNI_L("ext3"));
+}
+
+test("'*.*' filter gets converted to unix-style '*'-filter")
+{
+	FileChooserHolder h;
+
+	verify(OpStatus::IsSuccess(h.request.extension_filters.Add(OP_NEW(OpFileSelectionListener::MediaType, ()))));
+	verify(OpStatus::IsSuccess(h.request.extension_filters.Get(0)->media_type.Set(UNI_L("All files"))));
+	verify(OpStatus::IsSuccess(h.request.extension_filters.Get(0)->file_extensions.Add(OP_NEW(OpString, ()))));
+	verify(OpStatus::IsSuccess(h.request.extension_filters.Get(0)->file_extensions.Get(0)->Set(UNI_L("*.*"))));
+	verify(OpStatus::IsSuccess(h.chooser.Execute(0, &h.listener, h.request)));
+
+	verify(h.toolkit_chooser.m_filters.GetCount() == 1);
+	verify(h.toolkit_chooser.m_filters.Get(0)->file_extensions.GetCount() == 1);
+	verify(*h.toolkit_chooser.m_filters.Get(0)->file_extensions.Get(0) == UNI_L("*"));
+}
+
+test("forwards fixed filters")
+{
+	FileChooserHolder h;
+
+	h.request.fixed_filter = TRUE;
+	verify(OpStatus::IsSuccess(h.chooser.Execute(0, &h.listener, h.request)));
+
+	verify(h.toolkit_chooser.m_fixed_extensions);
+}
+
+test("gets results")
+{
+	FileChooserHolder h;
+
+	verify(OpStatus::IsSuccess(h.chooser.Execute(0, &h.listener, h.request)));
+	h.chooser.OnChoosingDone(&h.toolkit_chooser);
+
+	verify(h.listener.file_count == 1);
+	verify(h.listener.file == UNI_L("/test"));
+	verify(h.listener.active_directory == UNI_L("/testdir"));
+	verify(h.listener.selected_filter == 1);
+}

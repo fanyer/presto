@@ -1,0 +1,535 @@
+/* -*- Mode: c; tab-width: 4; c-basic-offset: 4 -*-
+ *
+ * Copyright (C) 2008-2009 Opera Software AS.  All rights reserved.
+ *
+ * This file is part of the Opera web browser.
+ * It may only be distributed as agreed with Opera Software.
+ */
+
+group "mime.mime_decoding";
+
+require _MIME_SUPPORT_;
+
+include "modules/url/url2.h";
+include "modules/url/url_man.h";
+include "modules/url/url_rep.h";
+include "modules/mime/mime_cs.h";
+include "modules/mime/mimedec2.h";
+include if(defined(M2_SUPPORT)) "modules/prefs/prefsmanager/collections/pc_m2.h";
+
+global {
+	BOOL enough_memory;
+}
+
+subtest verifyPartContent(MIME_DecodeCache_Storage* processor, int partNo, const char* contents, const char* filename)
+{
+	URL part;
+	URL_DataDescriptor *desc = NULL;
+	processor->GetAttachment(partNo, part);
+	if (contents)
+	{
+		desc = part.GetDescriptor(NULL,URL::KNoRedirect,FALSE,TRUE,NULL);
+		verify(desc);
+		BOOL more;
+		unsigned long len = UNICODE_DOWNSIZE(desc->RetrieveData(more));
+		verify(!more);
+		uni_char* buffer = (uni_char *) desc->GetBuffer();
+		verify(buffer);
+		OpString data;
+		data.Set(buffer, (int)len);
+		verify_string(data, contents);
+	}
+	if (filename)
+	{
+		OpString name;
+		part.GetAttributeL(URL::KSuggestedFileName_L, name);
+		verify_string(name,filename);
+	}
+}
+finally
+{
+	OP_DELETE(desc);
+}
+
+test("Various MIME decoding")
+{
+	MIME_DecodeCache_Storage* processor = NULL;
+	URL test_url = urlManager->GetURL("attachment:test");
+	URL_Rep* url = test_url.GetRep();
+	verify(url);
+	Cache_Storage* storage = NULL;
+	processor = OP_NEW(MIME_DecodeCache_Storage, (url, NULL));
+	verify(processor);
+	processor->Construct(url, storage);
+
+	const char* data =
+		"From roarl@opera.com Mon Apr 21 12:53:02 2008\n"
+		"Subject: Test\n"
+		"Content-Type: multipart/related; boundary=B1\n"
+		"Content-Transfer-Encoding: 8bit\n"
+		"MIME_Version: 1.0\n"
+		"\n"
+		"This is a multi-part message in MIME format.\n"
+		"--B1\n"
+		"Content-Type: multipart/alternative; boundary=B2\n"
+		"\n"
+		"--B2\n"
+		"Content-Type: text/plain\n"
+		"\n"
+		"Hello1234 \n"
+		"--B2\n"
+		"Content-Type: text/html; charset=ISO-8859-1\n"
+		"\n"
+		"Hello2345 \n"
+		"--B2--\n"
+		"\n"
+		"--B1\n"
+		"Content-Type: text/plain\n"
+		"Content-ID: <unreferenced>\n"
+		"\n"
+		"Hello3456 \n"
+		"--B1\n"
+		"Content-Type: application/ms-tnef\n"
+		"Content-Transfer-Encoding: base64\n"
+		"\n"
+		// 78 9F 3E 22                    TNEF_SIGNATURE
+		// 00 00                          (ignored)
+		// 02                             LVL_ATTACHMENT
+		// 10 80 01 00                    attAttachTitle, atpString (filename)
+		// 08 00 00 00                    length = 8
+		// 74 65 73 74 2E 74 78 74        "test.txt"
+		// 4E 03                          checksum
+		// 02                             LVL_ATTACHMENT
+		// 0F 80 06 00                    attAttachData, atpByte (data)
+		// 0A 00 00 00                    length = 10
+		// 48 65 6C 6C 6F 34 35 36 37 20  "Hello4567 "
+		// EA 02                          checksum
+		// 02                             LVL_ATTACHMENT
+		// 02 90 06 00                    attAttachRendData, atpByte (attachment separator)
+		// 00 00 00 00                    length = 0
+		// 00 00                          checksum
+		// 02                             LVL_ATTACHMENT
+		// 0F 80 06 00                    attAttachData, atpByte (data before filename this time)
+		// 0A 00 00 00                    length = 10
+		// 48 65 6C 6C 6F 35 36 37 38 20  "Hello5678 "
+		// EE 02                          checksum
+		// 02                             LVL_ATTACHMENT
+		// 10 80 01 00                    attAttachTitle, atpString (filename after data this time)
+		// 09 00 00 00                    length = 9
+		// 74 65 73 74 32 2E 74 78 74     "test2.txt"
+		// 80 03                          checksum
+		"eJ8+IgAAAhCAAQAIAAAAdGVzdC50eHROAwIPgAYACgAAAEhlbGxvNDU2NyDq\n"
+		"AgICkAYAAAAAAAAAAg+ABgAKAAAASGVsbG81Njc4IO4CAhCAAQAJAAAAdGVz\n"
+		"dDIudHh0gAM=\n"
+		"--B1\n"
+		"Content-Type: application/mime\n"
+		"\n"
+		"Content-Type: text/plain\n"
+		"\n"
+		"Hello6789 \n"
+		"--B1--\n";
+
+	static_cast<Cache_Storage*>(processor)->SetPreferPlaintext(FALSE);
+	verify_success(processor->StoreData((const unsigned char*)data, (unsigned long)op_strlen(data)));
+	processor->SetFinished(FALSE);
+	verify(verifyPartContent(processor, 0, "Hello2345 ", NULL)); // The HTML part
+	verify(verifyPartContent(processor, 1, "Hello3456 ", NULL));
+	verify(verifyPartContent(processor, 3, "Hello4567 ", "test.txt"));
+	verify(verifyPartContent(processor, 5, "Hello5678 ", "test2.txt"));
+	verify(verifyPartContent(processor, 6, "Hello6789 ", NULL));
+
+	processor->Purge();
+	static_cast<Cache_Storage*>(processor)->SetPreferPlaintext(TRUE);
+	verify_success(processor->StoreData((const unsigned char*)data, (unsigned long)op_strlen(data)));
+	processor->SetFinished(FALSE);
+	verify(verifyPartContent(processor, 0, "Hello1234 ", NULL)); // The plaintext part
+	verify(verifyPartContent(processor, 1, "Hello3456 ", NULL));
+	// And so on...
+}
+finally
+{
+	OP_DELETE(processor);
+}
+
+test("Uuencode variants")
+{
+	MIME_DecodeCache_Storage* processor = NULL;
+	URL test_url = urlManager->GetURL("attachment:test");
+	URL_Rep* url = test_url.GetRep();
+	verify(url);
+	Cache_Storage* storage = NULL;
+	processor = OP_NEW(MIME_DecodeCache_Storage, (url, NULL));
+	verify(processor);
+	processor->Construct(url, storage);
+
+	const char* data =
+		"From roarl@opera.com Mon Sep 12 10:34:42 2008\n"
+		"Subject: Test\n"
+		"Content-Type: text/plain\n"
+		"Content-Transfer-Encoding: 8bit\n"
+		"MIME_Version: 1.0\n"
+		"\n"
+		"Testing uuencode\n"
+		"begin 400 years from now\n"        // Proper mode, suspicious filename
+		"(Should it be allowed?)\n"         // Suspicious uuencode
+		"begin 300 years from now\n"        // Suspicious mode, suspicious filename
+		"(!!!NEVER!!!)\n"                   // Proper uuencode
+		"begin 300 test.txt\n"              // Suspicious mode, proper filename
+		"(Should it be allowed?)\n"         // Suspicious uuencode
+		"begin 400 test1.txt\n"             // Proper mode, proper filename
+		"this is invalid\n"                 // Invalid uuencode
+		"begin 640 test 2.txt\n"            // Proper mode, suspicious filename
+		"%5&5S=#(`\n"                       // Proper uuencode
+		"`\n"
+		"end\n"
+		"begin 077 test3.txt\n"             // Suspicious mode, proper filename
+		"%5&5S=#,`\n"                       // Proper uuencode
+		"`\n"
+		"end\n"
+		"begin 400 test4.txt\n"             // Proper mode, Proper filename
+		"%ufuS}cp \n";                      // Suspicious uuencode
+
+	verify_success(processor->StoreData((const unsigned char*)data, (unsigned long)op_strlen(data)));
+	processor->SetFinished(FALSE);
+	verify(verifyPartContent(processor, 0,
+		"Testing uuencode\n"
+		"begin 400 years from now\n"
+		"(Should it be allowed?)\n"
+		"begin 300 years from now\n"
+		"(!!!NEVER!!!)\n"
+		"begin 300 test.txt\n"
+		"(Should it be allowed?)\n"
+		"begin 400 test1.txt\n"
+		"this is invalid\n", NULL));
+
+	BOOL attachments_shown_inline = TRUE;
+
+#if defined(M2_SUPPORT) && defined(NEED_URL_MIME_DECODE_LISTENERS)
+	// similar conditions as in mimespec.cpp
+	if (!g_pcm2->GetIntegerPref(PrefsCollectionM2::ShowAttachmentsInline))
+		attachments_shown_inline = FALSE;
+#endif
+
+	if (attachments_shown_inline)
+	{
+		// Attachments intermixed with body text parts
+		verify(verifyPartContent(processor, 1, "Test2", "test 2.txt"));
+		verify(verifyPartContent(processor, 3, "Test3", "test3.txt"));
+		verify(verifyPartContent(processor, 5, "Test4", "test4.txt"));
+	}
+	else
+	{
+		// Attachments added after body text parts
+		verify(verifyPartContent(processor, 3, "Test2", "test 2.txt"));
+		verify(verifyPartContent(processor, 4, "Test3", "test3.txt"));
+		verify(verifyPartContent(processor, 5, "Test4", "test4.txt"));
+	}
+}
+finally
+{
+	OP_DELETE(processor);
+}
+
+test("Enough memory")
+{
+	void *ptr = op_malloc(0x10000000); // these tests are only meaningful if you have 256 MB free
+	enough_memory = (ptr != NULL);
+	if (enough_memory)
+		op_free(ptr);
+	else
+		output("\nOOM detected. Skipping the following selftests due to limited memory\n");
+}
+
+test("Nesty attack")
+	require success "Enough memory";
+{
+	if (enough_memory)
+		verify(test_nesty());
+	else
+		output("Skipped\n");
+}
+
+subtest test_nesty()
+{
+	MIME_Decoder* OP_MEMORY_VAR decoder = NULL;
+	char* data = NULL;
+	URL test_url = urlManager->GetURL("attachment:test");
+	URL_Rep* url = test_url.GetRep();
+	verify(url);
+
+	const char* part = "Content-type: message/rfc822;\n\n";
+	int part_len = (int)op_strlen(part);
+	int num_parts = 10000;
+	int i;
+	data = OP_NEWA(char, num_parts*part_len);
+	verify(data);
+	for (i=0; i<num_parts; i++)
+		op_memcpy(data+i*part_len, part, part_len);
+
+	TRAPD(op_err, decoder = MIME_Decoder::CreateDecoderL(NULL, (const unsigned char*)data, (unsigned long)part_len, URL_ATTACHMENT, url));
+	verify_success(op_err);
+	TRAP(op_err, decoder->LoadDataL((const unsigned char*)data+part_len, (unsigned long)(num_parts*part_len-part_len)));
+	verify_success(op_err);
+	TRAP(op_err, decoder->FinishedLoadingL());
+	verify_success(op_err);
+	verify(!decoder->HaveAttachments());
+	verify(decoder->HaveDecodeWarnings());
+}
+finally
+{
+	OP_DELETE(decoder);
+	OP_DELETEA(data);
+}
+	
+test("Nesty attack 2")
+	require success "Enough memory";
+{
+	if (enough_memory)
+		verify(test_nesty_2());
+	else
+		output("Skipped\n");
+}
+
+subtest test_nesty_2()
+{
+	MIME_Decoder* OP_MEMORY_VAR decoder = NULL;
+	char* data = NULL;
+	URL test_url = urlManager->GetURL("attachment:test");
+	URL_Rep* url = test_url.GetRep();
+	verify(url);
+
+	const char *part = "Content-Type: multipart/mixed; boundary=\"%04d\"\n\n--%04d\n"; // Note, "%04d" is 4 chars long
+	int header_len = (int)(op_strstr(part,"--")-part);
+	int part_len = (int)op_strlen(part);
+	int num_parts = 10000; // Must be less than 4 chars
+	int i;
+	data = OP_NEWA(char, num_parts*part_len+1);
+	verify(data);
+	for (i=0; i<num_parts; i++)
+		op_sprintf(data+i*part_len, part, i, i);
+
+	TRAPD(op_err, decoder = MIME_Decoder::CreateDecoderL(NULL, (const unsigned char*)data, (unsigned long)header_len, URL_ATTACHMENT, url));
+	verify_success(op_err);
+	TRAP(op_err, decoder->LoadDataL((const unsigned char*)data+header_len, (unsigned long)(num_parts*part_len-header_len)));
+	verify_success(op_err);
+	TRAP(op_err, decoder->FinishedLoadingL());
+	verify_success(op_err);
+	verify(!decoder->HaveAttachments());
+	verify(decoder->HaveDecodeWarnings());
+}
+finally
+{
+	OP_DELETE(decoder);
+	OP_DELETEA(data);
+}
+
+test("Multikill attack")
+	require success "Enough memory";
+{
+	if (enough_memory)
+		verify(test_multikill());
+	else
+		output("Skipped\n");
+}
+
+subtest test_multikill()
+{
+	MIME_Decoder* OP_MEMORY_VAR decoder = NULL;
+	char* data = NULL;
+	char* subData = NULL;
+	URL test_url = urlManager->GetURL("attachment:test");
+	URL_Rep* url = test_url.GetRep();
+	verify(url);
+
+	const char* header = "Content-Type: multipart/mixed; boundary=\"a\"   \n\n";
+	const char* part = "--a\n\nb\n\n";
+	int header_len = (int)op_strlen(header);
+	int part_len = (int)op_strlen(part);
+	int num_parts = 100000;
+	int i;
+	subData = OP_NEWA(char, 1000*part_len);
+	verify(subData);
+	for (i=0; i<1000; i++)
+		op_memcpy(subData+i*part_len, part, part_len);
+	data = OP_NEWA(char, header_len+num_parts*part_len);
+	verify(data);
+	op_memcpy(data, header, header_len);
+	for (i=0; i<num_parts/1000; i++)
+		op_memcpy(data+header_len+i*1000*part_len, subData, 1000*part_len);
+
+	TRAPD(op_err, decoder = MIME_Decoder::CreateDecoderL(NULL, (const unsigned char*)data, (unsigned long)header_len, URL_ATTACHMENT, url));
+	verify_success(op_err);
+	TRAP(op_err, decoder->LoadDataL((const unsigned char*)data+header_len, (unsigned long)(num_parts*part_len)));
+	verify_success(op_err);
+	TRAP(op_err, decoder->FinishedLoadingL());
+	verify_success(op_err);
+	UINT number_of_parts = decoder->NumberOfParts();
+	verify(number_of_parts == 65536);
+	verify(decoder->HaveDecodeWarnings());
+}
+finally
+{
+	OP_DELETE(decoder);
+	OP_DELETEA(data);
+	OP_DELETEA(subData);
+}
+
+test("Nested multikill attack")
+	require success "Enough memory";
+{
+	if (enough_memory)
+		verify(test_nested_multikill());
+	else
+		output("Skipped\n");
+}
+
+subtest test_nested_multikill()
+{
+	MIME_Decoder* OP_MEMORY_VAR decoder = NULL;
+	char* data = NULL;
+	char* subData = NULL;
+	URL test_url = urlManager->GetURL("attachment:test");
+	URL_Rep* url = test_url.GetRep();
+	verify(url);
+
+	const char* header = "Content-Type: multipart/mixed; boundary=\"a\"   \n\n";
+	const char* part_a = "--a\nContent-Type: multipart/mixed; boundary=\"b\"       \n\n";
+	const char* part_b = "--b\n\nb\n\n";
+	const char* part_b_end = "--b-- \n\n";
+	int header_len = (int)op_strlen(header);
+	int part_a_len = (int)op_strlen(part_a);
+	int part_b_len = (int)op_strlen(part_b);
+	int part_b_end_len = (int)op_strlen(part_b_end);
+	int num_parts_a = 10;
+	int num_parts_b = 10000;
+	int i;
+	subData = OP_NEWA(char, num_parts_b*part_b_len);
+	verify(subData);
+	for (i=0; i<num_parts_b; i++)
+		op_memcpy(subData+i*part_b_len, part_b, part_b_len);
+	data = OP_NEWA(char, header_len+num_parts_a*(part_a_len+num_parts_b*part_b_len+part_b_end_len));
+	verify(data);
+	char *pos = data;
+	op_memcpy(pos, header, header_len);
+	pos += header_len;
+	for (i=0; i<num_parts_a; i++) {
+		op_memcpy(pos, part_a, part_a_len);
+		pos += part_a_len;
+		op_memcpy(pos, subData, num_parts_b*part_b_len);
+		pos += num_parts_b*part_b_len;
+		op_memcpy(pos, part_b_end, part_b_end_len);
+		pos += part_b_end_len;
+	}
+
+	TRAPD(op_err, decoder = MIME_Decoder::CreateDecoderL(NULL, (const unsigned char*)data, (unsigned long)header_len, URL_ATTACHMENT, url));
+	verify_success(op_err);
+	TRAP(op_err, decoder->LoadDataL((const unsigned char*)data+header_len, (unsigned long)(pos-data-header_len)));
+	verify_success(op_err);
+	TRAP(op_err, decoder->FinishedLoadingL());
+	verify_success(op_err);
+	UINT number_of_parts = decoder->NumberOfParts();
+	verify(number_of_parts == 65536);
+	verify(decoder->HaveDecodeWarnings());
+}
+finally
+{
+	OP_DELETE(decoder);
+	OP_DELETEA(data);
+	OP_DELETEA(subData);
+}
+
+test("Header continuation attack, bug CORE-26196")
+{
+	MIME_DecodeCache_Storage* processor = NULL;
+	char *data = NULL;
+	URL test_url = urlManager->GetURL("attachment:test");
+	URL_Rep* url = test_url.GetRep();
+	verify(url);
+	Cache_Storage* storage = NULL;
+	processor = OP_NEW(MIME_DecodeCache_Storage, (url, NULL));
+	verify(processor);
+	processor->Construct(url, storage);
+
+	const char* header = "Content-Type: ";
+	const char* part = "\n ";
+	const char* end =
+		"text/html\n"
+		"\n"
+		"Hello1234";
+	int header_len = (int)op_strlen(header);
+	int part_len = (int)op_strlen(part);
+	int end_len = (int)op_strlen(end);
+	int num_parts = 400000;
+	int i;
+	data = OP_NEWA(char, header_len + num_parts*part_len + end_len);
+	verify(data);
+	char *pos = data;
+	op_memcpy(pos, header, header_len);
+	pos += header_len;
+	for (i=0; i<num_parts; i++) {
+		op_memcpy(pos, part, part_len);
+		pos += part_len;
+	}
+	op_memcpy(pos, end, end_len);
+	pos += end_len;
+
+	static_cast<Cache_Storage*>(processor)->SetPreferPlaintext(FALSE);
+	verify_success(processor->StoreData((const unsigned char*)data, (unsigned long)(pos-data)));
+	processor->SetFinished(FALSE);
+	verify(verifyPartContent(processor, 0, "Hello1234", NULL));
+	URL att;
+	processor->GetAttachment(0, att);
+	verify(att.GetAttribute(URL::KContentType) == URL_HTML_CONTENT); // We really did get the content type
+}
+finally
+{
+	OP_DELETE(processor);
+	OP_DELETEA(data);
+}
+
+test("GetOriginalContentType, DSK-176039")
+{
+	MIME_DecodeCache_Storage* processor = NULL;
+	URL test_url = urlManager->GetURL("attachment:test");
+	URL_Rep* url = test_url.GetRep();
+	verify(url);
+	Cache_Storage* storage = NULL;
+	processor = OP_NEW(MIME_DecodeCache_Storage, (url, NULL));
+	verify(processor);
+	processor->Construct(url, storage);
+
+	const char* data =
+		"From roarl@opera.com Fri Nov 27 13:06:35 2009\n"
+		"Subject: Test\n"
+		"Content-Type: multipart/mixed; boundary=B1\n"
+		"Content-Transfer-Encoding: 8bit\n"
+		"MIME_Version: 1.0\n"
+		"\n"
+		"This is a multi-part message in MIME format.\n"
+		"--B1\n"
+		"Content-Type: text/html; charset=ISO-8859-1\n"
+		"\n"
+		"HTML data\n"
+		"--B1\n"
+		"Content-Type: text/calendar; method=REQUEST;\n"
+		"\n"
+		"Calendar data\n"
+		"--B1--\n";
+
+	verify_success(processor->StoreData((const unsigned char*)data, (unsigned long)op_strlen(data)));
+	processor->SetFinished(FALSE);
+
+	URL part;
+	OpString8 content_type;
+	processor->GetAttachment(0, part);
+	verify_success(g_mime_module.GetOriginalContentType(part, content_type));
+	verify_string(content_type, "text/html");
+	processor->GetAttachment(1, part);
+	verify_success(g_mime_module.GetOriginalContentType(part, content_type));
+	verify_string(content_type, "text/calendar");
+}
+finally
+{
+	OP_DELETE(processor);
+}
+

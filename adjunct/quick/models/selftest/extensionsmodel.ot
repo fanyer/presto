@@ -1,0 +1,240 @@
+group "quick.extensions.extensionsmodel";
+
+require init;
+
+include "adjunct/quick/models/ExtensionsModel.h";
+include "adjunct/quick/extensions/ExtensionUtils.h";
+
+include "modules/gadgets/OpGadgetManager.h";
+
+global
+{
+	class ST_ExtensionsModelListener : public ExtensionsModel::Listener
+	{
+	public:
+
+		BOOL IsOkExtensionsModelItem(const ExtensionsModelItem& model_item)
+		{
+			return model_item.GetGadget() && model_item.GetGadgetClass();
+		}
+
+		BOOL ExtensionIsInDevMode(const ExtensionsModelItem& model_item)
+		{
+			return model_item.IsInDevMode();
+		}
+
+		void Reset()
+		{
+			refresh = 0;
+			normal_install = dev_install = uninstall = 0;
+			enable = disable = 0;
+		}
+
+		virtual void OnBeforeExtensionsModelRefresh(const ExtensionsModel::RefreshInfo& info)
+		{
+			refresh++;
+		}
+
+		virtual void OnAfterExtensionsModelRefresh()
+		{
+			/* FIXME: Test it. */
+		}
+
+		virtual void OnNormalExtensionAdded(const ExtensionsModelItem& model_item)
+		{
+			normal_install++;
+
+			if (!IsOkExtensionsModelItem(model_item) || ExtensionIsInDevMode(model_item))
+				ST_failed("On normal extension install: bad model item");
+		}
+
+		virtual void OnDeveloperExtensionAdded(const ExtensionsModelItem& model_item)
+		{
+			dev_install++;
+
+			if (!IsOkExtensionsModelItem(model_item) || !ExtensionIsInDevMode(model_item))
+				ST_failed("On developer extension install: bad model item");
+		}
+
+		virtual void OnExtensionUninstall(const ExtensionsModelItem& model_item)
+		{
+			uninstall++;
+
+			if (!IsOkExtensionsModelItem(model_item))
+				ST_failed("On extension uninstall: bad model item");
+		}
+
+		virtual void OnExtensionEnabled(const ExtensionsModelItem& model_item)
+		{
+			enable++;
+
+			if (!IsOkExtensionsModelItem(model_item))
+				ST_failed("On extension enabled: bad model item");
+		}
+
+		virtual void OnExtensionDisabled(const ExtensionsModelItem& model_item)
+		{
+			disable++;
+
+			if (!IsOkExtensionsModelItem(model_item))
+				ST_failed("On extension disabled: bad model item");
+		}
+
+		virtual void OnExtensionUpdateAvailable(const ExtensionsModelItem& model_item)
+		{
+			if (!IsOkExtensionsModelItem(model_item))
+				ST_failed("On extension update: bad model item");
+		}
+
+		virtual void OnExtensionExtendedNameUpdate(const ExtensionsModelItem& model_item)
+		{
+			if (!IsOkExtensionsModelItem(model_item))
+				ST_failed("On extension update: bad model item");
+		}
+	
+		unsigned refresh;
+		unsigned normal_install, dev_install, uninstall;
+		unsigned enable, disable;
+	};
+
+	class ST_ExtensionsModel : public ExtensionsModel
+	{
+	public:
+
+		void DeleteAll()	
+		{
+			m_extensions.DeleteAll();
+			OP_ASSERT(m_extensions.GetCount() == 0);
+		}
+	};
+
+	unsigned AllExtensionsCount()
+	{
+		unsigned count = 0;
+		for (unsigned i = 0; i < g_gadget_manager->NumGadgets(); ++i)
+		{
+			OpGadget* gadget = g_gadget_manager->GetGadget(i);
+			if (gadget->IsExtension())
+			{
+				count++;
+			}
+		}
+
+		return count;
+	}
+
+	unsigned NormalExtensionsCount()
+	{
+		unsigned count = 0;
+		for (unsigned i = 0; i < g_gadget_manager->NumGadgets(); ++i)
+		{
+			OpGadget* gadget = g_gadget_manager->GetGadget(i);
+			BOOL in_dev_mode = FALSE;
+			OpStatus::Ignore(
+					ExtensionUtils::IsDevModeExtension(*gadget->GetClass(), in_dev_mode));
+			if (!in_dev_mode && gadget->IsExtension())
+			{
+				count++;
+			}
+		}
+
+		return count;
+	}
+
+	unsigned DeveloperExtensionsCount()
+	{
+		return AllExtensionsCount() - NormalExtensionsCount();
+	}
+
+	ST_ExtensionsModelListener listener;
+}
+
+setup
+{
+}
+
+test("Setup extensions model")
+{
+	ST_ExtensionsModel model;
+	verify_success(model.Init());	
+
+	// Adding NULL listeners is an error.
+
+	verify(OpStatus::IsError(model.AddListener(NULL)));
+
+	verify_success(model.AddListener(&listener));
+	verify_success(model.RemoveListener(&listener));
+}
+
+test("Install/Enable/Disable/Uninstall normal and developer extensions")
+	file uni normal_ext_path_uni_char "data/normal_extension.oex";
+	file uni dev_ext_path_uni_char "data/developer_extension/config.xml";
+{	
+	OpGadget* normal_ext = NULL;
+	OpGadget* dev_ext = NULL;
+	OP_STATUS ret1, ret2;
+
+	ST_ExtensionsModel model;
+	verify_success(model.Init());
+
+	listener.Reset();
+	verify_success(model.AddListener(&listener));
+
+	OpString normal_ext_path, dev_ext_path;
+	verify_success(normal_ext_path.Set(normal_ext_path_uni_char));
+	verify_success(dev_ext_path.Set(dev_ext_path_uni_char));
+
+	unsigned before_normal_count = NormalExtensionsCount();
+	unsigned before_dev_count = DeveloperExtensionsCount();
+	
+	verify_success(g_gadget_manager->CreateGadget(&normal_ext, normal_ext_path,
+			URL_EXTENSION_INSTALL_CONTENT));
+	verify_success(g_gadget_manager->CreateGadget(&dev_ext, dev_ext_path, 
+			URL_EXTENSION_INSTALL_CONTENT));
+
+	verify_success(model.Refresh());
+
+	verify(listener.refresh == 1);
+	verify(listener.normal_install == before_normal_count + 1);
+	verify(listener.dev_install == before_dev_count + 1);
+
+	verify_success(model.EnableExtension(normal_ext->GetIdentifier()));
+	verify_success(model.EnableExtension(dev_ext->GetIdentifier()));
+
+	verify(listener.enable == 2);
+	verify(model.IsEnabled(normal_ext->GetIdentifier()));
+	verify(model.IsEnabled(dev_ext->GetIdentifier()));
+
+	verify_success(model.DisableExtension(normal_ext->GetIdentifier()));
+	verify_success(model.DisableExtension(dev_ext->GetIdentifier()));
+
+	verify(listener.disable == 2);
+	verify(!model.IsEnabled(normal_ext->GetIdentifier()));
+	verify(!model.IsEnabled(dev_ext->GetIdentifier()));
+
+	// Uninstall disables first.
+
+	verify_success(model.UninstallExtension(normal_ext->GetIdentifier()));
+	normal_ext = NULL;
+	verify_success(model.UninstallExtension(dev_ext->GetIdentifier()));
+	dev_ext = NULL;
+
+	verify(listener.disable == 4);
+	verify(listener.uninstall == 2);
+	verify(NormalExtensionsCount() == before_normal_count);
+	verify(DeveloperExtensionsCount() == before_dev_count);
+
+	verify_success(model.RemoveListener(&listener));
+}
+finally
+{
+	ret1 = ret2 = OpStatus::OK;
+	if (normal_ext) ret1 = model.UninstallExtension(normal_ext->GetIdentifier());
+	if (dev_ext) ret2 = model.UninstallExtension(dev_ext->GetIdentifier());
+	if (OpStatus::IsError(ret1) || OpStatus::IsError(ret2))
+	{
+		model.DeleteAll();
+		if (normal_ext) g_gadget_manager->DestroyGadget(normal_ext);
+		if (dev_ext) g_gadget_manager->DestroyGadget(dev_ext);
+	}
+}

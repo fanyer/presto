@@ -1,0 +1,535 @@
+/* -*- Mode: c++; tab-width: 4; indent-tabs-mode: t; c-basic-offset: 4 -*-
+**
+** Copyright (C) 1995-2012 Opera Software AS.  All rights reserved.
+**
+** This file is part of the Opera web browser.  It may not be distributed
+** under any circumstances.
+**
+** Marcin Zdun (mzdun)
+*/
+
+group "quick.extensions.wintab.events";
+
+include "adjunct/quick/extensions/TabAPIListener.h";
+
+include "modules/windowcommander/src/WindowCommander.h";
+include "adjunct/quick/windows/BrowserDesktopWindow.h";
+include "adjunct/quick/Application.h";
+
+require init;
+require EXTENSION_SUPPORT;
+
+global
+{
+#define WINTAB_async_verify(test) do { if (!(test)) { ST_failed("%s", #test); return 0; } } while(0);
+#define WINTAB_async_verify_success(test) do { if (!OpStatus::IsSuccess(test)) { ST_failed("%s", #test); return 0; } } while(0);
+
+	struct WinTabAPI: public OpTabAPIListener //to both separate the code _and_ get into OpTabAPIListener:: scope
+	{
+		enum LAST_EVENT
+		{
+			EVENT_UNKNOWN,
+
+			EVENT_WindowAction_create,
+			EVENT_WindowAction_close,
+			EVENT_WindowAction_blur,
+			EVENT_WindowAction_focus,
+			EVENT_WindowAction_update,
+
+			EVENT_TabAction_create,
+			EVENT_TabAction_close,
+			EVENT_TabAction_blur,
+			EVENT_TabAction_focus,
+			EVENT_TabAction_update,
+			EVENT_TabAction_move,
+			EVENT_TabAction_move_from_group,
+
+			EVENT_TabGroupAction_create,
+			EVENT_TabGroupAction_close,
+			EVENT_TabGroupAction_update,
+			EVENT_TabGroupAction_move,
+		};
+
+		enum EXPECTED_DATA {
+			DATA_NULL,
+			DATA_PRESENT
+		};
+
+		class TestActionListener: public ExtensionWindowTabActionListener
+		{
+		public:
+
+			LAST_EVENT last_event;
+			TabAPIItemId last_object;
+			unsigned int last_window_id;
+			EXPECTED_DATA actual;
+			ActionData data;
+
+			TestActionListener()
+				: last_event(EVENT_UNKNOWN)
+				, last_object(0)
+				, last_window_id(0)
+				, actual(DATA_NULL)
+			{
+			}
+
+			void set(LAST_EVENT event_id, TabAPIItemId object_id, unsigned int window_id, ActionData* data)
+			{
+				last_event = event_id;
+				last_object = object_id;
+				last_window_id = window_id;
+				if (!data) {
+					actual = DATA_NULL;
+				} else {
+					actual = DATA_PRESENT;
+					this->data = *data;
+				}
+			}
+
+			void OnBrowserWindowAction(ActionType action, TabAPIItemId window_id, ActionData* data)
+			{
+				LAST_EVENT event_id = EVENT_UNKNOWN;
+				switch (action){
+				case ACTION_CREATE: event_id = EVENT_WindowAction_create; break;
+				case ACTION_CLOSE:  event_id = EVENT_WindowAction_close; break;
+				case ACTION_FOCUS:  event_id = EVENT_WindowAction_focus; break;
+				case ACTION_BLUR:   event_id = EVENT_WindowAction_blur; break;
+				case ACTION_UPDATE: event_id = EVENT_WindowAction_update; break;
+				};
+				set(event_id, window_id, 0, data);
+			}
+
+			void OnTabAction(ActionType action, TabAPIItemId tab_id, unsigned int tab_window_id, ActionData* data)
+			{
+				LAST_EVENT event_id = EVENT_UNKNOWN;
+				switch (action){
+				case ACTION_CREATE:          event_id = EVENT_TabAction_create; break;
+				case ACTION_CLOSE:           event_id = EVENT_TabAction_close; break;
+				case ACTION_FOCUS:           event_id = EVENT_TabAction_focus; break;
+				case ACTION_BLUR:            event_id = EVENT_TabAction_blur; break;
+				case ACTION_MOVE:            event_id = EVENT_TabAction_move; break;
+				case ACTION_MOVE_FROM_GROUP: event_id = EVENT_TabAction_move_from_group; break;
+				case ACTION_UPDATE:          event_id = EVENT_TabAction_update; break;
+				};
+				set(event_id, tab_id, tab_window_id, data);
+			}
+
+			void OnTabGroupAction(ActionType action, TabAPIItemId tab_group_id, ActionData* data)
+			{
+				LAST_EVENT event_id = EVENT_UNKNOWN;
+				switch (action){
+				case ACTION_CREATE: event_id = EVENT_TabGroupAction_create; break;
+				case ACTION_CLOSE:  event_id = EVENT_TabGroupAction_close; break;
+				case ACTION_MOVE:   event_id = EVENT_TabGroupAction_move; break;
+				case ACTION_UPDATE: event_id = EVENT_TabGroupAction_update; break;
+				};
+				set(event_id, tab_group_id, 0, data);
+			}
+		};
+
+		struct TestEnv
+		{
+			TabAPIListener api;
+			TestActionListener cb;
+
+			TestEnv()
+			{
+				OpStatus::Ignore(api.OnRegisterWindowTabActionListener(&cb));
+			};
+
+			~TestEnv()
+			{
+				OpStatus::Ignore(api.OnUnRegisterWindowTabActionListener(&cb));
+			}
+		};
+
+		class TestEnvAsync;
+
+		struct TabAPIListenerAsync: TabAPIListener
+		{
+			TestEnvAsync* parent;
+
+			TabAPIListenerAsync(TestEnvAsync* parent): parent(parent) {}
+			void HandleCallback(OpMessage msg, MH_PARAM_1 par1, MH_PARAM_2 par2)
+			{
+				TabAPIListener::HandleCallback(msg, par1, par2);
+				if (!parent)
+					return;
+
+				switch(msg)
+				{
+				case MSG_TABAPI_BROWSER_CLOSE:
+					OnBrowserWindowActionCloseContinue(parent);
+					return;
+
+				case MSG_TABAPI_GROUP_CLOSE:
+					OnTabGroupActionCloseContinue(parent);
+					return;
+
+				case MSG_TABAPI_GROUP_UPDATE:
+					OnTabGroupActionUpdateContinue(parent);
+					return;
+
+				case MSG_TABAPI_TAB_ACTION:
+					OnTabActionMoveContinue(parent);
+					return;
+				}
+				//ST_failed("you forgot to hook the continue function for this event");
+			}
+		};
+
+		class TestEnvAsync
+		{
+			TestEnvAsync(): api(this), object_id(0)
+			{
+				OpStatus::Ignore(api.OnRegisterWindowTabActionListener(&cb));
+			};
+
+		public:
+			TabAPIListenerAsync api;
+			TestActionListener cb;
+			UINT32 object_id;
+			//Used only in OnTabActionMoveContinue:
+			struct MoveData {
+				LAST_EVENT expected_event;
+				unsigned int tab_window_id;
+				UINT32 previous_parent_id;
+
+				void prepare(LAST_EVENT expected_event, unsigned int tab_window_id, UINT32 previous_parent_id)
+				{
+					this->expected_event = expected_event;
+					this->tab_window_id = tab_window_id;
+					this->previous_parent_id = previous_parent_id;
+				}
+			} move;
+
+			static TestEnvAsync* Create() { return OP_NEW(TestEnvAsync, ()); }
+
+			~TestEnvAsync()
+			{
+				OpStatus::Ignore(api.OnUnRegisterWindowTabActionListener(&cb));
+			}
+
+#define WINTAB_async_verify_nontab(_event) \
+	WINTAB_async_verify(cb.last_event == _event); \
+	WINTAB_async_verify(cb.last_object == object_id); \
+	WINTAB_async_verify(cb.last_window_id == 0); \
+	WINTAB_async_verify(cb.actual == WinTabAPI::DATA_NULL); \
+	ST_passed(); \
+	return 1;
+
+			int OnBrowserWindowActionCloseContinue() {
+				WINTAB_async_verify_nontab(WinTabAPI::EVENT_WindowAction_close);
+			}
+
+			int OnTabGroupActionCloseContinue() {
+				WINTAB_async_verify_nontab(WinTabAPI::EVENT_TabGroupAction_close);
+			}
+
+			int OnTabGroupActionUpdateContinue() {
+				WINTAB_async_verify_nontab(WinTabAPI::EVENT_TabGroupAction_update);
+			}
+
+#undef WINTAB_async_verify_nontab
+
+			int OnTabActionMoveContinue() {
+				WINTAB_async_verify(cb.last_event == move.expected_event);
+				WINTAB_async_verify(cb.last_object == object_id);
+				WINTAB_async_verify(cb.last_window_id == move.tab_window_id);
+				WINTAB_async_verify(cb.actual == WinTabAPI::DATA_PRESENT);
+				WINTAB_async_verify(cb.data.move_data.previous_parent_id == move.previous_parent_id);
+				WINTAB_async_verify(cb.data.move_data.position == 0);
+				ST_passed();
+				return 1;
+			}
+
+			OP_STATUS InstallMessageListeners() {
+				return api.Init();
+			}
+		};
+
+#define GENERATE_CALLBACK(name) static void name(TestEnvAsync* env) { env->name(); OP_DELETE(env); }
+		GENERATE_CALLBACK(OnBrowserWindowActionCloseContinue)
+		GENERATE_CALLBACK(OnTabGroupActionCloseContinue)
+		GENERATE_CALLBACK(OnTabGroupActionUpdateContinue)
+		GENERATE_CALLBACK(OnTabActionMoveContinue)
+#undef GENERATE_CALLBACK
+	};
+}
+
+test("OpExtensionUIListener::OnRegisterWindowTabActionListener")
+{
+	TabAPIListener listener;
+	WinTabAPI::TestActionListener callbacks;
+
+	verify_success(listener.OnRegisterWindowTabActionListener(&callbacks));
+	verify_success(listener.OnUnRegisterWindowTabActionListener(&callbacks));
+}
+
+test("OnBrowserWindowAction(create)") require success "OpExtensionUIListener::OnRegisterWindowTabActionListener";
+{
+	WinTabAPI::TestEnv env;
+	BrowserDesktopWindow* window = g_application->GetActiveBrowserDesktopWindow();
+	verify(window);
+	env.api.OnBrowserDesktopWindowCreated(window);
+	UINT32 window_id = static_cast<UINT32>(window->GetID());
+	verify(env.cb.last_event == WinTabAPI::EVENT_WindowAction_create);
+	verify(env.cb.last_object == window_id);
+	verify(env.cb.last_window_id == 0);
+	verify(env.cb.actual == WinTabAPI::DATA_NULL);
+}
+
+test("OnBrowserWindowAction(focus)") require success "OpExtensionUIListener::OnRegisterWindowTabActionListener";
+{
+	WinTabAPI::TestEnv env;
+	BrowserDesktopWindow* window = g_application->GetActiveBrowserDesktopWindow();
+	verify(window);
+	env.api.OnBrowserDesktopWindowActivated(window);
+	UINT32 window_id = static_cast<UINT32>(window->GetID());
+	verify(env.cb.last_event == WinTabAPI::EVENT_WindowAction_focus);
+	verify(env.cb.last_object == window_id);
+	verify(env.cb.last_window_id == 0);
+	verify(env.cb.actual == WinTabAPI::DATA_NULL);
+}
+
+test("OnBrowserWindowAction(blur)") require success "OpExtensionUIListener::OnRegisterWindowTabActionListener";
+{
+	WinTabAPI::TestEnv env;
+	BrowserDesktopWindow* window = g_application->GetActiveBrowserDesktopWindow();
+	verify(window);
+	env.api.OnBrowserDesktopWindowDeactivated(window);
+	UINT32 window_id = static_cast<UINT32>(window->GetID());
+	verify(env.cb.last_event == WinTabAPI::EVENT_WindowAction_blur);
+	verify(env.cb.last_object == window_id);
+	verify(env.cb.last_window_id == 0);
+	verify(env.cb.actual == WinTabAPI::DATA_NULL);
+}
+
+test("OnBrowserWindowAction(close)") require success "OpExtensionUIListener::OnRegisterWindowTabActionListener"; async;
+{
+	WinTabAPI::TestEnvAsync* env =  WinTabAPI::TestEnvAsync::Create();
+	WINTAB_async_verify(env);
+	WINTAB_async_verify_success(env->InstallMessageListeners());
+
+	BrowserDesktopWindow* window = g_application->GetActiveBrowserDesktopWindow();
+	WINTAB_async_verify(window);
+
+	env->object_id = static_cast<UINT32>(window->GetID());
+	env->api.OnBrowserDesktopWindowDeleting(window);
+	//continued in OnBrowserWindowActionCloseContinue
+}
+
+test("OnTabAction(create)") require success "OpExtensionUIListener::OnRegisterWindowTabActionListener";
+{
+	WinTabAPI::TestEnv env;
+	DocumentDesktopWindow* doc_window = g_application->GetActiveDocumentDesktopWindow();
+	verify(doc_window);
+	OpWindowCommander* doc_window_commander = doc_window->GetWindowCommander();
+	verify(doc_window_commander);
+
+	env.api.OnDesktopWindowAdded(doc_window);
+	UINT32 window_id = static_cast<UINT32>(doc_window->GetID());
+	verify(env.cb.last_event == WinTabAPI::EVENT_TabAction_create);
+	verify(env.cb.last_object == window_id);
+	verify(env.cb.last_window_id == doc_window_commander->GetWindowId());
+	verify(env.cb.actual == WinTabAPI::DATA_NULL);
+}
+
+test("OnTabAction(create) (browser, no event)") require success "OpExtensionUIListener::OnRegisterWindowTabActionListener";
+{
+	WinTabAPI::TestEnv env;
+	BrowserDesktopWindow* window = g_application->GetActiveBrowserDesktopWindow();
+	verify(window);
+
+	env.api.OnDesktopWindowAdded(window);
+	verify(env.cb.last_event == WinTabAPI::EVENT_UNKNOWN);
+	verify(env.cb.last_object == 0);
+	verify(env.cb.last_window_id == 0);
+	verify(env.cb.actual == WinTabAPI::DATA_NULL);
+}
+
+test("OnTabAction(focus)") require success "OpExtensionUIListener::OnRegisterWindowTabActionListener";
+{
+	WinTabAPI::TestEnv env;
+	DocumentDesktopWindow* doc_window = g_application->GetActiveDocumentDesktopWindow();
+	verify(doc_window);
+	OpWindowCommander* doc_window_commander = doc_window->GetWindowCommander();
+	verify(doc_window_commander);
+	OpWorkspace* workspace = doc_window->GetParentWorkspace();
+	verify(workspace);
+
+	env.api.OnDesktopWindowActivated(workspace, doc_window, TRUE);
+	UINT32 window_id = static_cast<UINT32>(doc_window->GetID());
+	verify(env.cb.last_event == WinTabAPI::EVENT_TabAction_focus);
+	verify(env.cb.last_object == window_id);
+	verify(env.cb.last_window_id == doc_window_commander->GetWindowId());
+	verify(env.cb.actual == WinTabAPI::DATA_NULL);
+}
+
+test("OnTabAction(blur)") require success "OpExtensionUIListener::OnRegisterWindowTabActionListener";
+{
+	WinTabAPI::TestEnv env;
+	DocumentDesktopWindow* doc_window = g_application->GetActiveDocumentDesktopWindow();
+	verify(doc_window);
+	OpWindowCommander* doc_window_commander = doc_window->GetWindowCommander();
+	verify(doc_window_commander);
+	OpWorkspace* workspace = doc_window->GetParentWorkspace();
+	verify(workspace);
+
+	env.api.OnDesktopWindowActivated(workspace, doc_window, FALSE);
+	UINT32 window_id = static_cast<UINT32>(doc_window->GetID());
+	verify(env.cb.last_event == WinTabAPI::EVENT_TabAction_blur);
+	verify(env.cb.last_object == window_id);
+	verify(env.cb.last_window_id == doc_window_commander->GetWindowId());
+	verify(env.cb.actual == WinTabAPI::DATA_NULL);
+}
+
+test("OnTabAction(move)") require success "OpExtensionUIListener::OnRegisterWindowTabActionListener"; async;
+{
+	WinTabAPI::TestEnvAsync* env =  WinTabAPI::TestEnvAsync::Create();
+	WINTAB_async_verify(env);
+	WINTAB_async_verify_success(env->InstallMessageListeners());
+
+	BrowserDesktopWindow* window = g_application->GetActiveBrowserDesktopWindow();
+	WINTAB_async_verify(window);
+	DocumentDesktopWindow* doc_window = window->GetActiveDocumentDesktopWindow();
+	WINTAB_async_verify(doc_window);
+	OpWindowCommander* doc_window_commander = doc_window->GetWindowCommander();
+	WINTAB_async_verify(doc_window_commander);
+
+	env->object_id = static_cast<UINT32>(doc_window->GetID());
+	env->move.prepare(
+		WinTabAPI::EVENT_TabAction_move,
+		doc_window_commander->GetWindowId(),
+		static_cast<UINT32>(window->GetID())
+	);
+
+	env->api.OnCollectionItemMoved(&doc_window->GetModelItem(), &window->GetModelItem(), NULL);
+	//continued in OnTabActionMoveContinue
+}
+
+test("OnTabAction(move from group)") require success "OpExtensionUIListener::OnRegisterWindowTabActionListener"; async;
+{
+	WinTabAPI::TestEnvAsync* env =  WinTabAPI::TestEnvAsync::Create();
+	WINTAB_async_verify(env);
+	WINTAB_async_verify_success(env->InstallMessageListeners());
+
+	BrowserDesktopWindow* window = g_application->GetActiveBrowserDesktopWindow();
+	WINTAB_async_verify(window);
+	DocumentDesktopWindow* doc_window = window->GetActiveDocumentDesktopWindow();
+	WINTAB_async_verify(doc_window);
+	OpWindowCommander* doc_window_commander = doc_window->GetWindowCommander();
+	WINTAB_async_verify(doc_window_commander);
+
+	DesktopGroupModelItem group;
+
+	env->object_id = static_cast<UINT32>(doc_window->GetID());
+	env->move.prepare(
+		WinTabAPI::EVENT_TabAction_move_from_group,
+		doc_window_commander->GetWindowId(),
+		static_cast<UINT32>(group.GetID())
+	);
+
+	env->api.OnCollectionItemMoved(&doc_window->GetModelItem(), &group, NULL);
+	//continued in OnTabActionMoveContinue
+}
+
+test("OnTabAction(close)") require success "OpExtensionUIListener::OnRegisterWindowTabActionListener";
+{
+	WinTabAPI::TestEnv env;
+	DocumentDesktopWindow* doc_window = g_application->GetActiveDocumentDesktopWindow();
+	verify(doc_window);
+	OpWindowCommander* doc_window_commander = doc_window->GetWindowCommander();
+	verify(doc_window_commander);
+
+	env.api.OnDesktopWindowRemoved(doc_window);
+	UINT32 window_id = static_cast<UINT32>(doc_window->GetID());
+	verify(env.cb.last_event == WinTabAPI::EVENT_TabAction_close);
+	verify(env.cb.last_object == window_id);
+	verify(env.cb.last_window_id == doc_window_commander->GetWindowId());
+	verify(env.cb.actual == WinTabAPI::DATA_NULL);
+}
+
+test("OnTabAction(close) (browser, no event)") require success "OpExtensionUIListener::OnRegisterWindowTabActionListener";
+{
+	WinTabAPI::TestEnv env;
+	BrowserDesktopWindow* window = g_application->GetActiveBrowserDesktopWindow();
+	verify(window);
+
+	env.api.OnDesktopWindowRemoved(window);
+	verify(env.cb.last_event == WinTabAPI::EVENT_UNKNOWN);
+	verify(env.cb.last_object == 0);
+	verify(env.cb.last_window_id == 0);
+	verify(env.cb.actual == WinTabAPI::DATA_NULL);
+}
+
+test("OnTabGroupAction(create)") require success "OpExtensionUIListener::OnRegisterWindowTabActionListener";
+{
+	WinTabAPI::TestEnv env;
+	BrowserDesktopWindow* window = g_application->GetActiveBrowserDesktopWindow();
+	verify(window);
+	OpWorkspace* workspace = window->GetWorkspace();
+	verify(workspace);
+
+	DesktopGroupModelItem group;
+	UINT32 group_id = static_cast<UINT32>(group.GetID());
+	env.api.OnDesktopGroupCreated(workspace, group);
+
+	verify(env.cb.last_event == WinTabAPI::EVENT_TabGroupAction_create);
+	verify(env.cb.last_object == group_id);
+	verify(env.cb.last_window_id == 0);
+	verify(env.cb.actual == WinTabAPI::DATA_NULL);
+}
+
+test("OnTabGroupAction(move)") require success "OpExtensionUIListener::OnRegisterWindowTabActionListener";
+{
+	WinTabAPI::TestEnv env;
+	BrowserDesktopWindow* window = g_application->GetActiveBrowserDesktopWindow();
+	verify(window);
+	UINT32 parent_id = static_cast<UINT32>(window->GetID());
+
+	DesktopGroupModelItem group;
+	UINT32 group_id = static_cast<UINT32>(group.GetID());
+	env.api.OnCollectionItemMoved(&group, &window->GetModelItem(), NULL);
+
+	verify(env.cb.last_event == WinTabAPI::EVENT_TabGroupAction_move);
+	verify(env.cb.last_object == group_id);
+	verify(env.cb.last_window_id == 0);
+	verify(env.cb.actual == WinTabAPI::DATA_PRESENT);
+	verify(env.cb.data.move_data.previous_parent_id == parent_id);
+	verify(env.cb.data.move_data.position == 0);
+}
+
+test("OnTabGroupAction(update)") require success "OpExtensionUIListener::OnRegisterWindowTabActionListener"; async;
+{
+	WinTabAPI::TestEnvAsync* env =  WinTabAPI::TestEnvAsync::Create();
+	WINTAB_async_verify(env);
+	WINTAB_async_verify_success(env->InstallMessageListeners());
+
+	BrowserDesktopWindow* window = g_application->GetActiveBrowserDesktopWindow();
+	WINTAB_async_verify(window);
+	OpWorkspace* workspace = window->GetWorkspace();
+	WINTAB_async_verify(workspace);
+
+	DesktopGroupModelItem group;
+	env->object_id = static_cast<UINT32>(group.GetID());
+	env->api.OnDesktopGroupChanged(workspace, group);
+	//continued in OnTabGroupActionUpdateContinue
+}
+
+test("OnTabGroupAction(close)") require success "OpExtensionUIListener::OnRegisterWindowTabActionListener"; async;
+{
+	WinTabAPI::TestEnvAsync* env =  WinTabAPI::TestEnvAsync::Create();
+	WINTAB_async_verify(env);
+	WINTAB_async_verify_success(env->InstallMessageListeners());
+
+	BrowserDesktopWindow* window = g_application->GetActiveBrowserDesktopWindow();
+	WINTAB_async_verify(window);
+	OpWorkspace* workspace = window->GetWorkspace();
+	WINTAB_async_verify(workspace);
+
+	DesktopGroupModelItem group;
+	env->object_id = static_cast<UINT32>(group.GetID());
+	env->api.OnDesktopGroupDestroyed(workspace, group);
+	//continued in OnTabGroupActionCloseContinue
+}

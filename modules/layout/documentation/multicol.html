@@ -1,0 +1,209 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01//EN">
+<html lang="en" dir="ltr">
+<head>
+ <meta http-equiv="Content-Type" content="text/html;charset=iso-8859-1">
+ <title>Multi-column layout</title>
+ <link rev="made" href="mailto:mstensho@opera.com">
+ <link rel="stylesheet" href="../../coredoc/coredoc.css" type="text/css" media="all">
+ <link rel="contents" href="../../coredoc/index.html" type="text/html" title="Core API">
+
+ <style>
+  .class { color:green; background:#eee; }
+ </style>
+
+</head>
+
+<body>
+ <h1>Multi-column layout</h1>
+ <p>
+   Copyright &copy; 1995-2011 Opera Software AS. All rights reserved.  This
+   file is part of the Opera web browser. It may not be distributed under any
+   circumstances.
+ </p>
+
+ <h2>About this document</h2>
+
+ <p>
+   This is a description of Opera's implementation of CSS3 multi-column
+   layout.</p>
+
+ <h2>Introduction</h2>
+
+ <p>
+   CSS defines multi-column
+   here: <a href="http://www.w3.org/TR/css3-multicol/">http://www.w3.org/TR/css3-multicol/</a><br>
+   Opera has a complete implementation of this spec, with only one known
+   difference, at the time of writing this document: The CSS working group has
+   decided that the 'column-span' property take the values 'none' and 'all',
+   but this change still hasn't found its way to the candidate recommendation,
+   which still says that the possible values are '1' and 'all'.
+ </p>
+
+ <h2>Design</h2>
+
+ <p>
+   Content inside a multi-column container is laid out pretty much like any
+   other container. It does not care much about the "multi-columnness", apart
+   from setting the width of the containing block that it establishes to the
+   width of a column. It lays content out as if columns didn't exist, which
+   results in one long column/container when layout is finished. We refer to
+   the content height of this container as "virtual height", and the Y position
+   of each child in the layout stack is a "virtual Y". Right before finishing
+   layout of the outermost multi-column container, we enter a so-called
+   columnization phase, where content is distributed into columns (without
+   changing the actual layout structure inside of the container).
+ </p>
+
+ <p>
+   Note that layout of a multi-column container only requires one reflow pass,
+   unless there are other factors (such as shrink-to-fit) that cause more than
+   one pass. This is thanks to the columnizer, which doesn't modify the actual
+   layout, but instead creates a "translation pane" for each column, which
+   causes the multi-column effect. They are split into columns and the column
+   heights are balanced (if required) in one go.
+ </p>
+
+ <p>
+   During traversal we traverse a multi-column container (and its children)
+   once per column. For a given column, we skip irrelevant content before and
+   after it.
+ </p>
+
+ <h3>Problems</h3>
+
+ <p>
+   The approach with single-pass layout has turned out to work quite fine, with
+   one exception: nested multi-column containers. In that case we may have to
+   guess the height of an inner multi-column container at the time of finishing
+   its layout; there's no way to know the actual height until the outer
+   multi-column container has decided if it needs to split the inner
+   multi-column container into multiple outer columns (which may affect the
+   total height of the inner multi-column container). Content following the
+   inner multi-column container will depend on the guessed height, and if it
+   later (when being columnized via the outermost multi-column container's
+   columnizer) turns out that we guessed wrong, we have to try our best to
+   compensate for that on successive content, by moving such content downwards
+   (or upwards) in the layout structure. This is evil. Adding another reflow
+   pass could have been a better idea. Making sure that we don't get circular
+   dependencies and countless reflow iterations would be a challenge then,
+   though.
+ </p>
+
+ <h2>Implementation</h2>
+
+ <h3>Class overview</h3>
+
+ <p>
+   In the layout box/content structure multi-column support is implemented with
+   a class called <span class="class">MultiColumnContainer</span>. It lays out
+   child content pretty much in the same way as a regular Container. It does
+   not care much about the "multi-columnness", apart from setting the width of
+   the containing block that it establishes to the width of a column. It lays
+   content out as if columns didn't exist, which results in one long column
+   when layout is finished. Upon finishing layout, we enter a so-called
+   columnization phase, where content is distributed into columns (without
+   actually changing the layout structure). The multi-column effect is achieved
+   by creating one <span class="class">Column</span> object per column, and
+   each <span class="class">Column</span> object has an X and Y translation,
+   which makes the object function as a "translation pane". That, together with
+   some clipping, causes the multi-column effect.
+ </p>
+
+ <p>
+   The only class exposed the rest of the layout engine is
+   <span class="class">MultiColumnContainer</span>. There are other classes in
+   the multi-column implementation, but they are only used by
+   <span class="class">MultiColumnContainer</span>.
+ </p>
+
+ <p>
+   One such class has already been
+   mentioned: <span class="class">Column</span>, of which we instantiate one
+   per column. It serves as a "translation pane" for the column (translate from
+   the container's original coordinates to the column's coordinate system). It
+   also knows which elements the column starts with and ends with.
+   A <span class="class">Column</span> object is a chain in a linked list
+   of <span class="class">Column</span> objects. Together they form a row. The
+   class <span class="class">ColumnRow</span> holds the list of
+   <span class="class">Column</span>
+   objects. A <span class="class">ColumnRow</span> is a chain in a linked list
+   of <span class="class">ColumnRow</span> objects. The linked list has its
+   dedicated
+   class: <span class="class">ColumnRowStack</span>. <span class="class">MultiColumnContainer</span>
+   holds this list. The <span class="class">ColumnRow</span>
+   and <span class="class">Column</span> objects are built when the
+   outermost <span class="class">MultiColumnContainer</span> is being
+   columnized, right before finishing layout of this
+   element. The <span class="class">ColumnRow</span>
+   and <span class="class">Column</span> objects are used during traversal, to
+   position and clip each column traversed.
+ </p>
+
+ <p>
+   There are two state classes, used to carry out two different operations. One
+   is used during columnization to build
+   the <span class="class">ColumnRow</span>
+   and <span class="class">Column</span> objects. It is
+   called <span class="class">Columnizer</span>. The other state class only
+   reads from <span class="class">Column</span>
+   and <span class="class">ColumnRow</span>, and it is used to find out which
+   <span class="class">Column</span>(s) a given element belongs to. It is
+   called <span class="class">ColumnFinder</span>. Traversing is expensive, so
+   this class saves us some time, if all we need to know is the actual
+   whereabouts of some box inside of a multicol container.
+ </p>
+
+ <p>The class <span class="class">ColumnBoundaryElement</span> is used to keep
+   track of where a <span class="class">Column</span> starts and where it
+   stops. A start or stop element may be
+   a <span class="class">Line</span>, <span class="class">BlockBox</span>,
+   <span class="class">LayoutBreak</span>, <span class="class">TableRowBox</span>,
+   <span class="class">TableCaptionBox</span>
+   or <span class="class">TableRow</span>. This information is used during
+   traversal, to know where to begin traversing and when to end. It is also
+   used by <span class="class">ColumnFinder</span>.
+ </p>
+
+ <p>
+   There are two classes of which instances are created during layout and
+   consumed (and removed) during columnization. They are used to keep track of
+   explicit column/row/page breaks, and spanned elements ('column-span:
+   all'). They are called <span class="class">MultiColBreakpoint</span>
+   and <span class="class">SpannedElm</span>. A spanned element is considered
+   an explicit break point, since it will terminate any previous row of
+   columns, and force the columnizer to balance the column heights.
+ </p>
+
+ <h3>Paged media</h3>
+
+ <p>
+   Multi-column layout and paged media layout have a lot in common, but their
+   implementations are still separate. When doing paged media layout and
+   multi-column layout at the same time (e.g. when printing a web page that has
+   a multi-column container), however, the regular paged media layout code in
+   Opera is not used. Then the columnizer takes care of pagination.
+ </p>
+
+ <p>
+   In the future, we should consider consolidating those two implementations. A
+   page in paged media is little different from a column in a multi-column
+   container, and could therefore conceivably be represented by
+   a <span class="class">Column</span> object (which then might need a better
+   name, but that's another story).
+ </p>
+
+ <h2>Improvements to consider</h2>
+
+ <ul>
+   <li>Support orphans and widows</li>
+   <li>Consolidate paged media layout and multi-column layout</li>
+   <li>Improve support for nesting of multi-column containers (this will
+     probably require us to do multiple layout passes)</li>
+   <li>Bounding-box handling. If columns overflow the multi-column container
+     (because there are too many of them), we increase the bounding box
+     properly. However, if child content overflows the multi-column container,
+     we don't.</li>
+ </ul>
+
+</body>
+</html>

@@ -1,0 +1,123 @@
+/* -*- Mode: c++; tab-width: 4; indent-tabs-mode: t; c-basic-offset: 4 -*-
+**
+** Copyright (C) 2006-2007 Opera Software ASA.  All rights reserved.
+**
+** This file is part of the Opera web browser.  It may not be distributed
+** under any circumstances.
+**
+** Peter Karlsson
+*/
+
+group "console.opconsoleprefshelper";
+require init;
+require OPERA_CONSOLE_LOGFILE;
+require PREFS_WRITE; // Need access to preferences
+
+include "modules/util/opfile/opfile.h";
+include "modules/console/opconsoleengine.h";
+include "modules/console/opconsolefilter.h";
+include "modules/prefs/prefsmanager/collections/pc_files.h";
+include "modules/prefs/prefsmanager/collections/pc_core.h";
+
+// -- Global variables ---------------------------------------------------
+
+global
+{
+	OpFile *logfile;
+	OpConsoleFilter *filter;
+	OpFile *old_logfile;
+	BOOL old_prefssetting;
+	OpString old_filter_string;
+}
+
+setup
+{
+	logfile = NULL;
+	filter = NULL;
+	old_logfile = NULL;
+	old_prefssetting = FALSE;
+}
+
+// -- Tests --------------------------------------------------------------
+
+test("Setup") delay 0.2;
+{
+	// Fetch old settings so that we can restore them on exit
+	verify((old_logfile = OP_NEW(OpFile, ())) != NULL);
+	g_pcfiles->GetFileL(PrefsCollectionFiles::ConsoleErrorLogName, *old_logfile);
+	old_prefssetting = g_pccore->GetIntegerPref(PrefsCollectionCore::UseErrorLog);
+	TRAPD(rc, g_pccore->GetStringPrefL(PrefsCollectionCore::ErrorLogFilter, old_filter_string)); // if this fails, we may lose the settings
+	verify(OpStatus::IsSuccess(rc));
+
+	// Set up a new log file
+	verify((logfile = OP_NEW(OpFile, ())) != NULL);
+	verify(OpStatus::IsSuccess(logfile->Construct(UNI_L("console.log"), OPFILE_HOME_FOLDER)));
+	verify(logfile->IsWritable()); // Tests will fail if it isn't
+
+	// Set up a filter
+	OpString filter_string;
+	verify((filter = OP_NEW(OpConsoleFilter, (OpConsoleEngine::DoNotShow))) != NULL);
+	verify(OpStatus::IsSuccess(filter->SetOrReplace(OpConsoleEngine::SelfTest, OpConsoleEngine::Verbose)));
+#ifdef CON_ENABLE_SERIALIZATION
+	verify(OpStatus::IsSuccess(filter->GetFilter(filter_string, TRUE)));
+#endif
+
+	// Enable logging in preferences
+	TRAP(rc, g_pcfiles->WriteFilePrefL(PrefsCollectionFiles::ConsoleErrorLogName, logfile));
+	verify(OpStatus::IsSuccess(rc));
+	TRAP(rc, g_pccore->WriteIntegerL(PrefsCollectionCore::UseErrorLog, TRUE));
+	verify(OpStatus::IsSuccess(rc));
+	TRAP(rc, g_pccore->WriteStringL(PrefsCollectionCore::ErrorLogFilter, filter_string));
+	verify(OpStatus::IsSuccess(rc));
+}
+
+test("Posting message")
+	require success "Setup";
+{
+	/* Write a message */
+	OpConsoleEngine::Message msg(OpConsoleEngine::SelfTest, OpConsoleEngine::Verbose);
+	verify(OpStatus::IsSuccess(msg.context.Set("SelfTest")));
+	verify(OpStatus::IsSuccess(msg.message.Set("TestSelf")));
+	TRAPD(rc, g_console->PostMessageL(&msg));
+	verify(OpStatus::IsSuccess(rc));
+}
+
+test("Checking that log was written") delay pre 0.2;
+	require success "Posting message";
+{
+	OpString line;
+	verify(OpStatus::IsSuccess(logfile->Open(OPFILE_READ)));
+	bool found1 = false, found2 = false;
+	while (!logfile->Eof() && OpStatus::IsSuccess(logfile->ReadUTF8Line(line)))
+	{
+		if (line.Find("SelfTest") != KNotFound)
+		{
+			found1 = true;
+		}
+		if (line.Find("TestSelf") != KNotFound)
+		{
+			found2 = true;
+		}
+	}
+	OpStatus::Ignore(logfile->Close());
+	verify(found1);
+	verify(found2);
+}
+
+test("Restoring settings")
+{
+	TRAPD(rc, g_pcfiles->WriteFilePrefL(PrefsCollectionFiles::ConsoleErrorLogName, old_logfile));
+	TRAP(rc, g_pccore->WriteIntegerL(PrefsCollectionCore::UseErrorLog, old_prefssetting));
+	TRAP(rc, g_pccore->WriteStringL(PrefsCollectionCore::ErrorLogFilter, old_filter_string));
+}
+
+// -- Global cleanup -----------------------------------------------------
+
+exit
+{
+	OpStatus::Ignore(logfile->Close());
+	OpStatus::Ignore(logfile->Delete());
+	OP_DELETE(logfile);
+	OP_DELETE(filter);
+	OP_DELETE(old_logfile);
+}

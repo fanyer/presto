@@ -1,0 +1,541 @@
+/* -*- Mode: c++; tab-width: 4; indent-tabs-mode: t; c-basic-offset: 4 -*-
+**
+** Copyright (C) 2004-2006 Opera Software ASA.  All rights reserved.
+**
+** This file is part of the Opera web browser.  It may not be distributed
+** under any circumstances.
+**
+*/
+
+group "logdoc.domchanges";
+require initialization;
+
+include "modules/layout/traverse/traverse.h";
+include "modules/doc/html_doc.h";
+include "modules/util/tempbuf.h";
+
+require undefined HAS_NOTEXTSELECTION;
+
+language C++;
+
+html
+{
+	"<body>abc</body>"
+}
+
+test("DOMSetContents+Selection#1")
+{
+	// Select b
+	SelectionBoundaryPoint start, end;
+	HTML_Element* body = find_element("body");
+	verify(body);
+	HTML_Element* text = body->FirstChild();
+	verify(text);
+	verify(text->Type() == HE_TEXT);
+	start.SetLogicalPosition(text, 1);
+	end.SetLogicalPosition(text, 2);
+
+	HTML_Document* html_doc = state.doc->GetHtmlDocument();
+	verify(html_doc);
+	html_doc->SetSelection(&start, &end, TRUE);
+
+	uni_char sel_buf[100]; // ARRAY OK 2009-05-07 stighal
+	verify(html_doc->GetSelectedText(sel_buf, 100));
+	verify(uni_str_eq(sel_buf, "b"));
+
+	state.doc->ConstructDOMEnvironment();
+	DOM_Environment* env = state.doc->GetDOMEnvironment();
+	verify(env);
+
+	// replace c with d, no change to selection
+	text->DOMSetContents(env, UNI_L("abd"), HTML_Element::MODIFICATION_REPLACING, 2, 1, 1);
+
+	verify(html_doc->GetSelectedText(sel_buf, 100));
+	verify(uni_str_eq(sel_buf, "b"));
+
+	// replace a with eg, no change to selection
+	text->DOMSetContents(env, UNI_L("egbd"), HTML_Element::MODIFICATION_REPLACING, 0, 1, 2);
+	verify(html_doc->GetSelectedText(sel_buf, 100));
+	verify(uni_str_eq(sel_buf, "b"));
+
+	// insert f at the start, no change to selection
+	text->DOMSetContents(env, UNI_L("fegbd"), HTML_Element::MODIFICATION_INSERTING, 0, 1);
+	verify(html_doc->GetSelectedText(sel_buf, 100));
+	verify(uni_str_eq(sel_buf, "b"));
+}
+
+html
+{
+	"<body>abcde</body>"
+}
+
+test("DOMSetContents+Selection#2")
+{
+	// Select b
+	SelectionBoundaryPoint start, end;
+	HTML_Element* body = find_element("body");
+	verify(body);
+	HTML_Element* text = body->FirstChild();
+	verify(text);
+	verify(text->Type() == HE_TEXT);
+	start.SetLogicalPosition(text, 0);
+	end.SetLogicalPosition(text, 2);
+
+	HTML_Document* html_doc = state.doc->GetHtmlDocument();
+	verify(html_doc);
+	// select ab
+	html_doc->SetSelection(&start, &end, TRUE);
+
+	uni_char sel_buf[100]; // ARRAY OK 2009-05-07 stighal
+	verify(html_doc->GetSelectedText(sel_buf, 100));
+	verify(uni_str_eq(sel_buf, "ab"));
+
+	state.doc->ConstructDOMEnvironment();
+	DOM_Environment* env = state.doc->GetDOMEnvironment();
+	verify(env);
+
+	// replace b with fg: selection goes from ab to afg
+	text->DOMSetContents(env, UNI_L("afgcde"), HTML_Element::MODIFICATION_REPLACING, 1, 1, 2);
+
+	verify(html_doc->GetSelectedText(sel_buf, 100));
+	verify(uni_str_eq(sel_buf, "afg"));
+
+	// insert h between f and g: selection goes from afg to afhg
+	text->DOMSetContents(env, UNI_L("afhgcde"), HTML_Element::MODIFICATION_INSERTING, 2, 1);
+	verify(html_doc->GetSelectedText(sel_buf, 100));
+	verify(uni_str_eq(sel_buf, "afhg"));
+
+	// delete af, selection goes from afhg to hg
+	text->DOMSetContents(env, UNI_L("hgcde"), HTML_Element::MODIFICATION_DELETING, 0, 2);
+	verify(html_doc->GetSelectedText(sel_buf, 100));
+	verify(uni_str_eq(sel_buf, "hg"));
+}
+
+html
+{
+	"<html><body></body></html>"
+}
+
+test("DOMSetContents+Selection#3")
+{
+	// Select b
+	SelectionBoundaryPoint start, end;
+	HTML_Element* body = find_element("body");
+	verify(body);
+
+	// Going to insert a block that is larger that SplitSize so that
+	// we get an HE_TEXTGROUP
+
+	TempBuffer hugestring;
+	unsigned int size = 0;
+	while (size < 100000)
+	{
+		// Add 100 characters at a time
+		verify(OpStatus::IsSuccess(hugestring.Append("1234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890")));
+		size += 100;
+	}
+
+	verify(size == hugestring.Length());
+
+	verify(OpStatus::IsSuccess(hugestring.Append("abc")));
+	int start_offset = size;
+	size += 3;
+	int end_offset = size;
+	while (size < 150000)
+	{
+		// Add 100 characters at a time
+		verify(OpStatus::IsSuccess(hugestring.Append("1234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890")));
+		size += 100;
+	}
+
+	verify(size == hugestring.Length());
+	verify(size == uni_strlen(hugestring.GetStorage()));
+
+	state.doc->ConstructDOMEnvironment();
+	DOM_Environment* env = state.doc->GetDOMEnvironment();
+	verify(env);
+
+	HTML_Element* created_text;
+	verify(OpStatus::IsSuccess(HTML_Element::DOMCreateTextNode(created_text, env, hugestring.GetStorage(), FALSE, FALSE)));
+
+	verify(OpStatus::IsSuccess(body->DOMInsertChild(env, created_text, NULL)));
+
+	HTML_Element* textgroup = body->FirstChild();
+	verify(textgroup);
+	verify(textgroup->Type() == HE_TEXTGROUP);
+	verify(textgroup == created_text);
+	HTML_Element* text = textgroup->FirstChild();
+	int start_text_offset = start_offset;
+	int end_text_offset = end_offset;
+	HTML_Element* start_text = NULL;
+	HTML_Element* end_text = NULL;
+	for (;;)
+	{
+		verify(text);
+		verify(text->Type() == HE_TEXT);
+		int element_text_length = text->GetTextContentLength();
+		if (start_text_offset > element_text_length)
+		{
+			start_text_offset -= element_text_length;
+			end_text_offset -= element_text_length;
+			text = text->Suc();
+		}
+		else
+		{
+			start_text = text;
+			// Adjust end_offset in case it's in another block
+			for (;;)
+			{
+				verify(text);
+				verify(text->Type() == HE_TEXT);
+				element_text_length = text->GetTextContentLength();
+				if (end_text_offset > element_text_length)
+				{
+					end_text_offset -= element_text_length;
+					text = text->Suc();
+				}
+				else
+				{
+					end_text = text;
+					break;
+				}
+			}
+			break;
+		}
+	}
+
+	verify(start_text);
+	verify(end_text);
+
+	start.SetLogicalPosition(start_text, start_text_offset);
+	end.SetLogicalPosition(end_text, end_text_offset);
+
+	// FIXME: SetSelection doesn't work unless there are layout boxes. Need to be fixed
+	state.doc->Reflow(FALSE);
+
+	HTML_Document* html_doc = state.doc->GetHtmlDocument();
+	verify(html_doc);
+	// select abc
+	html_doc->SetSelection(&start, &end, TRUE);
+
+	uni_char sel_buf[100]; // ARRAY OK 2009-05-07 stighal
+	verify(html_doc->GetSelectedText(sel_buf, 100));
+	verify(uni_str_eq(sel_buf, "abc"));
+
+	// replace b with d: selection goes from abc to adc
+	verify(hugestring.GetStorage()[start_offset+1] == 'b');
+	hugestring.GetStorage()[start_offset+1] = 'd';
+	textgroup->DOMSetContents(env, hugestring.GetStorage(), HTML_Element::MODIFICATION_REPLACING, start_offset+1, 1, 1);
+
+	verify(html_doc->GetSelectedText(sel_buf, 100));
+	verify(uni_str_eq(sel_buf, "adc"));
+}
+
+html
+{
+	"<html><body>"
+	"<textarea> A  B</textarea>"
+	"</body></html>"
+}
+test("DOMSetCaretPosition")
+{
+	// Bug 201089
+	state.doc->ConstructDOMEnvironment();
+	DOM_Environment* env = state.doc->GetDOMEnvironment();
+	verify(env);
+
+	HTML_Element* elm = find_element("textarea");
+	verify(elm);
+
+	elm->DOMSetSelection(env, 1, 2);
+	int start, end;
+	elm->DOMGetSelection(env, start, end);
+	verify(start == 1);
+	verify(end == 2);
+
+	elm->DOMSetCaretPosition(env, 3);
+
+	verify(elm->DOMGetCaretPosition(env) == 3);
+
+	elm->DOMGetSelection(env, start, end);
+	verify(start == end);
+}
+
+html
+{
+	//! <!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01//EN">
+	//! <html><head>
+	//! <title>  getBoundingClientRect and scroll offset  </title>
+	//! <style type="text/css">
+	//! body{ height: 4000px; }
+	//! </style>
+	//! </head>
+	//! <body>
+	//! <p>FAILED (This TC requires JavaScript enabled)</p>
+	//! </body></html>
+}
+
+test("DOMGetPositionAndSize-DOM_PS_CONTENT")
+	language ecmascript;
+	require undefined ADAPTIVE_ZOOM_SUPPORT;
+{
+	// From bug 294750
+	// Written in ecmascript because it's easier to use scrollTo in
+	// ecmascript than scroll in C++
+	var log=document.getElementsByTagName('p')[0];
+	verify(log);
+	var top1 = log.getBoundingClientRect().top; // This will call DOMGetPositionAndSize(DOM_PS_CONTENT)
+	scrollTo( 0, 20 );
+	var top2 = log.getBoundingClientRect().top;  // This will call DOMGetPositionAndSize(DOM_PS_CONTENT)
+	var diff = top1-top2;
+	verify(diff == 20);
+}
+
+test("DOMGetOffsetParent with no parent")
+language ecmascript;
+{
+	var div = document.createElement('div');
+	var span = document.createElement('span');
+	div.appendChild(span);
+
+    verify(div.offsetParent == null);
+	verify(span.offsetParent == null);
+}
+
+html
+{
+	//! <body>
+	//! <div id="foo"></div>
+	//! <div id="foo"></div>
+	//! <div id="foo"></div>
+	//! <div id="foo"></div>
+	//! <div id="foo"></div>
+	//! <div id="foo"></div>
+	//! <div id="foo"></div>
+	//! <div id="foo"></div>
+	//! <div id="foo"></div>
+	//! <div id="foo"></div>
+	//! <div id="foo"></div>
+	//! <div id="foo"></div>
+	//! </body>
+}
+test("NamedElementsMap")
+language ecmascript;
+{
+	var foo = document.getElementById("foo");
+	verify(foo);
+	var foos = document.getElementsByTagName("div");
+	verify(foos);
+	verify(foos.length == 12);
+	verify(foos[0] == foo);
+
+	var body = document.body;
+	verify(body);
+
+	// 11
+	body.removeChild(foo);
+	verify(foos.length == 11);
+	var foo = document.getElementById("foo");
+	verify(foo);
+	verify(foo == foos[0]);
+
+	// 10
+	body.removeChild(foo);
+	verify(foos.length == 10);
+	var foo = document.getElementById("foo");
+	verify(foo);
+	verify(foo == foos[0]);
+
+	// 9
+	body.removeChild(foo);
+	verify(foos.length == 9);
+	var foo = document.getElementById("foo");
+	verify(foo);
+	verify(foo == foos[0]);
+
+	// 8
+	body.removeChild(foo);
+	verify(foos.length == 8);
+	var foo = document.getElementById("foo");
+	verify(foo);
+	verify(foo == foos[0]);
+
+	// 7
+	body.removeChild(foo); // Here the named map should shrink, triggering code for that
+	verify(foos.length == 7);
+	var foo = document.getElementById("foo");
+	verify(foo);
+	verify(foo == foos[0]);
+
+	// 6
+	body.removeChild(foo);
+	verify(foos.length == 6);
+	var foo = document.getElementById("foo");
+	verify(foo);
+	verify(foo == foos[0]);
+
+	// 5
+	body.removeChild(foo);
+	verify(foos.length == 5);
+	var foo = document.getElementById("foo");
+	verify(foo);
+	verify(foo == foos[0]);
+
+	// 4
+	body.removeChild(foo);
+	verify(foos.length == 4);
+	var foo = document.getElementById("foo");
+	verify(foo);
+	verify(foo == foos[0]);
+
+	// 3
+	body.removeChild(foo); // Here it shrinks again
+	verify(foos.length == 3);
+	var foo = document.getElementById("foo");
+	verify(foo);
+	verify(foo == foos[0]);
+
+	// 2
+	body.removeChild(foo);
+	verify(foos.length == 2);
+	var foo = document.getElementById("foo");
+	verify(foo);
+	verify(foo == foos[0]);
+
+	// 1
+	body.removeChild(foo);
+	verify(foos.length == 1); // And now it should revert to single storage
+	var foo = document.getElementById("foo");
+	verify(foo);
+	verify(foo == foos[0]);
+
+	// 0
+	body.removeChild(foo);
+	verify(foos.length == 0);
+	var foo = document.getElementById("foo");
+	verify(!foo);
+}
+
+html
+{
+	//! <body><div>
+}
+
+test("Inserting dirty trees")
+{
+	HTML_Element* span = NULL;
+
+	state.doc->ConstructDOMEnvironment();
+	DOM_Environment* env = state.doc->GetDOMEnvironment();
+	verify(env);
+
+	HTML_Element* div = find_element("div");
+	verify(div);
+
+	state.doc->Reflow(TRUE);
+	verify(!div->IsDirty());
+
+	verify(OpStatus::IsSuccess(HTML_Element::DOMCreateElement(span, env, UNI_L("span"))));
+	verify(span);
+	span->MarkExtraDirty(state.doc);
+	verify(span->IsDirty());
+	verify(span->IsExtraDirty());
+
+	verify(!div->IsDirty());
+
+	span->UnderSafe(state.doc, div);
+
+	verify(div->IsDirty());
+	verify(span->IsExtraDirty());
+}
+finally
+{
+	if (span && !span->Parent() && span->Clean(state.doc))
+		span->Free(state.doc);
+}
+
+
+html
+{
+	//! <!DOCTYPE html>
+	//! <head><title>Inserting scripts already run</title></head>
+	//! <body><p id=log>FAILED (script didn't run)
+	//! <div id=div>
+	//! <script>
+	//! document.getElementById("log").firstChild.data="FAIL";
+	//! </script>
+	//! </div>
+	//! </body></html>
+}
+
+test("mixed insertion of run and not run scripts")
+  language ecmascript;
+{
+	window.script_ran = false;
+	var s = document.createElement("script");
+	s.innerHTML = "window.script_ran = true;";
+	var div = document.getElementById("div");
+	div.parentNode.removeChild(div);
+	div.appendChild(s);
+	var log = document.getElementById("log").firstChild;
+	log.data="keepme";
+	document.body.appendChild(div); // This should run the script
+	verify(window.script_ran);
+	verify(log.data == "keepme");
+}
+
+// selftest for CORE-22735
+html
+{
+//! <!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01//EN" "http://www.w3.org/TR/html4/strict.dtd">
+//! <html>
+//! 	<head>
+//! 		<title>Replaced element insertion also inserts magic body</title>
+//! 		<script type="text/javascript">
+//! var elem = document.createElement('div'); //must be an element containing the replaced element
+//! elem.innerHTML = '<input>'; //must be a replaced element; img, input, iframe, etc
+//! var root = document.documentElement;
+//! root.insertBefore( elem, root.firstChild );
+//! root.removeChild( elem );
+//! 		</script>
+//! 	</head>
+//! 	<script type="text/javascript">
+//! var frameSet = "";
+//! frameSet += '<frameset rows="*,0">';
+//! frameSet += '<frame src="data:text/plain,PASS">';
+//! frameSet += '<frame src="">';
+//! frameSet += '</frameset>';
+//! document.write(frameSet);
+//! var passed = document.body.tagName == 'FRAMESET' || document.body.tagName == 'frameset';
+//! 	</script>
+//! 	<p>FAIL</p>
+//! </html>
+}
+test("replaced element insertion should not insert magic body")
+language ecmascript;
+{
+	var passed = document.body.tagName == 'FRAMESET' || document.body.tagName == 'frameset';
+	verify(passed);
+}
+
+html
+{
+	//! <!DOCTYPE html><html><head>  <title>width/height of image when hidden</title>  <style>#imgContainer { display: none; }</style>
+	//! <body><div id="imgContainer"><img onload="void(0)" src="http://t/resources/images/100x100-navy.png"></div>
+	//! </body>
+}
+
+test("Image size in hidden container - bug CORE-11792")
+	language ecmascript;
+{
+	// Should convert the access to t to a data url.
+	// Just need a 100x100 image after all, contents
+	// don't matter.
+
+	var img = document.getElementsByTagName("img")[0];
+	verify(img);
+	verify("width" in img);
+	verify(img.width == 100);
+	verify("height" in img);
+	verify(img.height == 100);
+}

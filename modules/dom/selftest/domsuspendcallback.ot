@@ -1,0 +1,147 @@
+/* -*- mode: c++; tab-width: 4; indent-tabs-mode: t; c-basic-offset: 4 */
+
+group "DOM.DOM_SuspeningCallback";
+require DOM_JIL_API_SUPPORT;
+
+include "modules/dom/src/domsuspendcallback.h";
+include "modules/dom/src/domcallstate.h";
+include "modules/dom/domenvironment.h";
+include "modules/ecmascript_utils/esasyncif.h";
+include "modules/ecmascript_utils/essched.h";
+include "modules/hardcore/timer/optimer.h";
+include "modules/doc/frm_doc.h";
+include "modules/dom/selftest/domselftestutils.h";
+
+global
+{
+	class TestSuspendingCallback : public DOM_SuspendCallback<OpTimerListener>
+	{
+	public:
+		TestSuspendingCallback(OP_STATUS result, double arg, ES_Thread* thread_to_kill = NULL) : m_result(result), m_arg(arg), m_thread_to_kill(thread_to_kill){}
+
+		virtual void OnTimeOut(OpTimer* timer)
+		{
+			if (m_thread_to_kill)
+			{
+				ES_ThreadScheduler* scheduler = m_thread_to_kill->GetScheduler();
+				OP_ASSERT(scheduler);
+				scheduler->CancelThread(m_thread_to_kill);
+				OnFailed(OpStatus::ERR);
+				return;
+			}
+			if (OpStatus::IsError(m_result))
+				OnFailed(m_result);
+			else
+				OnSuccess();
+		}
+
+		double GetReturnValue(){ return m_arg*2; }
+	private:
+		OP_STATUS m_result;
+		double m_arg;
+		ES_Thread* m_thread_to_kill;
+	};
+
+	class TestSuspendingFunction : public EcmaScript_Object
+	{
+	public:
+		/**
+		 * @param - expected result of suspending call
+		 * @param - timeout time after suspending call finishes
+		 * @param - kill_the_thread - if this is set to TRUE then instead of unsuspending the call after timeout the thread will be killed
+		 */
+		TestSuspendingFunction(OP_STATUS result, UINT32 timeout, BOOL kill_the_thread = FALSE) : m_result(result), m_timeout(timeout), m_kill_the_thread(kill_the_thread) {}
+
+		virtual int Call(ES_Object* this_es_object, ES_Value* argv, int argc, ES_Value* return_value, ES_Runtime* origining_es_runtime)
+		{
+			DOM_Runtime* origining_runtime = static_cast<DOM_Runtime*>(origining_es_runtime);
+			DOM_Object* this_object = DOM_HOSTOBJECT(this_es_object, DOM_Object);
+			DOM_CHECK_OR_RESTORE_ARGUMENTS_JIL("n");
+
+			DOM_SuspendingCall call(this_object, argv, argc, return_value, return_value, origining_runtime, DOM_CallState::PHASE_EXECUTION_0);
+
+			NEW_SUSPENDING_CALLBACK(TestSuspendingCallback, callback, return_value, call, (m_result
+																							  ,argv[0].value.number
+																							  , m_kill_the_thread ? DOM_Object::GetCurrentThread(origining_es_runtime) : NULL) );
+
+			m_timer.SetTimerListener(callback);
+
+			OpMemberFunctionObject1<OpTimer, UINT32> function(&m_timer, &OpTimer::Start, m_timeout);
+
+			DOM_SUSPENDING_CALL(call, function, TestSuspendingCallback, callback);
+			OP_ASSERT(callback);
+			CALL_FAILED_IF_ERROR(callback->GetErrorCode());
+			DOM_Object::DOMSetNumber(return_value, callback->GetReturnValue());
+			return ES_VALUE;
+		}
+	private:
+		OP_STATUS m_result;
+		UINT32 m_timeout;
+		OpTimer m_timer;
+		BOOL m_kill_the_thread;
+	};
+}
+
+
+test("Test suspending call - success")
+async;
+{
+#define verify_async(assertion) do{ if (!assertion) { ST_failed("%d:verify" #assertion "FAILED", __LINE__); return -2;  } } while(0)
+#define verify_success_async(assertion) do { if (OpStatus::IsError(assertion)){ ST_failed("%d:verify" #assertion "FAILED", __LINE__); return -2; }  } while(0)
+	const double arg = 10.0;
+	verify_success_async(state.doc->ConstructDOMEnvironment());
+	ES_Runtime* rt = state.doc->GetESRuntime();
+	TestSuspendingFunction* fun = OP_NEW(TestSuspendingFunction, (OpStatus::OK, 1)); // 1  = 1ms timeout
+	verify_success_async(fun->SetFunctionRuntime(rt, UNI_L("TestSuspendingFunction"), "TestSuspendingFunction", NULL));
+
+	ES_Value val;
+	DOM_Object::DOMSetNumber(&val, 2*arg);
+
+	ES_Value argv[1];
+	DOM_Object::DOMSetNumber(&(argv[0]), arg);
+	DOM_SelftestUtils::TestAsyncFunction(fun->GetNativeObject(), NULL, ARRAY_SIZE(argv), argv, ES_ASYNC_SUCCESS, val, __LINE__);
+#undef verify_success_async
+#undef verify_async
+}
+
+test("Test suspending call - OOM")
+async;
+{
+#define verify_async(assertion) do{ if (!assertion) { ST_failed("%d:verify" #assertion "FAILED", __LINE__); return -2;  } } while(0)
+#define verify_success_async(assertion) do { if (OpStatus::IsError(assertion)){ ST_failed("%d:verify" #assertion "FAILED", __LINE__); return -2; }  } while(0)
+	const double arg = 10.0;
+	verify_success_async(state.doc->ConstructDOMEnvironment());
+	ES_Runtime* rt = state.doc->GetESRuntime();
+	TestSuspendingFunction* fun = OP_NEW(TestSuspendingFunction, (OpStatus::ERR_NO_MEMORY, 1));// 1  = 1ms timeout
+	verify_success_async(fun->SetFunctionRuntime(rt, UNI_L("TestSuspendingFunction"), "TestSuspendingFunction", NULL));
+
+	ES_Value val;
+	DOM_Object::DOMSetNumber(&val, 2*arg);
+
+	ES_Value argv[1];
+	DOM_Object::DOMSetNumber(&(argv[0]), arg);
+	DOM_SelftestUtils::TestAsyncFunction(fun->GetNativeObject(), NULL, ARRAY_SIZE(argv), argv, ES_ASYNC_NO_MEMORY, val, __LINE__);
+#undef verify_success_async
+#undef verify_async
+}
+
+test("Test suspending call - thread cancelled")
+async;
+{
+#define verify_async(assertion) do{ if (!assertion) { ST_failed("%d:verify" #assertion "FAILED", __LINE__); return -2;  } } while(0)
+#define verify_success_async(assertion) do { if (OpStatus::IsError(assertion)){ ST_failed("%d:verify" #assertion "FAILED", __LINE__); return -2; }  } while(0)
+	const double arg = 10.0;
+	verify_success_async(state.doc->ConstructDOMEnvironment());
+	ES_Runtime* rt = state.doc->GetESRuntime();
+	TestSuspendingFunction* fun = OP_NEW(TestSuspendingFunction, (OpStatus::OK, 1, TRUE)); // 1  = 1ms timeout
+	verify_success_async(fun->SetFunctionRuntime(rt, UNI_L("TestSuspendingFunction"), "TestSuspendingFunction", NULL));
+
+	ES_Value val;
+	DOM_Object::DOMSetNumber(&val, 2*arg);
+
+	ES_Value argv[1];
+	DOM_Object::DOMSetNumber(&(argv[0]), arg);
+	DOM_SelftestUtils::TestAsyncFunction(fun->GetNativeObject(), NULL, ARRAY_SIZE(argv), argv, ES_ASYNC_CANCELLED, val, __LINE__);
+#undef verify_success_async
+#undef verify_async
+}

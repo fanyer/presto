@@ -1,0 +1,624 @@
+/* -*- Mode: c++; tab-width: 4; indent-tabs-mode: t; c-basic-offset: 4 -*-
+**
+** Copyright (C) 2008-2011 Opera Software ASA.  All rights reserved.
+**
+** This file is part of the Opera web browser.  It may not be distributed
+** under any circumstances.
+**
+** Lasse Magnussen
+** Peter Krefting
+*/
+
+group "gadgets.generic";
+require GADGET_SUPPORT;
+require init;
+
+include "modules/gadgets/gadget_selftest_utils.h";
+include "modules/gadgets/OpGadget.h";
+include "modules/gadgets/OpGadgetManager.h";
+include "modules/doc/frm_doc.h";
+include "modules/dochand/win.h";
+include "modules/url/url_api.h";
+include "modules/url/url2.h";
+include "modules/windowcommander/OpWindowCommander.h";
+include "modules/dochand/winman.h";
+
+global
+{
+	// Reports fail when widget opens, success when it doesn't
+	class SelftestInvertedOpenCallback : public GadgetSelftestUtils::GadgetOpenCallback
+	{
+		virtual void OnGadgetOpen(OP_GADGET_STATUS status)
+		{
+			if (OpStatus::IsSuccess(status))
+				ST_failed("Gadget opened when it shouldn't have.");
+			else
+				ST_passed();
+		}
+	} gadget_inverted_open_callback;
+
+	BOOL init_success = FALSE;
+	OpGadget *gadget = NULL;
+	OpGadget *gadget2 = NULL;
+
+	GadgetSelftestUtils g_utils;
+
+}
+
+setup
+{
+	init_success = OpStatus::IsSuccess(OpSecurityManager_Gadget::SetDefaultGadgetPolicy());
+}
+
+exit
+{
+	g_utils.UnloadGadget();
+}
+
+test("Initialized")
+{
+	verify(init_success);
+}
+
+test("Load gadget (selftest.wgt)")
+	require success "Initialized";
+	async;
+	file zip_file "testfiles/widgets/selftest.wgt";
+{
+	OP_GADGET_STATUS status = g_utils.LoadGadgetForSelftest(zip_file, URL_GADGET_INSTALL_CONTENT);
+
+	if (OpStatus::IsError(status))
+		ST_failed("Unable to install test widget, status: %d", status);
+	else if (status != OpGadgetStatus::OK_SIGNATURE_VERIFICATION_IN_PROGRESS)
+		ST_passed();
+}
+
+test("XHR to data/xhr.txt via widget protocol")
+	require success "Load gadget (selftest.wgt)";
+	language ecmascript;
+	async;
+{
+	var timeout_id;
+
+	function xhr_timeout()
+	{
+		ST_failed("Timeout", "gadgets.ot", 81);
+	}
+
+	function handler()
+	{
+		opera.postError("readyState = " + this.readyState + "\n");
+		if (this.readyState == 4)
+		{
+			window.clearTimeout(timeout_id);
+
+			var regexp = /GADGETS/;
+			var matchpos = this.responseText.search(regexp);
+			opera.postError("matchpos = " + matchpos + "\n");
+			if (matchpos != -1)
+				ST_passed();
+			else
+				ST_failed("Wrong response", "gadgets.ot", 97);
+		}
+	}
+
+	try
+	{
+		timeout_id = window.setTimeout(xhr_timeout, 5000);
+
+		var req = new XMLHttpRequest();
+		req.onreadystatechange = handler;
+		req.open('GET', 'data/xhr.txt');
+		req.send();
+	}
+	catch (ex)
+	{
+		ST_failed("XHR denied.", "gadgets.ot", 112);
+	}
+}
+
+test("Check that widget.onshow/onhide is called only once")
+	require success "Load gadget (selftest.wgt)";
+	language ecmascript;
+	async;
+{
+	var callback = 0;
+
+	widget.onhide = function ()
+	{
+		callback++;
+	}
+
+	widget.onshow = function ()
+	{
+		callback++;
+	}
+
+	function showWidget()
+	{
+		widget.show();
+		setTimeout(checkCallback, 500);
+	}
+
+	function checkCallback()
+	{
+		if (callback == 2)
+			ST_passed();
+		else
+			ST_failed("onshow() and onhide() called wrong number of times (" + callback + ")", "gadgets.ot",184);
+	}
+
+	widget.hide();
+	setTimeout(showWidget, 500);
+}
+
+test("Unload gadget (selftest.wgt)")
+	require success "Load gadget (selftest.wgt)";
+{
+	g_utils.UnloadGadget();
+}
+
+table dummy100(const char *) filelist "testfiles/widgets/update.wgt" recursively;
+
+test("Load gadget (update.wgt)")
+	require success "Initialized";
+	async;
+	file zip_file "testfiles/widgets/update.wgt";
+{
+	OP_GADGET_STATUS status = g_utils.LoadGadgetForSelftest(zip_file, URL_GADGET_INSTALL_CONTENT);
+
+	if (OpStatus::IsError(status))
+		ST_failed("Unable to install test widget, status: %d", status);
+	else if (status != OpGadgetStatus::OK_SIGNATURE_VERIFICATION_IN_PROGRESS)
+		ST_passed();
+}
+
+test("Widget.update")
+	require success "Load gadget (update.wgt)";
+	language ecmascript;
+	async;
+	disabled;
+{
+	try
+	{
+		widget.update();
+		ST_passed();
+	}
+	catch(e)
+	{
+		ST_failed("failed", "gadgets.ot", 175);
+	}
+}
+
+test("Unload gadget (update.wgt)")
+	require success "Load gadget (update.wgt)";
+{
+	g_utils.UnloadGadget();
+}
+
+table dummy_w3c_tester(const char *) filelist "testfiles/widgets/w3c_tester.wgt" recursively;
+
+test("Load gadget (w3c_tester.wgt)")
+	require DOM_GEOLOCATION_SUPPORT;
+	async;
+	require success "Initialized";
+	file zip_file "testfiles/widgets/w3c_tester.wgt";
+{
+	OP_GADGET_STATUS status = g_utils.LoadGadgetForSelftest(zip_file, URL_GADGET_INSTALL_CONTENT);
+
+	if (OpStatus::IsError(status))
+		ST_failed("Unable to install test widget, status: %d", status);
+	else if (status != OpGadgetStatus::OK_SIGNATURE_VERIFICATION_IN_PROGRESS)
+		ST_passed();
+}
+
+test("Getting text of an xml element")
+	require success "Load gadget (w3c_tester.wgt)";
+	language ecmascript;
+{
+//	<author email="core-extapps@opera.com"
+//			  href="http://www.opera.com"
+//			  img="http://www.opera.com/media/images/logo/ologo_wback.gif">
+//			  <test>Core</test> <test>Extapps</test>
+//	  </author>
+
+	verify(widget.author == "Core Extapps");
+}
+
+test("Geolocation API available")
+	require success "Load gadget (w3c_tester.wgt)";
+	require DOM_GEOLOCATION_SUPPORT;
+	language ecmascript;
+{
+	verify(navigator.geolocation);
+}
+
+test("Unload gadget (w3c_tester.wgt)")
+	require success "Load gadget (w3c_tester.wgt)";
+{
+	g_utils.UnloadGadget();
+}
+
+table dummy_w3c_widget(const char *) filelist "testfiles/widgets/w3c_widget.wgt" recursively;
+
+test("Load gadget (w3c_widget.wgt)")
+	require success "Initialized";
+	async;
+	file zip_file "testfiles/widgets/w3c_widget.wgt";
+{
+	OP_GADGET_STATUS status = g_utils.LoadGadgetForSelftest(zip_file, URL_GADGET_INSTALL_CONTENT);
+
+	if (OpStatus::IsError(status))
+		ST_failed("Unable to install test widget, status: %d", status);
+	else if (status != OpGadgetStatus::OK_SIGNATURE_VERIFICATION_IN_PROGRESS)
+		ST_passed();
+}
+
+test("Geolocation API _not_ available")
+	require success "Load gadget (w3c_widget.wgt)";
+	require DOM_GEOLOCATION_SUPPORT;
+	language ecmascript;
+{
+	verify(!navigator.geolocation);
+}
+
+test("Widget.icons array")
+	require success "Load gadget (w3c_widget.wgt)";
+	language ecmascript;
+	disabled;
+{
+	verify(widget.icons[0] != null);
+}
+
+test("Check widget access")
+	require success "Load gadget (w3c_widget.wgt)";
+	language ecmascript;
+{
+	try {
+		var req = new XMLHttpRequest();
+		req.open('GET', 'http://myopera.com', false);
+		req.send(null);
+	}
+	catch (ex) {
+		verify(false);
+	}
+
+	try {
+		var req = new XMLHttpRequest();
+		req.open('GET', 'http://labs.opera.com', false);
+		req.send(null);
+	}
+	catch (ex) {
+		verify(false);
+	}
+
+	try {
+		var req = new XMLHttpRequest();
+		req.open('GET', 'http://google.com:4242', false);
+		req.send(null);
+	}
+	catch (ex) {
+		verify(false);
+	}
+
+	try {
+		var req = new XMLHttpRequest();
+		req.open('GET', 'http://pvv.org', false);
+		req.send(null);
+		verify(false);
+	}
+	catch (ex) {
+		verify(true);
+	}
+}
+
+test("Widget.preferences")
+	require success "Load gadget (w3c_widget.wgt)";
+	require DATABASE_STORAGE_SUPPORT;
+	language ecmascript;
+{
+	verify(widget.preferences);
+
+	widget.preferences.setItem("test", "test");
+	verify(widget.preferences.length != 0);
+
+	verify(widget.preferences["test1"] == "PASS");
+	verify(widget.preferences["test2"] == "FAIL");
+	verify(widget.preferences["test"] == "test");
+}
+
+test("Unload gadget (w3c_widget.wgt)")
+	require success "Load gadget (w3c_widget.wgt)";
+{
+	g_utils.UnloadGadget();
+}
+
+table dummy_attributes(const char *) filelist "testfiles/widgets/attributes.wgt" recursively;
+
+test("Load gadget (attributes.wgt)")
+	require success "Initialized";
+	async;
+	file zip_file "testfiles/widgets/attributes.wgt";
+{
+	OP_GADGET_STATUS status = g_utils.LoadGadgetForSelftest(zip_file, URL_GADGET_INSTALL_CONTENT);
+
+	if (OpStatus::IsError(status))
+		ST_failed("Unable to install test widget, status: %d", status);
+	else if (status != OpGadgetStatus::OK_SIGNATURE_VERIFICATION_IN_PROGRESS)
+		ST_passed();
+}
+
+test("Unicode whitespace collapsing")
+	require success "Load gadget (attributes.wgt)";
+	language ecmascript;
+{
+	verify(widget.authorEmail == "PASS");
+	verify(widget.authorHref == "PASS:PASS");
+	verify(widget.author == "PASS");
+}
+
+test("Unload gadget (attributes.wgt)")
+	require success "Load gadget (attributes.wgt)";
+{
+	g_utils.UnloadGadget();
+}
+
+// Simple tests for loading widgets succeeding or failing
+// Note: remember to add a dummy* entry below as well.
+table succeed
+{
+	{ "Widget archive without an extension",
+	  "testfiles/widgets/noextension" },
+	{ "Default start file (.zip)",
+	  "testfiles/widgets/default.zip" },
+	{ "Default start file (.wgt)",
+	  "testfiles/widgets/default.wgt" },
+	{ "W3C Widget",
+	  "testfiles/widgets/w3c_widget.wgt" },
+	{ "Legacy sub-folder",
+	  "testfiles/widgets/legacyfolder.wgt" },
+	{ "CORE-23192: UTF-8 start file",
+	  "testfiles/widgets/utf-8.wgt" },
+	{ "Minimal configuration should be allowed",
+	  "testfiles/widgets/defaultvalues.wgt" },
+	{ "Widget folder without extension",
+	  "testfiles/widgets/widgetfolder" },
+	{ "Widget created on Mac",
+	  "testfiles/widgets/macwidget.wgt" },
+	{ "Case sensitive widget",
+	  "testfiles/widgets/case_sensitive.wgt" },
+	{ "Widget with <content> without src (crash: CORE-30730)",
+	  "testfiles/widgets/empty_content_element.wgt" },
+	{ "CORE-30009: empty content is ok",
+	  "testfiles/widgets/emptyelements.wgt" },
+}
+
+// This table is duplicated in OpGadgetClass.ot
+table fail
+{
+	{ "CORE-19220: File with CRC error",
+	  "testfiles/widgets/crc32error.wgt" },
+	{ "CORE-19221: Start file with reserved characters 1",
+	  "testfiles/widgets/backslash.wgt" },
+	{ "CORE-19221: Start file with reserved characters 2",
+	  "testfiles/widgets/questionmark.wgt" },
+	{ "CORE-19759: empty widgetname should fail",
+	  "testfiles/widgets/emptywidgetname.wgt" },
+	{ "CORE-19759: missing widgetname should fail",
+	  "testfiles/widgets/missingwidgetname.wgt" },
+	{ "CORE-23176: Non-root widget element",
+	  "testfiles/widgets/config_widget_not_root.wgt" },
+	{ "CORE-23186: Widget without start file",
+	  "testfiles/widgets/startfilemissing.wgt" },
+	{ "CORE-22003: config.xml.bak must not be read 1",
+	  "testfiles/widgets/namematch1.wgt" },
+	{ "CORE-22003: config.xml.bak must not be read 2",
+	  "testfiles/widgets/namematch2.wgt" },
+	{ "CORE-22003: config.xml.bak must not be read 3",
+	  "testfiles/widgets/namematch3.wgt" },
+	{ "CORE-22003: config.xml as a sub-path should fail",
+	  "testfiles/widgets/config.xml" },
+	{ "CORE-26854: invalid content-type should fail",
+	  "testfiles/widgets/unsupported_type.wgt" },
+	{ "Widget declaring opera:speeddial should be rejected",
+	  "testfiles/widgets/speeddial.wgt" },
+}
+
+// Mention all the contained files such that
+// they get listed in the selftest_data file.
+table dummy1(const char *) filelist "testfiles/widgets/legacyfolder.wgt" recursively;
+table dummy2(const char *) filelist "testfiles/widgets/config_widget_not_root.wgt" recursively;
+table dummy3(const char *) filelist "testfiles/widgets/defaultvalues.wgt" recursively;
+table dummy4(const char *) filelist "testfiles/widgets/emptywidgetname.wgt" recursively;
+table dummy5(const char *) filelist "testfiles/widgets/missingwidgetname.wgt" recursively;
+table dummy6(const char *) filelist "testfiles/widgets/selftest.wgt" recursively;
+table dummy7(const char *) filelist "testfiles/widgets/startfilemissing.wgt" recursively;
+table dummy8(const char *) filelist "testfiles/widgets/update.wgt" recursively;
+table dummy9(const char *) filelist "testfiles/widgets/w3c_widget.wgt" recursively;
+table dummy10(const char *) filelist "testfiles/widgets/widgetfolder" recursively;
+table dummy11(const char *) filelist "testfiles/widgets/empty_content_element.wgt" recursively;
+table dummy12(const char *) filelist "testfiles/widgets/config.xml" recursively;
+table dummy13(const char *) filelist "testfiles/widgets/unsupported_type.wgt" recursively;
+table dummy14(const char *) filelist "testfiles/widgets/emptyelements.wgt" recursively;
+table dummy15(const char *) filelist "testfiles/widgets/speeddial.wgt" recursively;
+
+foreach (testname, zipname) from succeed
+{
+	test("Unload previous gadget")
+	{
+		g_utils.UnloadGadget();
+	}
+
+	test(testname)
+		require success "Initialized";
+		async;
+		file zip_file zipname;
+	{
+		OP_GADGET_STATUS status = g_utils.LoadGadgetForSelftest(zip_file, URL_GADGET_INSTALL_CONTENT);
+
+		if (OpStatus::IsError(status))
+			ST_failed("Unable to install test widget: %d", status);
+		else if (status != OpGadgetStatus::OK_SIGNATURE_VERIFICATION_IN_PROGRESS)
+			ST_passed();
+	}
+}
+
+foreach (testname, zipname) from fail
+{
+	test(testname)
+		require success "Initialized";
+		async;
+		file zip_file zipname;
+	{
+		OP_GADGET_STATUS status = g_utils.LoadGadgetForSelftest(zip_file, URL_GADGET_INSTALL_CONTENT, NULL, &gadget_inverted_open_callback);
+
+		if (OpStatus::IsError(status))
+			ST_passed();
+		else if (status != OpGadgetStatus::OK_SIGNATURE_VERIFICATION_IN_PROGRESS)
+			ST_failed("Invalid gadget launched");
+	}
+
+	test("Unload gadget (" zipname ")")
+		require failure testname;
+	{
+		g_utils.UnloadGadget();
+	}
+
+}
+
+// Re-do the tests above, but pass a bad Content-Type. Now all the
+// widgets should fail loading, even the ones from the "succeed"
+// table.
+foreach (testname, zipname) from succeed
+{
+	test(testname " with bad Content-Type")
+		require success "Initialized";
+		async;
+		file zip_file zipname;
+	{
+		OP_GADGET_STATUS status = g_utils.LoadGadgetForSelftest(zip_file, URL_HTML_CONTENT, NULL, &gadget_inverted_open_callback);
+
+		if (OpStatus::IsError(status))
+			ST_passed();
+		else if (status != OpGadgetStatus::OK_SIGNATURE_VERIFICATION_IN_PROGRESS)
+			ST_failed("Invalid gadget launched");
+	}
+
+	test("Unload gadget (" zipname ")")
+// commented out due to selftest parser bug:
+//		require failure testname " with bad Content-Type";
+	{
+		g_utils.UnloadGadget();
+	}
+}
+
+foreach (testname, zipname) from fail
+{
+	test(testname " with bad Content-Type")
+		require success "Initialized";
+		file zip_file zipname;
+	{
+		OP_GADGET_STATUS status = g_utils.LoadGadgetForSelftest(zip_file, URL_HTML_CONTENT, NULL, &gadget_inverted_open_callback);
+
+		if (OpStatus::IsError(status))
+			ST_passed();
+		else if (status != OpGadgetStatus::OK_SIGNATURE_VERIFICATION_IN_PROGRESS)
+			ST_failed("Invalid gadget launched");
+	}
+
+	test("Unload gadget (" zipname ")")
+// commented out due to selftest parser bug:
+//		require failure testname " with bad Content-Type";
+	{
+		g_utils.UnloadGadget();
+	}
+}
+
+// Some convoluted path tests with JavaScript in them
+table eviljstests
+{
+	{ "\\ without / entry", "testfiles/widgets/backslash-js-1.wgt" },
+	{ "\\ with / entry",    "testfiles/widgets/backslash-js-2.wgt" },
+}
+
+foreach (testname, zipname) from eviljstests
+{
+	test("CORE-19221: Loading script reference " testname)
+		require success "Initialized";
+		file zip_file zipname;
+	{
+		OP_GADGET_STATUS status = g_utils.LoadGadgetForSelftest(zip_file, URL_GADGET_INSTALL_CONTENT);
+
+		if (OpStatus::IsError(status))
+			ST_failed("Unable to install test widget: %d", status);
+		else if (status != OpGadgetStatus::OK_SIGNATURE_VERIFICATION_IN_PROGRESS)
+			ST_passed();
+	}
+
+	test("CORE-19221: Checking result for " testname)
+// commented out due to selftest parser bug:
+//		require success "CORE-19221: Loading script reference " testname;
+		language ecmascript;
+	{
+		// The page sets passed to true in the index.html, and to false
+		// in the linked script, if it is run.
+		verify(passed);
+	}
+
+	test("Unload gadget (" zipname ")")
+// commented out due to selftest parser bug:
+//		require success "CORE-19221: Loading script reference " testname;
+	{
+		g_utils.UnloadGadget();
+	}
+}
+
+test("OpGadgetManager.CloseGadget: Load gadget")
+	require success "Initialized";
+	file zip_file "testfiles/widgets/w3c_widget.wgt";
+{
+	OP_GADGET_STATUS status = g_utils.LoadAndOpenGadget(zip_file, URL_GADGET_INSTALL_CONTENT, &gadget2);
+
+	if (OpStatus::IsError(status))
+		ST_failed("Unable to install test widget: %d", status);
+	else if (status != OpGadgetStatus::OK_SIGNATURE_VERIFICATION_IN_PROGRESS)
+		ST_passed();
+}
+
+test("FindGadgetResource null path crash, existing gadget (CORE-46532)")
+{
+	OpString gadget_url;
+	verify_success(gadget_url.AppendFormat(UNI_L("widget://%s"), gadget2->GetIdentifier()));
+	URL url = g_url_api->GetURL(gadget_url.CStr(), gadget2->UrlContextId());
+	OpString dummy_path;
+	verify_status(OpStatus::ERR_FILE_NOT_FOUND, g_gadget_manager->FindGadgetResource(gadget2->GetWindow()->GetMessageHandler(), &url, dummy_path));
+}
+
+test("FindGadgetResource null path crash, invalid gadget (CORE-46532)")
+{
+	URL url = g_url_api->GetURL("widget://foo", gadget2->UrlContextId());
+	OpString dummy_path;
+	verify_status(OpStatus::ERR, g_gadget_manager->FindGadgetResource(gadget2->GetWindow()->GetMessageHandler(), &url, dummy_path));
+}
+
+test("OpGadgetManager.CloseGadget: Close")
+	require success "OpGadgetManager.CloseGadget: Load gadget";
+{
+	verify(gadget2);
+	verify(gadget2->GetWindow());
+
+	Window *gadget_win = gadget2->GetWindow();
+
+	// This should close the gadget immediately
+	verify_success(g_gadget_manager->CloseGadget(gadget2, FALSE));
+	g_utils.MarkGadgetUnloaded();
+
+	BOOL found = FALSE;
+	for (Window* win = g_windowManager->FirstWindow(); win; win = (Window*)win->Suc())
+		if (win == gadget_win)
+			found = TRUE;
+	verify(!found, "Window belonging to gadget was removed after CloseGadget()");
+
+	verify_success(g_gadget_manager->DestroyGadget(gadget2));
+	gadget2 = NULL;
+}

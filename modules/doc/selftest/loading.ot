@@ -1,0 +1,361 @@
+/* -*- Mode: c++; tab-width: 4; indent-tabs-mode: t; c-basic-offset: 4 -*- */
+group "doc.loading";
+
+language C++;
+
+include "modules/doc/frm_doc.h";
+include "modules/logdoc/urlimgcontprov.h";
+
+html
+{
+	"<html></html>"
+}
+
+global
+{
+	class SelftestExternalInlineListener : public ExternalInlineListener
+	{
+		virtual void LoadingProgress(const URL &url)
+		{
+			if (url.Status(TRUE) == URL_LOADED)
+				ST_passed();
+			else
+				ST_failed("Loading stopped");
+		}
+		virtual void LoadingStopped(const URL &url)
+		{
+			if (url.Status(TRUE) == URL_LOADED)
+				ST_passed();
+			else
+				ST_failed("Loading stopped");
+		}
+		virtual void LoadingRedirected(const URL &from, const URL &to) { ST_failed("Loading redirected"); }
+	};
+
+	SelftestExternalInlineListener *listener;
+	FramesDocument *frm_doc;
+	URL requested_image_url;
+
+	class HoldVisible
+	{
+		Image m_img;
+		HEListElm* m_helm;
+	public:
+		HoldVisible(Image& img, HEListElm* helm) : m_img(img), m_helm(helm) { img.IncVisible(helm); }
+		~HoldVisible() { m_img.DecVisible(m_helm); }
+	};
+}
+
+setup
+{
+	listener = NULL;
+	frm_doc = NULL;
+}
+
+test("Init")
+{
+	frm_doc = state.doc;
+	verify(frm_doc);
+	listener = OP_NEW(SelftestExternalInlineListener, ());
+	verify(listener);
+}
+
+test("Start loading")
+require success "Init";
+async;
+{
+	URL url = g_url_api->GetURL("data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAYAAABytg0kAAAAEElEQVR42mNgaGD4D8YwBgAw9AX9Y9zBwwAAAABJRU5ErkJggg==");
+	requested_image_url = url;
+	OP_LOAD_INLINE_STATUS res = frm_doc->LoadInline(url, listener);
+	if (res != LoadInlineStatus::LOADING_STARTED)
+		ST_failed("Loading not started");
+}
+
+test("Cleanup")
+{
+	if (listener)
+	{
+		verify(frm_doc);
+		frm_doc->StopLoadingInline(requested_image_url, listener);
+		OP_DELETE(listener);
+		listener = NULL;
+		requested_image_url = URL();
+	}
+}
+
+html
+{
+	//! <body><img>
+}
+test("Setting .src to NULL stops loading")
+language C++;
+{
+	// Bug CORE-15286
+	HTML_Element* img = find_element("img");
+	verify(img);
+	OpString url;
+
+	OP_STATUS status = url.AppendFormat(UNI_L("http://t/resources/images/16x16-navy.ico?%d"), (int)op_rand());
+	verify(OpStatus::IsSuccess(status));
+	int pos = img->SetAttribute(state.doc, ATTR_SRC, NULL, NS_IDX_DEFAULT, url.CStr(), url.Length(), NULL, FALSE);
+	verify(pos >= 0);
+	URL img_url = g_url_api->GetURL(state.doc->GetURL(), url.CStr());
+	verify(img_url.Status(TRUE) == URL_LOADING);
+
+	pos = img->SetAttribute(state.doc, ATTR_SRC, NULL, NS_IDX_DEFAULT, NULL, 0, NULL, FALSE);
+	verify(pos >= 0);
+
+	verify(img_url.Status(TRUE) != URL_LOADING);
+}
+
+html
+{
+	//! <body><img src="http://t/resources/images/16x16-navy.ico">
+}
+
+test("Setting .src should keep the old image until the new is loaded")
+language C++;
+{
+	// Bug CORE-15286
+	HTML_Element* img = find_element("img");
+	verify(img);
+	HEListElm* helistelm = img->GetHEListElm(FALSE);
+	verify(helistelm);
+	LoadInlineElm* lie = helistelm->GetLoadInlineElm();
+	verify(lie);
+
+	URL* url_p = lie->GetUrl();
+	verify(url_p);
+	URL url_before_change = *url_p;
+	url_p = NULL;
+	verify(!url_before_change.IsEmpty());
+
+	OpString url;
+	OP_STATUS status = url.AppendFormat(UNI_L("http://t/resources/images/16x16-navy.ico?%d"), (int)op_rand());
+	verify(OpStatus::IsSuccess(status));
+
+	// If not loaded 'lie' will be deleted when changing attribute.
+	if (!lie->GetLoaded())
+		lie = NULL;
+
+	int pos = img->SetAttribute(state.doc, ATTR_SRC, NULL, NS_IDX_DEFAULT, url.CStr(), url.Length(), NULL, FALSE);
+	verify(pos >= 0);
+
+	HEListElm* helistelm2 = img->GetHEListElm(FALSE);
+	verify(helistelm2 == helistelm);
+
+	LoadInlineElm* lie2 = helistelm->GetLoadInlineElm();
+	verify(lie2);
+	verify(lie2 != lie);
+
+	URL old_url = helistelm->GetOldUrl();
+	verify(!old_url.IsEmpty());
+
+	verify(old_url == url_before_change);
+}
+
+html
+{
+	//! <body><img src="http://t/resources/images/16x16-navy.ico">
+	//! <script>function foo() { document.getElementsByTagName("img")[0].src = "qw:qw:qw"}
+	//! window.onload = foo;</script>
+}
+
+test("Loading invalid image should clear the previous image (setup)")
+language ecmascript;
+{
+// Just to make the message loop do an extra iteration so that the load has been fully handled
+}
+
+test("Loading invalid image should clear the previous image")
+language C++;
+{
+	// Could this test run before the qw:qw load has been handled?
+	HTML_Element* img = find_element("img");
+	verify(img);
+	HEListElm* helistelm = img->GetHEListElm(FALSE);
+	verify(helistelm);
+	LoadInlineElm* lie = helistelm->GetLoadInlineElm();
+	verify(lie);
+	URL orig_url = g_url_api->GetURL(state.doc->GetURL(), "http://t/resources/images/16x16-navy.ico");
+	verify(!(*lie->GetUrl() == orig_url));
+
+	URL old_url = helistelm->GetOldUrl();
+	verify(old_url.IsEmpty());
+
+	Image image = helistelm->GetImage();
+	verify(image.IsFailed()); // qw:qw:qw is not an image
+
+	URL* url_p = lie->GetUrl();
+	verify(url_p);
+	URL url_before_change = *url_p;
+	url_p = NULL;
+	verify(!url_before_change.IsEmpty());
+
+	//	OpString url;
+	//	OP_STATUS status = url.Set("qw:qw:qw");
+	//	verify(OpStatus::IsSuccess(status));
+	URL qw_url = g_url_api->GetURL(state.doc->GetURL(), "qw:qw:qw");
+
+	verify(url_before_change == qw_url);
+
+	ImageLoadingInfo loading_info;
+	state.doc->GetImageLoadingInfo(loading_info);
+
+	/* FIXME: these two checks are not exactly pertinent to this particular selftest, and very hard
+	 * to get right, since they're very susceptible to things like the favicon, for instance the
+	 * TV profile doesn't even support favicons...
+	 * If we want to test for this it should be in a separate selftest that takes into account all
+	 * the special cases that might arise. */
+	// verify(loading_info.total_count == 2); // or 1? or 3? - http://t/resources/images/16x16-navy.ico, the test page favicon and qw:qw:qw could all be there
+	// verify(loading_info.loaded_count == 2); // or 1? or 3?
+}
+
+html
+{
+	//! <img src="http://t/resources/images/100x100-navy.png">
+	//! <img src="http://t/resources/images/100x100-white.png">
+}
+
+test("Not decoding images that shouldn't be decoded when switching images")
+{
+	HTML_Element* img1 = find_element("img", 1);
+	verify(img1);
+	HEListElm* helistelm1 = img1->GetHEListElm(FALSE);
+	verify(helistelm1);
+	LoadInlineElm* lie1 = helistelm1->GetLoadInlineElm();
+	verify(lie1);
+	UrlImageContentProvider* provider = UrlImageContentProvider::FindImageContentProvider(*lie1->GetUrl());
+	verify(provider);
+	Image img = provider->GetImage();
+	verify(!img.IsEmpty());
+	HoldVisible holder1(img, helistelm1); // but this might hide a bug. So complicated to test this. :-p
+	OP_STATUS status = img.OnLoadAll(provider);
+	verify(status == OpStatus::OK);
+	verify(img.ImageDecoded());
+
+	HTML_Element* img2 = find_element("img", 2);
+	verify(img2);
+	HEListElm* helistelm2 = img2->GetHEListElm(FALSE);
+	verify(helistelm2);
+	LoadInlineElm* lie2 = helistelm2->GetLoadInlineElm();
+	verify(lie2);
+	provider = UrlImageContentProvider::FindImageContentProvider(*lie2->GetUrl());
+	verify(provider);
+	img = provider->GetImage();
+	verify(!img.IsEmpty());
+	HoldVisible holder2(img, helistelm2); // but this might hide a bug. So complicated to test this. :-p
+	status = img.OnLoadAll(provider);
+	verify(status == OpStatus::OK);
+	verify(img.ImageDecoded());
+
+	OpString url;
+	verify(OpStatus::IsSuccess(url.Set("http://t/resources/images/100x100-navy.png")));
+	int pos = img2->SetAttribute(state.doc, ATTR_SRC, NULL, NS_IDX_DEFAULT, url.CStr(), url.Length(), NULL, FALSE);
+	verify(pos >= 0);
+
+	// lie2 might now be deleted so don't be tempted to touch it
+	lie2 = reinterpret_cast<LoadInlineElm*>(static_cast<INTPTR>(0xbadbeef));
+
+	HEListElm* helistelm2_1 = img2->GetHEListElm(FALSE);
+	verify(helistelm2_1);
+	verify(helistelm2_1 == helistelm2);
+	LoadInlineElm* lie2_1 = helistelm2->GetLoadInlineElm();
+	verify(lie2_1);
+
+	// How to verify that no attempt at redecoding it will be done?
+	// This checks that the structures we can reach are decoded
+	// already but that is no guarantee
+	provider = UrlImageContentProvider::FindImageContentProvider(*lie2_1->GetUrl());
+	verify(provider);
+	verify(helistelm1->GetUrlContentProvider() == provider);
+	verify(provider->IsLoaded());
+	img = provider->GetImage();
+	verify(!img.IsEmpty());
+	verify(img.ImageDecoded()); // Should be decoded without any OnLoadAll since it's decoded above
+}
+
+html
+{
+	//! <img src="data:image/png,qwertyqwerty">
+}
+
+test("onerror called after changing .src of an image")
+language ecmascript;
+async;
+{
+	var count = 0;
+	var timeout = setTimeout("ST_failed('test timed out')", 3000);
+	document.images[0].onerror = function() {
+		clearTimeout(timeout);
+		count++;
+		if(count>1)
+			ST_failed("more than one error event");
+		else
+			ST_passed();
+	}
+	document.images[0].onload = function() {
+		clearTimeout(timeout);
+		ST_failed("got onload when expected onerror");
+	}
+	document.images[0].src = "data:image/png,qwertyqwerty";
+}
+
+html
+{
+	//! <script>window.iframe_onload_count = 0;</script>
+	//! <iframe onload="top.iframe_onload_count++" src="javascript:"></iframe>
+}
+
+test("iframe with javascript url #1")
+language ecmascript;
+{
+	verify("iframe_onload_count" in window);
+	verify(window.iframe_onload_count);
+	verify(window.iframe_onload_count === 1);
+}
+
+html
+{
+	//! <script>window.iframe_onload_count = 0;</script>
+	//! <iframe onload="top.iframe_onload_count++" src="javascript:void(window)"></iframe>
+}
+
+test("iframe with javascript url #2")
+language ecmascript;
+{
+	verify("iframe_onload_count" in window);
+	verify(window.iframe_onload_count);
+	verify(window.iframe_onload_count === 1);
+}
+
+html
+{
+	//! <script>window.iframe_onload_count = 0;</script>
+	//! <iframe onload="top.iframe_onload_count++" src="javascript:'Text'"></iframe>
+}
+
+test("iframe with javascript url #3")
+language ecmascript;
+{
+	verify("iframe_onload_count" in window);
+	verify(window.iframe_onload_count);
+	verify(window.iframe_onload_count === 1);
+}
+
+html
+{
+	//! <body><img></body>
+}
+
+test("load and stop already loaded data")
+{
+	verify(state.doc);
+	HTML_Element *img = find_element("img");
+	verify(img);
+	InlineResourceType inline_type = IMAGE_INLINE;
+	URL first_url = g_url_api->GetURL("data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAUAAAAFCAIAAAACDbGyAAAAI0lEQVR4nGNkYNjCgARYGBgY/v/3hnAYGbcyMaACdD4jmn4A7CkEc/PaWSMAAAAASUVORK5CYII=");
+	verify(state.doc->LoadInline(&first_url, img, inline_type) == LoadInlineStatus::LOADING_STARTED);
+	state.doc->StopLoadingInline(&first_url, img, inline_type);
+	verify(state.doc->LoadInline(&first_url, img, inline_type) == LoadInlineStatus::LOADING_STARTED);
+}

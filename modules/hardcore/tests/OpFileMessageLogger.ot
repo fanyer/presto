@@ -1,0 +1,236 @@
+/* -*- Mode: c++; tab-width: 4; indent-tabs-mode: t; c-basic-offset: 4 -*-
+ *
+ * Copyright (C) 2012 Opera Software AS.  All rights reserved.
+ *
+ * This file is part of the Opera web browser.
+ * It may not be distributed under any circumstances.
+ */
+group "hardcore.logging.opfilemessagelogger";
+
+require HC_MESSAGE_LOGGING;
+
+include "modules/hardcore/logging/OpFileMessageLogger.h";
+include "modules/hardcore/tests/OpLogFormatterMock.h";
+include "modules/hardcore/tests/OpTypedMessageFake.h";
+include "modules/util/tests/OpFileMock.h";
+include "modules/util/OpSharedPtr.h";
+include "modules/opdata/OpStringStream.h";
+include "modules/util/opstring.h";
+include "modules/stdlib/include/opera_stdlib.h";
+
+subtest checkMessageSent(
+		OpSharedPtr<OpFileMock> fileMock,
+		int expectedWriteCalls,
+		const char* expectedMessage)
+{
+	verify(fileMock->writeCalls == expectedWriteCalls);
+	verify(static_cast<size_t>(fileMock->writeLastLen) == op_strlen(expectedMessage));
+	verify_string(fileMock->writeLastData, expectedMessage);
+}
+
+subtest initialFileWrite(
+	OpSharedPtr<OpFileMock> fileMock)
+{
+	// The first log message.
+	const char* expectedMessage = "FormatBeginLogging result";
+
+	checkMessageSent(fileMock, 1, expectedMessage);
+	fileMock->reset(); // Reset the mock for convenient counting further on.
+}
+
+test("Startup from a closed file")
+{
+	OpSharedPtr<OpLogFormatterMock> logFormatterMock = make_shared<OpLogFormatterMock>();
+	OpSharedPtr<OpFileMock> fileMock = make_shared<OpFileMock>();
+	fileMock->isOpenReturn = FALSE; // File reports as closed.
+
+	OpFileMessageLogger logger(fileMock, logFormatterMock);
+
+	// The file wasn't open, so an open attempt was made...
+	verify(fileMock->openCalls == 1);
+
+	// ... with WRITE and TEXT mode.
+	verify(fileMock->openLastMode == (OPFILE_WRITE | OPFILE_TEXT));
+
+	// There were no attempts to close the file.
+	verify(fileMock->closeCalls == 0);
+
+	initialFileWrite(fileMock);
+
+	// Able to log.
+	verify(logger.IsAbleToLog());
+}
+
+test("Startup from an opened but non-wrtiable file")
+{
+	OpSharedPtr<OpLogFormatterMock> logFormatterMock = make_shared<OpLogFormatterMock>();
+	OpSharedPtr<OpFileMock> fileMock = make_shared<OpFileMock>();
+	fileMock->isOpenReturn = TRUE; // File reports as open...
+	fileMock->isWritableReturn = FALSE; // ... but not writable.
+
+	OpFileMessageLogger logger(fileMock, logFormatterMock);
+
+	// The file wasn't writable, so it was closed.
+	verify(fileMock->closeCalls == 1);
+
+	// It was opened again...
+	verify(fileMock->openCalls == 1);
+
+	// ... with WRITE and TEXT mode.
+	verify(fileMock->openLastMode == (OPFILE_WRITE | OPFILE_TEXT));
+
+	initialFileWrite(fileMock);
+
+	// Able to log.
+	verify(logger.IsAbleToLog());
+}
+
+test("Startup from an opened, writable file")
+{
+	OpSharedPtr<OpLogFormatterMock> logFormatterMock = make_shared<OpLogFormatterMock>();
+	OpSharedPtr<OpFileMock> fileMock = make_shared<OpFileMock>();
+	OpFileMessageLogger logger(fileMock, logFormatterMock);
+
+	// The file was open and writable so no attempts to open or close were made.
+	verify(fileMock->closeCalls == 0);
+	verify(fileMock->openCalls == 0);
+
+	initialFileWrite(fileMock);
+
+	// Able to log
+	verify(logger.IsAbleToLog());
+}
+
+test("No file given at construction")
+{
+	OpSharedPtr<OpLogFormatterMock> logFormatterMock = make_shared<OpLogFormatterMock>();
+	OpFileMessageLogger logger(OpSharedPtr<OpFileMock>(), logFormatterMock);
+
+	OpSharedPtr<OpTypedMessage> msg = make_shared<OpTypedMessageFake>();
+
+	// Not able to log
+	verify(!logger.IsAbleToLog());
+
+	// Calling log functions has no visible effect, doesn't crash.
+	logger.BeforeDispatch(msg.get());
+	logger.AfterDispatch(msg.get());
+	logger.Log(msg.get(), UNI_L("some action"));
+}
+
+test("No formatter given at construction")
+{
+	OpSharedPtr<OpFileMock> fileMock = make_shared<OpFileMock>();
+	OpFileMessageLogger logger(fileMock, OpSharedPtr<OpLogFormatter>());
+
+	OpSharedPtr<OpTypedMessage> msg = make_shared<OpTypedMessageFake>();
+
+	// Not able to log
+	verify(!logger.IsAbleToLog());
+
+	// Calling log functions has no visible effect, doesn't crash.
+	logger.BeforeDispatch(msg.get());
+	logger.AfterDispatch(msg.get());
+	logger.Log(msg.get(), UNI_L("some action"));
+}
+
+test("Null pointers to messages")
+{
+	OpSharedPtr<OpLogFormatterMock> logFormatterMock = make_shared<OpLogFormatterMock>();
+	OpSharedPtr<OpFileMock> fileMock = make_shared<OpFileMock>();
+	OpFileMessageLogger logger(fileMock, logFormatterMock);
+
+	initialFileWrite(fileMock);
+
+	logger.BeforeDispatch(NULL);
+	logger.AfterDispatch(NULL);
+	logger.Log(NULL, NULL);
+
+	verify(logger.IsAbleToLog());
+}
+
+test("Error while writing")
+{
+	OpSharedPtr<OpLogFormatterMock> logFormatterMock = make_shared<OpLogFormatterMock>();
+	OpSharedPtr<OpFileMock> fileMock = make_shared<OpFileMock>();
+	OpFileMessageLogger logger(fileMock, logFormatterMock);
+
+	initialFileWrite(fileMock);
+	fileMock->reset();
+
+	OpSharedPtr<OpTypedMessage> msg = make_shared<OpTypedMessageFake>();
+
+	fileMock->writeReturn = OpStatus::ERR; // Write attempt will fail.
+	logger.Log(msg.get(), UNI_L("example action"));
+
+	// All further attempts to log ignored, logger disables itself after error.
+	verify(!logger.IsAbleToLog());
+	logger.BeforeDispatch(msg.get());
+	logger.AfterDispatch(msg.get());
+	logger.Log(msg.get(), UNI_L("some action"));
+	verify(fileMock->writeCalls == 1); // There were no write attempts after the failed one.
+}
+
+test("Dispatch started log")
+{
+	OpSharedPtr<OpLogFormatterMock> logFormatterMock = make_shared<OpLogFormatterMock>();
+	OpSharedPtr<OpFileMock> fileMock = make_shared<OpFileMock>();
+	OpFileMessageLogger logger(fileMock, logFormatterMock);
+
+	initialFileWrite(fileMock);
+
+	OpSharedPtr<OpTypedMessage> msg = make_shared<OpTypedMessageFake>();
+
+	logger.BeforeDispatch(msg.get());
+
+	checkMessageSent(fileMock, 1, "FormatStartedDispatching result OpTypedMessageFake");
+
+	verify(logger.IsAbleToLog());
+}
+
+test("Dispatch finished log")
+{
+	OpSharedPtr<OpLogFormatterMock> logFormatterMock = make_shared<OpLogFormatterMock>();
+	OpSharedPtr<OpFileMock> fileMock = make_shared<OpFileMock>();
+	OpFileMessageLogger logger(fileMock, logFormatterMock);
+
+	initialFileWrite(fileMock);
+
+	OpSharedPtr<OpTypedMessage> msg = make_shared<OpTypedMessageFake>();
+
+	logger.AfterDispatch(msg.get());
+
+	checkMessageSent(fileMock, 1, "FormatFinishedDispatching result OpTypedMessageFake");
+
+	verify(logger.IsAbleToLog());
+}
+
+test("Action log")
+{
+	OpSharedPtr<OpLogFormatterMock> logFormatterMock = make_shared<OpLogFormatterMock>();
+	OpSharedPtr<OpFileMock> fileMock = make_shared<OpFileMock>();
+	OpFileMessageLogger logger(fileMock, logFormatterMock);
+
+	initialFileWrite(fileMock);
+
+	OpSharedPtr<OpTypedMessage> msg = make_shared<OpTypedMessageFake>();
+
+	logger.Log(msg.get(), UNI_L("an action"));
+
+	checkMessageSent(fileMock, 1, "FormatLog result an action OpTypedMessageFake");
+
+	verify(logger.IsAbleToLog());
+}
+
+test("End log")
+{
+	OpSharedPtr<OpLogFormatterMock> logFormatterMock = make_shared<OpLogFormatterMock>();
+	OpSharedPtr<OpFileMock> fileMock = make_shared<OpFileMock>();
+	{
+		OpFileMessageLogger logger(fileMock, logFormatterMock);
+
+		initialFileWrite(fileMock);
+		// End log should be done during destruction.
+	}
+
+	checkMessageSent(fileMock, 1, "FormatEndLogging result");
+}

@@ -1,0 +1,395 @@
+/* -*- Mode: c++; tab-width: 4; indent-tabs-mode: t; c-basic-offset: 4 -*- */
+
+
+group "autoupdate.autoupdater";
+require init;
+require defined AUTO_UPDATE_SUPPORT;
+
+include "adjunct/autoupdate/selftest/src/ST_autoupdater.h";
+include "adjunct/autoupdate/selftest/src/ST_autoupdatexml.h";
+include "adjunct/autoupdate/selftest/src/ST_additionchecker.h";
+include "adjunct/desktop_pi/DesktopOpSystemInfo.h";
+include "modules/prefs/prefsmanager/collections/pc_ui.h";
+include "adjunct/autoupdate/updatableresource.h";
+include "adjunct/autoupdate/additionchecker.h";
+
+language C++;
+
+global
+{
+    OpStringC g_auto_update_server;
+    int g_download_all_enabled = 0;
+}
+
+setup
+{
+    OP_NEW_DBG("autoupdate.autoupdater::setup", "Selftest");
+
+	// Save the prefs before we change them, so we can set them back to what they where.
+    g_auto_update_server = g_pcui->GetStringPref(PrefsCollectionUI::AutoUpdateServer);
+    g_download_all_enabled = g_pcui->GetIntegerPref(PrefsCollectionUI::DownloadAllSnapshots);
+
+	// Set the new Server value needed for the selftests.
+    TRAPD(ret_server, g_pcui->WriteStringL(PrefsCollectionUI::AutoUpdateServer, UNI_L("http://autoupdate.is2.oslo.opera.com/")));
+
+    if (OpStatus::IsSuccess(ret_server))
+        OP_DBG(("Setting Autoupdate server to %s during selftestrun.", g_pcui->GetStringPref(PrefsCollectionUI::AutoUpdateServer).CStr()));
+    else
+        OP_DBG(("Warning: Could not set Autoupdate server. Selftests will use %s", g_pcui->GetStringPref(PrefsCollectionUI::AutoUpdateServer).CStr()));
+
+	// Set the new Download all snapshots value needed for the selftests.
+    TRAPD(ret_all, g_pcui->WriteIntegerL(PrefsCollectionUI::DownloadAllSnapshots, 0));
+
+    if (OpStatus::IsSuccess(ret_all))
+        OP_DBG(("Setting download all snapshots to FALSE"));
+    else
+        OP_DBG(("Warning: Could not set the download all snapshots to FALSE. Please do so manually."));
+}
+
+exit
+{
+    OP_NEW_DBG("autoupdate.autoupdater::exit", "Autoupdate");
+
+	// Setting the Server pref back to what it was before we started.
+    TRAPD(ret_server, g_pcui->WriteStringL(PrefsCollectionUI::AutoUpdateServer, g_auto_update_server.CStr()));
+
+    if (OpStatus::IsSuccess(ret_server))
+        OP_DBG(("Resetting autpupdateserver to %s", g_pcui->GetStringPref(PrefsCollectionUI::AutoUpdateServer).CStr()));
+    else
+		OP_DBG(("Warning: Could not reset the Autoupdate server. Please do so manually."));
+
+	// Setting the Download all snapshots pref back to what it was before we started.
+	TRAPD(ret_all, g_pcui->WriteIntegerL(PrefsCollectionUI::DownloadAllSnapshots, g_download_all_enabled));
+
+    if (OpStatus::IsSuccess(ret_all))
+        OP_DBG(("Resetting download all snapshots to %s", g_download_all_enabled ? UNI_L("TRUE") : UNI_L("FALSE")));
+    else
+		OP_DBG(("Warning: Could not reset the download all snapshots setting."));
+}
+
+table OperaVersions(char*, char*, BOOL, int)
+{
+//	Version		Build number	Expects Opera package in XML	Browser JS timestamp for version
+	{ "9.00",	"1000",			TRUE,							1166701931	}
+	{ "9.51",	"1000",			TRUE,							1223363677	}
+	{ "9.52",	"4916",			TRUE,							1225745531	}
+	{ "9.53",	"1000",			TRUE,							0000000000	}
+	{ "9.60",	"1000",			TRUE,							1214421224	}
+	{ "10.00",	"1000",			TRUE,							1220390319	} 
+	{ "10.01",  "1844",         TRUE,                           1262960775  }
+	{ "11.50",  "1009",        FALSE,                           1262960788  }
+}
+
+table SpoofVersions(int, BOOL)
+{
+//	Spoof timestamp		Expect spoof file in XML
+
+	{ 0000000000,		TRUE	}
+	{ 1219600000,		TRUE	}
+	{ 1225709217,		FALSE	}
+	{ 1230000000,		FALSE	}
+}
+
+table BrowserJSTimestamps(int, BOOL)
+{
+//	Browser JS timestamp	Expect browser JS file in XML
+
+	{ 0000000000,			TRUE	}
+	{ 1166701930,			TRUE	}
+	{ 1275745440,			FALSE	}
+	{ 1280000000,			FALSE	}
+}
+
+table HardwareBlocklistTimestamps(int, BOOL)
+{
+//	Hardware blocklist timestamp	Expect hardware blocklist file in XML
+
+	{ 0000000000,			TRUE	}
+	{ 1166701930,			TRUE	}
+	{ 1275745440,			FALSE	}
+	{ 1280000000,			FALSE	}
+}
+
+table AdditionChecks(UpdatableResource::UpdatableResourceType, char*, BOOL)
+{
+	{ UpdatableResource::RTPlugin, "application/x-fake-mimetype", TRUE }
+	{ UpdatableResource::RTPlugin, "application/x-shockwave-flash", TRUE }
+	{ UpdatableResource::RTDictionary, "de", TRUE }
+	{ UpdatableResource::RTDictionary, "fake", FALSE }
+}
+
+test("Server Available") async;
+{
+	ST_AutoUpdater *au = OP_NEW(ST_AutoUpdater, ());
+
+	if (OpStatus::IsSuccess(au->Init()))
+	{
+		if(!OpStatus::IsSuccess(au->Activate()))
+		{
+			ST_failed("Failed to activate AutoUpdater");
+		}
+	}
+	else
+		ST_failed("AutoUpdater Init() failed");
+}
+
+test("Server Opera 9.00 Response") async;
+{
+	ST_AutoUpdater *au = OP_NEW(ST_AutoUpdater, (ST_AutoUpdater::VersionCheck));
+
+	if (OpStatus::IsSuccess(au->Init()))
+	{
+		ST_AutoUpdateXML* st_au_xml = NULL;
+		if (OpStatus::IsSuccess(au->ReplaceAutoUpdateXMLForST(&st_au_xml)))
+		{
+			st_au_xml->SetVersion("9.00");
+			st_au_xml->SetBuildNum("1000");
+
+			au->Activate();
+		}
+		else
+			ST_failed("AutoUpdater Init() failed");
+	}
+}
+
+foreach (version_string, build_number_string, expects_package, browserjs_timestamp_for_version) from OperaVersions
+{
+	test("Opera " version_string " build " build_number_string " Server Response") async;
+	{
+		ST_AutoUpdater *au = OP_NEW(ST_AutoUpdater, (ST_AutoUpdater::VersionCheck));
+
+		if (OpStatus::IsSuccess(au->Init()))
+		{
+			ST_AutoUpdateXML* st_au_xml = NULL;
+			if (OpStatus::IsSuccess(au->ReplaceAutoUpdateXMLForST(&st_au_xml)))
+			{
+				st_au_xml->SetVersion(version_string);
+				st_au_xml->SetBuildNum(build_number_string);
+
+				au->SetExpectPackageInXML(expects_package);
+
+				au->Activate();
+			}
+			else
+			{
+				ST_failed("ST_AutoUpdateXML could not be created or Init() failed");
+			}
+		}
+		else
+		{
+			ST_failed("ST_AutoUpdater Init() failed");
+		}
+	}
+}
+
+test("Download files Opera 9.00") async;
+{
+	ST_AutoUpdater *au = OP_NEW(ST_AutoUpdater, (ST_AutoUpdater::DownloadCheck));
+
+	if (OpStatus::IsSuccess(au->Init()))
+	{
+		ST_AutoUpdateXML* st_au_xml = NULL;
+		if (OpStatus::IsSuccess(au->ReplaceAutoUpdateXMLForST(&st_au_xml)))
+		{
+			st_au_xml->SetVersion("9.00");
+			st_au_xml->SetBuildNum("1000");
+			st_au_xml->SetTimeStamp(AutoUpdateXML::TSI_BrowserJS, 0);
+			st_au_xml->SetTimeStamp(AutoUpdateXML::TSI_OverrideDownloaded, 0);
+
+			au->Activate();
+		}
+		else
+		{
+			ST_failed("ST_AutoUpdateXML could not be created or Init() failed");
+		}
+	}
+	else
+	{
+		ST_failed("AutoUpdater Init() failed");
+	}
+}
+
+foreach (addition_type, addition_key, expecting_addition) from AdditionChecks
+{
+	test("Addition Check: " addition_key) async;
+	{
+		ST_AdditionChecker *addition_checker = OP_NEW(ST_AdditionChecker, ());
+
+		if (OpStatus::IsSuccess(addition_checker->Init()))
+		{
+			addition_checker->CheckForAddition(addition_type, addition_key, expecting_addition);
+		}
+		else
+		{
+			ST_failed("AdditionChecker Init() failed");
+		}
+	}
+}
+
+test("Signature Check") async;
+{
+	ST_AutoUpdater *au = OP_NEW(ST_AutoUpdater, (ST_AutoUpdater::SignatureCheck));
+
+	if (OpStatus::IsSuccess(au->Init()))
+	{
+		ST_AutoUpdateXML* st_au_xml = NULL;
+		if (OpStatus::IsSuccess(au->ReplaceAutoUpdateXMLForST(&st_au_xml)))
+		{
+			st_au_xml->SetVersion("9.00");
+			st_au_xml->SetBuildNum("1000");
+
+			au->Activate();
+		}
+		else
+		{
+			ST_failed("ST_AutoUpdateXML could not be created or Init() failed");
+		}
+	}
+	else
+	{
+		ST_failed("AutoUpdater Init() failed");
+	}
+}
+
+foreach (spoof_timestamp, expects_spoof_file) from SpoofVersions
+{
+	test("Spoof Timestamp $(spoof_timestamp) Check") async;
+	{
+		ST_AutoUpdater *au = OP_NEW(ST_AutoUpdater, (ST_AutoUpdater::SpoofCheck));
+
+		if (OpStatus::IsSuccess(au->Init()))
+		{
+			ST_AutoUpdateXML* st_au_xml = NULL;
+			if (OpStatus::IsSuccess(au->ReplaceAutoUpdateXMLForST(&st_au_xml)))
+			{
+				st_au_xml->SetVersion("9.00");
+				st_au_xml->SetBuildNum("1000");
+				st_au_xml->SetTimeStamp(AutoUpdateXML::TSI_OverrideDownloaded, spoof_timestamp);
+
+				au->SetExpectSpoofInXML(expects_spoof_file);
+
+				au->Activate();
+			}
+			else
+			{
+				ST_failed("ST_AutoUpdateXML could not be created or Init() failed");
+			}
+		}
+		else
+		{
+			ST_failed("AutoUpdater Init() failed");
+		}
+	}
+}
+
+foreach (browserjs_timestamp, expects_browserjs_file) from BrowserJSTimestamps
+{
+	test("Browser JS Timestamp $(browserjs_timestamp) Check") async;
+	{
+		ST_AutoUpdater *au = OP_NEW(ST_AutoUpdater, (ST_AutoUpdater::BrowserJSCheck));
+
+		if (OpStatus::IsSuccess(au->Init()))
+		{
+			ST_AutoUpdateXML* st_au_xml = NULL;
+			if (OpStatus::IsSuccess(au->ReplaceAutoUpdateXMLForST(&st_au_xml)))
+			{
+				st_au_xml->SetVersion("9.00");
+				st_au_xml->SetBuildNum("1000");
+				st_au_xml->SetTimeStamp(AutoUpdateXML::TSI_BrowserJS, browserjs_timestamp);
+
+				au->SetExpectBrowserJSInXML(expects_browserjs_file);
+
+				au->Activate();
+			}
+			else
+			{
+				ST_failed("ST_AutoUpdateXML could not be created or Init() failed");
+			}
+		}
+		else
+		{
+			ST_failed("AutoUpdater Init() failed");
+		}
+	}
+}
+
+foreach (hardware_blocklist_timestamp, expects_hardware_blocklist_file) from HardwareBlocklistTimestamps
+{
+	test("Hardware Blocklist Timestamp $(hardware_blocklist_timestamp) Check") async;
+	{
+		ST_AutoUpdater *au = OP_NEW(ST_AutoUpdater, (ST_AutoUpdater::HardwareBlocklistCheck));
+
+		if (OpStatus::IsSuccess(au->Init()))
+		{
+			ST_AutoUpdateXML* st_au_xml = NULL;
+			if (OpStatus::IsSuccess(au->ReplaceAutoUpdateXMLForST(&st_au_xml)))
+			{
+				st_au_xml->SetVersion("9.00");
+				st_au_xml->SetBuildNum("1000");
+				st_au_xml->SetTimeStamp(AutoUpdateXML::TSI_HardwareBlocklist, hardware_blocklist_timestamp);
+
+				au->SetExpectHardwareBlocklistInXML(expects_hardware_blocklist_file);
+
+				au->Activate();
+			}
+			else
+			{
+				ST_failed("ST_AutoUpdateXML could not be created or Init() failed");
+			}
+		}
+		else
+		{
+			ST_failed("AutoUpdater Init() failed");
+		}
+	}
+}
+
+foreach (version_string, build_number_string, expects_package, browserjs_timestamp_for_version) from OperaVersions
+{
+	foreach (spoof_timestamp, expects_spoof_file) from SpoofVersions
+	{
+		foreach (browserjs_timestamp, expects_browserjs_file) from BrowserJSTimestamps
+		{
+			foreach (hardware_blocklist_timestamp, expects_hardware_blocklist_file) from HardwareBlocklistTimestamps
+			{
+				test("Opera " version_string " spoof=$(spoof_timestamp) bspit=$(browserjs_timestamp) hwblist=$(hardware_blocklist_timestamp) Server Response") async;
+				{
+					ST_AutoUpdater *au = OP_NEW(ST_AutoUpdater, (ST_AutoUpdater::XMLCheck));
+
+					if (OpStatus::IsSuccess(au->Init()))
+					{
+						ST_AutoUpdateXML* st_au_xml = NULL;
+						if (OpStatus::IsSuccess(au->ReplaceAutoUpdateXMLForST(&st_au_xml)))
+						{
+							st_au_xml->SetVersion(version_string);
+							st_au_xml->SetBuildNum(build_number_string);
+							st_au_xml->SetTimeStamp(AutoUpdateXML::TSI_OverrideDownloaded, spoof_timestamp);
+							st_au_xml->SetTimeStamp(AutoUpdateXML::TSI_BrowserJS, browserjs_timestamp);
+							st_au_xml->SetTimeStamp(AutoUpdateXML::TSI_HardwareBlocklist, hardware_blocklist_timestamp);
+
+							au->SetExpectPackageInXML(expects_package);
+							au->SetExpectSpoofInXML(expects_spoof_file);
+							au->SetExpectBrowserJSInXML(browserjs_timestamp < browserjs_timestamp_for_version);
+							au->SetExpectHardwareBlocklistInXML(expects_hardware_blocklist_file);
+						
+							au->AddListener(au);
+
+							if(!OpStatus::IsSuccess(au->Activate()))
+							{
+								ST_failed("Failed to activate AutoUpdater");
+							}
+						}
+						else
+						{
+							ST_failed("ST_AutoUpdateXML could not be created or Init() failed");
+						}
+					}
+					else
+					{
+						ST_failed("AutoUpdater Init() failed");
+					}
+				}
+			}
+		}
+	}
+}

@@ -1,0 +1,551 @@
+/* -*- mode: c++; tab-width: 4; c-basic-offset: 4 -*- */
+
+group "layout.transforms";
+
+include "modules/doc/frm_doc.h";
+include "modules/layout/traverse/traverse.h";
+include "modules/layout/box/box.h";
+include "modules/style/css.h";
+include "modules/style/css_decl.h";
+include "modules/style/css_property_list.h";
+
+require init;
+require CSS_TRANSFORMS;
+
+global
+{
+	CSS_property_list* new_css;
+}
+
+test("AHEM")
+{
+	short font_number = styleManager->GetFontNumber(UNI_L("AHEM"));
+	verify(font_number != -1);
+}
+
+html
+{
+//! <html>
+//!	  <body style="margin: 0">
+//!		<div style="transform: translate(10px, 20px); width: 100px; height: 50px;"></div>
+//!		<div style="transform: rotate(45deg); width: 50px; height: 50px;"></div>
+//!
+//!		<div style="transform: rotate(0deg)">
+//!		 <div style="transform: rotate(45deg); width: 50px; height: 50px;"></div>
+//!		</div>
+//!
+//!		<span style="transform: translate(100px)"><div style="display:inline-block; width: 100px; height: 100px"></div></span>
+//!	  </body>
+//! </html>
+}
+
+// Table item: tag name, tag index, left, top, right, bottom, transform
+table ElementMap(const char *, int, int, int, int, int, const uni_char *)
+{
+	{ "div", 1, 0, 0, 100, 50, UNI_L("translate(10px, 20px)") }
+	{ "div", 2, 0, 0, 50, 50, UNI_L("translate(0, 50px) translate(25px, 25px) rotate(45deg) translate(-25px, -25px)") }
+	{ "div", 4, 0, 0, 50, 50, UNI_L("translate(0, 100px) rotate(0deg) translate(25px, 25px) rotate(45deg) translate(-25px, -25px)") }
+	{ "div", 5, 0, 0, 100, 100, UNI_L("translate(100px, 150px)") }
+}
+
+subtest test_eq(int idx, const AffinePos &af1, const AffinePos &af2)
+{
+	if (!af1.IsEqual(af2, 1e-6f))
+	{
+		output("%d\n", idx);
+	}
+
+	verify(af1.IsEqual(af2, 1e-6f));
+}
+
+test("BoxEdgesObject#1")
+{
+	FramesDocument* doc = state.doc;
+	new_css = NULL;
+	verify(doc != NULL);
+	verify(doc->GetDocRoot() != NULL);
+
+	HLDocProfile *hld_profile = doc->GetHLDocProfile();
+	HTML_Element *root = doc->GetLogicalDocument()->GetRoot();
+
+	iterate (name, n, le, to, ri, bo, ctm) from ElementMap
+	{
+		HTML_Element *div = find_element(name, n);
+
+		BoxEdgesObject box_edges(doc, div, root, BoxEdgesObject::BOUNDING_AREA);
+		box_edges.Traverse(root, NULL, FALSE);
+
+		verify(!box_edges.IsOutOfMemory());
+		verify(box_edges.GetBoxFound());
+
+		RECT a = box_edges.GetBoxEdges();
+
+		verify(a.left == le);
+		verify(a.right == ri);
+		verify(a.top == to);
+		verify(a.bottom == bo);
+
+		OP_STATUS status;
+
+		new_css = CSS::LoadDOMStyleValue(hld_profile, NULL, URL(), CSS_PROPERTY_transform,
+										 ctm, uni_strlen(ctm), status);
+		verify(new_css);
+		verify(new_css->GetLength() == 1);
+
+		CSS_decl *decl = new_css->GetFirstDecl();
+		verify(decl->GetDeclType() == CSS_DECL_TRANSFORM_LIST);
+
+		CSS_transform_list *transform_list = (CSS_transform_list *)decl;
+
+		AffineTransform at;
+		verify(transform_list->GetAffineTransform(at));
+
+		AffinePos ctm1(at);
+		AffinePos ctm2 = box_edges.GetBoxCTM();
+
+		verify(test_eq(__iter__, ctm1, ctm2));
+		new_css->Unref();
+		new_css = NULL;
+	}
+}
+finally
+{
+	if (new_css)
+		new_css->Unref();
+}
+
+
+// Since find_element can't find text nodes, there is a separate test
+// for them.
+
+html
+{
+	//! <html><body style="margin:0px"><div style="transform:translate(10px,10px);font-size:16px;line-height:16px;font-family:'AHEM'">XXXXXXX</div>
+	//! </body></html>
+}
+
+test("BoxEdgesObject#2") require success "AHEM";
+{
+	FramesDocument* doc = state.doc;
+	verify(doc != NULL);
+	verify(doc->GetDocRoot() != NULL);
+
+	HTML_Element *root = doc->GetLogicalDocument()->GetRoot();
+	HTML_Element *text_node = find_element("div", 1)->FirstChild();
+
+	BoxEdgesObject box_edges(doc, text_node, root, BoxEdgesObject::BOUNDING_AREA);
+	box_edges.Traverse(root, NULL, FALSE);
+
+	verify(!box_edges.IsOutOfMemory());
+	verify(box_edges.GetBoxFound());
+
+	RECT a = box_edges.GetBoxEdges();
+
+	verify(a.left == 0);
+	verify(a.right == 112);
+	verify(a.top == 0);
+	verify(a.bottom == 16);
+
+	AffineTransform at;
+	at.LoadTranslate(10,10);
+	AffinePos real_ctm(at);
+
+	verify(real_ctm == at);
+}
+
+html
+{
+//! <style>body{margin:0}</style>
+//! <div style="transform:translate(0px);-moz-transform:translate(0px);-webkit-transform:translate(0px)">
+//!	  <div style="position:relative;left:150px">relative
+//!		<div style="position:fixed;top:0px;width:100px;height:100px;background:yellow">
+//!		  Tests left:auto
+//!		</div>
+//!	  </div>
+//! </div>
+}
+
+test("Box::GetOffsetFromAncestor()")
+{
+	LayoutCoord x(0);
+	LayoutCoord y(0);
+
+	HTML_Element *element = find_element("div", 3);
+	HTML_Element *containing_element = Box::GetContainingElement(element, TRUE, TRUE);
+	verify(containing_element == find_element("div", 1));
+
+	int offset_result = element->GetLayoutBox()->GetOffsetFromAncestor(x, y, containing_element, Box::GETPOS_ABORT_ON_INLINE);
+
+	verify(offset_result == Box::GETPOS_FIXED_FOUND);
+	verify(x == 150);
+	verify(y == 0);
+}
+
+html
+{
+//! <!doctype html>
+//! <html>
+//!	 <style type="text/css">
+//!	   div {
+//!		 overflow: auto;
+//!		 height: 105px;
+//!		 width: 100px;
+//!		 line-height: 10px;
+//!	   }
+//!	   img {
+//!		  transform: translate(0px);
+//!	   }
+//!	 </style>
+//! <body><div><img width="100" height="100" src=""></div>
+//! </body></html>
+}
+test ("scrollHeight zero translation") language ecmascript;
+{
+	var div = document.getElementsByTagName('div')[0];
+	verify(div.scrollHeight == 105);
+}
+
+html
+{
+//! <!doctype html>
+//! <html>
+//!	 <style type="text/css">
+//!	   div {
+//!		 overflow: auto;
+//!		 height: 105px;
+//!		 width: 100px;
+//!		 line-height: 10px;
+//!	   }
+//!	   img {
+//!		  transform: translate(0, 100px);
+//!	   }
+//!	 </style>
+//! <body><div><img width="100" height="100" src=""></div>
+//! </body></html>
+}
+test ("scrollHeight non zero translation") language ecmascript;
+{
+	var div = document.getElementsByTagName('div')[0];
+	verify(div.scrollHeight == 200);
+}
+
+html {
+//! <!DOCTYPE html>
+//! <html>
+//! <head>
+//!    <title>Position of abs. pos. transformed element</title>
+//!    <style type="text/css">
+//!       div {
+//!          background: gray;
+//!          height: 100px;
+//!          width: 100px;
+//!          position: absolute;
+//!          left: 50px;
+//!          top: 150px;
+//!       }
+//!       div + div {
+//!          transform: rotate(0deg);
+//!          opacity: 0;
+//!          left: 200px;
+//!       }
+//!    </style>
+//! </head>
+//! <body>
+//!    <div></div>
+//!    <div></div>
+//! </body>
+//! </html>
+}
+test ("Position of abs. pos. transformed element") language ecmascript;
+{
+	var r = document.getElementsByTagName('div')[1].getBoundingClientRect();
+
+	verify(r.left == 200);
+	verify(r.top == 150);
+	verify(r.right == 300);
+	verify(r.bottom == 250);
+}
+
+html
+{
+//! <!DOCTYPE HTML>
+//! <html>
+//! <head>
+//!    <title>Transform with static position and top/left/bottom/right</title>
+//!    <style type="text/css">
+//!       div {
+//!          top: 50px; left: 200px; right: -200px; bottom: -50px;
+//!          transform: translateY(-100%);
+//!       }
+//!    </style>
+//! </head>
+//! <body style="margin:0">
+//!    <div></div>
+//! </body>
+//! </html>
+}
+test("Transformed block box with static position") language ecmascript;
+{
+	var elm = document.getElementsByTagName('div')[0];
+	var computedStyle = getComputedStyle(elm, null);
+	verify(computedStyle.top == "auto");
+	verify(computedStyle.bottom == "auto");
+	verify(computedStyle.right == "auto");
+	verify(computedStyle.left == "auto");
+	verify(elm.offsetLeft == 0);
+	verify(elm.offsetTop == 0);
+}
+
+html
+{
+//! <!DOCTYPE HTML>
+//! <html>
+//! <head>
+//!    <title>Transform with static position and top/left/bottom/right</title>
+//!    <style type="text/css">
+//!       div {
+//!          float: left;
+//!          top: 50px; left: 200px; right: -200px; bottom: -50px;
+//!          transform: translateY(-100%);
+//!       }
+//!    </style>
+//! </head>
+//! <body style="margin:0">
+//!    <div></div>
+//! </body>
+//! </html>
+}
+test("Transformed floating box with static position") language ecmascript;
+{
+	var elm = document.getElementsByTagName('div')[0];
+	var computedStyle = getComputedStyle(elm, null);
+	verify(computedStyle.top == "auto");
+	verify(computedStyle.bottom == "auto");
+	verify(computedStyle.right == "auto");
+	verify(computedStyle.left == "auto");
+	verify(elm.offsetLeft == 0);
+	verify(elm.offsetTop == 0);
+}
+
+html
+{
+//! <!DOCTYPE HTML>
+//! <html>
+//! <head>
+//!    <title>Transform with static position and top/left/bottom/right</title>
+//!    <style type="text/css">
+//!       span {
+//!          top: 50px; left: 200px; right: -200px; bottom: -50px;
+//!          transform: translateY(-100%);
+//!       }
+//!    </style>
+//! </head>
+//! <body style="margin:0">
+//!    <span>xxx</span>
+//! </body>
+//! </html>
+}
+test("Transformed inline box with static position") language ecmascript;
+{
+    var elm = document.getElementsByTagName('span')[0];
+	var computedStyle = getComputedStyle(elm, null);
+	verify(computedStyle.top == "auto");
+	verify(computedStyle.bottom == "auto");
+	verify(computedStyle.right == "auto");
+	verify(computedStyle.left == "auto");
+	verify(elm.offsetLeft == 0);
+	verify(elm.offsetTop == 0);
+}
+
+html
+{
+//! <!doctype html>
+//! <style>
+//! body { margin: 0px; }
+//! div {
+//!     position: absolute;
+//!     left: 100px; top: 100px; width: 100px; height: 100px;
+//!     transform: rotate(180deg);
+//! }
+//! </style>
+//! <div></div>
+}
+test("Propagated bounding-box of transformed abs.pos box")
+{
+	verify(state.doc);
+	LogicalDocument* logdoc = state.doc->GetLogicalDocument();
+	verify(logdoc);
+	HTML_Element* body = logdoc->GetBodyElm();
+	verify(body);
+	Box* box = body->GetLayoutBox();
+	verify(box);
+
+	AbsoluteBoundingBox bbox;
+	static_cast<Content_Box*>(box)->GetBoundingBox(bbox, TRUE);
+
+	verify(bbox.GetHeight() == 200);
+}
+
+html
+{
+//! <!doctype html>
+//! <style>
+//! body { margin: 0px; }
+//! div {
+//!     float: left;
+//!     width: 100px; height: 100px;
+//!     margin: 100px 0px 0px 100px;
+//!     transform: rotate(180deg);
+//! }
+//! </style>
+//! <div></div>
+}
+test("Propagated bounding-box of transformed float with margin")
+{
+	verify(state.doc);
+	LogicalDocument* logdoc = state.doc->GetLogicalDocument();
+	verify(logdoc);
+	HTML_Element* body = logdoc->GetBodyElm();
+	verify(body);
+	Box* box = body->GetLayoutBox();
+	verify(box);
+
+	AbsoluteBoundingBox bbox;
+	static_cast<Content_Box*>(box)->GetBoundingBox(bbox, TRUE);
+
+	verify(bbox.GetHeight() == 200);
+}
+
+html
+{
+//! <!doctype html>
+//! <style>
+//! body { margin: 0px; }
+//! div > div {
+//!     width: 100px; height: 100px;
+//!     margin: 100px 0px 0px 100px;
+//!     transform: rotate(180deg);
+//! }
+//! </style>
+//! <div style="display:flex;"><div></div></div>
+}
+test("Propagated bounding-box of transformed flex-item with margin")
+{
+	verify(state.doc);
+	LogicalDocument* logdoc = state.doc->GetLogicalDocument();
+	verify(logdoc);
+	HTML_Element* body = logdoc->GetBodyElm();
+	verify(body);
+	Box* box = body->GetLayoutBox();
+	verify(box);
+
+	AbsoluteBoundingBox bbox;
+	static_cast<Content_Box*>(box)->GetBoundingBox(bbox, TRUE);
+
+	verify(bbox.GetHeight() == 200);
+}
+
+html
+{
+//! <!DOCTYPE HTML>
+//! <table style="transform: scale(2); transform-origin: top left"><tr><td>Scaled cell</td></tr></table>
+}
+test("Transformed table")
+{
+	TransformContext *transform_context = find_element("table")->GetLayoutBox()->GetTransformContext();
+
+	AffineTransform cmp_to;
+	cmp_to.LoadScale(2.0, 2.0);
+
+	verify(transform_context);
+	verify(transform_context->GetCurrentTransform().IsEqual(cmp_to, 1e-6f));
+}
+
+html
+{
+//! <!DOCTYPE HTML>
+//! <div style="transform: translate(0%, 100%)">translated text</div>
+}
+test("Transformed block with percentage values")
+{
+	Box *box = find_element("div")->GetLayoutBox();
+	TransformContext *transform_context = box->GetTransformContext();
+
+	AffineTransform cmp_to;
+	cmp_to.LoadTranslate(0, float(box->GetHeight()));
+
+	verify(transform_context);
+	verify(transform_context->GetCurrentTransform().IsEqual(cmp_to, 1e-6f));
+}
+
+html
+{
+//! <!DOCTYPE HTML>
+//! <table style="transform: translate(0%, 100%)"><tr><td>Scaled cell</td></tr></table>
+}
+test("Transformed table with percentage values")
+{
+	Box *box = find_element("table")->GetLayoutBox();
+	TransformContext *transform_context = box->GetTransformContext();
+
+	AffineTransform cmp_to;
+	cmp_to.LoadTranslate(0, float(box->GetHeight()));
+
+	verify(transform_context);
+	verify(transform_context->GetCurrentTransform().IsEqual(cmp_to, 1e-6f));
+}
+
+html
+{
+//! <!DOCTYPE HTML>
+//! <input style="display:block; transform: translate(10px)"></input>
+}
+test("Transformed replaced content with display:block")
+{
+	Box *box = find_element("input")->GetLayoutBox();
+	TransformContext *transform_context = box->GetTransformContext();
+
+	AffineTransform cmp_to;
+	cmp_to.LoadTranslate(10, 0);
+
+	verify(transform_context);
+	verify(transform_context->GetCurrentTransform().IsEqual(cmp_to, 1e-6f));
+}
+
+html
+{
+//! <!DOCTYPE html>
+//! <style>
+//!      body {
+//!         margin: 8px;
+//!      }
+//!      #outer {
+//!         display: inline-block;
+//!         width: 100px;
+//!         height: 100px;
+//!      }
+//!      #inner {
+//!         position: absolute;
+//!         top: 40px;
+//!         left: 40px;
+//!         transform: translate(100px);
+//!      }
+//!   </style>
+//!</head>
+//!<body>
+//!   <div id="outer">
+//!      <div id="inner"></div>
+//!      <span></span>
+//!   </div>
+//!</body>
+//!</html>
+}
+test("getBoundingClientRect with pos., transformed child") language ecmascript;
+{
+	var bounds = document.getElementById('outer').getBoundingClientRect();
+	var passed = (bounds.top == 8 && bounds.right == 108
+				  && bounds.bottom == 108 && bounds.left == 8
+				  && bounds.width == 100 && bounds.height == 100);
+	verify(passed);
+}
+

@@ -1,0 +1,234 @@
+/* -*- Mode: c++; tab-width: 4; indent-tabs-mode: t; c-basic-offset: 4; c-file-style:"stroustrup" -*-
+**
+** Copyright (C) 1995-2000 Opera Software AS.  All rights reserved.
+**
+** This file is part of the Opera web browser.  It may not be distributed
+** under any circumstances.
+*/
+
+#if defined(USE_DEBUGGING_OP_STATUS)
+#include "modules/util/excepts.h"
+#include <stdio.h>
+#ifdef STACK_TRACE_SUPPORT
+#  include "modules/memtools/stacktrace.h"
+#endif
+
+
+inline
+OP_STATUS::OP_STATUS()
+	: m_value(OpStatus::OK),
+	  m_status(UNDEFINED)
+{
+#ifdef STACK_TRACE_SUPPORT
+	store_stack_trace(m_construct_addrs, STACK_LEVELS);
+#endif
+#ifdef PARTIAL_LTH_MALLOC
+	BOOL in_non_oom_code();
+	created_in_non_oom_code = in_non_oom_code();
+#endif
+}
+
+// The default state is CHECKED if the value is OK.  This is not quite right,
+// but it solves an ugly problem with code that creates a status variable,
+// initializes it to OK, and then assigns another value to it: we get an
+// error because the old value was never checked at all. 
+//
+// The problem with setting the state to CHECKED if it is assigned OK is
+// of course that in those cases a status variable is initialized by an
+// expression that returns a status value, expressions that return OK will
+// not trigger errors in test runs.
+//
+// It's not totally clear that this can be fixed without restrictions on
+// how values are initialized, in which case interchange with int becomes
+// more problematic.
+
+inline
+OP_STATUS::OP_STATUS(OpStatus::ErrorEnum value)
+	: m_value(value),
+	  m_status(UNCHECKED)
+{
+	// Disabled while we're investigating other options.
+	// if (value == 0) m_status = CHECKED;
+#ifdef STACK_TRACE_SUPPORT
+	store_stack_trace(m_construct_addrs, STACK_LEVELS, 1);
+#endif
+#ifdef PARTIAL_LTH_MALLOC
+	BOOL in_non_oom_code();
+	created_in_non_oom_code = in_non_oom_code();
+#endif
+}
+
+template<class T> inline
+OP_STATUS::OP_STATUS(const T& status)
+	: m_value((OpStatus::ErrorEnum)status),
+	m_status(UNCHECKED)
+{
+	// Disabled while we're investigating other options.
+	// if (value == 0) m_status = CHECKED;
+#ifdef STACK_TRACE_SUPPORT
+	store_stack_trace(m_construct_addrs, STACK_LEVELS, 1);
+#endif
+#ifdef PARTIAL_LTH_MALLOC
+	BOOL in_non_oom_code();
+	created_in_non_oom_code = in_non_oom_code();
+#endif
+}
+
+inline void
+OP_STATUS::SetChecked() const
+{
+	OP_STATUS& s = const_cast<OP_STATUS&>(*this);
+	s.m_status = CHECKED;
+}
+
+inline
+OP_STATUS::OP_STATUS(const OP_STATUS_ARG status)
+	: m_value(status.m_value),
+	  m_status(UNCHECKED)
+{
+#ifdef STACK_TRACE_SUPPORT
+	for (int i = 0; i < STACK_LEVELS; i++)
+		m_construct_addrs[i] =  status.m_construct_addrs[i];
+#endif
+#ifdef PARTIAL_LTH_MALLOC
+	created_in_non_oom_code = status.created_in_non_oom_code;
+#endif
+	status.SetChecked();
+}
+
+#ifndef HAVE_LTH_MALLOC
+// Not inline if we use HappyMalloc, in order to record problem sites reliably.
+inline
+OP_STATUS::~OP_STATUS()
+{
+	if (m_status == UNCHECKED)
+		IgnoredOpStatus();
+}
+#endif
+
+inline const OP_STATUS&
+OP_STATUS::operator=(const OP_STATUS_ARG status)
+{
+	if (m_status == UNCHECKED)
+		IgnoredOpStatus(); // Replacing unchecked value with new value!
+	m_value = status.m_value;
+	m_status = status.m_status;
+	status.SetChecked();
+	return *this;
+}
+
+inline BOOL
+OP_STATUS::operator<(const OP_STATUS_ARG status) const
+{
+	if (m_status == UNDEFINED)
+		UndefinedOpStatus();
+	SetChecked();
+	return m_value < status.m_value;
+}
+
+inline BOOL
+OP_STATUS::operator<=(const OP_STATUS_ARG status) const
+{
+	if (m_status == UNDEFINED)
+		UndefinedOpStatus();
+	SetChecked();
+	return m_value <= status.m_value;
+}
+
+inline BOOL
+OP_STATUS::operator>(const OP_STATUS_ARG status) const
+{
+	if (m_status == UNDEFINED)
+		UndefinedOpStatus();
+	SetChecked();
+	return m_value > status.m_value;
+}
+
+
+inline BOOL
+OP_STATUS::operator>=(const OP_STATUS_ARG status) const
+{
+	if (m_status == UNDEFINED)
+		UndefinedOpStatus();
+	SetChecked();
+	return m_value >= status.m_value;
+}
+
+inline BOOL
+OP_STATUS::operator==(const OP_STATUS_ARG status) const
+{
+	if (m_status == UNDEFINED)
+		UndefinedOpStatus();
+	SetChecked();
+	return m_value == status.m_value;
+}
+
+inline BOOL
+OP_STATUS::operator!=(const OP_STATUS_ARG status) const
+{
+	return !(*this == status);
+}
+
+#endif // USE_DEBUGGING_OP_STATUS
+
+op_force_inline BOOL
+OpStatus::IsSuccess(const OP_STATUS_ARG status)
+{
+	return (status >= 0);
+}
+
+op_force_inline BOOL
+OpStatus::IsError(const OP_STATUS_ARG status)
+{
+	return (status < 0);
+}
+
+op_force_inline BOOL
+OpStatus::IsRaisable(const OP_STATUS_ARG status)
+{
+	return (status == OpStatus::ERR_NO_MEMORY) 
+	|| (status == OpStatus::ERR_SOFT_NO_MEMORY)
+	|| (status == OpStatus::ERR_NO_DISK) ;
+}
+
+op_force_inline BOOL
+OpStatus::IsFatal(const OP_STATUS_ARG status)
+{
+	return status == OpStatus::ERR_NO_MEMORY;
+}
+
+op_force_inline BOOL
+OpStatus::IsMemoryError(const OP_STATUS_ARG status)
+{
+	return status == OpStatus::ERR_NO_MEMORY;
+}
+
+op_force_inline BOOL
+OpStatus::IsDiskError(const OP_STATUS_ARG status)
+{
+	return status == OpStatus::ERR_NO_DISK
+        || status == OpStatus::ERR_NO_ACCESS
+        || status == OpStatus::ERR_FILE_NOT_FOUND;
+}
+
+/**
+ * This is occasionally useful when we're using the class
+ * implementation of OP_STATUS: it allows an OpStatus to be
+ * ignored in those cases where an operation can't fail.  Use
+ * sparingly.  Any compiler worth anything should optimize this
+ * into nothing when OP_STATUS is an int.
+ */
+op_force_inline void OpStatus::Ignore(const OP_STATUS_ARG status)
+{
+	if (status == 0)
+		(void)(0);
+}
+
+op_force_inline int OpStatus::GetIntValue(const OP_STATUS_ARG status)
+{
+#ifdef USE_DEBUGGING_OP_STATUS
+	return status.GetValue();
+#else // USE_DEBUGGING_OP_STATUS
+	return status;
+#endif // USE_DEBUGGING_OP_STATUS
+}

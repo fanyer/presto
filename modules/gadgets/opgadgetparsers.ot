@@ -1,0 +1,663 @@
+/* -*- Mode: c++; tab-width: 4; indent-tabs-mode: t; c-basic-offset: 4 -*-
+**
+** Copyright (C) 2006-2010 Opera Software ASA.  All rights reserved.
+**
+** This file is part of the Opera web browser.  It may not be distributed
+** under any circumstances.
+**
+** Wojciech Maslowski
+** wmaslowski@opera.com
+*/
+
+group "gadgets.gadgetparsers";
+require init;
+require OPERA_URL_SUPPORT;
+require GADGET_SUPPORT;
+
+include "modules/util/opstring.h";
+
+include "modules/gadgets/OpGadgetManager.h";
+include "modules/gadgets/OpGadgetClass.h";
+include "modules/gadgets/OpGadgetManager.h";
+include "modules/gadgets/OpGadgetParsers.h";
+include "modules/pi/OpBitmap.h";
+include "modules/xmlutils/xmlfragment.h";
+include "modules/console/opconsoleengine.h";
+include "modules/hardcore/timer/optimer.h";
+
+global
+{
+	OpGadgetClass* g_gadget_class;
+	OpString g_last_error_reason;
+
+
+#ifdef OPERA_CONSOLE
+	class ConsoleListener :public OpConsoleListener, public OpTimerListener
+	{
+	public:
+		ConsoleListener()
+		{
+			m_timer.SetTimerListener(this);
+		}
+
+		virtual OP_STATUS NewConsoleMessage(unsigned int id, const OpConsoleEngine::Message *message)
+		{
+			if (message->source == OpConsoleEngine::Gadget && !m_expected_message.IsEmpty())
+			{
+				 m_timer.Stop();
+				if (m_expected_message.Compare(message->message) != 0)
+				{
+					OpString err_msg;
+					OpStatus::Ignore(err_msg.AppendFormat(UNI_L("EXPECTED : %s \n GOT       : %s"), m_expected_message.CStr(), message->message.CStr()));
+					OpString8 err_msg8;
+					OpStatus::Ignore(err_msg8.SetUTF8FromUTF16(err_msg.CStr()));
+					ST_failed(err_msg8.CStr());
+				}
+
+				else
+					ST_passed();
+				m_expected_message.Empty();
+			}
+			return OpStatus::OK;
+		}
+		virtual void OnTimeOut(OpTimer* timer)
+		{
+			ST_failed("timeout");
+		}
+
+		OP_STATUS ExpectMessage(const uni_char* expected)
+		{
+			RETURN_IF_ERROR(m_expected_message.Set(expected));
+			m_timer.Start(1000);
+			return OpStatus::OK;
+		}
+		OpString m_expected_message;
+		OpTimer m_timer;
+
+	};
+	ConsoleListener * g_listener;
+#endif // OPERA_CONSOLE
+
+	OP_GADGET_STATUS ParseGadgetConfig(const uni_char* format, ...)
+	{
+		g_gadget_class->Clear();
+		g_gadget_parsers->CleanParserElements();
+		g_last_error_reason.Empty();
+		XMLFragment f;
+		f.SetDefaultWhitespaceHandling(XMLWHITESPACEHANDLING_PRESERVE);
+		OpString xml;
+		va_list args;
+		va_start(args, format);
+		RETURN_IF_ERROR(xml.AppendVFormat(format, args));
+		va_end(args);
+		RETURN_IF_ERROR(f.Parse(xml.CStr()));
+
+		return g_gadget_parsers->ProcessTopLevelElement(g_gadget_class, &f, g_last_error_reason);
+	}
+}
+
+setup
+{
+	g_gadget_class = NULL;
+#ifdef OPERA_CONSOLE
+	g_listener = NULL;
+#endif // OPERA_CONSOLE
+
+}
+
+exit
+{
+	OP_DELETE(g_gadget_class);
+#ifdef OPERA_CONSOLE
+	g_console->UnregisterConsoleListener(g_listener);
+	OP_DELETE(g_listener);
+#endif // OPERA_CONSOLE
+}
+
+table dummy1(const char *) filelist "testfiles/widgets/parser_test_widget.wgt" recursively;
+
+test("Init")
+	file uni wgt_file "testfiles/widgets/parser_test_widget.wgt";
+{
+	g_gadget_class = OP_NEW(OpGadgetClass, ());
+	verify_not_oom(g_gadget_class);
+	verify_success(g_gadget_class->Construct(wgt_file, URL_GADGET_INSTALL_CONTENT));
+}
+
+test("Init console")
+	require OPERA_CONSOLE;
+{
+	g_listener = OP_NEW(ConsoleListener, ());
+	verify_not_oom(g_listener);
+	g_console->RegisterConsoleListener(g_listener);
+}
+
+// Synthetic single element parsers
+test("Test Process <widget> Tag (W3C)")
+	require success "Init";
+{
+	verify_success(ParseGadgetConfig(UNI_L("<widget xmlns='http://www.w3.org/ns/widgets' id='http://example.org/exampleWidget' href='http://example.org/exampleWidgetHomePage' version='2.0 Beta' height='342' width='678' viewmodes='windowed floating'/>")));
+
+	verify(g_gadget_class->SupportsNamespace(GADGETNS_W3C_1_0));
+	verify_string(g_gadget_class->GetAttribute(WIDGET_ATTR_ID), UNI_L("http://example.org/exampleWidget"));
+	verify_string(g_gadget_class->GetAttribute(WIDGET_ATTR_VERSION), UNI_L("2.0 Beta"));
+	verify_string(g_gadget_class->GetAttribute(WIDGET_HOME_PAGE), UNI_L("http://example.org/exampleWidgetHomePage"));
+	verify(g_gadget_class->GetAttribute(WIDGET_ATTR_HEIGHT) == 342);
+	verify(g_gadget_class->GetAttribute(WIDGET_ATTR_WIDTH) == 678);
+	verify(g_gadget_class->GetAttribute(WIDGET_ATTR_MODE) == (WINDOW_VIEW_MODE_WINDOWED | WINDOW_VIEW_MODE_FLOATING));
+	verify(g_gadget_class->GetAttribute(WIDGET_ATTR_DEFAULT_MODE) == WINDOW_VIEW_MODE_WINDOWED);
+	verify(g_gadget_class->GetAttribute(WIDGET_ACCESS_ATTR_NETWORK) == (GADGET_NETWORK_PRIVATE | GADGET_NETWORK_PUBLIC)); // implicit for W3C widgets
+
+}
+
+test("Test Process <description> Tag (W3C)")
+	require success "Init";
+{
+	verify_success(ParseGadgetConfig(UNI_L("<widget xmlns='http://www.w3.org/ns/widgets'><description>A medium rare steak.</description></widget>")));
+
+	verify_string(g_gadget_class->GetAttribute(WIDGET_DESCRIPTION_TEXT), UNI_L("A medium rare steak."));
+}
+
+test("Test Process <name> Tag (W3C)")
+	require success "Init";
+{
+	verify_success(ParseGadgetConfig(UNI_L("<widget xmlns='http://www.w3.org/ns/widgets'><name short='Rodeo drive'>Rodeo drive - A steak house in Wroclaw.</name></widget>")));
+
+	verify_string(g_gadget_class->GetAttribute(WIDGET_NAME_TEXT), UNI_L("Rodeo drive - A steak house in Wroclaw."));
+	verify_string(g_gadget_class->GetAttribute(WIDGET_NAME_SHORT), UNI_L("Rodeo drive"));
+}
+
+test("Test Process <license> Tag (W3C)")
+	require success "Init";
+{
+	verify_success(ParseGadgetConfig(UNI_L("<widget xmlns='http://www.w3.org/ns/widgets'><license href='http://licenses.org/license.html'>Blah blah blah</license></widget>")));
+
+	verify_string(g_gadget_class->GetAttribute(WIDGET_LICENSE_TEXT), UNI_L("Blah blah blah"));
+	verify_string(g_gadget_class->GetAttribute(WIDGET_LICENSE_ATTR_HREF), UNI_L("http://licenses.org/license.html"));
+}
+
+
+test("Test Process <icon> Tag (W3C)")
+	require success "Init";
+{
+	verify_success(ParseGadgetConfig(UNI_L("<widget xmlns='http://www.w3.org/ns/widgets'><icon src='icon.png' width='44' height='46' /></widget>")));
+
+	OpString icon_path;
+	INT32 width, height;
+	verify_success(g_gadget_class->GetGadgetIcon(0, icon_path, width, height, FALSE));
+
+	verify_string(icon_path.CStr(), PATHSEP"icon.png");
+	verify(width == 44);
+	verify(height == 46);
+}
+
+test("Test Process <preference> Tag (W3C)")
+	require success "Init";
+{
+	verify_success(ParseGadgetConfig(UNI_L("<widget xmlns='http://www.w3.org/ns/widgets'><preference name='skin' value='alien' readonly='no'/></widget>")));
+
+	verify(g_gadget_class->HasPreference(UNI_L("skin")));
+	OpGadgetPreference* pref = g_gadget_class->GetFirstPref();
+	verify(pref);
+	verify_string(pref->Name(), UNI_L("skin"));
+	verify_string(pref->Value(), UNI_L("alien"));
+	verify(pref->IsReadOnly() == FALSE);
+}
+
+test("Test Process <author> Tag (W3C)")
+	require success "Init";
+{
+	verify_success(ParseGadgetConfig(UNI_L("<widget xmlns='http://www.w3.org/ns/widgets'><author href='http://alice.com' email='alice@opera.com'>Alice</author></widget>")));
+
+	verify_string(g_gadget_class->GetAttribute(WIDGET_AUTHOR_ATTR_HREF), UNI_L("http://alice.com"));
+	verify_string(g_gadget_class->GetAttribute(WIDGET_AUTHOR_ATTR_EMAIL), UNI_L("alice@opera.com"));
+	verify_string(g_gadget_class->GetAttribute(WIDGET_AUTHOR_TEXT), UNI_L("Alice"));
+}
+
+test("Test Process <feature> Tag (W3C)")
+	require success "Init";
+{
+	verify_success(ParseGadgetConfig(UNI_L("<widget xmlns='http://www.w3.org/ns/widgets'><feature name='feature:a9bb79c1'/></widget>")));
+	verify(g_gadget_class->IsFeatureRequested("feature:a9bb79c1"));
+	verify(g_gadget_class->IsFeatureRequired("feature:a9bb79c1"));
+}
+
+test("Test Process <content> Tag (W3C)")
+	require success "Init";
+{
+	verify_success(ParseGadgetConfig(UNI_L("<widget xmlns='http://www.w3.org/ns/widgets'><content src='src/main.html' type='text/html' encoding='utf-8'/></widget>")));
+
+	verify_string(g_gadget_class->GetAttribute(WIDGET_CONTENT_ATTR_SRC), UNI_L("src/main.html"));
+	verify_string(g_gadget_class->GetAttribute(WIDGET_CONTENT_ATTR_TYPE), UNI_L("text/html"));
+	verify_string(g_gadget_class->GetAttribute(WIDGET_CONTENT_ATTR_CHARSET), UNI_L("utf-8"));
+}
+
+// TODO: selftest for <param> && <access>
+
+
+
+// Selftests for JIL widget parsing
+test("Test Process <widget> Tag (JIL 1.1)")
+	require success "Init";
+	require DOM_JIL_API_SUPPORT;
+{
+	verify_success(ParseGadgetConfig(UNI_L("<widget xmlns='http://www.jil.org/ns/widgets' id='http://jil.org/myWidget' version='01.00.Beta' height='153' width='101' />")));
+
+	verify(g_gadget_class->SupportsNamespace(GADGETNS_JIL_1_0));
+	verify_string(g_gadget_class->GetAttribute(WIDGET_ATTR_ID), UNI_L("http://jil.org/myWidget"));
+	verify_string(g_gadget_class->GetAttribute(WIDGET_ATTR_VERSION), UNI_L("01.00.Beta"));
+	verify(g_gadget_class->GetAttribute(WIDGET_ATTR_HEIGHT) == 153);
+	verify(g_gadget_class->GetAttribute(WIDGET_ATTR_WIDTH) == 101);
+	verify(g_gadget_class->GetAttribute(WIDGET_ACCESS_ATTR_NETWORK) == 0); // implicit for JIL widgets
+}
+
+test("Test Process <description> Tag (JIL)")
+	require success "Init";
+	require DOM_JIL_API_SUPPORT;
+{
+	verify_success(ParseGadgetConfig(UNI_L("<widget xmlns='http://www.jil.org/ns/widgets'><description>A rare steak.</description></widget>")));
+
+	verify_string(g_gadget_class->GetAttribute(WIDGET_DESCRIPTION_TEXT), UNI_L("A rare steak."));
+}
+
+
+test("Test Process <name> Tag (JIL)")
+	require success "Init";
+	require DOM_JIL_API_SUPPORT;
+{
+	verify_success(ParseGadgetConfig(UNI_L("<widget xmlns='http://www.jil.org/ns/widgets'><name>Mexico Bar - Yummy tortillaz</name></widget>")));
+
+	verify_string(g_gadget_class->GetAttribute(WIDGET_NAME_TEXT), UNI_L("Mexico Bar - Yummy tortillaz"));
+}
+
+
+test("Test Process <author> Tag (JIL)")
+	require success "Init";
+	require DOM_JIL_API_SUPPORT;
+{
+	verify_success(ParseGadgetConfig(UNI_L("<widget xmlns='http://www.jil.org/ns/widgets'><author href='http://bob.org' email='bob@opera.com'>Bob</author></widget>")));
+
+	verify_string(g_gadget_class->GetAttribute(WIDGET_AUTHOR_ATTR_HREF), UNI_L("http://bob.org"));
+	verify_string(g_gadget_class->GetAttribute(WIDGET_AUTHOR_ATTR_EMAIL), UNI_L("bob@opera.com"));
+	verify_string(g_gadget_class->GetAttribute(WIDGET_AUTHOR_TEXT), UNI_L("Bob"));
+}
+
+test("Test Process <license> Tag (JIL)")
+	require success "Init";
+	require DOM_JIL_API_SUPPORT;
+{
+	verify_success(ParseGadgetConfig(UNI_L("<widget xmlns='http://www.jil.org/ns/widgets'><license href='http://licenses.org/license2.html'>Blah blah I agree to give you my kidney.</license></widget>")));
+
+	verify_string(g_gadget_class->GetAttribute(WIDGET_LICENSE_TEXT), UNI_L("Blah blah I agree to give you my kidney."));
+	verify_string(g_gadget_class->GetAttribute(WIDGET_LICENSE_ATTR_HREF), UNI_L("http://licenses.org/license2.html"));
+}
+
+test("Test Process <icon> Tag (JIL)")
+	require success "Init";
+	require DOM_JIL_API_SUPPORT;
+{
+
+	verify_success(ParseGadgetConfig(UNI_L("<widget xmlns='http://www.jil.org/ns/widgets'><icon src='icon2.png' width='104' height='22' /></widget>")));
+
+	OpString icon_path;
+	INT32 width, height;
+	verify_success(g_gadget_class->GetGadgetIcon(0, icon_path, width, height, FALSE));
+	verify_string(icon_path.CStr(), PATHSEP"icon2.png");
+	verify(width == 104);
+	verify(height == 22);
+}
+
+test("Test ProcessFeatureTag (JIL)")
+	require success "Init";
+	require DOM_JIL_API_SUPPORT;
+{
+	verify_success(ParseGadgetConfig(UNI_L("<widget xmlns='http://www.jil.org/ns/widgets'><feature name='feature:a9bb79c1' required='false'/></widget>")));
+	verify(g_gadget_class->IsFeatureRequested("feature:a9bb79c1"));
+	verify(!g_gadget_class->IsFeatureRequired("feature:a9bb79c1"));
+}
+
+test("Test Process <content> Tag (JIL)")
+	require success "Init";
+	require DOM_JIL_API_SUPPORT;
+{
+	verify_success(ParseGadgetConfig(UNI_L("<widget xmlns='http://www.jil.org/ns/widgets'><content src='start.xml' type='text/xml' charset='cp-1250'/></widget>")));
+
+	verify_string(g_gadget_class->GetAttribute(WIDGET_CONTENT_ATTR_SRC), UNI_L("start.xml"));
+	verify_string(g_gadget_class->GetAttribute(WIDGET_CONTENT_ATTR_TYPE), UNI_L("text/xml"));
+	verify_string(g_gadget_class->GetAttribute(WIDGET_CONTENT_ATTR_CHARSET), UNI_L("cp-1250"));
+}
+
+test("Test Process <billing> Tag (JIL)")
+	require success "Init";
+	require DOM_JIL_API_SUPPORT;
+{
+	verify_success(ParseGadgetConfig(UNI_L("<widget xmlns='http://www.jil.org/ns/widgets'><billing required='true'/></widget>")));
+
+	verify(g_gadget_class->GetAttribute(WIDGET_JIL_ATTR_BILLING) == TRUE);
+}
+
+test("Test Process <maximum_display_mode> Tag (JIL)")
+	require success "Init";
+	require DOM_JIL_API_SUPPORT;
+{
+	verify_success(ParseGadgetConfig(UNI_L("<widget xmlns='http://www.jil.org/ns/widgets'><maximum_display_mode height='351' width='332'/></widget>")));
+
+	verify(g_gadget_class->GetAttribute(WIDGET_JIL_ATTR_MAXIMUM_HEIGHT) == 351);
+	verify(g_gadget_class->GetAttribute(WIDGET_JIL_ATTR_MAXIMUM_WIDTH) == 332);
+}
+
+test("Test Process <access> Tag (JIL)")
+	require success "Init";
+	require DOM_JIL_API_SUPPORT;
+{
+	verify_success(ParseGadgetConfig(UNI_L("<widget xmlns='http://www.jil.org/ns/widgets'><access network='true' localfs='true' remote_scripts='true'/></widget>")));
+
+	verify(g_gadget_class->GetAttribute(WIDGET_JIL_ATTR_ACCESS_NETWORK) == TRUE);
+	verify(g_gadget_class->GetAttribute(WIDGET_JIL_ACCESS_ATTR_FILESYSTEM) == TRUE);
+	verify(g_gadget_class->GetAttribute(WIDGET_JIL_ACCESS_ATTR_REMOTE_SCRIPTS) == TRUE);
+}
+
+test("Test Process <update> Tag (JIL)")
+	require success "Init";
+	require DOM_JIL_API_SUPPORT;
+{
+	verify_success(ParseGadgetConfig(UNI_L("<widget xmlns='http://www.jil.org/ns/widgets'><update href='http://test.org/333' period='1'/></widget>")));
+
+	verify_string(g_gadget_class->GetAttribute(WIDGET_UPDATE_ATTR_URI), UNI_L("http://test.org/333"));
+	verify(g_gadget_class->GetAttribute(WIDGET_UPDATE_ATTR_JIL_PERIOD) == TRUE);
+}
+
+
+// Selftest for Opera widget parsing
+test("Test Process <widget> Tag (Opera)")
+	require success "Init";
+{
+	verify_success(ParseGadgetConfig(UNI_L("<widget defaultmode='widget' dockable='true' transparent='true' network='private'/>")));
+
+	verify(g_gadget_class->SupportsNamespace(GADGETNS_OPERA));
+	verify(g_gadget_class->GetAttribute(WIDGET_ATTR_DEFAULT_MODE) == WINDOW_VIEW_MODE_WIDGET);
+	verify(g_gadget_class->GetAttribute(WIDGET_ATTR_TRANSPARENT) == TRUE);
+	verify(g_gadget_class->GetAttribute(WIDGET_ATTR_DOCKABLE) == TRUE);
+	verify(g_gadget_class->GetAttribute(WIDGET_ACCESS_ATTR_NETWORK) == GADGET_NETWORK_PRIVATE); // implicit for W3C widgets
+}
+
+// testing proper handling of attrs value
+table attributes_handling_opera_widget_tag
+{
+	//         attr             , value      , xml attribute
+//	{ WIDGET_ATTR_TRANSPARENT   , TRUE  , UNI_L("transparent='transparent'") }, // in the spec but not really implemented
+	{ WIDGET_ATTR_TRANSPARENT   , TRUE  , UNI_L("transparent='true'") },
+	{ WIDGET_ATTR_TRANSPARENT   , TRUE  , UNI_L("transparent='yes'") },
+	{ WIDGET_ATTR_TRANSPARENT   , FALSE , UNI_L("transparent='no'") },
+	{ WIDGET_ATTR_TRANSPARENT   , FALSE , UNI_L("transparent='false'") },
+	{ WIDGET_ATTR_TRANSPARENT   , FALSE , UNI_L("transparent='sausage'") },
+	{ WIDGET_ATTR_TRANSPARENT   , FALSE , UNI_L("transparent=' '") },
+	{ WIDGET_ATTR_TRANSPARENT   , FALSE , UNI_L("") },
+//	{ WIDGET_ATTR_DOCKABLE      , TRUE  , UNI_L("dockable='docked'") }, // in the spec but not really implemented
+	{ WIDGET_ATTR_DOCKABLE      , TRUE  , UNI_L("dockable='true'") },
+	{ WIDGET_ATTR_DOCKABLE      , TRUE  , UNI_L("dockable='yes'") },
+	{ WIDGET_ATTR_DOCKABLE      , FALSE , UNI_L("dockable='no'") },
+	{ WIDGET_ATTR_DOCKABLE      , FALSE , UNI_L("dockable='false'") },
+	{ WIDGET_ATTR_DOCKABLE      , FALSE , UNI_L("dockable='bacon'") },
+	{ WIDGET_ATTR_DOCKABLE      , FALSE , UNI_L("dockable=' '") },
+	{ WIDGET_ATTR_DOCKABLE      , FALSE , UNI_L("") },
+	{ WIDGET_ACCESS_ATTR_NETWORK, GADGET_NETWORK_PRIVATE  , UNI_L("network='private'") },
+	{ WIDGET_ACCESS_ATTR_NETWORK, (GADGET_NETWORK_PRIVATE | GADGET_NETWORK_PUBLIC)  , UNI_L("network='private public'") },
+	{ WIDGET_ACCESS_ATTR_NETWORK, GADGET_NETWORK_PUBLIC  , UNI_L("network='public'") },
+	{ WIDGET_ACCESS_ATTR_NETWORK, (GADGET_NETWORK_PRIVATE | GADGET_NETWORK_PUBLIC)  , UNI_L("network='public private'") },
+//	{ WIDGET_ACCESS_ATTR_NETWORK, 0  , UNI_L("network='public safety'") }, // going strictly by the spec we should ignore anything except 'private'
+//	{ WIDGET_ACCESS_ATTR_NETWORK, 0  , UNI_L("network='private eye'") },   // 'public' 'private public' 'public private', but we just try to parse whatever we can
+	{ WIDGET_ACCESS_ATTR_NETWORK, 0  , UNI_L("network='ham'") },
+	{ WIDGET_ACCESS_ATTR_NETWORK, 0  , UNI_L("network=''") },
+	{ WIDGET_ACCESS_ATTR_NETWORK, 0  , UNI_L("") },
+	{ WIDGET_ATTR_DEFAULT_MODE, WINDOW_VIEW_MODE_WIDGET  , UNI_L("defaultmode='widget'") },
+	{ WIDGET_ATTR_DEFAULT_MODE, WINDOW_VIEW_MODE_APPLICATION  , UNI_L("defaultmode='application'") },
+	{ WIDGET_ATTR_DEFAULT_MODE, WINDOW_VIEW_MODE_FULLSCREEN  , UNI_L("defaultmode='fullscreen'") },
+	{ WIDGET_ATTR_DEFAULT_MODE, WINDOW_VIEW_MODE_WIDGET  , UNI_L("defaultmode=''") },
+	{ WIDGET_ATTR_DEFAULT_MODE, WINDOW_VIEW_MODE_WIDGET  , UNI_L("") },
+
+}
+
+foreach (attr_name, expected_attr_value, attr_xml) from attributes_handling_opera_widget_tag
+{
+	test("Test Test Process <widget> Tag attributes (Opera)")
+	{
+		verify_success(ParseGadgetConfig(UNI_L("<widget %s />"), attr_xml));
+		verify(g_gadget_class->GetAttribute(attr_name) == expected_attr_value);
+	}
+}
+
+test("Test Process <description> Tag (Opera)")
+	require success "Init";
+{
+
+	verify_success(ParseGadgetConfig(UNI_L("<widget><description>A well done steak.</description></widget>")));
+
+	verify_string(g_gadget_class->GetAttribute(WIDGET_DESCRIPTION_TEXT), UNI_L("A well done steak."));
+}
+
+test("Test Process <widgetname> Tag (Opera)")
+	require success "Init";
+{
+	verify_success(ParseGadgetConfig(UNI_L("<widget ><widgetname>Masala - Indian cusine.</widgetname></widget>")));
+
+	verify_string(g_gadget_class->GetAttribute(WIDGET_NAME_TEXT), UNI_L("Masala - Indian cusine."));
+}
+
+test("Test Process <author> Tag (Opera)")
+	require success "Init";
+{
+	verify_success(ParseGadgetConfig(UNI_L("<widget><author><email>eve@opera.com</email><name>Eve</name><link>http://eve.net</link><organization>Hackers inc.</organization></author></widget>")));
+
+	verify_string(g_gadget_class->GetAttribute(WIDGET_AUTHOR_ATTR_HREF), UNI_L("http://eve.net"));
+	verify_string(g_gadget_class->GetAttribute(WIDGET_AUTHOR_ATTR_EMAIL), UNI_L("eve@opera.com"));
+	verify_string(g_gadget_class->GetAttribute(WIDGET_AUTHOR_TEXT), UNI_L("Eve"));
+	verify_string(g_gadget_class->GetAttribute(WIDGET_AUTHOR_ATTR_ORGANIZATION), UNI_L("Hackers inc."));
+
+}
+
+test("Test Process <icon> Tag (Opera)")
+	require success "Init";
+{
+	verify_success(ParseGadgetConfig(UNI_L("<widget><icon src='' width='11' height='77'>ico.png</icon></widget>")));
+
+	OpString icon_path;
+	INT32 width, height;
+	verify_success(g_gadget_class->GetGadgetIcon(0, icon_path, width, height, FALSE));
+	verify_string(icon_path.CStr(),PATHSEP"ico.png");
+	verify(width == 11);
+	verify(height == 77);
+}
+
+test("Test Process <feature> Tag (Opera)")
+	require success "Init";
+{
+	verify_success(ParseGadgetConfig(UNI_L("<widget><feature name='feature:a9bb79c1' required='true'/></widget>")));
+	verify(g_gadget_class->IsFeatureRequested("feature:a9bb79c1"));
+	verify(g_gadget_class->IsFeatureRequired("feature:a9bb79c1"));
+}
+
+test("Test Process <width> Tag (Opera)")
+	require success "Init";
+{
+	verify_success(ParseGadgetConfig(UNI_L("<widget><width>231</width></widget>")));
+	verify(g_gadget_class->GetAttribute(WIDGET_ATTR_WIDTH) == 231);
+}
+
+test("Test Process <height> Tag (Opera)")
+	require success "Init";
+{
+	verify_success(ParseGadgetConfig(UNI_L("<widget><height>456</height></widget>")));
+	verify(g_gadget_class->GetAttribute(WIDGET_ATTR_HEIGHT) == 456);
+}
+
+test("Test Process <widgetfile> Tag (Opera)")
+	require success "Init";
+{
+	verify_success(ParseGadgetConfig(UNI_L("<widget><widgetfile>opera_start_file.html</widgetfile></widget>")));
+	verify_string(g_gadget_class->GetAttribute(WIDGET_CONTENT_ATTR_SRC), UNI_L("opera_start_file.html"));
+}
+
+test("Test Process <id> Tag (Opera)")
+	require success "Init";
+{
+	verify_success(ParseGadgetConfig(UNI_L("<widget><id><host>somehost.org</host><name>test_wgt</name><revised>1.5.beta</revised></id></widget>")));
+	verify_string(g_gadget_class->GetAttribute(WIDGET_ATTR_ID), UNI_L("http://somehost.org/test_wgt/1.5.beta"));
+}
+// TODO : security element
+
+
+test("Test Ignore unsupported Tag ")
+	require success "Init";
+{
+	verify_success(ParseGadgetConfig(UNI_L("<widget><defintely_not_supported /></widget>")));
+}
+// General TODO: xml:lang handling ,bidi handling, more tests for specific attributes values + defaults
+
+test("Test handling of invalid configuration file no widget element")
+{
+	verify_status(OpGadgetStatus::ERR_WRONG_WIDGET_FORMAT, ParseGadgetConfig(UNI_L("<not_widget />")));
+	verify_string(UNI_L("No valid top level <widget> element found."), g_last_error_reason.CStr());
+}
+
+test("Test handling of invalid configuration file widget element not first")
+{
+	verify_status(OpGadgetStatus::ERR_WRONG_WIDGET_FORMAT, ParseGadgetConfig(UNI_L("<not_widget /><widget xmlns='http://www.w3.org/ns/widgets'> </widget>")));
+	verify_string(UNI_L("No valid top level <widget> element found."), g_last_error_reason.CStr());
+}
+
+// testing proper handling of attrs value
+table bad_configuration_document_element_handling
+{
+		//   widget_namespace       , config_content      , error_message
+	{ "http://bad.namespace.org/widgets"   , ""  ,"No valid top level <widget> element found." },
+	{ "http://www.w3.org/ns/widgets"   , "<feature name='invalid feature IRI' required='true'/>"  ,"Invalid <feature> element - 'name' attribute('invalid feature IRI') is not a valid IRI and required=true" }
+}
+
+foreach (widget_namespace, config_content, error_message) from bad_configuration_document_element_handling
+{
+	test("Test handling of invalid configuration file")
+	{
+		verify_status(OpGadgetStatus::ERR_WRONG_WIDGET_FORMAT, ParseGadgetConfig(UNI_L("<widget xmlns='%s'> %s </widget>"), UNI_L(widget_namespace), UNI_L(config_content)));
+		verify_string(UNI_L(error_message), g_last_error_reason.CStr());
+	}
+}
+
+
+// testing proper handling of attrs value
+table configuration_document_element_warnings
+{
+	//   widget_namespace       , config_content      , warning_message
+	{ "http://www.w3.org/ns/widgets"   , "<unsupported_tag />"  , "Widget loading warning: unsupported element <unsupported_tag> ignored." },
+
+	{ "http://www.w3.org/ns/widgets"   , "<icon />"  , "Widget loading warning: Empty icon path - element ignored." },
+	{ "http://www.w3.org/ns/widgets"   , "<icon src='' />"  , "Widget loading warning: Empty icon path - element ignored." },
+	{ "http://www.w3.org/ns/widgets"   , "<icon src='no_such_icon.png' />"  , "Widget loading warning: Could not load icon file 'no_such_icon.png'." },
+
+	{ "http://www.w3.org/ns/widgets"   , "<access />"  , "Widget loading warning: Empty <access> origin - element ignored." },
+	{ "http://www.w3.org/ns/widgets"   , "<access origin='' />"  , "Widget loading warning: Empty <access> origin - element ignored." },
+
+	{ "http://www.w3.org/ns/widgets"   , "<content />"  , "Widget loading warning: Empty <content> src." },
+	{ "http://www.w3.org/ns/widgets"   , "<content src='' />"  , "Widget loading warning: Empty <content> src." },
+	{ "http://www.w3.org/ns/widgets"   , "<content src='does_not_exist.html' />"  , "Widget loading warning: Start file 'does_not_exist.html' specified but not found in widget." },
+
+	{ "http://www.w3.org/ns/widgets"   , "<feature />"  , "Widget loading warning: ignored <feature> element - empty 'name' attribute." },
+	{ "http://www.w3.org/ns/widgets"   , "<feature name='' />"  , "Widget loading warning: ignored <feature> element - empty 'name' attribute." },
+//	{ "http://www.w3.org/ns/widgets"   , "<feature name='invalid feature IRI' required='false' />"  , "Widget loading warning: ignored <feature> element : ('invalid feature IRI') - 'name' attribute is not a valid IRI." }, // doesnt work we return unsupported feature
+
+	{ "http://www.w3.org/ns/widgets"   , "<feature name='feature:a9bb79c1' ><param /></feature>"  , "Widget loading warning: Feature <param> ignored because it has no 'name' attribute." },
+	{ "http://www.w3.org/ns/widgets"   , "<feature name='feature:a9bb79c1' ><param name=''/></feature>"  , "Widget loading warning: Feature <param> ignored because it has no 'name' attribute." },
+	{ "http://www.w3.org/ns/widgets"   , "<feature name='feature:a9bb79c1' ><param name='' value=''/></feature>"  , "Widget loading warning: Feature <param> ignored because it has no 'name' attribute." },
+	{ "http://www.w3.org/ns/widgets"   , "<feature name='feature:a9bb79c1' ><param name='' value='test'/></feature>"  , "Widget loading warning: Feature <param> ignored because it has no 'name' attribute." },
+	{ "http://www.w3.org/ns/widgets"   , "<feature name='feature:a9bb79c1' ><param name='test'/></feature>"  , "Widget loading warning: Feature <param> ignored because it has no 'value' attribute." },
+	{ "http://www.w3.org/ns/widgets"   , "<feature name='feature:a9bb79c1' ><param value='test'/></feature>"  , "Widget loading warning: Feature <param> ignored because it has no 'name' attribute." },
+	{ "http://www.w3.org/ns/widgets"   , "<feature name='feature:a9bb79c1' ><param name='' value='test'/></feature>"  , "Widget loading warning: Feature <param> ignored because it has no 'name' attribute." },
+	{ "http://www.w3.org/ns/widgets"   , "<feature name='feature:a9bb79c1' ><param name='test' value=''/></feature>"  , "Widget loading warning: Feature <param> ignored because it has no 'value' attribute." },
+
+	{ "http://www.w3.org/ns/widgets"   , "<preference name='' value='' />"  , "Widget loading warning: <preference> element ignored because it has no 'name' attribute." },
+	{ "http://www.w3.org/ns/widgets"   , "<preference value='' />"  , "Widget loading warning: <preference> element ignored because it has no 'name' attribute." },
+	{ "http://www.w3.org/ns/widgets"   , "<preference name='' />"  , "Widget loading warning: <preference> element ignored because it has no 'name' attribute." },
+	{ "http://www.w3.org/ns/widgets"   , "<preference name='' value='a' />"  , "Widget loading warning: <preference> element ignored because it has no 'name' attribute." },
+	{ "http://www.w3.org/ns/widgets"   , "<preference name='a' value='a' /><preference name='a' value='b' />"  , "Widget loading warning: <preference> element ignored because preference with such name was already defined." },
+	{ "http://www.w3.org/ns/widgets"   , "<preference name='a' value='a' /><preference name='c' value='d' /><preference name='a' value='b' />"  , "Widget loading warning: <preference> element ignored because preference with such name was already defined." },
+
+	{ ""   , "<author><not_supported /></author>"  , "Widget loading warning: unsupported element <not_supported> inside <author> element ignored." },
+
+	{ ""   , "<id><host>somehost.org</host><name>test_wgt</name><revised>1.5.beta</revised><unsupported_tag/></id>"  , "Widget loading warning: unsupported element <unsupported_tag> inside <id> element ignored." },
+	{ ""   , "<id><name>test_wgt</name><revised>1.5.beta</revised></id>"  , "Widget loading warning: <id> element not fully defined." },
+	{ ""   , "<id><host>somehost.org</host><revised>1.5.beta</revised></id>"  , "Widget loading warning: <id> element not fully defined." },
+	{ ""   , "<id><host>somehost.org</host><name>test_wgt</name></id>"  , "Widget loading warning: <id> element not fully defined." },
+	// TODO : check all warning condidtions.
+}
+
+foreach (widget_namespace, config_content, warning_message) from configuration_document_element_warnings
+{
+	test("Test handling of warnings for configuration file")
+		require OPERA_CONSOLE;
+		require success "Init console";
+		async;
+	{
+		if (OpStatus::IsError(ParseGadgetConfig(UNI_L("<widget xmlns='%s'> %s </widget>"), UNI_L(widget_namespace), UNI_L(config_content))))
+			ST_failed("Parsing failed");
+		else
+		{
+			g_gadget_class->ValidateIcons();
+			if (OpStatus::IsError(g_listener->ExpectMessage(UNI_L(warning_message))))
+				ST_failed("ExpectMessage failed");
+		}
+	}
+}
+
+test("Test that ignored single occurence tag causes next tags to be ignored")
+	require success "Init";
+{
+	verify_success(ParseGadgetConfig(UNI_L("<widget xmlns='http://www.w3.org/ns/widgets'><content src='' /><content src='src/main.html' type='text/html' encoding='utf-8'/></widget>")));
+
+	verify(g_gadget_class->GetAttribute(WIDGET_CONTENT_ATTR_SRC) == NULL);
+	verify(g_gadget_class->GetAttribute(WIDGET_CONTENT_ATTR_TYPE) == NULL);
+	verify(g_gadget_class->GetAttribute(WIDGET_CONTENT_ATTR_CHARSET) == NULL);
+}
+
+table localization_test_data
+{
+	// runtime_locale  , default_locale  , config_xml_content                                            ,  expected_name
+	{ "en,fr,it"      , NULL             , "<name>default</name>"                                        , "default" },
+	{ "en,fr,it"      , NULL             , "<name xml:lang='en'>en</name>"                               , "en" },
+	{ "en,fr,it"      , NULL             , "<name xml:lang='de'>de</name>"                               , NULL },
+	{ "en,fr,it"      , NULL             , "<name xml:lang='en'>en</name><name>default</name>"           , "en" },
+	{ "en,fr,it"      , NULL             , "<name xml:lang='de'>en</name><name>default</name>"           , "default" },
+	{ "en,fr,it"      , NULL             , "<name xml:lang='en'>en</name><name xml:lang='de'>de</name>"  , "en" },
+	{ "en,fr,it"      , NULL             , "<name xml:lang='en'>en</name><name xml:lang='it'>it</name>"  , "en" },
+	{ "en,fr,it"      , NULL             , "<name xml:lang='it'>it</name><name xml:lang='en'>en</name>"  , "en" },
+	{ "it,en,fr"      , NULL             , "<name xml:lang='en'>en</name><name xml:lang='it'>it</name>"  , "it" },
+	{ "en,fr,it"      , NULL             , "<name xml:lang='en'>1</name><name xml:lang='en'>2</name>"    , "1" },
+	{ "en,fr,it"      , NULL             , "<name>1</name><name>2</name>"                                , "1" },
+
+	{ "en,fr,it"      , UNI_L("en")      , "<name xml:lang='en'>en</name><name xml:lang='it'>it</name>"  , "en" },
+	{ "en,fr,it"      , UNI_L("it")      , "<name xml:lang='en'>en</name><name xml:lang='it'>it</name>"  , "en" },
+	{ "en,fr,it"      , UNI_L("de")      , "<name xml:lang='de'>de</name><name>default</name>"           , "de" },
+	{ "en,fr,it"      , UNI_L("de")      , "<name>default</name><name xml:lang='de'>de</name>"           , "de" },
+	{ "en,fr,it"      , UNI_L("de")      , "<name xml:lang='de'>1</name><name xml:lang='de'>2</name>"    , "1" },
+	{ "en,fr,it"      , UNI_L("de")      , "<name>1</name><name>2</name>"                                , "1" },
+}
+
+foreach (runtime_locale, default_locale, config_xml_content, expected_name) from localization_test_data
+{
+	test("Test l10n basic")
+		require success "Init";
+	{
+		OpString default_locale_attr;
+		if (default_locale)
+			default_locale_attr.AppendFormat(UNI_L("defaultlocale='%s'"), default_locale);
+		else
+			default_locale_attr.Set("");
+		g_gadget_manager->OverrideBrowserLocale(runtime_locale);
+		verify_success(ParseGadgetConfig(UNI_L("<widget xmlns='http://www.w3.org/ns/widgets' %s >%s</widget>"),
+			default_locale_attr.CStr(), UNI_L(config_xml_content)
+			));
+		verify_string(g_gadget_class->GetAttribute(WIDGET_NAME_TEXT), expected_name);
+		g_gadget_manager->SetupBrowserLocale();
+	}
+
+}
+

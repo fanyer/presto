@@ -1,0 +1,1232 @@
+/* -*- mode: c++; tab-width: 4; c-basic-offset: 4; indent-tabs-mode: t; -*- */
+
+group "layout.intersection";
+
+/** IntersectionObject selftest. */
+
+require init;
+
+include "modules/layout/traverse/traverse.h";
+include "modules/layout/content/content.h";
+include "modules/layout/content/scrollable.h";
+include "modules/layout/box/box.h";
+include "modules/dochand/win.h";
+include "modules/pi/OpWindow.h";
+
+global {
+
+	int vsw; // vertical scrollbar width
+	int hsw; // horizontal scrollbar width
+
+	/** Do IntersectionObject traversal at a given point x,y and store the inner_box under box. */
+	BOOL DoIntersection(FramesDocument* doc, int x, int y, Box*& box, BOOL text_boxes = TRUE, OpPoint* box_relative = NULL)
+	{
+		HTML_Element* root = doc->GetLogicalDocument() ? doc->GetLogicalDocument()->GetRoot() : NULL;
+		if (!root)
+			return FALSE;
+
+		IntersectionObject intersection(doc, LayoutCoord(x), LayoutCoord(y), text_boxes);
+
+		if (!OpStatus::IsSuccess(intersection.Traverse(root)))
+			return FALSE;
+		box = intersection.GetInnerBox();
+
+		if (box_relative)
+		{
+			box_relative->x = intersection.GetRelativeX();
+			box_relative->y = intersection.GetRelativeY();
+		}
+
+		return TRUE;
+	}
+
+	/** Do IntersectionObject with EOI traversal at a given point x,y and store the inner_box under box. */
+	BOOL DoIntersectionWithEOI(FramesDocument* doc, int x, int y, Box*& box, int radius = 1)
+	{
+#ifdef NEARBY_ELEMENT_DETECTION
+		HTML_Element* root = doc->GetLogicalDocument() ? doc->GetLogicalDocument()->GetRoot() : NULL;
+		if (!root)
+			return FALSE;
+
+		IntersectionObject intersection(doc, LayoutCoord(x), LayoutCoord(y), TRUE);
+		AutoDeleteHead eoi_list;
+
+		intersection.EnableEoiDetection(&eoi_list, radius);
+
+		if (!OpStatus::IsSuccess(intersection.Traverse(root)))
+			return FALSE;
+
+		box = intersection.GetInnerBox();
+
+		return TRUE;
+#else //!NEARBY_ELEMENT_DETECTION
+		return FALSE;
+#endif //NEARBY_ELEMENT_DETECTION
+	}
+
+	/** Check whether the element elm has the given id or text. */
+	BOOL HasIdOrText(HTML_Element* elm, const char* id_text, BOOL text_box = FALSE)
+	{
+		if (!elm)
+			return FALSE;
+
+		const uni_char* elm_id_text = NULL;
+
+		if (!text_box)
+			elm_id_text = elm->GetId();
+		else if (elm->Type() == Markup::HTE_TEXT)
+			elm_id_text = elm->Content();
+
+		return elm_id_text && uni_strcmp(id_text, elm_id_text) == 0;
+	}
+
+	/** Check whether the element, which created the box has the given id. */
+	BOOL HasIdOrText(Box* box, const char* id_text, BOOL text_box = FALSE)
+	{
+		HTML_Element* elm = box ? box->GetHtmlElement() : NULL;
+
+		return HasIdOrText(elm, id_text, text_box);
+	}
+}
+
+test("PRECONDITION: Window big enough.")
+{
+	OpWindow* op_win = state.GetWindow() ?  state.GetWindow()->GetOpWindow() : NULL;
+	UINT32 w, h;
+
+	verify(op_win);
+	op_win->GetInnerSize(&w, &h);
+
+	/* Magic numbers. Ensure that the tested areas of the documents of the tests that need bigger windows
+	   (than the smartphone standard) are visible within the visual viewport.
+	   Adjust if needed and make the tests depend on that precondition if needed. */
+	verify(w >= 652 && h >= 400);
+}
+
+html
+{
+	//! <!DOCTYPE html>
+	//! <style type="text/css">
+	//!   * { margin: 0; padding: 0; }
+	//!   html, body { height: 100%; width: 100%; }
+	//!   div { left: 0; position: absolute; width: 100px; height: 100px; clip: rect(0px, 100px, 50px, 0px ); }
+	//!   div#x1 { top: 0; }
+	//!   div#x2 { top: 100px; background-color: transparent; }
+	//!   div#x3 { top: 200px; background-color: lime; }
+	//!   div#x4 { top: 300px; background-image: url(.); }
+	//! </style>
+	//! <body id="b">
+	//! <div id="x1"></div>
+	//! <div id="x2"></div>
+	//! <div id="x3"></div>
+	//! <div id="x4"></div>
+	//! <body>
+}
+test ("absolute clip property")
+	require success "PRECONDITION: Window big enough.";
+{
+	FramesDocument* doc = state.doc;
+	verify(doc != NULL);
+	Box* inner_box;
+
+	verify(DoIntersection(doc, 10, 25, inner_box));
+	verify(HasIdOrText(inner_box, "x1"));
+
+	verify(DoIntersection(doc, 10, 75, inner_box));
+	verify(HasIdOrText(inner_box, "b"));
+
+	verify(DoIntersection(doc, 10, 125, inner_box));
+	verify(HasIdOrText(inner_box, "x2"));
+
+	verify(DoIntersection(doc, 10, 175, inner_box));
+	verify(HasIdOrText(inner_box, "b"));
+
+	verify(DoIntersection(doc, 10, 225, inner_box));
+	verify(HasIdOrText(inner_box, "x3"));
+
+	verify(DoIntersection(doc, 10, 275, inner_box));
+	verify(HasIdOrText(inner_box, "b"));
+
+	verify(DoIntersection(doc, 10, 325, inner_box));
+	verify(HasIdOrText(inner_box, "x4"));
+
+	verify(DoIntersection(doc, 10, 375, inner_box));
+	verify(HasIdOrText(inner_box, "b"));
+}
+
+html
+{
+//! <!doctype html>
+//! <html><body style="margin:0">
+//!   <span style="z-index: 1; position: relative">
+//!     <div style="float: left; position: relative">PASS</div>
+//!   </span>
+//! </body></html>
+}
+test("Traverse to floated position relative inside inline zroot")
+{
+	FramesDocument* doc = state.doc;
+	verify(doc != NULL);
+	Box* inner_box;
+
+	verify(DoIntersection(doc, 2, 2, inner_box));
+	verify(HasIdOrText(inner_box, "PASS", TRUE));
+}
+
+html
+{
+//! <!DOCTYPE html>
+//! <body style="margin:0">
+//!  <span style="position:relative; float:left;">
+//!   <span style="left: 300px; position: relative; z-index: 1">PASS</span>
+//!  </span>
+//! </body>
+}
+test("Traverse to positioned inline zroot inside relative positioned float")
+{
+	FramesDocument* doc = state.doc;
+	verify(doc != NULL);
+	Box* inner_box;
+
+	verify(DoIntersection(doc, 302, 2, inner_box));
+	verify(HasIdOrText(inner_box, "PASS", TRUE));
+}
+
+html
+{
+//! <!DOCTYPE html>
+//! <body style="margin:0">
+//!  <span style="position:relative;">
+//!   <div style="position:absolute; left:300px; top:0;">PASS</div>
+//!  </span>
+//! </body>
+}
+test("Traverse to absolute inside relative inline")
+{
+	FramesDocument* doc = state.doc;
+	verify(doc != NULL);
+	Box* inner_box;
+
+	verify(DoIntersection(doc, 302, 2, inner_box));
+	verify(HasIdOrText(inner_box, "PASS", TRUE));
+}
+
+html
+{
+//! <!DOCTYPE html>
+//! <body style="margin:0">
+//!  <span style="position:relative; margin-left:200px;">
+//!   <div style="position:absolute; left:-200px; top:0;">PASS</div>
+//!  </span>
+//! </body>
+}
+test("Traverse to absolute inside relative inline with margin")
+{
+	FramesDocument* doc = state.doc;
+	verify(doc != NULL);
+	Box* inner_box;
+
+	verify(DoIntersection(doc, 2, 2, inner_box));
+	verify(HasIdOrText(inner_box, "PASS", TRUE));
+}
+
+test("PRECONDITION: AHEM")
+{
+	short font_number = styleManager->GetFontNumber(UNI_L("AHEM"));
+	verify(font_number != -1);
+}
+
+html
+{
+//! <!DOCTYPE html>
+//!<html>
+//!<head>
+//!<style>
+//!*
+//!{
+//!	margin:0;padding:0;
+//!	font-family:'AHEM';
+//!}
+//!
+//!#absolute
+//!{
+//!	width:200px;
+//!	height:200px;
+//!	max-height:200px;
+//!	background-color:red;
+//!	border:solid 10px brown;
+//!	position:absolute;
+//!	left:50px;
+//!	top:50px;
+//!	clip: rect(0px, 100px, 100px, 0px);
+//!}
+//!
+//!#normal
+//!{
+//!	width:200px;
+//!	height:200px;
+//!	margin-left:50px;
+//!	margin-top:50px;
+//!	background-color:green;
+//!}
+//!
+//!span
+//!{
+//!	font-size:20px;
+//!}
+//!
+//!</style>
+//!</head>
+//!<body>
+//!
+//!<div id="normal">
+//!<span id="with_text">xxxxx xxxx</span>
+//!</div>
+//!
+//!<div id="absolute">
+//!</div>
+//!
+//!</body>
+//!
+//!</html>
+}
+test("absolute box with clip and border")
+	require success "PRECONDITION: AHEM";
+{
+	FramesDocument* doc = state.doc;
+	verify(doc != NULL);
+	Box* inner_box;
+
+	verify(DoIntersection(doc, 52, 52, inner_box, FALSE));
+	verify(HasIdOrText(inner_box, "absolute"));
+
+	verify(DoIntersection(doc, 70, 62, inner_box, FALSE));
+	verify(HasIdOrText(inner_box, "absolute"));
+
+	verify(DoIntersection(doc, 172, 52, inner_box, FALSE));
+	verify(HasIdOrText(inner_box, "with_text"));
+
+	verify(DoIntersection(doc, 172, 62, inner_box, FALSE));
+	verify(HasIdOrText(inner_box, "with_text"));
+}
+
+html
+{
+//!<!DOCTYPE html>
+//!<style>
+//!body {
+//!	margin: 0;
+//!}
+//!div {
+//!	font-family: 'AHEM';
+//!	position: relative;
+//!	z-index: -1;
+//!}
+//!</style>
+//!<div>
+//!XXXXXXXXXXXXXXXXXXX
+//!</div>
+}
+
+test("'z-index: -1' element is never hit")
+	require success "PRECONDITION: AHEM";
+{
+	FramesDocument* doc = state.doc;
+	verify(doc != NULL);
+	Box* inner_box;
+
+	verify(DoIntersection(doc, 2, 2, inner_box, TRUE));
+	verify(inner_box->GetHtmlElement() && inner_box->GetHtmlElement()->Type() == Markup::HTE_BODY);
+}
+
+html
+{
+//! <!DOCTYPE html>
+//!<html>
+//!<head>
+//!<style>
+//!*
+//!{
+//!	margin:0;padding:0;
+//!	font-family:'AHEM';
+//!	line-height:20px;
+//!}
+//!
+//!#container
+//!{
+//!	width:195px;
+//!	height:100px;
+//!	max-height:200px;
+//!	background-color:red;
+//!	margin-left:50px;
+//!	margin-top:50px;
+//!	border-right: solid 5px;
+//!	overflow:hidden;
+//!}
+//!
+//!#below
+//!{
+//!	width:200px;
+//!	height:100px;
+//!	position:relative;
+//!	left:150px;
+//!	top:-100px;
+//!	z-index:-1;
+//!	background-color:green;
+//!}
+//!
+//!span
+//!{
+//!	font-size:20px;
+//!	vertical-align:top;
+//!}
+//!
+//!#text_above
+//!{
+//!	color:blue;
+//!}
+//!
+//!</style>
+//!</head>
+//!<body style="background-color:yellow;">
+//!
+//!<div id="container">
+//!<br /> <br />
+//!<span id="text_above">xxxxxxxxxxxxx</span>
+//!</div>
+//!
+//!<div id="below">
+//!<br /> <br />
+//!<span id="text_below">xxxxxxxx</span>
+//!</div>
+//!
+//!</body>
+//!
+//!</html>
+}
+test("visibility hidden and border clipping, z_index<0, backg on body")
+	require success "PRECONDITION: AHEM";
+{
+	FramesDocument* doc = state.doc;
+	verify(doc != NULL);
+	Box* inner_box;
+
+	verify(DoIntersection(doc, 244, 95, inner_box, FALSE));
+	verify(HasIdOrText(inner_box, "text_above"));
+
+	verify(DoIntersection(doc, 248, 95, inner_box, FALSE));
+	verify(HasIdOrText(inner_box, "container"));
+
+	verify(DoIntersection(doc, 251, 95, inner_box, TRUE));
+	verify(inner_box->GetHtmlElement() && inner_box->GetHtmlElement()->Type() == Markup::HTE_BODY);
+}
+
+test("visibility hidden and border clipping, z_index<0, backg on body (with EOI)")
+	require success "PRECONDITION: AHEM";
+	require NEARBY_ELEMENT_DETECTION;
+{
+	FramesDocument* doc = state.doc;
+	verify(doc != NULL);
+	Box* inner_box;
+
+	verify(DoIntersectionWithEOI(doc, 244, 95, inner_box, 30));
+	verify(HasIdOrText(inner_box, "xxxxxxxxxxxxx", TRUE));
+
+	verify(DoIntersectionWithEOI(doc, 248, 95, inner_box, 30));
+	verify(HasIdOrText(inner_box, "container"));
+
+	verify(DoIntersectionWithEOI(doc, 251, 95, inner_box, 30));
+	verify(inner_box->GetHtmlElement() && inner_box->GetHtmlElement()->Type() == Markup::HTE_BODY);
+}
+
+html
+{
+//!<!DOCTYPE html>
+//!<html>
+//!<head>
+//!<style>
+//!*
+//!{
+//!	margin:0;padding:0;
+//!	font-family:'AHEM';
+//!	line-height:20px;
+//!}
+//!
+//!#container
+//!{
+//!	width:100px;
+//!	height:90px;
+//!	background-color:green;
+//!	margin-left:50px;
+//!	margin-top:50px;
+//!	overflow:auto;
+//!}
+//!
+//!#body
+//!{
+//!	height:200px;
+//!}
+//!
+//!span
+//!{
+//!	font-size:20px;
+//!	vertical-align:top;
+//!}
+//!
+//!</style>
+//!</head>
+//!<body id="body">
+//!
+//!<div id="container">
+//!<br /> <br /> <br /> <br />
+//!<span>FIRS</span><br />
+//!<span>SECO</span>
+//!</div>
+//!
+//!</body>
+//!
+//!</html>
+}
+test("scrollable clipping")
+	require success "PRECONDITION: AHEM";
+{
+	FramesDocument* doc = state.doc;
+	verify(doc != NULL);
+	Box* inner_box;
+
+	verify(DoIntersection(doc, 55, 135, inner_box));
+	verify(HasIdOrText(inner_box, "FIRS", TRUE));
+
+	verify(DoIntersection(doc, 55, 154, inner_box));
+	verify(HasIdOrText(inner_box, "body"));
+
+	verify(DoIntersection(doc, 145, 135, inner_box));
+	verify(HasIdOrText(inner_box, "container"));
+}
+
+test("scrollable clipping (with EOI)")
+	require success "PRECONDITION: AHEM";
+	require NEARBY_ELEMENT_DETECTION;
+{
+	FramesDocument* doc = state.doc;
+	verify(doc != NULL);
+	Box* inner_box;
+
+	verify(DoIntersectionWithEOI(doc, 55, 135, inner_box, 30));
+	verify(HasIdOrText(inner_box, "FIRS", TRUE));
+
+	verify(DoIntersectionWithEOI(doc, 55, 154, inner_box, 30));
+	verify(HasIdOrText(inner_box, "body"));
+
+	verify(DoIntersectionWithEOI(doc, 145, 135, inner_box, 30));
+	verify(HasIdOrText(inner_box, "container"));
+}
+
+html
+{
+//!<!DOCTYPE html>
+//!<html>
+//!<head>
+//!<style>
+//!*
+//!{
+//!	margin:0;padding:0;
+//!	font-family:'AHEM';
+//!	line-height:20px;
+//!}
+//!
+//!table
+//!{
+//!	margin-left:50px;
+//!	margin-top:50px;
+//!	border-spacing:0px;
+//!}
+//!
+//!td.double
+//!{
+//!	width:200px;
+//!	height:100px;
+//!	background-color:red;
+//!	vertical-align:top;
+//!}
+//!
+//!td.single
+//!{
+//!	width:100px;
+//!	height:100px;
+//!	background-color:green;
+//!}
+//!
+//!span
+//!{
+//!	font-size:20px;
+//!	vertical-align:top;
+//!}
+//!
+//!col.collapsed
+//!{
+//!	visibility:collapse;
+//!}
+//!
+//!#relative
+//!{
+//!	position:relative;
+//!	left:110px;
+//!	width:20px;
+//!	height:20px;
+//!	background-color:yellow;
+//!}
+//!
+//!#absolute
+//!{
+//!	position:absolute;
+//!	left:160px;
+//!	top:90px;
+//!	width:20px;
+//!	height:20px;
+//!	background-color:lime;
+//!}
+//!
+//!</style>
+//!</head>
+//!<body id="body">
+//!
+//!<table id="table">
+//!<col />
+//!<col class="collapsed" />
+//!<tr>
+//!<td colspan="2" class="double">
+//!<span>xxxxxxxxxx</span>
+//!<div id="relative">
+//!</div>
+//!<div id="absolute">
+//!</div>
+//!</td>
+//!</tr>
+//!
+//!<tr>
+//!<td class="single">
+//!</td>
+//!<td class="single">
+//!</td>
+//!</tr>
+//!
+//!</table>
+//!
+//!</body>
+//!
+//!</html>
+}
+test("collapsed table cell clipping")
+	require success "PRECONDITION: AHEM";
+{
+	FramesDocument* doc = state.doc;
+	verify(doc != NULL);
+	Box* inner_box;
+
+	verify(DoIntersection(doc, 148, 55, inner_box));
+	verify(HasIdOrText(inner_box, "xxxxxxxxxx", TRUE));
+
+	verify(DoIntersection(doc, 152, 55, inner_box));
+	verify(HasIdOrText(inner_box, "body"));
+
+	verify(DoIntersection(doc, 162, 75, inner_box));
+	verify(HasIdOrText(inner_box, "body"));
+
+	verify(DoIntersection(doc, 162, 95, inner_box));
+	verify(HasIdOrText(inner_box, "absolute"));
+}
+
+html
+{
+//! <!DOCTYPE html>
+//! <html>
+//!  <body style="margin: 0">
+//!   <div style="opacity: 0.9; display: inline">
+//!    <div style="float: left; position: relative">PASS</div>
+//!   </div>
+//!  </body>
+//! </html>
+}
+test("Traverse to positioned float within inline w/ opacity")
+{
+	FramesDocument* doc = state.doc;
+	verify(doc != NULL);
+	Box* inner_box;
+
+	verify(DoIntersection(doc, 2, 2, inner_box));
+	verify(HasIdOrText(inner_box, "PASS", TRUE));
+}
+
+html
+{
+//! <!DOCTYPE html>
+//! <html>
+//!  <body style="margin: 0">
+//!   <div style="position:relative; display: inline">
+//!    <div style="float: left; position: relative">PASS</div>
+//!   </div>
+//!  </body>
+//! </html>
+}
+test("Traverse to positioned float inside positioned inline")
+{
+	FramesDocument* doc = state.doc;
+	verify(doc != NULL);
+	Box* inner_box;
+
+	verify(DoIntersection(doc, 2, 2, inner_box));
+	verify(HasIdOrText(inner_box, "PASS", TRUE));
+}
+
+html
+{
+//! <!DOCTYPE html>
+//! <html>
+//!  <body style="margin: 0">
+//!   <div style="display: inline">
+//!    <div style="float: left; opacity: 0.9">PASS</div>
+//!   </div>
+//!  </body>
+//! </html>
+}
+test("Traverse to positioned float inside positioned inline")
+{
+	FramesDocument* doc = state.doc;
+	verify(doc != NULL);
+	Box* inner_box;
+
+	verify(DoIntersection(doc, 2, 2, inner_box));
+	verify(HasIdOrText(inner_box, "PASS", TRUE));
+}
+
+html
+{
+//! <!DOCTYPE html>
+//! <html>
+//!  <body style="margin: 0">
+//!   <div style="display: inline">
+//!    <div style="float: left; z-index: 1">PASS</div>
+//!   </div>
+//!  </body>
+//! </html>
+}
+test("Traverse to z-indexed positioned float inside positioned inline")
+{
+	FramesDocument* doc = state.doc;
+	verify(doc != NULL);
+	Box* inner_box;
+
+	verify(DoIntersection(doc, 2, 2, inner_box));
+	verify(HasIdOrText(inner_box, "PASS", TRUE));
+}
+
+html
+{
+//!<!DOCTYPE html>
+//!<html>
+//!<head>
+//!<style>
+//!*
+//!{
+//!	margin:0;padding:0;
+//!	font-family:'AHEM';
+//!	line-height:20px;
+//!	font-size:20px;
+//!	vertical-align:bottom;
+//!}
+//!
+//!#mc
+//!{
+//!	width:200px;
+//!	height:100px;
+//!	background-color:yellow;
+//!	column-count:2;
+//!	column-gap:0;
+//!	orphans:0;
+//!	widows:0;
+//!	overflow:visible;
+//!}
+//!
+//!a.clipped_shifted_left
+//!{
+//!	position:relative;
+//!	top:0px;
+//!	left:-40px;
+//!}
+//!
+//!#all_col_span
+//!{
+//!	column-span:all;
+//!	display:block;
+//!}
+//!
+//!</style>
+//!</head>
+//!<body id="body">
+//!
+//!<div id="mc">
+//!<a id="all_col_span" href="#">SPANSALL</a>
+//!
+//!WORD
+//!<a href="#">CLIPPED</a>
+//!WORD
+//!<span>HIT3</span>
+//!WORD
+//!<span>HIT1</span>
+//!WORD
+//!<a class="clipped_shifted_left" href="#">CLIPP</a>
+//!WORD WORD
+//!<span>HIT2</span>
+//!</div>
+//!
+//!</body>
+//!
+//!</html>
+}
+test("Intersection with multicol")
+	require success "PRECONDITION: Window big enough.";
+	require success "PRECONDITION: AHEM";
+{
+	FramesDocument* doc = state.doc;
+	verify(doc);
+	Box* inner_box;
+
+	verify(DoIntersection(doc, 10, 10, inner_box));
+	verify(HasIdOrText(inner_box, "SPANSALL", TRUE));
+
+	verify(DoIntersection(doc, 110, 10, inner_box));
+	verify(HasIdOrText(inner_box, "SPANSALL", TRUE));
+
+	verify(DoIntersection(doc, 170, 10, inner_box));
+	verify(HasIdOrText(inner_box, "all_col_span", FALSE));
+
+	verify(DoIntersection(doc, 210, 10, inner_box));
+	verify(HasIdOrText(inner_box, "body", FALSE));
+
+	verify(DoIntersection(doc, 90, 30, inner_box));
+	verify(HasIdOrText(inner_box, "mc", FALSE));
+
+	verify(DoIntersection(doc, 110, 50, inner_box));
+	verify(HasIdOrText(inner_box, "HIT1", TRUE));
+
+	verify(DoIntersection(doc, 210, 70, inner_box));
+	verify(HasIdOrText(inner_box, "HIT2", TRUE));
+
+	verify(DoIntersection(doc, 290, 70, inner_box));
+	verify(HasIdOrText(inner_box, "body", FALSE));
+
+	verify(DoIntersection(doc, 70, 90, inner_box));
+	verify(HasIdOrText(inner_box, "HIT3", TRUE));
+}
+
+html
+{
+	//! <html><div style="margin:30px; padding:20px;border:2px solid black">
+	//! <div style="margin:70px; padding:60px; border:6px solid black">
+	//! Lots of text to create a big text node.
+	//! Lots of text to create a big text node.
+	//! Lots of text to create a big text node.
+	//! Lots of text to create a big text node.
+	//! Lots of text to create a big text node.
+	//! Lots of text to create a big text node.
+	//! Lots of text to create a big text node.
+	//! Lots of text to create a big text node.
+	//! Lots of text to create a big text node.
+	//! Lots of text to create a big text node.
+	//! Lots of text to create a big text node.
+	//! Lots of text to create a big text node.
+	//! Lots of text to create a big text node.
+	//! Lots of text to create a big text node.
+	//! Lots of text to create a big text node.
+	//! </div></div>
+}
+test("Intersection in nested div with margin, padding and border")
+	require success "PRECONDITION: Window big enough.";
+{
+	LogicalDocument* logdoc = state.doc->GetLogicalDocument();
+	verify(logdoc);
+	HTML_Element* root = logdoc->GetRoot();
+	HTML_Element* outer_div = find_element("div", 1);
+	HTML_Element* inner_div = find_element("div", 2);
+	verify(root);
+	verify(outer_div);
+	verify(inner_div);
+
+	HTML_Element* text = inner_div->FirstChildActual();
+	verify(text);
+
+	Box* outer_box = outer_div->GetLayoutBox();
+	Box* inner_box = inner_div->GetLayoutBox();
+	Box* text_box = text->GetLayoutBox();
+
+	verify(outer_box);
+	verify(inner_box);
+	verify(text_box);
+
+	IntersectionObject intersection(state.doc, LayoutCoord(400), LayoutCoord(220), TRUE);
+	intersection.Traverse(root);
+
+	Box* found_box = intersection.GetInnerBox();
+	LayoutCoord found_offset_x = intersection.GetRelativeX();
+	LayoutCoord found_offset_y = intersection.GetRelativeY();
+
+	/* Text offsets are strange so just check if they are seemingly ok */
+	verify(found_box == text_box);
+	verify(found_offset_x >= 0);
+	verify(found_offset_y >= 0);
+
+	LayoutCoord offset_x;
+	LayoutCoord offset_y;
+
+	verify(intersection.GetRelativeToBox(found_box, offset_x, offset_y));
+	verify(offset_x == found_offset_x);
+	verify(offset_y == found_offset_y);
+
+	verify(intersection.GetRelativeToBox(inner_box, offset_x, offset_y));
+	verify(offset_x == 204); /* 400 - (8 + 30 + 2 + 20 + 70 + 6 + 60) */
+	verify(offset_y == 32); /* 220 - (30 + 2 + 20 + 70 + 6 + 60) */
+
+	verify(intersection.GetRelativeToBox(outer_box, offset_x, offset_y));
+	verify(offset_x == 340); /* 400 - (8 + 30 + 2 + 20) */
+	verify(offset_y == 168); /* 220 - (30 + 2 + 20) */
+}
+
+html
+{
+	//! <html><head><style> * { margin:0; padding:0;font-family:'AHEM';font-size:20px; } </style></head><body>
+	//! <div style="position:relative">XXXXX<br>XXXXX<br>XXXXX<br>XXXXX<br>XXXXX<br>XXXXX<br>XXXXX<br>
+	//! XXXXX<br>XXXXX<br>XXXXX<br>XXXXX<br>XXXXX<br>XXXXX<br>XXXXX<br>XXXXX
+	//! <button style="position:absolute;top:0;left:0;height:300px;width:100px;"></button></div>
+	//! </body></html>
+}
+test("Intersection and button element, button overlapping other element")
+{
+	LogicalDocument* logdoc = state.doc->GetLogicalDocument();
+	verify(logdoc);
+	HTML_Element* root = logdoc->GetRoot();
+	HTML_Element* button = find_element("button", 1);
+	verify(root);
+	verify(button);
+	IntersectionObject intersection(state.doc, LayoutCoord(50), LayoutCoord(150), TRUE);
+	intersection.Traverse(root);
+
+	Box* found_box = intersection.GetInnerBox();
+	verify(found_box);
+	verify(found_box->GetHtmlElement() == button);
+}
+
+html
+{
+//! <html><head><style>* { margin:0; padding:0;font-family:'AHEM';font-size:20px; }</style><body>
+//! <button id="button" style="height:40px;width:40px;"><span>XX<br>XX</span></button>
+//! </body></html>
+}
+test("Intersection and button element, button that has in-flow children")
+{
+	/* The IntersectionObject has a kludge to make sure we always hit the
+	   button element and not its children. */
+	LogicalDocument* logdoc = state.doc->GetLogicalDocument();
+	verify(logdoc);
+	HTML_Element* root = logdoc->GetRoot();
+	HTML_Element* button = find_element("button", 1);
+	verify(root);
+	verify(button);
+	IntersectionObject intersection(state.doc, LayoutCoord(20), LayoutCoord(20), TRUE);
+	intersection.Traverse(root);
+
+	Box* found_box = intersection.GetInnerBox();
+	verify(found_box);
+	verify(found_box->GetHtmlElement() == button);
+}
+
+html
+{
+//! <html><head><style>* { margin:0;padding:0; }</style></head><body>
+//! <div id="scrolldiv" style="overflow:scroll;position:absolute;left:100px;top:150px;width:100px;height:100px">
+//! <div style="width:200px;height:200px;"></div>
+//! </div></body></html>
+}
+test("PRECONDITION: setup scrollbar widths")
+{
+	/* This test stores the scrollbar widths in the vsw and hsw
+	   variables for use in later tests. */
+
+	HTML_Element* scrolldiv = find_element("div", 1);
+	verify (scrolldiv);
+	Box* box = scrolldiv->GetLayoutBox();
+	verify(box);
+	ScrollableArea* sc = box->GetScrollable();
+	verify(sc);
+
+	vsw = sc->GetVerticalScrollbarWidth();
+	hsw = sc->GetHorizontalScrollbarWidth();
+
+	verify(vsw > 1);
+	verify(hsw > 1);
+}
+
+subtest test_hit_scrollbar(int abs_x, int abs_y, BOOL vertical)
+{
+	FramesDocument* doc = state.doc;
+	verify(doc != NULL);
+	Box* inner_box;
+	OpPoint box_relative;
+
+	verify(DoIntersection(doc, abs_x, abs_y, inner_box, FALSE, &box_relative));
+	verify(HasIdOrText(inner_box, "scrolldiv", FALSE));
+
+	Container* container = inner_box->GetContainer();
+	verify(container);
+	ScrollableContainer* sc = container->GetScrollableContainer();
+	verify(sc);
+
+	OpScrollbar* sb;
+
+	if (vertical)
+		sb = sc->GetVerticalScrollbar();
+	else
+		sb = sc->GetHorizontalScrollbar();
+
+	verify(sb);
+
+	OpRect r = sb->GetRect();
+	verify(r.Contains(box_relative));
+}
+
+html
+{
+//! <html><head><style>* { margin:0;padding:0; }</style></head><body>
+//! <div id="scrolldiv" style="overflow:scroll;position:absolute;left:100px;top:150px;width:100px;height:100px">
+//! <div style="width:200px;height:200px;"></div>
+//! </div></body></html>
+}
+test("Scrollable div, hit scrollbar simple")
+	require success "PRECONDITION: setup scrollbar widths";
+{
+	test_hit_scrollbar(200 - vsw / 2, 250 - hsw - vsw / 2, TRUE);
+	test_hit_scrollbar(100 + hsw / 2, 250 - hsw / 2, FALSE);
+}
+
+html
+{
+//! <html><head><style>* { margin:0;padding:0; }</style></head><body>
+//! <div id="scrolldiv" style="overflow:scroll;position:absolute;left:100px;top:150px;width:100px;height:100px;transform:scale(2) translate(100,100)">
+//! <div style="width:200px;height:200px;"></div>
+//! </div></body></html>
+}
+test("Scrollable div, hit scrollbar transform scale")
+	require success "PRECONDITION: setup scrollbar widths";
+{
+	int top = 150 + 100 / 2 - 2 * 100 / 2 + 100 * 2;
+	int left = 100 + 100 / 2 - 2 * 100 / 2 + 100 * 2;
+	test_hit_scrollbar(left + 2 * (100 - vsw / 2), top + 2 * (100 - hsw - vsw / 2), TRUE);
+	test_hit_scrollbar(left + 2 * hsw / 2, top + 2 * (100 - hsw / 2), FALSE);
+}
+
+html
+{
+//! <html><head><style>* { margin:0;padding:0; }</style></head><body>
+//! <div id="scrolldiv" style="overflow:scroll;position:absolute;left:100px;top:150px;width:100px;height:100px;padding:30px;">
+//! <div style="width:200px;height:200px;"></div>
+//! </div></body></html>
+}
+test("Scrollable div, hit scrollbar padding")
+	require success "PRECONDITION: setup scrollbar widths";
+{
+	test_hit_scrollbar(100 + 160 - vsw / 2, 150 + 160 - hsw - vsw / 2, TRUE);
+	test_hit_scrollbar(100 + hsw / 2, 150 + 160 - hsw / 2, FALSE);
+}
+
+html
+{
+//! <html><head><style>* { margin:0;padding:0; }</style></head><body>
+//! <div id="scrolldiv" style="overflow:scroll;position:absolute;left:100px;top:150px;width:100px;height:100px;border:30px solid blue;">
+//! <div style="width:200px;height:200px;"></div>
+//! </div></body></html>
+}
+test("Scrollable div, hit scrollbar border")
+	require success "PRECONDITION: setup scrollbar widths";
+{
+	test_hit_scrollbar(100 + 160 - 30 - vsw / 2, 150 + 160 - 30 - hsw - vsw / 2, TRUE);
+	test_hit_scrollbar(100 + 30 + hsw / 2, 150 + 160 - 30 - hsw / 2, FALSE);
+}
+
+html
+{
+//! <html><head><style>* { margin:0;padding:0; }</style></head><body>
+//! <div id="scrolldiv" style="overflow:scroll;position:absolute;left:100px;top:150px;width:100px;height:100px;border:30px solid blue;padding:30px;">
+//! <div style="width:200px;height:200px;"></div>
+//! </div></body></html>
+}
+test("Scrollable div, hit scrollbar padding+border")
+	require success "PRECONDITION: setup scrollbar widths";
+{
+	test_hit_scrollbar(100 + 220 - 30 - vsw / 2, 150 + 220 - 30 - hsw - vsw / 2, TRUE);
+	test_hit_scrollbar(100 + 30 + hsw / 2, 150 + 220 - 30 - hsw / 2, FALSE);
+}
+
+html
+{
+//! <html><head><style>* { margin:0;padding:0; }</style></head><body>
+//! <div id="scrolldiv" style="direction:rtl;overflow:scroll;position:absolute;left:100px;top:150px;width:100px;height:100px;padding:30px;border:30px solid blue;">
+//! <div style="width:200px;height:200px;"></div>
+//! </div></body></html>
+}
+test("Scrollable div, hit scrollbar rtl + padding + border")
+	require success "PRECONDITION: setup scrollbar widths";
+{
+	test_hit_scrollbar(100 + 30 + vsw / 2, 150 + 220 - 30 - hsw - vsw / 2, TRUE);
+	test_hit_scrollbar(100 + 220 - 30 - hsw / 2, 150 + 220 - 30 - hsw / 2, FALSE);
+}
+
+html
+{
+//! <html><head><style>* { margin:0;padding:0; }</style></head><body>
+//! <div id="scrolldiv" style="width:300px;overflow:scroll">
+//! <div style="height:100px;width:1000px;background:red;"></div>
+//! </div></body></html>
+}
+test("Scrollable div, hit scrollbar auto height")
+	require success "PRECONDITION: setup scrollbar widths";
+{
+	test_hit_scrollbar(300 - vsw / 2, 100 - hsw - vsw / 2, TRUE);
+	test_hit_scrollbar(hsw / 2, 100 + hsw / 2, FALSE);
+}
+
+html
+{
+//!<!DOCTYPE html>
+//!<html>
+//!<head>
+//!
+//!<style>
+//!*
+//!{
+//!	margin:0;padding:0;
+//!	font-size:20px;
+//!	font-family:'AHEM';
+//!}
+//!
+//!ul, ol
+//!{
+//!	padding-left:40px;
+//!	list-style-type:decimal;
+//!}
+//!
+//!li
+//!{
+//!	display:list-item;
+//!	width:100px;
+//!	list-style-position:outside;
+//!	direction:ltr;
+//!}
+//!
+//!</style>
+//!</head>
+//!
+//!<body>
+//!
+//!<ol>
+//!<li id="list_item">X</li>
+//!</ol>
+//!
+//!</body>
+//!
+//!</html>
+}
+test("Hit outside list item marker (incl. inner space), ltr")
+	require success "PRECONDITION: AHEM";
+{
+	FramesDocument* doc = state.doc;
+	verify(doc != NULL);
+	Box* inner_box;
+	HTML_Element* list_item_elm;
+
+	verify(DoIntersection(doc, 40 - MARKER_INNER_OFFSET / 2, 10, inner_box, FALSE));
+	list_item_elm = inner_box->GetHtmlElement() ? inner_box->GetHtmlElement()->Parent() : NULL;
+	verify(HasIdOrText(list_item_elm, "list_item", FALSE));
+
+	verify(DoIntersection(doc, 40 - MARKER_INNER_OFFSET - 1, 10, inner_box, FALSE));
+	list_item_elm = inner_box->GetHtmlElement() ? inner_box->GetHtmlElement()->Parent() : NULL;
+	verify(HasIdOrText(list_item_elm, "list_item", FALSE));
+}
+
+html
+{
+//!<!DOCTYPE html>
+//!<html>
+//!<head>
+//!
+//!<style>
+//!*
+//!{
+//!	margin:0;padding:0;
+//!	font-size:20px;
+//!	font-family:'AHEM';
+//!}
+//!
+//!ul, ol
+//!{
+//!	padding-left:40px;
+//!	list-style-type:decimal;
+//!}
+//!
+//!li
+//!{
+//!	display:list-item;
+//!	width:100px;
+//!	list-style-position:outside;
+//!	direction:rtl;
+//!}
+//!
+//!</style>
+//!</head>
+//!
+//!<body>
+//!
+//!<ol>
+//!<li id="list_item">X</li>
+//!</ol>
+//!
+//!</body>
+//!
+//!</html>
+}
+test("Hit outside list item marker (incl. inner space), rtl")
+	require success "PRECONDITION: AHEM";
+	require SUPPORT_TEXT_DIRECTION;
+{
+	FramesDocument* doc = state.doc;
+	verify(doc != NULL);
+	Box* inner_box;
+	HTML_Element* list_item_elm;
+
+	verify(DoIntersection(doc, 140 + MARKER_INNER_OFFSET / 2, 10, inner_box, FALSE));
+	list_item_elm = inner_box->GetHtmlElement() ? inner_box->GetHtmlElement()->Parent() : NULL;
+	verify(HasIdOrText(list_item_elm, "list_item", FALSE));
+
+	verify(DoIntersection(doc, 140 + MARKER_INNER_OFFSET + 1, 10, inner_box, FALSE));
+	list_item_elm = inner_box->GetHtmlElement() ? inner_box->GetHtmlElement()->Parent() : NULL;
+	verify(HasIdOrText(list_item_elm, "list_item", FALSE));
+}
+
+html
+{
+//!<!DOCTYPE html>
+//! <html><body style="margin:0">
+//!  <div style="position: absolute; top: 0; left: 0; width: 1px; height: 1px; overflow: hidden; z-index: 1;">
+//!   <div id="hitme" style="position:fixed; top: 10px; left: 10px; width: 5px; height: 5px;"></div>
+//!  </div>
+//! </body></html>
+}
+
+test("Complex overflow: AbsoluteZRootBox")
+{
+	FramesDocument* doc = state.doc;
+	verify(doc != NULL);
+	Box* inner_box = NULL;
+
+	verify(DoIntersection(doc, 12, 12, inner_box));
+	verify(HasIdOrText(inner_box, "hitme"));
+}

@@ -1,0 +1,161 @@
+/* -*- Mode: c++; tab-width: 4; indent-tabs-mode: t; c-basic-offset: 4 -*-
+ *
+ * Copyright (C) 2009 Opera Software AS.  All rights reserved.
+ *
+ * This file is part of the Opera web browser.  It may not be distributed
+ * under any circumstances.
+ */
+
+group "memory.memorymanager";
+
+language C++;
+
+require ENABLE_MEMORY_MANAGER;
+
+include "modules/memory/src/memory_manager.h";
+
+global
+{
+	OpMemoryManager* mm;
+}
+
+setup
+{
+	mm = OP_NEW(OpMemoryManager, ());
+
+	mm->SetMax(25000);
+	mm->SetMax(MEMCLS_SELFTEST1, 10000);
+	mm->SetMax(MEMCLS_SELFTEST2, 15000);
+	mm->SetMax(MEMCLS_SELFTEST3, 30000);
+}
+
+exit
+{
+	OP_DELETE(mm);
+}
+
+test("Make successful allocations")
+{
+	verify(mm != 0); // Needs to exist
+
+	// Alloc 10K in SELFTEST1
+	verify(mm->Alloc(MEMCLS_SELFTEST1, 10000));
+	verify(mm->GetTotal() == 10000);
+	verify(mm->GetTotal(MEMCLS_SELFTEST1) == 10000);
+
+
+	// Alloc 15K in SELFTEST2
+	verify(mm->Alloc(MEMCLS_SELFTEST2, 15000));
+	verify(mm->GetTotal() == 25000);
+	verify(mm->GetTotal(MEMCLS_SELFTEST2) == 15000);
+
+	// Free 10K in SELFTEST1
+	mm->Free(MEMCLS_SELFTEST1, 10000);
+	verify(mm->GetTotal() == 15000);
+	verify(mm->GetTotal(MEMCLS_SELFTEST1) == 0);
+
+	// Alloc 10K in SELFTEST3
+	verify(mm->Alloc(MEMCLS_SELFTEST3, 10000));
+	verify(mm->GetTotal() == 25000);
+	verify(mm->GetTotal(MEMCLS_SELFTEST3) == 10000);
+
+	// Free 15K in SELFTEST2
+	mm->Free(MEMCLS_SELFTEST2, 15000);
+	verify(mm->GetTotal() == 10000);
+	verify(mm->GetTotal(MEMCLS_SELFTEST2) == 0);
+
+	// Alloc 15K in SELFTEST3
+	verify(mm->Alloc(MEMCLS_SELFTEST3, 15000));
+
+	verify(mm->GetTotal() == 25000);
+	verify(mm->GetTotal(MEMCLS_SELFTEST1) == 0);
+	verify(mm->GetTotal(MEMCLS_SELFTEST2) == 0);
+	verify(mm->GetTotal(MEMCLS_SELFTEST3) == 25000);
+}
+
+test("Make successful transfers")
+{
+	// Move between accounted memory classes
+	verify(mm->Transfer(MEMCLS_SELFTEST3, MEMCLS_SELFTEST1, 10000));
+	verify(mm->Transfer(MEMCLS_SELFTEST3, MEMCLS_SELFTEST2, 15000));
+
+	verify(mm->GetTotal() == 25000);
+	verify(mm->GetTotal(MEMCLS_SELFTEST1) == 10000);
+	verify(mm->GetTotal(MEMCLS_SELFTEST2) == 15000);
+	verify(mm->GetTotal(MEMCLS_SELFTEST3) == 0);
+
+	verify(mm->Transfer(MEMCLS_SELFTEST1, MEMCLS_SELFTEST3, 10000));
+	verify(mm->Transfer(MEMCLS_SELFTEST2, MEMCLS_SELFTEST3, 15000));
+
+	verify(mm->GetTotal() == 25000);
+	verify(mm->GetTotal(MEMCLS_SELFTEST1) == 0);
+	verify(mm->GetTotal(MEMCLS_SELFTEST2) == 0);
+	verify(mm->GetTotal(MEMCLS_SELFTEST3) == 25000);
+	verify(mm->GetTotal(MEMCLS_UNACCOUNTED) == 0);
+
+	// Move into unaccounted class ...
+	verify(mm->Transfer(MEMCLS_SELFTEST3, MEMCLS_UNACCOUNTED, 25000));
+
+	verify(mm->GetTotal() == 0);
+	verify(mm->GetTotal(MEMCLS_SELFTEST1) == 0);
+	verify(mm->GetTotal(MEMCLS_SELFTEST2) == 0);
+	verify(mm->GetTotal(MEMCLS_SELFTEST3) == 0);
+	verify(mm->GetTotal(MEMCLS_UNACCOUNTED) == 0); // Not accounted...
+
+	// ... and back again
+	verify(mm->Transfer(MEMCLS_UNACCOUNTED, MEMCLS_SELFTEST3, 25000));
+
+	verify(mm->GetTotal() == 25000);
+	verify(mm->GetTotal(MEMCLS_SELFTEST1) == 0);
+	verify(mm->GetTotal(MEMCLS_SELFTEST2) == 0);
+	verify(mm->GetTotal(MEMCLS_SELFTEST3) == 25000);
+	verify(mm->GetTotal(MEMCLS_UNACCOUNTED) == 0);
+}
+
+test("Blow total")
+	require success "Make successful transfers";
+{
+	// Blow it by allocating too much in total
+	verify(mm->Transfer(MEMCLS_SELFTEST3, MEMCLS_SELFTEST1, 10000));
+	verify(mm->Transfer(MEMCLS_SELFTEST3, MEMCLS_SELFTEST2, 15000));
+
+	verify(mm->GetTotal() == 25000);
+	verify(mm->GetTotal(MEMCLS_SELFTEST1) == 10000);
+	verify(mm->GetTotal(MEMCLS_SELFTEST2) == 15000);
+	verify(mm->GetTotal(MEMCLS_SELFTEST3) == 0);
+	verify(mm->GetTotal(MEMCLS_UNACCOUNTED) == 0);
+
+	verify(!mm->Alloc(MEMCLS_SELFTEST3, 1)); // This one must fail
+	verify(mm->GetTotal(MEMCLS_SELFTEST3) == 0);
+
+	// Blow it by trying to transfer from somewhere else
+	verify(!mm->Transfer(MEMCLS_UNACCOUNTED, MEMCLS_SELFTEST3, 1));
+	verify(mm->GetTotal(MEMCLS_SELFTEST3) == 0);
+	verify(mm->GetTotal(MEMCLS_UNACCOUNTED) == 0);
+}
+
+test("Blow allocation class")
+	require success "Blow total";
+{
+	verify(mm->GetTotal() == 25000);
+	verify(mm->GetTotal(MEMCLS_SELFTEST1) == 10000);
+	verify(mm->GetTotal(MEMCLS_SELFTEST2) == 15000);
+	verify(mm->GetTotal(MEMCLS_SELFTEST3) == 0);
+	verify(mm->GetTotal(MEMCLS_UNACCOUNTED) == 0);
+
+	// Make room for 5 bytes in each of SELFTEST1 and SELFTEST2...
+	mm->Free(MEMCLS_SELFTEST1, 5);
+	mm->Free(MEMCLS_SELFTEST2, 5);
+
+	// Blow the SELFTEST1+2 classes by allocating one byte too much
+	verify(!mm->Alloc(MEMCLS_SELFTEST1, 6));
+	verify(!mm->Alloc(MEMCLS_SELFTEST2, 6));
+	verify(mm->Alloc(MEMCLS_SELFTEST3, 6)); // This should work
+	mm->Free(MEMCLS_SELFTEST3, 6);
+
+	// Blow the SELFTEST1 class by transfering too much too it
+	verify(!mm->Transfer(MEMCLS_SELFTEST2, MEMCLS_SELFTEST1, 6));
+	verify(mm->GetTotal() == 24990);
+	verify(mm->GetTotal(MEMCLS_SELFTEST1) == 9995);
+	verify(mm->GetTotal(MEMCLS_SELFTEST2) == 14995);
+}

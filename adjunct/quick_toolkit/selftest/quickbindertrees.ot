@@ -1,0 +1,276 @@
+/* -*- Mode: c++; tab-width: 4; indent-tabs-mode: t; c-basic-offset: 4 -*-
+ *
+ * Copyright (C) 1995-2011 Opera Software AS.  All rights reserved.
+ *
+ * This file is part of the Opera web browser.	It may not be distributed
+ * under any circumstances.
+ *
+ * @author Wojciech Dzierzanowski (wdzierzanowski)
+ */
+
+group "quick_toolkit.quickbinder.trees";
+require init;
+
+include "adjunct/desktop_util/adt/opproperty.h";
+include "adjunct/desktop_util/treemodel/simpletreemodel.h";
+include "adjunct/quick_toolkit/bindings/DefaultQuickBinder.h";
+include "adjunct/quick_toolkit/selftest/src/ST_TestController.h";
+include "adjunct/quick_toolkit/widgets/QuickGrid/QuickGrid.h";
+include "adjunct/quick_toolkit/widgets/QuickGrid/QuickStackLayout.h";
+include "adjunct/quick_toolkit/widgets/QuickLabel.h";
+include "adjunct/quick_toolkit/widgets/QuickRadioButton.h";
+include "adjunct/quick_toolkit/widgets/QuickTabs.h";
+include "adjunct/quick_toolkit/widgets/QuickTreeView.h";
+include "adjunct/desktop_util/adt/typedobjectcollection.h";
+include "adjunct/quick_toolkit/widgets/QuickWidgetDecls.h";
+
+global
+{
+	typedef AutoTreeModel<char> TestTreeModel;
+
+	struct Model
+	{
+		OpProperty<OpTreeModel*> m_tree;
+		OpProperty<INT32> m_int;
+		OpProperty<OpINT32Vector> m_int_vector;
+	};
+
+	struct TreeSelectionInfo
+	{
+		bool Equals(const OpINT32Vector& rhs) const
+		{
+			OpINT32Vector lhs;
+			m_view->GetOpWidget()->GetSelectedItems(lhs, FALSE);
+			if (lhs.GetCount() != rhs.GetCount())
+				return false;
+			for (UINT32 i = 0; i < rhs.GetCount(); ++i)
+				if (lhs.Get(i) != rhs.Get(i))
+					return false;
+			return true;
+		}
+
+		QuickTreeView* m_view;
+	};
+
+	class Controller : public ST_TestController
+	{
+	public:
+		Controller()
+		{
+			m_binder.SetWidgetCollection(&m_widgets);
+			m_model.m_int.Set(-1);
+			m_model.m_tree.Set(&m_tree_model);
+
+			m_model.m_int.Subscribe(MAKE_DELEGATE(*this, &Controller::Format));
+			m_model.m_int_vector.Subscribe(MAKE_DELEGATE(*this, &Controller::MultiFormat));
+		}
+
+		TestTreeModel m_tree_model;
+		Model m_model;
+		TypedObjectCollection m_widgets;
+
+		OpProperty<OpString> m_selected_item;
+		void Format(INT32 i) { m_selected_item.Set(m_tree_model.GetItemString(i)); }
+
+		OpProperty<OpString> m_selected_items;
+		void MultiFormat(const OpINT32Vector& v)
+		{
+			OpString s;
+			for (UINT32 i = 0; i < v.GetCount(); ++i)
+			{
+				if (i > 0)
+					s.Append(UNI_L(", "));
+				s.Append(m_tree_model.GetItemString(v.Get(i)));
+			}
+			m_selected_items.Set(s);
+		}
+
+		DefaultQuickBinder m_binder;
+	};
+
+	// This needs to outlive an async testcase.
+	OpAutoPtr<Controller> g_controller;
+}
+
+
+test("Tree view model can be bound to a property")
+{
+	Model model;
+	model.m_tree.Set(NULL);
+	TestTreeModel tree_model1;
+	TestTreeModel tree_model2;
+
+	QuickTreeView tree_view;
+	tree_view.Init();
+
+	TypedObjectCollection widgets;
+	widgets.Put("tree_view", &tree_view);
+
+	DefaultQuickBinder binder;
+	binder.SetWidgetCollection(&widgets);
+	verify_success(binder.Connect("tree_view", model.m_tree));
+
+	model.m_tree.Set(&tree_model1);
+	verify(tree_view.GetOpWidget()->GetTreeModel() == model.m_tree.Get());
+	model.m_tree.Set(&tree_model2);
+	verify(tree_view.GetOpWidget()->GetTreeModel() == model.m_tree.Get());
+	model.m_tree.Set(NULL);
+	verify(tree_view.GetOpWidget()->GetTreeModel() == model.m_tree.Get());
+}
+
+test("Tree view single-selection can be bound to a property")
+{
+	TestTreeModel tree_model;
+	tree_model.AddItem(UNI_L("0"));
+	tree_model.AddItem(UNI_L("2"), NULL, 0, 0);
+	tree_model.AddItem(UNI_L("1"), NULL, 0, 0);
+
+	Model model;
+	model.m_tree.Set(&tree_model);
+	model.m_int.Set(-1);
+
+	QuickTreeView tree_view;
+	tree_view.Init();
+
+	TypedObjectCollection widgets;
+	widgets.Put("tree_view", &tree_view);
+
+	DefaultQuickBinder binder;
+	binder.SetWidgetCollection(&widgets);
+	verify_success(binder.Connect("tree_view", model.m_tree));
+	verify_success(binder.Connect("tree_view", model.m_int));
+
+	OpTreeView* view = tree_view.GetOpWidget();
+
+	view->OpenAllItems(TRUE);
+	view->Sort(0, TRUE);
+
+	verify(model.m_int.Get() == view->GetSelectedItemModelPos());
+	view->SetSelectedItem(0);
+	verify(model.m_int.Get() == view->GetSelectedItemModelPos());
+	view->SetSelectedItem(1);
+	verify(model.m_int.Get() == view->GetSelectedItemModelPos());
+	view->SetSelectedItem(2);
+	verify(model.m_int.Get() == view->GetSelectedItemModelPos());
+	view->SelectNext(FALSE);
+	verify(model.m_int.Get() == view->GetSelectedItemModelPos());
+	view->SelectNext(FALSE);
+	verify(model.m_int.Get() == view->GetSelectedItemModelPos());
+
+	model.m_int.Set(2);
+	verify(model.m_int.Get() == view->GetSelectedItemModelPos());
+	model.m_int.Set(1);
+	verify(model.m_int.Get() == view->GetSelectedItemModelPos());
+	model.m_int.Set(0);
+	verify(model.m_int.Get() == view->GetSelectedItemModelPos());
+
+	OpInputAction sort_dir_action(OpInputAction::ACTION_SORT_DIRECTION);
+	view->OnInputAction(&sort_dir_action);
+	verify(model.m_int.Get() == 0);
+}
+
+test("Tree view multiple-selection can be bound to a property")
+{
+	TestTreeModel tree_model;
+	tree_model.AddItem(UNI_L("0"));
+	tree_model.AddItem(UNI_L("2"), NULL, 0, 0);
+	tree_model.AddItem(UNI_L("1"), NULL, 0, 0);
+
+	Model model;
+	model.m_tree.Set(&tree_model);
+	model.m_int.Set(-1);
+
+	QuickTreeView tree_view;
+	tree_view.Init();
+	tree_view.GetOpWidget()->SetMultiselectable(TRUE);
+
+	TypedObjectCollection widgets;
+	widgets.Put("tree_view", &tree_view);
+
+	DefaultQuickBinder binder;
+	binder.SetWidgetCollection(&widgets);
+	verify_success(binder.Connect("tree_view", model.m_tree));
+	verify_success(binder.Connect("tree_view", model.m_int_vector));
+
+	tree_view.GetOpWidget()->OpenAllItems(TRUE);
+	tree_view.GetOpWidget()->Sort(0, TRUE);
+
+	TreeSelectionInfo tree_selection;
+	tree_selection.m_view = &tree_view;
+
+	verify(tree_selection.Equals(model.m_int_vector.Get()));
+	tree_view.GetOpWidget()->SetSelectedItem(0);
+	verify(tree_selection.Equals(model.m_int_vector.Get()));
+	tree_view.GetOpWidget()->SetSelectedItem(1);
+	verify(tree_selection.Equals(model.m_int_vector.Get()));
+	tree_view.GetOpWidget()->SetSelectedItem(2);
+	verify(tree_selection.Equals(model.m_int_vector.Get()));
+	tree_view.GetOpWidget()->SelectAllItems();
+	verify(tree_selection.Equals(model.m_int_vector.Get()));
+	tree_view.GetOpWidget()->SetSelectedItem(0);
+	verify(tree_selection.Equals(model.m_int_vector.Get()));
+
+	OpInputAction sort_dir_action(OpInputAction::ACTION_SORT_DIRECTION);
+	tree_view.GetOpWidget()->OnInputAction(&sort_dir_action);
+	verify(tree_selection.Equals(model.m_int_vector.Get()));
+}
+
+test("QuickTreeView binding demo")
+		manual "Am I really telling you which item is selected?";
+{
+	g_controller.reset(OP_NEW(Controller, ()));
+
+	// This part normally automated via declarative UI.
+
+	QuickTreeView* ss_tree_view = OP_NEW(QuickTreeView, ());
+	ss_tree_view->Init();
+	ss_tree_view->GetOpWidget()->OpenAllItems(TRUE);
+	ss_tree_view->GetOpWidget()->Sort(0, TRUE);
+	g_controller->m_widgets.Put("ss_tree_view", ss_tree_view);
+
+	QuickTreeView* ms_tree_view = OP_NEW(QuickTreeView, ());
+	ms_tree_view->Init();
+	ms_tree_view->GetOpWidget()->SetMultiselectable(TRUE);
+	ms_tree_view->GetOpWidget()->OpenAllItems(TRUE);
+	ms_tree_view->GetOpWidget()->Sort(0, TRUE);
+	g_controller->m_widgets.Put("ms_tree_view", ms_tree_view);
+
+	QuickTabs* tree_tabs = OP_NEW(QuickTabs, ());
+	tree_tabs->Init();
+	tree_tabs->InsertTab(ss_tree_view, UNI_L("Single selection"));
+	tree_tabs->InsertTab(ms_tree_view, UNI_L("Multiple selection"));
+	tree_tabs->SetMinimumHeight(150);
+
+	QuickLabel* label = OP_NEW(QuickLabel, ());
+	label->Init();
+	label->SetText(UNI_L("Current selection in focused tree:"));
+
+	QuickLabel* sel_label = OP_NEW(QuickLabel, ());
+	sel_label->Init();
+	g_controller->m_widgets.Put("sel_label", sel_label);
+
+	QuickGrid* grid = OP_NEW(QuickGrid, ());
+	grid->SetCenterVertically(FALSE);
+	grid->AddRow();
+	grid->InsertWidget(tree_tabs);
+	QuickStackLayout* stack = OP_NEW(QuickStackLayout,
+				(QuickStackLayout::VERTICAL));
+	stack->InsertWidget(label);
+	stack->InsertWidget(sel_label);
+	grid->InsertWidget(stack);
+
+	// This part normally in a Controller::Init().
+
+	g_controller->m_tree_model.AddItem(UNI_L("foo"));
+	g_controller->m_tree_model.AddItem(UNI_L("bar"), NULL, 0, 0);
+	g_controller->m_tree_model.AddItem(UNI_L("baz"), NULL, 0, 0);
+
+	g_controller->m_binder.Connect("ss_tree_view", g_controller->m_model.m_tree);
+	g_controller->m_binder.Connect("ss_tree_view", g_controller->m_model.m_int);
+	g_controller->m_binder.Connect("ms_tree_view", g_controller->m_model.m_tree);
+	g_controller->m_binder.Connect("ms_tree_view", g_controller->m_model.m_int_vector);
+	g_controller->m_binder.Connect("sel_label", g_controller->m_selected_item);
+	g_controller->m_binder.Connect("sel_label", g_controller->m_selected_items);
+
+	g_controller->Show(grid);
+}

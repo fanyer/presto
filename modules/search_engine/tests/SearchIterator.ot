@@ -1,0 +1,314 @@
+group "search_engine.iterator";
+
+require SEARCH_ENGINE;
+
+include "modules/search_engine/SingleBTree.h";
+include "modules/search_engine/tests/test_util.h";
+
+global
+{
+
+struct CmpClass
+{
+	static BOOL GreaterThan(const void *i1, const void *i2) {return *(int *)i1 > *(int *)i2;}
+};
+
+class KeyPayload
+{
+public:
+	KeyPayload(void)
+	{
+		m_index = -1;
+		m_payload = 0;
+	}
+
+	KeyPayload(int index, int payload = 0)
+	{
+		m_index = index;
+		m_payload = payload;
+	}
+
+	int GetKey(void) const {return m_index;}
+
+	int GetPayload(void) const {return m_payload;}
+
+	BOOL operator<(const KeyPayload& right) const
+	{
+		return this->m_index < right.m_index;
+	}
+
+protected:
+	int m_index;
+	int m_payload;
+};
+
+class EvenFilter : public SearchFilter<KeyPayload>
+{
+	virtual BOOL Matches(const KeyPayload &item) const
+	{
+		return (item.GetKey() & 1) == 0;
+	}
+};
+
+template <typename KEY> class BTree : public SingleBTree<KEY>
+{
+	char num;
+	const uni_char* m_dir;
+public:
+	BTree(const uni_char* dir, int items, TypeDescriptor::ComparePtr compare = &DefDescriptor<KEY>::Compare, int tree_num = 0) : SingleBTree<KEY>(compare)
+	{
+		num = tree_num + 'a';
+		m_dir = dir;
+		OpString s;
+		OpStatus::Ignore(s.AppendFormat(UNI_L("%sdata/btree%c.bt"), dir, num));
+		delete_file(s.CStr());
+		OpStatus::Ignore(s.Append(UNI_L("-j")));
+		delete_file(s.CStr());
+		s.Empty();
+		OpStatus::Ignore(s.AppendFormat(UNI_L("%sdata/btree%c.bt"), dir, num));
+		OpStatus::Ignore(SingleBTree<KEY>::Open(s.CStr(), BlockStorage::OpenReadWrite, 12 + 4 + items * (4 + sizeof(KEY))));
+	}
+	BTree(const uni_char* dir, int items, int tree_num) : SingleBTree<KEY>(&DefDescriptor<KEY>::Compare)
+	{
+		num = tree_num + 'a';
+		m_dir = dir;
+		OpString s;
+		OpStatus::Ignore(s.AppendFormat(UNI_L("%sdata/btree%c.bt"), dir, num));
+		delete_file(s.CStr());
+		OpStatus::Ignore(s.Append(UNI_L("-j")));
+		delete_file(s.CStr());
+		s.Empty();
+		OpStatus::Ignore(s.AppendFormat(UNI_L("%sdata/btree%c.bt"), dir, num));
+		OpStatus::Ignore(SingleBTree<KEY>::Open(s.CStr(), BlockStorage::OpenReadWrite, 12 + 4 + items * (4 + sizeof(KEY))));
+	}
+	~BTree(void)
+	{
+		OpStatus::Ignore(SingleBTree<KEY>::Close());
+		OpString s;
+		OpStatus::Ignore(s.AppendFormat(UNI_L("%sdata/btree%c.bt"), m_dir, num));
+		delete_file(s.CStr());
+	}
+};
+
+}
+
+
+test("GE search") leakcheck;
+	file uni dir "";
+{
+	BTree<int> b(dir, 5, &CmpClass::GreaterThan);
+	SearchIterator<int> *res = NULL;
+	int i;
+
+	for (i = 0; i < 25; ++i)
+		verify_success(b.Insert(i));
+
+	res = b.Search(20, operatorGE);
+
+	verify(res != NULL);
+	
+	for (i = 0; i < 10; ++i)
+	{
+		verify(!res->End());
+		verify(res->Get() == 20 - i);
+		res->Next();
+	}
+
+
+
+
+	for (i = 10; i >= 1; --i)
+	{
+		verify(!res->End());
+		verify(res->Get() == 20 - i);
+		res->Prev();
+	}
+
+	for (i = 0; i < 26; ++i)
+		res->Prev();
+
+	verify(res->Beginning());
+
+	res->Next();
+
+	verify(res->Error() == OpStatus::OK);
+	verify(res->Get() == 24);
+}
+finally
+{
+	if (res != NULL)
+		OP_DELETE(res);
+}
+
+test("Out of range") leakcheck;
+	file uni dir "";
+{
+	BTree<int> b(dir, 5);
+	SearchIterator<int> *res = NULL;
+
+	res = b.SearchLast();
+
+	verify(res != NULL);
+	
+	verify(res->Empty() && res->Beginning() && res->End());
+
+	OP_DELETE(res);
+
+	verify_success(b.Insert(1));
+
+	res = b.SearchFirst();
+
+	verify(res != NULL && !res->End());
+	
+	verify(res->Get() == 1);
+
+	res->Next();
+
+	verify(res->End() && res->Error() == OpStatus::OK);
+
+	res->Next();
+
+	verify(res->Error() == OpStatus::ERR_OUT_OF_RANGE);
+}
+finally
+{
+	if (res != NULL)
+		OP_DELETE(res);
+}
+
+test("AND") leakcheck;
+	file uni dir "";
+{
+	BTree<int> b1(dir, 5, 1);
+	BTree<int> b2(dir, 6, 2);
+	SearchIterator<int> *r1;
+	SearchIterator<int> *r2;
+	AndIterator<int> res;
+	int i, value;
+
+	for (i = 0; i < 10; ++i)
+	{
+		verify_success(b1.Insert(i * 2));
+		verify_success(b2.Insert(i * 3));
+	}
+
+	r1 = b1.Search(6, operatorGE);
+	r2 = b2.Search(22, operatorLT);
+	
+	verify(r1 != NULL && r2 != NULL);
+	
+	res.Set(r1, r2);
+
+	value = 5;
+	while (!res.End())
+	{
+		verify((res.Get()) > value);
+		value = (res.Get());
+		res.Next();
+	}
+
+	verify(res.Prev());
+	verify((res.Get()) == 18);
+}
+
+test("OR") leakcheck;
+	file uni dir "";
+{
+	BTree<int> b1(dir, 5, 1);
+	BTree<int> b2(dir, 6, 2);
+	SearchIterator<int> *r1;
+	SearchIterator<int> *r2;
+	OrIterator<int> res;
+	int i, value;
+	int six = 6, twentytwo = 22;
+
+	for (i = 0; i < 10; ++i)
+	{
+		verify_success(b1.Insert(i * 2));
+		verify_success(b2.Insert(i * 3));
+	}
+
+	r1 = b1.Search(six, operatorGE);
+	r2 = b2.Search(twentytwo, operatorLT);
+	
+	verify(r1 != NULL && r2 != NULL);
+	
+	res.Set(r1, r2);
+
+	value = -1;
+	while (!res.End())
+	{
+		verify((res.Get()) > value);
+		value = (res.Get());
+		res.Next();
+	}
+
+	verify(res.Prev());
+	verify((res.Get()) == 21);
+}
+
+test("AND NOT") leakcheck;
+	file uni dir "";
+{
+	BTree<KeyPayload> b1(dir, 5, 1);
+	BTree<KeyPayload> b2(dir, 6, 2);
+	SearchIterator<KeyPayload> *r1;
+	SearchIterator<KeyPayload> *r2;
+	AndNotIterator<KeyPayload> res;
+	int i, value;
+
+	for (i = 0; i < 10; ++i)
+	{
+		verify_success(b1.Insert(KeyPayload(i * 2)));
+		verify_success(b2.Insert(KeyPayload(i * 3)));
+	}
+
+	r1 = b1.Search(KeyPayload(6), operatorGE);
+	r2 = b2.Search(KeyPayload(22), operatorLT);
+	
+	verify(r1 != NULL && r2 != NULL);
+	
+	res.Set(r1, r2);
+
+	value = 5;
+	while (!res.End())
+	{
+		verify(KeyPayload(value) < res.Get());
+		value = res.Get().GetKey();
+		verify(value % 3 != 0);
+		res.Next();
+	}
+
+	verify(res.Prev());
+	verify(res.Get().GetKey() == 16);
+}
+
+test("FilterIterator") leakcheck;
+	file uni dir "";
+{
+	BTree<KeyPayload> b(dir, 5, 1);
+	SearchIterator<KeyPayload> *r;
+	int i, value;
+
+	for (i = 0; i < 10; ++i)
+		verify_success(b.Insert(KeyPayload(i)));
+
+	r = b.Search(KeyPayload(3), operatorGE);
+	
+	verify(r != NULL);
+	
+	FilterIterator<KeyPayload> res(r, OP_NEW(EvenFilter, ()));
+	verify_success(res.Error());
+
+	value = 4;
+	while (!res.End())
+	{
+		verify(value == res.Get().GetKey());
+		value += 2;
+		res.Next();
+	}
+
+	verify(res.Prev());
+	verify(res.Get().GetKey() == 8);
+}
+

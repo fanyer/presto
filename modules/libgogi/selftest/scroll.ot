@@ -1,0 +1,315 @@
+/* -*- Mode: c++; tab-width: 4; indent-tabs-mode: t; c-basic-offset: 4 -*- */
+group "libgogi.scroll";
+
+language c++;
+
+include "modules/libgogi/mde.h";
+
+global
+{
+	class ScrollTestScreen : public MDE_Screen
+	{
+	public:
+		static const unsigned int Width = 1000;
+		static const unsigned int Height = 1000;
+		static const MDE_FORMAT Format = MDE_FORMAT_BGRA32;
+
+		MDE_BUFFER buf;
+		BOOL fast_scrolled;
+		ScrollTestScreen(void* buf_data)
+		{
+			Init(Width, Height);
+			MDE_InitializeBuffer(Width, Height, Width * MDE_GetBytesPerPixel(Format), Format, buf_data, NULL, &buf);
+			Reset();
+		}
+		void Reset() { Validate(true); fast_scrolled = FALSE; }
+		virtual void OutOfMemory() {}
+		virtual MDE_FORMAT GetFormat() { return Format; }
+		virtual MDE_BUFFER *LockBuffer() { return &buf; }
+		virtual void UnlockBuffer(MDE_Region *update_region) {}
+		virtual void ScrollPixels(const MDE_RECT &rect, int dx, int dy) { fast_scrolled = TRUE; }
+		virtual bool ScrollPixelsSupported() { return true; }
+#ifdef VEGA_OPPAINTER_SUPPORT
+		virtual class VEGAOpPainter* GetVegaPainter() { return NULL; }
+#endif // VEGA_OPPAINTER_SUPPORT
+
+		List<MDE_ScrollOperation>& GetDeferredScollOperations() { return m_deferred_scroll_operations; }
+	};
+
+	class ScrollTestView : public MDE_View
+	{
+	public:
+		ScrollTestView()
+			: m_paint_rects(0)
+			, m_paint_rect_count(0), m_paint_rects_processed(0)
+			, m_correct_rects_painted(true)
+		{}
+		void OnPaint(const MDE_RECT& rect, MDE_BUFFER*)
+		{
+			if (!m_correct_rects_painted)
+				return;
+			if (m_paint_rects_processed < m_paint_rect_count)
+			{
+				m_correct_rects_painted = MDE_RectIsIdentical(rect, m_paint_rects[m_paint_rects_processed]);
+				++ m_paint_rects_processed;
+			}
+		}
+		void SetExpectedPaintRects(MDE_RECT* rects, size_t rect_count)
+		{
+			OP_ASSERT(!m_paint_rects);
+			OP_ASSERT(!m_paint_rect_count);
+			m_paint_rects = rects;
+			m_paint_rect_count = rect_count;
+		}
+		bool CorrectRectsPainted()
+		{
+			const bool result =  m_correct_rects_painted && m_paint_rects_processed == m_paint_rect_count;
+			m_paint_rects = 0;
+			m_paint_rect_count = m_paint_rects_processed = 0;
+			m_correct_rects_painted = true;
+			return result;
+		}
+
+		MDE_RECT* m_paint_rects;
+		size_t m_paint_rect_count;
+		size_t m_paint_rects_processed;
+		bool m_correct_rects_painted;
+	};
+
+	char* buf_data;
+	ScrollTestScreen *screen;
+	MDE_View *bg_view;
+	ScrollTestView *fg_view;
+}
+
+test("Init")
+{
+	verify(screen);
+	verify(bg_view);
+	verify(fg_view);
+}
+
+test("ScrollSolidOverlap")
+	require success "Init";
+{
+	screen->Reset();
+
+	bg_view->ScrollRect(MDE_MakeRect(0, 0, 100, 100), 2, 2, true);
+	bg_view->Validate(true);
+
+	// Solid overlap shouldn't affect fast scroll
+	verify(screen->fast_scrolled);
+}
+
+test("ScrollTransparentOverlap")
+	require success "Init";
+{
+	screen->Reset();
+
+	fg_view->SetTransparent(true);
+	bg_view->ScrollRect(MDE_MakeRect(0, 0, 100, 100), 2, 2, true);
+	bg_view->Validate(true);
+
+	// Transparent overlap must unfortunately switch to slow scroll
+	verify(!screen->fast_scrolled);
+}
+
+test("ScrollFullyTransparentOverlap")
+	require success "Init";
+{
+	screen->Reset();
+
+	fg_view->SetFullyTransparent(true);
+	bg_view->ScrollRect(MDE_MakeRect(0, 0, 100, 100), 2, 2, true);
+	bg_view->Validate(true);
+
+	// Fully transparent overlap should use fast scroll
+	verify(screen->fast_scrolled);
+}
+
+test("ScrollScrollingTransparentOverlap")
+	require success "Init";
+{
+	screen->Reset();
+
+	fg_view->SetScrollingTransparent(true);
+	bg_view->ScrollRect(MDE_MakeRect(0, 0, 100, 100), 2, 2, true);
+	bg_view->Validate(true);
+
+	// Fully scrolling transparent overlap should use fast scroll
+	verify(screen->fast_scrolled);
+}
+
+test("ScrollTransparentOverlapAgain")
+	require success "Init";
+{
+	screen->Reset();
+
+	fg_view->SetFullyTransparent(false);
+	fg_view->SetScrollingTransparent(false);
+	bg_view->ScrollRect(MDE_MakeRect(0, 0, 100, 100), 2, 2, true);
+	bg_view->Validate(true);
+
+	// Switching back to just transparent should do slow scroll again
+	verify(!screen->fast_scrolled);
+}
+
+test("ScrollSolidOverlapAgain")
+	require success "Init";
+{
+	screen->Reset();
+
+	fg_view->SetTransparent(false);
+	bg_view->ScrollRect(MDE_MakeRect(0, 0, 100, 100), 2, 2, true);
+	bg_view->Validate(true);
+
+	// Switching back to solid should do fast scroll again
+	verify(screen->fast_scrolled);
+}
+
+test("Scroll - invalidation")
+	require success "Init";
+{
+	MDE_RECT invalid_rects[1];
+
+	fg_view->SetTransparent(false);
+
+	screen->Reset();
+	verify(MDE_RectIsEmpty(fg_view->m_invalid_rect));
+
+	// Single vertical scroll
+	fg_view->ScrollRect(MDE_MakeRect(0, 0, 100, 100), 0, 2, true);
+	invalid_rects[0] = MDE_MakeRect(0, 0, 100, 2);
+	fg_view->SetExpectedPaintRects(invalid_rects, 1);
+	screen->Validate(true);
+	verify(fg_view->CorrectRectsPainted());
+	verify(MDE_RectIsEmpty(fg_view->m_invalid_rect));
+
+	// Multiple vertical scrolls (without validate)
+	fg_view->ScrollRect(MDE_MakeRect(0, 0, 100, 100), 0, 2, true);
+	fg_view->ScrollRect(MDE_MakeRect(0, 0, 100, 100), 0, 2, true);
+	fg_view->ScrollRect(MDE_MakeRect(0, 0, 100, 100), 0, 2, true);
+	invalid_rects[0] = MDE_MakeRect(0, 0, 100, 6);
+	fg_view->SetExpectedPaintRects(invalid_rects, 1);
+	screen->Validate(true);
+	verify(fg_view->CorrectRectsPainted());
+
+	// Single horizontal & vertical scroll
+	fg_view->ScrollRect(MDE_MakeRect(0, 0, 100, 100), 2, 2, true);
+	invalid_rects[0] = MDE_MakeRect(0, 0, 100, 100);
+	screen->Validate(true);
+	verify(fg_view->CorrectRectsPainted());
+ }
+
+test("Scroll - with existing invalidation")
+	require success "Init";
+{
+	MDE_RECT invalid_rects[2];
+
+	fg_view->SetTransparent(false);
+
+	screen->Reset();
+	verify(MDE_RectIsEmpty(fg_view->m_invalid_rect));
+
+	// Invalidate area A and scroll area B (not intersecting)
+	fg_view->Invalidate(MDE_MakeRect(5, 5, 10, 10));
+	fg_view->ScrollRect(MDE_MakeRect(50, 0, 50, 100), 0, 2, true);
+	invalid_rects[0] = MDE_MakeRect(5, 5, 10, 10);
+	invalid_rects[1] = MDE_MakeRect(50, 0, 50, 2);
+	fg_view->SetExpectedPaintRects(invalid_rects, 2);
+	screen->Validate(true);
+	verify(fg_view->CorrectRectsPainted());
+
+	// Invalidate area A and scroll area B (A contained within B)
+	fg_view->Invalidate(MDE_MakeRect(50, 50, 10, 10));
+	fg_view->ScrollRect(MDE_MakeRect(0, 0, 100, 100), 0, 2, true);
+	invalid_rects[0] = MDE_MakeRect(50, 52, 10, 10);
+	invalid_rects[1] = MDE_MakeRect(0, 0, 100, 2);
+	fg_view->SetExpectedPaintRects(invalid_rects, 2);
+	screen->Validate(true);
+	verify(fg_view->CorrectRectsPainted());
+}
+
+test("invalidate after scroll")
+require success("Init");
+{
+	ScrollTestScreen* screen = 0;
+	ScrollTestView*   view   = 0;
+
+	screen = OP_NEW(ScrollTestScreen, (0));
+	view = OP_NEW(ScrollTestView, ());
+	verify(screen && "OOM");
+	verify(view   && "OOM");
+
+	view->SetRect(MDE_MakeRect(0, 0,
+	                           10*ScrollTestScreen::Width,
+	                           10*ScrollTestScreen::Height));
+	screen->AddChild(view);
+
+	const int dx = 10;
+	const int dy = 5;
+
+	MDE_RECT expected_rects[3];
+
+	MDE_RECT screen_rect = { 0, 0, ScrollTestScreen::Width, ScrollTestScreen::Height };
+	List<MDE_ScrollOperation>& def_scrolls = screen->GetDeferredScollOperations();
+
+	// make sure nothing's invalid
+	view->Validate(true);
+
+	verify(def_scrolls.Cardinal() == 0);
+	view->ScrollRect(screen_rect, dx, dy, true);
+	verify(def_scrolls.Cardinal() == 1);
+
+	// This invalidation is really made *after* the call to
+	// ScrollRect. The resulting invalidation rect should have taken
+	// this into account and the validated rect should be what was
+	// passed to Invalidate.
+	MDE_RECT& invalid_rect = expected_rects[0];
+	invalid_rect = MDE_MakeRect(40, 40, 10, 10);
+	view->Invalidate(invalid_rect);
+
+	MDE_RECT& fresh_side = expected_rects[1];
+	fresh_side = MDE_MakeRect(0, 0, dx, ScrollTestScreen::Height);
+
+	MDE_RECT& fresh_top = expected_rects[2];
+	fresh_top = MDE_MakeRect(dx, 0, ScrollTestScreen::Width - dx, dy);
+
+	view->SetExpectedPaintRects(expected_rects, ARRAY_SIZE(expected_rects));
+	view->Validate(true);
+	verify(view->CorrectRectsPainted());
+}
+finally
+{
+	OP_DELETE(screen); // deletes view
+}
+
+setup
+{
+	buf_data = OP_NEWA(char, ScrollTestScreen::Width*ScrollTestScreen::Height*MDE_GetBytesPerPixel(ScrollTestScreen::Format));
+	screen = buf_data ? OP_NEW(ScrollTestScreen, (buf_data)) : 0;
+
+	if (screen)
+	{
+		bg_view = OP_NEW(MDE_View, ());
+		if (bg_view)
+		{
+			bg_view->SetRect(MDE_MakeRect(10, 10, 100, 100));
+			screen->AddChild(bg_view);
+		}
+
+		fg_view = OP_NEW(ScrollTestView, ());
+		if (fg_view)
+		{
+			fg_view->SetRect(MDE_MakeRect(50, 50, 100, 100));
+			screen->AddChild(fg_view);
+			fg_view->SetZ(MDE_Z_TOP);
+		}
+	}
+}
+
+exit
+{
+	OP_DELETE(screen); // also deletes the childviews
+	OP_DELETEA(buf_data);
+}

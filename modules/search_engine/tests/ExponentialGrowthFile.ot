@@ -1,0 +1,346 @@
+group "search_engine.exponentialgrowthfile";
+
+require SEARCH_ENGINE;
+require SEARCH_ENGINE_EXPONENTIAL_GROWTH_FILE;
+
+include "modules/search_engine/tests/test_util.h";
+include "modules/search_engine/tests/MockLowLevelFile.h";
+include "modules/search_engine/ExponentialGrowthFile.h";
+include "modules/search_engine/BufferedLowLevelFile.h";
+
+test("nextExpSize")
+{
+	verify(ExponentialGrowthFile::nextExpSize(0) == 0);
+	verify(ExponentialGrowthFile::nextExpSize(1) == 1);
+	for (OpFileLength i=2; i<1000000; i++)
+	{
+		OpFileLength new_len = ExponentialGrowthFile::nextExpSize(i);
+		verify(new_len >= i);
+		verify(new_len < i*3/2);
+		while ((new_len & 1) == 0)
+			new_len >>= 1;
+		verify(new_len == 1 || new_len == 3);
+	}
+}
+
+subtest TestExponentialGrowthFile(OpLowLevelFile* wrapped_file, MockLowLevelFile* mock, BOOL buffered, BOOL delete_file)
+{
+	OpLowLevelFile* f;
+	const char* file_contents;
+	unsigned int file_length;
+	char buf[256]; /* ARRAY OK 2010-09-24 roarl */
+	OpFileLength len, pos;
+	OP_STATUS status;
+
+	f = wrapped_file;
+	if (buffered)
+	{
+		f = BufferedLowLevelFile::Create(f, status, 512);
+		verify_success(status);
+	}
+	f = ExponentialGrowthFile::Create(f, status, 64);
+	verify_success(status);
+
+	//               0.......+.......1......
+	file_contents = "Mary had a little lamb,";
+	file_length = (int)op_strlen(file_contents);
+
+	if (mock) {
+		mock->Expect("Open", Mock::Str("%d", OPFILE_UPDATE), OpStatus::OK);
+		// From SetFilePos, trying to read virtual file length...
+		if (!buffered)
+			mock->Expect("GetFilePos", Mock::Str("OpFileLength*"), Mock::Str("0, %d", OpStatus::OK));
+		mock->Expect("GetFileLength", Mock::Str("OpFileLength*"), Mock::Str("%d, %d", file_length, OpStatus::OK));
+		pos = file_length-16;
+		if (!buffered)
+		{
+			mock->Expect("SetFilePos", Mock::Str("%d, %d", pos, SEEK_FROM_START), OpStatus::OK);
+			mock->Expect("Read", Mock::Str("void*, 16, OpFileLength*"), Mock::Str("'%.16s', 16, %d", file_contents+pos, OpStatus::OK));
+			mock->Expect("SetFilePos", Mock::Str("0, %d", SEEK_FROM_START), OpStatus::OK);
+			// Now for the actual SetFilePos
+			mock->Expect("SetFilePos", Mock::Str("0, %d", SEEK_FROM_START), OpStatus::OK);
+		}
+		else
+		{
+			mock->Expect("Read", Mock::Str("void*, 512, OpFileLength*"), Mock::Str("'%s', %d, %d", file_contents, file_length, OpStatus::OK));
+		}
+	}
+
+	verify_success(f->Open(OPFILE_UPDATE));
+	verify_success(f->SetFilePos(0));
+
+	pos = 1;
+	if (mock) {
+		verify(mock->VerifyExpectations());
+
+		if (!buffered)
+		{
+			mock->Expect("SetFilePos", Mock::Str("%d, %d", (int)pos, SEEK_FROM_START), OpStatus::OK);
+			mock->Expect("GetFilePos", Mock::Str("OpFileLength*"), Mock::Str("%d, %d", (int)pos, OpStatus::OK));
+			// No call to GetFileLength
+			mock->Expect("GetFilePos", Mock::Str("OpFileLength*"), Mock::Str("%d, %d", (int)pos, OpStatus::OK)); // From Eof
+			mock->Expect("GetFilePos", Mock::Str("OpFileLength*"), Mock::Str("%d, %d", (int)pos, OpStatus::OK)); // From Read
+			mock->Expect("Read", Mock::Str("void*, 6, OpFileLength*"), Mock::Str("'%.6s', 6, %d", file_contents+pos, OpStatus::OK));
+		}
+		mock->Expect("GetFileLength", Mock::Str("OpFileLength*"), Mock::Str("%d, %d", file_length, OpStatus::OK));
+	}
+
+	verify_success(f->SetFilePos(pos));
+	verify_success(f->GetFilePos(&pos));
+	verify(pos == 1);
+	verify_success(f->GetFileLength(&len));
+	verify(len == file_length);
+	verify(f->Eof() == FALSE);
+
+	verify_success(f->Read(buf, 6, &len));
+	verify(len == 6);
+	verify(op_strncmp(buf, file_contents+pos, (size_t)len) == 0);
+	verify_success(wrapped_file->GetFileLength(&len));
+	verify(len == file_length); // Read operations should not convert the file
+
+	pos = 16;
+	if (mock) {
+		verify(mock->VerifyExpectations());
+
+		if (!buffered)
+		{
+			mock->Expect("SetFilePos", Mock::Str("%d, %d", (int)pos, SEEK_FROM_START), OpStatus::OK);
+			mock->Expect("GetFilePos", Mock::Str("OpFileLength*"), Mock::Str("%d, %d", (int)pos, OpStatus::OK)); // From Read
+			mock->Expect("Read", Mock::Str("void*, 7, OpFileLength*"), Mock::Str("'%.7s', 7, %d", file_contents+pos, OpStatus::OK));
+		}
+		mock->Expect("GetFileLength", Mock::Str("OpFileLength*"), Mock::Str("%d, %d", file_length, OpStatus::OK));
+	}
+
+	verify_success(f->SetFilePos(pos));
+	verify_success(f->Read(buf, 16, &len));
+	verify(len == 7);
+	verify(op_strncmp(buf, file_contents+pos, (size_t)len) == 0);
+	verify_success(wrapped_file->GetFileLength(&len));
+	verify(len == file_length); // Read operations should not convert the file
+
+	//               0.......+.......1......
+	file_contents = "Mary had a *HUGE* lamb,";
+	pos = 11;
+	if (mock) {
+		verify(mock->VerifyExpectations());
+
+		mock->Expect("SetFilePos", Mock::Str("%d, %d", (int)pos, SEEK_FROM_START), OpStatus::OK);
+		mock->Expect("Write", Mock::Str("'%s', %d", file_contents+pos, file_length-pos), OpStatus::OK);
+		if (!buffered)
+			mock->Expect("GetFilePos", Mock::Str("OpFileLength*"), Mock::Str("%d, %d", file_length, OpStatus::OK)); // From Write
+		mock->Expect("GetFileLength", Mock::Str("OpFileLength*"), Mock::Str("%d, %d", file_length, OpStatus::OK));
+	}
+
+	verify_success(f->SetFilePos(pos));
+	verify_success(f->Write(file_contents+pos, file_length-pos));
+	verify_success(wrapped_file->GetFileLength(&len));
+	verify(len == file_length); // Write within current file should not update the file
+	
+	if (mock) {
+		verify(mock->VerifyExpectations());
+
+		mock->Expect("Write", Mock::Str("' ', 1"), OpStatus::OK);
+		if (!buffered)
+			mock->Expect("GetFilePos", Mock::Str("OpFileLength*"), Mock::Str("%d, %d", file_length+1, OpStatus::OK)); // From Write
+		// Convert file to ExponentialGrowthFile format
+		if (!buffered)
+		{
+			mock->Expect("GetFileLength", Mock::Str("OpFileLength*"), Mock::Str("%d, %d", file_length+1, OpStatus::OK));
+			mock->Expect("GetFilePos", Mock::Str("OpFileLength*"), Mock::Str("%d, %d", file_length+1, OpStatus::OK));
+		}
+		mock->Expect("SetFileLength", Mock::Str("64"), OpStatus::OK);
+		if (!buffered)
+			mock->Expect("GetFileLength", Mock::Str("OpFileLength*"), Mock::Str("%d, %d", 64, OpStatus::OK));
+		mock->Expect("SetFilePos", Mock::Str("%d, %d", 64-16, SEEK_FROM_START), OpStatus::OK);
+		mock->Expect("Write", Mock::Str("void*, 16"), OpStatus::OK);
+		if (!buffered)
+			mock->Expect("SetFilePos", Mock::Str("%d, %d", file_length+1, SEEK_FROM_START), OpStatus::OK);
+
+		mock->Expect("GetFileLength", Mock::Str("OpFileLength*"), Mock::Str("%d, %d", 64, OpStatus::OK));
+	}
+
+	// Writing one more byte should convert the file and expand it to the minimum size
+	verify_success(f->Write(" ", 1));
+	verify_success(wrapped_file->GetFileLength(&len));
+	verify(len == 64);
+
+	//               0.......+.......1......+.......2.......+.......3.......+.......4.......+.......5.......+.......6.......+.....
+	file_contents = "Mary had a little lamb, Its fleece was white as snow; And everywhere that Mary went, The lamb was sure to go.";
+	file_length = (int)op_strlen(file_contents);
+	len = 64-16+1;
+	if (mock) {
+		verify(mock->VerifyExpectations());
+
+		mock->Expect("SetFilePos", Mock::Str("0, %d", SEEK_FROM_START), OpStatus::OK);
+		mock->Expect("Write", Mock::Str("'%.*s', %d", (int)len, file_contents, (int)len), OpStatus::OK);
+		if (!buffered)
+			mock->Expect("GetFilePos", Mock::Str("OpFileLength*"), Mock::Str("%d, %d", (int)len, OpStatus::OK)); // From Write
+		// Writing 1 byte into the metadata should expanded the file half-way to the next power of 2
+		if (!buffered)
+		{
+			mock->Expect("GetFileLength", Mock::Str("OpFileLength*"), Mock::Str("%d, %d", 64, OpStatus::OK));
+			mock->Expect("GetFilePos", Mock::Str("OpFileLength*"), Mock::Str("%d, %d", (int)len, OpStatus::OK));
+		}
+		mock->Expect("SetFileLength", Mock::Str("96"), OpStatus::OK);
+		if (!buffered)
+			mock->Expect("GetFileLength", Mock::Str("OpFileLength*"), Mock::Str("%d, %d", 96, OpStatus::OK));
+		mock->Expect("SetFilePos", Mock::Str("%d, %d", 96-16, SEEK_FROM_START), OpStatus::OK);
+		mock->Expect("Write", Mock::Str("void*, 16"), OpStatus::OK);
+		if (!buffered)
+			mock->Expect("SetFilePos", Mock::Str("%d, %d", (int)len, SEEK_FROM_START), OpStatus::OK);
+
+		mock->Expect("GetFileLength", Mock::Str("OpFileLength*"), Mock::Str("%d, %d", 96, OpStatus::OK));
+	}
+
+	pos = 0;
+	verify_success(f->SetFilePos(pos));
+	verify_success(f->Write(file_contents, len));
+	verify_success(wrapped_file->GetFileLength(&len));
+	verify(len == 96);
+
+	if (mock) {
+		verify(mock->VerifyExpectations());
+
+		if (buffered)
+			mock->Expect("SetFilePos", Mock::Str("%d, %d", 64-16+1, SEEK_FROM_START), OpStatus::OK);
+		mock->Expect("Write", Mock::Str("'%s', %d", file_contents + 64-16+1, file_length-(64-16+1)), OpStatus::OK);
+		if (!buffered)
+			mock->Expect("GetFilePos", Mock::Str("OpFileLength*"), Mock::Str("%d, %d", file_length, OpStatus::OK)); // From Write
+		// File should be expanded to next power of 2
+		if (!buffered)
+		{
+			mock->Expect("GetFileLength", Mock::Str("OpFileLength*"), Mock::Str("%d, %d", 96, OpStatus::OK));
+			mock->Expect("GetFilePos", Mock::Str("OpFileLength*"), Mock::Str("%d, %d", file_length, OpStatus::OK));
+		}
+		mock->Expect("SetFileLength", Mock::Str("128"), OpStatus::OK);
+		if (!buffered)
+			mock->Expect("GetFileLength", Mock::Str("OpFileLength*"), Mock::Str("%d, %d", 128, OpStatus::OK));
+		mock->Expect("SetFilePos", Mock::Str("%d, %d", 128-16, SEEK_FROM_START), OpStatus::OK);
+		mock->Expect("Write", Mock::Str("void*, 16"), OpStatus::OK);
+		if (!buffered)
+			mock->Expect("SetFilePos", Mock::Str("%d, %d", file_length, SEEK_FROM_START), OpStatus::OK);
+
+		mock->Expect("GetFileLength", Mock::Str("OpFileLength*"), Mock::Str("%d, %d", 128, OpStatus::OK));
+	}
+
+	verify_success(f->Write(file_contents + 64-16+1, file_length-(64-16+1)));
+	verify_success(f->GetFileLength(&len));
+	verify(len == file_length);
+	verify_success(wrapped_file->GetFileLength(&len));
+	verify(len == 128);
+	
+	// With a mocked file, we can simulate out of disk space
+	if (mock) {
+		verify(mock->VerifyExpectations());
+
+		if (buffered)
+			mock->Expect("SetFilePos", Mock::Str("%d, %d", file_length, SEEK_FROM_START), OpStatus::OK);
+		mock->Expect("Write", Mock::Str("'    ', %d", 128-16+1 - file_length), OpStatus::OK);
+		if (!buffered)
+			mock->Expect("GetFilePos", Mock::Str("OpFileLength*"), Mock::Str("%d, %d", 128-16+1, OpStatus::OK)); // From Write
+		// File should be expanded to next power of 2
+		if (!buffered)
+		{
+			mock->Expect("GetFileLength", Mock::Str("OpFileLength*"), Mock::Str("%d, %d", 128, OpStatus::OK));
+			mock->Expect("GetFilePos", Mock::Str("OpFileLength*"), Mock::Str("%d, %d", 128-16+1, OpStatus::OK));
+		}
+		mock->Expect("SetFileLength", Mock::Str("192"), OpStatus::ERR); // Out of disk space
+		mock->Expect("SetFileLength", Mock::Str("%d", 128-16+1), OpStatus::OK);
+		if (!buffered)
+			mock->Expect("SetFilePos", Mock::Str("%d, %d", 128-16+1, SEEK_FROM_START), OpStatus::OK);
+
+		verify_success(f->Write("    ", (128-16+1)-file_length));
+		verify_success(f->GetFileLength(&len));
+		verify(len == 128-16+1);
+
+		verify(mock->VerifyExpectations());
+	}
+
+	//               0.......+.......1......
+	file_contents = "Mary had a little lamb,";
+	file_length = (int)op_strlen(file_contents);
+
+	if (mock) {
+		// File should be shrinked to next power of 2
+		if (!buffered)
+			mock->Expect("GetFileLength", Mock::Str("OpFileLength*"), Mock::Str("%d, %d", 128-16+1, OpStatus::OK));
+		mock->Expect("SetFileLength", Mock::Str("64"), OpStatus::OK);
+
+		mock->Expect("GetFileLength", Mock::Str("OpFileLength*"), Mock::Str("%d, %d", 64, OpStatus::OK));
+	}
+
+	verify_success(f->SetFileLength(file_length));
+	verify_success(f->GetFileLength(&len));
+	verify(len == file_length);
+	verify_success(wrapped_file->GetFileLength(&len));
+	verify(len == 64);
+
+	if (mock) {
+		verify(mock->VerifyExpectations());
+	
+		if (!buffered)
+			mock->Expect("GetFileLength", Mock::Str("OpFileLength*"), Mock::Str("%d, %d", 64, OpStatus::OK));
+		mock->Expect("SetFilePos", Mock::Str("%d, %d", 64-16, SEEK_FROM_START), OpStatus::OK);
+		mock->Expect("Write", Mock::Str("void*, 16"), OpStatus::OK);
+		mock->Expect("Close", NULL, OpStatus::OK);
+	}
+
+	f->Close();
+
+	if (mock)
+		verify(mock->VerifyExpectations());
+}
+finally
+{
+	if (mock)
+		mock->Expect("~MockLowLevelFile");
+	if (delete_file)
+	{
+		f->Close();
+		f->Delete();
+	}
+	OP_DELETE(f);
+	// Now, e too is gone, so we cannot mock->VerifyExpectations()
+}
+
+test("ExponentialGrowthFile, mocked virtual file")
+{
+	MockLowLevelFile* mock = OP_NEW(MockLowLevelFile, ());
+	verify(TestExponentialGrowthFile(mock, mock, FALSE, FALSE));
+}
+
+test("ExponentialGrowthFile, actual file")
+	file uni test_file_name "data/EGF_test.txt";
+{
+	OpLowLevelFile* f;
+
+	verify_success(OpLowLevelFile::Create(&f, test_file_name));
+	verify_success(f->Open(OPFILE_WRITE));
+	verify_success(f->Write("Mary had a little lamb,", 23));
+	verify_success(f->Close());
+	OP_DELETE(f);
+
+	verify_success(OpLowLevelFile::Create(&f, test_file_name));
+	verify(TestExponentialGrowthFile(f, NULL, FALSE, TRUE));
+}
+
+test("Buffered ExponentialGrowthFile, mocked virtual file")
+{
+	MockLowLevelFile* mock = OP_NEW(MockLowLevelFile, ());
+	verify(TestExponentialGrowthFile(mock, mock, TRUE, FALSE));
+}
+
+test("Buffered ExponentialGrowthFile, actual file")
+	file uni test_file_name "data/EGF_test.txt";
+{
+	OpLowLevelFile* f;
+
+	verify_success(OpLowLevelFile::Create(&f, test_file_name));
+	verify_success(f->Open(OPFILE_WRITE));
+	verify_success(f->Write("Mary had a little lamb,", 23));
+	verify_success(f->Close());
+	OP_DELETE(f);
+
+	verify_success(OpLowLevelFile::Create(&f, test_file_name));
+	verify(TestExponentialGrowthFile(f, NULL, TRUE, TRUE));
+}

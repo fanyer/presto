@@ -1,0 +1,188 @@
+// svgutils.ot
+group "svg.utils";
+
+require SVG_SUPPORT;
+require init;
+
+include "modules/svg/src/svgpch.h";
+include "modules/svg/src/OpBpath.h";
+include "modules/svg/src/SVGUtils.h";
+include "modules/svg/src/SVGTraverse.h";
+include "modules/svg/src/SVGUtils.h";
+include "modules/svg/src/SVGDocumentContext.h";
+include "modules/display/vis_dev.h";
+include "modules/svg/src/SVGManagerImpl.h";
+include "modules/svg/src/AttrValueStore.h";
+include "modules/svg/src/SVGImageImpl.h";
+include "modules/svg/src/SVGTextTraverse.h";
+include "modules/doc/frm_doc.h";
+include "modules/doc/searchinfo.h";
+include "modules/dochand/fdelm.h";
+
+language c++;
+
+subtest ConvertUnit(SVGValueContext vcxt, SVGNumber value, int unit)
+{
+	SVGLength len(value, unit);
+	SVGNumber user_units = SVGUtils::ResolveLength(len, SVGLength::SVGLENGTH_OTHER, vcxt);
+	SVGNumber resolved = SVGUtils::ConvertToUnit(user_units, unit, SVGLength::SVGLENGTH_OTHER, vcxt);
+	verify(resolved.Close(value));
+}
+
+test("Unit conversion")
+{
+	SVGValueContext vcxt(235, 100, 20, 16, 20);
+
+	verify(ConvertUnit(vcxt, 10, CSS_PX));
+	verify(ConvertUnit(vcxt, 10, CSS_PT));
+	verify(ConvertUnit(vcxt, 10, CSS_PC));
+	verify(ConvertUnit(vcxt, 10, CSS_CM));
+	verify(ConvertUnit(vcxt, 10, CSS_MM));
+	verify(ConvertUnit(vcxt, 10, CSS_IN));
+	verify(ConvertUnit(vcxt, 10, CSS_NUMBER));
+	verify(ConvertUnit(vcxt, 5, CSS_EM));
+	verify(ConvertUnit(vcxt, 5, CSS_REM));
+	verify(ConvertUnit(vcxt, 5, CSS_EX));
+	verify(ConvertUnit(vcxt, 35, CSS_PERCENTAGE));
+}
+
+svg {
+//! <?xml version="1.0" encoding="UTF-8"?>
+//! <svg xmlns='http://www.w3.org/2000/svg'
+//!      xmlns:xlink='http://www.w3.org/1999/xlink'
+//!      viewBox='0 0 480 360' width='480' height='360'>
+//!    <svg x='120' y='90' width='240' height='180' id='sub1'>
+//!         <rect width='100' height='100'/>
+//!    </svg>
+//!    <rect width='100' height='100'/>
+//!    <use xlink:href='#sub1' width='100' height='100'/>
+//!    <animation id='anim' width='120' height='90'
+//!		xlink:href='data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%3E%0D%0A%09%3Ccircle%20id%3D%22c%22%20cx%3D%22.5%22%20cy%3D%22.5%22%20r%3D%22.5%22%20fill%3D%22red%22%2F%3E%0D%0A%3C%2Fsvg%3E'/>
+//! </svg>
+};
+
+test("Viewport calculation")
+{
+	HTML_Element* r1 = find_element("rect", 1);
+	SVGDocumentContext* doc_ctx = AttrValueStore::GetSVGDocumentContext(r1);
+	verify(doc_ctx);
+	SVGNumberPair vp, vp_xy;
+
+	verify_success(SVGUtils::GetViewportForElement(r1, doc_ctx, vp, &vp_xy));
+
+	verify(vp.x == SVGNumber(240));
+	verify(vp.y == SVGNumber(180));
+
+	verify(vp_xy.x == SVGNumber(120));
+	verify(vp_xy.y == SVGNumber(90));
+
+	HTML_Element* r2 = find_element("rect", 2);
+
+	verify_success(SVGUtils::GetViewportForElement(r2, doc_ctx, vp));
+
+	verify(vp.x == SVGNumber(480));
+	verify(vp.y == SVGNumber(360));
+}
+
+test("Viewport calculation (use, XFAIL)")
+	disabled;
+{
+	HTML_Element* use_elm = find_element("use", 1);
+
+	// The shadow tree should be built during parsing
+	verify(SVGUtils::HasBuiltNormalShadowTree(use_elm));
+
+	// Find rect within svg pointed to by use
+	HTML_Element* shadow_rect = use_elm->FirstChild();
+	while (shadow_rect)
+	{
+		HTML_Element* layouted_elm = SVGUtils::GetElementToLayout(shadow_rect);
+		if (layouted_elm->IsMatchingType(Markup::SVGE_RECT, NS_SVG))
+			break;
+
+		shadow_rect = shadow_rect->Next();
+	}
+
+	verify(shadow_rect);
+	verify(SVGUtils::IsShadowNode(shadow_rect));
+
+	SVGDocumentContext* doc_ctx = AttrValueStore::GetSVGDocumentContext(use_elm);
+	verify(doc_ctx);
+	SVGNumberPair vp;
+
+	verify_success(SVGUtils::GetViewportForElement(shadow_rect, doc_ctx, vp));
+
+	verify(vp.x == SVGNumber(100));
+	verify(vp.y == SVGNumber(100));
+}
+
+test("Viewport calculation (animation, XFAIL)")
+	disabled;
+{
+	HTML_Element* anim_root = find_element("animation", 1);
+
+	// Get animation-document
+	FramesDocElm* frame = state.doc->GetFrmDocElmByHTML(anim_root);
+	verify(frame);
+	FramesDocument* anim_doc = frame->GetCurrentDoc();
+	verify(anim_doc);
+	LogicalDocument* anim_logdoc = anim_doc->GetLogicalDocument();
+	verify(anim_logdoc);
+
+	// Find circle in animation-document
+	HTML_Element* circle_elm = anim_logdoc->GetRoot();
+	while (circle_elm)
+	{
+		if (circle_elm->IsMatchingType(Markup::SVGE_CIRCLE, NS_SVG))
+			break;
+
+		circle_elm = circle_elm->Next();
+	}
+
+	verify(circle_elm);
+	verify(circle_elm->GetId());
+	verify(uni_strcmp(circle_elm->GetId(), "c") == 0);
+
+	SVGDocumentContext* doc_ctx = AttrValueStore::GetSVGDocumentContext(circle_elm);
+	verify(doc_ctx);
+	SVGNumberPair vp;
+
+	verify_success(SVGUtils::GetViewportForElement(circle_elm, doc_ctx, vp));
+
+	verify(vp.x == SVGNumber(120));
+	verify(vp.y == SVGNumber(90));
+}
+
+xml {
+//! <?xml version="1.0" encoding="UTF-8"?>
+//! <svg xmlns='http://www.w3.org/2000/svg'>
+//!   <rect width="100%" height="100%" fill="lime"/>
+//! </svg>
+};
+
+test("Invalidation state upgrading")
+{
+	HTML_Element* rect = find_element("rect", 1);
+
+	SVGElementContext* elem_context = AttrValueStore::AssertSVGElementContext(rect);
+	verify(elem_context);
+
+	elem_context->ClearInvalidState();
+	verify(elem_context->GetInvalidState() == NOT_INVALID);
+
+	elem_context->AddInvalidState(INVALID_SUBTREE);
+	verify(elem_context->GetInvalidState() == INVALID_SUBTREE);
+
+	elem_context->AddInvalidState(INVALID_STRUCTURE);
+	verify(elem_context->GetInvalidState() == INVALID_STRUCTURE);
+
+	elem_context->AddInvalidState(INVALID_FONT_METRICS);
+	verify(elem_context->GetInvalidState() == INVALID_FONT_METRICS);
+
+	elem_context->AddInvalidState(INVALID_ADDED);
+	verify(elem_context->GetInvalidState() == INVALID_ADDED);
+
+	// Make sure it won't downgrade
+	elem_context->AddInvalidState(INVALID_SUBTREE);
+	verify(elem_context->GetInvalidState() == INVALID_ADDED);
+}

@@ -1,0 +1,543 @@
+/* -*- Mode: c++; tab-width: 4; indent-tabs-mode: t; c-basic-offset: 4 -*-
+**
+** Copyright (C) 2007-2010 Opera Software ASA.  All rights reserved.
+**
+** This file is part of the Opera web browser.  It may not be distributed
+** under any circumstances.
+*/
+
+group "unicode.segmenter";
+require USE_UNICODE_SEGMENTATION;
+
+include "modules/unicode/unicode_segmenter.h";
+
+global
+{
+	const uni_char *base_tests[7];
+}
+
+setup
+{
+	// Data for the basic test
+	base_tests[0] = UNI_L("a\x0323\x0301");		// small a, combining dot below, combining ring above
+	base_tests[1] = UNI_L(" ");					// space
+	base_tests[2] = UNI_L("b\x0323\x0301");		// small b, combining dot below, combining ring above
+	base_tests[3] = UNI_L("c");					// small c
+	base_tests[4] = UNI_L("\x0323\x0301 d");	// combining dot below, combining ring above, space, small d
+	base_tests[5] = UNI_L("\x0323\x0301 e");	// combining dot below, combining ring above, space, small e
+	base_tests[6] = UNI_L("\0");				// end of text
+}
+
+subtest test_boundaries(UnicodeSegmenter::Type type, const int * boundaries)
+{
+	const uni_char **current_base = base_tests;
+	const uni_char **last_base = base_tests + 7;
+	int current_index = 0, current_baseoffset = 0;
+	const int * boundary = boundaries;
+
+	uni_char prev_char = 0;
+
+	UnicodeSegmenter seg(type);
+	while (current_base < last_base)
+	{
+		int current_len = static_cast<int>(uni_strlen(*current_base + current_baseoffset));
+		if ((*current_base)[0] == 0)
+		{
+			// Count NUL in last string
+			current_len = 1;
+		}
+
+		int retval = seg.FindBoundary(*current_base + current_baseoffset, current_len);
+//output("\nFindBoundary(\"%s\", %d, %d) returned %d%s, expected %s%d(%d)%s ",
+//ST_down(*current_base + current_baseoffset), current_len, type,
+//retval, (retval == current_len ? " (no boundary)" : ""),
+//(*boundary < 0 ? "no boundary " : ""), (*boundary < 0 ? *boundary : *boundary - current_index), *boundary, (retval == current_len ? " (ignored, waiting for next call)" : ""));
+		if (retval < current_len || (retval > *boundary - current_index && *boundary != -1))
+		{
+			verify(seg.LastChar() == *(*current_base + current_baseoffset + retval));
+			verify(seg.LastClass() == Unicode::GetCharacterClass(seg.LastChar()));
+
+			// Returned offset within current string
+			if (current_index + retval != *boundary)
+			{
+				// Output a friendly error
+				output("\nFindBoundary(\"%s\", %d, %d) returned %d, expected %d ",
+				       ST_down(*current_base + current_baseoffset), current_len,
+					   retval, *boundary - current_index);
+			}
+			verify(current_index + retval == *boundary);
+
+			// All boundaries are grapheme cluster boundaries
+			BOOL is_grapheme_boundary =
+				seg.IsGraphemeClusterBoundary(prev_char, *(*current_base + current_baseoffset + retval));
+			if (!is_grapheme_boundary)
+			{
+				// Output a friendly error
+				output("\nExpected grapheme cluster boundary between U+%04X and U+%04X ",
+				       prev_char, *(*current_base + current_baseoffset + retval));
+			}
+			verify(is_grapheme_boundary);
+
+			// Remember previous character
+			if (retval)
+			{
+				prev_char = *(*current_base + retval - 1);
+			}
+
+			// Advance test string offset
+			current_baseoffset += retval;
+
+			// Advance to next boundary
+			++ boundary;
+		}
+		else
+		{
+			// Remember previous character
+			prev_char = *(*current_base + current_baseoffset + current_len - 1);
+
+			// Advance to next string
+			++ current_base;
+			current_baseoffset = 0;
+		}
+
+		// Advance check string offset
+		current_index += retval;
+	}
+
+	// Make sure we found everything
+	verify(*boundary == -1);
+}
+
+test("Basic test - grapheme cluster boundary")
+{
+	// Grapheme cluster boundaries at indices:
+	int boundaries[] =
+	{ 0, 3, 4, 7, 10, 11, 14, 15, 16, -1 };
+
+	verify(test_boundaries(UnicodeSegmenter::Grapheme, boundaries));
+}
+
+test("Basic test - word boundary")
+{
+	// Word boundaries at indices:
+	int boundaries[] =
+	{ 0, 3, 4, 10, 11, 14, 15, 16, -1 };
+
+	verify(test_boundaries(UnicodeSegmenter::Word, boundaries));
+}
+
+test("Basic test - sentence boundary")
+{
+	// Sentence boundaries at indices:
+	int boundaries[] =
+	{ 0, 16, -1 };
+
+	verify(test_boundaries(UnicodeSegmenter::Sentence, boundaries));
+}
+
+test("Grapheme cluster boundary check GB3")
+{
+	// GB3: Do not break between a CR and a LF.
+	verify(!UnicodeSegmenter::IsGraphemeClusterBoundary(0x0D, 0x0A)); // CR × LF
+}
+
+test("Grapheme cluster boundary check GB4")
+{
+	// GB4: Otherwise, break before and after controls.
+	verify( UnicodeSegmenter::IsGraphemeClusterBoundary(0xAD, 0x1234)); // Control ÷
+	verify( UnicodeSegmenter::IsGraphemeClusterBoundary(0x0D, 0x2345)); // CR ÷
+	verify( UnicodeSegmenter::IsGraphemeClusterBoundary(0x0A, 0x3456)); // LF ÷
+}
+
+test("Grapheme cluster boundary check GB4")
+{
+	// GB5: Otherwise, break before and after controls.
+	verify( UnicodeSegmenter::IsGraphemeClusterBoundary(0x1234, 0x2029)); // ÷ Control
+	verify( UnicodeSegmenter::IsGraphemeClusterBoundary(0x2345, 0x0D)); // ÷ CR
+	verify( UnicodeSegmenter::IsGraphemeClusterBoundary(0x3456, 0x0A)); // ÷ LF
+}
+
+test("Grapheme cluster boundary check GB6")
+{
+	// GB6: Do not break Hangul syllable
+	verify(!UnicodeSegmenter::IsGraphemeClusterBoundary(0x1111, 0x1155)); // L × L
+	verify(!UnicodeSegmenter::IsGraphemeClusterBoundary(0x1122, 0x1166)); // L × V
+	verify(!UnicodeSegmenter::IsGraphemeClusterBoundary(0x1133, 0xAC00)); // L × LV
+	verify(!UnicodeSegmenter::IsGraphemeClusterBoundary(0x1144, 0xAC01)); // L × LVT
+}
+
+test("Grapheme cluster boundary check GB7")
+{
+	// GB7: Do not break Hangul syllable
+	verify(!UnicodeSegmenter::IsGraphemeClusterBoundary(0xAC1C, 0x1199)); // LV × V
+	verify(!UnicodeSegmenter::IsGraphemeClusterBoundary(0xAC37, 0x11AA)); // LV × T
+	verify(!UnicodeSegmenter::IsGraphemeClusterBoundary(0x1177, 0x11A2)); // V × V
+	verify(!UnicodeSegmenter::IsGraphemeClusterBoundary(0x1188, 0x11BB)); // V × T
+}
+
+test("Grapheme cluster boundary check GB8")
+{
+	// GB8: Do not break Hangul syllable
+	verify(!UnicodeSegmenter::IsGraphemeClusterBoundary(0xAC02, 0x11EE)); // LVT × T
+	verify(!UnicodeSegmenter::IsGraphemeClusterBoundary(0xAC03, 0x11F9)); // LVT × T
+	verify(!UnicodeSegmenter::IsGraphemeClusterBoundary(0x11CC, 0x11A8)); // T × T
+	verify(!UnicodeSegmenter::IsGraphemeClusterBoundary(0x11DD, 0x11C0)); // T × T
+}
+
+test("Grapheme cluster boundary check GB9")
+{
+	// GB9: Do not break before extending characters
+	verify(!UnicodeSegmenter::IsGraphemeClusterBoundary('A', 0x20DD)); // × Extend (Me)
+	verify(!UnicodeSegmenter::IsGraphemeClusterBoundary('A', 0x20E9)); // × Extend (Mn)
+//	verify(!UnicodeSegmenter::IsGraphemeClusterBoundary('A', 0x0CC2)); // × Extend (Other_Grapheme_Extend)
+//	verify(!UnicodeSegmenter::IsGraphemeClusterBoundary('A', 0x200D)); // × Extend (Other_Grapheme_Extend)
+}
+
+test("Grapheme cluster boundary check GB10")
+{
+	// GB10:Otherwise, break anywhere
+	verify( UnicodeSegmenter::IsGraphemeClusterBoundary(0x1234, 0x2345));
+	verify( UnicodeSegmenter::IsGraphemeClusterBoundary(0x2345, 0x3456));
+	verify( UnicodeSegmenter::IsGraphemeClusterBoundary(0x0007, 0x5678));
+	verify( UnicodeSegmenter::IsGraphemeClusterBoundary('A', 'B'));
+}
+
+test("Word boundary check WB1")
+{
+	UnicodeSegmenter seg(UnicodeSegmenter::Word);
+	verify(seg.FindBoundary(UNI_L(""), 1) == 0);
+}
+
+test("Word boundary check WB2")
+{
+	UnicodeSegmenter seg(UnicodeSegmenter::Word);
+	verify(seg.FindBoundary(UNI_L(" "), 2) == 0);
+	verify(seg.FindBoundary(UNI_L(" "), 2) == 1);
+}
+
+test("Word boundary check WB3")
+{
+	UnicodeSegmenter seg(UnicodeSegmenter::Word);
+	verify(seg.FindBoundary(UNI_L("\x0D\x0A "), 3) == 0);
+	verify(seg.FindBoundary(UNI_L("\x0D\x0A "), 3) == 2);
+}
+
+test("Word boundary check WB3a / WB3b")
+{
+	UnicodeSegmenter seg(UnicodeSegmenter::Word);
+	verify(seg.FindBoundary(UNI_L("\x0A\x0A "), 3) == 0);
+	verify(seg.FindBoundary(UNI_L("\x0A\x0A "), 3) == 1);
+}
+
+test("Word boundary check WB4")
+{
+	UnicodeSegmenter seg(UnicodeSegmenter::Word);
+	verify(seg.FindBoundary(UNI_L("a\x0323 "), 3) == 0);
+	verify(seg.FindBoundary(UNI_L("a\x0323 "), 3) == 2);
+}
+
+test("Word boundary check WB5")
+{
+	UnicodeSegmenter seg(UnicodeSegmenter::Word);
+	verify(seg.FindBoundary(UNI_L("XY "), 3) == 0);
+	verify(seg.FindBoundary(UNI_L("XY "), 3) == 2);
+}
+
+test("Word boundary check WB6--WB7")
+{
+	UnicodeSegmenter seg(UnicodeSegmenter::Word);
+	verify(seg.FindBoundary(UNI_L("n't "), 4) == 0);
+	verify(seg.FindBoundary(UNI_L("n't "), 4) == 3);
+
+	UnicodeSegmenter seg2(UnicodeSegmenter::Word);
+	verify(seg2.FindBoundary(UNI_L("n:t "), 4) == 0);
+	verify(seg2.FindBoundary(UNI_L("n:t "), 4) == 3);
+}
+
+test("Word boundary check WB8")
+{
+	UnicodeSegmenter seg(UnicodeSegmenter::Word);
+	verify(seg.FindBoundary(UNI_L("33 "), 3) == 0);
+	verify(seg.FindBoundary(UNI_L("33 "), 3) == 2);
+}
+
+test("Word boundary check WB9")
+{
+	UnicodeSegmenter seg(UnicodeSegmenter::Word);
+	verify(seg.FindBoundary(UNI_L("A3 "), 3) == 0);
+	verify(seg.FindBoundary(UNI_L("A3 "), 3) == 2);
+}
+
+test("Word boundary check WB10")
+{
+	UnicodeSegmenter seg(UnicodeSegmenter::Word);
+	verify(seg.FindBoundary(UNI_L("3a "), 3) == 0);
+	verify(seg.FindBoundary(UNI_L("3a "), 3) == 2);
+}
+
+test("Word boundary check WB11--WB12")
+{
+	UnicodeSegmenter seg(UnicodeSegmenter::Word);
+	verify(seg.FindBoundary(UNI_L("3.2 "), 4) == 0);
+	verify(seg.FindBoundary(UNI_L("3.2 "), 4) == 3);
+
+	UnicodeSegmenter seg2(UnicodeSegmenter::Word);
+	verify(seg2.FindBoundary(UNI_L("3,2 "), 4) == 0);
+	verify(seg2.FindBoundary(UNI_L("3,2 "), 4) == 3);
+}
+
+test("Word boundary check WB13")
+{
+	UnicodeSegmenter seg(UnicodeSegmenter::Word);
+	verify(seg.FindBoundary(UNI_L("\x30A1\x30A1 "), 3) == 0);
+	verify(seg.FindBoundary(UNI_L("\x30A1\x30A1 "), 3) == 2);
+}
+
+test("Word boundary check WB13a")
+{
+	UnicodeSegmenter seg(UnicodeSegmenter::Word);
+	verify(seg.FindBoundary(UNI_L("A_ "), 3) == 0);
+	verify(seg.FindBoundary(UNI_L("A_ "), 3) == 2);
+}
+
+test("Word boundary check WB13b")
+{
+	UnicodeSegmenter seg(UnicodeSegmenter::Word);
+	verify(seg.FindBoundary(UNI_L("_A "), 3) == 0);
+	verify(seg.FindBoundary(UNI_L("_A "), 3) == 2);
+}
+
+
+test("Word boundary check WB14")
+{
+	UnicodeSegmenter seg(UnicodeSegmenter::Word);
+	verify(seg.FindBoundary(UNI_L("\x3400\x3400 "), 3) == 0);
+	verify(seg.FindBoundary(UNI_L("\x3400\x3400 "), 3) == 1);
+}
+
+test("Word boundary tailoring - semicolon as separator (ALetter)")
+{
+	UnicodeSegmenter seg(UnicodeSegmenter::Word);
+	verify(seg.FindBoundary(UNI_L("Word;Word"), 9) == 0);
+	verify(seg.FindBoundary(UNI_L("Word;Word"), 9) == 4);
+}
+
+test("Word boundary tailoring - semicolon as separator (Numeric)")
+{
+	UnicodeSegmenter seg(UnicodeSegmenter::Word);
+	verify(seg.FindBoundary(UNI_L("1234;1234"), 9) == 0);
+	verify(seg.FindBoundary(UNI_L("1234;1234"), 9) == 4);
+}
+
+test("Word boundary tailoring - semicolon as separator (ALetter + Numeric)")
+{
+	UnicodeSegmenter seg(UnicodeSegmenter::Word);
+	verify(seg.FindBoundary(UNI_L("ABC1;ABC2"), 9) == 0);
+	verify(seg.FindBoundary(UNI_L("ABC1;ABC2"), 9) == 4);
+}
+
+test("Word boundary (non-BMP)")
+{
+	UnicodeSegmenter seg(UnicodeSegmenter::Word);
+	verify(seg.FindBoundary(UNI_L("\xD800\xDC00;\xD800\xDC00"), 9) == 0);
+	verify(seg.FindBoundary(UNI_L("\xD800\xDC00;\xD800\xDC00"), 9) == 2);
+}
+
+test("Sentence boundary check SB1")
+{
+	UnicodeSegmenter seg(UnicodeSegmenter::Sentence);
+	verify(seg.FindBoundary(UNI_L(""), 1) == 0);
+}
+
+test("Sentence boundary check SB2")
+{
+	UnicodeSegmenter seg(UnicodeSegmenter::Sentence);
+	verify(seg.FindBoundary(UNI_L(" "), 2) == 0);
+	verify(seg.FindBoundary(UNI_L(" "), 2) == 1);
+}
+
+test("Sentence boundary check SB3")
+{
+	UnicodeSegmenter seg(UnicodeSegmenter::Sentence);
+	verify(seg.FindBoundary(UNI_L("\x0D\x0A "), 3) == 0);
+	verify(seg.FindBoundary(UNI_L("\x0D\x0A "), 3) == 3);
+}
+
+test("Sentence boundary check SB4")
+{
+	UnicodeSegmenter seg(UnicodeSegmenter::Sentence);
+	verify(seg.FindBoundary(UNI_L("\x2029 "), 2) == 0);
+	verify(seg.FindBoundary(UNI_L("\x2029 "), 2) == 1);
+
+	UnicodeSegmenter seg2(UnicodeSegmenter::Sentence);
+	verify(seg2.FindBoundary(UNI_L("\x0D\x0D "), 2) == 0);
+	verify(seg2.FindBoundary(UNI_L("\x0D\x0D "), 2) == 1);
+
+	UnicodeSegmenter seg3(UnicodeSegmenter::Sentence);
+	verify(seg3.FindBoundary(UNI_L("\x0A\x0A "), 2) == 0);
+	verify(seg3.FindBoundary(UNI_L("\x0A\x0A "), 2) == 1);
+}
+
+test("Sentence boundary check SB5")
+{
+	UnicodeSegmenter seg(UnicodeSegmenter::Sentence);
+	verify(seg.FindBoundary(UNI_L("a\x200D"), 3) == 0);
+	verify(seg.FindBoundary(UNI_L("a\x200D"), 3) == 2);
+}
+
+
+test("Sentence boundary check SB6")
+{
+	UnicodeSegmenter seg(UnicodeSegmenter::Sentence);
+	verify(seg.FindBoundary(UNI_L(".9"), 3) == 0);
+	verify(seg.FindBoundary(UNI_L(".9"), 3) == 2);
+}
+
+
+test("Sentence boundary check SB7")
+{
+	UnicodeSegmenter seg(UnicodeSegmenter::Sentence);
+	verify(seg.FindBoundary(UNI_L("U.S"), 4) == 0);
+	verify(seg.FindBoundary(UNI_L("U.S"), 4) == 3);
+}
+
+
+test("Sentence boundary check SB8")
+{
+	UnicodeSegmenter seg(UnicodeSegmenter::Sentence);
+	verify(seg.FindBoundary(UNI_L(".) f"), 5) == 0);
+	verify(seg.FindBoundary(UNI_L(".) f"), 5) == 4);
+}
+
+
+test("Sentence boundary check SB8a")
+{
+	UnicodeSegmenter seg(UnicodeSegmenter::Sentence);
+	verify(seg.FindBoundary(UNI_L("!) !"), 5) == 0);
+	verify(seg.FindBoundary(UNI_L("!) !"), 5) == 4);
+
+	UnicodeSegmenter seg2(UnicodeSegmenter::Sentence);
+	verify(seg2.FindBoundary(UNI_L(".) ."), 5) == 0);
+	verify(seg2.FindBoundary(UNI_L(".) ."), 5) == 4);
+
+	UnicodeSegmenter seg3(UnicodeSegmenter::Sentence);
+	verify(seg3.FindBoundary(UNI_L(".) !"), 5) == 0);
+	verify(seg3.FindBoundary(UNI_L(".) !"), 5) == 4);
+
+	UnicodeSegmenter seg4(UnicodeSegmenter::Sentence);
+	verify(seg4.FindBoundary(UNI_L(".) !"), 5) == 0);
+	verify(seg4.FindBoundary(UNI_L(".) !"), 5) == 4);
+
+	UnicodeSegmenter seg5(UnicodeSegmenter::Sentence);
+	verify(seg5.FindBoundary(UNI_L("abc: def"), 9) == 0);
+	verify(seg5.FindBoundary(UNI_L("abc: def"), 9) == 8);
+}
+
+
+test("Sentence boundary check SB9")
+{
+	UnicodeSegmenter seg(UnicodeSegmenter::Sentence);
+	verify(seg.FindBoundary(UNI_L("!)) A"), 5) == 0);
+	verify(seg.FindBoundary(UNI_L("!)) A"), 5) == 4);
+
+	UnicodeSegmenter seg2(UnicodeSegmenter::Sentence);
+	verify(seg2.FindBoundary(UNI_L(".)) A"), 5) == 0);
+	verify(seg2.FindBoundary(UNI_L(".)) A"), 5) == 4);
+}
+
+
+test("Sentence boundary check SB10")
+{
+	UnicodeSegmenter seg(UnicodeSegmenter::Sentence);
+	verify(seg.FindBoundary(UNI_L("!) \x2028"), 4) == 0);
+	verify(seg.FindBoundary(UNI_L("!) \x2028"), 4) == 4);
+}
+
+test("Sentence boundary check SB11")
+{
+	UnicodeSegmenter seg(UnicodeSegmenter::Sentence);
+	verify(seg.FindBoundary(UNI_L("!) A"), 4) == 0);
+	verify(seg.FindBoundary(UNI_L("!) A"), 4) == 3);
+
+	UnicodeSegmenter seg2(UnicodeSegmenter::Sentence);
+	verify(seg2.FindBoundary(UNI_L("Dog.\x0D"), 5) == 0);
+	verify(seg2.FindBoundary(UNI_L("Dog.\x0D"), 5) == 4);
+}
+
+
+test("Sentence boundary check SB12")
+{
+	UnicodeSegmenter seg(UnicodeSegmenter::Sentence);
+	const uni_char *test = UNI_L("The quick brown fox jumped over the lazy dog");
+	int len = int(uni_strlen(test));
+	verify(seg.FindBoundary(test, len + 1) == 0);
+	verify(seg.FindBoundary(test, len + 1) == len);
+	verify(seg.LastChar() == 0);
+	verify(seg.LastClass() == CC_Cc);
+
+	UnicodeSegmenter seg2(UnicodeSegmenter::Sentence);
+	verify(seg2.FindBoundary(UNI_L("\x3400\x3400 "), 4) == 0);
+	verify(seg2.FindBoundary(UNI_L("\x3400\x3400 "), 4) == 3);
+	verify(seg2.LastChar() == 0);
+	verify(seg2.LastClass() == CC_Cc);
+}
+
+subtest singlestep(UnicodeSegmenter::Type type)
+{
+	// The sequence CR LF explicitly prohibits breaks inside,
+	// so we should only get breaks before a 0x0D
+	const uni_char *test = UNI_L("\x0D\x0A\x0D\x0A\x0D\x0A");
+	const uni_char *p = test;
+
+	UnicodeSegmenter seg(type);
+	while (*p)
+	{
+		int boundary = seg.FindBoundary(p, 1);
+		if (!boundary)
+		{
+			verify(*p == 0x0D);
+		}
+		p += boundary;
+	}
+}
+
+test("Single-step: Word")
+{
+	verify(singlestep(UnicodeSegmenter::Word));
+}
+
+test("Single-step: Sentence")
+{
+	verify(singlestep(UnicodeSegmenter::Word));
+}
+
+
+table MightBeFirstHalfOfGraphemeCluster_Data(uni_char, BOOL)
+{
+//    char		result
+	{ ' ',		FALSE	},
+	{ 0x0D,		TRUE	},	// GB3
+	{ 0xAD,		FALSE	},	// GB4
+	{ 0x0A,		FALSE	},
+	{ 0x1111,	TRUE	},	// GB6
+	{ 0x1122,	TRUE	},
+	{ 0x1133,	TRUE	},
+	{ 0x1144,	TRUE	},
+	{ 0xAC1C,	TRUE	},	// GB7
+	{ 0xAC37,	TRUE	},
+	{ 0x1177,	TRUE	},
+	{ 0x1188,	TRUE	},
+	{ 0xAC02,	TRUE	},	// GB8
+	{ 0xAC03,	TRUE	},
+	{ 0x11CC,	TRUE	},
+	{ 0x11DD,	TRUE	},
+	{ 0x10FF,	FALSE	}	// Hangul_NA
+}
+
+test("UnicodeSegmenter::MightBeFirstHalfOfGraphemeCluster")
+{
+	iterate (character, result) from MightBeFirstHalfOfGraphemeCluster_Data
+	{
+		verify(UnicodeSegmenter::MightBeFirstHalfOfGraphemeCluster(character) == result);
+	}
+}

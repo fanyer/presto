@@ -1,0 +1,2086 @@
+/* -*- mode: c++; tab-width: 4; c-basic-offset: 4 -*- */
+
+group "layout.selection";
+
+require init;
+require undefined HAS_NOTEXTSELECTION;
+
+include "modules/layout/box/box.h";
+include "modules/layout/box/inline.h";
+include "modules/layout/traverse/traverse.h";
+include "modules/doc/html_doc.h";
+include "modules/windowcommander/src/WindowCommander.h";
+include "modules/logdoc/src/textdata.h";
+include "modules/util/adt/opvector.h";
+
+global
+{
+	class TestSelectionUtil
+	{
+	public:
+		TestSelectionUtil(HTML_Document* document, int start_x, int start_y)
+			: m_document(document), m_x(start_x), m_y(start_y)
+		{
+			m_document->StartSelection(m_x, m_y);
+		}
+
+		void DragTo(int dst_x, int dst_y, int step = 1)
+		{
+			int vx = dst_x - m_x;
+			int vy = dst_y - m_y;
+
+			double length = op_sqrt(double(vx * vx + vy * vy));
+			double step_x = vx / length;
+			double step_y = vy / length;
+			for (int i = 1; i < length / step; i += step)
+				m_document->MoveSelectionFocusPoint(int(m_x + step_x * i + 0.5), int(m_y + step_y * i + 0.5), FALSE);
+
+			m_document->MoveSelectionFocusPoint(dst_x, dst_y, FALSE);
+
+			m_x = dst_x;
+			m_y = dst_y;
+		}
+
+	private:
+		HTML_Document* m_document;
+		int m_x;
+		int m_y;
+	};
+
+	class BoxList : public OpVector<Box> {};
+
+	class ST_SelectionUpdateObject : public SelectionUpdateObject
+	{
+	private:
+		LayoutSelectionPointExtended start;
+		LayoutSelectionPointExtended end;
+		BoxList box_list;
+		OpString8 text;
+
+		BOOL AddBox(Box* box, BOOL force = FALSE)
+		{
+			if (force || GetStartBoxDone() && !GetEndBoxDone())
+				if (OpStatus::IsMemoryError(box_list.Add(box)))
+				{
+					SetOutOfMemory();
+					return FALSE;
+				}
+
+			return TRUE;
+		}
+
+	public:
+		ST_SelectionUpdateObject(FramesDocument* doc, SelectionBoundaryPoint* start, SelectionBoundaryPoint* end)
+			: SelectionUpdateObject(doc, start, end),
+			  start(*start, FALSE, FALSE, FALSE),
+			  end(*end, FALSE, TRUE, FALSE) {}
+
+		virtual void StartingTraverse()
+		{
+			start.AdjustForTraverse();
+			end.AdjustForTraverse();
+			SelectionUpdateObject::StartingTraverse();
+		}
+
+		virtual BOOL EnterVerticalBox(LayoutProperties* parent_lprops, LayoutProperties*& layout_props, VerticalBox* box, TraverseInfo& traverse_info)
+		{
+			return AddBox(box) &&
+				SelectionUpdateObject::EnterVerticalBox(parent_lprops, layout_props, box, traverse_info);
+		}
+
+		virtual BOOL EnterInlineBox(LayoutProperties* layout_props, InlineBox* box, const RECT& box_area, LineSegment& segment, BOOL start_of_box, BOOL end_of_box, LayoutCoord baseline, TraverseInfo& traverse_info)
+		{
+			return AddBox(box) &&
+				SelectionUpdateObject::EnterInlineBox(layout_props, box, box_area, segment, start_of_box, end_of_box, baseline, traverse_info);
+		}
+
+		virtual BOOL EnterLayoutBreak(HTML_Element* break_element)
+		{
+			return AddBox(break_element->GetLayoutBox()) &&
+				SelectionUpdateObject::EnterLayoutBreak(break_element);
+		}
+
+		virtual void HandleLineBreak(LayoutProperties* layout_props, BOOL is_layout_break)
+		{
+			if (AddBox(layout_props->html_element->GetLayoutBox()))
+				SelectionUpdateObject::HandleLineBreak(layout_props, is_layout_break);
+		}
+
+		virtual void EnterTextBox(LayoutProperties* layout_props, Text_Box* box, LineSegment& segment)
+		{
+			if ((GetStartBoxDone() || box->GetHtmlElement() == start.GetElement()) && !GetEndBoxDone())
+				AddBox(box, TRUE);
+
+			SelectionUpdateObject::EnterTextBox(layout_props, box, segment);
+		}
+
+		virtual void HandleTextContent(LayoutProperties* layout_props,
+									   Text_Box* box,
+									   const uni_char* word,
+									   int word_length,
+									   LayoutCoord word_width,
+									   LayoutCoord space_width,
+									   LayoutCoord justified_space_extra,
+									   const WordInfo& word_info,
+									   LayoutCoord x,
+									   LayoutCoord virtual_pos,
+									   LayoutCoord baseline,
+									   LineSegment& segment,
+									   LayoutCoord line_height)
+		{
+			BOOL end_was_done = GetEndBoxDone();
+
+			SelectionUpdateObject::HandleTextContent(layout_props, box, word, word_length, word_width, space_width, justified_space_extra, word_info, x, virtual_pos, baseline, segment, line_height);
+
+			if (GetStartBoxDone() && !end_was_done)
+			{
+				const uni_char* word_fragment = word;
+				int length = word_length;
+
+				if (word == start.GetWord())
+				{
+					word_fragment += start.GetOffsetIntoWord();
+					length -= start.GetOffsetIntoWord();
+				}
+
+				if (word == end.GetWord())
+					length -= word_length - end.GetOffsetIntoWord();
+
+				if (length > 0)
+				{
+					OpString8 str8;
+
+					if (!OpStatus::IsMemoryError(str8.Set(word_fragment, length)))
+						if (!OpStatus::IsMemoryError(text.Append(str8)))
+							return;
+
+					SetOutOfMemory();
+				}
+			}
+		}
+
+		const char* GetText() const { return text.CStr(); }
+		const BoxList& GetBoxList() const { return box_list; }
+	};
+}
+
+html
+{
+	//! <html><head><style>div{white-space: pre;}span{white-space: pre;font-family:monospace;font-size: 159px;line-height: 160px;margin: 2px;}</style></head>
+	//! <body><div><span>a</span><span>bbbbbb</span><span>c</span></div>
+	//!       <div><span>x</span><span>yyyyyy</span><span>z</span></div></body>
+}
+
+test("Move selection from <bottom end> through <upper line> back to <beginning bottom>")
+{
+	// Preliminaries.
+	HTML_Element* txt_x_element = find_element(static_cast<const uni_char*>(0), 7);
+	HTML_Element* txt_y_element = find_element(static_cast<const uni_char*>(0), 8);
+	HTML_Element* txt_z_element = find_element(static_cast<const uni_char*>(0), 9);
+	verify(txt_x_element->GetTextData());
+	verify(txt_y_element->GetTextData());
+	verify(txt_z_element->GetTextData());
+	verify_string(txt_x_element->GetTextData()->GetText(), "x");
+	verify_string(txt_y_element->GetTextData()->GetText(), "yyyyyy");
+	verify_string(txt_z_element->GetTextData()->GetText(), "z");
+
+	RECT span_b_rect, span_c_rect, span_y_rect, span_z_rect;
+	HTML_Element* span_a_element = find_element("SPAN", 1);
+	HTML_Element* span_b_element = find_element("SPAN", 2);
+	HTML_Element* span_c_element = find_element("SPAN", 3);
+	HTML_Element* span_x_element = find_element("SPAN", 4);
+	HTML_Element* span_y_element = find_element("SPAN", 5);
+	HTML_Element* span_z_element = find_element("SPAN", 6);
+	verify(span_b_element->GetLayoutBox()->GetRect(state.doc, CONTENT_BOX, span_b_rect));
+	verify(span_c_element->GetLayoutBox()->GetRect(state.doc, CONTENT_BOX, span_c_rect));
+	verify(span_y_element->GetLayoutBox()->GetRect(state.doc, CONTENT_BOX, span_y_rect));
+	verify(span_z_element->GetLayoutBox()->GetRect(state.doc, CONTENT_BOX, span_z_rect));
+	int bottom_line = span_z_rect.bottom - 80;
+	int top_line = span_c_rect.bottom - 80;
+
+	HTML_Document* document = state.doc->GetHtmlDocument();
+	const size_t SELECTION_BUF_SIZE = 32;
+	uni_char buffer[SELECTION_BUF_SIZE];
+
+	// Move selection over: z-c-bbbbbb-yyyyyy-x.
+	TestSelectionUtil selection(document, span_z_rect.right, bottom_line);
+	selection.DragTo(span_z_rect.left + 2, bottom_line);
+	selection.DragTo(span_c_rect.left + 2, top_line);
+	selection.DragTo(span_b_rect.left + 2, top_line);
+	selection.DragTo(span_y_rect.left + 2, bottom_line);
+
+	// Check validity of selection.
+	verify(document->GetSelectedText(buffer, SELECTION_BUF_SIZE));
+	verify_string(buffer, "yyyyyyz");
+
+	verify(!txt_x_element->IsInSelection());
+	verify(txt_y_element->IsInSelection());
+	verify(txt_z_element->IsInSelection());
+
+	verify(!span_a_element->IsInSelection());
+	verify(!span_b_element->IsInSelection());
+	verify(!span_c_element->IsInSelection());
+	verify(!span_x_element->IsInSelection());
+	// span_y_element could be in selection but it's not essential.
+	verify(span_z_element->IsInSelection());
+}
+
+subtest selection_simple(HTML_Element* elm, const char* expected_cstr)
+{
+	verify(state.doc);
+	verify(elm);
+	TextSelection text_selection;
+	text_selection.SetNewSelection(state.doc, elm, FALSE, FALSE, TRUE);
+
+	int len = text_selection.GetSelectionAsText(state.doc, NULL, 0, TRUE, TRUE);
+
+	OpString text;
+
+	if (text.Reserve(len + 1))
+	{
+		text_selection.GetSelectionAsText(state.doc, text.CStr(), len + 1, TRUE, TRUE);
+		verify_string(expected_cstr, text);
+	}
+}
+
+subtest selection_range(HTML_Element* start_elm, int start_elm_offset, HTML_Element* end_elm, int end_elm_offset, int expected_len, const char* expected_cstr)
+{
+	TextSelection text_selection;
+	verify(state.doc);
+	verify(start_elm);
+	verify(end_elm);
+	SelectionBoundaryPoint start;
+	start.SetLogicalPosition(start_elm, start_elm_offset);
+	SelectionBoundaryPoint end;
+	end.SetLogicalPosition(end_elm, end_elm_offset);
+
+	text_selection.SetNewSelection(state.doc, &start, &end, TRUE, FALSE, TRUE);
+
+	INT32 len = text_selection.GetSelectionAsText(state.doc, NULL, 0, TRUE, TRUE);
+
+	verify (len == expected_len);
+
+	OpString text;
+
+	if (text.Reserve(len + 1))
+	{
+		text_selection.GetSelectionAsText(state.doc, text.CStr(), len + 1, TRUE, TRUE);
+		verify_string(expected_cstr, text);
+	}
+}
+
+html
+{
+	"<html><body>abc</body></html>\n"
+}
+test ("Copying text basic")
+{
+	verify(state.doc && state.doc->GetLogicalDocument());
+	verify(selection_simple(state.doc->GetLogicalDocument()->GetRoot(), "abc"));
+}
+
+html
+{
+	"<html><body>abc def</body></html>\n"
+}
+test ("Copying text basic - 2")
+{
+	verify(state.doc && state.doc->GetLogicalDocument());
+	verify(selection_simple(state.doc->GetLogicalDocument()->GetRoot(), "abc def"));
+}
+
+html
+{
+	"<html><body>abc  def  efg</body></html>\n"
+}
+test ("Copying text basic - 3")
+{
+	verify(state.doc && state.doc->GetLogicalDocument());
+	verify(selection_simple(state.doc->GetLogicalDocument()->GetRoot(), "abc def efg"));
+}
+
+html
+{
+	"<html><body>abc<div>def</div></body></html>\n"
+}
+test ("Copying text with lines closed by blocks")
+{
+	verify(state.doc && state.doc->GetLogicalDocument());
+	verify(selection_simple(state.doc->GetLogicalDocument()->GetRoot(), "abc\ndef"));
+}
+
+html
+{
+	"<html><body>abc<div><div>def</div></div>ghi</body></html>\n"
+}
+test ("Copying text with lines closed by blocks - 2")
+{
+	verify(state.doc && state.doc->GetLogicalDocument());
+	verify(selection_simple(state.doc->GetLogicalDocument()->GetRoot(), "abc\ndef\nghi"));
+}
+
+html
+{
+	"<html><body>abc<div>def</div>ghi</body></html>\n"
+}
+test ("Copying text with lines closed by blocks - 3")
+{
+	verify(state.doc && state.doc->GetLogicalDocument());
+	verify(selection_simple(state.doc->GetLogicalDocument()->GetRoot(), "abc\ndef\nghi"));
+}
+
+html
+{
+	"<html><body><div>abc</div><div>def</div></body></html>\n"
+}
+test ("Copying text with lines closed by blocks - 4")
+{
+	verify(state.doc && state.doc->GetLogicalDocument());
+	verify(selection_simple(state.doc->GetLogicalDocument()->GetRoot(),"abc\ndef"));
+}
+
+html
+{
+	"<html><body>abc<p>def</body></html>\n"
+}
+test ("Copying text with paragraphs")
+{
+	verify(state.doc && state.doc->GetLogicalDocument());
+	verify(selection_simple(state.doc->GetLogicalDocument()->GetRoot(),"abc\n\ndef"));
+}
+
+html
+{
+	"<html><body>abc<br><br>def</body></html>\n"
+}
+test ("Copying text with two <br>s")
+{
+	verify(state.doc && state.doc->GetLogicalDocument());
+	verify(selection_simple(state.doc->GetLogicalDocument()->GetRoot(),"abc\n\ndef"));
+}
+
+html
+{
+	"<html><body><pre>This\n"
+	"Is\n"
+	"A\n"
+	"Test</pre></body></html>\n"
+}
+test ("Copying <pre> text")
+{
+	verify(state.doc && state.doc->GetLogicalDocument());
+	verify(selection_simple(state.doc->GetLogicalDocument()->GetRoot(),"This\nIs\nA\nTest"));
+}
+
+html
+{
+	"<html><body><br><br><br><br><br>test</body></html>\n"
+}
+test("Leading line-breaks for SetNewSelection")
+{
+	verify(state.doc && state.doc->GetLogicalDocument());
+	verify(selection_simple(state.doc->GetLogicalDocument()->GetRoot(),"\n\n\n\n\ntest"));
+}
+
+html
+{
+	"<html><body>test<br>test</body></html>\n"
+}
+test("Contained line-breaks for SetNewSelection")
+{
+	verify(state.doc && state.doc->GetLogicalDocument());
+	verify(selection_simple(state.doc->GetLogicalDocument()->GetRoot(),"test\ntest"));
+}
+
+html
+{
+	"<html><body><table><tr><td>cell1</td></tr><tr><td>cell2</td></tr></table></body></html>\n"
+}
+test("Implicit line-break for table-row")
+{
+	verify(state.doc && state.doc->GetLogicalDocument());
+	verify(selection_simple(state.doc->GetLogicalDocument()->GetRoot(),"cell1\ncell2"));
+}
+
+html
+{
+	//! <html><body><div>foo<br id="br"><span id="span">bar</span></div></body></html>
+}
+test("Text selection starts in <br>")
+{
+	FramesDocument* doc = state.doc;
+	verify(doc);
+	HTML_Element* br = doc->GetDocRoot()->GetElmById(UNI_L("br"));
+	HTML_Element* span = doc->GetDocRoot()->GetElmById(UNI_L("span"));
+	verify(span);
+	HTML_Element* txt = span->FirstChild();
+
+	verify(selection_range(br, 0, txt, 3, 4, "\nbar"));
+}
+
+html
+{
+	//! <html><body><div><span id="span">foo</span><br id="br">bar</div></body></html>
+}
+test("Text selection ends in <br> - 1")
+{
+	FramesDocument* doc = state.doc;
+	verify(doc);
+	HTML_Element* br = doc->GetDocRoot()->GetElmById(UNI_L("br"));
+	HTML_Element* span = doc->GetDocRoot()->GetElmById(UNI_L("span"));
+	verify(span);
+	HTML_Element* txt = span->FirstChild();
+
+	verify(selection_range(txt, 0, br, 0, 3, "foo"));
+}
+
+
+html
+{
+	//! <html><body>abc<br id="br"></body></html>
+}
+test("Text selection ends in <br> - 2")
+{
+	FramesDocument* doc = state.doc;
+	verify(doc);
+	HTML_Element* br = doc->GetDocRoot()->GetElmById(UNI_L("br"));
+
+	verify(selection_range(br, 0, br, 0, 0, ""));
+}
+
+html
+{
+	//! <html><body><br id="br"></body></html>
+}
+test("Text selection ends in <br> - 3")
+{
+	FramesDocument* doc = state.doc;
+	verify(doc);
+	HTML_Element* br = doc->GetDocRoot()->GetElmById(UNI_L("br"));
+
+	verify(selection_range(br, 0, br, 1, 1, "\n"));
+}
+
+html
+{
+	//! <html><body><br id="first"><br><br><br id="last"></body></html>
+}
+test("Text selection ends in <br> - 4")
+{
+	FramesDocument* doc = state.doc;
+	verify(doc);
+	HTML_Element* first = doc->GetDocRoot()->GetElmById(UNI_L("first"));
+	HTML_Element* last = doc->GetDocRoot()->GetElmById(UNI_L("last"));
+
+	verify(selection_range(first, 0, last, 1, 4, "\n\n\n\n"));
+}
+
+
+html
+{
+	//! <html><body>abc <br></body></html>
+}
+test("Text selection and trailing whitespace, exclusive - 1")
+{
+	FramesDocument* doc = state.doc;
+	verify(doc);
+	HTML_Element* body = find_element("body");
+	verify(body);
+	HTML_Element* abc = body->FirstChild();
+
+	verify(selection_range(abc, 0, abc, 3, 3, "abc"));
+}
+
+html
+{
+	//! <html><body>abc def <br></body></html>
+}
+test("Text selection and trailing whitespace, exclusive - 2")
+{
+	FramesDocument* doc = state.doc;
+	verify(doc);
+	HTML_Element* body = find_element("body");
+	verify(body);
+	HTML_Element* abc = body->FirstChild();
+
+	verify(selection_range(abc, 4, abc, 7, 3, "def"));
+}
+
+html
+{
+	//! <html><body>abc <br>def</body></html>
+}
+test("Text selection and trailing whitespace, exclusive - 3")
+{
+	FramesDocument* doc = state.doc;
+	verify(doc);
+	HTML_Element* body = find_element("body");
+	verify(body);
+	HTML_Element* abc = body->FirstChild();
+
+	verify(selection_range(abc, 0, abc, 3, 3, "abc"));
+}
+
+html
+{
+	//! <html><body>abc <br>def</body></html>
+}
+test("Text selection and trailing whitespace, inclusive - 1")
+{
+	FramesDocument* doc = state.doc;
+	verify(doc);
+	HTML_Element* body = find_element("body");
+	verify(body);
+	HTML_Element* abc = body->FirstChild();
+
+	verify(selection_range(abc, 0, abc, 4, 4, "abc "));
+}
+
+html
+{
+	//! <html><body>abc <br>def <br></body></html>
+}
+test("Text selection and trailing whitespace, inclusive - 2")
+{
+	FramesDocument* doc = state.doc;
+	verify(doc);
+	HTML_Element* body = find_element("body");
+	verify(body);
+	HTML_Element* abc = body->FirstChild();
+	verify(abc && abc->Suc());
+	HTML_Element* def = abc->Suc()->Suc();
+
+	verify(selection_range(abc, 0, def, 4, 9, "abc \ndef "));
+}
+
+html
+{
+	//! <html><body>abc <br>def<br></body></html>
+}
+test("Text selection and trailing whitespace, inclusive - 3")
+{
+	FramesDocument* doc = state.doc;
+	verify(doc);
+	HTML_Element* body = find_element("body");
+	verify(body);
+	HTML_Element* abc = body->FirstChild();
+	HTML_Element* def = abc->Suc()->Suc();
+
+	verify(selection_range(abc, 4, def, 1, 2, "\nd"));
+}
+
+html
+{
+	//! <html><body>abc     <br></body></html>
+}
+test("Text selection and multiple trailing whitespaces, first word")
+{
+	FramesDocument* doc = state.doc;
+	verify(doc);
+	HTML_Element* body = find_element("body");
+	verify(body);
+	HTML_Element* abc = body->FirstChild();
+
+	verify(selection_range(abc, 0, abc, 8, 4, "abc "));
+}
+
+html
+{
+	//! <html><body>abc def <br></body></html>
+}
+test("Text selection and trailing whitespace, second word")
+{
+	FramesDocument* doc = state.doc;
+	verify(doc);
+	HTML_Element* body = find_element("body");
+	verify(body);
+	HTML_Element* abc = body->FirstChild();
+
+	verify(selection_range(abc, 4, abc, 8, 4, "def "));
+}
+
+html
+{
+	//! <html><body>abc def <br></body></html>
+}
+test("Text selection and only trailing whitespaces beginning at first")
+{
+	FramesDocument* doc = state.doc;
+	verify(doc);
+	HTML_Element* body = find_element("body");
+	verify(body);
+	HTML_Element* abc = body->FirstChild();
+
+	verify(selection_range(abc, 3, abc, 4, 1, " "));
+}
+
+html
+{
+	//! <html><body>abc     <br></body></html>
+}
+test("Text selection and only multiple trailing whitespaces beginning after first")
+{
+	FramesDocument* doc = state.doc;
+	verify(doc);
+	HTML_Element* body = find_element("body");
+	verify(body);
+	HTML_Element* abc = body->FirstChild();
+
+	/* This result is disputable, but selected trailing whitespaces after the first one
+	   is ignored. This simplifies the code. */
+	verify(selection_range(abc, 5, abc, 7, 0, ""));
+}
+
+
+/* The following test is disabled since it causes an assert. The intention and current state is that it is a PASS though. */
+html
+{
+	//! <html><body>abc <span> </span> def</body></html>
+}
+test("Text selection in collapsed whitespace element") disabled;
+{
+	FramesDocument* doc = state.doc;
+	verify(doc);
+	HTML_Element* span = find_element("span");
+	verify(span);
+	HTML_Element* empty = span->FirstChild();
+	verify(selection_range(empty, 0, empty, 1, 0, ""));
+}
+
+
+/* The following test is disabled since it causes an assert. The intention and current state is that is a PASS though. */
+html
+{
+	//! <html><body>abc <span> </span> def</body></html>
+}
+test("Text selection spanning collapsed whitespace element") disabled;
+{
+	FramesDocument* doc = state.doc;
+	verify(doc);
+	HTML_Element* body = find_element("body");
+	verify(body);
+	HTML_Element* abc = body->FirstChild();
+	verify(abc);
+	HTML_Element* span = abc->Suc();
+	verify(span);
+	HTML_Element* def = span->Suc();
+	verify(selection_range(abc, 0, def, 2, 5, "abc d"));
+}
+
+/* The following test is disabled since it causes an assert. The intention and current state is that is a PASS though. */
+html
+{
+	//! <html><body>   abc</body></html>
+}
+test("Text selection and leading whitespace - 1") disabled;
+{
+	FramesDocument* doc = state.doc;
+	verify(doc);
+	HTML_Element* body = find_element("body");
+	verify(body);
+	HTML_Element* abc = body->FirstChild();
+
+	verify(selection_range(abc, 0, abc, 2, 0, ""));
+}
+
+/* The following test is disabled since it causes an assert. The intention and current state is that is a PASS though. */
+html
+{
+	//! <html><body>   abc</body></html>
+}
+test("Text selection and leading whitespace - 2") disabled;
+{
+	FramesDocument* doc = state.doc;
+	verify(doc);
+	HTML_Element* body = find_element("body");
+	verify(body);
+	HTML_Element* abc = body->FirstChild();
+	verify(selection_range(abc, 2, abc, 3, 0, ""));
+}
+
+html
+{
+	//! <html><body style="white-space:pre-wrap">abc <br>def</body></html>2
+}
+test("Text selection and trailing whitespace, inclusive, pre-wrap")
+{
+	FramesDocument* doc = state.doc;
+	verify(doc);
+	HTML_Element* body = find_element("body");
+	verify(body);
+	HTML_Element* abc = body->FirstChild();
+
+	verify(selection_range(abc, 0, abc, 4, 4, "abc "));
+}
+
+html
+{
+	//! <html><body style="white-space:pre">abc <br>def</body></html>
+}
+test("Text selection and trailing whitespace, inclusive, pre")
+{
+	FramesDocument* doc = state.doc;
+	verify(doc);
+	HTML_Element* body = find_element("body");
+	verify(body);
+	HTML_Element* abc = body->FirstChild();
+
+	verify(selection_range(abc, 0, abc, 4, 4, "abc "));
+}
+
+test("AHEM")
+{
+	short font_number = styleManager->GetFontNumber(UNI_L("AHEM"));
+	verify(font_number != -1);
+}
+
+html
+{
+	"<div><span>x</span>\r\n\r\n<a>y</a></div>"
+}
+
+test("Selections in collapsed whitespace")
+require SEARCH_MATCHES_ALL;
+{
+	/* Trigger some sarch hits */
+
+	OpWindowCommander::SearchInfo si(
+ 		OpWindowCommander::DIR_FORWARD, /* direction */
+ 		FALSE, /* case_sensitive */
+		FALSE, /* whole_word */
+		FALSE, /* links_only */
+		TRUE, /* wrap */
+		TRUE); /* highlight_all*/
+
+	verify(state.doc->GetWindow()->GetWindowCommander()->Search(UNI_L(" "), si) == OpWindowCommander::SEARCH_FOUND);
+
+	/* Check that the HighlightUpdateObject traversal object didn't do anything bad. */
+
+	HTML_Element* div = find_element("div");
+	verify(div);
+	verify(!div->IsInSelection());
+	HTML_Element* span = div->FirstChild();
+	verify(span);
+	verify(!span->IsInSelection());
+	HTML_Element* span_child = span->FirstChild();
+	verify(span_child);
+	verify(!span_child->IsInSelection());
+	HTML_Element* whitespace = span->Suc();
+	verify(whitespace);
+	verify(whitespace->IsText());
+	verify(whitespace->IsInSelection());
+	HTML_Element* anchor = whitespace->Suc();
+	verify(anchor);
+	verify(!anchor->IsInSelection());
+	HTML_Element* anchor_child = anchor->FirstChild();
+	verify(anchor_child);
+	verify(!anchor_child->IsInSelection());
+
+	HTML_Document* html_doc = state.doc->GetHtmlDocument();
+	verify(html_doc);
+	SelectionElm* sel_elm = html_doc->GetSelectionElmFromHe(anchor_child);
+	verify(!sel_elm);
+	sel_elm = html_doc->GetSelectionElmFromHe(anchor);
+	verify(!sel_elm);
+	sel_elm = html_doc->GetSelectionElmFromHe(whitespace);
+	verify(sel_elm);
+}
+
+html
+{
+	//! <!doctype html>
+	//! <html><style>* { margin:0;padding:0; } </style>
+	//! <body><div style="width:500px;text-align:left;font-size:16px;font-family:'AHEM';" id="div">XXX<br id="br"></body></html>
+}
+test("Selection - pixel position of <br> left align")
+require DOCUMENT_EDIT_SUPPORT;
+require success "AHEM";
+{
+	FramesDocument* doc = state.doc;
+	verify(doc);
+	HTML_Element* div = doc->GetDocRoot()->GetElmById(UNI_L("div"));
+	verify(div);
+
+	SelectionBoundaryPoint start;
+	// Set position just before the <br>
+	start.SetLogicalPosition(div, 1);
+
+	CalcSelPointPositionObject so(doc, &start, TRUE);
+
+	verify (doc->GetDocRoot());
+	so.Traverse(doc->GetDocRoot());
+
+	verify (so.GetSelectionPointPosition().GetPixelTranslationX() == 48);
+
+}
+
+html
+{
+	//! <!doctype html>
+	//! <html><style>* { margin:0;padding:0; } </style>
+	//! <body><div style="width:500px;direction:rtl;font-size:16px;font-family:'AHEM';">
+	//! <bdo dir="rtl" id="bdo">XXX<br id="br"></bdo></div></body></html>
+}
+test("Selection - pixel position of <br> in rtl direction block")
+require DOCUMENT_EDIT_SUPPORT;
+require success "AHEM";
+{
+	FramesDocument* doc = state.doc;
+	verify(doc);
+	HTML_Element* bdo = doc->GetDocRoot()->GetElmById(UNI_L("bdo"));
+	verify(bdo);
+
+	SelectionBoundaryPoint start;
+	// Set position just before the <br>
+	start.SetLogicalPosition(bdo, 1);
+
+	CalcSelPointPositionObject so(doc, &start, TRUE);
+
+	verify (doc->GetDocRoot());
+	so.Traverse(doc->GetDocRoot());
+
+	verify (so.GetSelectionPointPosition().GetPixelTranslationX() == 500 - 48);
+
+}
+
+html
+{
+	//! <!doctype html>
+	//! <html><style>* { margin:0;padding:0; } </style>
+	//! <body><div style="width:500px;font-size:16px;font-family:'AHEM';direction:rtl;" id="div">
+	//! <bdo dir="rtl">X</bdo><br id="br">XX<br id="br"></div></body></html>
+}
+test("Selection - pixel position of <br> in bidirectional block")
+require DOCUMENT_EDIT_SUPPORT;
+require success "AHEM";
+{
+	FramesDocument* doc = state.doc;
+	verify(doc);
+	HTML_Element* div = doc->GetDocRoot()->GetElmById(UNI_L("div"));
+	verify(div);
+
+	SelectionBoundaryPoint start;
+	// Set position just before the first <br>
+	start.SetLogicalPosition(div, 1);
+
+	CalcSelPointPositionObject so(doc, &start, TRUE);
+
+	verify (doc->GetDocRoot());
+	so.Traverse(doc->GetDocRoot());
+
+	verify (so.GetSelectionPointPosition().GetPixelTranslationX() == 500 - 16);
+
+}
+
+html
+{
+	//! <!doctype html>
+	//! <html><style>* { margin:0;padding:0; } </style>
+	//! <body><div style="width:500px;font-size:16px;font-family:'AHEM';" id="div">
+	//! <bdo dir="rtl">X</bdo>XX<br id="br"></div></body></html>
+}
+test("Selection - pixel position of <br> in bidirectional block #2")
+require DOCUMENT_EDIT_SUPPORT;
+require success "AHEM";
+{
+	FramesDocument* doc = state.doc;
+	verify(doc);
+	HTML_Element* div = doc->GetDocRoot()->GetElmById(UNI_L("div"));
+	verify(div);
+
+	SelectionBoundaryPoint start;
+	// Set position just before the <br>
+	start.SetLogicalPosition(div, 3);
+
+	CalcSelPointPositionObject so(doc, &start, TRUE);
+
+	verify (doc->GetDocRoot());
+	so.Traverse(doc->GetDocRoot());
+
+	verify (so.GetSelectionPointPosition().GetPixelTranslationX() == 48);
+
+}
+
+html
+{
+	//! <!doctype html>
+	//! <html><style>* { margin:0;padding:0; } </style>
+	//! <body><div style="width:500px;text-align:right;font-size:16px;font-family:'AHEM';" id="div">XXX<br id="br"></div></body></html>
+}
+test("Selection - pixel position of <br> and right alignment")
+require DOCUMENT_EDIT_SUPPORT;
+require success "AHEM";
+{
+	FramesDocument* doc = state.doc;
+	verify(doc);
+	HTML_Element* div = doc->GetDocRoot()->GetElmById(UNI_L("div"));
+	verify(div);
+
+	SelectionBoundaryPoint start;
+	// Set position just before the <br>
+	start.SetLogicalPosition(div, 1);
+
+	CalcSelPointPositionObject so(doc, &start, TRUE);
+
+	verify (doc->GetDocRoot());
+	so.Traverse(doc->GetDocRoot());
+
+	verify (so.GetSelectionPointPosition().GetPixelTranslationX() == 500);
+}
+
+html
+{
+	//! <html><style>* { margin:0;padding:0; } </style>
+	//! <body><div style="width:500px;text-align:center;font-size:16px;font-family:'AHEM';" id="div">XXX<br id="br"></div></body></html>
+}
+test("Selection - pixel position of <br> and center alignment")
+require DOCUMENT_EDIT_SUPPORT;
+require success "AHEM";
+{
+	FramesDocument* doc = state.doc;
+	verify(doc);
+	HTML_Element* div = doc->GetDocRoot()->GetElmById(UNI_L("div"));
+	verify(div);
+
+	SelectionBoundaryPoint start;
+	// Set position just before the <br>
+	start.SetLogicalPosition(div, 1);
+
+	CalcSelPointPositionObject so(doc, &start, TRUE);
+
+	verify (doc->GetDocRoot());
+	so.Traverse(doc->GetDocRoot());
+
+	verify (so.GetSelectionPointPosition().GetPixelTranslationX() == (500 + 48)/2);
+}
+
+html
+{
+	//! <html><style>* { margin:0;padding:0; } </style>
+	//! <body><div style="width:500px;text-align:justify;font-size:16px;font-family:'AHEM';" id="div">XXX XXX XXX<br id="br">XXXX XXXX</div></body></html>
+}
+test("Selection - pixel position of <br> and justified alignment")
+require DOCUMENT_EDIT_SUPPORT;
+require success "AHEM";
+{
+	FramesDocument* doc = state.doc;
+	verify(doc);
+	HTML_Element* div = doc->GetDocRoot()->GetElmById(UNI_L("div"));
+	verify(div);
+
+	SelectionBoundaryPoint start;
+	// Set position just before the <br>
+	start.SetLogicalPosition(div, 1);
+
+	CalcSelPointPositionObject so(doc, &start, TRUE);
+
+	verify (doc->GetDocRoot());
+	so.Traverse(doc->GetDocRoot());
+
+	verify (so.GetSelectionPointPosition().GetPixelTranslationX() == 11 * 16);
+}
+
+html
+{
+	//! <html><style>* { margin:0;padding:0; } </style>
+	//! <body><div style="width:500px;text-align:justify;font-size:16px;font-family:'AHEM';direction:rtl;">
+	//! <bdo dir="rtl" id="bdo">XXX XXX XXX<br id="br">XXXX XXXX</bdo></div></body></html>
+}
+test("Selection - pixel position of <br>, rtl and justified alignment")
+require DOCUMENT_EDIT_SUPPORT;
+require success "AHEM";
+{
+	FramesDocument* doc = state.doc;
+	verify(doc);
+	HTML_Element* bdo = doc->GetDocRoot()->GetElmById(UNI_L("bdo"));
+	verify(bdo);
+
+	SelectionBoundaryPoint start;
+	// Set position just before the <br>
+	start.SetLogicalPosition(bdo, 1);
+
+	CalcSelPointPositionObject so(doc, &start, TRUE);
+
+	verify (doc->GetDocRoot());
+	so.Traverse(doc->GetDocRoot());
+
+	verify (so.GetSelectionPointPosition().GetPixelTranslationX() == 500 - 176);
+}
+
+html
+{
+	//! <html><body><blockquote><p>abc</blockquote></body></html>
+}
+test ("Copying blockquotes as text - simple")
+{
+	verify(state.doc && state.doc->GetLogicalDocument());
+	verify(selection_simple(state.doc->GetLogicalDocument()->GetRoot(), ">abc"));
+}
+
+html
+{
+	//! <html><body><blockquote><blockquote><p>abc</blockquote><p>def<br><br>ghi</blockquote>jkl</body></html>
+}
+test ("Copying blockquotes as text - double")
+{
+	verify(state.doc && state.doc->GetLogicalDocument());
+	verify(selection_simple(state.doc->GetLogicalDocument()->GetRoot(), ">>abc\n>\n>def\n>\n>ghi\njkl"));
+}
+
+html
+{
+	//! <html><body><blockquote><blockquote><p id="one">abc</blockquote><p id="two">def</blockquote></body></html>
+}
+test ("Copying blockquotes as text - partial")
+{
+	TextSelection text_selection;
+	SelectionBoundaryPoint anchor, focus;
+
+	HTML_Element* anchor_parent = find_element("P", 1);
+	verify(anchor_parent);
+	HTML_Element* anchor_element = anchor_parent->FirstChild();
+	HTML_Element* focus_parent = find_element("P", 2);
+	verify(focus_parent);
+	HTML_Element* focus_element = focus_parent->FirstChild();
+
+	verify(selection_range(anchor_element, 1, focus_element, 1, 9, ">>bc\n>\n>d"));
+}
+
+html
+{
+	//! <html><body>
+	//!	<p id="text" style="font-size: 14px; line-height: 15px; margin: 2px;">abcde</p>
+	//! <div id="empty" style="width: 50px; height: 50px; margin: 0px"></div>
+	//! </body></html>
+}
+test("Move selection from below a text line (CORE-25457)")
+{
+	HTML_Element* div_element = find_element("DIV", 1);
+	HTML_Element* p_element = find_element("P", 1);
+
+	RECT div_rect;
+	RECT p_rect;
+	verify(div_element->GetLayoutBox()->GetRect(state.doc, CONTENT_BOX, div_rect));
+	verify(p_element->GetLayoutBox()->GetRect(state.doc, CONTENT_BOX, p_rect));
+
+	HTML_Document* document = state.doc->GetHtmlDocument();
+	verify(document != NULL);
+
+	// Start near the left edge, somewhere inside the empty div element.
+	TestSelectionUtil selection(document, div_rect.left + 1, div_rect.top + 10);
+	// Drag up into the p element
+	selection.DragTo(div_rect.left + 1, p_rect.top + 5);
+	// Drag right to mark all of the text
+	selection.DragTo(p_rect.right, p_rect.top + 5);
+
+	long selection_length = document->GetSelectedTextLen();
+	verify(selection_length == 5);
+
+	const size_t SELECTION_BUF_SIZE = 16;
+	uni_char buffer[SELECTION_BUF_SIZE];
+	verify(document->GetSelectedText(buffer, SELECTION_BUF_SIZE));
+	buffer[selection_length] = '\0';
+	verify_string("abcde", buffer);
+}
+
+html
+{
+	//! <html><body>
+	//! <div id="empty" style="width: 50px; height: 50px; margin: 0px"></div>
+	//!	<p id="text" style="font-size: 14px; line-height: 15px; margin: 2px;">abcde</p>
+	//! </body></html>
+}
+test("Move selection from over a text line")
+{
+	HTML_Element* div_element = find_element("DIV", 1);
+	HTML_Element* p_element = find_element("P", 1);
+
+	RECT div_rect;
+	RECT p_rect;
+	verify(div_element->GetLayoutBox()->GetRect(state.doc, CONTENT_BOX, div_rect));
+	verify(p_element->GetLayoutBox()->GetRect(state.doc, CONTENT_BOX, p_rect));
+
+	HTML_Document* document = state.doc->GetHtmlDocument();
+	verify(document != NULL);
+
+	// Start near the left edge, somewhere inside the empty div element.
+	TestSelectionUtil selection(document, div_rect.left + 1, div_rect.bottom - 10);
+	// Drag down into the p element
+	selection.DragTo(div_rect.left + 1, p_rect.top + 5);
+	// Drag right to mark all of the text
+	selection.DragTo(p_rect.right, p_rect.top + 5);
+
+	long selection_length = document->GetSelectedTextLen();
+	verify(selection_length == 5);
+
+	const size_t SELECTION_BUF_SIZE = 16;
+	uni_char buffer[SELECTION_BUF_SIZE];
+	verify(document->GetSelectedText(buffer, SELECTION_BUF_SIZE));
+	buffer[selection_length] = '\0';
+	verify_string("abcde", buffer);
+}
+
+html
+{
+	//! <html><body>
+	//! <div id="empty" style="width: 50px; height: 50px; margin: 0px"></div>
+	//!	<p id="text" style="font-size: 14px; line-height: 15px; margin: 2px;"><span>abcde</span><span>12345</span></p>
+	//! </body></html>
+}
+test("Move selection diagonally from over a text line")
+{
+	HTML_Element* div_element = find_element("DIV", 1);
+	HTML_Element* span_digits_element = find_element("SPAN", 2);
+
+	RECT div_rect;
+	RECT span_digits_rect;
+	verify(div_element->GetLayoutBox()->GetRect(state.doc, CONTENT_BOX, div_rect));
+	verify(span_digits_element->GetLayoutBox()->GetRect(state.doc, CONTENT_BOX, span_digits_rect));
+
+	HTML_Document* document = state.doc->GetHtmlDocument();
+	verify(document != NULL);
+
+	// Start near the left edge, somewhere inside the empty div element.
+	TestSelectionUtil selection(document, div_rect.left + 1, div_rect.bottom - 10);
+	// Drag down and to the right  into the span element with digits, not touching the first span
+	selection.DragTo(span_digits_rect.left, span_digits_rect.top);
+	// Drag right to mark all of the text
+	selection.DragTo(span_digits_rect.right, span_digits_rect.top + 10);
+
+	long selection_length = document->GetSelectedTextLen();
+	verify(selection_length == 5);
+
+	const size_t SELECTION_BUF_SIZE = 16;
+	uni_char buffer[SELECTION_BUF_SIZE];
+	verify(document->GetSelectedText(buffer, SELECTION_BUF_SIZE));
+	buffer[selection_length] = '\0';
+	verify_string("12345", buffer);
+}
+
+html
+{
+	//! <html><body>
+	//! <p>text text text text <span style="position:relative;top:400px;">12345</span>text text</p>
+	//! </body></html>
+}
+test("Move selection from below a positioned text line")
+{
+	HTML_Element* span_element = find_element("SPAN", 1);
+
+	RECT span_rect;
+	verify(span_element->GetLayoutBox()->GetRect(state.doc, CONTENT_BOX, span_rect));
+
+	HTML_Document* document = state.doc->GetHtmlDocument();
+	verify(document != NULL);
+
+	// Start below the span element.
+	TestSelectionUtil selection(document, span_rect.left - 5, span_rect.bottom + 10);
+	// Drag up and to the right  into the span element with digits, not touching the first span
+	selection.DragTo(span_rect.left, span_rect.top + 5);
+	// Drag right to mark all of the text
+	selection.DragTo(span_rect.right, span_rect.top + 5);
+
+	long selection_length = document->GetSelectedTextLen();
+	verify(selection_length == 5);
+
+	const size_t SELECTION_BUF_SIZE = 16;
+	uni_char buffer[SELECTION_BUF_SIZE];
+	verify(document->GetSelectedText(buffer, SELECTION_BUF_SIZE));
+	buffer[selection_length] = '\0';
+	verify_string("12345", buffer);
+}
+
+html
+{
+	//! <html><body>
+	//! <p>text text text text <span style="position:relative;top:400px;">12345</span>text text</p>
+	//! </body></html>
+}
+test("Move selection from above a positioned text line")
+{
+	HTML_Element* span_element = find_element("SPAN", 1);
+
+	RECT span_rect;
+	verify(span_element->GetLayoutBox()->GetRect(state.doc, CONTENT_BOX, span_rect));
+
+	HTML_Document* document = state.doc->GetHtmlDocument();
+	verify(document != NULL);
+
+	// Start below the span element.
+	TestSelectionUtil selection(document, span_rect.left - 5, span_rect.top - 10);
+	// Drag up and to the right  into the span element with digits, not touching the first span
+	selection.DragTo(span_rect.left, span_rect.top + 5);
+	// Drag right to mark all of the text
+	selection.DragTo(span_rect.right, span_rect.top + 5);
+
+	long selection_length = document->GetSelectedTextLen();
+	verify(selection_length == 5);
+
+	const size_t SELECTION_BUF_SIZE = 16;
+	uni_char buffer[SELECTION_BUF_SIZE];
+	verify(document->GetSelectedText(buffer, SELECTION_BUF_SIZE));
+	buffer[selection_length] = '\0';
+	verify_string("12345", buffer);
+}
+
+html
+{
+    //! <html><head><style>div{white-space: pre;}span{white-space: pre;font-family:monospace;font-size: 159px;line-height: 160px;margin: 2px;}</style></head>
+    //! <body><p>word1 word2 word3</p>
+    //! <p>word4 word5 word6</p></body>
+}
+test("Select word by clicking on word.")
+{
+	// Preliminaries.
+	HTML_Element* p_1_element = find_element("p", 1);
+	HTML_Element* p_2_element = find_element("p", 2);
+	verify(p_1_element);
+	verify(p_2_element);
+	HTML_Element* txt_1_element = p_1_element->FirstChild();
+	HTML_Element* txt_2_element = p_2_element->FirstChild();
+	verify(txt_1_element);
+	verify(txt_2_element);
+	verify(txt_1_element->GetTextData());
+	verify(txt_2_element->GetTextData());
+	verify_string(txt_1_element->GetTextData()->GetText(), "word1 word2 word3");
+	verify_string(txt_2_element->GetTextData()->GetText(), "word4 word5 word6");
+
+	RECT txt_1_rect, txt_2_rect;
+	verify(txt_1_element->GetLayoutBox()->GetRect(state.doc, CONTENT_BOX, txt_1_rect));
+	verify(txt_2_element->GetLayoutBox()->GetRect(state.doc, CONTENT_BOX, txt_2_rect));
+
+	HTML_Document* document = state.doc->GetHtmlDocument();
+	const size_t SELECTION_BUF_SIZE = 32;
+	uni_char buffer[SELECTION_BUF_SIZE];
+
+	// Select each word one by one and verify the resulting selected text.
+	document->SelectWord(txt_1_rect.left, txt_1_rect.top);
+	verify(document->GetSelectedText(buffer, SELECTION_BUF_SIZE));
+	verify_string(buffer, "word1");
+
+	document->SelectWord(txt_1_rect.left + (txt_1_rect.right - txt_1_rect.left) / 2, txt_1_rect.top);
+	verify(document->GetSelectedText(buffer, SELECTION_BUF_SIZE));
+	verify_string(buffer, "word2");
+
+	document->SelectWord(txt_1_rect.right, txt_1_rect.top);
+	verify(document->GetSelectedText(buffer, SELECTION_BUF_SIZE));
+	verify_string(buffer, "word3");
+
+	document->SelectWord(txt_2_rect.left, txt_2_rect.top);
+	verify(document->GetSelectedText(buffer, SELECTION_BUF_SIZE));
+	verify_string(buffer, "word4");
+
+	document->SelectWord(txt_2_rect.left + (txt_2_rect.right - txt_2_rect.left) / 2, txt_2_rect.top);
+	verify(document->GetSelectedText(buffer, SELECTION_BUF_SIZE));
+	verify_string(buffer, "word5");
+
+	document->SelectWord(txt_2_rect.right, txt_2_rect.top);
+	verify(document->GetSelectedText(buffer, SELECTION_BUF_SIZE));
+	verify_string(buffer, "word6");
+}
+
+html
+{
+    //! <html><head><style>div{white-space: pre;}span{white-space: pre;font-family:monospace;font-size: 159px;line-height: 160px;margin: 2px;}</style></head>
+    //! <body><p>word1 word2 word3</p>
+    //! <p>word4 word5 word6</p></body>
+}
+test("Select word by clicking between lines.")
+{
+	// Preliminaries.
+	HTML_Element* p_1_element = find_element("p", 1);
+	HTML_Element* p_2_element = find_element("p", 2);
+	verify(p_1_element);
+	verify(p_2_element);
+	HTML_Element* txt_1_element = p_1_element->FirstChild();
+	HTML_Element* txt_2_element = p_2_element->FirstChild();
+	verify(txt_1_element);
+	verify(txt_2_element);
+	verify(txt_1_element->GetTextData());
+	verify(txt_2_element->GetTextData());
+	verify_string(txt_1_element->GetTextData()->GetText(), "word1 word2 word3");
+	verify_string(txt_2_element->GetTextData()->GetText(), "word4 word5 word6");
+
+	RECT txt_1_rect, txt_2_rect;
+	verify(txt_1_element->GetLayoutBox()->GetRect(state.doc, CONTENT_BOX, txt_1_rect));
+	verify(txt_2_element->GetLayoutBox()->GetRect(state.doc, CONTENT_BOX, txt_2_rect));
+
+	HTML_Document* document = state.doc->GetHtmlDocument();
+	const size_t SELECTION_BUF_SIZE = 32;
+	uni_char buffer[SELECTION_BUF_SIZE];
+
+	int middle_y = txt_1_rect.bottom + (txt_2_rect.top - txt_1_rect.bottom) / 2;
+	verify(middle_y > txt_1_rect.bottom);
+	verify(middle_y < txt_2_rect.top);
+
+	// Select a word and verify the resulting selected text.
+	document->SelectWord(txt_1_rect.left, middle_y);
+	verify(document->GetSelectedText(buffer, SELECTION_BUF_SIZE));
+	verify_string(buffer, "word1");
+
+	document->SelectWord(txt_1_rect.left + (txt_1_rect.right - txt_1_rect.left) / 2, middle_y);
+	verify(document->GetSelectedText(buffer, SELECTION_BUF_SIZE));
+	verify_string(buffer, "word2");
+
+	document->SelectWord(txt_1_rect.right, middle_y);
+	verify(document->GetSelectedText(buffer, SELECTION_BUF_SIZE));
+	verify_string(buffer, "word3");
+}
+
+html
+{
+    //! <html><head><style>div{white-space: pre;}span{white-space: pre;font-family:monospace;font-size: 159px;line-height: 160px;margin: 2px;}</style></head>
+    //! <body><p>word1 word2 word3</p>
+    //! <p>word4 word5 word6</p></body>
+}
+test("Select word by clicking outside text boxes.")
+{
+	// Preliminaries.
+	HTML_Element* p_1_element = find_element("p", 1);
+	HTML_Element* p_2_element = find_element("p", 2);
+	verify(p_1_element);
+	verify(p_2_element);
+	HTML_Element* txt_1_element = p_1_element->FirstChild();
+	HTML_Element* txt_2_element = p_2_element->FirstChild();
+	verify(txt_1_element);
+	verify(txt_2_element);
+	verify(txt_1_element->GetTextData());
+	verify(txt_2_element->GetTextData());
+	verify_string(txt_1_element->GetTextData()->GetText(), "word1 word2 word3");
+	verify_string(txt_2_element->GetTextData()->GetText(), "word4 word5 word6");
+
+	RECT txt_1_rect, txt_2_rect;
+	verify(txt_1_element->GetLayoutBox()->GetRect(state.doc, CONTENT_BOX, txt_1_rect));
+	verify(txt_2_element->GetLayoutBox()->GetRect(state.doc, CONTENT_BOX, txt_2_rect));
+
+	HTML_Document* document = state.doc->GetHtmlDocument();
+	const size_t SELECTION_BUF_SIZE = 32;
+	uni_char buffer[SELECTION_BUF_SIZE];
+
+	int middle_y = txt_1_rect.bottom + (txt_2_rect.top - txt_1_rect.bottom) / 2;
+	verify(middle_y > txt_1_rect.bottom);
+	verify(middle_y < txt_2_rect.top);
+
+	// Select each word one by one and verify the resulting selected text.
+	document->SelectWord(0, txt_1_rect.top);
+	verify(document->GetSelectedText(buffer, SELECTION_BUF_SIZE));
+	verify_string(buffer, "word1");
+
+	document->SelectWord(txt_1_rect.left + (txt_1_rect.right - txt_1_rect.left) / 2, 0);
+	verify(document->GetSelectedText(buffer, SELECTION_BUF_SIZE));
+	verify_string(buffer, "word2");
+
+	document->SelectWord(txt_1_rect.right + 100, txt_1_rect.top);
+	verify(document->GetSelectedText(buffer, SELECTION_BUF_SIZE));
+	verify_string(buffer, "word3");
+
+	document->SelectWord(0, txt_2_rect.top);
+	verify(document->GetSelectedText(buffer, SELECTION_BUF_SIZE));
+	verify_string(buffer, "word4");
+
+	document->SelectWord(txt_2_rect.left + (txt_2_rect.right - txt_2_rect.left) / 2, txt_2_rect.bottom + 100);
+	verify(document->GetSelectedText(buffer, SELECTION_BUF_SIZE));
+	verify_string(buffer, "word5");
+
+	document->SelectWord(txt_2_rect.right + 100, txt_2_rect.top);
+	verify(document->GetSelectedText(buffer, SELECTION_BUF_SIZE));
+	verify_string(buffer, "word6");
+}
+
+html
+{
+	//! <html>
+	//!   <body>a b</body>
+	//! </html>
+}
+test("Empty selection is really empty #1")
+{
+	HTML_Element* body = find_element("BODY", 1);
+	RECT body_rect;
+	verify(body->GetLayoutBox()->GetRect(state.doc, CONTENT_BOX, body_rect));
+
+	TextSelection selection;
+	verify_success(selection.SetCollapsedPosition(state.doc, LayoutCoord(body_rect.left + 1), LayoutCoord(body_rect.top + 1), FALSE, FALSE));
+	verify(selection.GetSelectionAsText(state.doc, NULL, 0, TRUE, TRUE) == 0);
+}
+
+html
+{
+	//! <html>
+	//!   <body>
+	//!     <div>a b</div>
+	//!   </body>
+	//! </html>
+}
+test("Empty selection is really empty #2")
+{
+	HTML_Element* div = find_element("DIV", 1);
+	RECT div_rect;
+	verify(div->GetLayoutBox()->GetRect(state.doc, CONTENT_BOX, div_rect));
+
+	TextSelection selection;
+	verify_success(selection.SetCollapsedPosition(state.doc, LayoutCoord(div_rect.left + 1), LayoutCoord(div_rect.top + 1), FALSE, FALSE));
+	verify(selection.GetSelectionAsText(state.doc, NULL, 0, TRUE, TRUE) == 0);
+}
+
+html
+{
+	//! <html><head><style>div{white-space: pre;}span{font-family:monospace;font-size: medium;}</style></head>
+	//! <body><div><span>word1</span> <span>word2</span> <span>word3</span></br>
+	//! <span>word4</span> <span>word5</span> <span>word6</span></div></body>
+}
+test("Select and modify")
+{
+	// Preliminaries.
+	HTML_Element* span_1_element = find_element("span", 1);
+	HTML_Element* span_2_element = find_element("span", 2);
+	HTML_Element* span_3_element = find_element("span", 3);
+	HTML_Element* span_4_element = find_element("span", 4);
+	HTML_Element* span_5_element = find_element("span", 5);
+	HTML_Element* span_6_element = find_element("span", 6);
+	verify(span_1_element);
+	verify(span_2_element);
+	verify(span_3_element);
+	verify(span_4_element);
+	verify(span_5_element);
+	verify(span_6_element);
+	HTML_Element* txt_1_element = span_1_element->FirstChild();
+	HTML_Element* txt_2_element = span_2_element->FirstChild();
+	HTML_Element* txt_3_element = span_3_element->FirstChild();
+	HTML_Element* txt_4_element = span_4_element->FirstChild();
+	HTML_Element* txt_5_element = span_5_element->FirstChild();
+	HTML_Element* txt_6_element = span_6_element->FirstChild();
+	verify(txt_1_element);
+	verify(txt_2_element);
+	verify(txt_3_element);
+	verify(txt_4_element);
+	verify(txt_5_element);
+	verify(txt_6_element);
+
+	verify(txt_1_element->GetTextData());
+	verify(txt_2_element->GetTextData());
+	verify(txt_3_element->GetTextData());
+	verify(txt_4_element->GetTextData());
+	verify(txt_5_element->GetTextData());
+	verify(txt_6_element->GetTextData());
+	verify_string(txt_1_element->GetTextData()->GetText(), "word1");
+	verify_string(txt_2_element->GetTextData()->GetText(), "word2");
+	verify_string(txt_3_element->GetTextData()->GetText(), "word3");
+	verify_string(txt_4_element->GetTextData()->GetText(), "word4");
+	verify_string(txt_5_element->GetTextData()->GetText(), "word5");
+	verify_string(txt_6_element->GetTextData()->GetText(), "word6");
+
+	RECT txt_1_rect, txt_2_rect, txt_3_rect, txt_4_rect, txt_5_rect, txt_6_rect;
+	verify(txt_1_element->GetLayoutBox()->GetRect(state.doc, CONTENT_BOX, txt_1_rect));
+	verify(txt_2_element->GetLayoutBox()->GetRect(state.doc, CONTENT_BOX, txt_2_rect));
+	verify(txt_3_element->GetLayoutBox()->GetRect(state.doc, CONTENT_BOX, txt_3_rect));
+	verify(txt_4_element->GetLayoutBox()->GetRect(state.doc, CONTENT_BOX, txt_4_rect));
+	verify(txt_5_element->GetLayoutBox()->GetRect(state.doc, CONTENT_BOX, txt_5_rect));
+	verify(txt_6_element->GetLayoutBox()->GetRect(state.doc, CONTENT_BOX, txt_6_rect));
+
+	HTML_Document* document = state.doc->GetHtmlDocument();
+	const size_t SELECTION_BUF_SIZE = 64;
+	uni_char buffer[SELECTION_BUF_SIZE];
+
+	// select the first row.
+	document->StartSelection(txt_1_rect.left,txt_1_rect.top);
+	document->MoveSelectionFocusPoint(txt_3_rect.right,txt_3_rect.top, FALSE);
+	verify(document->GetSelectedText(buffer, SELECTION_BUF_SIZE));
+	verify_string(buffer, "word1 word2 word3");
+
+	// contract the selection from the left.
+	document->MoveSelectionAnchorPoint(txt_2_rect.left,txt_2_rect.top);
+	verify(document->GetSelectedText(buffer, SELECTION_BUF_SIZE));
+	verify_string(buffer, "word2 word3");
+
+	// contract the selection from the right.
+	document->MoveSelectionFocusPoint(txt_2_rect.right,txt_2_rect.top, FALSE);
+	verify(document->GetSelectedText(buffer, SELECTION_BUF_SIZE));
+	verify_string(buffer, "word2");
+
+	// select both rows.
+	document->StartSelection(txt_1_rect.left,txt_1_rect.top);
+	document->MoveSelectionFocusPoint(txt_6_rect.right,txt_6_rect.top, FALSE);
+	verify(document->GetSelectedText(buffer, SELECTION_BUF_SIZE));
+	verify_string(buffer, "word1 word2 word3\n\nword4 word5 word6");
+
+	// contract the selection from the top.
+	document->MoveSelectionAnchorPoint(txt_4_rect.left,txt_4_rect.top);
+	verify(document->GetSelectedText(buffer, SELECTION_BUF_SIZE));
+	verify_string(buffer, "word4 word5 word6");
+
+	// contract the selection from the right.
+	document->MoveSelectionFocusPoint(txt_4_rect.right,txt_4_rect.top, FALSE);
+	verify(document->GetSelectedText(buffer, SELECTION_BUF_SIZE));
+	verify_string(buffer, "word4");
+
+	// select the top middle word.
+	document->StartSelection(txt_2_rect.left,txt_2_rect.top);
+	document->MoveSelectionFocusPoint(txt_2_rect.right,txt_2_rect.top, FALSE);
+	verify(document->GetSelectedText(buffer, SELECTION_BUF_SIZE));
+	verify_string(buffer, "word2");
+
+	// expand selection to the left.
+	document->MoveSelectionAnchorPoint(txt_1_rect.left,txt_1_rect.top);
+	verify(document->GetSelectedText(buffer, SELECTION_BUF_SIZE));
+	verify_string(buffer, "word1 word2");
+
+	// expand selection to the right.
+	document->MoveSelectionFocusPoint(txt_3_rect.right,txt_3_rect.top, FALSE);
+	verify(document->GetSelectedText(buffer, SELECTION_BUF_SIZE));
+	verify_string(buffer, "word1 word2 word3");
+
+	// expand selection to the bottom.
+	document->MoveSelectionFocusPoint(txt_6_rect.right,txt_6_rect.top, FALSE);
+	verify(document->GetSelectedText(buffer, SELECTION_BUF_SIZE));
+	verify_string(buffer, "word1 word2 word3\n\nword4 word5 word6");
+}
+
+html
+{
+	//! <!doctype html>
+	//! <style>span { visibility: hidden }</style>
+	//! <div><span>FAIL</span>PASS</div>
+	//! <div>PASS<span>FAIL</span>FAIL</div>
+	//! <div><span>FAIL</span>PASS<span>FAIL</span>FAIL</div>
+	//! <div>PA<span>FAIL</span>SS</div>
+}
+test ("Selection end point in hidden text")
+{
+	HTML_Element* div = find_element("DIV", 1);
+	verify(div);
+
+	HTML_Element* start_elm = div->FirstChild();
+	verify(start_elm);
+	start_elm = start_elm->FirstChild();
+	verify(start_elm);
+
+	HTML_Element* end_elm = div->LastChild();
+	verify(end_elm);
+
+	verify(selection_range(start_elm, 0, end_elm, 4, 4, "PASS"));
+}
+test ("Selection start point in hidden text")
+{
+	HTML_Element* div = find_element("DIV", 2);
+	verify(div);
+
+	HTML_Element* start_elm = div->FirstChild();
+	verify(start_elm);
+
+	HTML_Element* end_elm = start_elm->Suc();
+	verify(end_elm);
+	end_elm = end_elm->FirstChild();
+	verify(end_elm);
+
+	verify(selection_range(start_elm, 0, end_elm, 4, 4, "PASS"));
+}
+test ("Selection start and end points in hidden text")
+{
+	HTML_Element* div = find_element("DIV", 3);
+	verify(div);
+
+	HTML_Element* start_elm = div->FirstChild();
+	verify(start_elm);
+	start_elm = start_elm->FirstChild();
+	verify(start_elm);
+
+	HTML_Element* end_elm = div->LastChild();
+	verify(end_elm);
+	end_elm = end_elm->Pred();
+	verify(end_elm);
+	end_elm = end_elm->FirstChild();
+	verify(end_elm);
+
+	verify(selection_range(start_elm, 0, end_elm, 4, 4, "PASS"));
+}
+test ("Selection contains hidden text")
+{
+	HTML_Element* div = find_element("DIV", 4);
+	verify(div);
+
+	HTML_Element* start_elm = div->FirstChild();
+	verify(start_elm);
+
+	HTML_Element* end_elm = div->LastChild();
+	verify(end_elm);
+
+	verify(selection_range(start_elm, 0, end_elm, 2, 4, "PASS"));
+}
+
+html
+{
+	//! <!DOCTYPE html>
+	//! <html><body>
+	//!   <span id="s1">FAILA</span>
+	//!   <div><span id="fail">FAILB</span><span id="start">xxx FAILCPA</span></div><span id="end">SSFAILD xxx</span>
+	//!   <span id="s3">FAILE</span>
+	//! </body></html>
+}
+test("SelectionUpdateObject - block and inlines")
+{
+	FramesDocument* doc = state.doc;
+	HTML_Element* root = doc->GetDocRoot();
+	SelectionBoundaryPoint start;
+	SelectionBoundaryPoint end;
+
+	HTML_Element* t1 = root->GetElmById(UNI_L("start"));
+	verify(t1);
+	verify(t1 = t1->FirstChild());
+	verify(t1->Type() == Markup::HTE_TEXT);
+	verify(t1->GetLayoutBox());
+	verify(!t1->Suc());
+
+	HTML_Element* t2 = root->GetElmById(UNI_L("end"));
+	verify(t2);
+	verify(t2 = t2->FirstChild());
+	verify(t2->Type() == Markup::HTE_TEXT);
+	verify(t2->GetLayoutBox());
+	verify(!t2->Suc());
+
+	start.SetLogicalPosition(t1, 9);
+	end.SetLogicalPosition(t2, 2);
+
+	ST_SelectionUpdateObject traversal_object(doc, &start, &end);
+
+	traversal_object.Traverse(root);
+	verify(!traversal_object.IsOutOfMemory());
+
+	const BoxList &box_list = traversal_object.GetBoxList();
+	UINT32 index = 0;
+	Box* box;
+
+	verify(box = box_list.Get(index++));
+	verify(box->IsTextBox());
+	verify(box->GetHtmlElement()->Parent() == root->GetElmById(UNI_L("start")));
+
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement() == root->GetElmById(UNI_L("end")));
+
+	verify(box = box_list.Get(index++));
+	verify(box->IsTextBox());
+	verify(box->GetHtmlElement()->Parent() == root->GetElmById(UNI_L("end")));
+
+	verify(!box_list.Get(index++));
+
+	verify(!op_strcmp(traversal_object.GetText(), "PASS"));
+	verify(traversal_object.GetStartBoxDone());
+	verify(traversal_object.GetEndBoxDone());
+}
+
+html
+{
+	//! <!DOCTYPE html>
+	//! <html><body>
+	//!   <span id="s1">FAILA</span>
+	//!   <div style="float:left;"><span id="fail">FAILB</span><span id="start">xxx FAILCPA</span></div><span id="end">SSFAILD xxx</span>
+	//!   <span id="s3">FAILE</span>
+	//! </body></html>
+}
+test("SelectionUpdateObject - float on line")
+{
+	// This test is inspired by CORE-43889.
+
+	FramesDocument* doc = state.doc;
+	HTML_Element* root = doc->GetDocRoot();
+	SelectionBoundaryPoint start;
+	SelectionBoundaryPoint end;
+
+	HTML_Element* t1 = root->GetElmById(UNI_L("start"));
+	verify(t1);
+	verify(t1 = t1->FirstChild());
+	verify(t1->Type() == Markup::HTE_TEXT);
+	verify(t1->GetLayoutBox());
+	verify(!t1->Suc());
+
+	HTML_Element* t2 = root->GetElmById(UNI_L("end"));
+	verify(t2);
+	verify(t2 = t2->FirstChild());
+	verify(t2->Type() == Markup::HTE_TEXT);
+	verify(t2->GetLayoutBox());
+	verify(!t2->Suc());
+
+	start.SetLogicalPosition(t1, 9);
+	end.SetLogicalPosition(t2, 2);
+
+	ST_SelectionUpdateObject traversal_object(doc, &start, &end);
+
+	traversal_object.Traverse(root);
+	verify(!traversal_object.IsOutOfMemory());
+
+	const BoxList &box_list = traversal_object.GetBoxList();
+	UINT32 index = 0;
+	Box* box;
+
+	verify(box = box_list.Get(index++));
+	verify(box->IsTextBox());
+	verify(box->GetHtmlElement()->Parent() == root->GetElmById(UNI_L("start")));
+
+	verify(box = box_list.Get(index++));
+	verify(box->GetHtmlElement() == root->GetElmById(UNI_L("end")));
+
+	verify(box = box_list.Get(index++));
+	verify(box->IsTextBox());
+	verify(box->GetHtmlElement()->Parent() == root->GetElmById(UNI_L("end")));
+
+	verify(!box_list.Get(index++));
+
+	verify(!op_strcmp(traversal_object.GetText(), "PASS"));
+	verify(traversal_object.GetStartBoxDone());
+	verify(traversal_object.GetEndBoxDone());
+}
+
+html
+{
+	//! <!DOCTYPE html>
+	//! <html><body>
+	//!   <h1><span>FAIL</span><div id="elm" style="float:left;">xxx xPASSx xxx</div></h1>
+	//! </body></html>
+}
+test("SelectionUpdateObject - float last on line")
+{
+	// This test is inspired by CORE-43889.
+
+	FramesDocument* doc = state.doc;
+	HTML_Element* root = doc->GetDocRoot();
+	SelectionBoundaryPoint start;
+	SelectionBoundaryPoint end;
+
+	HTML_Element* elm = root->GetElmById(UNI_L("elm"));
+	verify(elm);
+	verify(elm = elm->FirstChild());
+	verify(elm->Type() == Markup::HTE_TEXT);
+	verify(elm->GetLayoutBox());
+	verify(!elm->Suc());
+
+	start.SetLogicalPosition(elm, 5);
+	end.SetLogicalPosition(elm, 9);
+
+	ST_SelectionUpdateObject traversal_object(doc, &start, &end);
+
+	traversal_object.Traverse(root);
+	verify(!traversal_object.IsOutOfMemory());
+
+	const BoxList &box_list = traversal_object.GetBoxList();
+	UINT32 index = 0;
+	Box* box;
+
+	verify(box = box_list.Get(index++));
+	verify(box->IsTextBox());
+	verify(box->GetHtmlElement()->Parent() == root->GetElmById(UNI_L("elm")));
+
+	verify(!box_list.Get(index++));
+
+	verify(!op_strcmp(traversal_object.GetText(), "PASS"));
+	verify(traversal_object.GetStartBoxDone());
+	verify(traversal_object.GetEndBoxDone());
+}
+
+html
+{
+	//! <!DOCTYPE html>
+	//! <html><body>
+	//!   <h1 id="container">before<div id="fl" style="float:left;">FLOAT</div><span id="neg" style="margin-left:-200px;">after</span></h1>
+	//! </body></html>
+}
+test("SelectionUpdateObject - float on line with negative pos. (1)")
+{
+	FramesDocument* doc = state.doc;
+	HTML_Element* root = doc->GetDocRoot();
+	SelectionBoundaryPoint start;
+	SelectionBoundaryPoint end;
+
+	HTML_Element* fl = root->GetElmById(UNI_L("fl"));
+	verify(fl);
+	verify(fl = fl->FirstChild());
+	verify(fl->Type() == Markup::HTE_TEXT);
+	verify(fl->GetLayoutBox());
+	verify(!fl->Suc());
+
+	start.SetLogicalPosition(fl, 1);
+	end.SetLogicalPosition(fl, 4);
+
+	ST_SelectionUpdateObject traversal_object(doc, &start, &end);
+
+	traversal_object.Traverse(root);
+	verify(!traversal_object.IsOutOfMemory());
+
+	const BoxList &box_list = traversal_object.GetBoxList();
+	UINT32 index = 0;
+	Box* box;
+
+	verify(box = box_list.Get(index++));
+	verify(box->IsTextBox());
+	verify(box->GetHtmlElement()->Parent() == root->GetElmById(UNI_L("fl")));
+
+	verify(!box_list.Get(index++));
+
+	verify(!op_strcmp(traversal_object.GetText(), "LOA"));
+	verify(traversal_object.GetStartBoxDone());
+	verify(traversal_object.GetEndBoxDone());
+}
+test("SelectionUpdateObject - float on line with negative pos. (2)")
+{
+	FramesDocument* doc = state.doc;
+	HTML_Element* root = doc->GetDocRoot();
+	SelectionBoundaryPoint start;
+	SelectionBoundaryPoint end;
+
+	HTML_Element* fl = root->GetElmById(UNI_L("fl"));
+	verify(fl);
+	verify(fl = fl->FirstChild());
+	verify(fl->Type() == Markup::HTE_TEXT);
+	verify(fl->GetLayoutBox());
+	verify(!fl->Suc());
+
+	start.SetLogicalPosition(fl, 0);
+	end.SetLogicalPosition(fl, 5);
+
+	ST_SelectionUpdateObject traversal_object(doc, &start, &end);
+
+	traversal_object.Traverse(root);
+	verify(!traversal_object.IsOutOfMemory());
+
+	const BoxList &box_list = traversal_object.GetBoxList();
+	UINT32 index = 0;
+	Box* box;
+
+	verify(box = box_list.Get(index++));
+	verify(box->IsTextBox());
+	verify(box->GetHtmlElement()->Parent() == root->GetElmById(UNI_L("fl")));
+
+	verify(!box_list.Get(index++));
+
+	verify(!op_strcmp(traversal_object.GetText(), "FLOAT"));
+	verify(traversal_object.GetStartBoxDone());
+	verify(traversal_object.GetEndBoxDone());
+}
+test("SelectionUpdateObject - float on line with negative pos. (3)")
+{
+	FramesDocument* doc = state.doc;
+	HTML_Element* root = doc->GetDocRoot();
+	SelectionBoundaryPoint start;
+	SelectionBoundaryPoint end;
+
+	HTML_Element* first_text = root->GetElmById(UNI_L("container"));
+	verify(first_text);
+	verify(first_text = first_text->FirstChild());
+	verify(first_text->Type() == Markup::HTE_TEXT);
+	verify(first_text->GetLayoutBox());
+
+	start.SetLogicalPosition(first_text, 0);
+	end.SetLogicalPosition(first_text, 6);
+
+	ST_SelectionUpdateObject traversal_object(doc, &start, &end);
+
+	traversal_object.Traverse(root);
+	verify(!traversal_object.IsOutOfMemory());
+
+	const BoxList &box_list = traversal_object.GetBoxList();
+	UINT32 index = 0;
+	Box* box;
+
+	verify(box = box_list.Get(index++));
+	verify(box->IsTextBox());
+	verify(box->GetHtmlElement()->Parent() == root->GetElmById(UNI_L("container")));
+	verify(!box->GetHtmlElement()->Pred());
+
+	verify(!box_list.Get(index++));
+
+	verify(!op_strcmp(traversal_object.GetText(), "before"));
+	verify(traversal_object.GetStartBoxDone());
+	verify(traversal_object.GetEndBoxDone());
+}
+test("SelectionUpdateObject - float on line with negative pos. (4)")
+{
+	FramesDocument* doc = state.doc;
+	HTML_Element* root = doc->GetDocRoot();
+	SelectionBoundaryPoint start;
+	SelectionBoundaryPoint end;
+
+	HTML_Element* first_text = root->GetElmById(UNI_L("container"));
+	verify(first_text);
+	verify(first_text = first_text->FirstChild());
+	verify(first_text->Type() == Markup::HTE_TEXT);
+	verify(first_text->GetLayoutBox());
+
+	HTML_Element* fl = root->GetElmById(UNI_L("fl"));
+	verify(fl);
+	verify(fl = fl->FirstChild());
+	verify(fl->Type() == Markup::HTE_TEXT);
+	verify(fl->GetLayoutBox());
+	verify(!fl->Suc());
+
+	start.SetLogicalPosition(first_text, 2);
+	end.SetLogicalPosition(fl, 5);
+
+	ST_SelectionUpdateObject traversal_object(doc, &start, &end);
+
+	traversal_object.Traverse(root);
+	verify(!traversal_object.IsOutOfMemory());
+
+	const BoxList &box_list = traversal_object.GetBoxList();
+	UINT32 index = 0;
+	Box* box;
+
+	verify(box = box_list.Get(index++));
+	verify(box->IsTextBox());
+	verify(box->GetHtmlElement()->Parent() == root->GetElmById(UNI_L("container")));
+	verify(!box->GetHtmlElement()->Pred());
+
+	verify(box = box_list.Get(index++));
+	verify(box->IsFloatingBox());
+
+	verify(box = box_list.Get(index++));
+	verify(box->IsTextBox());
+	verify(box->GetHtmlElement()->Parent() == root->GetElmById(UNI_L("fl")));
+
+	verify(!box_list.Get(index++));
+
+	verify(!op_strcmp(traversal_object.GetText(), "foreFLOAT"));
+	verify(traversal_object.GetStartBoxDone());
+	verify(traversal_object.GetEndBoxDone());
+}
+test("SelectionUpdateObject - float on line with negative pos. (5)")
+{
+	FramesDocument* doc = state.doc;
+	HTML_Element* root = doc->GetDocRoot();
+	SelectionBoundaryPoint start;
+	SelectionBoundaryPoint end;
+
+	HTML_Element* neg = root->GetElmById(UNI_L("neg"));
+	verify(neg);
+	verify(neg = neg->FirstChild());
+	verify(neg->Type() == Markup::HTE_TEXT);
+	verify(neg->GetLayoutBox());
+	verify(!neg->Suc());
+
+	start.SetLogicalPosition(neg, 0);
+	end.SetLogicalPosition(neg, 5);
+
+	ST_SelectionUpdateObject traversal_object(doc, &start, &end);
+
+	traversal_object.Traverse(root);
+	verify(!traversal_object.IsOutOfMemory());
+
+	const BoxList &box_list = traversal_object.GetBoxList();
+	UINT32 index = 0;
+	Box* box;
+
+	verify(box = box_list.Get(index++));
+	verify(box->IsTextBox());
+	verify(box->GetHtmlElement()->Parent() == root->GetElmById(UNI_L("neg")));
+
+	verify(!box_list.Get(index++));
+
+	verify(!op_strcmp(traversal_object.GetText(), "after"));
+	verify(traversal_object.GetStartBoxDone());
+	verify(traversal_object.GetEndBoxDone());
+}
+test("SelectionUpdateObject - float on line with negative pos. (6)")
+{
+	FramesDocument* doc = state.doc;
+	HTML_Element* root = doc->GetDocRoot();
+	SelectionBoundaryPoint start;
+	SelectionBoundaryPoint end;
+
+	HTML_Element* fl = root->GetElmById(UNI_L("fl"));
+	verify(fl);
+	verify(fl = fl->FirstChild());
+	verify(fl->Type() == Markup::HTE_TEXT);
+	verify(fl->GetLayoutBox());
+	verify(!fl->Suc());
+
+	HTML_Element* neg = root->GetElmById(UNI_L("neg"));
+	verify(neg);
+	verify(neg = neg->FirstChild());
+	verify(neg->Type() == Markup::HTE_TEXT);
+	verify(neg->GetLayoutBox());
+	verify(!neg->Suc());
+
+	start.SetLogicalPosition(fl, 0);
+	end.SetLogicalPosition(neg, 5);
+
+	ST_SelectionUpdateObject traversal_object(doc, &start, &end);
+
+	traversal_object.Traverse(root);
+	verify(!traversal_object.IsOutOfMemory());
+
+	const BoxList &box_list = traversal_object.GetBoxList();
+	UINT32 index = 0;
+	Box* box;
+
+	verify(box = box_list.Get(index++));
+	verify(box->IsTextBox());
+	verify(box->GetHtmlElement()->Parent() == root->GetElmById(UNI_L("fl")));
+
+	verify(box = box_list.Get(index++));
+	verify(box->IsInlineBox());
+
+	verify(box = box_list.Get(index++));
+	verify(box->IsTextBox());
+	verify(box->GetHtmlElement()->Parent() == root->GetElmById(UNI_L("neg")));
+
+	verify(!box_list.Get(index++));
+
+	verify(!op_strcmp(traversal_object.GetText(), "FLOATafter"));
+	verify(traversal_object.GetStartBoxDone());
+	verify(traversal_object.GetEndBoxDone());
+}
+test("SelectionUpdateObject - float on line with negative pos. (7)")
+{
+	FramesDocument* doc = state.doc;
+	HTML_Element* root = doc->GetDocRoot();
+	SelectionBoundaryPoint start;
+	SelectionBoundaryPoint end;
+
+	HTML_Element* first_text = root->GetElmById(UNI_L("container"));
+	verify(first_text);
+	verify(first_text = first_text->FirstChild());
+	verify(first_text->Type() == Markup::HTE_TEXT);
+	verify(first_text->GetLayoutBox());
+
+	HTML_Element* neg = root->GetElmById(UNI_L("neg"));
+	verify(neg);
+	verify(neg = neg->FirstChild());
+	verify(neg->Type() == Markup::HTE_TEXT);
+	verify(neg->GetLayoutBox());
+	verify(!neg->Suc());
+
+	start.SetLogicalPosition(first_text, 1);
+	end.SetLogicalPosition(neg, 4);
+
+	ST_SelectionUpdateObject traversal_object(doc, &start, &end);
+
+	traversal_object.Traverse(root);
+	verify(!traversal_object.IsOutOfMemory());
+
+	const BoxList &box_list = traversal_object.GetBoxList();
+	UINT32 index = 0;
+	Box* box;
+
+	verify(box = box_list.Get(index++));
+	verify(box->IsTextBox());
+	verify(box->GetHtmlElement()->Parent() == root->GetElmById(UNI_L("container")));
+	verify(!box->GetHtmlElement()->Pred());
+
+	verify(box = box_list.Get(index++));
+	verify(box->IsFloatingBox());
+
+	verify(box = box_list.Get(index++));
+	verify(box->IsTextBox());
+	verify(box->GetHtmlElement()->Parent() == root->GetElmById(UNI_L("fl")));
+
+	verify(box = box_list.Get(index++));
+	verify(box->IsInlineBox());
+
+	verify(box = box_list.Get(index++));
+	verify(box->IsTextBox());
+	verify(box->GetHtmlElement()->Parent() == root->GetElmById(UNI_L("neg")));
+
+	verify(!box_list.Get(index++));
+
+	verify(!op_strcmp(traversal_object.GetText(), "eforeFLOATafte"));
+	verify(traversal_object.GetStartBoxDone());
+	verify(traversal_object.GetEndBoxDone());
+}

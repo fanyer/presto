@@ -1,0 +1,408 @@
+/* -*- Mode: c++; tab-width: 4; indent-tabs-mode: t; c-basic-offset: 4 -*-
+ *
+ * Copyright (C) 2011 Opera Software AS.  All rights reserved.
+ *
+ * This file is part of the Opera web browser.
+ * It may not be distributed under any circumstances.
+ */
+
+group "dom.geolocation.access_notifications";
+
+require GEOLOCATION_SUPPORT;
+require init;
+
+language c++;
+
+include "modules/security_manager/include/security_manager.h";
+include "modules/windowcommander/src/WindowCommander.h";
+include "modules/dochand/win.h";
+
+global
+{
+	class TestDocumentListener : public NullDocumentListener
+	{
+	public:
+		TestDocumentListener()
+			: m_is_oom(FALSE)
+			, m_listener(NULL)
+			, m_wc(NULL)
+		{
+		}
+
+		void Setup(WindowCommander* wc)
+		{
+			m_wc = wc;
+			m_listener = wc->GetDocumentListener();
+			wc->SetDocumentListener(this);
+		}
+
+		~TestDocumentListener()
+		{
+			if (m_wc)
+				m_wc->SetDocumentListener(m_listener);
+		}
+
+		virtual void OnGeolocationAccess(OpWindowCommander* wc, const OpVector<uni_char>* hostnames)
+		{
+			NotificationContent* evt = OP_NEW(NotificationContent, ());
+
+			if (!evt || OpStatus::IsError((hostnames->GetCount() > 0) ? m_start_called.Add(evt) : m_end_called.Add(evt)))
+			{
+				OP_DELETE(evt);
+				m_is_oom = TRUE;
+				return;
+			}
+			evt->wc = wc;
+		}
+
+		void Reset()
+		{
+			m_start_called.DeleteAll();
+			m_end_called.DeleteAll();
+			m_is_oom = FALSE;
+		}
+
+		struct NotificationContent
+		{
+			OpWindowCommander* wc;
+		};
+
+		BOOL m_is_oom;
+		OpAutoVector<NotificationContent> m_start_called;
+		OpAutoVector<NotificationContent> m_end_called;
+		OpDocumentListener* m_listener;
+		WindowCommander* m_wc;
+	};
+
+	class TestPermissionListener : public NullPermissionListener
+	{
+	public:
+		TestPermissionListener()
+			: m_wc(NULL)
+			, m_listener(NULL)
+			, m_allow(FALSE)
+		{
+		}
+
+		void Setup(WindowCommander* wc, BOOL allow)
+		{
+			m_wc = wc;
+			m_listener = wc->GetPermissionListener();
+			wc->SetPermissionListener(this);
+			m_allow = allow;
+		}
+
+		~TestPermissionListener()
+		{
+			if (m_wc)
+				m_wc->SetPermissionListener(m_listener);
+		}
+#ifdef WIC_SET_PERMISSION
+		void RevokePermission()
+		{
+			m_wc->SetUserConsent(PermissionCallback::PERMISSION_TYPE_GEOLOCATION_REQUEST, PermissionCallback::PERSISTENCE_TYPE_RUNTIME, UNI_L("opera-selftest"), MAYBE);
+		}
+#endif // WIC_SET_PERMISSION
+		void OnAskForPermission(OpWindowCommander *commander, PermissionCallback *callback)
+		{
+			if (m_allow)
+				callback->OnAllowed(PermissionCallback::PERSISTENCE_TYPE_RUNTIME);
+			else
+				callback->OnDisallowed(PermissionCallback::PERSISTENCE_TYPE_RUNTIME);
+		}
+
+	private:
+		WindowCommander* m_wc;
+		OpPermissionListener* m_listener;
+		BOOL m_allow;
+	};
+
+	TestPermissionListener g_test_permission_listener;
+	TestDocumentListener g_test_document_listener;
+}
+
+setup
+{
+	g_test_permission_listener.Setup(state.GetWindow()->GetWindowCommander(), TRUE);
+	g_test_document_listener.Setup(state.GetWindow()->GetWindowCommander());
+}
+
+html {
+//! <html>
+//! <script>
+//! </script>
+//! </html>
+}
+
+test("test1.1 getPosition should cause start+end notification")
+	language ecmascript;
+	async;
+{
+	navigator.geolocation.getCurrentPosition( function(){ ST_passed(); });
+}
+
+test("test1.2 getPosition should cause start+end notification")
+	require success "test1.1 getPosition should cause start+end notification";
+{
+	verify(!g_test_document_listener.m_is_oom);
+
+	verify(g_test_document_listener.m_start_called.GetCount() == 1);
+	verify(g_test_document_listener.m_end_called.GetCount() == 1);
+	verify(g_test_document_listener.m_start_called.Get(0)->wc == state.GetWindow()->GetWindowCommander());
+	verify(g_test_document_listener.m_end_called.Get(0)->wc == state.GetWindow()->GetWindowCommander());
+
+}
+
+html {
+//! <html>
+//! <script>
+//! </script>
+//! </html>
+}
+
+test("test1.cleanup getPosition should cause start+end notification")
+{
+	g_test_document_listener.Reset()
+}
+
+test("test2.1 watchPosition should cause only start notification")
+	language ecmascript;
+	async;
+{
+	var finished = false;
+	var watchId = navigator.geolocation.watchPosition( function(){ if (!finished) {ST_passed(); finished = true;}});
+}
+
+test("test2.2 watchPosition should cause only start notification")
+	require success "test2.1 watchPosition should cause only start notification";
+{
+	verify(!g_test_document_listener.m_is_oom);
+
+	verify(g_test_document_listener.m_start_called.GetCount() == 1);
+	verify(g_test_document_listener.m_end_called.GetCount() == 0);
+	verify(g_test_document_listener.m_start_called.Get(0)->wc == state.GetWindow()->GetWindowCommander());
+
+}
+
+html {
+//! <html>
+//! <script>
+//! </script>
+//! </html>
+}
+
+test("test2.cleanup watchPosition should cause only start notification")
+{
+	g_test_document_listener.Reset()
+}
+
+test("test3.1watchPosition+clear should cause start+end notification")
+	language ecmascript;
+{
+	watchId = navigator.geolocation.watchPosition( function(){ });
+	navigator.geolocation.clearWatch(watchId);
+}
+
+test("test3.2 watchPosition+clear should cause start+end notification")
+	require success "test3.1watchPosition+clear should cause start+end notification";
+{
+	verify(!g_test_document_listener.m_is_oom);
+
+	verify(g_test_document_listener.m_start_called.GetCount() == 1);
+	verify(g_test_document_listener.m_end_called.GetCount() == 1);
+	verify(g_test_document_listener.m_start_called.Get(0)->wc == state.GetWindow()->GetWindowCommander());
+	verify(g_test_document_listener.m_end_called.Get(0)->wc == state.GetWindow()->GetWindowCommander());
+}
+
+html {
+//! <html>
+//! <script>
+//! </script>
+//! </html>
+}
+
+test("test3.cleanup watchPosition+clear should cause start+end notification")
+{
+	g_test_document_listener.Reset()
+}
+
+test("test4.1 watchPositionx2 should cause only 1 start notification")
+	language ecmascript;
+{
+	navigator.geolocation.watchPosition( function(){ });
+	navigator.geolocation.watchPosition( function(){ });
+}
+
+test("test4.2 watchPositionx2 should cause only 1 start notification")
+	require success "test4.1 watchPositionx2 should cause only 1 start notification";
+{
+	verify(!g_test_document_listener.m_is_oom);
+
+	verify(g_test_document_listener.m_start_called.GetCount() == 1);
+	verify(g_test_document_listener.m_end_called.GetCount() == 0);
+	verify(g_test_document_listener.m_start_called.Get(0)->wc == state.GetWindow()->GetWindowCommander());
+}
+
+html {
+//! <html>
+//! <script>
+//! </script>
+//! </html>
+}
+
+test("test4.cleanup watchPositionx2 should cause only 1 start notification")
+{
+	g_test_document_listener.Reset()
+}
+
+/////////////// test5 watchPosition + revoke permission should cause 1xstart+1xend notification ///////////////
+
+test("test5.1 watchPosition + revoke permission should cause 1xstart+1xend notification")
+	require WIC_SET_PERMISSION;
+	language ecmascript;
+{
+	navigator.geolocation.watchPosition( function(){ });
+}
+
+test("test5.2 watchPosition + revoke permission should cause 1xstart+1xend notification")
+	require WIC_SET_PERMISSION;
+	require success "test5.1 watchPosition + revoke permission should cause 1xstart+1xend notification";
+{
+	verify(!g_test_document_listener.m_is_oom);
+
+	verify(g_test_document_listener.m_start_called.GetCount() == 1);
+	verify(g_test_document_listener.m_end_called.GetCount() == 0);
+	verify(g_test_document_listener.m_start_called.Get(0)->wc == state.GetWindow()->GetWindowCommander());
+
+	g_test_permission_listener.RevokePermission();
+
+	verify(g_test_document_listener.m_start_called.GetCount() == 1);
+	verify(g_test_document_listener.m_end_called.GetCount() == 1);
+	verify(g_test_document_listener.m_start_called.Get(0)->wc == state.GetWindow()->GetWindowCommander());
+	verify(g_test_document_listener.m_end_called.Get(0)->wc == state.GetWindow()->GetWindowCommander());
+}
+
+html {
+//! <html>
+//! <script>
+//! </script>
+//! </html>
+}
+
+test("test5.cleanup watchPosition + revoke permission should cause 1xstart+1xend notification")
+	require WIC_SET_PERMISSION;
+{
+	g_test_document_listener.Reset()
+}
+
+/////////////// test6 watchPosition + move to a different location should cause 1xstart+1xend notification ///////////////
+
+test("test6.1 watchPosition + move to a different location should cause 1xstart+1xend notification")
+	language ecmascript;
+{
+	navigator.geolocation.watchPosition( function(){ });
+	window.location = "opera:blanker";
+}
+
+test("test6.2 watchPosition + move to a different location should cause 1xstart+1xend notification")
+	require success "test6.1 watchPosition + move to a different location should cause 1xstart+1xend notification";
+{
+	verify(!g_test_document_listener.m_is_oom);
+
+	verify(g_test_document_listener.m_start_called.GetCount() == 1);
+	verify(g_test_document_listener.m_end_called.GetCount() == 1);
+	verify(g_test_document_listener.m_start_called.Get(0)->wc == state.GetWindow()->GetWindowCommander());
+	verify(g_test_document_listener.m_end_called.Get(0)->wc == state.GetWindow()->GetWindowCommander());
+}
+
+html {
+//! <html>
+//! <script>
+//! </script>
+//! </html>
+}
+
+test("test6.cleanup watchPosition + move to a different location should cause 1xstart+1xend notification")
+{
+	g_test_document_listener.Reset()
+}
+
+/////////////// test7 watchPosition + go back in history should cause 1xstart+1xend notification ///////////////
+
+test("test7.1 watchPosition + go back in history should cause 1xstart+1xend notification")
+	language ecmascript;
+{
+	navigator.geolocation.watchPosition( function(){ });
+	history.go(-1);
+}
+
+test("test7.2 watchPosition + go back in history should cause 1xstart+1xend notification")
+	require success "test7.1 watchPosition + go back in history should cause 1xstart+1xend notification";
+{
+	verify(!g_test_document_listener.m_is_oom);
+
+	verify(g_test_document_listener.m_start_called.GetCount() == 1);
+	verify(g_test_document_listener.m_end_called.GetCount() == 1);
+	verify(g_test_document_listener.m_start_called.Get(0)->wc == state.GetWindow()->GetWindowCommander());
+	verify(g_test_document_listener.m_end_called.Get(0)->wc == state.GetWindow()->GetWindowCommander());
+}
+
+html {
+//! <html>
+//! <script>
+//! </script>
+//! </html>
+}
+
+test("test7.cleanup watchPosition + go back in history should cause 1xstart+1xend notification")
+{
+	g_test_document_listener.Reset()
+}
+
+/////////////// test8 watchPosition + go forward in history should cause 1xstart+1xend notification ///////////////
+
+test("test8.01 watchPosition + go forward in history should cause 1xstart+1xend notification")
+	language ecmascript;
+{
+	window.location = "opera:blanker";
+}
+
+test("test8.02 watchPosition + go forward in history should cause 1xstart+1xend notification")
+	language ecmascript;
+	delay pre 1;
+{
+	history.go(-1);
+}
+
+
+test("test8.1 watchPosition + go forward in history should cause 1xstart+1xend notification")
+	language ecmascript;
+	delay pre 1;
+{
+	navigator.geolocation.watchPosition( function(){ });
+	history.go(1);
+}
+
+test("test8.2 watchPosition + go forward in history should cause 1xstart+1xend notification")
+	require success "test8.1 watchPosition + go forward in history should cause 1xstart+1xend notification";
+	delay pre 1;
+{
+	verify(!g_test_document_listener.m_is_oom);
+
+	verify(g_test_document_listener.m_start_called.GetCount() == 1);
+	verify(g_test_document_listener.m_end_called.GetCount() == 1);
+	verify(g_test_document_listener.m_start_called.Get(0)->wc == state.GetWindow()->GetWindowCommander());
+	verify(g_test_document_listener.m_end_called.Get(0)->wc == state.GetWindow()->GetWindowCommander());
+}
+
+html {
+//! <html>
+//! <script>
+//! </script>
+//! </html>
+}
+
+test("test8.cleanup watchPosition + go forward in history should cause 1xstart+1xend notification")
+{
+	g_test_document_listener.Reset()
+}

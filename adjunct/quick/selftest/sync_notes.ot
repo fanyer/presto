@@ -1,0 +1,470 @@
+/* -*- Mode: c++; tab-width: 4; indent-tabs-mode: t; c-basic-offset: 4 -*- */
+
+
+group "quick_sync.notes";
+require init;
+require SUPPORT_DATA_SYNC;
+
+include "modules/sync/sync_coordinator.h";
+include "modules/sync/sync_dataitem.h";
+include "modules/sync/sync_state.h";
+include "modules/sync/sync_util.h";
+include "adjunct/quick/Application.h";
+include "adjunct/quick/managers/SyncManager.h";
+include "adjunct/quick/selftest/src/ST_SyncNoteItems.h";
+include "adjunct/desktop_util/string/stringutils.h";
+
+language C++;
+
+
+/*******************************************************************
+ *
+ * Tests: Deleting an item and then emptying trash
+ * Notifications to Syncer/Sync module: modified item, deleted item
+ *
+ *
+ ********************************************************************/
+
+test("Delete item -> Empty Trash")
+{
+	ST_SyncNoteItems* syncer = OP_NEW(ST_SyncNoteItems, ());
+	verify(syncer);
+	syncer->EnableNoteListening(TRUE);
+	verify(syncer->IsNoteListening());
+
+	HotlistModelItem* item = OP_NEW(NoteModelItem, ());
+		
+	item->SetUrl(UNI_L("Item-to-delete"));
+	item->SetName(UNI_L("ITEM_TO_DELETE"));
+
+	HotlistGenericModel* model = g_hotlist_manager->GetNotesModel();
+	verify(model);
+	HotlistModelItem* added = model->AddItem(item, /* allow_duplicates */ FALSE, FALSE);
+	verify(added != 0);
+	verify(added->GetUniqueGUID().HasContent());
+	verify(added->GetPreviousItem() != 0);
+
+	model->EmptyTrash();
+	syncer->ResetSentCounts();
+	verify(model->DeleteItem( added, /* copy_to_trash */TRUE ));
+
+	// -- Listeners (SyncBookmarkItems) should be notified the item moved
+	verify(syncer->GetModifiedCount() == 1);
+	verify(syncer->GetDeleteCount() == 0);
+	verify(syncer->GetAddCount() == 0);
+
+	// -- Listeners (SyncBookmarkItems) should be notified the item was deleted
+	model->EmptyTrash();
+	verify(syncer->GetAddCount() == 0);
+	verify(syncer->GetDeleteCount() == 1);
+	verify(syncer->GetModifiedCount() == 1);
+
+	syncer->EnableNoteListening(FALSE);
+	OP_DELETE(syncer);
+
+}
+
+
+/*******************************************************************
+ *
+ * Tests: Drag-drop trash folder to different position
+ * Notifications to Syncer: One modified notification
+ *
+ ******************************************************************/
+
+test("Drag-drop trash folder and verify that only modified is sent to sync module")
+{
+	ST_SyncNoteItems* syncer = OP_NEW(ST_SyncNoteItems, ());
+	verify(syncer);
+	syncer->EnableNoteListening(TRUE);
+	verify(syncer->IsNoteListening());
+
+	// Drag-drop Trash and then check that what we send is a modified with the correct data
+	HotlistGenericModel* model = g_hotlist_manager->GetNotesModel();
+	verify(model);
+	model->Erase();
+	verify(model->GetCount() == 0);
+	HotlistModelItem* item = model->GetTrashFolder();
+	syncer->ResetSentCounts();
+
+	INT32 first_id = 0;
+	BOOL is_dropped = g_hotlist_manager->DropItem( item->GetID(), HotlistModel::NoteRoot, DROP_MOVE, DesktopDragObject::INSERT_AFTER, TRUE, &first_id, FALSE);
+	verify(is_dropped);
+	verify(first_id != -1);
+	verify(syncer->GetAddCount() == 0);
+	verify(syncer->GetDeleteCount() == 0);
+	verify(syncer->GetModifiedCount() == 1);
+
+	syncer->EnableNoteListening(TRUE);
+	OP_DELETE(syncer);
+
+}
+
+test("ProcessSyncItem on null item (bookmark)")
+{
+	g_sync_manager->SetSupportsType(SyncManager::SYNC_NOTES, TRUE);
+
+	ST_SyncNoteItems syncer;
+
+	// --- Store away original value of m_is_recieving_items
+	BOOL stored_value = syncer.IsProcessingIncomingItems();
+
+	// Test add null item
+	OpSyncItem* empty_item = 0;
+	BOOL dirty = FALSE;
+	verify(OpStatus::IsError(syncer.ProcessSyncItem(empty_item, dirty)));
+	verify(!dirty);
+
+	// --- Check that m_is_receiving_items value has been reset
+	verify(syncer.IsProcessingIncomingItems() == stored_value);
+}
+
+
+test("ProcessSyncItem(Note) on Search item")
+{
+	ST_SyncNoteItems syncer;
+
+	// --- Store away original value of m_is_recieving_items
+	BOOL stored_value = syncer.IsProcessingIncomingItems();
+
+	OpSyncItem* item = 0;
+
+	OpString guid;
+
+	// --- Generate a GUID and get the SyncItem
+	verify(OpStatus::IsSuccess(StringUtils::GenerateClientID(guid)));
+	verify(OpStatus::IsSuccess(g_sync_coordinator->GetSyncItem(&item, OpSyncDataItem::DATAITEM_SEARCH, OpSyncItem::SYNC_KEY_ID, guid.CStr()))); 
+
+	// -- Set action and a set of elements / attributes on the item
+	item->SetStatus(OpSyncDataItem::DATAITEM_ACTION_ADDED);
+	verify(OpStatus::IsSuccess(item->SetData(OpSyncItem::SYNC_KEY_URI, UNI_L("opera:about"))));
+	verify(OpStatus::IsSuccess(item->SetData(OpSyncItem::SYNC_KEY_TITLE, UNI_L("opera about"))));
+	
+	BOOL dirty = FALSE;
+
+	// -- Test ProcessSyncItem on the item 
+	// -- Need to test that ProcessSyncItem does not end up with sending the item
+	verify(OpStatus::IsError(syncer.ProcessSyncItem(item, dirty)));
+	verify(!dirty);
+
+	// --- Check that m_is_receiving_items value has been reset
+	verify(syncer.IsProcessingIncomingItems() == stored_value);
+
+	verify(!syncer.ItemsSentToServer());
+	syncer.ResetSentToServer();
+
+	g_sync_coordinator->ReleaseSyncItem(item);
+}
+
+test("ProcessSyncItem - received items should not be sent back to server")
+{
+	ST_SyncNoteItems* syncer = OP_NEW(ST_SyncNoteItems, ());
+	g_sync_coordinator->SetSyncDataClient(syncer, OpSyncDataItem::DATAITEM_NOTE);
+	verify(g_sync_manager->SupportsType(SyncManager::SYNC_NOTES));
+	verify(syncer->IsNoteListening());
+
+	// --- Store away original value of m_is_recieving_items
+	BOOL stored_value = syncer->IsProcessingIncomingItems();
+	
+	OpSyncItem *item = 0;
+	
+	OpString guid;
+		
+	// --- Generate a GUID and get the SyncItem
+	verify(OpStatus::IsSuccess(StringUtils::GenerateClientID(guid)));
+	verify(OpStatus::IsSuccess(g_sync_coordinator->GetSyncItem(&item, OpSyncDataItem::DATAITEM_NOTE, OpSyncItem::SYNC_KEY_ID, guid.CStr()))); //
+
+	// -- Set action and a set of elements / attributes on the item
+	item->SetStatus(OpSyncDataItem::DATAITEM_ACTION_ADDED);
+	verify(OpStatus::IsSuccess(item->SetData(OpSyncItem::SYNC_KEY_GROUP, UNI_L("custom"))));
+	verify(OpStatus::IsSuccess(item->SetData(OpSyncItem::SYNC_KEY_URI, UNI_L("opera:about"))));
+	verify(OpStatus::IsSuccess(item->SetData(OpSyncItem::SYNC_KEY_TITLE, UNI_L("opera about"))));
+
+	// -- Test ProcessSyncItem on the item 
+	BOOL dirty = FALSE;
+	verify(OpStatus::IsSuccess(syncer->ProcessSyncItem(item, dirty)));
+	verify(!dirty);
+	verify(syncer->ReceivedNotification());
+	syncer->ResetNotification();
+	g_sync_coordinator->ReleaseSyncItem(item);
+
+	// --- Check that m_is_receiving_items value has been reset
+	verify(syncer->IsProcessingIncomingItems() == stored_value);
+	verify(!syncer->ItemsSentToServer());
+	syncer->ResetSentToServer();
+
+	// --- Store away original value of m_is_recieving_items
+	stored_value = syncer->IsProcessingIncomingItems();
+	
+	item = 0;
+	guid.Empty();
+		
+	// --- Generate a GUID and get the SyncItem
+	verify(OpStatus::IsSuccess(StringUtils::GenerateClientID(guid)));
+	verify(OpStatus::IsSuccess(g_sync_coordinator->GetSyncItem(&item, OpSyncDataItem::DATAITEM_NOTE, OpSyncItem::SYNC_KEY_ID, guid.CStr()))); //
+
+	// -- Set action and a set of elements / attributes on the item
+	item->SetStatus(OpSyncDataItem::DATAITEM_ACTION_ADDED);
+	verify(OpStatus::IsSuccess(item->SetData(OpSyncItem::SYNC_KEY_GROUP, UNI_L("custom"))));
+	verify(OpStatus::IsSuccess(item->SetData(OpSyncItem::SYNC_KEY_URI, UNI_L("opera:about"))));
+	verify(OpStatus::IsSuccess(item->SetData(OpSyncItem::SYNC_KEY_TITLE, UNI_L("opera about"))));
+
+	// -- Test ProcessSyncItem on the item 
+	dirty = FALSE;
+	verify(OpStatus::IsSuccess(syncer->ProcessSyncItem(item, dirty)));
+	verify(!dirty);
+	verify(syncer->ReceivedNotification());
+	syncer->ResetNotification();
+	g_sync_coordinator->ReleaseSyncItem(item);
+
+	// --- Check that m_is_receiving_items value has been reset
+	verify(syncer->IsProcessingIncomingItems() == stored_value);
+	verify(!syncer->ItemsSentToServer());
+	syncer->ResetSentToServer();
+
+	g_sync_coordinator->RemoveSyncDataClient(syncer, OpSyncDataItem::DATAITEM_NOTE);
+	g_sync_coordinator->RemoveSyncDataClient(syncer, OpSyncDataItem::DATAITEM_BOOKMARK);
+// 	verify(!syncer->IsNoteListening());
+
+	OP_DELETE(syncer);
+}
+
+test("DropItem and verify that only modified is sent to sync module")
+{
+	ST_SyncNoteItems* syncer = OP_NEW(ST_SyncNoteItems, ());
+	verify(syncer);
+	syncer->EnableNoteListening(TRUE);
+	verify(syncer->IsNoteListening());
+
+	// Drag-drop an item and then check that what we send is a modified with the correct data
+	HotlistModelItem* item = OP_NEW(NoteModelItem, ());
+		
+	item->SetUrl(UNI_L("Item-to-move"));
+	item->SetName(UNI_L("ITEM_TO_MOVE"));
+
+	HotlistGenericModel* model = g_hotlist_manager->GetNotesModel();
+	verify(model);
+	HotlistModelItem* added = model->AddItem(item, /* allow_duplicates */ TRUE, FALSE);
+	verify(added != 0);
+	verify(added->GetUniqueGUID().HasContent());
+	verify(added->GetPreviousItem() != 0);
+
+	syncer->ResetSentCounts();
+	// Drag-drop the item?
+	INT32 first_id = 0;
+	BOOL is_dropped = g_hotlist_manager->DropItem( added->GetID(), HotlistModel::NoteRoot, DROP_MOVE, DesktopDragObject::INSERT_AFTER, TRUE, &first_id, FALSE);
+	verify(is_dropped);
+	verify(first_id != -1);
+	verify(syncer->GetAddCount() == 0);
+	verify(syncer->GetDeleteCount() == 0);
+	verify(syncer->GetModifiedCount() == 1);
+
+	HotlistModelItem* item2 = model->GetItemByID(first_id);
+	verify(item2);
+	item2->Delete();
+	// Do the same with Mini folder?
+
+	syncer->EnableNoteListening(FALSE);
+	OP_DELETE(syncer);
+}
+
+
+
+
+test("Quick sync to Sync module - Update previous of next item when moving an item into trash (bug no 364608)")
+{
+	ST_SyncNoteItems* syncer = OP_NEW(ST_SyncNoteItems, ());
+	verify(syncer);
+	syncer->EnableNoteListening(TRUE);
+	verify(syncer->IsNoteListening());
+
+	HotlistModelItem* prev = OP_NEW(NoteModelItem, ());
+		
+	prev->SetUrl(UNI_L("previous-item"));
+	prev->SetName(UNI_L("PREVIOUS_ITEM"));
+
+	HotlistGenericModel* model = g_hotlist_manager->GetNotesModel();
+	verify(model);
+	model->SetParentIndex(-1);
+	model->Erase();
+
+	// Add item prev
+	HotlistModelItem* previous = model->AddItem(prev, /* allow_duplicates */ TRUE, FALSE);
+	verify(previous != 0);
+	verify(previous->GetUniqueGUID().HasContent());
+
+	HotlistModelItem* item = OP_NEW(NoteModelItem, ());
+		
+	item->SetUrl(UNI_L("Item-to-move-to-trash"));
+	item->SetName(UNI_L("ITEM_TO_MOVE_TO_TRASH"));
+
+
+	// Add item to move to trash
+	HotlistModelItem* added = model->AddItem(item, /* allow_duplicates */ TRUE, FALSE);
+	verify(added != 0);
+	verify(added->GetUniqueGUID().HasContent());
+	verify(added->GetPreviousItem() != 0);
+
+	OpString s;
+	s.Set(added->GetUniqueGUID());
+
+	HotlistModelItem* item_added = model->GetByUniqueGUID(s);
+	verify(added == item_added);
+	verify(item_added != 0);
+
+	/*HotlistModelItem* item = */model->GetTrashFolder(); // To ensure this is not done inside DeleteItem	
+	//model->EmptyTrash();
+	syncer->ResetSentCounts();
+
+	verify(!item_added->GetIsInsideTrashFolder());
+
+	// Move item into trash (item-to-move-to-trash)
+	verify(model->DeleteItem( (OpTreeModelItem*)item_added, /* copy_to_trash */TRUE ));
+
+	// Should get one notification about modified on item 'added'
+	// Should get one notification about new previous on old next
+	// Should get one notification about new previous on new next (this is done in Changed, we assume ok)
+	verify(syncer->GetAddCount() == 0);
+	verify(syncer->GetMovedFromCount() == 1);
+	verify(syncer->GetModifiedCount() == 1);
+	verify(syncer->GetDeleteCount() == 0);
+
+	// The empty trash should delete the item too (no need to do so here)
+
+	OP_DELETE(syncer);
+}
+
+
+test("Don't send deleted on items in deleted folder (bug DSK-233605) - Using EmptyTrash")
+{
+	ST_SyncNoteItems syncer;
+	syncer.EnableNoteListening(TRUE);
+	verify(syncer.IsNoteListening());
+
+	HotlistModelItem* folder = OP_NEW(FolderModelItem, ());
+		
+	folder->SetName(UNI_L("FOLDER_TO_DELETE"));
+
+	HotlistGenericModel* model = g_hotlist_manager->GetNotesModel();
+	verify(model);
+	model->SetParentIndex(-1);
+	model->Erase();
+	model->GetTrashFolder();
+
+	// Add item prev
+	verify(model->AddItem(folder, /* allow_duplicates */ TRUE, FALSE) != 0);
+
+	INT32 idx = folder->GetIndex();
+	model->SetParentIndex(idx);
+
+	for (UINT32 i = 0; i < 5; i++)
+	{
+		HotlistModelItem* item = OP_NEW(NoteModelItem, ());
+		item->SetName(UNI_L("item-in-folder"));
+		verify(model->AddItem(item, /* allow_duplicates */ TRUE, FALSE) != 0);
+		verify(item->GetParentFolder() == folder);
+	}
+	
+	verify(model->GetCount() == 7);
+	syncer.ResetSentCounts();
+	syncer.ResetNotification();
+	syncer.ResetSentToServer();
+		
+	OpINT32Vector vec;
+	vec.Add(folder->GetID());
+
+	g_hotlist_manager->Delete(vec, /* save_to_clipboard */FALSE);  // save_to_clipboard FALSE implies copy_to_trash TRUE
+
+	verify(syncer.ReceivedNotification());
+	verify(syncer.ItemsSentToServer());
+	verify(syncer.GetDeleteCount() == 0);
+	verify(syncer.GetAddCount() == 0);
+
+	//verify(syncer.GetMovedFromCount() == 0);
+	verify(syncer.GetModifiedCount() == 1);
+
+	syncer.ResetSentCounts();
+	syncer.ResetNotification();
+	syncer.ResetSentToServer();
+
+	g_hotlist_manager->EmptyTrash(model);
+
+	verify(syncer.GetModifiedCount() == 0);
+	verify(syncer.GetMovedFromCount() == 0);
+	verify(syncer.GetAddCount() == 0);
+	verify(syncer.GetDeleteCount() == 1);
+
+}
+
+
+test("Don't send deleted on items in deleted folder (bug DSK-233605) - Using Delete")
+{
+	ST_SyncNoteItems syncer;
+	syncer.EnableNoteListening(TRUE);
+	verify(syncer.IsNoteListening());
+
+	HotlistModelItem* folder = OP_NEW(FolderModelItem, ());
+		
+	folder->SetName(UNI_L("FOLDER_TO_DELETE"));
+
+	HotlistGenericModel* model = g_hotlist_manager->GetNotesModel();
+	verify(model);
+	model->SetParentIndex(-1);
+	model->Erase();
+	HotlistModelItem* trash = model->GetTrashFolder();
+	verify(trash);
+
+	// Add item prev
+	verify(model->AddItem(folder, /* allow_duplicates */ TRUE, FALSE) != 0);
+
+	INT32 idx = folder->GetIndex();
+	model->SetParentIndex(idx);
+
+	for (UINT32 i = 0; i < 5; i++)
+	{
+		HotlistModelItem* item = OP_NEW(NoteModelItem, ());
+		item->SetName(UNI_L("item-in-folder"));
+		verify(model->AddItem(item, /* allow_duplicates */ TRUE, FALSE) != 0);
+		verify(item->GetParentFolder() == folder);
+	}
+	
+	verify(model->GetCount() == 7);
+	syncer.ResetSentCounts();
+	syncer.ResetNotification();
+	syncer.ResetSentToServer();
+		
+	INT32 folder_id = folder->GetID();
+
+	OpINT32Vector vec;
+	vec.Add(folder_id);
+
+	g_hotlist_manager->Delete(vec, /* save_to_clipboard */FALSE);  // save_to_clipboard FALSE implies copy_to_trash TRUE
+
+	verify(syncer.ReceivedNotification());
+	verify(syncer.ItemsSentToServer());
+	verify(syncer.GetDeleteCount() == 0);
+	verify(syncer.GetAddCount() == 0);
+
+	//verify(syncer.GetMovedFromCount() == 0);
+	verify(syncer.GetModifiedCount() == 1);
+
+	syncer.ResetSentCounts();
+	syncer.ResetNotification();
+	syncer.ResetSentToServer();
+
+	HotlistModelItem* folder_item = model->GetByName(UNI_L("FOLDER_TO_DELETE"));
+	verify(folder_item);
+	verify(folder_item->GetIsInsideTrashFolder());
+	verify(folder_item->GetChildCount() == 5);
+
+	vec.Clear();
+	vec.Add(folder_item->GetID());
+
+	g_hotlist_manager->Delete(vec, TRUE); // save_to_clipboard TRUE implies copy_to_trash FALSE
+
+	verify(syncer.GetModifiedCount() == 0);
+	verify(syncer.GetMovedFromCount() == 0);
+	verify(syncer.GetAddCount() == 0);
+	verify(syncer.GetDeleteCount() == 1);
+
+}

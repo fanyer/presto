@@ -1,0 +1,265 @@
+/* -*- Mode: c++; tab-width: 4; indent-tabs-mode: t; c-basic-offset: 4 -*- */
+group "geolocation.google2011_api.build_request";
+require GEOLOCATION_SUPPORT;
+language C++;
+
+include "modules/geolocation/src/geo_impl.h";
+include "modules/geolocation/src/geo_google2011_network_api.h";
+include "modules/pi/OpGeolocation.h";
+
+global {
+	OP_STATUS MakeAccessPointData(OpWifiData::AccessPointData *&ap_data, const uni_char *mac_address, const uni_char *ssid, int signal_strength, BYTE channel, INT16 snr)
+	{
+		ap_data = OP_NEW(OpWifiData::AccessPointData, ());
+		RETURN_OOM_IF_NULL(ap_data);
+		RETURN_IF_ERROR(ap_data->mac_address.Set(mac_address));
+		RETURN_IF_ERROR(ap_data->ssid.Set(ssid));
+		ap_data->signal_strength = signal_strength;
+		ap_data->channel = channel;
+		ap_data->snr = snr;
+		return OpStatus::OK;
+	}
+
+
+	OP_STATUS MakeCellTowerData(OpRadioData::CellData *&cell_data, INT32 id, INT16 lac, INT16 mcc, INT16 mnc, INT16 ss, BYTE ta)
+	{
+		cell_data = OP_NEW(OpRadioData::CellData, ());
+		RETURN_OOM_IF_NULL(cell_data);
+		cell_data->cell_id = id;
+		cell_data->location_area_code = lac;
+		cell_data->mobile_network_code = mnc;
+		cell_data->mobile_country_code = mcc;
+		cell_data->signal_strength = ss;
+		cell_data->timing_advance = ta;
+
+		return OpStatus::OK;
+	}
+
+}
+
+table wifi_request_tests
+{
+	// test name,                             mac addr,     ss,         ssid,  chan, snr,           token, expected query string (':' -> %3A, '|' -> %7C, '\' -> %5C, '&' -> '%26')
+	{ "simple",             UNI_L("11-22-33-44-55-66"),    -15, UNI_L("SSID"),    2,   3,         NULL, UNI_L("?browser=opera&sensor=true&wifi=mac%3A11-22-33-44-55-66%7Css%3A-15%7Cssid%3ASSID%7Cchan%3A2%7Csnr%3A3") },
+	{ "with |",             UNI_L("11-22-33-44-55-66"),    -15, UNI_L("pipe|"),   2,   3,         NULL, UNI_L("?browser=opera&sensor=true&wifi=mac%3A11-22-33-44-55-66%7Css%3A-15%7Cssid%3Apipe%5C%7C%7Cchan%3A2%7Csnr%3A3") },
+	{ "with \\",            UNI_L("11-22-33-44-55-66"),    -15, UNI_L("bs\\"),    2,   3,         NULL, UNI_L("?browser=opera&sensor=true&wifi=mac%3A11-22-33-44-55-66%7Css%3A-15%7Cssid%3Abs%5C%5C%7Cchan%3A2%7Csnr%3A3") },
+	{ "with &",             UNI_L("11-22-33-44-55-66"),    -15, UNI_L("SSID&"),   2,   3,         NULL, UNI_L("?browser=opera&sensor=true&wifi=mac%3A11-22-33-44-55-66%7Css%3A-15%7Cssid%3ASSID%26%7Cchan%3A2%7Csnr%3A3") },
+	{ "mandatory only",     UNI_L("aa-bb-cc-dd-ee-ff"),    -15, UNI_L("SSID"),    0,   0,         NULL, UNI_L("?browser=opera&sensor=true&wifi=mac%3Aaa-bb-cc-dd-ee-ff%7Css%3A-15%7Cssid%3ASSID") },
+	{ "mandatory + snr",    UNI_L("aa-bb-cc-dd-ee-ff"),    -15, UNI_L("SSID"),    0,   5,         NULL, UNI_L("?browser=opera&sensor=true&wifi=mac%3Aaa-bb-cc-dd-ee-ff%7Css%3A-15%7Cssid%3ASSID%7Csnr%3A5") },
+	{ "with token",         UNI_L("11-22-33-44-55-66"),    -15, UNI_L("SSID"),    2,   3, UNI_L("abc"), UNI_L("?browser=opera&sensor=true&token=abc&wifi=mac%3A11-22-33-44-55-66%7Css%3A-15%7Cssid%3ASSID%7Cchan%3A2%7Csnr%3A3") },
+	{ "with token escaped", UNI_L("11-22-33-44-55-66"),    -15, UNI_L("SSID"),    2,   3, UNI_L("a&c"), UNI_L("?browser=opera&sensor=true&token=a%26c&wifi=mac%3A11-22-33-44-55-66%7Css%3A-15%7Cssid%3ASSID%7Cchan%3A2%7Csnr%3A3") },
+}
+
+foreach (testname, mac_addr, signal_strength, ssid, channel, snr, access_token, expected_result) from wifi_request_tests
+{
+	test("Build WiFi request URL - " testname)
+	{
+		GeoWifiData wifi_data;
+		OpWifiData::AccessPointData *ap_data;
+		verify_success(MakeAccessPointData(ap_data, mac_addr, ssid, signal_strength, channel, snr));
+		verify_success(wifi_data.m_data.wifi_towers.Add(ap_data));
+
+		OpString url_string;
+		verify_success(OpGeolocationGoogle2011NetworkApi::AppendQueryString(url_string, &wifi_data, NULL, NULL, access_token));
+
+		verify_string(expected_result, url_string);
+	}
+}
+
+test("Build multi-ap WiFi request")
+{
+	GeoWifiData wifi_data;
+	OpWifiData::AccessPointData *ap_data;
+	verify_success(MakeAccessPointData(ap_data, UNI_L("11-22-33-44-55-66"), UNI_L("SSID1"), -10, 8, 3));
+	verify_success(wifi_data.m_data.wifi_towers.Add(ap_data));
+	verify_success(MakeAccessPointData(ap_data, UNI_L("aa-bb-cc-dd-ee-ff"), UNI_L("SSID2"), -5, 3, 4));
+	verify_success(wifi_data.m_data.wifi_towers.Add(ap_data));
+
+	OpString url_string;
+	verify_success(OpGeolocationGoogle2011NetworkApi::AppendQueryString(url_string, &wifi_data, NULL, NULL, NULL));
+
+	verify_string(UNI_L("?browser=opera&sensor=true&wifi=mac%3A11-22-33-44-55-66%7Css%3A-10%7Cssid%3ASSID1%7Cchan%3A8%7Csnr%3A3&wifi=mac%3Aaa-bb-cc-dd-ee-ff%7Css%3A-5%7Cssid%3ASSID2%7Cchan%3A3%7Csnr%3A4"),
+		url_string);
+}
+
+test("Build trimmed WiFi request")
+{
+	// Requests should be limited to 2048.
+	GeoWifiData wifi_data;
+	OpWifiData::AccessPointData *ap_data;
+	verify_success(MakeAccessPointData(ap_data, UNI_L("11-22-33-44-55-66"), UNI_L("SSID1"), -5, 8, 3));
+	verify_success(wifi_data.m_data.wifi_towers.Add(ap_data));
+	verify_success(MakeAccessPointData(ap_data, UNI_L("11-22-33-44-55-66"), UNI_L("SSID2"), -9, 8, 3));
+	verify_success(wifi_data.m_data.wifi_towers.Add(ap_data));
+	verify_success(MakeAccessPointData(ap_data, UNI_L("11-22-33-44-55-66"), UNI_L("SSID3"), -10, 8, 3));
+	verify_success(wifi_data.m_data.wifi_towers.Add(ap_data));
+	verify_success(MakeAccessPointData(ap_data, UNI_L("11-22-33-44-55-66"), UNI_L("SSID4"), -12, 8, 3));
+	verify_success(wifi_data.m_data.wifi_towers.Add(ap_data));
+	verify_success(MakeAccessPointData(ap_data, UNI_L("11-22-33-44-55-66"), UNI_L("SSID5"), -23, 8, 3));
+	verify_success(wifi_data.m_data.wifi_towers.Add(ap_data));
+	verify_success(MakeAccessPointData(ap_data, UNI_L("11-22-33-44-55-66"), UNI_L("SSID6"), -43, 8, 3));
+	verify_success(wifi_data.m_data.wifi_towers.Add(ap_data));
+	verify_success(MakeAccessPointData(ap_data, UNI_L("11-22-33-44-55-66"), UNI_L("SSID7"), -45, 8, 3));
+	verify_success(wifi_data.m_data.wifi_towers.Add(ap_data));
+
+	OpString url_string;
+	// Insert 1600 characters
+	const char *padding = "012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678=012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678=012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678=012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678=012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678=012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678=012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678=012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678=012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678=012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678=012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678=012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678=012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678=012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678=012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678=012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678=";
+
+	verify_success(url_string.Append(padding));
+	verify_success(OpGeolocationGoogle2011NetworkApi::AppendQueryString(url_string, &wifi_data, NULL, NULL, NULL));
+
+	// The result should contain data for the first six wifi networks added above. The last one passes over the limit and is not included.
+	OpString expected_url;
+	verify_success(expected_url.Set(padding));
+	verify_success(expected_url.Append(UNI_L("?browser=opera&sensor=true&wifi=mac%3A11-22-33-44-55-66%7Css%3A-5%7Cssid%3ASSID1%7Cchan%3A8%7Csnr%3A3&wifi=mac%3A11-22-33-44-55-66%7Css%3A-9%7Cssid%3ASSID2%7Cchan%3A8%7Csnr%3A3&wifi=mac%3A11-22-33-44-55-66%7Css%3A-10%7Cssid%3ASSID3%7Cchan%3A8%7Csnr%3A3&wifi=mac%3A11-22-33-44-55-66%7Css%3A-12%7Cssid%3ASSID4%7Cchan%3A8%7Csnr%3A3&wifi=mac%3A11-22-33-44-55-66%7Css%3A-23%7Cssid%3ASSID5%7Cchan%3A8%7Csnr%3A3")));
+
+	verify(url_string.Length() <= 2048);
+	// verify_string uses a small buffer and trims the compared strings, use regular comparison
+	int string_comparison = url_string.Compare(expected_url);
+	verify(string_comparison == 0);
+}
+
+
+table radio_request_tests(char*, OpRadioData::RadioType, INT32, INT32, char*)
+{
+	// test name,                      radio type, home MCC, home MNC, expected url
+	{  "UNKNOWN", OpRadioData::RADIO_TYPE_UNKNOWN,  9897235, 12335153, "?browser=opera&sensor=true&device=mcc%3A9897235%7Cmnc%3A12335153%7Crt%3A0&cell=id%3A5341%7Clac%3A234%7Cmcc%3A123%7Cmnc%3A23524%7Css%3A-43%7Cta%3A13&cell=id%3A1231%7Clac%3A3300%7Cmcc%3A2%7Cmnc%3A2321%7Css%3A-56%7Cta%3A40"},
+	{  "GSM",     OpRadioData::RADIO_TYPE_GSM,          231,    24969, "?browser=opera&sensor=true&device=mcc%3A231%7Cmnc%3A24969%7Crt%3A1&cell=id%3A5341%7Clac%3A234%7Cmcc%3A123%7Cmnc%3A23524%7Css%3A-43%7Cta%3A13&cell=id%3A1231%7Clac%3A3300%7Cmcc%3A2%7Cmnc%3A2321%7Css%3A-56%7Cta%3A40"},
+	{  "WCDMA",   OpRadioData::RADIO_TYPE_WCDMA,      32231,   307585, "?browser=opera&sensor=true&device=mcc%3A32231%7Cmnc%3A307585%7Crt%3A3&cell=id%3A5341%7Clac%3A234%7Cmcc%3A123%7Cmnc%3A23524%7Css%3A-43%7Cta%3A13&cell=id%3A1231%7Clac%3A3300%7Cmcc%3A2%7Cmnc%3A2321%7Css%3A-56%7Cta%3A40"},
+	{  "CDMA",    OpRadioData::RADIO_TYPE_CDMA,      231780 ,  307585, "?browser=opera&sensor=true&device=mcc%3A231780%7Cmnc%3A307585%7Crt%3A2&cell=id%3A5341%7Clac%3A234%7Cmcc%3A123%7Cmnc%3A23524%7Css%3A-43%7Cta%3A13&cell=id%3A1231%7Clac%3A3300%7Cmcc%3A2%7Cmnc%3A2321%7Css%3A-56%7Cta%3A40"}
+}
+
+foreach (testname, rt, home_mcc, home_mnc, expected_url_string) from radio_request_tests
+{
+	test("Build radio request URL: " testname)
+	{
+		GeoRadioData radio_data;
+		radio_data.m_data.radio_type = rt;
+		radio_data.m_data.home_mobile_network_code = home_mnc;
+		radio_data.m_data.home_mobile_country_code = home_mcc;
+		radio_data.m_data.primary_cell_id = -1;
+
+		OpRadioData::CellData *cell;
+		//                                       id, lac, mcc,   mnc,  ss, ta
+		verify_success(MakeCellTowerData(cell, 5341, 234, 123, 23524, -43, 13));
+		verify_success(radio_data.m_data.cell_towers.Add(cell));
+		//                                       id,  lac, mcc,  mnc,  ss, ta
+		verify_success(MakeCellTowerData(cell, 1231, 3300,   2, 2321, -56, 40));
+		verify_success(radio_data.m_data.cell_towers.Add(cell));
+
+		OpString url_string;
+		verify_success(OpGeolocationGoogle2011NetworkApi::AppendQueryString(url_string, NULL, &radio_data, NULL, NULL));
+
+		verify(url_string.Compare(expected_url_string) == 0);
+	}
+}
+
+test("Build WiFi+radio+GPS request URL")
+{
+	GeoWifiData wifi_data;
+	OpWifiData::AccessPointData *ap_data;
+	verify_success(MakeAccessPointData(ap_data, UNI_L("11-22-33-44-55-66"), UNI_L("SSID1"), -10, 8, 3));
+	verify_success(wifi_data.m_data.wifi_towers.Add(ap_data));
+	verify_success(MakeAccessPointData(ap_data, UNI_L("aa-bb-cc-dd-ee-ff"), UNI_L("SSID2"), -5, 3, 4));
+	verify_success(wifi_data.m_data.wifi_towers.Add(ap_data));
+
+	GeoRadioData radio_data;
+	radio_data.m_data.radio_type = OpRadioData::RADIO_TYPE_GSM;
+	radio_data.m_data.home_mobile_country_code = 4321;
+	radio_data.m_data.home_mobile_network_code = 1234;
+	radio_data.m_data.primary_cell_id = -1;
+
+	OpRadioData::CellData *cell;
+	//                                       id, lac, mcc,   mnc,  ss, ta
+	verify_success(MakeCellTowerData(cell, 5341, 234, 123, 23524, -43, 13));
+	verify_success(radio_data.m_data.cell_towers.Add(cell));
+	//                                       id,  lac, mcc,  mnc,  ss, ta
+	verify_success(MakeCellTowerData(cell, 1231, 3300,   2, 2321, -56, 40));
+	verify_success(radio_data.m_data.cell_towers.Add(cell));
+
+	GeoGpsData gps_data;
+	gps_data.m_data.capabilities = 0;
+	gps_data.m_data.latitude = 51.132;
+	gps_data.m_data.longitude = 17.021;
+	gps_data.m_data.horizontal_accuracy = 5000;
+
+	OpString url_string;
+	verify_success(OpGeolocationGoogle2011NetworkApi::AppendQueryString(url_string, &wifi_data, &radio_data, &gps_data, NULL));
+
+	const char* expected_url_string = "?browser=opera&sensor=true&wifi=mac%3A11-22-33-44-55-66%7Css%3A-10%7Cssid%3ASSID1%7Cchan%3A8%7Csnr%3A3&wifi=mac%3Aaa-bb-cc-dd-ee-ff%7Css%3A-5%7Cssid%3ASSID2%7Cchan%3A3%7Csnr%3A4"
+			"&device=mcc%3A4321%7Cmnc%3A1234%7Crt%3A1"
+			"&cell=id%3A5341%7Clac%3A234%7Cmcc%3A123%7Cmnc%3A23524%7Css%3A-43%7Cta%3A13&cell=id%3A1231%7Clac%3A3300%7Cmcc%3A2%7Cmnc%3A2321%7Css%3A-56%7Cta%3A40"
+			"&location=lat%3A51.132000%7Clng%3A17.021000";
+	verify(url_string.Compare(expected_url_string) == 0);
+}
+
+test("Build trimmed WiFi+radio request")
+{
+	// Requests should be limited to 2048.
+	GeoWifiData wifi_data;
+	OpWifiData::AccessPointData *ap_data;
+	verify_success(MakeAccessPointData(ap_data, UNI_L("11-22-33-44-55-66"), UNI_L("SSID1"), -5, 8, 3));
+	verify_success(wifi_data.m_data.wifi_towers.Add(ap_data));
+	verify_success(MakeAccessPointData(ap_data, UNI_L("11-22-33-44-55-66"), UNI_L("SSID2"), -9, 8, 3));
+	verify_success(wifi_data.m_data.wifi_towers.Add(ap_data));
+	verify_success(MakeAccessPointData(ap_data, UNI_L("11-22-33-44-55-66"), UNI_L("SSID3"), -10, 8, 3));
+	verify_success(wifi_data.m_data.wifi_towers.Add(ap_data));
+	verify_success(MakeAccessPointData(ap_data, UNI_L("11-22-33-44-55-66"), UNI_L("SSID4"), -12, 8, 3));
+	verify_success(wifi_data.m_data.wifi_towers.Add(ap_data));
+	verify_success(MakeAccessPointData(ap_data, UNI_L("11-22-33-44-55-66"), UNI_L("SSID5"), -23, 8, 3));
+	verify_success(wifi_data.m_data.wifi_towers.Add(ap_data));
+	verify_success(MakeAccessPointData(ap_data, UNI_L("11-22-33-44-55-66"), UNI_L("SSID6"), -43, 8, 3));
+	verify_success(wifi_data.m_data.wifi_towers.Add(ap_data));
+	verify_success(MakeAccessPointData(ap_data, UNI_L("11-22-33-44-55-66"), UNI_L("SSID7"), -45, 8, 3));
+	verify_success(wifi_data.m_data.wifi_towers.Add(ap_data));
+
+	GeoRadioData radio_data;
+	radio_data.m_data.radio_type = OpRadioData::RADIO_TYPE_GSM;
+	radio_data.m_data.home_mobile_country_code = 4321;
+	radio_data.m_data.home_mobile_network_code = 1234;
+	radio_data.m_data.primary_cell_id = -1;
+
+	OpRadioData::CellData *cell;
+	//                                       id, lac, mcc,   mnc,  ss, ta
+	verify_success(MakeCellTowerData(cell, 5341, 234, 123, 23524, -10, 13));
+	verify_success(radio_data.m_data.cell_towers.Add(cell));
+	//                                       id,  lac, mcc,  mnc,  ss, ta
+	verify_success(MakeCellTowerData(cell, 5341, 234, 123, 23524, -20, 13));
+	verify_success(radio_data.m_data.cell_towers.Add(cell));
+	//                                       id, lac, mcc,   mnc,  ss, ta
+	verify_success(MakeCellTowerData(cell, 5341, 234, 123, 23524, -30, 13));
+	verify_success(radio_data.m_data.cell_towers.Add(cell));
+	//                                       id,  lac, mcc,  mnc,  ss, ta
+	verify_success(MakeCellTowerData(cell, 5341, 234, 123, 23524, -40, 13));
+	verify_success(radio_data.m_data.cell_towers.Add(cell));
+	//                                       id, lac, mcc,   mnc,  ss, ta
+	verify_success(MakeCellTowerData(cell, 5341, 234, 123, 23524, -50, 13));
+	verify_success(radio_data.m_data.cell_towers.Add(cell));
+	//                                       id,  lac, mcc,  mnc,  ss, ta
+	verify_success(MakeCellTowerData(cell, 5341, 234, 123, 23524, -60, 13));
+	verify_success(radio_data.m_data.cell_towers.Add(cell));
+	//                                       id,  lac, mcc,  mnc,  ss, ta
+	verify_success(MakeCellTowerData(cell, 5341, 234, 123, 23524, -70, 13));
+	verify_success(radio_data.m_data.cell_towers.Add(cell));
+
+	GeoGpsData gps_data;
+	gps_data.m_data.capabilities = 0;
+	gps_data.m_data.latitude = 51.132;
+	gps_data.m_data.longitude = 17.021;
+	gps_data.m_data.horizontal_accuracy = 5000;
+
+	// 1150 characters. This leaves enough space for 5 WiFi entries and 6 cell tower entries. GPS data won't fit.
+	const char *url_prefix = "0123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789";
+	OpString url_string;
+	verify_success(url_string.Set(url_prefix));
+	verify_success(OpGeolocationGoogle2011NetworkApi::AppendQueryString(url_string, &wifi_data, &radio_data, &gps_data, NULL));
+
+	const char *expected = "?browser=opera&sensor=true&wifi=mac%3A11-22-33-44-55-66%7Css%3A-5%7Cssid%3ASSID1%7Cchan%3A8%7Csnr%3A3&wifi=mac%3A11-22-33-44-55-66%7Css%3A-9%7Cssid%3ASSID2%7Cchan%3A8%7Csnr%3A3&wifi=mac%3A11-22-33-44-55-66%7Css%3A-10%7Cssid%3ASSID3%7Cchan%3A8%7Csnr%3A3&wifi=mac%3A11-22-33-44-55-66%7Css%3A-12%7Cssid%3ASSID4%7Cchan%3A8%7Csnr%3A3&wifi=mac%3A11-22-33-44-55-66%7Css%3A-23%7Cssid%3ASSID5%7Cchan%3A8%7Csnr%3A3"
+			"&device=mcc%3A4321%7Cmnc%3A1234%7Crt%3A1&cell=id%3A5341%7Clac%3A234%7Cmcc%3A123%7Cmnc%3A23524%7Css%3A-10%7Cta%3A13&cell=id%3A5341%7Clac%3A234%7Cmcc%3A123%7Cmnc%3A23524%7Css%3A-20%7Cta%3A13&cell=id%3A5341%7Clac%3A234%7Cmcc%3A123%7Cmnc%3A23524%7Css%3A-30%7Cta%3A13&cell=id%3A5341%7Clac%3A234%7Cmcc%3A123%7Cmnc%3A23524%7Css%3A-40%7Cta%3A13&cell=id%3A5341%7Clac%3A234%7Cmcc%3A123%7Cmnc%3A23524%7Css%3A-50%7Cta%3A13&cell=id%3A5341%7Clac%3A234%7Cmcc%3A123%7Cmnc%3A23524%7Css%3A-60%7Cta%3A13";
+
+	OpString8 expected_url_string;
+	verify_success(expected_url_string.SetConcat(url_prefix, expected));
+	verify(url_string.Compare(expected_url_string) == 0);
+}
+

@@ -1,0 +1,183 @@
+group "datastream performance flag records";
+disabled;
+
+include "core/pch.h";
+
+require DATASTREAM_BYTEARRAY_ENABLED;
+require FORMATS_DATAFILE_ENABLED;
+
+include "modules/datastream/fl_lib.h";
+include "modules/formats/url_dfr.h";
+
+subtest TestRecord(DataFile_Record *encapsulated_recs)
+{
+	verify(encapsulated_recs);
+
+	TRAPD(op_err, encapsulated_recs->IndexRecordsL());
+	verify_success(op_err);
+
+	BOOL chosen[128];
+	int i;
+	DataFile_Record *rec;
+	for(i= 0; i<128;i++)
+	{
+		rec = encapsulated_recs->GetIndexedRecord(i | MSB_VALUE);
+
+		verify(rec);
+
+		verify(rec->GetTag() ==(i | MSB_VALUE));
+
+		verify(rec->GetLength() == 0);
+	}
+
+	for(i=0;i<128;i++)
+		chosen[i] = FALSE;	
+
+	encapsulated_recs->ResetRead();
+	OpAutoPtr<DataFile_Record> rec2;
+	while(encapsulated_recs->MoreData())
+	{
+		TRAP(op_err, rec2.reset(encapsulated_recs->GetNextRecordL()));
+		verify(OpStatus::IsSuccess(op_err));
+
+		verify(rec2.get());
+		verify(rec2->Finished());
+
+		uint32 tag = rec2->GetTag();
+
+		verify((tag & MSB_VALUE) != 0);
+		uint32 tag_val = (tag & (~MSB_VALUE));
+
+		verify( tag_val < 128);
+
+		verify(rec2->GetLength() == 0);
+
+		verify(chosen[tag_val] == FALSE);
+
+		chosen[tag_val] = TRUE;
+		rec2.reset();
+	}
+
+	for(i=0;i<128;i++)
+		verify(chosen[i] != FALSE);	
+}
+
+subtest TestRecords(DataFile_Record *src)
+{
+	verify(src);
+
+	int count = 0;
+	OpAutoPtr<DataFile_Record> rec;
+
+	while(src->MoreData())
+	{
+		TRAPD(op_err, rec.reset(src->GetNextRecordL()));
+		verify(OpStatus::IsSuccess(op_err));
+
+		verify(rec.get() != NULL);
+		verify(rec->Finished());
+
+		count++;
+
+		int tag = rec->GetTag();
+
+		verify(tag == 32);
+
+		verify(TestRecord(rec.get()));
+
+		rec.reset();
+	}
+
+	verify(count == 2000);
+}
+
+
+subtest BuildRecord(DataFile_Record *rec)
+{
+	BOOL chosen[128];
+	int i;
+
+	op_srand(((unsigned int)op_time(NULL))); 
+
+	for(i=0;i<128;i++)
+		chosen[i] = FALSE;	
+
+	for (i=0;i<128; i++)
+	{
+		int flag_id = 0;
+		do{
+			flag_id = (op_rand() & 0x7f);
+		}while(chosen[flag_id]);
+
+		chosen[flag_id] = TRUE;
+
+		TRAPD(op_err, rec->AddRecordL(flag_id | MSB_VALUE));
+		verify(OpStatus::IsSuccess(op_err));
+	}
+
+	TRAPD(op_err, rec->FinishedAddingL());
+	verify(OpStatus::IsSuccess(op_err));
+	for(i=0;i<128;i++)
+		verify(chosen[i] != FALSE);	
+}
+
+
+subtest BuildRecords(DataFile_Record *target)
+{
+	verify(target);
+	OpAutoPtr<DataFile_Record> rec;
+	int i;
+	for (i=0;i<2000; i++)
+	{
+		rec.reset(OP_NEW(DataFile_Record, ()));
+
+		verify(rec.get() != NULL);
+
+		rec->SetTag(32);
+
+		rec->SetRecordSpec(target->GetRecordSpec());
+
+		verify(BuildRecord(rec.get()));
+
+		TRAPD(op_err, rec->WriteRecordL(target));
+		verify(OpStatus::IsSuccess(op_err));
+		rec.reset();
+	}
+}
+
+test("Performance array of flag-only records")
+{
+	DataStream_NonSensitive_ByteArray(testing);
+
+	DataFile_Record generator_buffer;
+	DataFile_Record read_buffer;
+
+	DataRecord_Spec spec(TRUE,1,TRUE, TRUE, TRUE, 4, TRUE, TRUE);
+
+	output("Generating testcases\n");
+
+	generator_buffer.SetRecordSpec(spec);
+
+	verify(BuildRecords(&generator_buffer));
+
+	TRAPD(op_err, generator_buffer.FinishedAddingL());
+	verify(OpStatus::IsSuccess(op_err));
+
+	generator_buffer.ResetRead();
+	output("Finished Generating testcases\n");
+
+	TRAP(op_err, generator_buffer.WriteRecordPayloadL(&read_buffer));
+	verify(OpStatus::IsSuccess(op_err));
+
+	read_buffer.ResetRead();
+
+	read_buffer.SetRecordSpec(spec);
+
+	output("Checking testcases\n");
+
+	verify(TestRecords(&read_buffer));
+
+}
+
+
+

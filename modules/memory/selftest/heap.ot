@@ -1,0 +1,231 @@
+/* -*- Mode: c++; tab-width: 4; indent-tabs-mode: t; c-basic-offset: 4 -*-
+ *
+ * Copyright (C) 2009 Opera Software AS.  All rights reserved.
+ *
+ * This file is part of the Opera web browser.  It may not be distributed
+ * under any circumstances.
+ */
+
+group "memory.heap";
+
+language C++;
+
+require ENABLE_OPERA_HEAP_SEGMENT;
+
+include "modules/pi/system/OpMemory.h";
+include "modules/memory/src/memory_heap.h";
+include "modules/memory/src/memory_pilayer.h";
+
+global
+{
+	const OpMemory::OpMemSegment* mseg;
+	OpHeapSegment* hseg;
+	size_t pagesize;
+	char* initial;
+}
+
+setup
+{
+	mseg = 0;
+	hseg = 0;
+	pagesize = OpMemory::GetPageSize();
+}
+
+exit
+{
+	if ( hseg != 0 )
+		OpHeapSegment::Destroy(hseg);
+	if ( mseg != 0 )
+		OpMemory_DestroySegment(mseg);
+}
+
+test("Create heap segment")
+{
+	// Create a segment with minimum 1024 pages, which is 4M with 4K pages
+	mseg = OpMemory_CreateVirtualSegment(1024 * pagesize);
+	verify(mseg != 0);
+
+#ifdef ENABLE_MEMORY_MANAGER
+	// Expect the memory manager to be "clean" when starting
+	verify(g_mem_manager->GetTotal(MEMCLS_SELFTEST1) == 0);
+#endif
+
+	hseg = OpHeapSegment::Create(mseg, MEMCLS_SELFTEST1);
+	verify(hseg != 0);
+
+#ifdef ENABLE_MEMORY_MANAGER
+	verify(g_mem_manager->GetTotal(MEMCLS_SELFTEST1) == pagesize);
+#endif
+}
+
+test("Make some allocations")
+	require success "Create heap segment";
+{
+	initial = (char*)hseg->sbrk(0);
+	verify((char*)hseg + pagesize == initial);
+
+	char* alloc1 = (char*)hseg->sbrk(16 * pagesize);  // Alloc 16 pages
+	char* curr2 = (char*)hseg->sbrk(0);
+	verify(alloc1 == initial);
+	verify(alloc1 + 16 * pagesize == curr2);
+
+	op_memset(alloc1, 17, 16 * pagesize); // Should not crash
+
+#ifdef ENABLE_MEMORY_MANAGER
+	verify(g_mem_manager->GetTotal(MEMCLS_SELFTEST1) >= 17 * pagesize);
+#endif
+
+	char* alloc2 = (char*)hseg->sbrk(200 * pagesize); // Alloc 200 pages
+	verify(alloc2 == curr2);
+	char* curr3 = (char*)hseg->sbrk(0);
+	verify(alloc2 + 200 * pagesize == curr3);
+
+	op_memset(alloc2, 69, 200 * pagesize); // Should not crash
+
+#ifdef ENABLE_MEMORY_MANAGER
+	verify(g_mem_manager->GetTotal(MEMCLS_SELFTEST1) >= 217 * pagesize);
+#endif
+}
+
+test("Fail by over-allocating")
+	require success "Make some allocations";
+{
+	//
+	// Fail by asking for more than the memory segment can possibly
+	// hold This assumes the memory segment is not rounded up in size
+	// significantly by the platform implementation.
+	//
+	char* cur = (char*)hseg->sbrk(0);
+	char* failed = (char*)hseg->sbrk(20000 * pagesize);
+	verify(failed == (char*)-1);
+	verify(cur == (char*)hseg->sbrk(0));
+}
+
+test("Fail through policy decisions")
+	require ENABLE_MEMORY_MANAGER;
+{
+	size_t limit = g_mem_manager->GetMax(MEMCLS_SELFTEST1);
+	char* restore = (char*)hseg->sbrk(0);
+
+	//
+	// Succeed by asking for slightly less than what the memory
+	// manager policy allows: Set headroom to 100 pages, then
+	// allocate 90, this should work.
+	//
+	size_t used = g_mem_manager->GetTotal(MEMCLS_SELFTEST1);
+	g_mem_manager->SetMax(MEMCLS_SELFTEST1, used + 100 * pagesize);
+
+	char* cur = (char*)hseg->sbrk(0);
+	char* alloc = (char*)hseg->sbrk(90 * pagesize); // Alloc 90 pages
+	verify(alloc == cur);
+	cur = (char*)hseg->sbrk(0);
+	verify(alloc + 90 * pagesize == cur);
+
+	//
+	// Fail by asking for more than what the memory manager policy
+	// allows. Ask for significantly more so any e.g. 64K rounding
+	// does not accidentially allow the allocation because it is
+	// already made.
+	//
+	alloc = (char*)hseg->sbrk(200 * pagesize);
+	verify(alloc == (char*)-1);
+
+	//
+	// Free allocation so the next test in the chain has a predictable
+	// starting point (int case this test is not run).
+	//
+	alloc = (char*)hseg->sbrk(-90 * pagesize); // Free 90 pages
+	cur = (char*)hseg->sbrk(0);
+	verify(cur == initial + 216 * pagesize);
+}
+finally
+{
+	// Restore original limit
+	g_mem_manager->SetMax(MEMCLS_SELFTEST1, limit);
+
+	// Restore heap back to original size before test started
+	cur = (char*)hseg->sbrk(0);
+	if ( cur > restore )
+	{
+		int reduce = cur - restore;
+		(char*)hseg->sbrk(-reduce);
+	}
+}
+
+test("Deallocate")
+	require success "Fail by over-allocating";
+{
+	char* cur = (char*)hseg->sbrk(0);
+
+	// Release three pages, and verify that it is done correctly
+	char* release = (char*)hseg->sbrk(-3 * pagesize);
+	char* cur2 = (char*)hseg->sbrk(0);
+	verify(release == cur); // This is how UNIX does it...
+	verify(cur2 == cur - 3 * pagesize);
+	verify(cur2 == initial + (16 + 200 - 3) * pagesize);
+
+	// Release the remainder and verify that we are back where we
+	// started
+	cur = (char*)hseg->sbrk(0);
+	release = (char*)hseg->sbrk(-(16 + 200 - 3) * pagesize);
+	cur2 = (char*)hseg->sbrk(0);
+	verify(release == cur);
+	verify(cur2 == cur - (16 + 200 - 3) * pagesize);
+	verify(cur2 == initial);
+
+#ifdef ENABLE_MEMORY_MANAGER
+	// Verify that the size of the heap has shrunk, also physically
+	verify(g_mem_manager->GetTotal(MEMCLS_SELFTEST1) < 100 * pagesize);
+#endif
+}
+
+test("Fill the whole heap")
+	require success "Create heap segment";
+{
+	// Keep allocating until it runs full and verify that the whole heap
+	// was filled. Do it one memory page at a time.
+
+	char* alloc = 0;
+	char* expected = (char*)hseg->sbrk(0);
+
+	for (;;)
+	{
+		alloc = (char*)hseg->sbrk(pagesize);
+		if ( alloc == (char*)-1 )
+			break;
+		verify(alloc == expected);
+		expected += pagesize;
+	}
+
+	char* cur = (char*)hseg->sbrk(0);
+
+	verify(alloc != 0); // At least one should succeed
+	verify((void*)hseg == (void*)mseg->address);
+	verify(cur == (char*)hseg + mseg->size);
+}
+
+test("Fail with an almost full heap")
+	require success "Fill the whole heap";
+{
+	verify(hseg->sbrk(-50 * pagesize) != (void*)-1); // Make room for 50 pages
+	verify(hseg->sbrk(51 * pagesize) == (void*)-1); // Fail allocating 51 pages
+}
+
+test("Succeed with an almost full heap")
+	require success "Fail with an almost full heap";
+{
+	verify(hseg->sbrk(49 * pagesize) != (void*)-1); // OK
+	verify(hseg->sbrk(1 * pagesize) != (void*)-1);  // OK
+	verify(hseg->sbrk(1 * pagesize) == (void*)-1);  // Fails
+}
+
+test("Destroy the heap")
+	require success "Fail with an almost full heap";
+{
+	OpHeapSegment::Destroy(hseg);
+	hseg = 0;
+
+#ifdef ENABLE_MEMORY_MANAGER
+	verify(g_mem_manager->GetTotal(MEMCLS_SELFTEST1) == 0);
+#endif
+}

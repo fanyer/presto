@@ -1,0 +1,280 @@
+/* -*- Mode: c++; tab-width: 4; indent-tabs-mode: t; c-basic-offset: 4 -*-
+**
+** Copyright (C) 2009-2012 Opera Software ASA.  All rights reserved.
+**
+** This file is part of the Opera web browser.  It may not be distributed
+** under any circumstances.
+**
+** Peter Krefting
+*/
+
+group "prefs.prefsmanager.collections.pcfiles";
+
+include "modules/prefs/prefsmanager/collections/pc_files.h";
+include "modules/util/opfile/opfolder.h";
+include "modules/prefs/prefsmanager/prefsmanager.h";
+
+// -- Global variables ---------------------------------------------------
+
+global
+{
+	OpString cache_folder_path, home_folder_path;
+}
+
+// -- Tests --------------------------------------------------------------
+
+test("GetDefaultDirectoryPref and GetDefaultDirectoryPrefL")
+{
+	// Check that we get the same path from both APIs
+	OpFileFolder parent;
+	const uni_char *folder_name = NULL;
+	OpString full_folder_name;
+	g_pcfiles->GetDefaultDirectoryPref(OPFILE_HOME_FOLDER, &parent, &folder_name);
+	TRAPD(rc, g_pcfiles->GetDefaultDirectoryPrefL(OPFILE_HOME_FOLDER, full_folder_name));
+
+	// Make sure we got a path
+	verify_success(rc);
+	verify(folder_name && *folder_name);
+	verify(!full_folder_name.IsEmpty() && *full_folder_name.CStr());
+
+	// Compare the paths received
+#ifdef FOLDER_PARENT_SUPPORT
+	// Build the full path using the parent folder name
+	OpString built_full_folder_name;
+	verify_success(built_full_folder_name.Set(folder_name));
+	//output("\n1 \"%s\" ", ST_down(built_full_folder_name.CStr()));
+	while (parent != OPFILE_ABSOLUTE_FOLDER)
+	{
+		// Get the parent folder
+		OpFileFolder new_parent;
+		const uni_char *parent_name = NULL;
+		g_pcfiles->GetDefaultDirectoryPref(parent, &new_parent, &parent_name);
+		verify(parent_name && *parent_name);
+
+		OpString buildtmp;
+		if (parent_name[uni_strlen(parent_name) - 1] != PATHSEPCHAR)
+		{
+			buildtmp.SetConcat(parent_name, UNI_L(PATHSEP), built_full_folder_name.CStr());
+		}
+		else
+		{
+			buildtmp.SetConcat(parent_name, built_full_folder_name.CStr());
+		}
+		built_full_folder_name.TakeOver(buildtmp);
+		//output("\n2 \"%s\" (got \"%s\") ", ST_down(built_full_folder_name.CStr()), ST_down(parent_name));
+
+		// Move on to the next parent
+		parent = new_parent;
+	}
+	
+	verify_string(full_folder_name, built_full_folder_name);
+#else
+	// Both code paths should return the same thing when building without
+	// FOLDER_PARENT_SUPPORT
+	//output("\nA \"%s\"\nB \"%s\" ", ST_down(folder_name), ST_down(full_folder_name.CStr()));
+	verify(OPFILE_ABSOLUTE_FOLDER == parent);
+	verify_string(full_folder_name, folder_name);
+#endif
+}
+
+test("WriteDirectoryL setup")
+	require PREFS_WRITE;
+	require DISK_CACHE_SUPPORT;
+{
+	verify_success(g_folder_manager->GetFolderPath(OPFILE_CACHE_FOLDER, cache_folder_path));
+	verify(cache_folder_path.HasContent());
+	verify_success(g_folder_manager->GetFolderPath(OPFILE_HOME_FOLDER, home_folder_path));
+	verify(home_folder_path.HasContent());
+}
+
+test("WriteDirectoryL")
+	require success "WriteDirectoryL setup";
+	require PREFS_WRITE;
+	require DISK_CACHE_SUPPORT;
+{
+	OpString new_home_folder_path;
+
+	TRAPD(rc, g_pcfiles->WriteDirectoryL(OPFILE_HOME_FOLDER, cache_folder_path));
+	verify_success(rc);
+	verify_success(g_folder_manager->GetFolderPath(OPFILE_HOME_FOLDER, new_home_folder_path));
+	verify_string(new_home_folder_path, cache_folder_path);
+}
+finally
+{
+	TRAP(rc, g_pcfiles->WriteDirectoryL(OPFILE_HOME_FOLDER, home_folder_path));
+	OpStatus::Ignore(rc);
+}
+
+test("Testing GetFileURLL (host is uni_char)")
+require HAVE_DISK;
+require _MIME_SUPPORT_;
+{
+        OpString org_dirstyle;
+        OpString host_dirstyle;
+		OpString new_dirstyle_convert;
+		OpString org_dirstyle_after_override;
+        OpFile new_dirstyle;
+        const uni_char* host = UNI_L("http://www.example.com/01.html");
+		
+		//Get the default style folder path
+		verify_trap(g_pcfiles->GetFileURLL(PrefsCollectionFiles::StyleMIMEFile, &org_dirstyle));
+
+		//Create a new style folder path
+        verify(OpStatus::IsSuccess(new_dirstyle.Construct(UNI_L("/home/a.css"))));               
+        
+		//Override the style folder path with the new one for this host
+		verify_trap(g_pcfiles->OverridePrefL(host, PrefsCollectionFiles::StyleMIMEFile, &new_dirstyle, TRUE));
+		//Verify that the override succeeded
+		verify(g_pcfiles->PrefsCollectionFiles::IsPreferenceOverridden(PrefsCollectionFiles::StyleMIMEFile, host)); 
+
+		//Get the style folder path for this host
+		verify_trap(g_pcfiles->GetFileURLL(PrefsCollectionFiles::StyleMIMEFile, &host_dirstyle, host));
+			
+		// Get the default style folder path after override
+		verify_trap(g_pcfiles->GetFileURLL(PrefsCollectionFiles::StyleMIMEFile, &org_dirstyle_after_override));
+		
+		//Convert the new style folder path in comparable format
+		verify_trap(g_url_api->ResolveUrlNameL(new_dirstyle.GetFullPath(),new_dirstyle_convert));
+
+		//Verifications:
+		verify(new_dirstyle_convert.Compare(host_dirstyle) == 0);
+		verify(org_dirstyle.Compare(host_dirstyle) != 0);
+		verify(org_dirstyle_after_override.Compare(host_dirstyle) != 0);
+		verify(org_dirstyle_after_override.Compare(org_dirstyle) == 0);	
+}
+finally
+{
+	// Remove overrides
+	TRAPD(err, g_prefsManager->RemoveOverridesL(host, TRUE));
+}
+
+test("Testing GetFileURLL (host is URL)")
+require HAVE_DISK;
+require _MIME_SUPPORT_;
+{
+        OpString org_dirstyle;
+        OpString host_dirstyle;
+		OpString new_dirstyle_convert;
+		OpString org_dirstyle_after_override;
+        OpFile new_dirstyle;
+ 
+        URL base_url = g_url_api->GetURL("http://www.example.com");
+		const uni_char* host = base_url.GetAttribute(URL::KUniHostName).CStr();
+		
+		//Get the default style folder path
+		verify_trap(g_pcfiles->GetFileURLL(PrefsCollectionFiles::StyleMIMEFile, &org_dirstyle));
+
+		//Create a new style folder path
+        verify(OpStatus::IsSuccess(new_dirstyle.Construct(UNI_L("/home/a.css"))));               
+        
+		//Override the style folder path with the new one for this host
+		verify_trap(g_pcfiles->OverridePrefL(host, PrefsCollectionFiles::StyleMIMEFile, &new_dirstyle, TRUE));
+		//Verify that the override success
+		verify(g_pcfiles->PrefsCollectionFiles::IsPreferenceOverridden(PrefsCollectionFiles::StyleMIMEFile, base_url)); 
+
+		//Get the style folder path for this host
+		verify_trap(g_pcfiles->GetFileURLL(PrefsCollectionFiles::StyleMIMEFile, &host_dirstyle, base_url));
+			
+		// Get the default style folder path after overridden
+		verify_trap(g_pcfiles->GetFileURLL(PrefsCollectionFiles::StyleMIMEFile, &org_dirstyle_after_override));
+		
+		//Convert the new style folder path in comparable format
+		verify_trap(g_url_api->ResolveUrlNameL(new_dirstyle.GetFullPath(),new_dirstyle_convert));
+
+		//Verifications:
+		verify(new_dirstyle_convert.Compare(host_dirstyle) == 0);
+		verify(org_dirstyle.Compare(host_dirstyle) != 0);
+		verify(org_dirstyle_after_override.Compare(host_dirstyle) != 0);
+		verify(org_dirstyle_after_override.Compare(org_dirstyle) == 0);	
+}
+finally
+{
+	// Remove overrides
+	TRAPD(err, g_prefsManager->RemoveOverridesL(host, TRUE));
+}
+
+test("Testing WriteDirectoryL and ResetDirectoryL")
+require HAVE_DISK;
+require SKIN_SUPPORT;
+require PREFS_WRITE;
+{
+		OpString org_folderpath;
+		OpString new_folderpath;
+
+		const uni_char* where = UNI_L("newSkinFolder");
+		
+		//Get the default directory for OPFILE_SKIN_FOLDER
+		verify_success(g_folder_manager->GetFolderPath(OPFILE_SKIN_FOLDER,org_folderpath));
+		
+		//Write the new directory
+		verify_trap(g_pcfiles->WriteDirectoryL(OPFILE_SKIN_FOLDER,where));
+		
+		//Read it back and verify that the writing of the new folder successed
+		verify_success(g_folder_manager->GetFolderPath(OPFILE_SKIN_FOLDER,new_folderpath));
+		verify(new_folderpath.Compare(org_folderpath) != 0);
+
+		//Reset the directory
+		verify_trap(g_pcfiles->ResetDirectoryL(OPFILE_SKIN_FOLDER));
+		
+		//Read it back and verify that reset success
+		verify_success(g_folder_manager->GetFolderPath(OPFILE_SKIN_FOLDER,new_folderpath));
+		verify(new_folderpath.Compare(org_folderpath) == 0);	
+}
+
+test("Testing WriteDirectoryL invalid folder")
+require HAVE_DISK;
+require PREFS_WRITE;
+{
+		const uni_char* where = UNI_L("newSkinFolder");		
+		TRAPD(rc,g_pcfiles->WriteDirectoryL(OPFILE_TEMP_FOLDER,where));
+		verify(OpStatus::IsError(rc));
+}
+
+test("Testing ResetFileL")
+require HAVE_DISK;
+require OPERA_CONSOLE_LOGFILE;
+require PREFS_WRITE;
+{
+     	OpFile logfiles[3];
+     	
+		//Get the original log file
+		verify_trap(g_pcfiles->GetFileL(PrefsCollectionFiles::ConsoleErrorLogName, logfiles[0]));
+		
+		//Construct the new log file
+		verify_trap(OpStatus::IsSuccess(logfiles[1].Construct(UNI_L("newerror.log"), OPFILE_HOME_FOLDER)));    
+		
+		//Update the pref with the new log file
+		verify_trap(g_pcfiles->WriteFilePrefL(PrefsCollectionFiles::ConsoleErrorLogName, &logfiles[1]));
+		verify_trap(g_pcfiles->GetFileL(PrefsCollectionFiles::ConsoleErrorLogName, logfiles[2]));
+		verify_string(logfiles[1].GetFullPath(),logfiles[2].GetFullPath());
+		
+		//Reset the pref 
+		verify_trap(g_pcfiles->ResetFileL(PrefsCollectionFiles::ConsoleErrorLogName));
+		verify_trap(g_pcfiles->GetFileL(PrefsCollectionFiles::ConsoleErrorLogName, logfiles[2]));
+		verify_string(logfiles[0].GetFullPath(),logfiles[2].GetFullPath());
+}
+
+test("WriteDirectoryL checks conditions for OPFILE_TEMPDOWNLOAD_FOLDER")
+	require PREFS_READ;
+	require PREFS_VALIDATE;
+	require PREFS_CHECK_TEMPDOWNLOAD_FOLDER;
+{
+	OpString tempdownload_folder_path;
+	verify_success(g_folder_manager->GetFolderPath(OPFILE_TEMPDOWNLOAD_FOLDER, tempdownload_folder_path));
+
+	// change OPFILE_TEMPDOWNLOAD_FOLDER
+	tempdownload_folder_path.AppendL(UNI_L(PATHSEP));
+	tempdownload_folder_path.AppendL(UNI_L("my documents"));
+	tempdownload_folder_path.AppendL(UNI_L(PATHSEP));
+	g_pcfiles->WriteDirectoryL(OPFILE_TEMPDOWNLOAD_FOLDER, tempdownload_folder_path.CStr());
+
+	// get and verify OPFILE_TEMPDOWNLOAD_FOLDER
+	verify_success(g_folder_manager->GetFolderPath(OPFILE_TEMPDOWNLOAD_FOLDER, tempdownload_folder_path));
+	OpString expected_subdir_path;
+	expected_subdir_path.AppendL(UNI_L(PATHSEP));
+	expected_subdir_path.AppendL(UNI_L("temporary_downloads"));
+	expected_subdir_path.AppendL(UNI_L(PATHSEP));
+	OpStringC path_postfix = tempdownload_folder_path.SubString(MAX(0, tempdownload_folder_path.Length() - expected_subdir_path.Length()));
+	verify_string(path_postfix, expected_subdir_path);
+}
+

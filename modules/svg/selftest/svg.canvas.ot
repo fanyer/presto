@@ -1,0 +1,186 @@
+// -*- Mode: c++; tab-width: 4; indent-tabs-mode: t; c-basic-offset: 4 -*-
+group "svg.canvas";
+
+require init;
+require SVG_SUPPORT;
+
+language c++;
+
+include "modules/svg/src/SVGCanvas.h";
+include "modules/svg/src/svgpainter.h";
+include "modules/svg/src/AttrValueStore.h";
+include "modules/img/decoderfactorypng.h";
+include "modules/pi/OpBitmap.h";
+
+global
+{
+	void WriteFailedBitmap(const char* filename, OpBitmap* bitmap)
+	{
+		DecoderFactoryPng::verify(filename, bitmap,
+								  bitmap->Height(), 5, 10000, TRUE);
+	}
+
+	OpBitmap* bitmap;
+	SVGPainter painter;
+	VEGARenderer renderer;
+	VEGARenderTarget* rendertarget;
+	UINT32* buf;
+}
+
+test("Creation")
+{
+	bitmap = NULL;
+	rendertarget = NULL;
+	buf = NULL;
+
+	verify_success(renderer.Init(400, 400));
+	verify_success(OpBitmap::Create(&bitmap, 400, 400, FALSE, FALSE, 0, 0, TRUE));
+
+	verify_success(renderer.createBitmapRenderTarget(&rendertarget, bitmap));
+}
+
+test("Test proper use of broken painter alpha tweak")
+	require success "Creation";
+{
+	OpRect rect(0,0,400,400);
+	FontAtt fontatt;
+	fontatt.SetHeight(50);
+	int fontid = styleManager->GetGenericFontNumber(StyleManager::SERIF, WritingSystem::LatinWestern);
+	fontatt.SetFontNumber(fontid);
+	OpFont* font = g_font_cache->GetFont(fontatt, 100);
+	verify(font);
+	uni_char* str = const_cast<uni_char*>(UNI_L("Test SgAVo%dzQ"));
+
+	verify_success(painter.BeginPaint(&renderer, rendertarget, rect));
+	painter.SetFlatness(SVGNumber(25) / 100);
+	painter.SetClipRect(rect);
+	painter.Clear(0, &rect);
+
+	SVGPaintDesc black;
+	black.Reset();
+	black.color = 0xff000000;
+	black.opacity = 255;
+
+	SVGObjectProperties obj_props;
+	obj_props.aa_quality = VEGA_DEFAULT_QUALITY;
+	obj_props.fillrule = SVGFILL_EVEN_ODD;
+	obj_props.filled = TRUE;
+	obj_props.stroked = FALSE;
+
+	painter.SetFillPaint(black);
+	painter.SetObjectProperties(&obj_props);
+
+	painter.SetTransform(SVGMatrix()); // Set identity
+
+	painter.SetPainterRect(rect);
+
+	OP_STATUS err = painter.GetPainter(0);
+	if (OpStatus::IsSuccess(err))
+	{
+		painter.DrawStringPainter(font, OpPoint(10,200), str, uni_strlen(str), 0, NULL);
+		painter.ReleasePainter();
+	}
+	painter.EndPaint();
+
+	verify_success(err);
+
+	buf = OP_NEWA(UINT32, bitmap->Width());
+	verify(buf);
+	
+	BOOL has_alpha = FALSE;
+	for (unsigned int line = 0; !has_alpha && line < bitmap->Height(); line++)
+	{
+		verify(bitmap->GetLineData(buf, line));
+		for(unsigned int x = 0; !has_alpha && x < bitmap->Width(); x++)
+		{
+			UINT8 a = GetSVGColorAValue(buf[x]);
+			has_alpha = (a > 0 && a < 255);
+		}
+	}
+
+	if (!has_alpha)
+	{
+		WriteFailedBitmap("./brokenpainter_failed.png", bitmap);
+		output("Manually inspect the brokenpainter_failed.png image. It should contain an anti-aliased and readable text string. If it is of poor quality, first try these steps: If you have enabled TWEAK_SVG_FIX_BROKEN_PAINTER_ALPHA then it's possible that you should disable it. If OTOH you haven't enabled the same tweak then you should do so. If you tried both and it didn't help, mail the svg module owners.");
+	}
+	
+	verify(has_alpha);
+}
+finally
+{
+	g_font_cache->ReleaseFont(font);
+}
+
+
+xml {
+//!<svg xmlns="http://www.w3.org/2000/svg">
+//!<path d="M0,-60 L-35.3,48.5 L57,-18.5 L-57,-18.5 L35.3,48.5 z"/>
+//!<polygon points="0,-60 -57,-18.5 -35.3,48.5 35.3,48.5 57,-18.5"/>
+//!</svg>
+}
+
+table IsectTestPoints(int, int, BOOL)
+{
+	{80, 96, TRUE},
+	{100, 100, FALSE},
+	{280, 96, TRUE},
+	{300, 100, TRUE},
+	{200, 200, FALSE}
+}
+
+foreach (point_x, point_y, expect_isect) from IsectTestPoints
+{
+	test("Intersection testing w/clip ($(point_x), $(point_y))")
+		require success "Creation";
+		require SVG_SUPPORT_STENCIL;
+	{
+		SVGIntersectionCanvas isect_canvas;
+		isect_canvas.SetIntersectionMode(SVGNumberPair(point_x, point_y));
+		isect_canvas.SetCurrentElement(NULL);
+		isect_canvas.SetLastIntersectedElement();
+
+		isect_canvas.SetDefaults(25);
+		isect_canvas.SetFillColor(0xffffffff);
+
+		BOOL path_ok = FALSE;
+
+		isect_canvas.SetFillRule(SVGFILL_EVEN_ODD);
+		isect_canvas.BeginClip();
+		{
+			OpBpath* path = NULL;
+			path = AttrValueStore::GetPath(find_element("path"), Markup::SVGA_D);
+			if (path)
+			{
+				path_ok = TRUE;
+
+				isect_canvas.EnableFill(SVGCanvasState::USE_COLOR);
+
+				isect_canvas.GetTransform().MultTranslation(100, 100);
+				isect_canvas.DrawPath(path);
+
+				isect_canvas.SetFillRule(SVGFILL_NON_ZERO);
+
+				isect_canvas.GetTransform().MultTranslation(200, 0);
+				isect_canvas.DrawPath(path);
+			}
+		}
+		isect_canvas.EndClip();
+
+		isect_canvas.SetFillRule(SVGFILL_EVEN_ODD);
+		isect_canvas.GetTransform().LoadIdentity();
+		isect_canvas.SetCurrentElement((HTML_Element*)0x1);
+		isect_canvas.DrawRect(0, 0, 400, 400, 0, 0);
+
+		isect_canvas.RemoveClip();
+
+		verify(path_ok);
+		verify(!!isect_canvas.GetLastIntersectedElement() == !!expect_isect);
+	}
+}
+
+exit
+{
+	VEGARenderTarget::Destroy(rendertarget);
+	OP_DELETE(bitmap);
+	OP_DELETEA(buf);
+}

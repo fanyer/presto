@@ -1,0 +1,147 @@
+/* -*- Mode: c++; tab-width: 4; indent-tabs-mode: t; c-basic-offset: 4 -*- */
+
+group "style.match_benchmark";
+
+require init;
+
+language C++;
+
+include "modules/doc/frm_doc.h";
+include "modules/dochand/fdelm.h";
+include "modules/layout/layout_workplace.h";
+include "modules/style/css_collection.h";
+include "modules/style/css_dom.h";
+include "modules/style/css_property_list.h";
+include "modules/pi/OpSystemInfo.h";
+
+table test_files(uni_char*) filelist "benchmarks" name "top_*.html";
+
+global
+{
+	class WaitUntilLoadedObj : public OpTimerListener
+	{
+	private:
+		OpTimer* m_timer;
+
+	public:
+		WaitUntilLoadedObj()
+		{
+			m_timer = OP_NEW(OpTimer, ());
+			if (m_timer)
+			{
+				m_timer->SetTimerListener(this);
+				m_timer->Start(250);
+			}
+			else
+				ST_failed("Out of memory");
+		}
+
+		~WaitUntilLoadedObj() { OP_DELETE(m_timer); }
+
+		virtual void OnTimeOut(OpTimer* timer)
+		{
+			FramesDocument* doc = GetTestDocument();
+   			if (doc && doc->IsLoaded(TRUE))
+			{
+				if (!doc->GetDOMEnvironment())
+					doc->ConstructDOMEnvironment();
+				const uni_char* res = doc->GetHLDocProfile()->GetBodyElm()->DOMGetAttribute(doc->GetDOMEnvironment(), Markup::HA_XML, UNI_L("res"), NS_IDX_DEFAULT, TRUE);
+				if (res)
+				{
+					OpString8 out;
+					out.Set(res);
+					out.Append(" (page load time) .. \n");
+					output(out.CStr());
+					OP_DELETE(this);
+					ST_passed();
+				}
+				else
+				{
+					// Wait for onload handler...
+					m_timer->Start(10);
+				}
+			}
+			else
+				m_timer->Start(250);
+		}
+
+		static FramesDocument* GetTestDocument()
+		{
+			// Due to bugs in selftest, state.doc is sometimes not updated so we have to get it from window.
+			Window* window = g_selftest.utils->GetWindow();
+			FramesDocument* doc = NULL;
+			DocumentManager* doc_man = window ? window->DocManager() : NULL;
+			if (doc_man)
+				doc = doc_man->GetCurrentDoc();
+			if (doc)
+				return doc;
+			return state.doc;
+		}
+	};
+
+	void WaitUntilLoaded()
+	{
+		if (!(OP_NEW(WaitUntilLoadedObj, ())))
+			ST_failed("Out of memory\n");
+	}
+}
+
+html {
+//! <div>dummy doc</div>
+}
+
+foreach (file) from test_files
+{
+	test("Page load") async;
+	{
+		Window* win = state.doc->GetWindow();
+		OP_STATUS stat = win->OpenURL(file);
+		if (stat == OpStatus::OK)
+			WaitUntilLoaded();
+		else
+			ST_failed("Out of memory");
+	}
+
+	test("Reload properties")
+	{
+		FramesDocument* doc = state.doc->GetIFrmRoot()->FirstChild()->GetCurrentDoc();
+		HTML_Element* root_elm = doc->GetDocRoot();
+
+		for (int i=0; i<10; i++)
+		{
+			root_elm->MarkPropsDirty(doc);
+			double start = g_op_time_info->GetRuntimeMS();
+			doc->GetLogicalDocument()->GetLayoutWorkplace()->ReloadCssProperties();
+			double stop = g_op_time_info->GetRuntimeMS();
+			int diff = static_cast<int>(op_floor(stop-start));
+			output("ReloadCssProperties: %dms\n", diff);
+		}
+	}
+
+	test("Reload properties with stylesheets enabled/disabled")
+	{
+		FramesDocument* doc = state.doc->GetIFrmRoot()->FirstChild()->GetCurrentDoc();
+		HTML_Element* root_elm = doc->GetDocRoot();
+		CSSCollection* coll = doc->GetHLDocProfile()->GetCSSCollection();
+
+		for (int i=0; i<10; i++)
+		{
+			BOOL enable = ((i % 2) == 0);
+
+			CSSCollection::Iterator iter(coll, CSSCollection::Iterator::STYLESHEETS_NOIMPORTS);
+			CSS* css;
+			while ((css = static_cast<CSS*>(iter.Next())))
+			{
+				css->SetEnabled(enable);
+				enable = !enable;
+			}
+
+			root_elm->MarkPropsDirty(doc);
+			double start = g_op_time_info->GetRuntimeMS();
+			doc->GetLogicalDocument()->GetLayoutWorkplace()->ReloadCssProperties();
+			double stop = g_op_time_info->GetRuntimeMS();
+			int diff = static_cast<int>(op_floor(stop-start));
+			output("ReloadCssProperties: %dms\n", diff);
+		}
+	}
+}

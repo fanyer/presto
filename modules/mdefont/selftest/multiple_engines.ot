@@ -1,0 +1,135 @@
+/* -*- Mode: c++; tab-width: 4; indent-tabs-mode: t; c-basic-offset: 4 -*- */
+
+group "mdefont.engines";
+require MDEFONT_MODULE;
+
+include "modules/mdefont/mdefont.h";
+
+/*
+  NOTE: all tests that use g_engine should depend on "create
+  additional engine"
+ */
+
+global
+{
+	MDF_FontEngine* g_engine;
+}
+setup
+{
+	g_engine = 0;
+}
+exit
+{
+	MDF_DestroyFontEngine(g_engine);
+}
+
+test("create additional engine")
+{
+	verify(OpStatus::IsSuccess(MDF_CreateFontEngine(&g_engine)));
+}
+
+table fonts filelist "." name "*.ttf";
+
+test("add fonts")
+require success("create additional engine");
+{
+	verify(OpStatus::IsSuccess(MDF_BeginFontEnumeration(g_engine)));
+
+	foreach (font) from fonts
+	{
+		verify(OpStatus::IsSuccess(MDF_AddFontFile(ST_up(font), g_engine)));
+	}
+}
+finally
+{
+	MDF_EndFontEnumeration(g_engine);
+}
+
+test("get fonts")
+require success("create additional engine");
+{
+	MDE_FONT* font = 0;
+	for (int i = 0; i < MDF_CountFonts(g_engine); ++i)
+	{
+		// creat font instance
+		// assumes there's a normal version of each font in 'fonts' table
+		verify(font = MDF_GetFont(i, 12, FALSE, FALSE, g_engine));
+
+		// fetch font info
+		MDF_FONTINFO fi;
+		verify(OpStatus::IsSuccess(MDF_GetFontInfo(i, &fi, g_engine)));
+
+		// measure a string
+		int width;
+		verify(OpStatus::IsSuccess(MDF_StringWidth(width, font, UNI_L("biteme"), 6, 0) && width));
+
+		MDF_ReleaseFont(font);
+		font = 0;
+	}
+}
+finally
+{
+	if (font)
+		MDF_ReleaseFont(font);
+}
+
+test("MDF_ProcessString from different engines")
+require success("create additional engine");
+{
+	MDE_FONT* def_font = 0;
+	MDE_FONT* other_font = 0;
+	// MDF_ProcessString works on a shared buffer. however, there will
+	// have to be one buffer per engine, or things will break.
+
+	// process a string using a font from default engine
+	def_font = MDF_GetFont(0, 12, FALSE, FALSE, g_mdf_engine);
+	verify(def_font);
+	ProcessedString def_str;
+	verify(OpStatus::IsSuccess(MDF_ProcessString(def_font, def_str, UNI_L("biteme"), 6)));
+
+	// copy data so comparison can be made later
+	ProcessedGlyph glyphs[6];
+	op_memcpy(glyphs, def_str.m_processed_glyphs, 6*sizeof(ProcessedGlyph));
+
+	// process a string using a font from engine created by this test
+	// suite - this shouldn't affect def_str
+	other_font = MDF_GetFont(0, 12, FALSE, FALSE, g_engine);
+	verify(other_font);
+	ProcessedString other_str;
+	verify(OpStatus::IsSuccess(MDF_ProcessString(other_font, other_str, UNI_L("hard"),   4)));
+
+	// compare data in def_str's buffer to copied data
+	verify(!op_memcmp(glyphs, def_str.m_processed_glyphs, 6*sizeof(ProcessedGlyph)));
+}
+finally
+{
+	if (def_font)
+		MDF_ReleaseFont(def_font);
+	if (other_font)
+		MDF_ReleaseFont(other_font);
+}
+
+test("assert when font is leaking")
+file vera "Vera.ttf";
+disabled; // this test intentionally leaks, so it's disabled
+{
+	MDF_FontEngine* engine = 0;
+	verify(OpStatus::IsSuccess(MDF_CreateFontEngine(&engine)));
+
+	OP_ASSERT(OpStatus::IsSuccess(MDF_BeginFontEnumeration(engine)));
+	OP_ASSERT(OpStatus::IsSuccess(MDF_AddFontFile(vera, engine)));
+	MDF_EndFontEnumeration(engine);
+
+	// this font will leak - once engine is destroyed it's impossible
+	// to delete it
+	MDE_FONT* font = MDF_GetFont(0, 12, FALSE, FALSE, engine);
+	verify(font);
+
+	MDF_DestroyFontEngine(engine); // should trigger assert, since font is not released
+	engine = 0;
+}
+finally
+{
+	if (engine)
+		MDF_DestroyFontEngine(engine);
+}

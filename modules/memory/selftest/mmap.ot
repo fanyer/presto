@@ -1,0 +1,488 @@
+/* -*- Mode: c++; tab-width: 4; indent-tabs-mode: t; c-basic-offset: 4 -*-
+ *
+ * Copyright (C) 2009 Opera Software AS.  All rights reserved.
+ *
+ * This file is part of the Opera web browser.  It may not be distributed
+ * under any circumstances.
+ */
+
+group "memory.mmap";
+
+language C++;
+
+require ENABLE_OPERA_MMAP_SEGMENT;
+
+include "modules/pi/system/OpMemory.h";
+include "modules/memory/src/memory_mmap.h";
+include "modules/memory/src/memory_pilayer.h";
+
+global
+{
+	const OpMemory::OpMemSegment* mseg;
+	OpMmapSegment* mmap;
+	size_t pagesize;
+	unsigned int usable;
+	char* first_usable_byte;
+	void* alloc1;
+	void* alloc2;
+	void* alloc3;
+	void* alloc4;
+}
+
+setup
+{
+	mseg = 0;
+	mmap = 0;
+	pagesize = OpMemory::GetPageSize();
+
+	//
+	// Decide suitable 'usable' pages for an OpMmapSegment with
+	// 8192 pages available (32M with 4K pages)
+	// This code may not be sufficiently robust for 64-bit machines,
+	// and must be adapted for pagesizes other than 4K.
+	//
+	switch ( pagesize )
+	{
+	case 4096:
+		usable = 8175;
+		break;
+	default:
+		OP_ASSERT(!"Don't know how to test with current memory page size");
+		usable = 9000; // Most certainly causing the tests to fail...
+		break;
+	}
+}
+
+exit
+{
+	if ( mmap != 0 )
+		mmap->ForceReleaseAll();
+	if ( mseg != 0 )
+		OpMemory::DestroySegment(mseg);
+}
+
+test("Create mmap segment")
+{
+#ifdef ENABLE_MEMORY_MANAGER
+	// Check preconditions for testing the interaction with the
+	// memory manager (for accounting and policy decisions)
+	verify(g_mem_manager->GetTotal(MEMCLS_SELFTEST1) == 0);
+	verify(g_mem_manager->GetTotal(MEMCLS_SELFTEST2) == 0);
+	verify(g_mem_manager->GetTotal(MEMCLS_SELFTEST3) == 0);
+#endif
+
+	// Create a segment with total of 8192 pages, which is 32M with 4K pages
+	mseg = OpMemory_CreateVirtualSegment(8192 * pagesize);
+	verify(mseg != 0);
+
+	mmap = OpMmapSegment::Create(mseg, MEMCLS_SELFTEST1, MEMCLS_SELFTEST3);
+	verify(mmap != 0);
+
+	first_usable_byte = (char*)mmap->TestGetAddressFirstUsable();
+	char* top_header = (char*)mmap + sizeof(OpMmapSegment);
+	top_header += ((usable + 2) * sizeof(OpMemPageHandle));
+	verify(first_usable_byte >= top_header);
+
+#ifdef ENABLE_MEMORY_MANAGER
+	// Assume pagesize is small enough that 8192 pages does not fit in
+	// a single page (64K pages are too large for this to hold true)
+	verify(g_mem_manager->GetTotal(MEMCLS_SELFTEST1) == 2 * pagesize);
+#endif
+}
+
+test("Check initial consistency")
+	require success "Create mmap segment";
+{
+	// The state contains a single reserved block
+	verify(mmap->TestState(OP_MMAP_FLAG_RESERVED, usable, 0) == 0);
+}
+
+test("Check sentinels")
+	require success "Create mmap segment";
+{
+
+	//
+	// Just before the first usable page-handle, there is a sentinel
+	// handle with a different type than the rest - it will ensure that
+	// there will be no attempt at merging with the (non-existing) block
+	// below the first usable one. There is also a sentinel above the
+	// last usable page-handle, to prevent merging outside the available
+	// space in the other direction.
+	//
+	OpMemPageHandle* ph = mmap->TestGetPageHandle(OP_MMAP_ANCHOR_COUNT);
+	verify(ph->flag == OP_MMAP_FLAG_SENTINEL);
+	verify(ph->size == 1); // Not really important
+
+	ph = mmap->TestGetPageHandle(OP_MMAP_ANCHOR_COUNT + 1 + usable);
+	verify(ph->flag == OP_MMAP_FLAG_SENTINEL);
+	verify(ph->size == 1); // Not really important
+}
+
+test("Check sizeclass computation")
+{
+	for ( int pages = 1; pages < 0x10000; pages++ )
+	{
+		// Comments on sizes in K below assume 4K memory block size.
+
+		unsigned int cls = 42;
+
+		if ( pages <= 17 )
+			cls = pages - 1; // 1-17 pages, 1 to 68K
+		else if ( pages < 32 )
+			cls = 17; // 17-31 pages, 68K+1 to 124K
+		else if ( pages < 64 )
+			cls = 18; // 32-63 pages, 124K+1 to 252K
+		else if ( pages < 128 )
+			cls = 19; // 64-127 pages, 252K+1 to 508K
+		else if ( pages < 256 )
+			cls = 20; // 128-255 pages, 508K+1 to 1020K
+		else if ( pages < 512 )
+			cls = 21; // 256-511 pages, 1020K+1 to 2044K
+		else if ( pages < 1024 )
+			cls = 22; // 512-1023 pages, 2044K+1 to 4092K
+		else if ( pages < 2048 )
+			cls = 23; // 1024-2047 pages, 4092K+1 to 8188K
+		else if ( pages < 4096 )
+			cls = 24; // 2048-4095 pages, 8188K+1 to 16380K
+		else if ( pages < 8192 )
+			cls = 25; // 4096-8191 pages, 16380K+1 to 32764K
+		else if ( pages < 16384 )
+			cls = 26; // 8192-16383 pages, 32764K+1 to 65532K
+		else if ( pages < 32768 )
+			cls = 27; // 16384-32767 pages, 65532K+1 to 131068K
+		else if ( pages <= 65536 )
+		{
+			cls = 28; // 32768-65536 pages, 131068K+1 to 262144K
+			OP_ASSERT(OP_MMAP_SIZECLASSES_COUNT == 29);
+		}
+		else
+			OP_ASSERT(!"Does only handle 16-bit number of memory pages");
+
+		unsigned int computed = OpMmapSegment::TestComputeSizeClass(pages);
+		verify(computed == cls);
+	}
+}
+
+test("Check usable pages computation")
+{
+	unsigned int pagesize = 4096;
+	unsigned int pages = 2;
+	unsigned int useful;
+	unsigned int static_header_bytes =
+		sizeof(OpMmapSegment) + 2 * sizeof(OpMemPageHandle);
+
+	for (;;)
+	{
+		unsigned int total_bytes = pages * pagesize;
+		useful = OpMmapSegment::TestComputeUsablePages(pages, pagesize);
+		unsigned int dynamic_header_bytes = useful * sizeof(OpMemPageHandle);
+		unsigned int header_bytes = static_header_bytes + dynamic_header_bytes;
+		unsigned used_bytes = header_bytes + useful * pagesize;
+
+		verify(used_bytes <= total_bytes);
+		verify(used_bytes + pagesize >= total_bytes);
+		verify(useful < pages);
+
+		//
+		// Break when total number of useful pages pluss anchors and
+		// sentinels fill the whole 16-bit index range.
+		//
+		if ( useful + OP_MMAP_ANCHOR_COUNT + 2 == 65536 )
+			break;
+
+		pages++;
+	}
+
+	//
+	// This loop verifies that the size used is truncated when the memory
+	// segment is larger than what can be handled with 16-bit page indexes.
+	//
+	for ( unsigned int m = 0; m < 30; m++ )
+	{
+		unsigned int truncated =
+			OpMmapSegment::TestComputeUsablePages(pages, pagesize);
+		verify(truncated == useful); // Inherit the last useful from prev loop
+		pages++;
+	}
+}
+
+test("First Allocation")
+	require success "Create mmap segment";
+{
+	alloc1 = mmap->Test_mmap(4 * pagesize, MEMCLS_SELFTEST2);
+	verify(alloc1 != 0); // Should not fail
+	verify(alloc1 == (void*)first_usable_byte); // Expect it here
+
+	// Check state
+	verify(mmap->TestState(OP_MMAP_FLAG_ALLOCATED, 4,
+						   OP_MMAP_FLAG_RESERVED, usable - 4, 0) == 0);
+
+#ifdef ENABLE_MEMORY_MANAGER
+	verify(g_mem_manager->GetTotal(MEMCLS_SELFTEST1) == 2 * pagesize);
+	verify(g_mem_manager->GetTotal(MEMCLS_SELFTEST2) == 4 * pagesize);
+	verify(g_mem_manager->GetTotal(MEMCLS_SELFTEST3) == 0);
+#endif
+}
+
+test("More allocations")
+	require success "First Allocation";
+{
+	alloc2 = mmap->Test_mmap(pagesize, MEMCLS_SELFTEST2);
+	verify(alloc2 != 0);
+	verify(alloc2 == (void*)(first_usable_byte + 4 * pagesize));
+
+#ifdef ENABLE_MEMORY_MANAGER
+	verify(g_mem_manager->GetTotal(MEMCLS_SELFTEST1) == 2 * pagesize);
+	verify(g_mem_manager->GetTotal(MEMCLS_SELFTEST2) == 5 * pagesize);
+	verify(g_mem_manager->GetTotal(MEMCLS_SELFTEST3) == 0);
+#endif
+
+	alloc3 = mmap->Test_mmap(4 * pagesize, MEMCLS_SELFTEST2);
+	verify(alloc3 != 0);
+	verify(alloc3 == (void*)(first_usable_byte + 5 * pagesize));
+
+	// Check state
+	verify(mmap->TestState(OP_MMAP_FLAG_ALLOCATED, 4,
+						   OP_MMAP_FLAG_ALLOCATED, 1,
+						   OP_MMAP_FLAG_ALLOCATED, 4,
+						   OP_MMAP_FLAG_RESERVED, usable - 4 - 1 - 4, 0) == 0);
+
+#ifdef ENABLE_MEMORY_MANAGER
+	verify(g_mem_manager->GetTotal(MEMCLS_SELFTEST1) == 2 * pagesize);
+	verify(g_mem_manager->GetTotal(MEMCLS_SELFTEST2) == 9 * pagesize);
+	verify(g_mem_manager->GetTotal(MEMCLS_SELFTEST3) == 0);
+#endif
+}
+
+test("Free first allocation")
+	require success "First Allocation";
+{
+	verify(mmap->Test_munmap(alloc1));
+	verify(mmap->TestState(OP_MMAP_FLAG_UNUSED, 4,
+						   OP_MMAP_FLAG_ALLOCATED, 1,
+						   OP_MMAP_FLAG_ALLOCATED, 4,
+						   OP_MMAP_FLAG_RESERVED, usable - 4 - 1 - 4, 0) == 0);
+
+#ifdef ENABLE_MEMORY_MANAGER
+	verify(g_mem_manager->GetTotal(MEMCLS_SELFTEST1) == 2 * pagesize);
+	verify(g_mem_manager->GetTotal(MEMCLS_SELFTEST2) == 5 * pagesize);
+	verify(g_mem_manager->GetTotal(MEMCLS_SELFTEST3) == 4 * pagesize);
+#endif
+}
+
+test("Free more allocations")
+	require success "Free first allocation";
+{
+	// This should merge the two first unused blocks into one
+	verify(mmap->Test_munmap(alloc2));
+	verify(mmap->TestState(OP_MMAP_FLAG_UNUSED, 4 + 1,
+						   OP_MMAP_FLAG_ALLOCATED, 4,
+						   OP_MMAP_FLAG_RESERVED, usable - 4 - 1 - 4, 0) == 0);
+
+#ifdef ENABLE_MEMORY_MANAGER
+	verify(g_mem_manager->GetTotal(MEMCLS_SELFTEST1) == 2 * pagesize);
+	verify(g_mem_manager->GetTotal(MEMCLS_SELFTEST2) == 4 * pagesize);
+	verify(g_mem_manager->GetTotal(MEMCLS_SELFTEST3) == 5 * pagesize);
+#endif
+
+	// This should merge allocation 3 into one unused block
+	verify(mmap->Test_munmap(alloc3));
+	verify(mmap->TestState(OP_MMAP_FLAG_UNUSED, 4 + 1 + 4,
+						   OP_MMAP_FLAG_RESERVED, usable - 4 - 1 - 4, 0) == 0);
+
+#ifdef ENABLE_MEMORY_MANAGER
+	verify(g_mem_manager->GetTotal(MEMCLS_SELFTEST1) == 2 * pagesize);
+	verify(g_mem_manager->GetTotal(MEMCLS_SELFTEST2) == 0);
+	verify(g_mem_manager->GetTotal(MEMCLS_SELFTEST3) == 9 * pagesize);
+#endif
+}
+
+test("Re-use unused block")
+	require success "Free more allocations";
+{
+	alloc1 = mmap->Test_mmap(1 * pagesize, MEMCLS_SELFTEST2);
+	verify(alloc1 != 0);
+	alloc2 = mmap->Test_mmap(2 * pagesize, MEMCLS_SELFTEST2);
+	verify(alloc2 != 0);
+	alloc3 = mmap->Test_mmap(3 * pagesize, MEMCLS_SELFTEST2);
+	verify(alloc3 != 0);
+
+	verify(mmap->TestState(OP_MMAP_FLAG_ALLOCATED, 1,
+						   OP_MMAP_FLAG_ALLOCATED, 2,
+						   OP_MMAP_FLAG_ALLOCATED, 3,
+						   OP_MMAP_FLAG_UNUSED, 3,
+						   OP_MMAP_FLAG_RESERVED, usable - 9, 0) == 0);
+
+#ifdef ENABLE_MEMORY_MANAGER
+	verify(g_mem_manager->GetTotal(MEMCLS_SELFTEST1) == 2 * pagesize);
+	verify(g_mem_manager->GetTotal(MEMCLS_SELFTEST2) == 6 * pagesize);
+	verify(g_mem_manager->GetTotal(MEMCLS_SELFTEST3) == 3 * pagesize);
+#endif
+}
+
+test("Big allocation with partial reuse")
+	require success "Free more allocations";
+{
+	alloc4 = mmap->Test_mmap(2500 * pagesize, MEMCLS_SELFTEST2);
+	verify(alloc4 != 0);
+
+	verify(mmap->TestState(OP_MMAP_FLAG_ALLOCATED, 1,
+						   OP_MMAP_FLAG_ALLOCATED, 2,
+						   OP_MMAP_FLAG_ALLOCATED, 3,
+						   OP_MMAP_FLAG_ALLOCATED, 2500,
+						   OP_MMAP_FLAG_RESERVED, usable - 2506, 0) == 0);
+
+	// 2500 pages will typically consume 7 header pages in total, but
+	// we only verify that we need at least one additional one.
+	// This first verify is not a good test and is not valid for huge pates
+
+#ifdef ENABLE_MEMORY_MANAGER
+	verify(g_mem_manager->GetTotal(MEMCLS_SELFTEST1) > 2 * pagesize);
+	verify(g_mem_manager->GetTotal(MEMCLS_SELFTEST2) == 2506 * pagesize);
+	verify(g_mem_manager->GetTotal(MEMCLS_SELFTEST3) == 0);
+#endif
+}
+
+test("Free a small allocation with no memory release")
+	require success "Big allocation with partial reuse";
+{
+	verify(mmap->Test_munmap(alloc3));
+
+	verify(mmap->TestState(OP_MMAP_FLAG_ALLOCATED, 1,
+						   OP_MMAP_FLAG_ALLOCATED, 2,
+						   OP_MMAP_FLAG_UNUSED, 3,
+						   OP_MMAP_FLAG_ALLOCATED, 2500,
+						   OP_MMAP_FLAG_RESERVED, usable - 2506, 0) == 0);
+
+#ifdef ENABLE_MEMORY_MANAGER
+	verify(g_mem_manager->GetTotal(MEMCLS_SELFTEST1) > 2 * pagesize);
+	verify(g_mem_manager->GetTotal(MEMCLS_SELFTEST2) == 2503 * pagesize);
+	verify(g_mem_manager->GetTotal(MEMCLS_SELFTEST3) == 3 * pagesize);
+#endif
+}
+
+test("Free a large block and release memory")
+	require success "Free a small allocation with no memory release";
+{
+	verify(mmap->Test_munmap(alloc4));
+
+	verify(mmap->TestState(OP_MMAP_FLAG_ALLOCATED, 1,
+						   OP_MMAP_FLAG_ALLOCATED, 2,
+						   OP_MMAP_FLAG_RESERVED, usable - 3, 0) == 0);
+
+#ifdef ENABLE_MEMORY_MANAGER
+	verify(g_mem_manager->GetTotal(MEMCLS_SELFTEST1) > 2 * pagesize);
+	verify(g_mem_manager->GetTotal(MEMCLS_SELFTEST2) == 3 * pagesize);
+	verify(g_mem_manager->GetTotal(MEMCLS_SELFTEST3) == 0);
+#endif
+}
+
+test("ForceReleaseAll()")
+	require success "Free a large block and release memory";
+{
+
+	mmap->ForceReleaseAll(); // Release *all* memory, including the header
+	mmap = 0; // The 'mmap' object does no longer have accessible memory
+
+#ifdef ENABLE_MEMORY_MANAGER
+	// Verify that we are back to zero again for the accounting
+	verify(g_mem_manager->GetTotal(MEMCLS_SELFTEST1) == 0);
+	verify(g_mem_manager->GetTotal(MEMCLS_SELFTEST2) == 0);
+	verify(g_mem_manager->GetTotal(MEMCLS_SELFTEST3) == 0);
+#endif
+}
+
+test("Allocate all one page at a time")
+	require success "ForceReleaseAll()";
+{
+	// This test helps make sure there are no off-by ones in the calculation
+	// of indexes, and their allocations, and that there are in fact
+	// 'usable' pages in total (verifies the assumptions for these tests).
+
+	void** allocs = 0;
+
+	mmap = OpMmapSegment::Create(mseg, MEMCLS_SELFTEST1);
+	verify(mmap != 0);
+
+	// The state contains a single reserved block
+	verify(mmap->TestState(OP_MMAP_FLAG_RESERVED, usable, 0) == 0);
+
+	char* ptr = (char*)mmap->TestGetAddressFirstUsable();
+
+	verify(mmap->TestState(0) == 0);
+
+	allocs = OP_NEWA(void*, usable);
+	verify(allocs != 0);
+
+	for ( unsigned int k = 0; k < usable; k++ )
+	{
+		verify(mmap->TestState(0) == 0);
+
+		char* alloc = (char*)mmap->Test_mmap(pagesize, MEMCLS_SELFTEST2);
+		allocs[k] = (void*)alloc;
+
+		verify(alloc == ptr);
+
+#ifdef ENABLE_MEMORY_MANAGER
+		verify(g_mem_manager->GetTotal(MEMCLS_SELFTEST2) == (k+1) * pagesize);
+#endif
+
+		ptr += pagesize;
+	}
+
+	verify(mmap->Test_mmap(pagesize, MEMCLS_SELFTEST2) == 0); // Should OOM now
+	verify(mmap->TestState(0) == 0);
+
+#ifdef ENABLE_MEMORY_MANAGER
+	verify(g_mem_manager->GetTotal(MEMCLS_SELFTEST2) == usable * pagesize);
+	verify((g_mem_manager->GetTotal(MEMCLS_SELFTEST1) +
+			g_mem_manager->GetTotal(MEMCLS_SELFTEST2)) == 8192 * pagesize);
+#endif
+
+	//
+	// Free allocations one at a time, in random order
+	//
+	op_srand(4711); // Repeatable test
+	unsigned int remaining = usable;
+	while ( remaining > 0 )
+	{
+		unsigned int q = ((unsigned int)op_rand()) % remaining;
+
+		// Run internal consistency along the way (but not all the time)
+		if ( (remaining & 15) == 0 )
+			verify(mmap->TestState(0) == 0);
+
+		verify(mmap->Test_munmap(allocs[q]));
+
+		allocs[q] = allocs[remaining - 1];
+		remaining--;
+
+		verify(mmap->TestGetUnusedPagesCount()
+			   <= mmap->TestGetUnusedThreshold());
+
+#ifdef ENABLE_MEMORY_MANAGER
+		verify(g_mem_manager->GetTotal(MEMCLS_SELFTEST2)
+			   == remaining * pagesize);
+		verify(g_mem_manager->GetTotal(MEMCLS_SELFTEST3)
+			   <= mmap->TestGetUnusedThreshold() * pagesize);
+#endif
+	}
+
+	verify(mmap->TestGetAllocatedPagesCount() == 0);
+	verify(mmap->TestGetUnusedPagesCount() > 0);
+	verify(mmap->TestState(0) == 0);
+
+	mmap->ReleaseAllUnused();
+
+	verify(mmap->TestGetAllocatedPagesCount() == 0);
+	verify(mmap->TestGetUnusedPagesCount() == 0);
+	verify(mmap->TestState(0) == 0);
+
+#ifdef ENABLE_MEMORY_MANAGER
+	verify(g_mem_manager->GetTotal(MEMCLS_SELFTEST2) == 0);
+#endif
+}
+finally
+{
+	OP_DELETEA(allocs);
+}

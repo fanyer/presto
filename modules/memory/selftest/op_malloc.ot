@@ -1,0 +1,177 @@
+/* -*- Mode: c; tab-width: 4; c-basic-offset: 4 -*-
+ *
+ * Copyright (C) 2004-2008 Opera Software ASA.  All rights reserved.
+ *
+ * This file is part of the Opera web browser.
+ * It may not be distributed under any circumstances.
+ *
+ * Tests of standard memory management infrastructure, including stuff
+ * we take for granted that the standard doesn't actually promise.
+ */
+group "memory.malloc";
+
+language C++;
+
+test("op_malloc basic")
+{
+	op_free(0); // Legal, should not crash
+	// malloc works:
+	void* p = op_malloc(37);
+	verify(p != 0);
+}
+finally
+{
+	op_free(p);
+}
+
+test("op_malloc zero size allocations")
+{
+	/* malloc, free, calloc, realloc
+	 *
+	 * ANSI X3.159-1989, 4.10.3: If the size of the space requested is zero,
+	 * the behavior is implementation-defined; the value returned shall be
+	 * either a null pointer or a unique pointer.
+	 */
+	void* p = op_malloc(0);
+	void* q = op_malloc(0);
+
+	// That should get us either two NULLs or two distinct non-NULLs:
+	if ( p == 0 )
+	{
+		verify(q == 0);
+	}
+	else
+	{
+		verify(q != 0);
+		verify(p != q);
+	}
+}
+finally
+{
+	op_free(q);
+	op_free(p);
+}
+
+test("op_calloc")
+{
+	void* p = 0;
+
+	//
+	// Allocate different sizes twise with a free inbetween. This tests
+	// that quicklists and mmap'ed memory gets zeroed before reuse.
+	//
+	// Select sizes so they follow the pattern: 1.mmm * 2^e for various
+	// values of e and all combinations of 'mmm'.
+	//
+	unsigned int size = 2*1024*1024; // Must be a power of two
+	unsigned int high = size;
+	unsigned int mask = high + (high>>1) + (high>>2) + (high>>3);
+	unsigned int step = (high>>3);
+
+	while ( size > 8 )
+	{
+		for ( int m = 0; m < 2; m++ )
+		{
+			// Break up the size into v1 and v2 parameters to specify the size
+			unsigned int v1 = 1;
+			unsigned int v2 = size;
+
+			while ( (v2 & 1) == 0 && v1 < v2 )
+			{
+				v1 <<= 1;
+				v2 >>= 1;
+			}
+
+			OP_ASSERT((v1*v2) == size);
+			void* p = op_calloc(v1, v2);
+			verify(p != 0); // In case of OOM here, reduce blocksize
+
+			unsigned char* c = (unsigned char*)p;
+			for ( unsigned int i = 0; i < size; i++ )
+				verify(c[i] == 0);
+
+			op_memset(p, 17, size); // non-zero contents for next time around
+
+			op_free(p);
+		}
+
+		if ( (size & mask) == high ) {
+			high >>= 1;
+			mask >>= 1;
+			step >>= 1;
+		}
+
+		size -= step;
+	}
+}
+finally
+{
+	op_lowlevel_free(p);
+}
+
+test("op_realloc")
+{
+	// realloc works:
+	void* p = op_malloc(10);
+	verify(p != 0);
+	p = op_realloc(p, 20);
+	verify(p != 0);
+	p = op_realloc(p, 5);
+	verify(p != 0);
+}
+finally
+{
+	op_free(p);
+}
+
+test("op_realloc data")
+{
+	/* [ANSI X3.159-1989/4.10.3.4] The contents of the object shall be
+	 * unchanged up to the lesser of the new and old sizes.
+	 */
+	static const char text[] = "The quick brown fox jumped over the lazy dogs.";
+	char* p = (char*)op_malloc(sizeof(text));
+	op_strcpy(p, text);
+	verify(p != 0);
+
+	p = (char*)op_realloc(p, 19);
+	verify(p != 0);
+	verify(op_strncmp("The quick brown fox", p, 19) == 0);
+
+	p = (char*)op_realloc(p, sizeof(text));
+	verify(p != 0);
+	verify(op_strncmp("The quick brown fox", p, 19) == 0);
+}
+finally
+{
+	op_free(p);
+}
+
+test("op_realloc zero alloc consistency")
+	require OPTIONAL_MEMORY_SELFTESTS;
+{
+	void* p = op_realloc(0, 17);
+	verify(p != 0);
+	/* The standard leaves implementation-defined whether each of malloc(0)
+	 * and realloc(p, 0) returns a unique zero-sized allocation or NULL;
+	 * but we might want to require the memory module to ensure that the
+	 * two agree.  See bug 291136 for further details.  The memory module
+	 * should cope if the lowlevel methods fail this test: however, those
+	 * implicated in bug 291136 would like to know about any platform that
+	 * does fail it.
+	 */
+	p = op_realloc(p, 0);
+	void* q = op_malloc(0);
+
+	if ( q != 0 ) // Unique zero-sized allocations:
+	{
+		verify(p != 0);
+		op_free(q);
+	}
+	else // NULL returns:
+		verify(p == 0);
+}
+finally
+{
+	op_free(p);
+}

@@ -1,0 +1,193 @@
+group "search_engine.out_of_disk";
+
+disabled;
+
+require SEARCH_ENGINE;
+
+include "modules/search_engine/tests/test_util.h";
+include "modules/search_engine/BlockStorage.h";
+include "modules/search_engine/DiskBTree.h";
+
+/*
+ * these tests require a 10kB empty disk
+ */
+
+global
+{
+#define DISK_PATH "L:/"
+
+OpFileLength disk_size;
+}
+
+test("BlockStorage w/o transaction")
+{
+	BlockStorage f;
+	UINT32 pos, tmp;
+	OpFileLength bbsize;
+	
+	delete_file(MKPATH(DISK_PATH, "01.dat"));
+
+	verify(f.Open(MKPATH(DISK_PATH, "01.dat"), BlockStorage::OpenReadWrite, 16) == OpStatus::OK);
+
+	disk_size = 0;
+	pos = 0;
+	do {
+		disk_size += 16;
+		if ((tmp = (UINT32)f.Write(&pos, 4)) != 0)
+			pos = tmp;
+	} while (tmp != 0);
+
+	verify(disk_size == (int)disk_size);
+
+	verify(f.GetFileSize() == pos + 16);
+
+	while (pos != 0)
+	{
+		tmp = pos;
+		verify(f.Read(&pos, 4, pos));
+		verify(f.Delete(tmp));
+
+		verify(pos % 16 == 0 && pos < f.GetFileSize());
+	}
+
+	verify(f.GetFileSize() == 16);
+
+	f.Close();
+	
+	delete_file(MKPATH(DISK_PATH, "01.dat"));
+
+	output("\n    disk size is %1.0fB   ", (double)disk_size);
+
+	bbsize = 16;
+	while (disk_size % bbsize == 0 && bbsize < disk_size)
+		bbsize <<= 1;
+
+	bbsize <<= 1;
+
+	if (bbsize < disk_size)
+	{
+		verify(f.Open(MKPATH(DISK_PATH, "01.dat"), BlockStorage::OpenReadWrite, (int)bbsize) == OpStatus::OK);
+
+		pos = 0;
+		do {
+			if ((tmp = (UINT32)f.Write(&pos, 4)) != 0)
+				pos = tmp;
+		} while (tmp != 0);
+
+		verify(f.GetFileSize() == pos + bbsize);
+
+		while (pos != 0)
+		{
+			tmp = pos;
+			verify(f.Read(&pos, 4, pos));
+			verify(f.Delete(tmp));
+
+			verify(pos % bbsize == 0 && pos < f.GetFileSize());
+		}
+
+		verify(f.GetFileSize() == bbsize);
+
+		f.Close();
+		
+		delete_file(MKPATH(DISK_PATH, "01.dat"));
+	}
+}
+finally
+{
+	f.Close();
+	delete_file(MKPATH(DISK_PATH, "01.dat"));
+}
+
+test("BlockStorage w/transaction") require success "BlockStorage w/o transaction";
+{
+	BlockStorage f;
+	UINT32 pos, tmp;
+	
+	delete_file(MKPATH(DISK_PATH, "02.dat"));
+
+	verify(f.Open(MKPATH(DISK_PATH, "02.dat"), BlockStorage::OpenReadWrite, 16) == OpStatus::OK);
+
+	tmp = -1;
+	for (pos = 1; pos < 2 * disk_size / 48; ++pos)
+	{
+		verify(f.Write(&tmp, 4) != 0);
+	}
+
+	verify(f.BeginTransaction() == OpStatus::OK);
+
+	tmp = 0;
+
+	for (pos = 1; pos < disk_size / 32 - 1; ++pos)
+		f.Update(&tmp, 4, pos * 16);
+
+	verify(!f.Update(&tmp, 4, disk_size / 2));
+
+	f.Rollback();
+
+	f.Read(&tmp, 4, 16);
+	verify(tmp == -1);
+	f.Read(&tmp, 4, (disk_size / 32 - 1) * 16);
+	verify(tmp == -1);
+	f.Read(&tmp, 4, disk_size / 2);
+	verify(tmp == -1);
+
+	f.Close();
+	
+	delete_file(MKPATH(DISK_PATH, "02.dat"));
+}
+finally
+{
+	f.Close();
+	delete_file(MKPATH(DISK_PATH, "02.dat"));
+}
+
+test("BTree") require success "BlockStorage w/o transaction";
+{
+	BTreePool<int> pool;
+	BTreePool<int>::DiskBTree *b = NULL;
+	OP_STATUS err;
+	int i;
+
+	delete_file(MKPATH(DISK_PATH, "03.dat"));
+	delete_file(MKPATH(DISK_PATH, "03.dat-j"));
+
+	pool.Open(MKPATH(DISK_PATH, "03.dat"), BlockStorage::OpenReadWrite);
+
+	b = pool.CreateTree();
+
+	for (i = 0; i < disk_size; ++i)
+	{
+		if (b->Insert(i) != OpStatus::OK)
+			break;
+		if (pool.Flush() != OpBoolean::IS_TRUE)
+			break;
+	}
+
+	err = b->Insert(i);
+	if (err == OpStatus::OK)
+		err = pool.Flush();
+	verify(err == OpStatus::ERR || err == OpStatus::ERR_NO_DISK);
+
+	b->Clear();
+	OP_DELETE(b);
+	b = NULL;
+
+	pool.Abort();
+
+	verify(pool.GetStorage()->GetFileSize() == pool.GetStorage()->GetBlockSize());
+}
+finally
+{
+	if (b != NULL)
+	{
+		b->Clear();
+		OP_DELETE(b);
+	}
+	if (pool.Close() != OpStatus::OK)
+	{
+		pool.Abort();
+		pool.Close();
+	}
+	delete_file(MKPATH(DISK_PATH, "03.dat"));
+}
+

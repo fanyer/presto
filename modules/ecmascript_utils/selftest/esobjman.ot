@@ -1,0 +1,727 @@
+/* -*- Mode: c++; tab-width: 4; indent-tabs-mode: t; c-basic-offset: 4 -*-
+**
+** Copyright (C) 2011 Opera Software AS.  All rights reserved.
+**
+** This file is part of the Opera web browser.  It may not be distributed
+** under any circumstances.
+**
+*/
+
+group "ESUtils.ObjMan";
+require init;
+require ECMASCRIPT_DEBUGGER;
+
+include "modules/ecmascript_utils/esobjman.h";
+include "modules/ecmascript_utils/esasyncif.h";
+include "modules/ecmascript_utils/esdebugger.h";
+include "modules/ecmascript_utils/esenginedebugger.h";
+include "modules/ecmascript/carakan/src/ecmascript_manager.h";
+include "modules/doc/frm_doc.h";
+include "modules/dochand/win.h";
+include "modules/dochand/winman.h";
+include "modules/dochand/fdelm.h";
+
+global
+{
+	ES_Runtime *runtime;
+	unsigned window_id;
+
+	class PropertyHandler : public ES_PropertyHandler
+	{
+		OpVector<ES_GetSlotHandler> m_getslotshandlers;
+	public:
+		unsigned property_count, seen_prop_values;
+		PropertyHandler(): seen_prop_values(0) {}
+		~PropertyHandler()
+		{
+			for (unsigned i = 0; i < m_getslotshandlers.GetCount(); i++)
+			{
+				ES_GetSlotHandler* handler = m_getslotshandlers.Get(i);
+				handler->OnListenerDied();
+			}
+		}
+
+		//ES_PropertyHandler
+		OP_STATUS OnPropertyValue(ES_DebugObjectProperties *properties, const uni_char *propertyname, const ES_Value &result, unsigned propertyindex, BOOL exclude, GetNativeStatus getstatus) { OP_DELETE(propertyname); return OpStatus::OK;}
+		OP_STATUS AddObjectPropertyListener(ES_Object *owner, unsigned property_count, ES_DebugObjectProperties* properties, BOOL chain_info) {this->property_count = property_count; return OpStatus::OK;}
+		void OnError() { ST_failed("PropertyHandler::OnError()"); }
+		OP_STATUS GetSlotHandlerCreated(ES_GetSlotHandler* slothandler) { return m_getslotshandlers.Add(slothandler); }
+		OP_STATUS GetSlotHandlerDied(ES_GetSlotHandler* slothandler) { return m_getslotshandlers.RemoveByItem(slothandler); }
+		void OnDebugObjectChainCreated(ES_DebugObjectChain *targetstruct, unsigned count) {}
+		ES_Thread* GetBlockedThread() {return NULL;}
+		void SetSynchronousMode() {}
+		void SetAsynchronousMode() {}
+	};
+
+	class Exporter
+			: public ES_AsyncCallback
+			, public ESU_ObjectExporter::Handler
+	{
+	public:
+
+		template <typename T>
+		static OP_STATUS RunTest(ES_Runtime *rt, const uni_char *code)
+		{
+			OpAutoPtr<T> t(OP_NEW(T, ()));
+			RETURN_OOM_IF_NULL(t.get());
+			t->SetRuntime(rt);
+			ES_AsyncInterface *aif = rt->GetESAsyncInterface();
+			RETURN_VALUE_IF_NULL(aif, OpStatus::ERR_NULL_POINTER);
+			RETURN_IF_ERROR(aif->Eval(code, t.get()));
+			t.release();
+			return OpStatus::OK;
+		}
+
+		Exporter()
+			: prop_handler(NULL), ok(FALSE), hits(0)
+		{
+		}
+
+		void SetRuntime(ES_Runtime *rt)
+		{
+			this->rt = rt;
+		}
+
+		virtual OP_STATUS HandleCallback(ES_AsyncOperation operation, ES_AsyncStatus status, const ES_Value &result)
+		{
+			if (operation != ES_ASYNC_EVAL)
+			{
+				ST_failed("Expected ES_AsyncOperation == ES_ASYNC_EVAL");
+				OP_DELETE(this);
+				return OpStatus::ERR;
+			}
+
+			if (status != ES_ASYNC_SUCCESS)
+			{
+				ST_failed("Expected ES_AsyncStatus == ES_ASYNC_SUCCESS");
+				OP_DELETE(this);
+				return OpStatus::ERR;
+			}
+
+			if (result.type != VALUE_OBJECT)
+			{
+				ST_failed("Expected ES_Value == VALUE_OBJECT");
+				OP_DELETE(this);
+				return OpStatus::ERR;
+			}
+			OP_STATUS err = ESU_ObjectExporter::ExportObject(rt, result.value.object, this);
+
+			if (OpStatus::IsError(err))
+			{
+				ST_failed("ExportObject failed");
+				OP_DELETE(this);
+				return err;
+			}
+
+			ES_Object* es_obj = result.value.object;
+
+			if (prop_handler)
+			{
+				uni_char **names;
+				ES_Value *values;
+				GetNativeStatus *getstatuses;
+
+				g_ecmaManager->GetObjectProperties(rt, es_obj, NULL, FALSE, &names, &values, &getstatuses);
+
+				if (!names || !values || !getstatuses)
+				{
+					ST_failed("GetObjectProperties failed");
+					return OpStatus::ERR_NO_MEMORY;
+				}
+
+				uni_char **name = names;
+				unsigned prop_count = 0;
+				while(*name)
+				{
+					prop_count++;
+					name++;
+				}
+
+				name = names;
+				GetNativeStatus *getstatus = getstatuses;
+				ES_Value *value = values;
+
+				OP_STATUS status = prop_handler->AddObjectPropertyListener(es_obj, prop_count, NULL, FALSE);
+
+				if (OpStatus::IsSuccess(status))
+				{
+					for (unsigned index=0; index<prop_count; index++)
+					{
+						if (*getstatus == GETNATIVE_SUCCESS || *getstatus == GETNATIVE_SCRIPT_GETTER)
+							prop_handler->OnPropertyValue(NULL, *name, *value, index, FALSE, *getstatus);
+						else
+						{
+							ES_AsyncInterface *asyncif = rt->GetESAsyncInterface();
+							status = asyncif ? OpStatus::OK : OpStatus::ERR;
+							if (OpStatus::IsError(status))
+								break;
+
+							uni_char *aname = *name;
+							ES_GetSlotHandler *getslothandler;
+							OP_STATUS newhandlerstat = ES_GetSlotHandler::Make(getslothandler, es_obj, prop_handler, NULL, index, aname, NULL);
+							if (OpStatus::IsError(newhandlerstat) || OpStatus::IsError(asyncif->GetSlot(es_obj, aname, getslothandler, prop_handler->GetBlockedThread())))
+								prop_handler->OnError();
+						}
+						op_free(*name);
+						value++;
+						name++;
+						getstatus++;
+					}
+				}
+
+				OP_DELETEA(names);
+				OP_DELETEA(values);
+				OP_DELETEA(getstatuses);
+
+			}
+			else
+			{
+				if (!ok)
+					ST_failed("Failed");
+				else
+					ST_passed();
+
+				OP_DELETE(this);
+			}
+			return OpStatus::OK;
+		}
+
+		virtual OP_STATUS Object(BOOL, const char *, const uni_char *, ES_Object *)
+		{
+			return OpStatus::OK;
+		}
+
+		virtual OP_STATUS PropertyCount(unsigned)
+		{
+			return OpStatus::OK;
+		}
+
+		virtual OP_STATUS Property(const uni_char *, const ES_Value &)
+		{
+			return OpStatus::OK;
+		}
+
+		PropertyHandler* prop_handler;
+
+	protected:
+		// Set this to TRUE when the testcase has passed.
+		BOOL ok;
+
+		// If a test has more than one passing condition, use this variable
+		// to indicate the number of passed conditions so far.
+		unsigned hits;
+	private:
+		ES_Runtime *rt;
+	};
+
+	class Test1 : public Exporter
+	{
+	public:
+		OP_STATUS Object(BOOL is_callable, const char *class_name, const uni_char *function_name, ES_Object *prototype)
+		{
+			ok = !is_callable;
+			return OpStatus::OK;
+		}
+	};
+
+	class Test2 : public Exporter
+	{
+	public:
+		OP_STATUS Object(BOOL is_callable, const char *class_name, const uni_char *function_name, ES_Object *prototype)
+		{
+			ok = op_strcmp(class_name, "Object") == 0;
+			return OpStatus::OK;
+		}
+	};
+
+	class Test3 : public Exporter
+	{
+	public:
+		OP_STATUS Object(BOOL is_callable, const char *class_name, const uni_char *function_name, ES_Object *prototype)
+		{
+			ok = !function_name;
+			return OpStatus::OK;
+		}
+	};
+
+	class Test4 : public Exporter
+	{
+	public:
+		OP_STATUS Object(BOOL is_callable, const char *class_name, const uni_char *function_name, ES_Object *prototype)
+		{
+			ok = (prototype != NULL);
+			return OpStatus::OK;
+		}
+	};
+
+	class Test5 : public Exporter, public PropertyHandler
+	{
+	public:
+
+		Test5() { prop_handler = this; }
+		OP_STATUS OnPropertyValue(ES_DebugObjectProperties *properties, const uni_char *propertyname, const ES_Value &result, unsigned propertyindex, BOOL exclude, GetNativeStatus getstatus)
+		{
+			seen_prop_values++;
+			if(uni_str_eq(propertyname, "apples") && result.type == VALUE_NUMBER && result.value.number == 5)
+				ST_passed();
+			else
+				ST_failed("");
+
+			if(property_count == seen_prop_values)
+				OP_DELETE(this);
+
+			return OpStatus::OK;
+		}
+	};
+
+	class Test6 : public Exporter, public PropertyHandler
+	{
+	public:
+		Test6() { prop_handler = this; }
+		OP_STATUS OnPropertyValue(ES_DebugObjectProperties *properties, const uni_char *propertyname, const ES_Value &result, unsigned propertyindex, BOOL exclude, GetNativeStatus getstatus)
+		{
+			if (uni_str_eq(propertyname, "0") && (result.type == VALUE_STRING) && uni_str_eq(result.value.string, "lychee")
+				|| uni_str_eq(propertyname, "1") && (result.type == VALUE_STRING) && uni_str_eq(result.value.string, "rambutan")
+				|| uni_str_eq(propertyname, "2") && (result.type == VALUE_STRING) && uni_str_eq(result.value.string, "longan"))
+				++hits;
+
+			if(++seen_prop_values == property_count)
+			{
+				if(hits == 3)
+					ST_passed();
+				else ST_failed("did not find properties");
+			}
+
+			if(property_count == seen_prop_values)
+				OP_DELETE(this);
+
+			return OpStatus::OK;
+		}
+	};
+
+	class Test7 : public Exporter, public PropertyHandler
+	{
+	public:
+		Test7() { prop_handler = this; }
+		OP_STATUS AddObjectPropertyListener(ES_Object *owner, unsigned property_count, ES_DebugObjectProperties* properties, BOOL chain_info)
+		{
+			this->property_count = property_count;
+			if(property_count >= 3)
+				ST_passed();
+			else
+				ST_failed("wrong property count");
+			return OpStatus::OK;
+		}
+		OP_STATUS OnPropertyValue(ES_DebugObjectProperties *properties, const uni_char *propertyname, const ES_Value &result, unsigned propertyindex, BOOL exclude, GetNativeStatus getstatus)
+		{
+			++seen_prop_values;
+			if(property_count == seen_prop_values)
+				OP_DELETE(this);
+			return OpStatus::OK;
+		}
+
+	};
+
+	class Test8 : public Exporter
+	{
+	public:
+		OP_STATUS Object(BOOL is_callable, const char *class_name, const uni_char *function_name, ES_Object *prototype)
+		{
+			ok = op_strcmp(class_name, "Array") == 0;
+			return OpStatus::OK;
+		}
+	};
+
+	class Test9 : public Exporter, public PropertyHandler
+	{
+	public:
+		Test9() { prop_handler = this; }
+		OP_STATUS OnPropertyValue(ES_DebugObjectProperties *properties, const uni_char *propertyname, const ES_Value &result, unsigned propertyindex, BOOL exclude, GetNativeStatus getstatus)
+		{
+			if (uni_str_eq(propertyname, "height") && (result.type == VALUE_NUMBER) && result.value.number == 22
+				|| uni_str_eq(propertyname, "alive") && (result.type == VALUE_BOOLEAN) && result.value.boolean
+				|| uni_str_eq(propertyname, "squirrel") && (result.type == VALUE_OBJECT))
+				++hits;
+
+			if(++seen_prop_values == 3)
+			{
+				if(hits == 3)
+					ST_passed();
+				else ST_failed("did not find properties");
+			}
+
+			if(property_count == seen_prop_values)
+				OP_DELETE(this);
+
+			return OpStatus::OK;
+		}
+	};
+
+	class Test10 : public Exporter
+	{
+	public:
+		OP_STATUS Object(BOOL is_callable, const char *class_name, const uni_char *function_name, ES_Object *prototype)
+		{
+			ok = is_callable;
+			return OpStatus::OK;
+		}
+	};
+
+	class Test11 : public Exporter
+	{
+	public:
+		OP_STATUS Object(BOOL is_callable, const char *class_name, const uni_char *function_name, ES_Object *prototype)
+		{
+			ok = op_strcmp(class_name, "Function") == 0;
+			return OpStatus::OK;
+		}
+	};
+
+	class Test12 : public Exporter
+	{
+	public:
+		OP_STATUS Object(BOOL is_callable, const char *class_name, const uni_char *function_name, ES_Object *prototype)
+		{
+			ok = uni_str_eq(function_name, "World");
+			return OpStatus::OK;
+		}
+	};
+}
+
+setup
+{
+	runtime = NULL;
+	window_id = 0;
+}
+
+exit
+{
+}
+
+html
+{
+	//! <html>
+	//!		<head>
+	//!			<title>ESUtils.ObjMan</title>
+	//!		</head>
+	//!		<body>
+	//!		<script>
+	//!			var foo = "bar";
+	//!			bar = { apples: 5 };
+	//!			fruit = ["lychee", "rambutan", "longan"];
+	//!			tree = {
+	//!				height: 22,
+	//!				alive: true,
+	//!				squirrel: { age: 5 }
+	//!			};
+	//!
+	//!			function World()
+	//!			{
+	//!				this.type = "Brave New";
+	//!			}
+	//!
+	//!			world = new World();
+	//!		</script>
+	//!		</body>
+	//! </html>
+}
+
+test("Find selftest runtime")
+{
+	for (Window* w = g_windowManager->FirstWindow() ; w != NULL ; w = w->Suc())
+		if (w->GetWindowTitle() && uni_strcmp(w->GetWindowTitle(), UNI_L("ESUtils.ObjMan")) == 0)
+		{
+			runtime = w->GetCurrentDoc()->GetESRuntime();
+			window_id = w->Id();
+			break;
+		}
+
+	verify(runtime);
+}
+
+table ExportTests
+{
+	{ "simple object is callable", Test1, "bar" },
+	{ "simple object class name", Test2, "bar" },
+	{ "simple object function name", Test3, "bar" },
+	{ "simple object prototype", Test4, "bar" },
+	{ "simple object properties", Test5, "bar" },
+	{ "array properties", Test6, "fruit" },
+	{ "array properties count", Test7, "fruit" },
+	{ "array class name", Test8, "fruit" },
+	{ "nested object properties", Test9, "tree" },
+	{ "function is callable", Test10, "World" },
+	{ "function class name", Test11, "World" },
+	{ "function name", Test12, "World" },
+}
+
+foreach (test_name, class_name, eval_data) from ExportTests
+{
+	test("ESU_ObjectExporter: " test_name)
+		async;
+		require success "Find selftest runtime";
+	{
+		RETURN_IF_ERROR(Exporter::RunTest<class_name>(runtime, UNI_L(eval_data)));
+	}
+}
+
+test("ESU_ObjectManager::GetId")
+	require success "Find selftest runtime";
+{
+	ESU_ObjectManager objman;
+	ES_Object *obj = runtime->GetGlobalObjectAsPlainObject();
+	unsigned id;
+	RETURN_IF_ERROR(objman.GetId(runtime, obj, id));
+	verify(id > 0);
+}
+
+test("ESU_ObjectManager::GetId (multiple calls)")
+	require success "Find selftest runtime";
+{
+	ESU_ObjectManager objman;
+	ES_Object *obj = runtime->GetGlobalObjectAsPlainObject();
+	unsigned id, id2;
+	RETURN_IF_ERROR(objman.GetId(runtime, obj, id));
+	verify(id > 0);
+
+	RETURN_IF_ERROR(objman.GetId(runtime, obj, id2));
+	verify(id == id2);
+}
+
+test("ESU_ObjectManager::GetObject")
+	require success "Find selftest runtime";
+{
+	ESU_ObjectManager objman;
+	ES_Object *obj = runtime->GetGlobalObjectAsPlainObject();
+	unsigned id;
+	RETURN_IF_ERROR(objman.GetId(runtime, obj, id));
+	ES_Object *obj2 = objman.GetObject(runtime, id);
+	verify(obj == obj2);
+}
+
+test("ESU_ObjectManager::GetObject (nonexistent)")
+	require success "Find selftest runtime";
+{
+	ESU_ObjectManager objman;
+	ES_Object *obj = objman.GetObject(5);
+	verify(!obj);
+}
+
+test("ESU_ObjectManager::Release")
+	require success "Find selftest runtime";
+{
+	ESU_ObjectManager objman;
+	ES_Object *obj = runtime->GetGlobalObjectAsPlainObject();
+	unsigned id;
+	RETURN_IF_ERROR(objman.GetId(runtime, obj, id));
+	ES_Object *obj2 = objman.GetObject(runtime, id);
+	verify(obj == obj2);
+
+	objman.Release(id);
+	ES_Object *obj3 = objman.GetObject(runtime, id);
+	verify(!obj3);
+}
+
+test("ESU_ObjectManager::ReleaseAll")
+	require success "Find selftest runtime";
+{
+	ESU_ObjectManager objman;
+	ES_Object *obj = runtime->GetGlobalObjectAsPlainObject();
+	unsigned id;
+	RETURN_IF_ERROR(objman.GetId(runtime, obj, id));
+	ES_Object *obj2 = objman.GetObject(runtime, id);
+	verify(obj == obj2);
+
+	objman.ReleaseAll();
+	ES_Object *obj3 = objman.GetObject(runtime, id);
+	verify(!obj3);
+}
+
+test("ESU_RuntimeManager::FindAllRuntimes")
+	require success "Find selftest runtime";
+{
+	OpVector<ES_Runtime> runtimes;
+	RETURN_IF_ERROR(ESU_RuntimeManager::FindAllRuntimes(runtimes));
+
+	verify(runtimes.GetCount() > 0);
+
+	// Runtime must be in list.
+	verify(runtimes.Find(runtime) >= 0);
+}
+
+test("ESU_RuntimeManager::GetRuntime/Id")
+	require success "Find selftest runtime";
+{
+	ESU_RuntimeManager rtman;
+
+	unsigned rtid;
+	verify(OpStatus::IsSuccess(rtman.GetId(runtime, rtid)));
+	verify(rtid != 0);
+
+	ES_Runtime *rt = rtman.GetRuntime(rtid);
+	verify(rt == runtime);
+
+	unsigned rtid2;
+	verify(OpStatus::IsSuccess(rtman.GetId(runtime, rtid2)));
+	verify(rtid == rtid2);
+}
+
+test("ESU_RuntimeManager::GetRuntime (0)")
+{
+	ESU_RuntimeManager rtman;
+	ES_Runtime *rt = rtman.GetRuntime(0);
+	verify(rt == NULL);
+}
+
+test("ESU_RuntimeManager::GetWindowId")
+	require success "Find selftest runtime";
+{
+	unsigned wid = ESU_RuntimeManager::GetWindowId(runtime);
+	verify(wid > 0);
+	verify(wid == window_id);
+}
+
+test("ESU_RuntimeManager::GetWindowId (NULL)")
+{
+	unsigned wid = ESU_RuntimeManager::GetWindowId(NULL);
+	verify(wid == 0);
+}
+
+html
+{
+	//! <html>
+	//!		<head>
+	//!			<title>ESUtils.ObjMan</title>
+	//!		</head>
+	//!		<body>
+	//!		<script>
+	//!			var foo = "bar";
+	//!		</script>
+	//!		<iframe name="ifrm">
+	//!			<script>
+	//!				var bar = "foo";
+	//!			</script>
+	//!		</iframe>
+	//!		<iframe name="ifrm2">
+	//!			<script>
+	//!				var st = "fu";
+	//!			</script>
+	//!		</iframe>
+	//!		</body>
+	//! </html>
+}
+
+test("ESU_ObjectManager::Release(runtime)")
+	require success "Find selftest runtime";
+{
+	OpVector<ES_Runtime> runtimes;
+	RETURN_IF_ERROR(ESU_RuntimeManager::FindAllRuntimes(runtimes));
+
+	// There should be at least one runtime for the main document, and two iframes,
+	// but allow other runtimes as well.
+	verify(runtimes.GetCount() >= 3);
+
+	ESU_ObjectManager objman;
+
+	// Allocate space for IDs.
+	unsigned *ids = OP_NEWA(unsigned, runtimes.GetCount());
+	RETURN_OOM_IF_NULL(ids);
+	OpAutoArray<unsigned> ids_anchor(ids);
+
+	// Get the ID for the global object in each ES_Runtime.
+	for (unsigned i = 0; i < runtimes.GetCount(); ++i)
+	{
+		ES_Runtime *rt = runtimes.Get(i);
+		verify(rt != NULL);
+		ES_Object *obj = rt->GetGlobalObjectAsPlainObject();
+
+		RETURN_IF_ERROR(objman.GetId(rt, obj, ids[i]));
+		ES_Object *obj2 = objman.GetObject(rt, ids[i]);
+		verify(obj == obj2);
+	}
+
+	// Release objects for the first runtime.
+	ES_Runtime *first_rt = runtimes.Get(0);
+	objman.Release(first_rt);
+
+	// Verify that object was released for first runtime.
+	ES_Object *first_global_object = objman.GetObject(first_rt, ids[0]);
+	verify (first_global_object == NULL);
+
+	// Verify that objects still exist for all other runtimes.
+	for (unsigned i = 1; i < runtimes.GetCount(); ++i)
+	{
+		ES_Runtime *rt = runtimes.Get(i);
+		verify(rt != NULL);
+		ES_Object *obj = objman.GetObject(rt, ids[i]);
+		verify(obj != NULL);
+	}
+}
+
+html
+{
+	//! <html>
+	//!		<head>
+	//!			<title>ESUtils.ObjMan</title>
+	//!		</head>
+	//!		<body>
+	//!		<script>
+	//!			var foo = "bar";
+	//!		</script>
+	//!		<iframe name="ifrm">
+	//!			<script>
+	//!				var bar = "foo";
+	//!			</script>
+	//!		</iframe>
+	//!		<iframe name="ifrm">
+	//!			<script>
+	//!				var st = "fu";
+	//!			</script>
+	//!		</iframe>
+	//!		<iframe>
+	//!			<script>
+	//!				var st = "fu";
+	//!			</script>
+	//!		</iframe>
+	//!		</body>
+	//! </html>
+}
+
+table Framepaths(char*)
+{
+	{ "_top" },
+	{ "_top/ifrm[1]" },
+	{ "_top/ifrm[2]" },
+	{ "_top/[3]" },
+}
+
+foreach (fp) from Framepaths
+{
+	test("ESU_RuntimeManager::GetFramePath " fp)
+		require success "Find selftest runtime";
+	{
+		OpVector<ES_Runtime> runtimes;
+		RETURN_IF_ERROR(ESU_RuntimeManager::FindAllRuntimes(runtimes));
+
+		verify(runtimes.GetCount() > 0);
+
+		BOOL found = FALSE;
+
+		for (unsigned i = 0; i < runtimes.GetCount(); ++i)
+		{
+			ES_Runtime *rt = runtimes.Get(i);
+
+			if (rt)
+			{
+				OpString str;
+				RETURN_IF_ERROR(ESU_RuntimeManager::GetFramePath(rt, str));
+				if (str.Compare(UNI_L(fp)) == 0)
+				{
+					found = TRUE;
+				}
+			}
+		}
+
+		verify(found);
+	}
+}

@@ -1,0 +1,673 @@
+/* -*- Mode: c++; tab-width: 4; indent-tabs-mode: t; c-basic-offset: 4 -*-
+**
+** Copyright (C) 1995-2009 Opera Software AS.  All rights reserved.
+**
+** This file is part of the Opera web browser.
+** It may not be distributed under any circumstances.
+**
+*/
+
+group "dom.storage.database";
+
+require DATABASE_STORAGE_SUPPORT;
+
+include "modules/database/opdatabasemanager.h";
+
+setup
+{
+#ifdef DATABASE_MODULE_MANAGER_SUPPORT
+	OP_ASSERT(g_database_manager);
+	g_database_manager->m_self_test_instance = TRUE;
+#endif // DATABASE_MODULE_MANAGER_SUPPORT
+}
+
+html "http://foo.local/"
+{
+	//! <script>
+	//! function getlineno(offset)
+	//! {
+	//!   try {
+	//!     undefined();
+	//!   }
+	//!   catch(ex) {
+	//!     var m = ex.stacktrace.split('\n')[offset * 2 + 2];
+	//!     m = m && m.match(/line\s+(\d+)/);
+	//!     return (m && m[1] ? parseInt(m[1]) : 0) + $ST_line$ - 7;
+	//!   }
+	//! }
+	//! function TC_failed(error, statement) {
+	//!   ST_failed(
+	//!     (typeof error == 'string' ? error : "ERROR " + error.code + ": " + error.message) +
+	//!     (statement ? '; sql: "' + statement + '"': ''),
+	//!     $ST_filename$, getlineno(1));
+	//! }
+	//! function executeSql(tr, statement, args, successcb, errorcb) {
+	//!   tr.executeSql(statement, args, successcb, 5 <= arguments.length ? errorcb : function(tr, error) {
+	//!     TC_failed(error, statement);
+	//!   });
+	//! }
+	//! var current_timeout;
+	//! function bootstrap_timeout()
+	//! {
+	//!   clearTimeout(current_timeout);
+	//!   current_timeout = setTimeout(function(){ST_failed("Test timed out", $ST_filename$, getlineno(0)); }, 5000);
+	//! }
+	//! </script>
+
+}
+
+language ecmascript;
+
+test("openDatabase")
+{
+	opera.deleteDatabase("test");
+
+	verify(window.openDatabase);
+	var db = openDatabase("test", "", "bleh", 2000000);
+	verify(db);
+	verify(db.changeVersion);
+	verify(db.transaction);
+	verify(db.readTransaction);
+}
+
+test("bad version")
+{
+	opera.deleteDatabase("t-t-t-test");
+
+	var db = openDatabase("t-t-t-test", "0.1", "bleh", 200000);
+	try {
+		db2 = openDatabase("t-t-t-test", "0.2", "bleh", 200000);
+		verify(!"should've thrown INVALID_STATE_ERR exception");
+	}
+	catch(e)
+	{
+		verify(e.code == DOMException.INVALID_STATE_ERR);
+	}
+}
+
+test("quick version change")
+{
+	opera.deleteDatabase("t-t-t-test");
+
+	var db = openDatabase("t-t-t-test", "0.1", "bleh", 200000);
+	verify(db.version == "0.1");
+	db.changeVersion(db.version, "xxx")
+	verify(db.version == "xxx");
+}
+
+test("success callback") async;
+{
+	bootstrap_timeout();
+
+	var db = openDatabase("test", "", "bleh", 2000000);
+	db.transaction(function(tx) {}, TC_failed, ST_passed);
+}
+
+test("transaction") async;
+{
+	bootstrap_timeout();
+
+	opera.deleteDatabase("test");
+
+	var db = openDatabase("test", "", "bleh", 2000000);
+	db.transaction(function(tx) {
+		executeSql(tx, "drop table if exists t", [], function (tx, r) {
+			executeSql(tx, "create table t (id INTEGER PRIMARY KEY AUTOINCREMENT, data TEXT)", [], function (tx, r) {
+				executeSql(tx, "insert into t (data) values (?)", ['outer'], function (tx, results) {
+					executeSql(tx, "insert into t (data) values (?)", ['inner'], function (tx, results) {
+						verify(results.rowsAffected == 1);
+						verify(results.insertId == 2);
+
+						verify(results.rows);
+						verify(results.rows[0] === undefined);
+						verify(results.rows.length == 0);
+
+						ST_passed();
+					});
+				});
+			});
+		});
+	}, TC_failed);
+}
+
+test("read-only transaction") async;
+{
+	bootstrap_timeout();
+
+	opera.deleteDatabase("test");
+
+	var db = openDatabase("test", "", "bleh", 2000000);
+	db.transaction(function(tx) {
+		executeSql(tx, "drop table if exists t", [], function (tx, r) {
+			executeSql(tx, "create table t (id INTEGER PRIMARY KEY AUTOINCREMENT, data TEXT)", [], function (tx, r) {
+				executeSql(tx, "insert into t (data) values (?)", ['outer'], function (tx, results) {
+					executeSql(tx, "insert into t (data) values (?)", ['inner'], function (tx, results) {
+						verify(results.rowsAffected == 1);
+						verify(results.insertId == 2);
+
+						verify(results.rows);
+						verify(results.rows[0] === undefined);
+						verify(results.rows.length == 0);
+					});
+				});
+			});
+		});
+	}, TC_failed);
+
+	db.readTransaction(function(tx) {
+		executeSql(tx, "select * from t order by id", null, function(tx, r) {
+			verify(r);
+			verify(r.rows);
+			verify(r.rows.length == 2);
+			verify(r.rows.item(0).id == 1);
+			verify(r.rows.item(0)["data"] == "outer");
+			verify(r.rows[1].id == 2);
+			verify(r.rows[1].data == "inner");
+
+			verify(r.rowsAffected == 0);
+			try{
+				var x  = r.insertId;
+				verify(!"r.insertId should have thrown exception");
+			}
+			catch(ex){
+				verify(ex.code == DOMException.INVALID_ACCESS_ERR);
+			}
+
+			tx.executeSql("insert into t (data) values ('shouldnt')", [], function(tx) {
+				verify(!"Should've failed with read-only message");
+			}, function(tx, error) {
+				verify(error);
+				verify(error.code == 5);
+				ST_passed();
+				return false;
+			});
+		});
+	}, TC_failed);
+}
+
+test("results") async;
+{
+	bootstrap_timeout();
+
+	opera.deleteDatabase("test");
+
+	function ignore(tx, r) {}
+
+	var db = openDatabase("test", "", "bleh", 2000000);
+	db.transaction(function(tx) {
+		executeSql(tx, "drop table if exists t", [], ignore);
+		executeSql(tx, "create table t (id INTEGER PRIMARY KEY AUTOINCREMENT, data TEXT)", [], ignore);
+		executeSql(tx, "insert into t (data) values (?)", ['A'], ignore);
+		executeSql(tx, "insert into t (data) values (?)", ['B'], ignore);
+		executeSql(tx, "select id, data from t", [], function(tx, r) {
+			verify(r);
+			verify(r.rows);
+			verify(r.rows.length == 2);
+			verify(r.rows.item(0).data == "A");
+			verify(r.rows[1].data == "B");
+			ST_passed();
+		});
+	}, TC_failed);
+}
+
+test("rollback") async; allowexceptions;
+{
+	bootstrap_timeout();
+
+	opera.deleteDatabase("test");
+
+	var db = openDatabase("test", "", "bleh", 2000000);
+
+	db.transaction(function(tx) {
+		executeSql(tx, "drop table if exists t", [], null);
+		executeSql(tx, "create table t (id INTEGER PRIMARY KEY AUTOINCREMENT, data TEXT)", [], null);
+		executeSql(tx, "insert into t (data) values (?)", ['0'], null);
+	}, TC_failed, function () {
+		db.transaction(function(tx) {
+			executeSql(tx, "insert into t (data) values (?)", ['AA'], null);
+			executeSql(tx, "insert into t (data) values (?)", ['BB'], null);
+			throw "die!";
+		}, function () {
+			db.transaction(function(tx) {
+				executeSql(tx, "select id, data from t", [], function(tx, r) {
+					verify(r);
+					verify(r.rows);
+					verify(r.rows.length == 1);
+					verify(r.rows[0].data == "0");
+					ST_passed();
+				});
+			});
+		}, function () { TC_failed("Shouldn't have called success callback"); });
+	});
+}
+
+test("nested transactions") async; allowexceptions;
+{
+	bootstrap_timeout();
+
+	opera.deleteDatabase("test");
+
+	var db = openDatabase("test", "", "bleh", 2000000);
+
+	db.transaction(function(tx) {
+		executeSql(tx, "drop table if exists t", [], null);
+		executeSql(tx, "create table t (id INTEGER PRIMARY KEY AUTOINCREMENT, data TEXT)", [], null);
+		executeSql(tx, "insert into t (data) values (?)", ['0'], null);
+	}, TC_failed, function () {
+		db.transaction(function(tx) {
+			executeSql(tx, "insert into t (data) values (?)", ['AA'], null);
+			db.transaction(function(tx) {
+				executeSql(tx, "insert into t (data) values (?)", ['1'], null);
+			}, TC_failed);
+			executeSql(tx, "insert into t (data) values (?)", ['BB'], null);
+			throw "die!";
+		}, function () {
+			db.transaction(function(tx) {
+				executeSql(tx, "select * from t order by data", [], function(tx, r) {
+					verify(r);
+					verify(r.rows);
+					verify(r.rows.length == 2);
+					verify(r.rows[0].data == "0");
+					verify(r.rows[1].data == "1");
+					ST_passed();
+				});
+			});
+		}, function () { TC_failed("Shouldn't have called success callback"); });
+	});
+}
+
+test("null/undefined arguments") async;
+{
+	bootstrap_timeout();
+
+	opera.deleteDatabase("test");
+
+	var db = openDatabase("test", "", "bleh", 2000000);
+	db.transaction(function(tx) {
+		executeSql(tx, "drop table if exists t", null, null);
+		executeSql(tx, "create table t (id INTEGER PRIMARY KEY AUTOINCREMENT, data TEXT)", undefined, undefined);
+		executeSql(tx, "insert into t (data) values (?)", ['A'], null);
+		executeSql(tx, "insert into t (data) values (?)", ['B'], null);
+		executeSql(tx, "select * from t", [], function(tx, r) {
+			verify(r);
+			verify(r.rows);
+			verify(r.rows.length == 2);
+			verify(r.rows.item(0)["data"] == "A");
+			verify(r.rows[1].data == "B");
+			tx.executeSql("drop table t");
+			ST_passed();
+		});
+	}, TC_failed);
+}
+
+test("invalid sql statements") async;
+{
+	bootstrap_timeout();
+
+	opera.deleteDatabase("test");
+
+	var db = openDatabase("test", "", "bleh", 2000000);
+	db.transaction(function(tx) {
+		tx.executeSql("pragma page_size", null, function(tx, r) {
+			TC_failed("Should have not allowed statement 'pragma page_size'");
+		}, function(tx, error){
+			verify(error.code==5);
+			tx.executeSql("commit", null, function(tx, r) {
+				TC_failed("Should have not allowed statement 'commit'");
+			}, function(tx, error){
+				verify(error.code==5);
+				ST_passed();
+				return false;//to continue
+			});
+			return false;//to continue
+		});
+	}, TC_failed);
+}
+
+test("use done transaction") async;
+{
+	bootstrap_timeout();
+
+	opera.deleteDatabase("test");
+
+	var db = openDatabase("test", "", "bleh", 200000);
+	var saved_tx = null;
+	db.transaction(
+		function(tx) { saved_tx = tx; },
+		null,
+		function () {
+			try {
+				saved_tx.executeSql("create table t (id INTEGER PRIMARY KEY AUTOINCREMENT, data TEXT)");
+				TC_failed("Should have raised INVALID_STATE_ERR");
+			} catch(e) {
+				verify(e.code == DOMException.INVALID_STATE_ERR);
+				ST_passed();
+			}
+		}
+	);
+}
+
+test("simple queries") async;
+{
+	bootstrap_timeout();
+
+	opera.deleteDatabase("test");
+
+	var db = openDatabase("test", "", "bleh", 200000);
+	db.transaction(function(tx) {
+
+		executeSql(tx, "select 1 t where 1 = 0", [], function(tx, r){
+			verify(r.rows.length == 0);
+			verify(r.rows[0] === undefined);
+		});
+
+		tx.executeSql("select ?", null, function(tx, r) {
+			verify(!"Should have failed due to few args");
+		}, function(tx, e){
+			verify(e);
+			verify(e.code == SQLError.SYNTAX_ERR);
+			return false;
+		});
+
+		tx.executeSql("select ?", [], function(tx, r) {
+			verify(!"Should have failed due to few args");
+		}, function(tx, e){
+			verify(e);
+			verify(e.code == SQLError.SYNTAX_ERR);
+			return false;
+		});
+
+		tx.executeSql("select ?", [1, 2], function(tx, r) {
+			verify(!"Should have failed due to many args");
+		}, function(tx, e){
+			verify(e);
+			verify(e.code == SQLError.SYNTAX_ERR);
+			return false;
+		});
+
+		executeSql(tx, "select 3, 2, 1, 0, 'a'", null, function(tx, r){
+			verify(r);
+			verify(r.rows);
+			verify(r.rows.length == 1);
+			verify(r.rows[0]);
+			verify(r.rows[0][0] == 0);
+			verify(r.rows[0][1] == 1);
+			verify(r.rows[0][2] == 2);
+			verify(r.rows[0][3] == 3);
+
+			verify(r.rows[0]["'a'"] == 'a');
+
+			var col_count = 0;
+			for(var p in r.rows[0])
+			{
+				if (p == "1" || p == "2"   || p == "3" ||
+					p == "0" || p == "'a'")
+					col_count++;
+			}
+			verify(col_count == 5);
+		});
+
+		tx.executeSql("creat", [], function(tx, r) {
+			verify(!"Should have failed due to syntax error");
+		}, function(tx, e){
+			verify(e);
+			verify(e.code == SQLError.SYNTAX_ERR);
+			return false;
+		});
+
+		tx.executeSql("sele\0ct 'hello world' a", [], function(tx, r) {
+			verify(!"Should have failed due to syntax error");
+		}, function(tx, e){
+			verify(e);
+			verify(e.code == SQLError.SYNTAX_ERR);
+			return false;
+		});
+
+		tx.executeSql("select 'hello \0world' a", [], function(tx, r) {
+			verify(!"Should have failed due to syntax error");
+		}, function(tx, e){
+			verify(e);
+			verify(e.code == SQLError.SYNTAX_ERR);
+			return false;
+		});
+
+		tx.executeSql("select ? a", ["hello \0world"], function(tx, r) {
+			verify(r);
+			verify(r.rows);
+			verify(r.rows.length == 1);
+			verify(r.rows[0].a == "hello \0world");
+		});
+	},
+	TC_failed,
+	function(){
+		ST_passed();
+	});
+}
+
+test("arguments filtering") async; allowexceptions;
+{
+	bootstrap_timeout();
+
+	opera.deleteDatabase("test");
+
+	function catch_ret(f, expect_success)
+	{
+		try{
+			f();
+			return expect_success;
+		}
+		catch(ex){
+			return !expect_success;
+		}
+	}
+
+	var db = openDatabase("test", "", "bleh", 200000);
+
+	//1. Test listener validation to transaction
+	var f = function(){},
+		o = {handleEvent:f},
+		b = "bad",
+		c = {handleEvent:1},
+		d = {x:1};
+
+	verify(catch_ret(function(){ db.readTransaction(f); }, true));
+	verify(catch_ret(function(){ db.readTransaction(o); }, true));
+
+	verify(catch_ret(function(){ db.readTransaction(f, null); }, true));
+	verify(catch_ret(function(){ db.readTransaction(f, f);    }, true));
+	verify(catch_ret(function(){ db.readTransaction(f, o);    }, true));
+
+	verify(catch_ret(function(){ db.readTransaction(f, f, null); }, true));
+	verify(catch_ret(function(){ db.readTransaction(f, f, f);    }, true));
+	verify(catch_ret(function(){ db.readTransaction(f, f, o);    }, true));
+
+	verify(catch_ret(function(){ db.readTransaction(null); }, false));
+	verify(catch_ret(function(){ db.readTransaction(b);    }, false));
+	verify(catch_ret(function(){ db.readTransaction(c);    }, false));
+	verify(catch_ret(function(){ db.readTransaction(d);    }, false));
+
+	verify(catch_ret(function(){ db.readTransaction(f, b); }, false));
+	verify(catch_ret(function(){ db.readTransaction(f, c); }, false));
+	verify(catch_ret(function(){ db.readTransaction(f, d); }, false));
+
+	verify(catch_ret(function(){ db.readTransaction(f, f, b); }, false));
+	verify(catch_ret(function(){ db.readTransaction(f, f, c); }, false));
+	verify(catch_ret(function(){ db.readTransaction(f, f, d); }, false));
+
+	//2. Deleting the handleEvent - no asserts please.
+	var o = {handleEvent: f};
+	db.transaction(o);
+	delete o.handleEvent;
+
+	var o = {handleEvent: f};
+	db.transaction(function(){
+		throw 'error';
+	}, o);
+	delete o.handleEvent;
+
+	var o = {handleEvent: f};
+	db.transaction(f, null, o);
+	delete o.handleEvent;
+
+	db.transaction(function(t){
+		verify(catch_ret(function(){ t.executeSql("select ?", null, 1); }, false));
+		verify(catch_ret(function(){ t.executeSql("select ?", null, {}); }, false));
+		verify(catch_ret(function(){ t.executeSql("select ?", null, null, 1); }, false));
+		verify(catch_ret(function(){ t.executeSql("select ?", null, null, {}); }, false));
+
+		var o = {handleEvent: f};
+		t.executeSql("select 'hello world'", null, o);
+		delete o.handleEvent;
+
+		var o = {handleEvent: f};
+		t.executeSql("bad query", null, null, o);
+		delete o.handleEvent;
+	});
+
+	//3. Test argument conversion to executeSql, with a round trip through the SQL engine.
+	db.transaction(function(tx) {
+		verify(catch_ret(function(){ tx.executeSql("select 1", null); }, true));
+		verify(catch_ret(function(){ tx.executeSql("select 1", []); }, true));
+
+		verify(catch_ret(function(){ tx.executeSql("select 1", {}); }, false));
+		verify(catch_ret(function(){ tx.executeSql("select 1", new Function("a")); }, false));
+		verify(catch_ret(function(){ tx.executeSql("select 1", new String("a")); }, false));
+		verify(catch_ret(function(){ tx.executeSql("select 1", new Object()); }, false));
+		verify(catch_ret(function(){ tx.executeSql("select 1", new Date()); }, false));
+		verify(catch_ret(function(){ tx.executeSql("select 1", {length:2000000000}); }, false) && "Should not have allowed such enormeous size!");
+
+		var args = [null, undefined, 1, "a", true,   false,   new String("aa"), new Number(1.1), new Boolean(true), new Boolean(false)];
+		var res =  [null, null,      1, "a", "true", "false", "aa",             1.1,             "true",            "false"];
+
+		executeSql(tx, "select " + args.map(function(_,i){ return '? a'+i;}).join(','), args,
+			function(t, r){
+				verify(r);
+				verify(r.rows);
+				verify(r.rows.length == 1);
+				verify(r.rows[0].a0  == res[0]);
+				verify(r.rows[0].a1  == res[1]);
+				verify(r.rows[0].a2  == res[2]);
+				verify(r.rows[0].a3  == res[3]);
+				verify(r.rows[0].a4  == res[4]);
+				verify(r.rows[0].a5  == res[5]);
+				verify(r.rows[0].a6  == res[6]);
+				verify(r.rows[0].a7  == res[7]);
+				verify(r.rows[0].a8  == res[8]);
+				verify(r.rows[0].a9  == res[9]);
+				verify(res.length == 10);
+
+			});
+
+		/* non existent positions are treated as NULL */
+		executeSql(tx, "select ? a,? b,? c", {length:3, 2:2}, function(t, r){
+			verify(r);
+			verify(r.rows);
+			verify(r.rows.length == 1);
+			verify(r.rows[0].a === null);
+			verify(r.rows[0].b === null);
+			verify(r.rows[0].c === 2);
+		});
+	},
+	TC_failed,
+	function(){
+		ST_passed();
+	});
+}
+
+test("arguments infinite recursion") async; allowexceptions;
+{
+	bootstrap_timeout();
+
+	opera.deleteDatabase("test");
+
+	var db = openDatabase("test", "", "bleh", 200000);
+	db.transaction(function(t) {
+		function f(){
+			return t.executeSql("select ?", [{
+					valueOf:function(){return f();},
+					toString:function(){return String(this.valueOf());}
+				}]);
+		}
+		f();
+	}, function(){
+		ST_passed();
+	}, function(){
+		verify(!"Should have failed");
+	});
+}
+
+test("error before any statement is executed") async; allowexceptions;
+{
+	bootstrap_timeout();
+
+	opera.deleteDatabase("test");
+
+	var db = openDatabase("test", "", "bleh", 200000);
+	db.transaction(
+		function(tx) {
+			throw "something";
+		},
+		function (e) {
+			verify(e.code == 0);
+			// this situation used to crash, so the actual pass condition is not to crash
+			ST_passed();
+		},
+		function () {
+			TC_failed("Should have errored out and called the error callback");
+		}
+	);
+}
+
+test("success callback is not called on error") async; allowexceptions;
+{
+	bootstrap_timeout();
+
+	opera.deleteDatabase("test");
+
+	var db = openDatabase("test", "", "bleh", 200000);
+
+	db.transaction(
+		function () {
+			throw "error";
+		},
+		function() { ST_passed(); },
+		function () { verify(!"success callback shouldn't have run"); }
+	);
+}
+
+test("null and empty string") async;
+{
+	bootstrap_timeout();
+
+	opera.deleteDatabase("test");
+
+	var db = openDatabase("test", "", "bleh", 200000);
+	db.transaction(function (t) {
+		executeSql(t, "select NULL a, '' b", null, function(t, r){
+			verify(r);
+			verify(r.rows);
+			verify(r.rows.length == 1);
+			verify(r.rows[0].a === null);
+			verify(r.rows[0].b === '');
+		});
+		executeSql(t, "select ? a, ? b", [null, ''], function(t, r){
+			verify(r);
+			verify(r.rows);
+			verify(r.rows.length == 1);
+			verify(r.rows[0].a === null);
+			verify(r.rows[0].b === '');
+		});
+	},
+	TC_failed,
+	function(){
+		ST_passed();
+	});
+}
+
+exit
+{
+#ifdef DATABASE_MODULE_MANAGER_SUPPORT
+	if (g_database_manager)
+		g_database_manager->m_self_test_instance = FALSE;
+#endif // DATABASE_MODULE_MANAGER_SUPPORT
+}

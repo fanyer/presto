@@ -1,0 +1,1207 @@
+/*-*- Mode: c++; tab-width: 4; indent-tabs-mode: t; c-basic-offset: 4; c-file-style:"stroustrup" -*-
+**
+** Copyright (C) 2000-2010 Opera Software ASA.  All rights reserved.
+**
+** This file is part of the Opera web browser.  It may not be distributed
+** under any circumstances.
+*/
+group "bookmarks";
+require CORE_BOOKMARKS_SUPPORT;
+
+include "modules/bookmarks/bookmark_item.h"; 
+include "modules/bookmarks/bookmark_manager.h"; 
+include "modules/bookmarks/bookmark_ini_storage.h";
+include "modules/bookmarks/bookmark_sync.h";
+include if(defined(SUPPORT_DATA_SYNC)) "modules/sync/sync_coordinator.h";
+include if(defined(SUPPORT_DATA_SYNC)) "modules/sync/sync_dataitem.h";
+include "modules/util/opstring.h";
+include "modules/bookmarks/bookmark_storage_provider.h";
+include "modules/prefs/prefsmanager/collections/pc_core.h";
+
+global
+{
+	class BookmarkTestListener : public BookmarkManagerListener
+	{
+	public:
+		virtual void OnBookmarksSaved(OP_STATUS ret, UINT32 operation_count)
+			{
+				if (OpStatus::IsSuccess(ret))
+					ST_passed();
+				else
+					ST_failed("Could not save bookmarks.\n");
+			}
+		virtual void OnBookmarksLoaded(OP_STATUS ret, UINT32 operation_count)
+			{
+				if (OpStatus::IsSuccess(ret))
+					ST_passed();
+				else
+					ST_failed("Could not load bookmarks.\n");
+			}
+#ifdef SUPPORT_DATA_SYNC
+		virtual void OnBookmarksSynced(OP_STATUS ret)
+			{
+				if (OpStatus::IsSuccess(ret))
+					ST_passed();
+				else
+					ST_failed("Could not sync bookmarks.\n");
+			}
+#endif // SUPPORT_DATA_SYNC
+		virtual void OnBookmarkAdded(BookmarkItem *bookmark) { }
+		virtual void OnBookmarkDeleted(BookmarkItem *bookmark) { }
+		virtual void OnBookmarkChanged(BookmarkItem *bookmark) { }
+	};
+
+	class BookmarkTestStorage : public BookmarkStorageProvider
+	{
+	public:
+		BookmarkTestStorage(BookmarkManager *manager) : BookmarkStorageProvider(manager) { folder_begin = folder_end = save_bookmark = 0; }
+		virtual OP_STATUS Close() { return OpStatus::OK; }
+		virtual OP_STATUS UseFormat(BookmarkFormatType format) { return OpStatus::OK; }
+		virtual OP_STATUS SaveBookmark(BookmarkItem *bookmark) { save_bookmark++; return OpStatus::OK; }
+		virtual OP_STATUS ClearStorage() { return OpStatus::OK; }
+		virtual OP_STATUS LoadBookmark(BookmarkItem *bookmark) { return OpStatus::OK; }
+		virtual OP_STATUS FolderBegin(BookmarkItem *folder) { folder_begin++; return OpStatus::OK; }
+		virtual OP_STATUS FolderEnd(BookmarkItem *folder) { folder_end++; return OpStatus::OK; }
+		virtual BOOL MoreBookmarks() { return FALSE; }
+		virtual void RegisterListener(BookmarkStorageListener *l) {}
+		virtual void UnRegisterListener(BookmarkStorageListener *l) {}
+
+		int folder_begin, folder_end, save_bookmark;
+	};
+
+	BookmarkManager *manager;
+	BookmarkIniStorage *storage;
+#ifdef SUPPORT_DATA_SYNC
+	BookmarkSync *sync;
+	OpSyncCoordinator *coordinator;
+#endif // SUPPORT_DATA_SYNC
+	BookmarkTestListener *listener;
+	BookmarkItem *bookmark, *tmp;
+	BookmarkAttribute* new_attribute;
+	Head list;
+}
+
+setup
+{
+	manager = OP_NEW(BookmarkManager, ());
+	storage = OP_NEW(BookmarkIniStorage, (manager));
+#ifdef SUPPORT_DATA_SYNC
+	sync = OP_NEW(BookmarkSync, ());
+	coordinator = OP_NEW(OpSyncCoordinator, ());
+#endif // SUPPORT_DATA_SYNC
+	listener = OP_NEW(BookmarkTestListener, ());
+	bookmark = OP_NEW(BookmarkItem, ());
+	new_attribute = OP_NEW(BookmarkAttribute, ());
+}
+
+test("Init bookmark manager and storage provider")
+	file uni data_file "bookmarks_selftest.ini";
+{
+	verify(manager);
+	manager->SetMaxBookmarkCount(1);
+	verify(storage);
+	manager->SetMaxBookmarkCount(3);
+	manager->SetSaveBookmarksTimeout(BookmarkManager::NO_AUTO_SAVE, 1000);
+	verify(listener);
+	verify(bookmark);
+	verify(OpStatus::IsSuccess(manager->Init()));
+	manager->RegisterBookmarkManagerListener(listener);
+	storage->UseFormat(BOOKMARK_INI);
+	verify(OpStatus::IsSuccess(storage->OpenLoad(data_file, OPFILE_ABSOLUTE_FOLDER)));
+	manager->SetStorageProvider(storage);
+	manager->SetStorageFormat(BOOKMARK_INI);
+#ifdef SUPPORT_DATA_SYNC
+	verify(sync && coordinator);
+	manager->SetBookmarkSync(sync);
+	sync->SetManager(manager);
+	coordinator->Init(NULL, FALSE);
+	sync->SetCoordinator(coordinator);
+	manager->DoneSyncing();
+#endif // SUPPORT_DATA_SYNC
+}
+
+test("Load bookmarks")
+async;
+require success "Init bookmark manager and storage provider";
+{
+	if (!OpStatus::IsSuccess(manager->LoadBookmarks()))
+		ST_failed("Could not load bookmarks.\n");
+}
+
+test("BookmarkManager GetAttributeMaxLength Prefs")
+require success "Init bookmark manager and storage provider";
+require PREFS_HAVE_BOOKMARK;
+{
+	verify(manager);
+	verify(static_cast<int>(manager->GetAttributeMaxLength(BOOKMARK_TITLE)) == g_pccore->GetIntegerPref(PrefsCollectionCore::BookmarksTitleMaxLength));
+	verify(static_cast<int>(manager->GetAttributeMaxLength(BOOKMARK_URL)) == g_pccore->GetIntegerPref(PrefsCollectionCore::BookmarksUrlMaxLength));
+	verify(static_cast<int>(manager->GetAttributeMaxLength(BOOKMARK_DESCRIPTION)) == g_pccore->GetIntegerPref(PrefsCollectionCore::BookmarksDescMaxLength));
+	verify(static_cast<int>(manager->GetAttributeMaxLength(BOOKMARK_SHORTNAME)) == g_pccore->GetIntegerPref(PrefsCollectionCore::BookmarksSnMaxLength));
+	verify(static_cast<int>(manager->GetAttributeMaxLength(BOOKMARK_FAVICON_FILE)) == g_pccore->GetIntegerPref(PrefsCollectionCore::BookmarksFaviconFileMaxLength));
+	verify(static_cast<int>(manager->GetAttributeMaxLength(BOOKMARK_THUMBNAIL_FILE)) == g_pccore->GetIntegerPref(PrefsCollectionCore::BookmarksThumbnailFileMaxLength));
+	verify(static_cast<int>(manager->GetAttributeMaxLength(BOOKMARK_CREATED)) == g_pccore->GetIntegerPref(PrefsCollectionCore::BookmarksCreatedMaxLength));
+	verify(static_cast<int>(manager->GetAttributeMaxLength(BOOKMARK_VISITED)) == g_pccore->GetIntegerPref(PrefsCollectionCore::BookmarksVisitedMaxLength));
+}
+
+test("Add bookmark")
+require success "Init bookmark manager and storage provider";
+{
+	BookmarkAttribute attribute;
+
+	verify(manager->GetStorageProvider() == storage);
+	verify(OpStatus::IsSuccess(attribute.SetTextValue(UNI_L("U2"))));
+	verify(OpStatus::IsSuccess(bookmark->SetAttribute(BOOKMARK_URL, &attribute)));
+	
+	verify(OpStatus::IsSuccess(attribute.SetTextValue(UNI_L("T2"))));
+	verify(OpStatus::IsSuccess(bookmark->SetAttribute(BOOKMARK_TITLE, &attribute)));
+
+	verify(OpStatus::IsSuccess(attribute.SetTextValue(UNI_L("D2"))));
+	verify(OpStatus::IsSuccess(bookmark->SetAttribute(BOOKMARK_DESCRIPTION, &attribute)));
+	
+	verify(OpStatus::IsSuccess(attribute.SetTextValue(UNI_L("S2"))));
+	verify(OpStatus::IsSuccess(bookmark->SetAttribute(BOOKMARK_SHORTNAME, &attribute)));
+
+	verify(OpStatus::IsSuccess(attribute.SetTextValue(UNI_L("F2"))));
+	verify(OpStatus::IsSuccess(bookmark->SetAttribute(BOOKMARK_FAVICON_FILE, &attribute)));
+
+	verify(OpStatus::IsSuccess(attribute.SetTextValue(UNI_L("TF2"))));
+	verify(OpStatus::IsSuccess(bookmark->SetAttribute(BOOKMARK_THUMBNAIL_FILE, &attribute)));
+
+	verify(OpStatus::IsSuccess(attribute.SetTextValue(UNI_L("2007-06-28"))));
+	verify(OpStatus::IsSuccess(bookmark->SetAttribute(BOOKMARK_CREATED, &attribute)));
+
+	manager->SetAttributeMaxLength(BOOKMARK_VISITED, 4, ACTION_CUT);
+	verify(OpStatus::IsSuccess(attribute.SetTextValue(UNI_L("2007-06-28"))));
+	verify(OpStatus::IsSuccess(bookmark->SetAttribute(BOOKMARK_VISITED, &attribute)));
+
+	bookmark->SetFolderType(FOLDER_NO_FOLDER);
+
+#ifdef SUPPORT_DATA_SYNC
+	verify(OpStatus::IsSuccess(manager->AddBookmark(bookmark, NULL, manager->GetRootFolder(), FALSE)));
+	verify(OpStatus::IsError(manager->AddBookmark(bookmark, NULL, manager->GetRootFolder(), FALSE)));
+#else
+	verify(OpStatus::IsSuccess(manager->AddBookmark(bookmark, NULL, manager->GetRootFolder())));
+	verify(OpStatus::IsError(manager->AddBookmark(bookmark, NULL, manager->GetRootFolder())));
+#endif // SUPPORT_DATA_SYNC
+	manager->SetAttributeMaxLength(BOOKMARK_VISITED, 10, ACTION_CUT);
+	verify(manager->GetTrashFolder() == NULL);
+}
+
+test("Get list")
+require success "Init bookmark manager and storage provider";
+{
+	UINT32 i;
+	BookmarkAttribute attribute;
+	OpString str, ref;
+	verify(ref.Reserve(10));
+	BookmarkItem *after = manager->FindId(UNI_L("00000000000000000000000000000002"));
+	verify(OpStatus::IsSuccess(manager->MoveBookmarkAfter(bookmark, after)));
+	verify(OpStatus::IsSuccess(manager->GetList(&list)));
+	BookmarkListElm *elm = (BookmarkListElm*) list.First();
+	for (i=0; elm; elm = (BookmarkListElm*) elm->Suc(), i++)
+	{
+		bookmark = elm->GetBookmark();
+		verify(OpStatus::IsSuccess(bookmark->GetAttribute(BOOKMARK_TITLE, &attribute)));
+		attribute.GetTextValue(str);
+		ref[0] = 0;
+		verify(OpStatus::IsSuccess(ref.AppendFormat(UNI_L("T%d"), i)));
+		verify(ref.Compare(str) == 0);
+		verify(!manager->IsInTrashFolder(bookmark));
+	}
+
+	verify(bookmark);
+	bookmark->GetAttribute(BOOKMARK_VISITED, &attribute);
+	attribute.GetTextValue(str);
+	verify(str.Length() == 4);
+	verify(uni_strcmp(str.CStr(), UNI_L("2007")) == 0);
+	verify(manager->GetCount() == 3);
+}
+
+test("Save bookmarks")
+async;
+require success "Init bookmark manager and storage provider";
+{
+	if (!OpStatus::IsSuccess(manager->SaveBookmarks()))
+		ST_failed("Could not save bookmarks.\n");
+}
+
+test("Delete bookmark")
+require success "Init bookmark manager and storage provider";
+{
+	tmp = manager->FindId(UNI_L("00000000000000000000000000000001"));
+	verify(tmp);
+#ifdef SUPPORT_DATA_SYNC
+	verify(OpStatus::IsSuccess(manager->DeleteBookmark(tmp, TRUE, FALSE)));
+#else
+	verify(OpStatus::IsSuccess(manager->DeleteBookmark(tmp)));
+#endif // SUPPORT_DATA_SYNC
+}
+
+test("Restore file")
+async;
+require success "Delete bookmark";
+{
+	BookmarkAttribute attribute;
+
+	bookmark = OP_NEW(BookmarkItem, ());
+
+	if (!bookmark)
+		ST_failed("Failed to allocate bookmark.\n");
+	else
+	{
+		if (OpStatus::IsError(attribute.SetTextValue(UNI_L("U1"))))
+			ST_failed("OOM.\n");
+		if (OpStatus::IsError(bookmark->SetAttribute(BOOKMARK_URL, &attribute)))
+			ST_failed("OOM.\n");
+		
+		if (OpStatus::IsError(attribute.SetTextValue(UNI_L("T1"))))
+			ST_failed("OOM.\n");
+		if (OpStatus::IsError(bookmark->SetAttribute(BOOKMARK_TITLE, &attribute)))
+			ST_failed("OOM.\n");
+		
+		if (OpStatus::IsError(attribute.SetTextValue(UNI_L("D1"))))
+			ST_failed("OOM.\n");
+		if (OpStatus::IsError(bookmark->SetAttribute(BOOKMARK_DESCRIPTION, &attribute)))
+			ST_failed("OOM.\n");
+		
+		if (OpStatus::IsError(attribute.SetTextValue(UNI_L("S1"))))
+			ST_failed("OOM.\n");
+		if (OpStatus::IsError(bookmark->SetAttribute(BOOKMARK_SHORTNAME, &attribute)))
+			ST_failed("OOM.\n");
+		
+		if (OpStatus::IsError(attribute.SetTextValue(UNI_L("F1"))))
+			ST_failed("OOM.\n");
+		if (OpStatus::IsError(bookmark->SetAttribute(BOOKMARK_FAVICON_FILE, &attribute)))
+			ST_failed("OOM.\n");
+		
+		if (OpStatus::IsError(attribute.SetTextValue(UNI_L("TF1"))))
+			ST_failed("OOM.\n");
+		if (OpStatus::IsError(bookmark->SetAttribute(BOOKMARK_THUMBNAIL_FILE, &attribute)))
+			ST_failed("OOM.\n");
+		
+		if (OpStatus::IsError(attribute.SetTextValue(UNI_L("2007-06-28"))))
+			ST_failed("OOM.\n");
+		if (OpStatus::IsError(bookmark->SetAttribute(BOOKMARK_CREATED, &attribute)))
+			ST_failed("OOM.\n");
+		
+		if (OpStatus::IsError(attribute.SetTextValue(UNI_L("2007-06-28"))))
+			ST_failed("OOM.\n");
+		if (OpStatus::IsError(bookmark->SetAttribute(BOOKMARK_VISITED, &attribute)))
+			ST_failed("OOM.\n");
+		
+		bookmark->SetFolderType(FOLDER_NO_FOLDER);
+		
+		uni_char *uid = OP_NEWA(uni_char, 37);
+		
+		if (!uid)
+			ST_failed("Failed to allocate uid.\n");
+		else
+		{
+			uni_strcpy(uid, UNI_L("00000000000000000000000000000001"));
+			bookmark->SetUniqueId(uid);
+			bookmark->SetFolderType(FOLDER_NO_FOLDER);
+			BookmarkItem *folder = (BookmarkItem*) manager->GetRootFolder()->First();
+			if (!folder)
+				ST_failed("Could not find bookmark folder\n");
+			else
+			{
+#ifdef SUPPORT_DATA_SYNC
+				if (!OpStatus::IsSuccess(manager->AddBookmark(bookmark, folder, FALSE)))
+#else
+				if (!OpStatus::IsSuccess(manager->AddBookmark(bookmark, folder)))
+#endif // SUPPORT_DATA_SYNC
+					ST_failed("Could not add bookmark.\n");
+				else
+				{
+					bookmark = NULL;
+					if (OpStatus::IsError(attribute.SetTextValue(UNI_L("http://U2"))))
+						ST_failed("OOM.\n");
+					BookmarkItem *tmp = manager->GetFirstByAttribute(BOOKMARK_URL, &attribute);
+					if (!tmp)
+						ST_failed("Could not find bookmark to delete.\n");
+#ifdef SUPPORT_DATA_SYNC
+					else if (!OpStatus::IsSuccess(manager->DeleteBookmark(tmp, TRUE, FALSE)))
+#else
+					else if (!OpStatus::IsSuccess(manager->DeleteBookmark(tmp)))
+#endif // SUPPORT_DATA_SYNC
+						ST_failed("Could not delete bookmark.\n");
+					else if (OpStatus::IsError(manager->SaveBookmarks()))
+						ST_failed("Could not save bookmarks.\n");
+				}
+			}
+		}
+	}
+}
+
+test("Get items from sync")
+require SUPPORT_DATA_SYNC;
+{
+	OpSyncItem *sync_item;
+	OP_STATUS s = coordinator->GetSyncItem(&sync_item, OpSyncDataItem::DATAITEM_BOOKMARK, OpSyncItem::SYNC_KEY_ID, UNI_L("00000000000000000000000000000003"));
+	verify(OpStatus::IsSuccess(s));
+
+	sync_item->SetStatus(OpSyncDataItem::DATAITEM_ACTION_ADDED);
+	s = sync_item->SetData(OpSyncItem::SYNC_KEY_TITLE, UNI_L("T2"));
+	verify(OpStatus::IsSuccess(s));
+	s = sync_item->SetData(OpSyncItem::SYNC_KEY_URI, UNI_L("http://www.opera.com/"));
+	verify(OpStatus::IsSuccess(s));
+	s = sync_item->SetData(OpSyncItem::SYNC_KEY_PARENT, UNI_L("00000000000000000000000000000004"));
+	verify(OpStatus::IsSuccess(s));
+
+	verify(OpStatus::IsSuccess(sync->NewItem(sync_item)));
+	verify(OpStatus::IsSuccess(sync_item->CommitItem(FALSE)));
+	coordinator->ReleaseSyncItem(sync_item);
+
+	s = coordinator->GetSyncItem(&sync_item, OpSyncDataItem::DATAITEM_BOOKMARK_FOLDER, OpSyncItem::SYNC_KEY_ID, UNI_L("00000000000000000000000000000004"));
+	verify(OpStatus::IsSuccess(s));
+
+	sync_item->SetStatus(OpSyncDataItem::DATAITEM_ACTION_ADDED);
+	s = sync_item->SetData(OpSyncItem::SYNC_KEY_TITLE, UNI_L("T3"));
+	verify(OpStatus::IsSuccess(s));
+	s = sync_item->SetData(OpSyncItem::SYNC_KEY_PARENT, UNI_L(""));
+	verify(OpStatus::IsSuccess(s));
+
+	verify(OpStatus::IsSuccess(sync->NewItem(sync_item)));
+	verify(OpStatus::IsSuccess(sync_item->CommitItem(FALSE)));
+	coordinator->ReleaseSyncItem(sync_item);
+
+	manager->SetMaxBookmarkCount(4);
+	verify(OpStatus::IsSuccess(sync->CleanupItems()));
+
+	list.Clear();
+	verify(OpStatus::IsSuccess(manager->GetList(&list)));
+	verify(list.Cardinal() == 4);
+
+	tmp = manager->FindId(UNI_L("00000000000000000000000000000003"));
+	verify(tmp);
+	verify(tmp->GetFolderType() == FOLDER_NO_FOLDER);
+	BookmarkAttribute attribute;
+	OpString str;
+	verify(OpStatus::IsSuccess(tmp->GetAttribute(BOOKMARK_URL, &attribute)));
+	attribute.GetTextValue(str);
+	verify(str.Compare("http://www.opera.com/") == 0);
+	tmp = manager->FindId(UNI_L("00000000000000000000000000000004"));
+	verify(tmp);
+	verify(tmp->GetFolderType() == FOLDER_NORMAL_FOLDER);
+}
+
+test("Update from sync")
+require SUPPORT_DATA_SYNC;
+require success "Get items from sync";
+{
+	OpSyncItem *sync_item;
+	OP_STATUS s = coordinator->GetSyncItem(&sync_item, OpSyncDataItem::DATAITEM_BOOKMARK, OpSyncItem::SYNC_KEY_ID, UNI_L("00000000000000000000000000000003"));
+	verify(OpStatus::IsSuccess(s));
+
+	sync_item->SetStatus(OpSyncDataItem::DATAITEM_ACTION_MODIFIED);
+	s = sync_item->SetData(OpSyncItem::SYNC_KEY_URI, UNI_L(""));
+	verify(OpStatus::IsSuccess(s));
+	s = sync_item->SetData(OpSyncItem::SYNC_KEY_PARENT, UNI_L("00000000000000000000000000000004"));
+	verify(OpStatus::IsSuccess(s));
+
+	verify(OpStatus::IsSuccess(sync->NewItem(sync_item)));
+	verify(OpStatus::IsSuccess(sync_item->CommitItem(FALSE)));
+	coordinator->ReleaseSyncItem(sync_item);
+
+	tmp = manager->FindId(UNI_L("00000000000000000000000000000003"));
+	BookmarkAttribute attribute;
+	OpString str;
+	verify(OpStatus::IsSuccess(tmp->GetAttribute(BOOKMARK_TITLE, &attribute)));
+	attribute.GetTextValue(str);
+	verify(str.Compare("T2") == 0);
+	verify(OpStatus::IsSuccess(tmp->GetAttribute(BOOKMARK_URL, &attribute)));
+	attribute.GetTextValue(str);
+	verify(str.Compare("") == 0);
+
+	verify(OpStatus::IsSuccess(manager->DeleteBookmark(tmp, TRUE, TRUE)));
+	tmp = manager->FindId(UNI_L("00000000000000000000000000000004"));
+	verify(OpStatus::IsSuccess(manager->DeleteBookmark(tmp, TRUE, TRUE)));
+}
+
+subtest create_bookmark(const uni_char *id, const uni_char *title, BookmarkItem *parent, BookmarkItem *&new_bookmark)
+{
+	OpString str;
+	BookmarkAttribute attribute;
+	new_bookmark = OP_NEW(BookmarkItem, ());
+	verify(new_bookmark);
+	uni_char *uid = OP_NEWA(uni_char, 37);
+	verify(uid);
+	uni_strcpy(uid, id);
+	new_bookmark->SetUniqueId(uid);
+	verify(OpStatus::IsSuccess(str.Set(title)));
+	verify(OpStatus::IsSuccess(attribute.SetTextValue(str.CStr())));
+	verify(OpStatus::IsSuccess(new_bookmark->SetAttribute(BOOKMARK_TITLE, &attribute)));
+#ifdef SUPPORT_DATA_SYNC
+	verify(OpStatus::IsSuccess(manager->AddBookmark(new_bookmark, parent, FALSE)));
+#else
+	verify(OpStatus::IsSuccess(manager->AddBookmark(new_bookmark, parent)));
+#endif //SUPPORT_DATA_SYNC
+}
+
+test("Swap")
+require success "Init bookmark manager and storage provider";
+{
+	UINT32 i;
+	BookmarkAttribute attribute;
+	OpString str, ref;
+	BookmarkItem *bookmark = NULL;
+	verify(ref.Reserve(10));
+	list.Clear();
+	verify(OpStatus::IsSuccess(manager->GetList(&list)));
+	BookmarkListElm *elm = (BookmarkListElm*) list.First();
+	for (i=0; elm; elm = (BookmarkListElm*) elm->Suc(), i++)
+	{
+		bookmark = elm->GetBookmark();
+		verify(OpStatus::IsSuccess(bookmark->GetAttribute(BOOKMARK_TITLE, &attribute)));
+		attribute.GetTextValue(str);
+		ref[0] = 0;
+		verify(OpStatus::IsSuccess(ref.AppendFormat(UNI_L("T%d"), i)));
+		verify(ref.Compare(str) == 0);
+	}
+	verify(bookmark);
+	BookmarkItem *bookmark2 = bookmark;
+
+	verify(create_bookmark(UNI_L("00000000000000000000000000000003"), UNI_L("T2"), static_cast<BookmarkItem*>(bookmark2->Parent()), bookmark));
+	verify(create_bookmark(UNI_L("00000000000000000000000000000004"), UNI_L("T3"), static_cast<BookmarkItem*>(bookmark2->Parent()), bookmark));
+
+	verify(OpStatus::IsSuccess(manager->Swap(bookmark, bookmark2)));
+
+	list.Clear();
+	verify(OpStatus::IsSuccess(manager->GetList(&list)));
+	elm = (BookmarkListElm*) list.First();
+	int reference[4] = {0,3,2,1}; /* ARRAY OK 2008-07-01 adame */
+	verify(list.Cardinal() == 4);
+	for (i=0; elm; elm = (BookmarkListElm*) elm->Suc(), i++)
+	{
+		bookmark = elm->GetBookmark();
+		verify(OpStatus::IsSuccess(bookmark->GetAttribute(BOOKMARK_TITLE, &attribute)));
+		attribute.GetTextValue(str);
+		ref[0] = 0;
+		verify(OpStatus::IsSuccess(ref.AppendFormat(UNI_L("T%d"), reference[i])));
+		verify(ref.Compare(str) == 0);
+	}
+	storage->UnRegisterListener(manager);
+}
+
+test("SaveImmediately")
+require success "Init bookmark manager and storage provider";
+{
+	BookmarkTestStorage *test_storage = OP_NEW(BookmarkTestStorage, (manager));
+	verify(test_storage);
+	manager->SetStorageProvider(test_storage);
+	verify(OpStatus::IsSuccess(manager->SaveImmediately()));
+	verify(test_storage->folder_begin == 1);
+	verify(test_storage->folder_end == 1);
+	verify(test_storage->save_bookmark == 4);
+	OP_DELETE(test_storage);
+}
+
+test("Copy bookmarks")
+require success "Init bookmark manager and storage provider";
+{
+	OpString str, ref;
+	BookmarkAttribute attribute;
+
+	BookmarkItem *folder_copy, *folder, *sub_folder;
+
+	manager->SetMaxBookmarkCount(15);
+	verify(create_bookmark(UNI_L("00000000000000000000000000000010"), UNI_L("T10"), manager->GetRootFolder(), folder_copy));
+	folder_copy->SetFolderType(FOLDER_NORMAL_FOLDER);
+	folder_copy->SetMoveIsCopy(TRUE);
+	verify(folder_copy->MoveIsCopy());
+
+	verify(create_bookmark(UNI_L("00000000000000000000000000000011"), UNI_L("T11"), manager->GetRootFolder(), folder));
+	folder->SetFolderType(FOLDER_NORMAL_FOLDER);
+	verify(create_bookmark(UNI_L("00000000000000000000000000000012"), UNI_L("T12"), folder, bookmark));
+	verify(create_bookmark(UNI_L("00000000000000000000000000000013"), UNI_L("T13"), folder, sub_folder));
+	sub_folder->SetFolderType(FOLDER_NORMAL_FOLDER);
+	verify(create_bookmark(UNI_L("00000000000000000000000000000014"), UNI_L("T14"), sub_folder, bookmark));
+	verify(create_bookmark(UNI_L("00000000000000000000000000000015"), UNI_L("T15"), folder, bookmark));
+
+	OP_STATUS res = manager->MoveBookmark(folder, NULL, folder_copy
+#ifdef SUPPORT_DATA_SYNC
+						  , FALSE
+#endif // SUPPORT_DATA_SYNC
+		);
+	verify(OpStatus::IsSuccess(res));
+
+	bookmark = static_cast<BookmarkItem*>(folder_copy->First());
+	BookmarkItem *next = static_cast<BookmarkItem*>(folder_copy->Suc());
+	verify(bookmark);
+	verify(next);
+	int i;
+	for (i=0; bookmark != next; bookmark = static_cast<BookmarkItem*>(bookmark->Next()), i++)
+	{
+		verify(OpStatus::IsSuccess(bookmark->GetAttribute(BOOKMARK_TITLE, &attribute)));
+		attribute.GetTextValue(str);
+		ref.Empty();
+		verify(OpStatus::IsSuccess(ref.AppendFormat(UNI_L("T%d"), i+11)));
+		verify_string(ref, str);
+
+		if (i == 0)
+			verify(bookmark->GetParentFolder() == folder_copy);
+		else if (i == 3)
+			verify(bookmark->GetParentFolder() == bookmark->Prev());
+		else
+			verify(bookmark->GetParentFolder() == folder_copy->First());
+	}
+	verify(i == 5);
+
+	bookmark = folder;
+	next = static_cast<BookmarkItem*>(folder->Suc());
+	verify(bookmark);
+	verify(folder->GetParentFolder() == manager->GetRootFolder());
+	verify(!next);
+	for (i=0; bookmark != next; bookmark = static_cast<BookmarkItem*>(bookmark->Next()), i++)
+	{
+		verify(OpStatus::IsSuccess(bookmark->GetAttribute(BOOKMARK_TITLE, &attribute)));
+		attribute.GetTextValue(str);
+		ref.Empty();
+		verify(OpStatus::IsSuccess(ref.AppendFormat(UNI_L("T%d"), i+11)));
+		verify_string(ref, str);
+
+		if (i == 0)
+			verify(bookmark->GetParentFolder() == manager->GetRootFolder());
+		else if (i == 3)
+			verify(bookmark->GetParentFolder() == bookmark->Prev());
+		else
+			verify(bookmark->GetParentFolder() == folder);
+	}
+	verify(i == 5);
+}
+
+test("Move bookmark with no copy")
+require SUPPORT_DATA_SYNC;
+require success "Init bookmark manager and storage provider";
+{
+	OpString str, ref;
+	BookmarkAttribute attribute;
+
+	BookmarkItem *folder, *bookmark;
+
+	manager->SetMaxBookmarkCount(17);
+	verify(create_bookmark(UNI_L("00000000000000000000000000000020"), UNI_L("T20"), manager->GetRootFolder(), folder));
+	folder->SetFolderType(FOLDER_NORMAL_FOLDER);
+	folder->SetMoveIsCopy(TRUE);
+	verify(folder->MoveIsCopy());
+
+	verify(create_bookmark(UNI_L("00000000000000000000000000000021"), UNI_L("T21"), manager->GetRootFolder(), bookmark));
+
+	OP_STATUS res = manager->MoveBookmark(bookmark, folder, FALSE, TRUE);
+	verify(OpStatus::IsSuccess(res));
+
+	verify(bookmark->GetParentFolder() == folder);
+}
+
+test("BookmarkAttribute constructor")
+require success "Init bookmark manager and storage provider";
+{
+	tmp = manager->FindId(UNI_L("00000000000000000000000000000001"));
+	verify(tmp);
+	verify_success(tmp->GetAttribute(BOOKMARK_TITLE, new_attribute));
+	OpString str;
+	new_attribute->GetTextValue(str);
+	verify_string(str, "T1");
+}
+
+test("BookmarkAttribute Equal")
+require success "BookmarkAttribute constructor";
+{
+	verify(new_attribute);
+	OpString str;
+	verify_success(str.Set("T1"));
+	verify(new_attribute->Equal(&str));
+}
+
+test("BookmarkAttribute GetAttributeType")
+require success "BookmarkAttribute constructor";
+{
+	verify(new_attribute);
+	verify(new_attribute->GetAttributeType() == BOOKMARK_TITLE);
+	new_attribute->SetAttributeType(BOOKMARK_URL);
+	verify(new_attribute->GetAttributeType() == BOOKMARK_URL);
+	new_attribute->SetAttributeType(BOOKMARK_DESCRIPTION);
+	verify(new_attribute->GetAttributeType() == BOOKMARK_DESCRIPTION);
+	new_attribute->SetAttributeType(BOOKMARK_SHORTNAME);
+	verify(new_attribute->GetAttributeType() == BOOKMARK_SHORTNAME);
+	new_attribute->SetAttributeType(BOOKMARK_FAVICON_FILE);
+	verify(new_attribute->GetAttributeType() == BOOKMARK_FAVICON_FILE);
+	new_attribute->SetAttributeType(BOOKMARK_THUMBNAIL_FILE);
+	verify(new_attribute->GetAttributeType() == BOOKMARK_THUMBNAIL_FILE);
+	new_attribute->SetAttributeType(BOOKMARK_CREATED);
+	verify(new_attribute->GetAttributeType() == BOOKMARK_CREATED);
+	new_attribute->SetAttributeType(BOOKMARK_VISITED);
+	verify(new_attribute->GetAttributeType() == BOOKMARK_VISITED);
+	new_attribute->SetAttributeType(BOOKMARK_ACTIVE);
+	verify(new_attribute->GetAttributeType() == BOOKMARK_ACTIVE);
+	new_attribute->SetAttributeType(BOOKMARK_TARGET);
+	verify(new_attribute->GetAttributeType() == BOOKMARK_TARGET);
+	new_attribute->SetAttributeType(BOOKMARK_EXPANDED);
+	verify(new_attribute->GetAttributeType() == BOOKMARK_EXPANDED);
+	new_attribute->SetAttributeType(BOOKMARK_SMALLSCREEN);
+	verify(new_attribute->GetAttributeType() == BOOKMARK_SMALLSCREEN);
+	new_attribute->SetAttributeType(BOOKMARK_PARTNER_ID);
+	verify(new_attribute->GetAttributeType() == BOOKMARK_PARTNER_ID);
+	new_attribute->SetAttributeType(BOOKMARK_DISPLAY_URL);
+	verify(new_attribute->GetAttributeType() == BOOKMARK_DISPLAY_URL);
+	new_attribute->SetAttributeType(BOOKMARK_NONE);
+	verify(new_attribute->GetAttributeType() == BOOKMARK_NONE);
+	new_attribute->SetAttributeType(BOOKMARK_TITLE);
+}
+
+test("BookmarkAttribute IntValue")
+require success "BookmarkAttribute constructor";
+{
+	verify(new_attribute);
+	verify(new_attribute->GetIntValue() == 0);
+	new_attribute->SetIntValue(16);
+	verify(new_attribute->GetIntValue() == 16);
+	new_attribute->SetIntValue(0);
+}
+
+test("BookmarkAttribute MaxLength")
+require success "BookmarkAttribute constructor";
+{
+	verify(new_attribute);
+	verify(new_attribute->GetMaxLength() == 0);
+	verify_success(new_attribute->SetMaxLength(1));
+	verify(new_attribute->GetMaxLength() == 1);
+	verify_success(new_attribute->SetMaxLength(0));
+	verify(new_attribute->GetMaxLength() == 0);
+}
+
+test("BookmarkAttribute MaxLengthAction")
+require success "BookmarkAttribute constructor";
+{
+	verify(new_attribute);
+	verify(new_attribute->GetMaxLengthAction() == ACTION_FAIL);
+	new_attribute->SetMaxLengthAction(ACTION_CUT);
+	verify(new_attribute->GetMaxLengthAction() == ACTION_CUT);
+	new_attribute->SetMaxLengthAction(ACTION_FAIL);
+	verify(new_attribute->GetMaxLengthAction() == ACTION_FAIL);
+}
+
+test("BookmarkAttribute TextValue")
+require success "BookmarkAttribute constructor";
+{
+	verify(new_attribute);
+	verify_string(new_attribute->GetTextValue(), "T1");
+	new_attribute->SetTextValue(UNI_L("opera"));
+	verify_string(new_attribute->GetTextValue(), "opera");
+	new_attribute->SetTextValue(UNI_L(" "));
+	verify_string(new_attribute->GetTextValue(), " ");
+	new_attribute->SetTextValue(UNI_L(""));
+	verify(new_attribute->GetTextValue() == NULL);
+	new_attribute->SetTextValue(NULL);
+	verify(new_attribute->GetTextValue() == NULL);
+	new_attribute->SetTextValue(UNI_L("T1"));
+	verify_string(new_attribute->GetTextValue(), "T1");
+}
+
+test("BookmarkAttribute OwnsTextValue")
+require success "BookmarkAttribute constructor";
+{
+	verify(new_attribute);
+	verify(new_attribute->OwnsTextValue());
+	new_attribute->SetOwnsTextValue(FALSE);
+	verify(!new_attribute->OwnsTextValue());
+	new_attribute->SetOwnsTextValue(TRUE);
+	verify(new_attribute->OwnsTextValue());
+}
+
+test("BookmarkAttribute Sync")
+require success "BookmarkAttribute constructor";
+{
+	verify(new_attribute);
+	verify(!new_attribute->ShouldSync());
+	new_attribute->SetSync(TRUE);
+	verify(new_attribute->ShouldSync());
+	new_attribute->SetSync(FALSE);
+	verify(!new_attribute->ShouldSync());
+}
+
+test("BookmarkItem Deletable and SetDeletable")
+require success "Init bookmark manager and storage provider";
+{
+	verify(manager);
+	verify(manager->GetMaxBookmarkCount() == 17);
+	manager->SetMaxBookmarkCount(18);
+	verify(create_bookmark(UNI_L("00000000000000000000000000000016"), UNI_L("T16"), manager->GetRootFolder(), tmp));
+	verify(tmp);
+	BookmarkAttribute ba;
+	verify_success(tmp->GetAttribute(BOOKMARK_TITLE, &ba));
+	OpString str;
+	ba.GetTextValue(str);
+	verify_string(str, "T16");
+	verify(tmp->Deletable());
+	tmp->SetDeletable(FALSE);
+	verify(!tmp->Deletable());
+	verify(OpStatus::IsError(manager->DeleteBookmark(tmp, TRUE, FALSE)));
+	tmp = manager->FindId(UNI_L("00000000000000000000000000000016"));
+	verify(tmp);
+	tmp->SetDeletable(TRUE);
+	verify(tmp->Deletable());
+	verify_success(manager->DeleteBookmark(tmp, TRUE, FALSE));
+	tmp = manager->FindId(UNI_L("00000000000000000000000000000016"));
+	verify(!tmp);
+	manager->SetMaxBookmarkCount(17);
+}
+
+test("BookmarkItem GetAttribute")
+require success "Init bookmark manager and storage provider";
+{
+	verify(manager);
+	verify(manager->GetMaxBookmarkCount() == 17);
+	manager->SetMaxBookmarkCount(18);
+	verify(create_bookmark(UNI_L("00000000000000000000000000000016"), UNI_L("T16"), manager->GetRootFolder(), tmp));
+	verify(tmp);
+	verify(tmp->GetAttribute(BOOKMARK_TITLE));
+	verify(!tmp->GetAttribute(BOOKMARK_URL));
+	verify_success(manager->DeleteBookmark(tmp, TRUE, FALSE));
+	tmp = manager->FindId(UNI_L("00000000000000000000000000000016"));
+	verify(!tmp);
+	manager->SetMaxBookmarkCount(17);
+}
+
+test("BookmarkItem GetChildren")
+require success "Init bookmark manager and storage provider";
+{
+	verify(manager);
+	list.Clear();
+	verify_success(manager->GetList(&list));
+	BookmarkListElm *elm = static_cast<BookmarkListElm*>(list.First());
+	while (elm)
+	{
+		tmp = elm->GetBookmark();
+		if (tmp->GetFolderType() == FOLDER_NORMAL_FOLDER)
+			verify(tmp->GetChildren());
+		elm = static_cast<BookmarkListElm*>(elm->Suc());
+	}
+}
+
+test("BookmarkItem GetCount")
+require success "Init bookmark manager and storage provider";
+{
+	verify(manager);
+	list.Clear();
+	verify_success(manager->GetList(&list));
+	BookmarkListElm *elm = static_cast<BookmarkListElm*>(list.First());
+	while (elm)
+	{
+		tmp = elm->GetBookmark();
+		if (tmp->GetFolderType() == FOLDER_NORMAL_FOLDER)
+		{
+			UINT32 children_count = 0;
+			BookmarkItem* child = tmp->GetChildren();
+			for (; child; child = child->GetNextItem())
+				children_count += child->GetCount() + 1;
+			verify(tmp->GetCount() == children_count);
+		}
+		else
+			verify(tmp->GetCount() == 0);
+
+		elm = static_cast<BookmarkListElm*>(elm->Suc());
+	}
+}
+
+test("BookmarkItem GetFolderDepth")
+require success "Init bookmark manager and storage provider";
+{
+	verify(manager);
+	list.Clear();
+	verify_success(manager->GetList(&list));
+	BookmarkListElm *elm = static_cast<BookmarkListElm*>(list.First());
+	while (elm)
+	{
+		UINT32 folder_depth = 0;
+		tmp = elm->GetBookmark();
+		BookmarkItem *parent = tmp->GetParentFolder();
+		for (; parent; parent = parent->GetParentFolder())
+			folder_depth++;
+		verify(folder_depth == tmp->GetFolderDepth());
+		elm = static_cast<BookmarkListElm*>(elm->Suc());
+	}
+}
+
+test("BookmarkItem GetMaxCount")
+require success "Init bookmark manager and storage provider";
+{
+	verify(manager);
+	verify(manager->GetMaxBookmarkCount() == 17);
+	verify_success(manager->GetList(&list));
+	const UINT32 init_value = ~0u;
+	BookmarkListElm *elm = static_cast<BookmarkListElm*>(list.First());
+	while (elm)
+	{
+		tmp = elm->GetBookmark();
+		verify(tmp->GetMaxCount() == init_value);
+		tmp->SetMaxCount(10);
+		verify(tmp->GetMaxCount() == 10);
+		tmp->SetMaxCount(init_value);
+		verify(tmp->GetMaxCount() == init_value);
+		elm = static_cast<BookmarkListElm*>(elm->Suc());
+	}
+}
+
+test("BookmarkItem GetNextItem and GetPreviousItem")
+require success "Init bookmark manager and storage provider";
+{
+	verify(manager);
+	list.Clear();
+	verify_success(manager->GetList(&list));
+	BookmarkListElm *elm = static_cast<BookmarkListElm*>(list.First());
+	while (elm)
+	{
+		verify(elm->GetBookmark());
+		BookmarkItem* child = elm->GetBookmark()->GetChildren();
+		while (child)
+		{
+			BookmarkItem* prev = child;
+			child = child->GetNextItem();
+			if (child)
+				verify(prev == child->GetPreviousItem());
+		}
+		elm = static_cast<BookmarkListElm*>(elm->Suc());
+	}
+}
+
+test("BookmarkItem UniqueId")
+require success "Init bookmark manager and storage provider";
+{
+	verify(manager);
+	list.Clear();
+	verify_success(manager->GetList(&list));
+	BookmarkListElm *elm = static_cast<BookmarkListElm*>(list.First());
+	while (elm)
+	{
+		tmp = elm->GetBookmark();
+		verify(tmp);
+		BookmarkItem* child = tmp->GetChildren();
+		while (child)
+		{
+			verify(!child->GetParentUniqueId());
+			child->SetParentUniqueId(tmp->GetUniqueId());
+			child = child->GetNextItem();
+		}
+		elm = static_cast<BookmarkListElm*>(elm->Suc());
+	}
+	list.Clear();
+	verify_success(manager->GetList(&list));
+	elm = static_cast<BookmarkListElm*>(list.First());
+	while (elm)
+	{
+		tmp = elm->GetBookmark();
+		BookmarkItem* child = tmp->GetChildren();
+		while (child)
+		{
+			verify(child->GetParentUniqueId() == tmp->GetUniqueId());
+			child->SetParentUniqueId(NULL);
+			verify(!child->GetParentUniqueId());
+			child = child->GetNextItem();
+		}
+		elm = static_cast<BookmarkListElm*>(elm->Suc());
+	}
+}
+
+test("BookmarkItem flags")
+require success "Init bookmark manager and storage provider";
+require SUPPORT_DATA_SYNC;
+{
+	verify(manager);
+	verify(manager->GetMaxBookmarkCount() == 17);
+	manager->SetMaxBookmarkCount(18);
+	verify(create_bookmark(UNI_L("00000000000000000000000000000016"), UNI_L("T16"), manager->GetRootFolder(), tmp));
+	verify(tmp);
+	verify(!tmp->IsAdded());
+	verify(!tmp->IsDeleted());
+	verify(!tmp->IsModified());
+	tmp->SetAdded(TRUE);
+	tmp->SetDeleted(TRUE);
+	tmp->SetModified(TRUE);
+	verify(tmp->IsAdded());
+	verify(tmp->IsDeleted());
+	verify(tmp->IsModified());
+	tmp->SetAdded(FALSE);
+	tmp->SetDeleted(FALSE);
+	tmp->SetModified(FALSE);
+	verify(!tmp->IsAdded());
+	verify(!tmp->IsDeleted());
+	verify(!tmp->IsModified());
+	verify_success(manager->DeleteBookmark(tmp, TRUE, FALSE));
+	tmp = manager->FindId(UNI_L("00000000000000000000000000000016"));
+	verify(!tmp);
+	manager->SetMaxBookmarkCount(17);
+}
+
+test("BookmarkItem AllowedToSync")
+require success "Init bookmark manager and storage provider";
+require SUPPORT_DATA_SYNC;
+{
+	verify(manager);
+	list.Clear();
+	verify_success(manager->GetList(&list));
+	BookmarkListElm *elm = static_cast<BookmarkListElm*>(list.First());
+	while (elm)
+	{
+		tmp = elm->GetBookmark();
+		verify(tmp);
+		verify(tmp->IsAllowedToSync());
+		tmp->SetAllowedToSync(FALSE);
+		verify(!tmp->IsAllowedToSync());
+		elm = static_cast<BookmarkListElm*>(elm->Suc());
+	}
+	list.Clear();
+	verify_success(manager->GetList(&list));
+	elm = static_cast<BookmarkListElm*>(list.First());
+	while (elm)
+	{
+		tmp = elm->GetBookmark();
+		verify(!tmp->IsAllowedToSync());
+		tmp->SetAllowedToSync(TRUE);
+		verify(tmp->IsAllowedToSync());
+		elm = static_cast<BookmarkListElm*>(elm->Suc());
+	}
+}
+
+test("BookmarkItem MoveIsCopy")
+require success "Init bookmark manager and storage provider";
+require SUPPORT_DATA_SYNC;
+{
+	verify(manager);
+	list.Clear();
+	verify_success(manager->GetList(&list));
+	BookmarkListElm *elm = static_cast<BookmarkListElm*>(list.First());
+	while (elm)
+	{
+		tmp = elm->GetBookmark();
+		verify(tmp);
+		if (tmp->MoveIsCopy())
+		{
+			tmp->SetMoveIsCopy(FALSE);
+			verify(!tmp->MoveIsCopy());
+			tmp->SetMoveIsCopy(TRUE);
+			verify(tmp->MoveIsCopy());
+		}
+		elm = static_cast<BookmarkListElm*>(elm->Suc());
+	}
+}
+
+test("BookmarkItem SeparatorsAllowed")
+require success "Init bookmark manager and storage provider";
+{
+	verify(manager);
+	verify(manager->GetMaxBookmarkCount() == 17);
+	manager->SetMaxBookmarkCount(18);
+	verify(create_bookmark(UNI_L("00000000000000000000000000000016"), UNI_L("T16"), manager->GetRootFolder(), tmp));
+	verify(tmp);
+	verify(tmp->SeparatorsAllowed());
+	tmp->SetSeparatorsAllowed(FALSE);
+	verify(!tmp->SeparatorsAllowed());
+	tmp->SetSeparatorsAllowed(TRUE);
+	verify(tmp->SeparatorsAllowed());
+	verify_success(manager->DeleteBookmark(tmp, TRUE, FALSE));
+	tmp = manager->FindId(UNI_L("00000000000000000000000000000016"));
+	verify(!tmp);
+	manager->SetMaxBookmarkCount(17);
+}
+
+test("BookmarkManager AddNewBookmark")
+require success "Init bookmark manager and storage provider";
+require SUPPORT_DATA_SYNC;
+{
+	verify(manager);
+	verify(manager->GetMaxBookmarkCount() == 17);
+	manager->SetMaxBookmarkCount(18);
+	OpString str;
+	BookmarkAttribute attribute;
+	tmp = OP_NEW(BookmarkItem, ());
+	verify(tmp);
+	uni_char *uid = OP_NEWA(uni_char, 37);
+	verify(uid);
+	uni_strcpy(uid, UNI_L("00000000000000000000000000000016"));
+	tmp->SetUniqueId(uid);
+	verify_success(str.Set(UNI_L("T16")));
+	verify_success(attribute.SetTextValue(str.CStr()));
+	verify_success(tmp->SetAttribute(BOOKMARK_TITLE, &attribute));
+	verify_success(manager->AddNewBookmark(tmp, manager->GetRootFolder(), FALSE));
+	tmp = manager->FindId(UNI_L("00000000000000000000000000000016"));
+	verify_string(tmp->GetUniqueId(), "00000000000000000000000000000016");
+	verify(tmp->GetParentFolder() == manager->GetRootFolder());
+	verify_success(tmp->GetAttribute(BOOKMARK_TITLE, &attribute));
+	str.Empty();
+	verify_success(attribute.GetTextValue(str));
+	verify_string(str, "T16");
+}
+
+test("BookmarkManager AddSeparator")
+require success "BookmarkManager AddNewBookmark";
+require SUPPORT_DATA_SYNC;
+{
+	verify(manager);
+	verify(manager->GetMaxBookmarkCount() == 18);
+	manager->SetMaxBookmarkCount(19);
+	OpString str;
+	BookmarkAttribute attribute;
+	BookmarkItem* sep = OP_NEW(BookmarkItem, ());
+	verify(sep);
+	uni_char *uid = OP_NEWA(uni_char, 37);
+	verify(uid);
+	uni_strcpy(uid, UNI_L("00000000000000000000000000000017"));
+	sep->SetUniqueId(uid);
+	verify_success(str.Set(UNI_L("T17")));
+	verify_success(attribute.SetTextValue(str.CStr()));
+	verify_success(sep->SetAttribute(BOOKMARK_TITLE, &attribute));
+	verify_success(manager->AddSeparator(sep, tmp, manager->GetRootFolder(), FALSE));
+	verify(manager->FindId(UNI_L("00000000000000000000000000000017")));
+
+	tmp = manager->FindId(UNI_L("00000000000000000000000000000016"));
+	verify(sep->GetPreviousItem() == tmp);
+	verify_success(manager->DeleteBookmark(tmp, TRUE, FALSE));
+	tmp = manager->FindId(UNI_L("00000000000000000000000000000016"));
+	verify(!tmp);
+	manager->SetMaxBookmarkCount(18);
+
+	verify_success(manager->DeleteBookmark(sep, TRUE, FALSE));
+	sep = manager->FindId(UNI_L("00000000000000000000000000000017"));
+	verify(!sep);
+	manager->SetMaxBookmarkCount(17);
+}
+
+test("BookmarkManager BookmarkManagerListenerRegistered")
+require success "Init bookmark manager and storage provider";
+{
+	verify(manager);
+	verify(listener);
+	verify(manager->BookmarkManagerListenerRegistered(listener));
+}
+
+test("BookmarkManager GetAttributeMaxLength Prefs")
+require success "Init bookmark manager and storage provider";
+{
+	verify(manager);
+	verify(manager->GetAttributeMaxLength(BOOKMARK_ACTIVE) == 0);
+	verify(manager->GetAttributeMaxLength(BOOKMARK_TARGET) == 0);
+	verify(manager->GetAttributeMaxLength(BOOKMARK_EXPANDED) == 0);
+	verify(manager->GetAttributeMaxLength(BOOKMARK_SMALLSCREEN) == 0);
+	verify(manager->GetAttributeMaxLength(BOOKMARK_PARTNER_ID) == 0);
+	verify(manager->GetAttributeMaxLength(BOOKMARK_DISPLAY_URL) == 0);
+	verify(manager->GetAttributeMaxLength(BOOKMARK_NONE) == 0);
+}
+
+test("BookmarkManager GetAttributeMaxLengthAction")
+require success "Init bookmark manager and storage provider";
+{
+	verify(manager);
+	verify(manager->GetAttributeMaxLengthAction(BOOKMARK_TITLE) == 1);
+	verify(manager->GetAttributeMaxLengthAction(BOOKMARK_URL) == 1);
+	verify(manager->GetAttributeMaxLengthAction(BOOKMARK_DESCRIPTION) == 1);
+	verify(manager->GetAttributeMaxLengthAction(BOOKMARK_SHORTNAME) == 1);
+	verify(manager->GetAttributeMaxLengthAction(BOOKMARK_FAVICON_FILE) == 1);
+	verify(manager->GetAttributeMaxLengthAction(BOOKMARK_THUMBNAIL_FILE) == 1);
+	verify(manager->GetAttributeMaxLengthAction(BOOKMARK_CREATED) == 1);
+	verify(manager->GetAttributeMaxLengthAction(BOOKMARK_VISITED) == 1);
+	verify(manager->GetAttributeMaxLengthAction(BOOKMARK_ACTIVE) == 0);
+	verify(manager->GetAttributeMaxLengthAction(BOOKMARK_TARGET) == 0);
+	verify(manager->GetAttributeMaxLengthAction(BOOKMARK_EXPANDED) == 0);
+	verify(manager->GetAttributeMaxLengthAction(BOOKMARK_SMALLSCREEN) == 0);
+	verify(manager->GetAttributeMaxLengthAction(BOOKMARK_PARTNER_ID) == 0);
+	verify(manager->GetAttributeMaxLengthAction(BOOKMARK_DISPLAY_URL) == 0);
+	verify(manager->GetAttributeMaxLengthAction(BOOKMARK_NONE) == 0);
+}
+
+test("BookmarkManager GetMaxBookmarkCountPerFolder")
+require success "Init bookmark manager and storage provider";
+{
+	verify(manager);
+	verify(manager->GetMaxBookmarkCountPerFolder() == 1000000);
+	manager->SetMaxBookmarkCountPerFolder(1000001);
+	verify(manager->GetMaxBookmarkCountPerFolder() == 1000001);
+	manager->SetMaxBookmarkCountPerFolder(1000000);
+	verify(manager->GetMaxBookmarkCountPerFolder() == 1000000);
+}
+
+test("BookmarkManager GetMaxBookmarkFolderDepth")
+require success "Init bookmark manager and storage provider";
+{
+	verify(manager);
+	verify(manager->GetMaxBookmarkFolderDepth() == 1000000);
+	manager->SetMaxBookmarkFolderDepth(1000001);
+	verify(manager->GetMaxBookmarkFolderDepth() == 1000001);
+	manager->SetMaxBookmarkFolderDepth(1000000);
+	verify(manager->GetMaxBookmarkFolderDepth() == 1000000);
+}
+
+test("BookmarkManager GetStorageFormat")
+require success "Init bookmark manager and storage provider";
+{
+	verify(manager);
+	verify(manager->GetStorageFormat() == BOOKMARK_INI);
+	manager->SetStorageFormat(BOOKMARK_VERBOSE);
+	verify(manager->GetStorageFormat() == BOOKMARK_VERBOSE);
+	manager->SetStorageFormat(BOOKMARK_BINARY);
+	verify(manager->GetStorageFormat() == BOOKMARK_BINARY);
+	manager->SetStorageFormat(BOOKMARK_BINARY_COMPRESSED);
+	verify(manager->GetStorageFormat() == BOOKMARK_BINARY_COMPRESSED);
+	manager->SetStorageFormat(BOOKMARK_ADR);
+	verify(manager->GetStorageFormat() == BOOKMARK_ADR);
+	manager->SetStorageFormat(BOOKMARK_NO_FORMAT);
+	verify(manager->GetStorageFormat() == BOOKMARK_NO_FORMAT);
+	manager->SetStorageFormat(BOOKMARK_INI);
+	verify(manager->GetStorageFormat() == BOOKMARK_INI);
+}
+
+test("BookmarkManager NewTrashFolder")
+require success "Init bookmark manager and storage provider";
+require SUPPORT_DATA_SYNC;
+{
+	verify(manager);
+	verify(manager->GetMaxBookmarkCount() == 17);
+	manager->SetMaxBookmarkCount(18);
+	verify(create_bookmark(UNI_L("00000000000000000000000000000016"), UNI_L("T16"), manager->GetRootFolder(), tmp));
+	verify(tmp);
+	tmp->SetFolderType(FOLDER_TRASH_FOLDER);
+
+	manager->NewTrashFolder(tmp);
+	verify(manager->GetTrashFolder() == tmp);
+	list.Clear();
+	verify_success(manager->GetList(&list));
+	BookmarkListElm *elm = static_cast<BookmarkListElm*>(list.First());
+	while (elm)
+	{
+		verify(!manager->IsInTrashFolder(elm->GetBookmark()));
+		elm = static_cast<BookmarkListElm*>(elm->Suc());
+	}
+
+	verify(tmp->GetCount() == 0);
+	verify(!tmp->Deletable());
+	verify(manager->DeleteBookmark(tmp, TRUE, FALSE) == OpStatus::ERR_OUT_OF_RANGE);
+	tmp = manager->FindId(UNI_L("00000000000000000000000000000016"));
+	verify(tmp);
+	verify(manager->DeleteBookmark(tmp, TRUE, TRUE) == OpStatus::ERR_OUT_OF_RANGE);
+	tmp = manager->FindId(UNI_L("00000000000000000000000000000016"));
+	verify(tmp);
+	verify(manager->DeleteBookmark(tmp, TRUE, FALSE, TRUE) == OpStatus::ERR_OUT_OF_RANGE);
+	tmp = manager->FindId(UNI_L("00000000000000000000000000000016"));
+	verify(tmp);
+	tmp->SetDeletable(TRUE);
+	verify_success(manager->DeleteBookmark(tmp, TRUE, FALSE));
+	tmp = manager->FindId(UNI_L("00000000000000000000000000000016"));
+	verify(!tmp);
+	manager->SetMaxBookmarkCount(17);
+	verify(!manager->GetTrashFolder());
+}
+
+exit
+{
+	manager->UnregisterBookmarkManagerListener(listener);
+	OP_DELETE(manager);
+	OP_DELETE(storage);
+#ifdef SUPPORT_DATA_SYNC
+	OP_DELETE(sync);
+	OP_DELETE(coordinator);
+#endif // SUPPORT_DATA_SYNC
+	OP_DELETE(listener);
+	OP_DELETE(bookmark);
+	OP_DELETE(new_attribute);
+	list.Clear();
+}

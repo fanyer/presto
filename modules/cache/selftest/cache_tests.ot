@@ -1,0 +1,124 @@
+/* -*- Mode: c++; tab-width: 4; indent-tabs-mode: t; c-basic-offset: 4 -*-
+**
+** Copyright (C) 2004-2010 Opera Software ASA.  All rights reserved.
+**
+** This file is part of the Opera web browser.  It may not be distributed
+** under any circumstances.
+**
+** This file tests functionalities used for streaming and for the download API
+**
+** Luca Venturi
+**
+** Some tests, that can even be unrelated to the cache.
+** In particular, they can be used to test crash conditions, and to better understand some of the internals of Opera.
+*/
+group "cache tests";
+require init;
+require DISK_CACHE_SUPPORT;
+disabled;
+include "modules/cache/cache_selftest.h";
+include "modules/cache/cache_st_helpers.h";
+include "modules/cache/cache_debug.h";
+include "platforms/gogi/include/gogi_opera_api.h";
+include "platforms/gogi/src/gogi_opera.h";
+
+global
+{
+	// Used to test if the object has been deleted
+	#define SIGN_OK 0x86931fb5d0816cc0ULL
+	
+	class TestMessageObject: public MessageObject
+	{
+	private:
+		UINT64 sign;
+		BOOL deleted;
+		MessageHandler *mh;
+		
+	public:
+		TestMessageObject() { sign=SIGN_OK; deleted=FALSE; mh=NULL; }
+		~TestMessageObject()
+		{
+			sign=0xFA11FA11FA11FA11ULL; /* FAILFAILFAILFAIL...*/
+			deleted=FALSE;
+			
+			if(mh)
+				mh->UnsetCallBacks(this);
+				
+			mh=NULL;
+		}
+		
+		/// TRUE if the object is valid, FALSE if it has been deleted
+		BOOL IsValid() { return sign==SIGN_OK && !deleted; }
+		virtual void HandleCallback(OpMessage msg, MH_PARAM_1 par1, MH_PARAM_2 par2)
+		{
+			if(!IsValid())
+				ST_failed("Object deleted!");
+			else
+			{
+				if(msg==MSG_COMM_LOADING_FINISHED)
+					ST_passed();
+			}
+		}
+		
+		void SetMessageHandler(MessageHandler *handler)
+		{
+			OP_ASSERT(!mh);
+			OP_ASSERT(handler);
+			
+			mh=handler;
+			mh->SetCallBack(this, MSG_COMM_LOADING_FINISHED, 0);
+		}
+	};
+	
+	TestMessageObject *tmo1;
+	TestMessageObject *tmo2;
+	TestMessageObject *tmo3;
+	MessageHandler *mh;
+}
+
+setup 
+{
+	tmo1=OP_NEW(TestMessageObject, ());
+	tmo2=OP_NEW(TestMessageObject, ());
+	tmo3=OP_NEW(TestMessageObject, ());
+	mh=OP_NEW(MessageHandler, (NULL));
+}
+
+exit
+{
+	OP_DELETE(tmo1);
+	OP_DELETE(tmo2);
+	OP_DELETE(tmo3);
+	OP_DELETE(mh);
+}
+
+test("test validity")
+{
+	verify(tmo1->IsValid());
+	verify(tmo2->IsValid());
+	verify(tmo3->IsValid());
+	
+	OP_DELETE(tmo1);
+	verify(!tmo1->IsValid());
+	tmo1=NULL;
+	tmo2->SetMessageHandler(mh);
+	tmo3->SetMessageHandler(mh);	
+}
+
+test("message handling 1") async;
+{
+	mh->PostMessage(MSG_COMM_LOADING_FINISHED, 0, 0);
+}
+
+test("message handling 2") async;
+{
+	mh->PostDelayedMessage(MSG_COMM_LOADING_FINISHED, 0, 0, 100);
+}
+
+test("message handling 3") async;
+{
+	OP_DELETE(tmo2);
+	tmo2=NULL;
+	
+	mh->PostDelayedMessage(MSG_COMM_LOADING_FINISHED, 0, 0, 100);
+}

@@ -1,0 +1,239 @@
+/* -*- Mode: c++; tab-width: 4; indent-tabs-mode: t; c-basic-offset: 4 -*-
+**
+** Copyright (C) 2004-2011 Opera Software ASA.  All rights reserved.
+**
+** This file is part of the Opera web browser.  It may not be distributed
+** under any circumstances.
+**
+** Peter Krefting
+*/
+
+group "encodings.utility.createinputconverter";
+require initialization;
+
+include "modules/encodings/charconverter.h";
+include "modules/encodings/decoders/inputconverter.h";
+include "modules/encodings/utility/createinputconverter.h";
+include "modules/hardcore/mh/mh.h";
+include "modules/hardcore/timer/optimer.h";
+include "modules/url/url2.h";
+include "modules/url/url_api.h";
+
+// -- Global variables ---------------------------------------------------
+
+global
+{
+	/* Helper object for handling the createInputConverter tests. We need
+	 * an object because loading is asynchronous even for data URLs.
+	 */
+	class LoadHelper : public MessageObject, public OpTimerListener
+	{
+	public:
+		LoadHelper(const char *encoding, const char *alternative_encoding,
+		           URL url)
+			: m_encoding(encoding),
+			  m_alternative_encoding(alternative_encoding),
+			  m_done(false),
+			  m_url_dd(NULL), m_conv(NULL), m_url(url)
+		{
+			RegisterMe(MSG_URL_DATA_LOADED, m_url.Id());
+			RegisterMe(MSG_URL_LOADING_FAILED, m_url.Id());
+		}
+
+		virtual ~LoadHelper()
+		{
+			g_main_message_handler->UnsetCallBacks(this);
+			OP_DELETE(m_url_dd);
+			OP_DELETE(m_conv);
+		}
+
+		/* MessageObject */
+		virtual void HandleCallback(OpMessage msg, MH_PARAM_1, MH_PARAM_2)
+		{
+			BOOL more;
+
+			switch (msg)
+			{
+			case MSG_URL_LOADING_FAILED:
+				m_done = true;
+				ST_failed("Loading failed");
+				break;
+
+			case MSG_URL_DATA_LOADED:
+				/* We have the data now, check that it is correct */
+				if (m_done)
+					break;
+				m_done = true;
+				if (!m_url_dd)
+					m_url_dd = m_url.GetDescriptor(g_main_message_handler, URL::KFollowRedirect, TRUE);
+
+				if (m_url_dd == NULL)
+				{
+					ST_failed("URL::GetDescriptor() failed");
+					return;
+				}
+				m_url_dd->RetrieveData(more);
+
+				// Create the converter
+				if (!m_conv)
+					m_conv = createInputConverter(m_url_dd, m_url_dd->GetBuffer(),
+					                              m_url_dd->GetBufSize(), NULL, 0);
+				if (m_conv == NULL)
+				{
+					ST_failed("createInputConverter() failed\n");
+					return;
+				}
+
+				// Make sure it is the one we expected
+				char encerr[256]; /* ARRAY OK 2011-09-09 peter */
+				op_sprintf(encerr, "Encoding mismatch: got \"%.200s\"\n",
+				           m_conv->GetCharacterSet());
+				if (m_alternative_encoding)
+				{
+					if (0 != op_strcmp(m_encoding, m_conv->GetCharacterSet()) &&
+					    0 != op_strcmp(m_alternative_encoding, m_conv->GetCharacterSet()))
+					{
+						ST_failed(encerr);
+						return;
+					}
+				}
+				else
+				{
+					if (0 != op_strcmp(m_encoding, m_conv->GetCharacterSet()))
+					{
+						ST_failed(encerr);
+						return;
+					}
+				}
+
+				ST_passed();
+				break;
+			}
+		}
+
+		/* OpTimerListener */
+		void OnTimeOut(OpTimer *)
+		{
+			if (!m_done)
+			{
+				ST_failed("No data within 5 seconds");
+			}
+		}
+
+	private:
+		void RegisterMe(OpMessage msg, int url_id)
+		{
+			if (OpStatus::IsError(g_main_message_handler->SetCallBack(this, msg, url_id)))
+			{
+				ST_failed("Could not register with message handler");
+			}
+		}
+
+		const char *m_encoding, *m_alternative_encoding;
+		bool m_done;
+		URL_DataDescriptor *m_url_dd;
+		InputConverter *m_conv;
+		URL m_url;
+	} *loadhelper;
+
+	OpTimer *timer;
+
+	static const char utf8_content_type[] =
+		"data:text/html;charset=utf-8,"
+		"<title>Foo</title>"
+		"<p>Foo</p>";
+
+	static const char utf8_meta_tag[] =
+		"data:text/html,"
+		"<title>Foo</title>"
+		"<meta http-equiv=\"Content-Type\" content=\"text/html;charset=utf-8\">"
+		"<p>Foo</p>";
+
+	static const char ascii_content_type[] =
+		"data:text/html;charset=us-ascii,"
+		"<title>Foo</title>"
+		"<p>Foo</p>";
+
+	static const char latin1_content_type[] =
+		"data:text/html;charset=latin1,"
+		"<title>Foo</title>"
+		"<p>Foo</p>";
+
+	static const char svg_content_type[] =
+		"data:image/svg+xml,"
+		"<?xml version=\"1.0\" standalone=\"no\"?>"
+		"<svg xmlns=\"http://www.w3.org/2000/svg\">"
+		"<text font-size=\"96pt\" y=\"198\" x=\"149\">åäö</text>"
+		"</svg>";
+
+	static const char js_content_type_1[] =
+		"data:application/x-javascript,"
+		"%EF%BB%BFvar x = 2;";
+
+	static const char js_content_type_3[] =
+		"data:application/x-javascript,"
+		"%00%FE%00%FF%00v%00a%00r%00 %00x%00 %00=%00 %002%00;";
+
+	static const char js_content_type_4[] =
+		"data:application/x-javascript,"
+		"%FF%00%FE%00v%00a%00r%00 %00x%00 %00=%00 %002%00;%00";
+}
+
+setup
+{
+	loadhelper = NULL;
+	timer = NULL;
+}
+
+// -- Tests --------------------------------------------------------------
+
+table Tests(const char *, const char *, const char *, const char *)
+{
+	{ "utf-8 (Content-Type)", utf8_content_type,   "utf-8",      NULL           },
+	{ "utf-8 (meta)",         utf8_meta_tag,       "utf-8",      NULL           },
+	{ "us-ascii",             ascii_content_type,  "us-ascii",   "windows-1252" },
+	{ "latin1",               latin1_content_type, "iso-8859-1", "windows-1252" },
+	{ "image/svg+xml",        svg_content_type,    "utf-8",      NULL           },
+	{ "application/x-javascript (UTF8-BOM)",   js_content_type_1, "utf-8",  NULL},
+	{ "application/x-javascript (UTF-16 BOM)", js_content_type_3, "utf-16", NULL}
+	{ "application/x-javascript (UTF-16LE BOM)", js_content_type_4, "utf-16", NULL}
+}
+
+foreach (name, data_url, encoding, alternative_encoding) from Tests
+{
+	test("createInputConverter(): " name)
+		require SUPPORT_DATA_URL;
+		async;
+	{
+		// Set up a URL and a data descriptor for it
+		URL url = g_url_api->GetURL(data_url);
+		if (url.IsEmpty())
+		{
+			ST_failed("Got empty URL");
+		}
+
+		/*CommState state = */url.Load(g_main_message_handler, url, FALSE, TRUE);
+
+		OP_DELETE(timer);
+		timer = OP_NEW(OpTimer, ());
+		OP_DELETE(loadhelper);
+		loadhelper = OP_NEW(LoadHelper, (encoding, alternative_encoding, url));
+		if (!loadhelper)
+		{
+			ST_failed("Failed allocating LoadHelper\n");
+		}
+		if (timer)
+		{
+			timer->SetTimerListener(loadhelper);
+			timer->Start(5000);
+		}
+	}
+}
+
+// -- Global cleanup -----------------------------------------------------
+
+exit
+{
+	OP_DELETE(timer);
+	OP_DELETE(loadhelper);
+}

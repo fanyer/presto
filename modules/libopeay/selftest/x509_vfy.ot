@@ -1,0 +1,453 @@
+/* -*- Mode: c++; tab-width: 4; indent-tabs-mode: t; c-basic-offset: 4 -*-
+**
+** Copyright (C) 2012-2012 Opera Software AS.  All rights reserved.
+**
+** This file is part of the Opera web browser.  It may not be distributed
+** under any circumstances.
+*/
+
+/**
+ * @file x509_vfy.ot
+ *
+ * Selftests for OpenSSL cert verification functionality.
+ *
+ * @author Alexei Khlebnikov <alexeik@opera.com>
+ *
+ */
+
+group "libopeay.x509_vfy";
+require CRYPTO_CERTIFICATE_VERIFICATION_USE_CORE_IMPLEMENTATION;
+
+language c++;
+
+include "modules/libopeay/openssl/cryptlib.h";
+
+include "modules/libopeay/addon/libopeay_util.h";
+include "modules/libopeay/openssl/pem.h";
+include "modules/libopeay/openssl/x509.h";
+include "modules/util/opfile/opfile.h";
+
+global
+{
+	/** Load the whole file into memory.
+	 *
+	 *  Caller is responsible to deallocate 'data' by OP_DELETEA,
+	 *  if and only if OpStatus::OK was returned.
+	 *
+	 *  @param       filename     Name of the file to load.
+	 *  @param[out]  data         Pointer to the data will be written here.
+	 *  @param[out]  data_length  Data length will be written here.
+	 *  @param       max_length   File length limit. The function will fail
+	 *                            if the file is bigger than this limit.
+	 */
+	OP_STATUS file2mem(
+		const char* filename,
+		char*& data,
+		OpFileLength& data_length,
+		// 640K should be enough for everyone.
+		OpFileLength max_length = 640 * 1024)
+	{
+		OpString filename16;
+		OP_STATUS status = filename16.SetFromUTF8(filename);
+		RETURN_IF_ERROR(status);
+
+		OpFile file;
+		status = file.Construct(filename16);
+		RETURN_IF_ERROR(status);
+
+		BOOL exists = FALSE;
+		status = file.Exists(exists);
+		RETURN_IF_ERROR(status);
+		if (!exists)
+			return OpStatus::ERR;
+
+		status = file.GetFileLength(data_length);
+		RETURN_IF_ERROR(status);
+		if (data_length < 0 || data_length > max_length || data_length > INT_MAX)
+			return OpStatus::ERR;
+
+		status = file.Open(OPFILE_READ);
+		RETURN_IF_ERROR(status);
+
+		if (data_length == 0)
+		{
+			data = NULL;
+			return OpStatus::OK;
+		}
+
+		data = OP_NEWA(char, static_cast<size_t>(data_length));
+		RETURN_OOM_IF_NULL(data);
+
+		OpFileLength bytes_read = 0;
+		status = file.Read(data, data_length, &bytes_read);
+		if (OpStatus::IsError(status) || !data || bytes_read != data_length)
+		{
+			OP_DELETEA(data);
+			return OpStatus::ERR;
+		}
+
+		return OpStatus::OK;
+	}
+
+	void free_bio_and_data(BIO* bio)
+	{
+		OP_ASSERT(bio);
+		int ret = BIO_reset(bio);
+		OP_ASSERT(ret == 1);
+		(void)ret;
+
+		char* data = NULL;
+		long data_length = BIO_get_mem_data(bio, &data);
+		BIO_free(bio);
+
+		if (data_length > 0)
+			OP_DELETEA(data);
+	}
+
+	BIO* file2membio(const char* filename)
+	{
+		char* data = NULL;
+		OpFileLength data_length = 0;
+
+		OP_STATUS status = file2mem(filename, data, data_length);
+		RETURN_VALUE_IF_ERROR(status, NULL);
+		OP_ASSERT(data_length < INT_MAX);
+
+		BIO* bio = BIO_new_mem_buf(data, static_cast<int>(data_length));
+		if (!bio)
+		{
+			OP_DELETEA(data);
+			ERR_clear_error();
+			return NULL;
+		}
+
+		return bio;
+	}
+
+	X509* load_X509_from_file(const char* filename)
+	{
+		BIO* bio = file2membio(filename);
+		if (!bio)
+			return NULL;
+
+		X509* x509 = PEM_read_bio_X509(bio, NULL, NULL, NULL);
+		free_bio_and_data(bio);
+		if (!x509)
+			ERR_clear_error();
+
+		return x509;
+	}
+
+	X509* load_X509_AUX_from_file(const char* filename)
+	{
+		BIO* bio = file2membio(filename);
+		if (!bio)
+			return NULL;
+
+		X509* x509 = PEM_read_bio_X509_AUX(bio, NULL, NULL, NULL);
+		free_bio_and_data(bio);
+		if (!x509)
+			ERR_clear_error();
+
+		return x509;
+	}
+
+	X509_CRL* load_X509_CRL_from_file(const char* filename)
+	{
+		BIO* bio = file2membio(filename);
+		if (!bio)
+			return NULL;
+
+		X509_CRL* crl = PEM_read_bio_X509_CRL(bio, NULL, NULL, NULL);
+		free_bio_and_data(bio);
+		if (!crl)
+			ERR_clear_error();
+
+		return crl;
+	}
+
+	X509* m_cacert = NULL;
+	X509* m_cert1  = NULL;
+	X509* m_cert2  = NULL;
+	X509_CRL* m_crl1 = NULL;
+	X509_CRL* m_crl2 = NULL;
+	STACK_OF(X509_CRL)* m_stack_of_crl1 = NULL;
+	STACK_OF(X509_CRL)* m_stack_of_crl2 = NULL;
+	X509_STORE*     m_store = NULL;
+	X509_STORE_CTX* m_store_ctx = NULL;
+
+	STACK_OF(X509)* NO_UNTRUSTED = NULL;
+	STACK_OF(X509_CRL)* NO_CRL = NULL;
+	unsigned long NO_FLAGS = 0;
+	unsigned long REQUIRE_CRL = X509_V_FLAG_CRL_CHECK_ALL | X509_V_FLAG_CRL_CHECK;
+
+} // global
+
+
+setup
+{
+	OP_ASSERT(!ERR_peek_error());
+}
+
+
+exit
+{
+	X509_STORE_CTX_free(m_store_ctx);
+	X509_STORE_free(m_store);
+	sk_X509_CRL_free(m_stack_of_crl2);
+	sk_X509_CRL_free(m_stack_of_crl1);
+	X509_CRL_free(m_crl2);
+	X509_CRL_free(m_crl1);
+	X509_free(m_cert2);
+	X509_free(m_cert1);
+	X509_free(m_cacert);
+	OP_ASSERT(!ERR_peek_error());
+}
+
+
+test("Load cacert.pem as X509_AUX")
+	file filename "TestCA/ca-data/cacert.pem";
+{
+	verify(!ERR_peek_error());
+
+	m_cacert = load_X509_AUX_from_file(filename);
+	verify(m_cacert);
+
+	verify(!ERR_peek_error());
+}
+
+
+test("Load cert1.pem  as X509")
+	file filename "TestCA/certs/cert1.pem";
+{
+	verify(!ERR_peek_error());
+
+	m_cert1 = load_X509_from_file(filename);
+	verify(m_cert1);
+
+	verify(!ERR_peek_error());
+}
+
+
+test("Load cert2.pem  as X509")
+	file filename "TestCA/certs/cert2.pem";
+{
+	verify(!ERR_peek_error());
+
+	m_cert2 = load_X509_from_file(filename);
+	verify(m_cert2);
+
+	verify(!ERR_peek_error());
+}
+
+
+test("Load crl1.pem   as X509_CRL")
+	file filename "TestCA/crls/crl1.pem";
+{
+	verify(!ERR_peek_error());
+
+	m_crl1 = load_X509_CRL_from_file(filename);
+	verify(m_crl1);
+
+	verify(!ERR_peek_error());
+}
+
+
+test("Load crl2.pem   as X509_CRL")
+	file filename "TestCA/crls/crl2.pem";
+{
+	verify(!ERR_peek_error());
+
+	m_crl2 = load_X509_CRL_from_file(filename);
+	verify(m_crl2);
+
+	verify(!ERR_peek_error());
+}
+
+
+test("Create X509_STORE")
+{
+	verify(!ERR_peek_error());
+
+	m_store = X509_STORE_new();
+	verify(m_store);
+
+	verify(!ERR_peek_error());
+}
+finally
+{
+	ERR_clear_error();
+}
+
+
+test("Add cacert.pem to X509_STORE")
+{
+	verify(!ERR_peek_error());
+
+	int ret = X509_STORE_add_cert(m_store, m_cacert);
+	verify(ret == 1);
+
+	verify(!ERR_peek_error());
+}
+finally
+{
+	ERR_clear_error();
+}
+
+
+test("Create the 1st STACK_OF(X509_CRL)")
+{
+	verify(!ERR_peek_error());
+
+	m_stack_of_crl1 = sk_X509_CRL_new_null();
+	verify(m_stack_of_crl1);
+
+	verify(!ERR_peek_error());
+}
+finally
+{
+	ERR_clear_error();
+}
+
+
+test("Add crl1.pem to m_stack_of_crl1")
+{
+	verify(!ERR_peek_error());
+	verify(m_stack_of_crl1);
+	verify(m_crl1);
+
+	int idx = sk_X509_CRL_push(m_stack_of_crl1, m_crl1);
+	verify(idx > 0);
+
+	verify(!ERR_peek_error());
+}
+finally
+{
+	ERR_clear_error();
+}
+
+
+test("Create the 2nd STACK_OF(X509_CRL) and add crl2.pem to it")
+{
+	verify(!ERR_peek_error());
+
+	verify(m_crl2);
+
+	m_stack_of_crl2 = sk_X509_CRL_new_null();
+	verify(m_stack_of_crl2);
+	verify(!ERR_peek_error());
+
+	int idx = sk_X509_CRL_push(m_stack_of_crl2, m_crl2);
+	verify(idx > 0);
+
+	verify(!ERR_peek_error());
+}
+finally
+{
+	ERR_clear_error();
+}
+
+
+test("Create X509_STORE_CTX")
+{
+	verify(!ERR_peek_error());
+
+	m_store_ctx = X509_STORE_CTX_new();
+	verify(m_store_ctx);
+
+	verify(!ERR_peek_error());
+}
+finally
+{
+	ERR_clear_error();
+}
+
+
+test("Data for cert verification is ready")
+{
+	verify(m_cacert);
+	verify(m_cert1);
+	verify(m_cert2);
+	verify(m_crl1);
+	verify(m_crl2);
+	verify(m_stack_of_crl1);
+	verify(m_stack_of_crl2);
+	verify(m_store);
+	verify(m_store_ctx);
+	verify(!ERR_peek_error());
+}
+
+
+subtest verify_cert(
+	X509*               cert,
+	STACK_OF(X509)*     untrusted_stack,
+	STACK_OF(X509_CRL)* crl_stack,
+	unsigned long       flags,
+	int                 expected_error)
+{
+	verify(!ERR_peek_error());
+	verify(m_store_ctx);
+	verify(m_store);
+
+	int ret = X509_STORE_CTX_init(m_store_ctx, m_store, cert, untrusted_stack);
+	verify(ret == 1);
+	verify(!ERR_peek_error());
+
+	X509_STORE_CTX_set0_crls(m_store_ctx, crl_stack);
+	X509_STORE_CTX_set_flags(m_store_ctx, flags);
+
+	ret = X509_verify_cert(m_store_ctx);
+	int error = X509_STORE_CTX_get_error(m_store_ctx);
+	verify((ret == 1) ^ (error != X509_V_OK));
+
+	if (error != expected_error)
+	{
+		output("vvvvvv\n");
+		output("  |X509_verify_cert() returned: %s\n", X509_V_ERR_name(error));
+		output("  |                   expected: %s\n", X509_V_ERR_name(expected_error));
+		output("  |>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>> ");
+	}
+
+	verify (error == expected_error);
+}
+finally
+{
+	if(m_store_ctx)
+		X509_STORE_CTX_cleanup(m_store_ctx);
+	ERR_clear_error();
+}
+
+table cert_verification_tests(
+	const char*         test_name,
+	X509*               cert,
+	STACK_OF(X509)*     untrusted_stack,
+	STACK_OF(X509_CRL)* crl_stack,
+	unsigned long       flags,
+	int                 expected_error)
+{
+	{ "Verify   valid cert1.pem, without CRL check",
+		m_cert1, NO_UNTRUSTED, NO_CRL, NO_FLAGS, X509_V_OK }
+	{ "Verify revoked cert2.pem, without CRL check",
+		m_cert2, NO_UNTRUSTED, NO_CRL, NO_FLAGS, X509_V_OK }
+	{ "Verify   valid cert1.pem, missing CRL",
+		m_cert1, NO_UNTRUSTED, NO_CRL, REQUIRE_CRL, X509_V_ERR_UNABLE_TO_GET_CRL }
+	{ "Verify revoked cert2.pem, missing CRL",
+		m_cert2, NO_UNTRUSTED, NO_CRL, REQUIRE_CRL, X509_V_ERR_UNABLE_TO_GET_CRL }
+	{ "Verify   valid cert1.pem, with crl1.pem",
+		m_cert1, NO_UNTRUSTED, m_stack_of_crl1, REQUIRE_CRL, X509_V_OK }
+	{ "Verify revoked cert2.pem, with crl1.pem",
+		m_cert2, NO_UNTRUSTED, m_stack_of_crl1, REQUIRE_CRL, X509_V_OK }
+	{ "Verify   valid cert1.pem, with crl2.pem",
+		m_cert1, NO_UNTRUSTED, m_stack_of_crl2, REQUIRE_CRL, X509_V_OK }
+	{ "Verify revoked cert2.pem, with crl2.pem",
+		m_cert2, NO_UNTRUSTED, m_stack_of_crl2, REQUIRE_CRL, X509_V_ERR_CERT_REVOKED }
+}
+
+foreach (test_name, cert, untrusted_stack, crl_stack, flags, expected_error) from cert_verification_tests
+{
+	test(test_name)
+		require success("Data for cert verification is ready");
+	{
+		verify_cert(cert, untrusted_stack, crl_stack, flags, expected_error);
+	}
+}

@@ -1,0 +1,1117 @@
+syntax = "scope";
+
+/**
+ * A service that allows for managing of widgets in an Opera host.
+ *
+ * The manager allows for installing new widgets to the host, upgrading
+ * existing ones or uninstalling widget. Widgets can be opened and closed to
+ * be shown to the user of the host.
+ *
+ * The service also reports about any widget which is installed or uninstalled
+ * from the host, even those installed by the client. It also reports back
+ * any failures in downloading or installing a widget.
+ *
+ * Existing widgets on the host can be queried by calling ListWidgets.
+ */
+service WidgetManager
+{
+    option (version) = "1.1";
+
+    /**
+     * Returns the current settings of the host.
+     */
+    command GetSettings(Default) returns (Settings) = 1;
+    /**
+     * Lists all widgets installed in the host.
+     */
+    command ListWidgets(Default) returns (WidgetList) = 2;
+    /**
+     * Opens a widget on the host, the widget will then be visible for the
+     * user of the host.
+     */
+    command OpenWidget(OpenWidgetArg) returns (Default) = 3;
+    /**
+     * Closes a widget on the host, the widget will no longer be usable until
+     * it is re-opened.
+     *
+     * All persistent settings of the widget is kept while the widget is closed.
+     */
+    command CloseWidget(CloseWidgetArg) returns (Default) = 4;
+
+    /**
+     * Create a new installer in the host. The installer will keep a temporary
+     * file on the host which can be filled with binary data (one chunk at a time)
+     * by calling UpdateInstaller.
+     * It is also possible to specify a widget ID, if specified the installer will
+     * upgrade an existing widget to use a new widget file instead of installing
+     * a new one.
+     *
+     * To use the installer call InstallWidget, to cancel the installer call
+     * RemoveInstaller.
+     */
+    command CreateInstaller(CreateInstallerArg) returns (Installer) = 5;
+    /**
+     * Adds additional data to an existing installer. The binary data will
+     * be appended to the temporary file.
+     *
+     * @note Make sure the client does not send more data in one chunk than the
+     *       host can deal with. The max chunk size can be attained by calling
+     *       GetSettings.
+     */
+    command UpdateInstaller(UpdateInstallerArg) returns (Default) = 6;
+    /**
+     * Cancels an installation by removing the installer and the temporary file
+     * from the host.
+     */
+    command RemoveInstaller(RemoveInstallerArg) returns (Default) = 7;
+    /**
+     * Installs a widget by using the specified installer created by CreateInstaller.
+     * Once the widget is installed the installer and temporary file will be removed
+     * from the host.
+     *
+     * If the installation succeded it will return INSTALL_SUCCESSFUL, otherwise
+     * INSTALL_FAILED.
+     *
+     * @note A OnWidgetInstalled will be sent before the call is finished if the
+     *       widget was installed.
+     */
+    command InstallWidget(InstallWidgetArg) returns (WidgetInstallResult) = 8;
+    /**
+     * Install a widget by telling the host to download the widget file from the
+     * specified URL first. If the file was succesfully downloaded it will be
+     * installed in the host.
+     *
+     * If the download and installation succeded it will return INSTALL_SUCCESSFUL,
+     * otherwise it returns one of the failure types.
+     *
+     * @note A OnWidgetInstalled will be sent before the call is finished if the
+     *       widget was installed. A OnWidgetInstallFailed event is sent if the
+     *       the download failed or the widget could not be installed.
+     */
+    command InstallWidgetByURL(InstallWidgetByURLArg) returns (WidgetInstallResult) = 9;
+    /**
+     * Removes a widget from the host, the widget is closed and the widget file
+     * is removed.
+     *
+     * @note A OnWidgetUninstalled will be sent if the widget could be uninstalled.
+     */
+    command UninstallWidget(UninstallWidgetArg) returns (Default) = 10;
+
+    /**
+     * A new widget has been installed.
+     */
+    event OnWidgetInstalled returns (Widget) = 11;
+    /**
+     * An existing widget has been upgraded to use a new widget file.
+     */
+    event OnWidgetUpgraded returns (Widget) = 12;
+    /**
+     * A widget failed to install in the host.
+     */
+    event OnWidgetInstallFailed returns (WidgetInstallResult) = 13;
+    /**
+     * A widget was uninstalled from the host.
+     */
+    event OnWidgetUninstalled returns (WidgetUninstalled) = 14;
+
+    /**
+     * An upgrade to an existing widget is available.
+     *
+     * @since 1.1
+     */
+    event OnWidgetUpgradeAvailable returns (Widget) = 15;
+
+    /**
+     * Do an update on the specified widget. This will trigger 
+     * OnWidgetUpgradeAvailable.
+     *
+     * @since 1.1
+     */
+    command UpdateWidget(UpdateWidgetArg) returns (WidgetUpdateResult) = 16;
+
+    /**
+     * Set extension flag, only for extensions.
+     *
+     * @since 1.1
+     */
+    command SetExtensionFlag(SetExtensionFlagArg) returns (Default) = 17;
+
+    /**
+     * Get extension flag, only for extensions.
+     *
+     * @since 1.1
+     */
+    command GetExtensionFlag(GetExtensionFlagArg) returns (ExtensionFlag) = 18;
+}
+
+message ExtensionFlag
+{
+    enum FlagType
+    {
+        /**
+         * If an extension contains UserJS that would activate
+         * on HTTPS hosted content, this flag controls if those
+         * scripts should be allowed to activate.
+         */
+        ALLOW_USERJS_HTTPS = 1;
+        /**
+         * If in a private mode setting, this flag controls if an
+         * an extension's UserJS should be allowed to activate
+         * (provided it would otherwise apply.) Not orthogonal to
+         * the above option; HTTPS may or may not be supported within
+         * privacy mode windows.
+         */
+        ALLOW_USERJS_PRIVATE = 2;
+    }
+    /**
+     * Flag type.
+     */
+    required FlagType flag = 1;
+    /**
+     * The value of 'flag'
+     */
+    required bool value = 2;
+}
+
+message Settings
+{
+    /**
+     * This host requires that the size of a chunk does not exceed this value.
+     * The host may run on a limited machine such as a mobile device and might
+     * not have enough memory to decode chunks larger than this size.
+     *
+     * All clients must adhere to this maximum value and never send a larger
+     * chunk.
+     */
+    required uint32 maxChunkSize = 1;
+    /**
+     * Contains the user agent locales used to determine localized content.
+     * e.g. "en", "en-us", "*"
+     */
+    repeated string localeList = 2;
+}
+
+/**
+ * Contains detailed information on a widget. The structure is modeled after
+ * the W3C spec but with additional information for opera specific widgets.
+ *
+ * The same structure is also used for Unite apps/services and browser
+ * extensions.
+ */
+message Widget
+{
+    /**
+     * A unique identifier for the widget.
+     *
+     * e.g. "wuid-351f0e9d-24f2-080b-07e7-13b724cdaef8"
+     */
+    required string widgetID = 1;
+
+    enum Type
+    {
+        /**
+         * Regular widget.
+         */
+        WIDGET = 1;
+        /**
+         * Unite application or service.
+         */
+        UNITE = 2;
+        /**
+         * Browser extension.
+         */
+        EXTENSION = 3;
+    }
+    /**
+     * The major type for the widget, most fields are common among
+     * the types but certain fields are type specific.
+     */
+    required Type type = 2;
+
+    enum WidgetType
+    {
+        UNKNOWN = 1;
+        CHROMELESS = 2;
+        WINDOWED = 3;
+        TOOLBAR = 4;
+    }
+    required WidgetType widgetType = 3;
+
+    /**
+     * Represents the full human-readable name for a widget that is used, for example, in an application menu or in other contexts.
+     *
+     * 7.7
+     * http://www.w3.org/TR/widgets/#name
+     */
+    message Name
+    {
+        /**
+         * The full human-readable name for the widget.
+         */
+        required string text = 1;
+        /**
+         * A displayable string intended to represent a condensed name for a widget,
+         * e.g. as a name for an icon.
+         *
+         * note: This is the unlocalized version.
+         */
+        optional string shortName = 2;
+        /**
+         * The locale used for the name and shortName fields.
+         * If the fields are unlocalized the field is not set.
+         */
+        optional string locale = 3;
+    }
+    /**
+     * Represents the full human-readable name for a widget. This field will
+     * only be set if there is a name element defined in the widget
+     * specification.
+     *
+     * Note: This is either the localized name that matches the gadget locales, or the unlocalized name.
+     */
+    optional Name name = 4;
+
+    /**
+     * Various properties specific to Opera
+     */
+    message Properties
+    {
+        /**
+         * Specifies whether the widget is currently running or not.
+         */
+        required bool isActive = 1;
+        /**
+         * Specifies whether the widget is enabled or not. If the widget is
+         * disabled details on this may be found in disabledDetails.
+         */
+        required bool isEnabled = 2;
+        /**
+         * Specifies whether the widget is dockable or not. This is only used
+         * by older Opera widgets (not W3C), other types sets this to false.
+         */
+        required bool isDockable = 3;
+        /**
+         * Specifies whether the widget as access to the filesystem or not.
+         */
+        required bool hasFileAccess = 4;
+        /**
+         * Specifies whether the widget is considered persistent or not.
+         * Persistent widgets cannot be removed. Widgets are by default not
+         * persistent.
+         */
+        required bool isPersistent = 5;
+        /**
+         * True if the widget has transparent features or not, false otherwise.
+         */
+        required bool hasTransparentFeatures = 6;
+        /**
+         * Specifies whether the widget can use JS plugins or not. This is
+         * specific to older Opera widget (not W3C), other types sets this to
+         * false.
+         */
+        required bool hasJSPluginsAccess = 8;
+        /**
+         * Specific flag for JIL widgets, set to true if the widget has
+         * filesystem access.
+         */
+        required bool hasJILFilesystemAccess = 9;
+        /**
+         * Is true if the widget namespace supports feature tags.
+         * Currently W3C and JIL widgets support this.
+         */
+        required bool hasFeatureTagSupport = 10;
+
+        /**
+         * The entire path of the widget as it is stored on the host.
+         */
+        required string path = 11;
+        /**
+         * The filename of the widget as it stored on the host.
+         */
+        required string fileName = 12;
+        /**
+         * The relative path to the config file, this is usually config.xml
+         * but may differ depending on the widget namespace in use.
+         * e.g. "config.xml"
+         */
+        required string configFilePath = 13;
+        /**
+         * The URL which was used to download and install the widget. This
+         * may be empty in some cases even though it was downloaded from a URL.
+         */
+        required string downloadURL = 14;
+        /**
+         * The ID of the window the widget was opened in or 0 if there is no window.
+         */
+        required uint32 windowID = 15 [default = 0];
+        /**
+         * Set to true if the widget has access to public networks.
+         * Some widget namespaces allow this to be controlled per widget
+         * while others have it set globally.
+         */
+        required bool publicNetwork = 16;
+        /**
+         * Set to true if the widget has access to private networks.
+         * Some widget namespaces allow this to be controlled per widget
+         * while others have it set globally.
+         */
+        required bool privateNetwork = 17;
+        /**
+         * Details on why a widget is disabled. Only set when disabled.
+         */
+        optional string disabledDetails = 18;
+        /**
+         * Full path of the widget resource in the filesystem. (eg '/opera/widgets/somewidget.wgt/index.html')
+         */
+        optional string resolvedStartPath = 19;
+        /**
+         * The current locale used in the widget/extension. (eg 'en', 'en-gb', 'nb-no')
+         */
+        optional string startfileLocale = 20;
+    }
+    required Properties properties = 5;
+
+    /**
+     * Represents people or an organization attributed with the creation of the widget.
+     *
+     * 7.9
+     * http://www.w3.org/TR/widgets/#author0
+     */
+    message Author
+    {
+        /**
+         * People or organization attributed with the creation of the widget.
+         */
+        required string text = 1;
+        /**
+         * Email address associated with the author.
+         */
+        optional string email = 2;
+        /**
+         * URI that represents a link associated with the author.
+         */
+        optional string href = 3;
+        /**
+         * Represents the name of an organization that the author is affiliated with.
+         */
+        optional string organization = 4;
+    }
+    /**
+     * Represents people or an organization attributed with the creation of the widget.
+     * This field will only be set if there is an author element defined in the
+     * widget specification.
+     */
+    optional Author author = 6;
+
+    /**
+     * The namespaces this widget uses. If no namespace is defined the field is not set.
+     * e.g. "http://www.w3.org/ns/widgets" or "http://xmlns.opera.com/2006/widget"
+     */
+    optional string namespace = 7;
+    /**
+     * The version of the widget.
+     */
+    optional string version = 8;
+
+    /**
+     * If specified defines the preferred viewport width in pixels. The value,
+     * when set, is from 1 and up.
+     */
+    optional int32 width = 9;
+    /**
+     * If specified defines the preferred viewport height in pixels. The value,
+     * when set, is from 1 and up.
+     */
+    optional int32 height = 10;
+    /**
+     * The current width of the widget in pixels.
+     */
+    optional int32 currentWidth = 11;
+    /**
+     * The current height of the widget in pixels.
+     */
+    optional int32 currentHeight = 12;
+
+    enum ViewMode
+    {
+        UNKNOWN = 1;
+        /**
+         * No chrome
+         */
+        WIDGET = 2;
+        /**
+         * Floating, same as widget (W3C mode)
+         */
+        FLOATING = 3;
+        DOCKED = 4;
+        APPLICATION = 5;
+        FULLSCREEN = 6;
+        /**
+         * With chrome and occupying the entire screen.
+         */
+        MAXIMIZED = 7;
+        /**
+         * Same as docked
+         */
+        MINIMIZED = 8;
+        /**
+         * Same as widget
+         */
+        WINDOWED = 9;
+    }
+    /**
+     * The current viewmode used by the widget.
+     */
+    required ViewMode currentViewMode = 13;
+    /**
+     * The default viewmode for the widget.
+     */
+    required ViewMode defaultViewMode = 14;
+    /**
+     * All viewmodes defined for this widget.
+     */
+    repeated ViewMode viewModeList = 15;
+
+    /**
+     * Represents a human-readable description of the widget.
+     *
+     * 7.8
+     * http://www.w3.org/TR/widgets/#description
+     */
+    message Description
+    {
+        /**
+         * The description text.
+         */
+        required string text = 1;
+        /**
+         * The locale used for the description field.
+         * If the field is unlocalized the field is not set.
+         */
+        optional string locale = 2;
+    }
+    /**
+     * Represents a human-readable description of the widget.
+     * This field will only be set if there is a description element defined
+     * in the widget specification.
+     *
+     * Note: This is either the localized description that matches the gadget locales, or the unlocalized description.
+     */
+    optional Description description = 16;
+
+    /**
+     * The software license for this widget.
+     */
+    message License
+    {
+        /**
+         * The license text.
+         */
+        required string text = 1;
+        /**
+         * A URL or path that points to a representation of a software and/or content license
+         */
+        optional string href = 2;
+        /**
+         * The locale used for this license.
+         * If the field is unlocalized the field is not set.
+         */
+        optional string locale = 3;
+    }
+    /**
+     * The license information for the widget if one is present.
+     * This field will only be set if there is a license element defined in
+     * the widget specification.
+     */
+    optional License license = 17;
+
+    /**
+     * A custom icon for the widget.
+     *
+     * 7.11
+     * http://www.w3.org/TR/widgets/#the-icon-element-and-its-attributes
+     */
+    message Icon
+    {
+        /**
+         * A path attribute that points to a file inside the widget package.
+         */
+        required string src = 1;
+        /**
+         * The author's preferred width for the icon if any. Only set for values
+         * 1 and up.
+         */
+        optional uint32 width = 2;
+        /**
+         * The author's preferred height for the icon if any. Only set for values
+         * 1 and up.
+         */
+        optional uint32 height = 3;
+    }
+    /**
+     * All icons defined for the widget.
+     */
+    repeated Icon iconList = 18;
+
+    /**
+     * Defines the start file for a widget, the file is defined by a path
+     * and optionally which MIME-Type and encoding it has.
+     * If no content has been defined the widget is started from "index.html".
+     */
+    message Content
+    {
+        /**
+         * A path which points to a file within the widget package.
+         * e.g. "mywidget.html"
+         */
+        required string src = 1;
+        /**
+         * Defines the MIME-Type for the file referenced in 'src'.
+         * The default MIME-Type is "text/html".
+         */
+        optional string type = 2;
+        /**
+         * Defines the encoding for the file referenced in 'src'.
+         * The default encoding is "UTF-8".
+         */
+        optional string encoding = 3;
+    }
+    /**
+     * Declare a custom start file the user agent is expected to use when it
+     * instantiates the widget.
+     * This field will only be set if there is a content element defined in
+     * the widget specification.
+     */
+    optional Content content = 19;
+
+    /**
+     * A feature is a URI identifiable runtime component. (e.g. an API).
+     *
+     * 7.13
+     * http://www.w3.org/TR/widgets/#feature
+     */
+    message Feature
+    {
+        /**
+         * An IRI attribute that identifies a feature that is needed by the widget at runtime (such as an API).
+         */
+        required string name = 1;
+        /**
+         * A boolean attribute that indicates whether or not this feature has to be available to the widget at runtime.
+         */
+        required bool isRequired = 2;
+
+        /**
+         * A parameter for a feature, defined as a name/value pair. The meaning
+         * of the name and value depends entirely on the feature.
+         *
+         * 7.14
+         * http://www.w3.org/TR/widgets/#param
+         */
+        message Param
+        {
+            required string name = 1;
+            required string value = 2;
+        }
+        /**
+         * List of parameters for the feature.
+         */
+        repeated Param paramList = 3;
+    }
+    /**
+     * List of all features requested by the widget.
+     */
+    repeated Feature featureList = 20;
+
+    /**
+     * The preference element allows authors to declare one or more preferences.
+     * Preferences are persistently stored in the browser.
+     *
+     * 7.15
+     * http://www.w3.org/TR/widgets/#preference
+     */
+    message Preference
+    {
+        /**
+         * The name of the preference
+         * e.g. "skin"
+         */
+        required string name = 1;
+        /**
+         * The value of the preference
+         * e.g. "alien"
+         */
+        required string value = 2;
+        /**
+         * Controls whether this preference can, or cannot, be overwritten at runtime (e.g. via scripts).
+         */
+        required bool isReadOnly = 3 [default = false];
+    }
+    /**
+     * List of all preferences defined by the widget.
+     */
+    repeated Preference preferenceList = 21;
+
+    message Signature
+    {
+        enum State
+        {
+            UNKNOWN = 1;
+            /**
+             * Widget is unsigned.
+             */
+            UNSIGNED = 2;
+            /**
+             * Widget is signed and signature is valid.
+             */
+            SIGNED = 3;
+            /**
+             * Widget is signed but the signature is invalid.
+             */
+            VERIFICATION_FAILED = 4;
+            /**
+             * Signature verification is still in progress.
+             */
+            PENDING = 5;
+        }
+        /**
+         * Short name of the signature used.
+         */
+        required string id = 1;
+        /**
+         * The state of the signature, for instance whether verification failed
+         * or it was properly signed.
+         */
+        required State state = 2;
+        /**
+         * Set to true if the widget has been signed with a privileged certificate.
+         */
+        optional bool isPrivilegedCert = 3;
+    }
+    /**
+     * If the widget was signed with a digital signature this is set with
+     * information on the signature.
+     */
+    optional Signature signature = 22;
+
+    /**
+     * The URL used for updating the widget.
+     */
+    optional string updateURL = 23;
+
+    /**
+     * Defines a request for permission to access a set of network resources.
+     * http://www.w3.org/TR/widgets-access/#the-access-element
+     */
+    message Network
+    {
+        /**
+         * Defines the URL that the widget should get access to, e.g. "https://example.net"
+         * A special value of U+002A ASTERISK (*) means unrestricted access to any network resources.
+         */
+        required string origin = 1;
+        /**
+         * Indicates whether or not the host component part of origin applies to subdomains as well.
+         * The default is not to allow subdomains.
+         */
+        required bool allowSubdomains = 2;
+    }
+    /**
+     * List of requests to access network resources.
+     */
+    repeated Network networkAccessList = 24;
+
+    /**
+     * Declares which protocols, hosts, ports, and paths the widget may use.
+     *
+     * http://dev.opera.com/articles/view/opera-widgets-specification-1-0/#xmlsecurity
+     */
+    message SecurityAccess
+    {
+        /**
+         * The protocols the widget will be using to contact external servers. All protocols, except the file protocol is permitted.
+         * e.g. "http", "https"
+         * If the list is empty it means any protocol (excluding exceptions).
+         */
+        repeated string protocolList = 1;
+        /**
+         * The hostnames/ip-addresses which the widget may use, e.g. "www.example.com" or "192.168.1.1"
+         * The hostnames is an exact match, so a widget specifying www.example.com will not be able to contact example.com.
+         * If the list is empty it means any host.
+         */
+        repeated string hostList = 2;
+
+        /**
+         * Represents a range of ports the widget may use, e.g. 1024-2048
+         * If only a single port is defined then both low and high will contain the same value.
+         */
+        message Port
+        {
+            required uint32 low = 1;
+            required uint32 high = 2;
+        }
+        /**
+         * Ports which may be used by the widget.
+         * Each entry is a range of ports, e.g. 1024-2048
+         * If the list is empty it means port.
+         */
+        repeated Port portList = 3;
+        /**
+         * The path elements the widget may contact, e.g. "/foo"
+         * If the list is empty it means any path.
+         */
+        repeated string pathList = 4;
+    }
+    /**
+     * Lists of security access the widget requests.
+     * Note: This only applies to Opera Widgets (namespace "http://xmlns.opera.com/2006/widget" and ""), not W3C and other widget formats.
+     */
+    repeated SecurityAccess securityAccessList = 25;
+
+    /**
+     * An IRI identifier chosen by widget itself.
+     */
+    optional string iriIdentifier = 26;
+
+    message ExtensionInfo
+    {
+        /**
+         * Specifies the includes folder for the extension.
+         */
+        required string includesPath = 1;
+        /**
+         * True if the extension is currently running.
+         */
+        required bool isRunning = 2;
+    }
+    /**
+     * Additional information which is specific to extensions. Only set when
+     * it contains an extension.
+     */
+    optional ExtensionInfo extensionInfo = 27;
+
+    message UniteInfo
+    {
+        /**
+         * Unite type
+         */
+        enum Type
+        {
+            /**
+             * The Unite type is not known by the service.
+             */
+            UNKNOWN = 1;
+            SERVICE = 2;
+            APPLICATION = 3;
+        }
+        required Type type = 1;
+        /**
+         * The service path, e.g. "fridge".
+         */
+        optional string servicePath = 2;
+    }
+    /**
+     * Additional information which is specific to Unite apps and services.
+     * Only set when it contains a Unite app or service.
+     */
+    optional UniteInfo uniteInfo = 28;
+
+    message UpdateInfo
+    {
+        enum UpdateType
+        {
+            /**
+             * The update type is not known by the service.
+             */
+            UNKNOWN = 1;
+            /**
+             * An update is available for this widget.
+             */
+            UPDATE = 2;
+            /**
+             * The widget is to be disabled.
+             */
+            DISABLE = 3;
+            /**
+             * The widget is to be enabled.
+             */
+            ACTIVATE = 4;
+            /**
+             * The widget is to be deleted.
+             */
+            DELETE = 5;
+            /**
+             * No update is available.
+             *
+             * This value is DEPRECATED. If there is no update available then no message is sent.
+             */
+            NO_UPDATE = 6;
+        }
+
+        /**
+         * Widget id (not the same as widget uid, which is called id...), specified in config.xml
+         */
+        required string customWidgetID = 1;
+        /**
+         * What type of update this is (update, disable, activate, delete)
+         */
+        required UpdateType updateType = 2;
+        /**
+         * This is a mandatory update.
+         */
+        required bool isMandatory = 3;
+        /**
+         * Version of the updated widget.
+         */
+        required string version = 4;
+        /**
+         * Last visited time on 'src' URI
+         */
+        required double lastModified = 5;
+        /**
+         * URI pointing to the updated widget.
+         */
+        required string src = 6;
+        /**
+         * Size of the widget archive (or 0 if unknown).
+         */
+        required uint32 size = 7;
+        /**
+         * Detail text as returned by the update server.
+         */
+        required string details = 8;
+        /**
+         * URI that could point to an additional information document.
+         */
+        optional string documentUri = 9;
+
+    }
+    /**
+     * Information about an available update for the widget.
+     * Set when available, which will be during an update.
+     */
+    optional UpdateInfo updateInfo = 29;
+
+    message UserJS
+    {
+        /**
+         * Absolute path to the file representing this userjs.
+         */
+        required string filename = 1;
+    }
+
+    /**
+     *  Added UserJS files, this applies to extensions.
+     */
+    repeated UserJS userJSList = 30;
+
+}
+
+message WidgetList
+{
+    repeated Widget widgetList = 1;
+}
+
+message OpenWidgetArg
+{
+    required string widgetID = 1;
+
+    /**
+     * Set this to true to give the widget programmatic access
+     * to the global security policy (the widget.setGlobalPolicy
+     * function).
+     *
+     * This should only be set for widgets deployed for testing
+     * purposes.
+     */
+    optional bool allowMutablePolicy = 2 [default = false];
+
+    /**
+     * Override the regular global policy. This field may contain
+     * a full XML global policy file, starting with the <widgets>
+     * tag. The 'allowMutablePolicy' must be set to true when using
+     * this field.
+     *
+     * If a security policy was specified, but could not be parsed,
+     * this command fails and the widget will not be opened.
+     */
+    optional string globalPolicy = 3;
+}
+
+message CloseWidgetArg
+{
+    required string widgetID = 1;
+}
+
+message CreateInstallerArg
+{
+    /**
+     * If specified makes the installer perform an upgrade instead of a new
+     * installation. An upgrade causes the widget on the host to use the
+     * new widget file once installed.
+     */
+    optional string widgetID = 1;
+    /**
+     * Which type the installer should be created for.
+     * The default is to create it for a widget installation.
+     */
+    optional Widget.Type widgetType = 2;
+}
+
+message Installer
+{
+    required uint32 installerID = 1;
+}
+
+message UpdateInstallerArg
+{
+    required uint32 installerID = 1;
+
+    /**
+     * Byte data which will be appended to the temporary file.
+     *
+     * @note Must not exceed the max size set by the host, see GetSettings.
+     */
+    required bytes byteData = 2;
+}
+
+message RemoveInstallerArg
+{
+    required uint32 installerID = 1;
+}
+
+message InstallWidgetArg
+{
+    required uint32 installerID = 1;
+}
+
+message UpdateWidgetArg
+{
+    /**
+     * The uid of the widget to update.
+     */
+    required string widgetID = 1;
+}
+
+message SetExtensionFlagArg
+{
+    /**
+     * The uid of the widget.
+     */
+    required string widgetID = 1;
+    /**
+     * Flagtype and value.
+     */
+    required ExtensionFlag flag = 2;
+}
+
+message GetExtensionFlagArg
+{
+    /**
+     * The uid of the widget.
+     */
+    required string widgetID = 1;
+    /**
+     * Flagtype and value.
+     */
+    required ExtensionFlag flag = 2;
+}
+
+message InstallWidgetByURLArg
+{
+    /**
+     * Any URL which the host can reach can be used. This includes data URLs
+     * and file URLs available on the host.
+     *
+     * The only requirements is that the MIME-Type is set when the resource is
+     * fetched and the MIME-Type must be a widget. For data URLs remember to
+     * set the MIME-Type and encoding, e.g.::
+     *
+     *  data:application/x-opera-widgets;base64,
+     */
+    required string url = 1;
+}
+
+message UninstallWidgetArg
+{
+    required string widgetID = 1;
+}
+
+message WidgetInstallResult
+{
+    enum Result
+    {
+        /**
+         * The install failed but the reason is unknown.
+         */
+        UNKNOWN = 1;
+        /**
+         * Failed to download widget from URL.
+         */
+        DOWNLOAD_FAILED = 2;
+        /**
+         * Not enough space to install widget file.
+         */
+        NOT_ENOUGH_SPACE = 3;
+        /**
+         * Installation of widget failed.
+         */
+        INSTALL_FAILED = 4;
+        /**
+         * Widget was successfully installed.
+         */
+        INSTALL_SUCCESSFUL = 5;
+    }
+    /**
+     * Result of an installation attempt.
+     */
+    required Result result = 1;
+    /**
+     * The URL that was used to (download and) install the widget.
+     * Should be the same URL as InstallWidgetByURLArg.url
+     * @note Only set if it was installed from a URL.
+     */
+    optional string url = 2;
+}
+
+message WidgetUpdateResult
+{
+    enum Result
+    {
+        /**
+         * The update failed but the reason is unknown.
+         */
+        UNKNOWN = 1;
+        /**
+         * Failed to download widget from URL.
+         */
+        DOWNLOAD_FAILED = 2;
+        /**
+         * Not enough space to update widget file.
+         */
+        NOT_ENOUGH_SPACE = 3;
+        /**
+         * Update of widget failed.
+         */
+        UPDATE_FAILED = 4;
+        /**
+         * Widget was successfully updated.
+         */
+        UPDATE_SUCCESSFUL = 5;
+    }
+    /**
+     * Result of an installation attempt.
+     */
+    required Result result = 1;
+    /**
+     * The URL that was used to (download and) install the widget.
+     * Should be the same URL as InstallWidgetByURLArg.url
+     * @note Only set if it was installed from a URL.
+     */
+    optional string url = 2;
+}
+
+message WidgetUninstalled
+{
+    required string widgetID = 1;
+}

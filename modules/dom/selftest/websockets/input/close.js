@@ -1,0 +1,1 @@
+var result = []; try { var close = new CloseEvent("close", {cancelable: false, code: 65537.2, wasClean: true, reason: 2}); result = [close.reason === "2", close.code === 1, close.wasClean === true, close.isTrusted === false]; } catch (e) { result = [false]; } postMessage(result);

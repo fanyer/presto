@@ -1,0 +1,125 @@
+/* -*- mode: c++; tab-width: 4; indent-tabs-mode: t; c-basic-offset: 4 */
+
+group "DOM.DOM_AsyncCallback";
+
+include "modules/dom/src/domasynccallback.h";
+include "modules/dom/src/domobj.h";
+include "modules/dom/domenvironment.h";
+include "modules/ecmascript_utils/esasyncif.h";
+include "modules/hardcore/timer/optimer.h";
+include "modules/doc/frm_doc.h";
+include "modules/dom/selftest/domselftestutils.h";
+
+global
+{
+	class TestAsyncCallback : public OpTimerListener, public DOM_AsyncCallback
+	{
+	public:
+		TestAsyncCallback(ES_Object* callback, ES_Object* this_obj, DOM_Runtime* runtime)
+			: DOM_AsyncCallback(runtime, callback, this_obj)
+		{
+		}
+
+		void OnTimeOut(OpTimer* timer)
+		{
+			ES_Value argv[1];
+			DOM_Object::DOMSetNumber(&(argv[0]), 10.0);
+			CallCallback(argv, ARRAY_SIZE(argv));
+			OP_DELETE(this);
+			OP_DELETE(timer);
+		}
+	};
+
+	class TestAsyncFunction : public EcmaScript_Object
+	{
+	public:
+		TestAsyncFunction(UINT32 timeout, BOOL kill_the_thread = FALSE) : m_timeout(timeout), m_kill_the_thread(kill_the_thread) {}
+
+		virtual int Call(ES_Object* this_es_object, ES_Value* argv, int argc, ES_Value* return_value, ES_Runtime* origining_es_runtime)
+		{
+			DOM_Runtime* origining_runtime = static_cast<DOM_Runtime*>(origining_es_runtime);
+			if (argc >= 0)
+				DOM_CHECK_ARGUMENTS("o");
+			TestAsyncCallback* async_callback = OP_NEW(TestAsyncCallback, (argv[0].value.object, this_es_object, origining_runtime));
+			CALL_FAILED_IF_ERROR(async_callback ? OpStatus::OK: OpStatus::ERR_NO_MEMORY);
+			OpAutoPtr<TestAsyncCallback> async_callback_deleter(async_callback);
+			CALL_FAILED_IF_ERROR(async_callback->Construct());
+			OpTimer* timer = OP_NEW(OpTimer, ());
+			CALL_FAILED_IF_ERROR(timer ? OpStatus::OK: OpStatus::ERR_NO_MEMORY);
+			timer->SetTimerListener(async_callback);
+			timer->Start(m_timeout);
+			async_callback_deleter.release();
+			return ES_FAILED;
+		}
+	private:
+		UINT32 m_timeout;
+		BOOL m_kill_the_thread;
+	};
+
+	class TestCallbackImpl : public EcmaScript_Object
+	{
+	public:
+		TestCallbackImpl(){}
+
+		virtual int Call(ES_Object* this_es_object, ES_Value* argv, int argc, ES_Value* return_value, ES_Runtime* origining_es_runtime)
+		{
+			ST_passed();
+			return ES_FAILED;
+		}
+	};
+}
+
+test("Test async call - success")
+async;
+{
+#define verify_async(assertion) do{ if (!assertion) { ST_failed("%d:verify" #assertion "FAILED", __LINE__); return -2;  } } while(0)
+#define verify_success_async(assertion) do { if (OpStatus::IsError(assertion)){ ST_failed("%d:verify" #assertion "FAILED", __LINE__); return -2; }  } while(0)
+	verify_success_async(state.doc->ConstructDOMEnvironment());
+	ES_Runtime* rt = state.doc->GetESRuntime();
+	TestAsyncFunction* fun = OP_NEW(TestAsyncFunction, (1)); // 1  = 1ms timeout
+	verify_success_async(fun->SetFunctionRuntime(rt, UNI_L("TestAsyncFunction"), "TestAsyncFunction", NULL));
+
+	ES_AsyncInterface* async_if = g_selftest.utils->doc->GetESAsyncInterface();
+	verify_async(async_if);
+
+	async_if->SetWantExceptions();
+
+	ES_Object* this_obj = rt->GetGlobalObjectAsPlainObject();
+
+	ES_Value argv[1];
+	TestCallbackImpl* callback = OP_NEW(TestCallbackImpl, ()); // 1  = 1ms timeout
+	verify_success_async(callback->SetFunctionRuntime(rt, UNI_L("TestCallbackImpl"), "TestCallbackImpl", NULL));
+	DOM_Object::DOMSetObject(&(argv[0]), callback);
+
+	verify_success_async(async_if->CallFunction(fun->GetNativeObject(), this_obj, ARRAY_SIZE(argv), argv, NULL, NULL));
+#undef verify_success_async
+#undef verify_async
+}
+
+test("Test async call - success + trigger GC")
+async;
+{
+#define verify_async(assertion) do{ if (!assertion) { ST_failed("%d:verify" #assertion "FAILED", __LINE__); return -2;  } } while(0)
+#define verify_success_async(assertion) do { if (OpStatus::IsError(assertion)){ ST_failed("%d:verify" #assertion "FAILED", __LINE__); return -2; }  } while(0)
+	verify_success_async(state.doc->ConstructDOMEnvironment());
+	ES_Runtime* rt = state.doc->GetESRuntime();
+	TestAsyncFunction* fun = OP_NEW(TestAsyncFunction, (1000)); // 1  = 1ms timeout
+	verify_success_async(fun->SetFunctionRuntime(rt, UNI_L("TestAsyncFunction"), "TestAsyncFunction", NULL));
+
+	ES_AsyncInterface* async_if = g_selftest.utils->doc->GetESAsyncInterface();
+	verify_async(async_if);
+	async_if->SetWantExceptions();
+
+	ES_Object* this_obj = rt->GetGlobalObjectAsPlainObject();
+
+	ES_Value argv[1];
+	TestCallbackImpl* callback = OP_NEW(TestCallbackImpl, ()); // 1  = 1ms timeout
+	verify_success_async(callback->SetFunctionRuntime(rt, UNI_L("TestCallbackImpl"), "TestCallbackImpl", NULL));
+	DOM_Object::DOMSetObject(&(argv[0]), callback);
+
+	verify_success_async(async_if->CallFunction(fun->GetNativeObject(), this_obj, ARRAY_SIZE(argv), argv, NULL, NULL));
+
+	g_ecmaManager->GarbageCollect();
+#undef verify_success_async
+#undef verify_async
+}

@@ -1,0 +1,570 @@
+group "datastream bytearray";
+require DATASTREAM_BYTEARRAY_ENABLED;
+
+include "modules/datastream/fl_lib.h";
+include "modules/libcrypto/include/OpRandomGenerator.h";
+
+global {
+
+void Randomize(unsigned char *vector, unsigned long len)
+{
+	g_libcrypto_random_generator->GetRandom(vector,  len);
+}
+
+int TestVector(unsigned long length, BOOL use_separate_commit)
+{
+	DataStream_NonSensitive_ByteArray(tester);
+	
+	unsigned char *test_vector = OP_NEWA(unsigned char, length);
+
+	if(test_vector == NULL)
+	{
+		return (length >= 250000 ? 0 : -1000); // Return OK if memory allocation failure for large numbers, but not for smaller)
+	}
+
+	Randomize(test_vector, length);
+
+	DataStream_ByteArray first_test;
+
+	TRAPD(op_err, first_test.AddContentL(test_vector, length));
+	
+	if(OpStatus::IsError(op_err))
+	{
+		OP_DELETEA(test_vector);
+		return (length >= 250000 ? 0 : -100); // Return OK if memory allocation failure for large numbers, but not for smaller)
+	}
+
+	TRAP(op_err, first_test.FinishedAddingL());
+	
+	if(OpStatus::IsError(op_err))
+	{
+		OP_DELETEA(test_vector);
+		return (length >= 250000 ? 0 : -1001); // Return OK if memory allocation failure for large numbers, but not for smaller)
+	}
+
+	if(first_test.GetLength() != length)
+	{
+		OP_DELETEA(test_vector);
+		return -2;
+	}
+
+	unsigned char *testbuffer = (unsigned char *)g_memory_manager->GetTempBuf();
+	unsigned long testbuf_len = g_memory_manager->GetTempBufLen();
+	OP_MEMORY_VAR unsigned long pos = 0;
+
+	first_test.ResetRead();
+	while(first_test.MoreData())
+	{
+		unsigned long read_bytes = 0;
+
+		TRAP(op_err, read_bytes = first_test.ReadDataL(testbuffer, testbuf_len));
+
+		if(OpStatus::IsError(op_err))
+		{
+			OP_DELETEA(test_vector);
+			return (length >= 250000 ? 0 : -101); // Return OK if memory allocation failure for large numbers, but not for smaller)
+		}
+
+		if(read_bytes == 0)
+		{
+			OP_DELETEA(test_vector);
+			return -3;
+		}
+		
+		if(pos + read_bytes > length)
+		{
+			OP_DELETEA(test_vector);
+			return -4;
+		}
+
+		if(op_memcmp(test_vector+pos, testbuffer, read_bytes) != 0)
+		{
+			OP_DELETEA(test_vector);
+			return -5;
+		}
+
+		pos += read_bytes;
+	}
+
+	DataStream_ByteArray second_test;
+
+	second_test.SetNeedDirectAccess(TRUE);
+
+	first_test.ResetRead();
+	unsigned int len = length/2;
+	TRAP(op_err, second_test.AddContentL(&first_test, len));
+	if(OpStatus::IsError(op_err))
+	{
+		OP_DELETEA(test_vector);
+		return (length >= 250000 ? 0 : -102); // Return OK if memory allocation failure for large numbers, but not for smaller)
+	}
+
+	TRAP(op_err, second_test.AddContentL(&first_test));
+	if(OpStatus::IsError(op_err))
+	{
+		OP_DELETEA(test_vector);
+		return (length >= 250000 ? 0 : -103); // Return OK if memory allocation failure for large numbers, but not for smaller)
+	}
+
+	TRAP(op_err, first_test.FinishedAddingL());
+	
+	if(OpStatus::IsError(op_err))
+	{
+		OP_DELETEA(test_vector);
+		return (length >= 250000 ? 0 : -104); // Return OK if memory allocation failure for large numbers, but not for smaller)
+	}
+
+	second_test.ResetRead();
+	pos = 0;
+	while(second_test.MoreData())
+	{
+		OP_MEMORY_VAR unsigned long read_bytes = 0;
+
+		TRAP(op_err, read_bytes = second_test.ReadDataL(testbuffer, testbuf_len, (use_separate_commit ? DataStream::KSampleOnly: DataStream::KReadAndCommit) /* == sample */));
+
+		if(OpStatus::IsError(op_err))
+		{
+			OP_DELETEA(test_vector);
+			return (length >= 250000 ? 0 : -105); // Return OK if memory allocation failure for large numbers, but not for smaller)
+		}
+
+		if(read_bytes == 0)
+		{
+			OP_DELETEA(test_vector);
+			return -6;
+		}
+		
+		if(pos + read_bytes > length)
+		{
+			OP_DELETEA(test_vector);
+			return -7;
+		}
+
+		if(use_separate_commit)
+		{
+			TRAP(op_err, second_test.CommitSampledBytesL(read_bytes));
+			if(OpStatus::IsError(op_err))
+			{
+				OP_DELETEA(test_vector);
+				return -71;
+			}
+		}
+
+		if(op_memcmp(test_vector+pos, testbuffer, read_bytes) != 0)
+		{
+			OP_DELETEA(test_vector);
+			return -8;
+		}
+
+		pos += read_bytes;
+	}
+
+	if(second_test.GetDirectPayload() == NULL)
+	{
+		OP_DELETEA(test_vector);
+		return -9;
+	}
+
+	if(second_test.GetLength() != length)
+	{
+		OP_DELETEA(test_vector);
+		return -10;
+	}
+
+	if(op_memcmp(second_test.GetDirectPayload(), test_vector, length) != 0)
+	{
+		OP_DELETEA(test_vector);
+		return -11;
+	}
+
+#ifdef DATASTREAM_USE_FLEXIBLE_SEQUENCE
+	if(!(second_test == first_test))
+	{
+		OP_DELETEA(test_vector);
+		return -12;
+	}
+#endif
+
+	OP_DELETEA(test_vector);
+	
+	return 0;
+}
+
+
+int TestVector_Segments(unsigned long length, BOOL use_separate_commit, unsigned long segment_len)
+{
+	DataStream_NonSensitive_ByteArray(tester);
+	
+	unsigned char *test_vector = OP_NEWA(unsigned char, length);
+
+	if(test_vector == NULL)
+	{
+		return (length >= 250000 ? 0 : -1000); // Return OK if memory allocation failure for large numbers, but not for smaller)
+	}
+
+	Randomize(test_vector, length);
+
+	DataStream_ByteArray first_test;
+	OP_MEMORY_VAR unsigned long pos;
+	OP_STATUS op_err;
+
+	for(pos = 0; pos< length; pos+= segment_len)
+	{
+		TRAP(op_err, first_test.AddContentL(test_vector+pos, (pos + segment_len > length ? length-pos : segment_len)));
+		
+		if(OpStatus::IsError(op_err))
+		{
+			OP_DELETEA(test_vector);
+			return (length >= 250000 ? 0 : -100); // Return OK if memory allocation failure for large numbers, but not for smaller)
+		}
+	}
+
+	TRAP(op_err, first_test.FinishedAddingL());
+	
+	if(OpStatus::IsError(op_err))
+	{
+		OP_DELETEA(test_vector);
+		return (length >= 250000 ? 0 : -1001); // Return OK if memory allocation failure for large numbers, but not for smaller)
+	}
+
+	if(first_test.GetLength() != length)
+	{
+		OP_DELETEA(test_vector);
+		return -2;
+	}
+
+	unsigned char *testbuffer = (unsigned char *)g_memory_manager->GetTempBuf();
+	unsigned long testbuf_len = g_memory_manager->GetTempBufLen();
+	pos = 0;
+
+	first_test.ResetRead();
+	while(first_test.MoreData())
+	{
+		unsigned long read_bytes = 0;
+
+		TRAP(op_err, read_bytes = first_test.ReadDataL(testbuffer, testbuf_len));
+
+		if(OpStatus::IsError(op_err))
+		{
+			OP_DELETEA(test_vector);
+			return (length >= 250000 ? 0 : -101); // Return OK if memory allocation failure for large numbers, but not for smaller)
+		}
+
+		if(read_bytes == 0)
+		{
+			OP_DELETEA(test_vector);
+			return -3;
+		}
+		
+		if(pos + read_bytes > length)
+		{
+			OP_DELETEA(test_vector);
+			return -4;
+		}
+
+		if(op_memcmp(test_vector+pos, testbuffer, read_bytes) != 0)
+		{
+			OP_DELETEA(test_vector);
+			return -5;
+		}
+
+		pos += read_bytes;
+	}
+
+	DataStream_ByteArray second_test;
+
+	second_test.SetNeedDirectAccess(TRUE);
+
+	first_test.ResetRead();
+	unsigned int len = segment_len;
+	TRAP(op_err, second_test.AddContentL(&first_test, len));
+	if(OpStatus::IsError(op_err))
+	{
+		OP_DELETEA(test_vector);
+		return (length >= 250000 ? 0 : -102); // Return OK if memory allocation failure for large numbers, but not for smaller)
+	}
+
+	while(first_test.MoreData())
+	{
+		TRAP(op_err, second_test.AddContentL(&first_test, segment_len));
+		if(OpStatus::IsError(op_err))
+		{
+			OP_DELETEA(test_vector);
+			return (length >= 250000 ? 0 : -103); // Return OK if memory allocation failure for large numbers, but not for smaller)
+		}
+		}
+
+	TRAP(op_err, second_test.FinishedAddingL());
+	
+	if(OpStatus::IsError(op_err))
+	{
+		OP_DELETEA(test_vector);
+		return (length >= 250000 ? 0 : -104); // Return OK if memory allocation failure for large numbers, but not for smaller)
+	}
+
+	second_test.ResetRead();
+	pos = 0;
+	while(second_test.MoreData())
+	{
+		OP_MEMORY_VAR unsigned long read_bytes = 0;
+
+		TRAP(op_err, read_bytes = second_test.ReadDataL(testbuffer, testbuf_len, (use_separate_commit ? DataStream::KSampleOnly: DataStream::KReadAndCommit) /* == sample */));
+
+		if(OpStatus::IsError(op_err))
+		{
+			OP_DELETEA(test_vector);
+			return (length >= 250000 ? 0 : -105); // Return OK if memory allocation failure for large numbers, but not for smaller)
+		}
+
+		if(read_bytes == 0)
+		{
+			OP_DELETEA(test_vector);
+			return -6;
+		}
+		
+		if(pos + read_bytes > length)
+		{
+			OP_DELETEA(test_vector);
+			return -7;
+		}
+
+		if(use_separate_commit)
+		{
+			TRAP(op_err, second_test.CommitSampledBytesL(read_bytes));
+			if(OpStatus::IsError(op_err))
+			{
+				OP_DELETEA(test_vector);
+				return -71;
+			}
+		}
+
+		if(op_memcmp(test_vector+pos, testbuffer, read_bytes) != 0)
+		{
+			OP_DELETEA(test_vector);
+			return -8;
+		}
+
+		pos += read_bytes;
+	}
+
+	if(second_test.GetDirectPayload() == NULL)
+	{
+		OP_DELETEA(test_vector);
+		return -9;
+	}
+
+	if(second_test.GetLength() != length)
+	{
+		OP_DELETEA(test_vector);
+		return -10;
+	}
+
+	if(op_memcmp(second_test.GetDirectPayload(), test_vector, length) != 0)
+	{
+		OP_DELETEA(test_vector);
+		return -11;
+	}
+
+#ifdef DATASTREAM_USE_FLEXIBLE_SEQUENCE
+	if(!(second_test == first_test))
+	{
+		OP_DELETEA(test_vector);
+		return -12;
+	}
+#endif
+
+	OP_DELETEA(test_vector);
+	
+	return 0;
+}
+
+class TestVectorRecord : public DataStream_GenericRecord_Small
+{
+protected:
+	virtual DataStream *CreateRecordL()
+	{
+		return OP_NEW(TestVectorRecord,());
+	}
+};
+
+int TestIncompleteVector(unsigned long length)
+{
+	DataStream_NonSensitive_ByteArray(tester);
+	OP_STATUS op_err;
+	
+	unsigned char *test_vector = OP_NEWA(unsigned char, 1000);
+	if(!test_vector)
+	{
+		return -1000;
+	}
+
+	Randomize(test_vector, 1000);
+
+	int count=0;
+	TestVectorRecord test_template;
+	TRAP(op_err, test_template.AddContentL(test_vector, 1000));
+	OP_DELETEA(test_vector);
+	test_vector = NULL;
+	
+	if(OpStatus::IsError(op_err) || test_template.GetLength() != 1000)
+	{
+		return -100;
+	}
+
+	DataStream_ByteArray test_base;
+	TestVectorRecord test_ground;
+	OpAutoPtr<TestVectorRecord> test_read;
+
+	test_base.SetNeedDirectAccess(TRUE);
+	while(test_base.GetLength() <= length)
+	{
+		count ++;
+		test_template.SetTag(count);
+		TRAP(op_err, test_template.WriteRecordL(&test_base));
+		if(OpStatus::IsError(op_err))
+		{
+			return -200;
+		}
+		if(test_base.GetLength() == length)
+			length +=10;
+
+	}
+
+
+	test_ground.SetNeedDirectAccess(TRUE);
+	TRAP(op_err, test_ground.WriteDataL(test_base.GetDirectPayload(),length));
+	if(OpStatus::IsError(op_err) || test_ground.GetLength() != length)
+	{
+		return -300;
+	}
+
+	int i;
+
+	test_ground.ResetRead();
+	for (i=1;i<count;i++)
+	{
+		test_read.reset();
+		TRAP(op_err, test_read.reset((TestVectorRecord *) test_ground.GetNextRecordL()));
+
+		if(OpStatus::IsError(op_err))
+		{
+			output("%d %d\n", i, (int) op_err);
+			return -400;
+		}
+
+		if(test_read.get() == NULL)
+		{
+			output("%d %d %d\n", i, (int) count, length);
+			return -450;
+		}
+
+		if(!test_read->Finished())
+		{
+			test_read.release(); // test_ground will release since it is unfinished
+			return -500;
+		}
+	}
+
+	// Incomplete record
+	test_read.reset();
+	TRAP(op_err, test_read.reset((TestVectorRecord *) test_ground.GetNextRecordL()));
+
+	if(OpStatus::IsError(op_err))
+	{
+		if(op_err == OpRecStatus::RECORD_TOO_SHORT)
+			return 0; // Passed
+		return -600;
+	}
+
+	if(test_read.get() == NULL)
+	{
+		return 0; //passed
+	}
+
+	if(test_read->Finished())
+	{
+		test_read.reset();
+		return -700;
+	}
+
+	test_read.release(); // test_ground will release since it is unfinished
+
+	return 0;
+}
+
+
+
+}
+
+
+table TestLengths (unsigned long)
+{
+	{1},
+	{2},
+	{4},
+	{8},
+	{16},
+	{32},
+	{64},
+	{127},
+	{128},
+	{129},
+	{1024},
+	{4096},
+	{8192},
+	{16383},
+	{16384},
+	{16385},
+	{32*1024},
+	{65400},
+	{65500},
+	{65536},
+	{65537},
+	{128*1024},
+	{256*1024},
+	{512*1024},
+	{1024*1024},
+	/*{32*1024*1024},
+	{64*1024*1024},
+	{128*1024*1024},*/
+};
+
+
+test("DataStreamArrays")
+{
+	iterate (length) from TestLengths
+	{
+		verify(TestVector(length, FALSE) == 0);
+		verify(TestVector(length, TRUE) == 0);
+		verify(TestVector_Segments(length, FALSE, 1000) == 0);
+		verify(TestVector_Segments(length, TRUE, 1000) == 0);
+		verify(TestVector_Segments(length, FALSE, 10000) == 0);
+		verify(TestVector_Segments(length, TRUE, 10000) == 0);
+		verify(TestVector_Segments(length, FALSE, 100000) == 0);
+		verify(TestVector_Segments(length, TRUE, 100000) == 0);
+	}
+}
+
+table TestIncompleteLengths (unsigned long)
+{
+	{1},
+	{2},
+	{4},
+	{8},
+	{16},
+	{32},
+	{64},
+	{127},
+	{128},
+	{129},
+	{1024},
+	{4096},
+};
+
+test("incompleteVector")
+{
+	iterate (length) from TestIncompleteLengths
+	{
+		verify(TestIncompleteVector(length) == 0);
+	}
+}

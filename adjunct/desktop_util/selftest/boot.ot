@@ -1,0 +1,236 @@
+/* -*- Mode: c++; tab-width: 4; indent-tabs-mode: t; c-basic-offset: 4 -*-
+ *
+ * Copyright (C) 1995-2011 Opera Software AS.  All rights reserved.
+ *
+ * This file is part of the Opera web browser.	It may not be distributed
+ * under any circumstances.
+ *
+ * @author Wojciech Dzierzanowski (wdzierzanowski)
+ */
+
+group "desktop_util.boot";
+
+include "adjunct/desktop_util/boot/DesktopBootstrap.h";
+include "adjunct/quick/application/ApplicationAdapter.h";
+include "adjunct/quick/application/NonBrowserApplication.h";
+
+global
+{
+	class TestApplication : public NonBrowserApplication
+	{
+	public:
+		TestApplication() : started(FALSE)  {}
+
+		virtual OP_STATUS Start()
+		{
+			started = TRUE;
+			return OpStatus::OK;
+		}
+		BOOL IsStarted() const
+			{ return started; }
+
+		virtual OpUiWindowListener* CreateUiWindowListener()
+			{ return 0; }
+		virtual DesktopOpAuthenticationListener* CreateAuthenticationListener()
+			{ return 0; }
+		virtual DesktopMenuHandler* GetMenuHandler()
+			{ return NULL; }
+		virtual DesktopWindow* GetActiveDesktopWindow(BOOL toplevel_only)
+			{ return 0; }
+		virtual BOOL HasCrashed() const
+			{ return FALSE; }
+		virtual Application::RunType DetermineFirstRunType()
+			{ return Application::RUNTYPE_NORMAL; }
+		virtual BOOL IsExiting() const
+			{ return FALSE; }
+		virtual OperaVersion GetPreviousVersion()
+			{ return OperaVersion(); }
+		virtual UiContext* GetInputContext()
+			{ return NULL; }
+		virtual void SetInputContext(UiContext& input_context)
+			{}
+		virtual DesktopWindow* GetToplevelDesktopWindow(INT32 pos)
+			{ return NULL; }
+		virtual INT32 GetToplevelDesktopWindowCount()
+			{ return 0; }
+		virtual BOOL OpenURL(const OpStringC& address)
+			{ return FALSE; }
+
+	private:
+		BOOL started;
+	};
+
+	enum ListenerState
+	{
+		START,
+		APPLICATION_CREATED,
+		MANAGERS_CREATED,
+		STARTUP_DONE,
+		END,
+	};
+
+	class TestListener : public DesktopBootstrap::Listener
+	{
+	public:
+		TestListener() : m_application(NULL)
+		{
+			State() = START;
+		}
+
+		TestApplication* GetApplication()
+			{ return m_application; }
+
+		virtual Application* OnCreateApplication()
+		{
+			State() = APPLICATION_CREATED;
+			m_application = OP_NEW(TestApplication, ());
+			return OP_NEW(ApplicationAdapter, (m_application));
+		}
+		virtual StartupStepResult OnStepStartupSequence(MH_PARAM_1 par1,
+				MH_PARAM_2 par2)
+		{
+			static int count = 0;
+			if (++count >= 2)
+			{
+				State() = STARTUP_DONE;
+				return DONE;
+			}
+			return CONTINUE;
+		}
+		virtual OP_STATUS OnInitDesktopManagers(
+				ManagerHolder& manager_holder)
+		{
+			State() = MANAGERS_CREATED;
+			return OpStatus::OK;
+		}
+		virtual void OnShutDown()
+			{ State() = END; }
+
+		static ListenerState& State()
+		{
+			static ListenerState state = START;
+			return state;
+		}
+
+	private:
+		TestApplication* m_application;
+	};
+
+	struct BootingProduct
+	{
+		static DesktopBootstrap::Product*& Get()
+		{
+			static DesktopBootstrap::Product* product = NULL;
+			return product;
+		}
+	};
+
+	class EnabledProduct : public DesktopBootstrap::Product
+	{
+	public:
+		explicit EnabledProduct(const char* name) : m_name(name)  {}
+
+		virtual const char* GetName() const
+			{ return m_name; }
+		virtual OP_STATUS BootMe(BOOL& boot_me) const
+			{ boot_me = TRUE; return OpStatus::OK; }
+		virtual OP_STATUS GetOperaProfileName(OpString& profile_name) const
+		{
+			// Mark ourselves as the product being booted.
+			BootingProduct::Get() = const_cast<EnabledProduct*>(this);
+			// Fail so that DesktopBootstrap::Init() doesn't call ResourceUtils.
+			return OpStatus::ERR;
+		}
+		virtual DesktopBootstrap::Listener* CreateBootstrapListener() const
+			{ return OP_NEW(TestListener, ()); }
+	private:
+		const char* m_name;
+	};
+
+	class DisabledProduct : public DesktopBootstrap::Product
+	{
+	public:
+		explicit DisabledProduct(const char* name) : m_name(name)  {}
+
+		virtual const char* GetName() const
+			{ return m_name; }
+		virtual OP_STATUS BootMe(BOOL& boot_me) const
+			{ boot_me = FALSE; return OpStatus::OK; }
+		virtual OP_STATUS GetOperaProfileName(OpString& profile_name) const
+		{
+			// Mark ourselves as the product being booted.
+			BootingProduct::Get() = const_cast<DisabledProduct*>(this);
+			// Fail so that DesktopBootstrap::Init() doesn't call ResourceUtils.
+			return OpStatus::ERR;
+		}
+		virtual DesktopBootstrap::Listener* CreateBootstrapListener() const
+			{ return NULL; }
+	private:
+		const char* m_name;
+	};
+
+	class TestBootstrap : public DesktopBootstrap
+	{
+	public:
+		TestBootstrap()
+		{
+			AddProduct(OP_NEW(DisabledProduct, ("D0")));
+			AddProduct(OP_NEW(DisabledProduct, ("D1")));
+			AddProduct(OP_NEW(EnabledProduct, ("E0")));
+			AddProduct(OP_NEW(EnabledProduct, ("E1")));
+			AddProduct(OP_NEW(DisabledProduct, ("D2")));
+		}
+		Listener* GetListener()
+			{ return DesktopBootstrap::GetListener(); }
+		MessageObject* GetMessageObject()
+			{ return DesktopBootstrap::GetMessageObject(); }
+	};
+}
+
+
+test("Choosing the right product")
+{
+	TestBootstrap bootstrap;
+	bootstrap.Init();
+	verify(BootingProduct::Get() != NULL);
+	verify(OpStringC8(BootingProduct::Get()->GetName()) == OpStringC8("E0"));
+
+	bootstrap.ShutDown();
+}
+
+test("Booting follows the right order")
+{
+	TestBootstrap bootstrap;
+
+	bootstrap.Init();
+
+	verify(bootstrap.GetApplication() == NULL);
+	verify(bootstrap.GetListener() != NULL);
+
+	TestListener& listener(static_cast<TestListener&>(
+			*bootstrap.GetListener()));
+
+	verify(TestListener::State() == START);
+
+	bootstrap.Boot();
+
+	verify(bootstrap.GetApplication() != NULL);
+	verify(!listener.GetApplication()->IsStarted());
+	verify(TestListener::State() == APPLICATION_CREATED);
+	
+	bootstrap.GetMessageObject()->HandleCallback(
+			MSG_QUICK_APPLICATION_START, 0, 0);
+	verify(!listener.GetApplication()->IsStarted());
+	verify(TestListener::State() == MANAGERS_CREATED);
+
+	bootstrap.GetMessageObject()->HandleCallback(
+			MSG_QUICK_APPLICATION_START_CONTINUE, 0, 0);
+	verify(listener.GetApplication()->IsStarted());
+	verify(TestListener::State() == STARTUP_DONE);
+
+	// After shut-down, Application is no more
+	bootstrap.ShutDown();
+	verify(bootstrap.GetApplication() == NULL);
+	verify(bootstrap.GetListener() == NULL);
+	verify(TestListener::State() == END);
+}

@@ -1,0 +1,172 @@
+/* -*- Mode: c++; tab-width: 4; indent-tabs-mode: t; c-basic-offset: 4 -*-
+**
+** Copyright (C) 2004-2011 Opera Software ASA.  All rights reserved.
+**
+** This file is part of the Opera web browser.  It may not be distributed
+** under any circumstances.
+**
+** Yngve N. Pettersen
+*/
+
+group "auth extended domain loading";
+
+require init;
+language c++;
+
+include "core/pch.h";
+
+require _ENABLE_AUTHENTICATE;
+require HTTP_DIGEST_AUTH;
+
+include "modules/dochand/win.h";
+include "modules/dochand/docman.h";
+include "modules/doc/frm_doc.h";
+
+include "modules/url/url_man.h";
+include "modules/network_selftest/basicwincom.h";
+include "modules/network_selftest/scanpass.h";
+include "modules/prefs/prefsmanager/collections/pc_files.h";
+
+global {
+
+	URL_DocSelfTest_Manager *auth_tests = NULL;
+	
+
+	class MultihostAuthenticationListener 
+		: public BasicWindowListener
+	{
+	private:
+		int attempt;
+	public:
+		MultihostAuthenticationListener (URL_DocSelfTest_Manager *manager, OpLoadingListener *fallback)
+			: BasicWindowListener(manager, fallback), attempt(0) {}
+
+		virtual ~MultihostAuthenticationListener(){}
+
+		BOOL Authenticate(OpAuthenticationCallback* callback)
+		{
+			if(callback == NULL)
+				return FALSE;
+
+			if(attempt > 0)
+			{
+				callback->CancelAuthentication();
+				URL empty;
+				ReportFailure(empty, "Too many retries");
+			}
+
+			callback->Authenticate(UNI_L("opera"), UNI_L("test"));
+			attempt++;
+
+			return TRUE;
+		}
+
+		virtual void OnAuthenticationRequired(OpWindowCommander* commander, OpAuthenticationCallback* callback)
+		{
+			if (Authenticate(callback))
+				return;
+			else
+			{
+				URL empty;
+				ReportFailure(empty,"Authentication failed");
+			}
+		}
+	};
+
+    MultihostAuthenticationListener *listener = NULL;
+	WindowCommander *wc=NULL;
+}
+
+table url_list(const char *) 
+{
+	//{"http://apache2.lab.osa/apache2/http/auth/multiserver/"},
+	//{"http://apache2.lab.osa:81/http/auth/multiserver/"},
+	//{"http://qatest1.vlab.osa/http/auth/multiserver/"},
+	{"http://certo3.opera.com/http-protocol-tests/auth/multiserver/"},
+	{"http://certo3.opera.com:8080/http-protocol-tests/auth/multiserver/"},
+	{"http://certo2.opera.com/http/auth/multiserver/"},
+	{"http://netcore3.oslo.osa/netcore/http/auth/multiserver/"},
+};
+ 
+html { "<html><body>Empty document, Authentication going on. An authentication dialog is a failure.</body></html>" };
+ 
+setup 
+{
+	urlManager->Clear_Authentication_List();
+	auth_tests = OP_NEW(URL_DocSelfTest_Manager, ());
+}
+
+exit
+{
+	OP_DELETE(auth_tests);
+	auth_tests = NULL;
+	if(wc)
+	    wc->SetLoadingListener(listener->GetFallback());
+	OP_DELETE(listener);
+	listener = NULL;
+	urlManager->Clear_Authentication_List();
+}
+
+test("Initialized")
+{
+	verify(auth_tests != NULL);
+}
+
+subtest AddScanPassTest(URL_DocSelfTest_Batch *batch, const OpStringC8 &url, URL &ref_url)
+{
+	verify(batch != NULL);
+	verify(url.HasContent());
+
+	OpAutoPtr<ScanPass_SimpleTester> test(OP_NEW(ScanPass_SimpleTester, ()));
+	verify(test.get() != NULL);
+
+	verify(OpStatus::IsSuccess(test->Construct(url, ref_url, "<p>You made it!</p>")));
+
+	verify(batch->AddTestCase(test.release()));
+}
+
+
+subtest AddBatch(URL_DocSelfTest_Batch *batch)
+{
+	verify(batch != NULL);
+	verify(auth_tests->AddBatch(batch));
+}
+
+subtest StartTestSet()
+{
+	verify(auth_tests->SetLastBatch());
+}
+
+subtest Setup_MultipleTests(const OpStringC8 &batch_id)
+{
+	URL empty_ref;
+	iterate (url) from url_list
+	{
+		OpAutoPtr<URL_DocSelfTest_Batch> batch(OP_NEW(URL_DocSelfTest_Batch, ()));
+
+		verify(batch.get() != NULL);
+
+		batch->Construct(state.doc->GetMessageHandler());
+		batch->SetBatchID(batch_id);
+
+		verify(AddScanPassTest(batch.get(), url, empty_ref));
+
+		verify(!batch->Empty());
+
+		verify(AddBatch(batch.release()));
+	}
+}
+
+test("test multi-domain authentication")
+	require success "Initialized";
+    async;
+{
+    wc = state.doc->GetWindow()->GetWindowCommander();
+    WindowCommander::SelftestHelper helper(wc);
+    listener = OP_NEW(MultihostAuthenticationListener, (auth_tests, helper.GetPlatformLoadingListener()));
+    wc->SetLoadingListener(listener);
+
+	if (!Setup_MultipleTests("[Multi_1]") ||
+		!StartTestSet())
+		ST_failed("Could not start test set");
+}

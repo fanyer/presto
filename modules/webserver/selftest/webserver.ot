@@ -1,0 +1,2878 @@
+/** -*- Mode: c++; tab-width: 4; c-basic-offset: 4 -*-
+ *
+ * Copyright (C) 1995-2010 Opera Software AS.  All rights reserved.
+ *
+ * This file is part of the Opera web browser.
+ * It may not be distributed under any circumstances.
+ */
+group "webserver.api.test";
+
+include "modules/security_manager/include/security_manager.h";
+include "modules/webserver/webserver-api.h";
+include "modules/webserver/webserver_resources.h";
+include "modules/webserver/webserver_direct_socket.h";
+include "modules/webserver/webserver_request.h";
+include "modules/webserver/src/rendezvous/webserver_rendezvous.h";
+include "modules/webserver/src/webservercore/webserver_connection.h";
+include "modules/prefs/prefsmanager/collections/pc_webserver.h";
+include "modules/pi/network/OpSocket.h";
+include "modules/pi/network/OpSocketAddress.h";
+require init;
+require DOM_GADGET_FILE_API_SUPPORT;
+require WEBSERVER_SUPPORT;
+
+/* When the selftest is running, a basic test service "selftest" has been installed in the window */
+html
+{
+//!	<html> <head>
+//!	<script type='text/javascript' language='javascript'>
+//!	var ws = opera.io.webserver;
+//!	var g_server = "localhost:" + ws.port;
+//!	var g_service_url = "http://" + g_server +  ws.currentServicePath;
+//!
+//!	function testReturn(mex, open_url, expected_result, expected_status)
+//!	{
+//!		var timeoutid = setTimeout("ST_failed('testReturn TIMEOUT: webserver did not respond', 'webserver.ot', 0)", 5000);
+//!		var xhr = new XMLHttpRequest();
+//!
+//!		if(open_url.slice(0, 5)!='http:' && open_url.slice(0, 6)!='unite:')
+//!			open_url=g_service_url + open_url;
+//!
+//!		if(!expected_status || expected_status=="undefined" || typeof(expected_status)=="undefined")
+//!			expected_status=200;
+//!
+//!		xhr.onreadystatechange = function()
+//!		{
+//!			if (xhr.readyState == 4)
+//!			{
+//!				clearTimeout(timeoutid);
+//!
+//!				if(xhr.status == expected_status)
+//!				{
+//!					if(expected_result && typeof(expected_result)!="undefined" && expected_result!="undefined")
+//!					{
+//!						if(xhr.responseText==expected_result)
+//!						{
+//!							/*opera.postError("Response OK: " + mex + " - url " + open_url + " - Status: " + xhr.status);*/
+//!							ST_passed();
+//!						}
+//!						else
+//!							ST_failed("Wrong answer from " + open_url + "(" + mex + "): " + xhr.responseText + " != " + expected_result, "webserver.ot", 0);
+//!					}
+//!					else
+//!					{
+//!						/*opera.postError("Status OK: " + mex + " - url " + open_url + " - Status: " + xhr.status);*/
+//!						ST_passed();
+//!					}
+//!				}
+//!				else
+//!				{
+//!					opera.postError("HTTP Status on " + open_url + " is wrong: " + xhr.status + " instead of " + expected_status);
+//!					ST_failed("HTTP Status on " + open_url + " is wrong: " + xhr.status + " instead of " + expected_status, "webserver.ot", 0);
+//!				}
+//!		    }
+//!		};
+//!		xhr.open("GET", open_url, true);
+//!		xhr.send("");
+//!	}
+//!
+//! function pasteInClipboard(mex, open_url)
+//!	{
+//!		var xhr = new XMLHttpRequest();
+//!		var timeoutid = setTimeout("ST_failed('pasteInClipboard TIMEOUT: webserver did not respond', 'webserver.ot', 0)", 5000);
+//!
+//!		if(open_url.slice(0, 5)!='http:' && open_url.slice(0, 6)!='unite:')
+//!			open_url=g_service_url + open_url;
+//!
+//!		xhr.onreadystatechange = function()
+//!		{
+//!			if (xhr.readyState == 4)
+//!			{
+//!				clearTimeout(timeoutid);
+//!
+//!				if(xhr.status == 200)
+//!				{
+//!					opera.postError("Response for " + mex + ": \r\n" + xhr.responseText);
+//!					ST_passed();
+//!				}
+//!				else
+//!				{
+//!					opera.postError("HTTP Status on " + open_url + " is wrong: " + xhr.status);
+//!					ST_failed("HTTP Status on " + open_url + " is wrong: " + xhr.status, "webserver.ot", 0);
+//!				}
+//!		    }
+//!		};
+//!		xhr.open("GET", open_url, true);
+//!		xhr.send("");
+//!	}
+//!
+//!	function createFile(mp, name, content)
+//!	{
+//!		var fs = mp.open(name, "w");
+//!		fs.write(content);
+//!		fs.close();
+//!	}
+//!
+//!	function generateBigString(num_kb)
+//!	{
+//!		var str_big="";
+//!		var str_1k="";
+//!		var i;
+//!
+//!		for(i=0; i<16; i++)
+//!			str_1k+="0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF";
+//!
+//!		for(i=0; i<num_kb; i++)
+//!			str_big+=str_1k;
+//!
+//!		return str_big;
+//!	}
+//!
+//!
+//!	</script>
+//!	</head></html>
+}
+
+
+global
+{
+	#define BUF_SIZE (512*1024)
+	#define MEDIUM_SIZE 32768
+
+	#define VERIFY_READ_ONLY(VAR, NAME, B) { try { VAR="fail"; B=false; ST_failed(NAME + " is not readonly!", 'webserver.ot', 0); } catch(e) { } }
+
+	OpSecurityManager::PrivilegedBlock g_webserver_privileged_block;
+	char *buf;
+	char *buf2;
+	char *buf3;
+	WebserverDirectServerSocket *srv;
+	WebserverDirectClientSocket *cli;
+	OpSocketAddress *addr;
+
+	void escapeTest(const char *unescaped8, const char *expected8)
+	{
+		OpString escaped;
+		OpString unescaped;
+		OpString8 escaped8;
+
+		if(	OpStatus::IsError(unescaped.Set(unescaped8)) ||
+			OpStatus::IsError(WebserverRequest::UrlEncodeString(unescaped, escaped)) ||
+			OpStatus::IsError(escaped8.Set(escaped.CStr())))
+			ST_failed("Error on escape initialization for %s", unescaped8);
+
+		if(escaped8.Compare(expected8))
+			ST_failed("Escaping error: %s != %s", escaped8.CStr(), expected8);
+	}
+
+	class EmptySocketListener: public OpSocketListener
+	{
+	public:
+		virtual ~EmptySocketListener() {}
+
+		virtual void OnSocketConnected(OpSocket* socket) { }
+		virtual void OnSocketDataReady(OpSocket* socket) { }
+		virtual void OnSocketDataSent(OpSocket* socket, UINT bytes_sent) { }
+		virtual void OnSocketClosed(OpSocket* socket)  { }
+	#ifdef SOCKET_LISTEN_SUPPORT
+		virtual void OnSocketConnectionRequest(OpSocket* socket) { }
+		virtual void OnSocketListenError(OpSocket* socket, OpSocket::Error error) { }
+	#endif // SOCKET_LISTEN_SUPPORT
+
+		virtual void OnSocketConnectError(OpSocket* socket, OpSocket::Error error) { }
+		virtual void OnSocketReceiveError(OpSocket* socket, OpSocket::Error error) { }
+		virtual void OnSocketSendError(OpSocket* socket, OpSocket::Error error) { }
+		virtual void OnSocketCloseError(OpSocket* socket, OpSocket::Error error) { }
+	};
+
+	class DataReader: public EmptySocketListener, MessageObject
+	{
+	private:
+		const char *buffer;
+		UINT32 bytes_to_read;
+		UINT32 original;
+		UINT32 max_read;
+		UINT32 threshold;  // used to switch between two buffers
+		BOOL error;
+
+	public:
+		DataReader(const char *ptr, UINT32 len, UINT32 max, UINT32 buffer_threshold=0)
+		{
+			buffer=ptr;
+			error=FALSE;
+
+			OP_ASSERT(ptr); SetExpectedBytes(len, max);
+
+			g_main_message_handler->SetCallBack(this, MSG_WEBSERVER_MESSAGE_DATA_READY, (MH_PARAM_1)this);
+			threshold=buffer_threshold;
+		}
+
+		~DataReader()
+		{
+			g_main_message_handler->RemoveCallBacks(this, (MH_PARAM_1)this);
+			g_main_message_handler->UnsetCallBacks(this);
+		}
+
+		void SetExpectedBytes(UINT32 len, UINT32 max) { bytes_to_read=len; original=len; max_read=max; OP_ASSERT(max_read<=bytes_to_read); }
+		void RestoreExpectedBytes() { SetExpectedBytes(original, max_read); error=FALSE; }
+		void SetThreshold(UINT32 buffer_threshold) { threshold=buffer_threshold; error=FALSE; RestoreExpectedBytes(); }
+
+		virtual void OnSocketDataReady(OpSocket* socket)
+		{
+			UINT bytes_read=0;
+			OP_STATUS ops=OpStatus::OK;
+
+			while(bytes_to_read && ops==OpStatus::OK)
+			{
+				ops=socket->Recv((void *)buffer, max_read, &bytes_read);
+
+				for(int i=0; i<(int)bytes_read; i++)
+				{
+					UINT32 total_read=i+original-bytes_to_read;
+					UINT32 offset=total_read;
+
+					if(threshold && offset>=threshold)
+						offset-=threshold;
+
+					if(buffer[i]!=(char)(offset%251))
+					{
+						if(!error)
+							ST_failed("Error after %d bytes: %d vs %d", total_read, buffer[i], (char)(offset%251));
+
+						error=TRUE;
+
+						return;
+					}
+				}
+
+				bytes_to_read-=bytes_read;
+
+				if(!bytes_to_read)
+				{
+					ops=socket->Recv((void *)buffer, max_read, &bytes_read);
+
+					output("All the %d bytes have been read\n", original);
+
+					if(bytes_read>0 && !error)
+						ST_failed("The socket has at least %d more bytes...\n", bytes_read);
+
+					ST_passed();
+				}
+				//else if(bytes_read)
+				//	output("Still %d bytes to read...\n", bytes_to_read);
+
+				if(!bytes_read)
+					break;
+			}
+
+			if(ops==OpSocket::SOCKET_BLOCKING)
+				output("Socket blocking...\n");
+			else if(OpStatus::IsError(ops))
+				ST_failed("Recv gave an error: %d", ops);
+		}
+
+		virtual void OnSocketSendError(OpSocket* socket, OpSocket::Error error_code)
+		{
+			if(!error)
+			{
+				if(error_code==OpSocket::SOCKET_BLOCKING)
+					g_main_message_handler->PostDelayedMessage(MSG_WEBSERVER_MESSAGE_DATA_READY, (MH_PARAM_1)this, (MH_PARAM_2)socket, 1);
+				else
+					ST_failed("Error during writing: %d", error_code);
+			}
+		}
+
+		virtual void HandleCallback(OpMessage msg, MH_PARAM_1 par1, MH_PARAM_2 par2)
+		{
+			switch (msg)
+			{
+				case MSG_WEBSERVER_MESSAGE_DATA_READY:  // Not really... but it is worth to try to send again
+					OnSocketDataReady((OpSocket*) par2);
+					break;
+
+				default:
+					break;
+			}
+		}
+	};
+
+	class DataWriter: public EmptySocketListener, public MessageObject
+	{
+		// First Write
+		const char *buffer;
+		UINT32 bytes_to_write;
+		UINT32 original;
+		UINT32 max_write;
+		int num;
+		WebserverDirectClientSocket *cli;
+
+		// Second write
+		const char *buffer2;
+		UINT32 bytes_to_write2;
+		UINT32 original2;
+		UINT32 max_write2;
+
+		OP_STATUS InternalSingleWrite()
+		{
+			if(bytes_to_write)
+			{
+				UINT size=(bytes_to_write>max_write?max_write:bytes_to_write);
+
+				if(!OpStatus::IsSuccess(cli->Send(buffer+original-bytes_to_write, size)))
+				{
+					ST_failed("Unable to send data");
+
+					return OpStatus::ERR;
+				}
+			}
+
+			return OpStatus::OK;
+		}
+
+	public:
+		DataWriter()
+		: buffer(NULL)
+		, bytes_to_write(0)
+		, original(0)
+		, max_write(0)
+		, num(0)
+		, cli(0)
+		{
+			Reset();
+
+			g_main_message_handler->SetCallBack(this, MSG_WEBSERVER_MESSAGE_DATA_READY_FOR_SENDING, (MH_PARAM_1)this);
+		}
+
+		void Reset()
+		{
+			buffer=NULL;
+			bytes_to_write=0;
+			original=0;
+			max_write=0;
+
+			buffer2=NULL;
+			bytes_to_write2=0;
+			original2=0;
+			max_write2=0;
+		}
+
+		OP_STATUS Write(WebserverDirectClientSocket *direct_socket, const char *ptr, UINT32 len, UINT32 max, BOOL reset=TRUE)
+		{
+			if(reset)
+				Reset();
+
+			if(!bytes_to_write)
+			{
+				cli=direct_socket;
+				cli->SetListener(this);
+
+				buffer=ptr;
+				bytes_to_write=len;
+				original=len;
+				max_write=max;
+				num=0;
+
+				OP_ASSERT(max_write<=bytes_to_write);
+				OP_ASSERT(ptr);
+
+				return InternalSingleWrite();
+			}
+			else if(buffer2)
+			{
+				ST_failed("No more than 2 pending writes allowed");
+
+				return OpStatus::ERR;
+			}
+			else
+			{
+				if(cli!=direct_socket)
+				{
+					ST_failed("Direct socket changed!");
+
+					return OpStatus::ERR;
+				}
+
+				buffer2=ptr;
+				bytes_to_write2=len;
+				original2=len;
+				max_write2=max;
+
+				OP_ASSERT(max_write2<=bytes_to_write2);
+				OP_ASSERT(ptr);
+			}
+
+			return OpStatus::OK;
+		}
+
+		virtual void OnSocketSendError(OpSocket* socket, OpSocket::Error error)
+		{
+			if(error==OpSocket::SOCKET_BLOCKING)
+				g_main_message_handler->PostDelayedMessage(MSG_WEBSERVER_MESSAGE_DATA_READY_FOR_SENDING, (MH_PARAM_1)this, 0, 1);
+			else
+				ST_failed("Error during writing: %d", error);
+		}
+
+		virtual void OnSocketDataSent(OpSocket* socket, UINT bytes_sent)
+		{
+			bytes_to_write-=bytes_sent;
+			num++;
+
+			if(!bytes_to_write)
+			{
+				//output("\n%d bytes sent in %d times\n", original, num);
+
+				if(buffer2)
+				{
+					buffer=buffer2;
+					bytes_to_write=bytes_to_write2;
+					original=original2;
+					max_write=max_write2;
+					num=0;
+
+					buffer2=NULL;
+					bytes_to_write2=0;
+					original2=0;
+					max_write2=0;
+
+					if(OpStatus::IsError(InternalSingleWrite()))
+						ST_failed("Error during second send");
+				}
+			}
+			else if(OpStatus::IsError(InternalSingleWrite()))
+				ST_failed("Error during send");
+		}
+
+		virtual void HandleCallback(OpMessage msg, MH_PARAM_1 par1, MH_PARAM_2 par2)
+		{
+			switch (msg)
+			{
+				case MSG_WEBSERVER_MESSAGE_DATA_READY_FOR_SENDING:  // Not really... but it is worth to try to send again
+					InternalSingleWrite();
+					break;
+
+				default:
+					break;
+			}
+		}
+
+		~DataWriter()
+		{
+			if(cli)
+				cli->SetListener(NULL);
+
+			g_main_message_handler->RemoveCallBacks(this, (MH_PARAM_1)this);
+			g_main_message_handler->UnsetCallBacks(this);
+		}
+	};
+
+	class TestListener: public WebserverEventListener
+	{
+	virtual void OnWebserverStopped(WebserverStatus status) { }
+	virtual void OnWebserverUPnPPortsClosed(UINT16 port) { }
+	virtual void OnWebserverServiceStarted(const uni_char *service_name, const uni_char *service_path, BOOL is_root_service = FALSE) { }
+	virtual void OnWebserverServiceStopped(const uni_char *service_name, const uni_char *service_path, BOOL is_root_service = FALSE) { }
+	virtual void OnWebserverListenLocalStarted(unsigned int port) { ST_passed(); }
+	virtual void OnWebserverListenLocalStopped() { }
+	virtual void OnWebserverListenLocalFailed(WebserverStatus status) { }
+
+#ifdef WEB_UPLOAD_SERVICE_LIST
+	virtual void OnWebserverUploadServiceStatus(UploadServiceStatus status) { }
+#endif // WEB_UPLOAD_SERVICE_LIST
+
+#ifdef WEBSERVER_RENDEZVOUS_SUPPORT
+	virtual void OnProxyConnected() { }
+	virtual void OnProxyConnectionFailed(WebserverStatus status, BOOL retry) { }
+	virtual void OnProxyConnectionProblem(WebserverStatus status,  BOOL retry) { }
+	virtual void OnProxyDisconnected(WebserverStatus status, BOOL retry, int code = 0) { }
+#endif
+
+	virtual void OnDirectAccessStateChanged(BOOL direct_access, const char* direct_access_address) { }
+	virtual void OnNewDOMEventListener(const uni_char *service_name, const uni_char *evt, const uni_char *virtual_path = NULL) { }
+	virtual void OnPortOpened(UPnPDevice *device, UINT16 internal_port, UINT16 external_port) { }
+	};
+
+	DataReader *dr_1024;
+	DataReader *dr_big;
+	DataReader *dr_big_mul;
+	DataReader *dr_32K;
+	DataReader *dr_prime;
+	DataWriter *dw;
+	WebserverEventListener *lsn;
+}
+
+setup
+{
+	buf=OP_NEWA(char, BUF_SIZE);
+	buf2=OP_NEWA(char, BUF_SIZE);
+	buf3=OP_NEWA(char, MEDIUM_SIZE);
+	dr_1024=OP_NEW(DataReader, (buf2, 1024, 1024));
+	dr_big=OP_NEW(DataReader, (buf2, BUF_SIZE, BUF_SIZE));
+	dr_big_mul=OP_NEW(DataReader, (buf2, BUF_SIZE, 16384));
+	dr_32K=OP_NEW(DataReader, (buf2, 32768, 32768));
+	dr_prime=OP_NEW(DataReader, (buf2, 32768, 3571));
+	OpSocketAddress::Create(&addr);
+	lsn=OP_NEW(TestListener, ());
+
+	dw=OP_NEW(DataWriter, ());
+
+	WebserverDirectClientSocket::CreateDirectClientSocket(&cli, NULL);
+	WebserverDirectServerSocket::CreateDirectServerSocket(&srv, FALSE);
+	srv->SetListener(dr_1024);
+}
+
+exit
+{
+	OP_DELETEA(buf);
+	OP_DELETEA(buf2);
+	OP_DELETEA(buf3);
+
+	OP_DELETE(dw);
+	OP_DELETE(cli);
+	OP_DELETE(srv);
+	OP_DELETE(dr_1024);
+	OP_DELETE(dr_big);
+	OP_DELETE(dr_big_mul);
+	OP_DELETE(dr_32K);
+	OP_DELETE(dr_prime);
+	OP_DELETE(addr);
+	OP_DELETE(lsn);
+}
+
+/// Test that the webserver correctly accept or refuse URLs for the more common corner cases
+test("Acceptable URLs")
+require _DEBUG;
+{
+	#define CHECK_URL_OK(url) WebserverFileName::DebugIsURLAcceptable(url)
+	#define CHECK_URL_OK_2(url, url2) WebserverFileName::DebugIsURLAcceptable(url, url2)
+	#define CHECK_URL_NOT_OK(url) WebserverFileName::DebugIsURLInAcceptable(url)
+	#define CHECK_URL_NOT_OK_2(url, url2) WebserverFileName::DebugIsURLInAcceptable(url, url2)
+
+	// Test ".."
+	verify(CHECK_URL_OK("/"));
+	verify(CHECK_URL_OK("/_root"));
+	verify(CHECK_URL_OK("/_root/abc"));
+	verify(CHECK_URL_OK_2("/_root/abc/..", "/_root"));
+	verify(CHECK_URL_OK_2("/_root/abc/../b", "/_root/b"));
+	verify(CHECK_URL_OK_2("/_root/abc/../b/..", "/_root"));
+	verify(CHECK_URL_OK("/_root/../"));
+	verify(CHECK_URL_OK("_root/./"));
+	verify(CHECK_URL_OK("_root/./b/../"));
+	verify(CHECK_URL_OK_2("/_root/a/b/c/../../..", "/_root"));
+	verify(CHECK_URL_OK_2("/_root/a/b/c/././../../..", "/_root"));
+	verify(CHECK_URL_OK_2("/_root/a/b/c/d/./.././../../././..", "/_root"));
+	verify(CHECK_URL_OK_2("/_root/./a/./b/././c/./d/./.././../../././..", "/_root"));
+	verify(CHECK_URL_OK_2("_root/./a/./b/././c/./d/./.././../../././..", "_root"));
+		// It shoud be "/"
+	verify(CHECK_URL_OK_2("/_root/./../", "//"));
+		// It shoud work
+	//verify(CHECK_URL_OK("_root/./../"));
+		// It shoud be "/"
+	verify(CHECK_URL_OK_2("/_root/./b/../../", "//"));
+		// It shoud work
+	//verify(CHECK_URL_OK("_root/./b/../../"));
+		// It shoud be "/b"
+	verify(CHECK_URL_OK_2("/abaco/../b", "//b"));
+		// It shoud be "/b/"
+	verify(CHECK_URL_OK_2("/abaco/../b/", "//b/"));
+		// It shoud work
+	//verify(CHECK_URL_OK_2("abaco/../b", "/b/"));
+		// It shoud be "/b"
+	verify(CHECK_URL_OK_2("/ab/../b", "//b"));
+		// It shoud be work
+	//verify(CHECK_URL_OK_2("/a/../b", "//b"));
+		// It shoud work
+	//verify(CHECK_URL_OK_2("a/../b", "/b/"));
+	verify(CHECK_URL_OK("./_root"));
+	verify(CHECK_URL_OK("./././_root"));
+	verify(CHECK_URL_OK("a"));
+	verify(CHECK_URL_NOT_OK("/_root/../../"));
+	verify(CHECK_URL_NOT_OK("./_root/../../"));
+	verify(CHECK_URL_NOT_OK("././_root/../../"));
+	verify(CHECK_URL_NOT_OK("_root/./../../"));
+		// TODO: it should be "/b"
+	verify(CHECK_URL_OK_2("/_root/abc/../../b", "//b"));
+	verify(CHECK_URL_NOT_OK("/_root/abc/../../../b"));
+	verify(CHECK_URL_NOT_OK("/_root/abc/../../../../../../b"));
+	verify(CHECK_URL_NOT_OK("/_root/abc/../../../b.."));
+		// TODO: it should be "/b"
+	verify(CHECK_URL_OK_2("/_root/../b", "//b"));
+	verify(CHECK_URL_NOT_OK("/../b"));
+	verify(CHECK_URL_NOT_OK("/.."));
+	verify(CHECK_URL_NOT_OK("/../"));
+	//verify(CHECK_URL_NOT_OK(".."));
+	//verify(CHECK_URL_NOT_OK("../"));
+		// It should be "/"
+	verify(CHECK_URL_OK_2("/./", "/./"));
+		// It should be "/"
+	verify(CHECK_URL_OK_2("/.", "/."));
+	verify(CHECK_URL_OK_2("./", "/"));
+		// It should probably be ""
+	//verify(CHECK_URL_OK_2(".", ""));
+	verify(CHECK_URL_OK_2("/_root/..b", "/_root/..b"));
+	verify(CHECK_URL_OK_2("/_root/a..b", "/_root/a..b"));
+	verify(CHECK_URL_OK_2("/_root/a....b", "/_root/a....b"));
+
+	// Test "+"
+	//verify(CHECK_URL_OK_2("/_root/a+b", "/_root/a b"));
+
+	// Test "%2e"
+	// TODO: it should be "/b"
+	verify(CHECK_URL_OK_2("/_root/%2e%2e/b", "//b"));
+	verify(CHECK_URL_NOT_OK("/%2e%2e/b"));
+}
+
+/// Test the reconnection timeout policy
+test("Timeouts")
+require WEBSERVER_RENDEZVOUS_SUPPORT;
+	{
+	TimeoutPolicy t1(0);
+	TimeoutPolicy t2(1);
+	TimeoutPolicy t3(2);
+	int i=0;
+
+	// Type check
+	verify(t1.GetType()==0);
+	verify(t2.GetType()==1);
+	verify(t3.GetType()==2);
+
+	// Basic check: 2, 4, 8, 10 STOP
+	t1.AddFiniteStep(2, 1, 0);
+	verify(t1.GetWaitTimeMS(0)==2000);
+	verify(t1.GetWaitTimeMS(1)==TIMEOUT_NEVER);
+	t1.AddFiniteStep(4, 1, 0);
+	t1.AddFiniteStep(8, 1, 0);
+	t1.AddFiniteStep(10, 1, 0);
+
+	verify(t1.GetWaitTimeMS(0)==2000);
+	verify(t1.GetWaitTimeMS(1)==4000);
+	verify(t1.GetWaitTimeMS(2)==8000);
+	verify(t1.GetWaitTimeMS(3)==10000);
+	verify(t1.GetWaitTimeMS(4)==TIMEOUT_NEVER);
+
+	// Multiple Step check: 2*10, 4*5, 8, 10*2 STOP
+	t2.AddFiniteStep(2, 10, 0);
+	t2.AddFiniteStep(4, 5, 0);
+	t2.AddFiniteStep(8, 1, 0);
+	t2.AddFiniteStep(10, 2, 0);
+
+	for(i=10; i<15; i++)
+		verify(t2.GetWaitTimeMS(i)==4000);
+	for(i=0; i<10; i++)
+		verify(t2.GetWaitTimeMS(i)==2000);
+	verify(t2.GetWaitTimeMS(15)==8000);
+	verify(t2.GetWaitTimeMS(16)==10000);
+	verify(t2.GetWaitTimeMS(17)==10000);
+	verify(t2.GetWaitTimeMS(18)==TIMEOUT_NEVER);
+	verify(t2.GetWaitTimeMS(1000)==TIMEOUT_NEVER);
+
+	// Infinite step
+	t2.AddInfiniteStep(86400, 0);
+	for(i=10; i<15; i++)
+		verify(t2.GetWaitTimeMS(i)==4000);
+	for(i=0; i<10; i++)
+		verify(t2.GetWaitTimeMS(i)==2000);
+	verify(t2.GetWaitTimeMS(15)==8000);
+	verify(t2.GetWaitTimeMS(16)==10000);
+	verify(t2.GetWaitTimeMS(17)==10000);
+	verify(t2.GetWaitTimeMS(18)==86400000);
+	verify(t2.GetWaitTimeMS(1000)==86400000);
+	verify(t2.GetWaitTimeMS(1000000000)==86400000);
+
+	// Multiple Step check with random: 2*50, 4*150, 8*1800, 60(infinite)
+	t3.AddFiniteStep(2, 50, 3);
+	t3.AddFiniteStep(4, 150, 7);
+	t3.AddFiniteStep(8, 1800, 10);
+	t3.AddInfiniteStep(60, 30);
+
+	for(i=0; i<50; i++)
+		verify(t3.GetWaitTimeMS(i)>=2000 && t3.GetWaitTimeMS(i)<=2000+3000);
+	for(i=50; i<200; i++)
+		verify(t3.GetWaitTimeMS(i)>=4000 && t3.GetWaitTimeMS(i)<=4000+7000);
+	for(i=200; i<2000; i++)
+		verify(t3.GetWaitTimeMS(i)>=8000 && t3.GetWaitTimeMS(i)<=8000+10000);
+	for(i=2000; i<5000; i++)
+		verify(t3.GetWaitTimeMS(i)>=60000 && t3.GetWaitTimeMS(i)<=60000+30000);
+
+	verify(t3.GetWaitTimeMS(1000000000)>=60000 && t3.GetWaitTimeMS(1000000000)<=60000+30000);
+
+	// AutoStep test
+	t3.ResetStep();
+
+	int wait=0;
+
+	for(i=0; i<50; i++)
+	{
+		wait=t3.GetAutoWaitTimeMS();
+		verify(wait>=2000 && wait<=2000+3000);
+	}
+	for(i=50; i<200; i++)
+	{
+		wait=t3.GetAutoWaitTimeMS();
+		verify(wait>=4000 && wait<=4000+7000);
+	}
+	for(i=200; i<2000; i++)
+	{
+		wait=t3.GetAutoWaitTimeMS();
+		verify(wait>=8000 && wait<=8000+10000);
+	}
+	for(i=2000; i<5000; i++)
+	{
+		wait=t3.GetAutoWaitTimeMS();
+		verify(wait>=60000 && wait<=60000+30000);
+	}
+
+	verify(t3.GetWaitTimeMS(1000000000)>=60000 && t3.GetWaitTimeMS(1000000000)<=60000+30000);
+}
+
+test("Start WebServer if required") async;
+	{
+	if(g_webserver->IsRunning() && g_webserver->GetLocalListeningPort())
+	{
+		output("WebServer running on port %d\n", (UINT32) g_webserver->GetLocalListeningPort());
+
+		ST_passed();
+	}
+	else
+	{
+		ST_failed("WebServer not running...\n ");
+	}
+}
+
+test("wait the webserver")
+	async;
+	language ecmascript;
+	require undefined GOGI;
+	{
+	setTimeout("ST_passed()", 5000);
+}
+
+test("Start UPnP Service discovery")
+require UPNP_SUPPORT;
+require UPNP_SERVICE_DISCOVERY;
+require undefined LINGOGI;
+{
+	g_webserver->EnableUPnPServicesDiscovery();
+}
+
+test("info on output")
+	{
+#ifdef WEBSERVER_RENDEZVOUS_SUPPORT
+	OpString8 device, proxy, user;
+
+	device.Set(g_pcwebserver->GetStringPref(PrefsCollectionWebserver::WebserverDevice).CStr());
+	proxy.Set(g_pcwebserver->GetStringPref(PrefsCollectionWebserver::WebserverProxyHost).CStr());
+	user.Set(g_pcwebserver->GetStringPref(PrefsCollectionWebserver::WebserverUser).CStr());
+
+	output("\nPort: %d - Device: %s - Proxy: %s - User: %s\n", g_webserver->GetLocalListeningPort(), device.CStr(), proxy.CStr(), user.CStr());
+#endif
+	output("Number of SubServers running: %d\n", g_webserver->GetSubServerCount());
+	for(UINT32 i=0; i<g_webserver->GetSubServerCount(); i++)
+	{
+		WebSubServer *wss=g_webserver->GetSubServerAtIndex(i);
+
+		if(wss)
+		{
+			OpString8 wss_name;
+			OpString8 wss_storage;
+
+			wss_name.Set(wss->GetSubServerName().CStr());
+			wss_storage.Set(wss->GetSubServerStoragePath().CStr());
+			output("* %d is %s - storage: %s\n", i, wss_name.CStr(), wss_storage.CStr());
+		}
+	}
+}
+
+
+test("info on console")
+language ecmascript;
+{
+	opera.postError(g_service_url + "\nDevice: " + ws.deviceName + " - port: " + ws.port + "\nProxy: " + ws.proxyName + " - User: " + ws.userName);
+}
+
+test("set service url")
+language ecmascript;
+require undefined GOGI;
+{
+	g_service_url = "http://" + ws.deviceName +  "." + ws.userName + ".operaunite.com/" + ws.currentServicePath;
+	opera.postError("New Cervice URL: " + g_service_url);
+}
+
+/*test("Test WebServer presence: selftest")
+	async;
+	language ecmascript;
+{
+	verify(ws.port != null);
+	verify(ws.port != undefined);
+	verify(typeof(ws.port) != "undefined");
+	verify(ws.port != "");
+
+	testReturn("WebServer presence: selftest", "http://localhost:" + ws.port + "/selftest/");
+}*/
+
+test("Test WebServer presence")
+	async;
+	language ecmascript;
+	require GOGI;
+	{
+	verify(ws.port != null);
+	verify(ws.port != undefined);
+	verify(typeof(ws.port) != "undefined");
+	verify(ws.port != "");
+
+	var open_url="http://" + g_server;
+
+	opera.postError("Testing WebServer presence on " + open_url);
+	testReturn("WebServer presence", open_url);
+}
+
+test("hostName, publicIP, publicPort and read-only values")
+language ecmascript;
+{
+	function testcase()
+	{
+		"use strict";
+
+		var b=true;
+
+		// I want macro in Javascript... String are passed by value... :-(
+		try { ws.publicIP="fail"; b=false; ST_failed("ws.publicIP is not readonly!", 'webserver.ot', 0); } catch(e) { }
+
+		verify(b); // Stop creating problems to the other tests...
+
+		var hn=ws.hostName;
+		var ip=ws.publicIP;
+		var port=ws.publicPort;
+
+		try { ws.hostName="fail"; b=false; ST_failed("ws.hostName is not readonly!", 'webserver.ot', 0); } catch(e) { opera.postError("Exception on readonly: " + e); }
+		try { ws.publicPort="fail"; b=false; ST_failed("ws.publicPort is not readonly!", 'webserver.ot', 0); } catch(e) { }
+
+		try { ws.deviceName="fail"; b=false; ST_failed("ws.deviceName is not readonly!", 'webserver.ot', 0); } catch(e) { }
+		try { ws.userName="fail"; b=false; ST_failed("ws.userName is not readonly!", 'webserver.ot', 0); } catch(e) { }
+		try { ws.proxyName="fail"; b=false; ST_failed("ws.proxyName is not readonly!", 'webserver.ot', 0); } catch(e) { }
+		try { ws.currentServiceName="fail"; b=false; ST_failed("ws.currentServiceName is not readonly!", 'webserver.ot', 0); } catch(e) { }
+		try { ws.currentServicePath="fail"; b=false; ST_failed("ws.currentServicePath is not readonly!", 'webserver.ot', 0); } catch(e) { }
+
+		// Test a custom property
+		try { ws.custom_property="fail"; ws.path="fail"; } catch(e) {  }
+		if(ws.custom_property!="fail" || ws.path!="fail")
+		{
+			b=false;
+			ST_failed("Custom properties not allowed on the WebServer object", 'webserver.ot', 0);
+		}
+
+		opera.postError("hostName-ip-port was " + hn + " * " + ip + " * " + port + "\nNow it is " + ws.hostName + " * " + ws.publicIP + " * " + ws.publicPort);
+
+		verify(b);
+	}
+	testcase();
+}
+
+test("Root test 1")
+	async;
+	language ecmascript;
+	require GOGI;
+	{
+	testReturn("Root test 1", "http://" + g_server);
+}
+
+test("Root test 2")
+	async;
+	language ecmascript;
+	require GOGI;
+	{
+	testReturn("Root test 2", "http://" + g_server + "/_root/");
+}
+
+/*test("Root test 3")
+	async;
+	language ecmascript;
+{
+	testReturn("Root test 3", "unite://" + g_server + "/");
+}
+
+test("Root test 4")
+	async;
+	language ecmascript;
+{
+	testReturn("Root test 4", "unite://" + g_server + "/_root/");
+}*/
+
+test("Share File - storage")
+	async;
+	language ecmascript;
+	{
+	var mp = opera.io.filesystem.mountSystemDirectory("storage", "shareTestStorage0");
+
+	createFile(mp, "testShareF.txt", "success");
+
+	ws.sharePath("FShare1", mp.resolve("testShareF.txt"));
+
+	testReturn("Share File - storage", "FShare1", "success");
+}
+
+test("Share File - already shared")
+	fails;
+	language ecmascript;
+	{
+	var mp = opera.io.filesystem.mountSystemDirectory("storage", "shareTestStorage0");
+
+	createFile(mp, "testShareF.txt", "success");
+
+	ws.sharePath("FShare1", mp.resolve("testShareF.txt"));
+
+	testReturn("Share File - storage", "FShare1", "success");
+}
+
+test("unShare and re-share")
+	language ecmascript;
+	{
+	var mp = opera.io.filesystem.mountSystemDirectory("storage", "shareTestStorage0");
+
+	createFile(mp, "testShareF.txt", "success");
+
+	ws.unsharePath("FShare1");
+	ws.sharePath("FShare1", mp.resolve("testShareF.txt"));
+
+	testReturn("Share File - storage", "FShare1", "success");
+}
+
+
+test("Share File - multiple share with different virtual paths")
+	async;
+	language ecmascript;
+	{
+	var mp = opera.io.filesystem.mountSystemDirectory("storage", "shareTestStorage0");
+
+	createFile(mp, "testShareF.txt", "success")
+
+	var f=mp.resolve("testShareF.txt");
+
+	ws.sharePath("FShare1_b", f);
+	ws.sharePath("FShare2_b", f);
+	ws.sharePath("FShare3_b", f);
+
+	testReturn("Share File - storage", "FShare1_b", "success");
+	testReturn("Share File - storage", "FShare2_b", "success");
+	testReturn("Share File - storage", "FShare3_b", "success");
+}
+
+test("Share File - multiple share with same virtual paths")
+	async;
+	language ecmascript;
+	{
+	var mp = opera.io.filesystem.mountSystemDirectory("storage", "shareTestStorage0");
+
+	createFile(mp, "testShareF.txt", "success");
+
+	ws.sharePath("FShare1_c", mp.resolve("testShareF.txt"));
+	ws.sharePath("FShare2_c", mp.resolve("testShareF.txt"));
+
+	testReturn("Share File - storage", "FShare1_c", "success");
+	testReturn("Share File - storage", "FShare2_c", "success");
+}
+
+test("Share File 404- storage")
+	async;
+	language ecmascript;
+	{
+	var mp = opera.io.filesystem.mountSystemDirectory("storage", "shareTestStorage0b");
+
+	createFile(mp, "testShareF.txt", "success");
+
+	ws.sharePath("FShare1b", mp.resolve("testShareF.txt"));
+
+	testReturn("Share File Fail - storage", "FShare1fake", "undefined", 404);
+}
+
+test("Share File - multiple 1")
+	async;
+	language ecmascript;
+	{
+	var mp = opera.io.filesystem.mountSystemDirectory("storage", "shareTestStorage_dbl");
+
+	createFile(mp, "testShareF_dbl.txt", "success_dbl");
+
+	ws.sharePath("FShare_dbl_1", mp.resolve("testShareF_dbl.txt"));
+	ws.sharePath("FShare_dbl_2", mp.resolve("testShareF_dbl.txt"));
+	ws.sharePath("FShare_dbl_3", mp.resolve("testShareF_dbl.txt"));
+	ws.sharePath("FShare_dbl_4", mp.resolve("testShareF_dbl.txt"));
+	ws.sharePath("FShare_dbl_5", mp.resolve("testShareF_dbl.txt"));
+
+	testReturn("Share File - multiple", "FShare_dbl_3", "success_dbl");
+}
+
+/*test("Share File - multiple 2")
+	async;
+	language ecmascript;
+{
+	var mp = opera.io.filesystem.mountSystemDirectory("storage", "shareTestStorage_dbl_b");
+
+	createFile(mp, "testShareF_dbl_b.txt", "success_dbl_b");
+
+	var f=mp.resolve("testShareF_dbl_b.txt");
+
+	ws.sharePath("FShare_dbl_b_1", f);
+	ws.sharePath("FShare_dbl_b_2", f);
+	ws.sharePath("FShare_dbl_b_3", f);
+	ws.sharePath("FShare_dbl_b_4", f);
+	ws.sharePath("FShare_dbl_b_5", f);
+
+	testReturn("Share File - multiple", "FShare_dbl_b_3", "success_dbl_b");
+}*/
+
+
+test("Share File with folder - storage")
+	async;
+	language ecmascript;
+	{
+	var mp = opera.io.filesystem.mountSystemDirectory("storage", "shareTestStorage1");
+
+	createFile(mp, "testShareF2.txt", "success");
+	createFile(mp, "test/testShareF2.txt", "success2");
+
+	ws.sharePath("FShare2", mp.resolve("testShareF2.txt"));
+	ws.sharePath("/test/FShare2", mp.resolve("test/testShareF2.txt"));
+
+	testReturn("Share File with folder - storage", "test/FShare2", "success2");
+}
+
+test("Share File with triple folder - storage")
+	async;
+	language ecmascript;
+	{
+	var mp = opera.io.filesystem.mountSystemDirectory("storage", "shareTestStorage1_3");
+
+	createFile(mp, "testShareF2.txt", "success");
+	createFile(mp, "test/a/b/testShareF2.txt", "success3");
+
+	ws.sharePath("FShare2_3", mp.resolve("testShareF2.txt"));
+	ws.sharePath("/test/c/d/FShare2_3", mp.resolve("test/a/b/testShareF2.txt"));
+
+	testReturn("Share File with triple folder - storage", "test/c/d/FShare2_3", "success3");
+}
+
+test("Share Directory with one shared file - storage")
+	async;
+	language ecmascript;
+	{
+	var mp = opera.io.filesystem.mountSystemDirectory("storage", "shareTestStorage4");
+
+	createFile(mp, "test/testShare.txt", "success");
+
+	ws.sharePath("/ShareD3", mp.resolve("test"));
+
+	testReturn("Share Directory with one shared file - storage", "ShareD3/testShare.txt", "success");
+}
+
+
+test("Share Directory with folder - storage")
+	async;
+	language ecmascript;
+	{
+	var mp = opera.io.filesystem.mountSystemDirectory("storage", "shareTestStorage5");
+
+	createFile(mp, "test/testShare.txt", "success2");
+
+	ws.sharePath("/test/ShareD", mp.resolve("test"));
+
+	testReturn("Share Directory with folder - storage", "test/ShareD/testShare.txt", "success2");
+}
+
+test("Share Directory with triple folder - storage")
+	async;
+	language ecmascript;
+	{
+	var mp = opera.io.filesystem.mountSystemDirectory("storage", "shareTestStorage5_3");
+
+	createFile(mp, "test/testShare_3.txt", "success3");
+
+	ws.sharePath("/test/a/b/ShareD_3", mp.resolve("test"));
+
+	testReturn("Share Directory with triple folder - storage", "test/a/b/ShareD_3/testShare_3.txt", "success3");
+}
+
+test("Share File with folder - application")
+	language ecmascript;
+	require undefined GOGI;
+	{
+	var mp = opera.io.filesystem.mountSystemDirectory("application", "shareTestApp");
+
+	opera.postError("Application Object is: " + mp + "\n");
+
+	if(mp && mp!=null && mp!=undefined && typeof(mp)!="undefined")
+	{
+		opera.postError("Application Path: " + mp.nativePath + "\n");
+
+		ST_passed();
+	}
+	else
+		ST_failed("application storage not correctly supported");
+}
+
+test("Basic GET request, write and close")
+	async;
+	language ecmascript;
+	{
+	var timeoutid = setTimeout("ST_failed('Basic GET request, write() and close() TIMEOUT: webserver did not respond', 'webserver.ot', 0)", 5000);
+	
+	verify(opera.io.webserver != null);
+	verify(ws != null && "server is not running");
+
+	got_response = false;
+
+	ws.addEventListener("test0", function(e)
+	                        {
+								var request = e.connection.request;
+								var response = e.connection.response;
+								var testUri = ws.currentServicePath + "test0";
+								if (request.uri != testUri || request.connection != e.connection)
+								{
+									response.setStatusCode(404);
+									response.write("test Uri: " + testUri + " - request uri: " + request.uri + " - Connections: " + (request.connection == e.connection))
+									response.close();
+									return;
+								}
+								response.write("suc");
+								response.flush();
+								response.write("cess");
+								response.close();
+
+	                        }, false);
+
+
+	/* Do an xhr request to the localhost:port/selftest/test0 here */
+
+	var xhr = new XMLHttpRequest();
+
+	xhr.open("GET", g_service_url + "test0", true);
+
+	xhr.onreadystatechange = function()
+	{
+
+		if (xhr.readyState == 4)
+		{
+			clearTimeout(timeoutid);
+			verify(xhr.responseText == "success");
+			verify(xhr.status == 200);
+			ST_passed();
+		}
+	};
+	xhr.send("");
+}
+
+test("Basic GET request, write and close info")
+	async;
+	language ecmascript;
+	{
+	var timeoutid = setTimeout("ST_failed('Basic GET request, write() and close() info TIMEOUT: webserver did not respond', 'webserver.ot', 0)", 5000);
+	
+	verify(opera.io.webserver != null);
+	verify(ws != null && "server is not running");
+
+	got_response = false;
+
+	ws.addEventListener("test_info", function(e)
+										{
+										   var request = e.connection.request;
+										   var response = e.connection.response;
+										   var ws=opera.io.webserver;
+										   var srv_path=g_service_url + "test_info";
+
+										   response.write('<!DOCTYPE html>'
+												+ '<html><head><title>Opera Unite Info</title></head>'
+												+ '<body><b>HostName: </b>' + ws.hostName+'<br />'
+												+ '<b>Device Name: </b>' + ws.deviceName+'<br />'
+												+ '<b>User Name: </b>' + ws.userName+'<br />'
+												+ '<b>Proxy Name: </b>' + ws.proxyName+'<br />'
+												+ '<b>Port </b>' + ws.port+'<br />'
+												+ '<b>Current Service Name: </b>' + ws.currentServiceName+'<br />'
+												+ '<b>Current Service Path: </b>' + ws.currentServicePath+'<br />'
+												+ '<b>Full Service Path: </b>' + srv_path +'<br />'
+												+ '</body></html>'
+											);
+											response.close();
+										}, false);
+
+
+	/* Do an xhr request to the localhost:port/selftest/test0 here */
+
+	var xhr = new XMLHttpRequest();
+
+	xhr.open("GET", g_service_url + "test_info", true);
+
+	xhr.onreadystatechange = function()
+	{
+		if (xhr.readyState == 4)
+		{
+			clearTimeout(timeoutid);
+
+			verify(xhr.status == 200);
+			ST_passed();
+		}
+	};
+	xhr.send("");
+}
+
+
+test("Basic POST request")
+	async;
+	language ecmascript;
+	{
+	var timeoutid = setTimeout("ST_failed('Basic POST request TIMEOUT: webserver did not respond', 'webserver.ot', 0)", 5000);
+	
+	ws.addEventListener("test1", function(e)
+	                        {
+								if (e.connection.request.method == "POST" && e.connection.request.body == "testing_post")
+								{
+									e.connection.response.write("success");
+									e.connection.response.close();
+									return;
+								}
+
+								e.connection.response.setStatusCode(404);
+								e.connection.response.close();
+
+	                        }, false);
+
+
+	var xhr = new XMLHttpRequest();
+
+	xhr.open("POST", g_service_url + "test1", true);
+
+	xhr.onreadystatechange = function()
+	{
+		if (xhr.readyState == 4)
+		{
+			clearTimeout(timeoutid);
+			verify(xhr.status == 200 && xhr.responseText == "success");
+			ST_passed();
+	    }
+	};
+
+	xhr.send("testing_post");
+}
+
+test("Items test")
+	async;
+	language ecmascript;
+	{
+	var timeoutid = setTimeout("ST_failed('Items test TIMEOUT: webserver did not respond', 'webserver.ot', 0)", 5000);
+	var val1_encoded="val+%20test^*()@%3F%3D%3E%3C%26%25%2B";
+	var val1_pluss_to_space_decoded="val %20test%5E*()@%3F%3D%3E%3C%26%25%2B";
+	var val1_decoded="val  test^*()@?=><&%+";
+
+	ws.addEventListener("test2", function(e)
+	                        {
+								var request = e.connection.request;
+								var response = e.connection.response;
+								var items = request.getItem("item");
+								var items1 = request.getItem("item1");
+								var items5 = request.getItem("item5");
+								var items3 = request.getItem("item3");
+
+								var items2 = request.getItem("nonExisting");
+								
+								if (items2 != null || items5[0] != "" || items5[1] != "" || items3[0] != "")
+								{
+									response.write("ITEMS TEST error phase 1");
+
+									response.setStatusCode(404);
+									response.close();
+									return;
+								}
+								
+								if (items.length != 2 || items[0] != val1_decoded || items[1] != "val2"   || items1[0] != "item1value")
+								{
+									if(items[0] != val1_decoded)
+										response.write("ITEMS TEST error phase 2 - item 0 error: " + items[0] + " != " + val1_decoded);
+									else
+										response.write("ITEMS TEST error phase 2");
+									
+									response.setStatusCode(404);
+									response.close();
+									return;
+								}
+								
+								var queryItems = request.queryItems;
+
+								if (queryItems["item"][0] != val1_pluss_to_space_decoded || queryItems["item"][1] != "val2"   || queryItems["item1"][0] != "item1value")
+								{
+									response.write("ITEMS TEST error phase 3: " + queryItems["item"][0] + " - " + queryItems["item"][1] + " - " + queryItems["item1"][0]);
+									response.setStatusCode(404);
+									response.close();
+									return;
+								}
+								
+								if (queryItems["item2"][0] != "" || queryItems["item3"][0] != ""   || queryItems["item4"][0] != "")
+								{
+									response.write("ITEMS TEST error phase 4");
+
+									response.setStatusCode(404);
+									response.close();
+									return;
+								}
+								
+								if (queryItems["item5"][0] != "" || queryItems["item5"][1] != "")
+								{
+									response.write("ITEMS TEST error phase 5");
+
+									response.setStatusCode(404);
+									response.close();
+									return;
+								}
+								
+								response.setStatusCode(200);
+								response.close();
+
+	                        }, false);
+
+
+	/* Do an xhr request to the localhost:port/selftest/test1 here */
+
+	var xhr = new XMLHttpRequest();
+
+	xhr.open("GET", g_service_url + "test2?=&=&=test===test&&&&item=" + val1_encoded + "&item1=item1value&item2&item3=&item4&item5&item5&item=val2", true);
+
+	xhr.onreadystatechange = function()
+	{
+		if (xhr.readyState == 4)
+		{
+			clearTimeout(timeoutid);
+			
+			if(xhr.status == 200)
+				ST_passed();
+			else
+				ST_failed("ITEMS TEST status: " + xhr.status + ". responseText: " + xhr.responseText , 'webserver.ot', 0);
+	    }
+	};
+
+	xhr.send("testing_post");
+}
+
+test("Request headers test")
+	async;
+	language ecmascript;
+	{
+	var timeoutid = setTimeout("ST_failed('Request headers test TIMEOUT: webserver did not respond', 'webserver.ot', 0)", 5000);
+	
+	function return_fail(response, txt)
+	{
+		response.write(txt);
+		response.setStatusCode(404);
+		response.close();
+		return;
+	}
+
+	function ensure_read_only(object, object_name, property_name, value_to_set)
+	{
+		var old_value = object[property_name]
+		object[property_name] = value_to_set;
+		if (object[property_name] != old_value)
+		{
+			object[property_name] = old_value;
+			throw new Error("Property " + object_name + "." + property_name + " is not read-only!");
+		}
+	}
+
+	ws.addEventListener("test3", function(e)
+	                        {
+								var request = e.connection.request;
+								var response = e.connection.response;
+								var headers = request.getRequestHeader("header1");
+								var headers2 = request.getRequestHeader("header2");
+
+								if(request.host=="Host")
+								{
+									return return_fail(response, "request.host is not working!");
+								}
+
+								try
+								{
+									ensure_read_only(request, "request", "host", "fail");
+									ensure_read_only(request, "request", "protocol", "fail");
+									ensure_read_only(request, "request", "connection", "fail");
+									ensure_read_only(request, "request", "method", "fail");
+									ensure_read_only(request, "request", "ip", "fail");
+									ensure_read_only(request, "request", "headers", "fail");
+									ensure_read_only(request, "request", "bodyItems", "fail");
+									ensure_read_only(request, "request", "queryItems", "fail");
+									ensure_read_only(request, "request", "files", "fail");
+									ensure_read_only(request, "request", "body", "fail");
+								}
+								catch(e)
+								{
+									return return_fail(response, "Error: " + e.message);
+								}
+
+								// Test a custom property
+								try { request.custom_property="pass"; request.path="pass"} catch(e) {  }
+								if(request.custom_property!="pass" || request.path!="pass")
+								{
+									return return_fail(response, "Custom properties not allowed on the Request object");
+								}
+
+								try
+								{
+									var connection = e.connection;
+									ensure_read_only(connection, "connection", "request", "fail");
+									ensure_read_only(connection, "connection", "response", "fail");
+									ensure_read_only(connection, "connection", "closed", "fail");
+									ensure_read_only(connection, "connection", "id", "fail");
+									ensure_read_only(connection, "connection", "isLocal", "fail");
+									ensure_read_only(connection, "connection", "isOwner", "fail");
+									ensure_read_only(connection, "connection", "isProxied", "fail");
+								}
+								catch(e)
+								{
+									return return_fail(response, "Error: " + e.message);
+								}
+
+								// Test a custom property
+								try { e.connection.custom_property="pass"; e.connection.path="pass"; } catch(e) {  }
+								if(e.connection.custom_property!="pass" || e.connection.path!="pass")
+								{
+									return return_fail(response, "Custom properties not allowed on the Connection object");
+								}
+
+								opera.postError("REQUEST HEADERS - host: " + request.host + " - protocol: " + request.protocol + " - custom on request: " + request.custom_property + " - " + request.path + " - custom on connection: " + e.connection.custom_property + " - " + e.connection.path);
+
+								if (headers.length != 1 || headers[0] != "value1"  || headers2[0] != "value2")
+								{
+									return return_fail(response, 'REQUEST HEADERS error: ' + headers.length + ' - ' + headers[0] + ' - ' + headers2[0]);
+								}
+
+								var allHeaders = request.headers;
+								if (allHeaders["header1"][0] != "value1" || allHeaders["header2"][0] != "value2")
+								{
+									return return_fail(response, 'REQUEST HEADERS error: ' + allHeaders["header1"][0] + ' - ' + allHeaders["header2"][0]);
+								}
+
+								response.setStatusCode(200);
+								response.close();
+
+	                        }, false);
+
+
+	var xhr = new XMLHttpRequest();
+
+	xhr.open("GET", g_service_url + "test3", true);
+	xhr.setRequestHeader( "header1", "value1");
+
+	xhr.setRequestHeader( "header2", "value2");
+
+	xhr.onreadystatechange = function()
+	{
+		if (xhr.readyState == 4)
+		{
+			clearTimeout(timeoutid);
+			
+			if(xhr.status == 200)
+				ST_passed();
+			else
+				ST_failed("REQUEST HEADERS test status: " + xhr.status + ". reponseText: " + xhr.responseText, 'webserver.ot', 0);
+	    }
+	};
+
+	xhr.send("testing_post");
+}
+
+test("Response Header test")
+	async;
+	language ecmascript;
+	{
+	var timeoutid = -1;
+	ws.setDefaultHeader("def1", "val1");
+	ws.setDefaultHeader("def2", "val2");
+
+	ws.addEventListener("test4", function(e)
+	                        {
+								var request = e.connection.request;
+								var response = e.connection.response;
+
+								response.setResponseHeader("header1", "value1");
+								response.setResponseHeader("header1", "value2", true);
+								response.setResponseHeader("header2", "value3");
+								response.setResponseHeader("header2", "value4", false);
+								response.setResponseHeader("def2", "new_val2");
+
+								response.close();
+
+	                        }, false);
+
+
+	var xhr = new XMLHttpRequest();
+
+	xhr.open("GET", g_service_url + "test4", true);
+	xhr.setRequestHeader( "header1", "value1");
+
+	xhr.setRequestHeader( "header2", "value2");
+
+	xhr.onreadystatechange = function()
+	{
+		if (xhr.readyState == 4)
+		{
+
+			clearTimeout(timeoutid);
+			verify(xhr.status == 200);
+			verify(xhr.getResponseHeader("header1") == "value1, value2");
+			verify(xhr.getResponseHeader("header2") == "value4");
+			verify(xhr.getResponseHeader("def1") == "val1");
+			verify(xhr.getResponseHeader("def2") == "new_val2");
+			ST_passed();
+	    }
+	};
+
+	timeoutid = setTimeout("ST_failed('Response Header test TIMEOUT: webserver did not respond', 'webserver.ot', 0)", 5000);
+
+	xhr.send("testing_post");
+
+}
+
+test("Flush callback test")
+	async;
+	language ecmascript;
+	{
+	var timeoutid = -1;
+	var callback2 = false;
+	var callback3 = false;
+	var callback4 = false;
+	var callback5 = false;
+
+	ws.addEventListener("test5", function(e)
+	                        {
+								var response = e.connection.response;
+
+								response.write("How ");
+								response.flush();
+								response.write("are ");
+								response.flush(function()
+												{
+													callback2 = true;
+		  										}
+								);
+
+								response.write("you ");
+								response.flush(function()
+												{
+													if (callback2 == true)
+														callback3 = true;
+		  										}
+								);
+
+								response.write("doing");
+								response.flush();
+
+								response.flush(function()
+												{
+													callback4 = false;
+													if (callback3 == true)
+													{
+														callback4 = true;
+													}
+		  										}
+								);
+								response.flush();
+
+								response.setStatusCode(200);
+								response.close(function()
+												{
+													callback5 = false;
+													if (callback4 == true)
+													{
+														callback5 = true;
+													}
+		  										});
+
+	                        }, false);
+
+
+	var xhr = new XMLHttpRequest();
+
+	xhr.open("GET", g_service_url + "test5", true);
+
+	xhr.onreadystatechange = function()
+	{
+		if (xhr.readyState == 4)
+		{
+			clearTimeout(timeoutid);
+			verify(xhr.status == 200 && callback5 == true && xhr.responseText == "How are you doing");
+			ST_passed();
+	    }
+	};
+
+	timeoutid = setTimeout("ST_failed('Flush callback test TIMEOUT: webserver did not respond', 'webserver.ot', 0)", 5000);
+	xhr.send("");
+}
+
+test("Writing images - canvas")
+	async;
+	language ecmascript;
+	{
+	var timeoutid = setTimeout("ST_failed('Writing images - canvas - TIMEOUT: webserver did not respond', 'webserver.ot', 0)", 5000);
+	
+	ws.addEventListener("test6", function(e)
+	                        {
+								var response = e.connection.response;
+
+								canvas = document.createElement('canvas');
+     							canvas.setAttribute('width', 100);
+     							canvas.setAttribute('height', 100);
+								ctx = canvas.getContext('2d');
+     							ctx.beginPath();
+						      	ctx.moveTo(30,96);
+						      	ctx.lineTo(70,66);
+						      	ctx.lineTo(75,76);
+						      	ctx.lineTo(100,15);
+						      	ctx.stroke();
+
+								response.setResponseHeader("Content-type", "image/png");
+								response.writeImage(canvas);
+								
+								response.close();
+	                        }, false);
+
+	var img = new Image();
+	
+    img.onload = function()
+	{
+		opera.postError("CANVAS: 4");
+    	clearTimeout(timeoutid);
+    	opera.postError("CANVAS: Cleared timeout " + timeoutid + " - " + img.width + " - " + img.height);
+		verify(img.width == 100 && img.height == 100);
+		ST_passed();
+	}
+
+	opera.postError("CANVAS: 1b - timeout: " + timeoutid);
+	img.src = g_service_url + "test6";
+}
+
+test("Writing images - file test")
+	async;
+	language ecmascript;
+	{
+	var timeoutid = -1;
+	// 3x2 red GIF 87a image
+	var img_ar=[ 0x47,0x49,0x46,0x38,0x37,0x61,0x03,0x00,0x02,0x00,0x88,0x00,0x00,0xFC,0x02,0x04,0x00,0x00,0x00,0x2C,0x00,0x00,0x00,0x00,0x03,0x00,0x02,0x00,0x00,0x02,0x02,0x84,0x5F,0x00,0x3B];
+    var bytes = new ByteArray(35);
+
+    for(var i=0; i<35; i++)
+        bytes[i]=img_ar[i];
+
+	var mp = opera.io.filesystem.mountSystemDirectory("storage", "writeImage");
+	var fs = mp.open("GifTest.gif", "w");
+	fs.writeBytes(bytes);
+	fs.close();
+
+	ws.addEventListener("test6_file", function(e)
+	                        {
+								var response = e.connection.response;
+
+								ws.sharePath("test6_file", mp.resolve("GifTest.gif"));
+								response.closeAndRedispatch();
+								ws.unsharePath("test6_file");
+
+								response.close();
+	                        }, false);
+
+	var img = new Image();
+    img.onload = function()
+	{
+    	clearTimeout(timeoutid);
+		verify(img.width == 3 && img.height == 2);
+		ST_passed();
+	}
+
+  	timeoutid = setTimeout("ST_failed('Writing images - file test TIMEOUT: webserver did not respond', 'webserver.ot', 0)", 5000);
+	img.src = g_service_url + "test6_file";
+}
+
+test("write file - Custom")
+	async;
+	language ecmascript;
+	{
+	var timeoutid = -1;
+	var filetext = "<html><body>This is served from file </body></html>";
+
+	var mp = opera.io.filesystem.mountSystemDirectory("storage", "foo1");
+	var fs = mp.open("test7", "w");
+	fs.write(filetext);
+	fs.close();
+
+	ws.addEventListener("test7", function(e)
+	                        {
+								var response = e.connection.response;
+								var file = mp.resolve("test7");
+								response.setResponseHeader("Content-Type", "text/html");
+								response.setResponseHeader("Content-Length", filetext.length);
+								response.writeFile(file);
+								response.close();
+	                        }, false);
+
+	var xhr = new XMLHttpRequest();
+
+	xhr.open("GET", g_service_url + "test7", true);
+
+	xhr.onreadystatechange = function()
+	{
+		if (xhr.readyState == 4)
+		{
+			clearTimeout(timeoutid);
+			verify(xhr.status == 200 && xhr.responseText == filetext);
+			verify(xhr.getResponseHeader("Content-Type") == "text/html");
+			verify(xhr.getResponseHeader("Content-Length") == filetext.length);
+			ST_passed();
+	    }
+	};
+
+	timeoutid = setTimeout("ST_failed('write file - Custom TIMEOUT: webserver did not respond', 'webserver.ot', 0)", 5000);
+	xhr.send("");
+}
+
+test("write file - auto Content-Type (JPEG) with closeAndRedispatch()")
+	async;
+	language ecmascript;
+	{
+	var timeoutid = -1;
+	var filetext = "<html><body>This is served from file </body></html>";
+
+	var mp = opera.io.filesystem.mountSystemDirectory("storage", "foo1");
+	var fs = mp.open("test7.jpg", "w");
+	fs.write(filetext);
+	fs.close();
+
+	ws.addEventListener("test7.jpg", function(e)
+	                        {
+								var response = e.connection.response;
+
+								ws.sharePath("test7.jpg", mp.resolve("test7.jpg"))
+								response.closeAndRedispatch();
+								ws.unsharePath("test7.jpg");
+	                        }, false);
+
+	var xhr = new XMLHttpRequest();
+
+	xhr.open("GET", g_service_url + "test7.jpg", true);
+
+	xhr.onreadystatechange = function()
+	{
+		if (xhr.readyState == 4)
+		{
+			clearTimeout(timeoutid);
+			verify(xhr.status == 200 && xhr.responseText == filetext);
+			verify(xhr.getResponseHeader("Content-Type") == "image/jpeg");
+			verify(xhr.getResponseHeader("Content-Length") == filetext.length);
+			ST_passed();
+	    }
+	};
+
+	timeoutid = setTimeout("ST_failed('write file - auto Content-Type (JPEG) with closeAndRedispatch() TIMEOUT: webserver did not respond', 'webserver.ot', 0)", 5000);
+	xhr.send("");
+}
+
+test("write file - auto Content-Type (HTML) with closeAndRedispatch()")
+	async;
+	language ecmascript;
+	{
+	var timeoutid = -1;
+	var filetext = "<html><body>This is served from file </body></html>";
+
+	var mp = opera.io.filesystem.mountSystemDirectory("storage", "foo1");
+	var fs = mp.open("test7_b", "w");
+	fs.write(filetext);
+	fs.close();
+
+	ws.addEventListener("test7_b", function(e)
+	                        {
+								var response = e.connection.response;
+								ws.sharePath("test7_b", mp.resolve("test7_b"))
+								response.closeAndRedispatch();
+								ws.unsharePath("test7_b");
+	                        }, false);
+
+	var xhr = new XMLHttpRequest();
+
+	xhr.open("GET", g_service_url + "test7_b", true);
+
+	xhr.onreadystatechange = function()
+	{
+		if (xhr.readyState == 4)
+		{
+			clearTimeout(timeoutid);
+			verify(xhr.status == 200 && xhr.responseText == filetext);
+			verify(xhr.getResponseHeader("Content-Type") == "text/html; charset=utf-8");
+			verify(xhr.getResponseHeader("Content-Length") == filetext.length);
+			ST_passed();
+	    }
+	};
+
+	timeoutid = setTimeout("ST_failed('write file - auto Content-Type (HTML) with closeAndRedispatch() TIMEOUT: webserver did not respond', 'webserver.ot', 0)", 5000);
+	xhr.send("");
+}
+
+test("write file - auto Content-Type (HTML) with writeFile()")
+	async;
+	language ecmascript;
+	{
+	var timeoutid = -1;
+	var filetext = "<html><body>This is served from file </body></html>";
+
+	var mp = opera.io.filesystem.mountSystemDirectory("storage", "foo1");
+	var fs = mp.open("test7_c", "w");
+	fs.write(filetext);
+	fs.close();
+
+	ws.addEventListener("test7_c", function(e)
+	                        {
+								var response = e.connection.response;
+								var file = mp.resolve("test7_c");
+								response.setResponseHeader("Content-Length", filetext.length);
+								response.writeFile(file);
+								response.close();
+	                        }, false);
+
+	var xhr = new XMLHttpRequest();
+
+	xhr.open("GET", g_service_url + "test7_c", true);
+
+	xhr.onreadystatechange = function()
+	{
+		if (xhr.readyState == 4)
+		{
+			clearTimeout(timeoutid);
+			verify(xhr.status == 200 && xhr.responseText == filetext);
+			verify(xhr.getResponseHeader("Content-Type") == "text/html; charset=utf-8");
+			verify(xhr.getResponseHeader("Content-Length") == filetext.length);
+			ST_passed();
+	    }
+	};
+
+	timeoutid = setTimeout("ST_failed('write file - auto Content-Type (HTML) with writeFile() TIMEOUT: webserver did not respond', 'webserver.ot', 0)", 5000);
+	xhr.send("");
+}
+
+test("Testing Share file and closeAndRedispatch")
+	async;
+	language ecmascript;
+	{
+	var timeoutid = -1;
+	var filetext = "<html><body>This is served from file </body></html>";
+
+	var mp = opera.io.filesystem.mountSystemDirectory("storage", "foo2");
+	var fs = mp.open("test8", "w");
+	fs.write(filetext);
+	fs.close();
+
+ 	/* shares the file test8, on the uri g_service_url + "test8" */
+	ws.sharePath("test8", mp.resolve("test8"));
+
+	ws.addEventListener("test8", function(e)
+	                        {
+								var response = e.connection.response;
+								response.setResponseHeader("Test-Header", "test-value");
+
+								response.closeAndRedispatch(); /* sends the request to file */
+	                        }, false);
+
+	var xhr = new XMLHttpRequest();
+
+	xhr.open("GET", g_service_url + "test8", true);
+
+	xhr.onreadystatechange = function()
+	{
+		if (xhr.readyState == 4)
+		{
+			var last_modified_header = xhr.getResponseHeader("Last-Modified");
+			clearTimeout(timeoutid);
+			verify(xhr.status == 200);
+			verify(xhr.getResponseHeader("Test-Header") == "test-value");
+			verify(last_modified_header);
+			verify(last_modified_header.length != 0);
+			ST_passed();
+	    }
+	};
+
+	timeoutid = setTimeout("ST_failed('Testing Share file and closeAndRedispatch TIMEOUT: webserver did not respond', 'webserver.ot', 0)", 5000);
+	xhr.send("");
+}
+
+test("Testing Share directory and closeAndRedispatch")
+	async;
+	language ecmascript;
+	{
+	var timeoutid = -1;
+	var filetext = "<html><body>This is served from file </body></html>";
+
+	var mp = opera.io.filesystem.mountSystemDirectory("storage", "foo3");
+	var fs = mp.open("textfile", "w");
+	fs.write(filetext);
+	fs.close();
+
+ 	/* shares the file test9, on the uri g_service_url + "test9" */
+	ws.sharePath("directory_test", mp);
+
+	ws.addEventListener("test9", function(e)
+	                        {
+
+								var response = e.connection.response;
+
+								e.connection.request.uri = ws.currentServicePath + "directory_test/textfile"; /* 'redirect' to the file */
+								response.setResponseHeader("Test-Header", "test-value");
+								response.closeAndRedispatch(); /* sends the request to file */
+	                        }, false);
+
+	var xhr = new XMLHttpRequest();
+
+	xhr.open("GET", g_service_url + "test9", true);
+
+	xhr.onreadystatechange = function()
+	{
+		if (xhr.readyState == 4)
+		{
+			clearTimeout(timeoutid);
+			verify(xhr.status == 200);
+			verify(xhr.getResponseHeader("Test-Header") == "test-value");
+			ST_passed();
+			ws.unshareFile(mp);
+	    }
+	};
+
+	timeoutid = setTimeout("ST_failed('Testing Share directory and closeAndRedispatch TIMEOUT: webserver did not respond', 'webserver.ot', 0)", 5000);
+	xhr.send("");
+}
+
+test("Testing Share directory and closeAndRedispatch security")
+	async;
+	language ecmascript;
+	{
+	var timeoutid = -1;
+	var filetext = "<html><body>This is served from file </body></html>";
+
+	var mp = opera.io.filesystem.mountSystemDirectory("storage", "foo4");
+	var fs = mp.open("textfile2", "w");
+	fs.write(filetext);
+	fs.close();
+
+ 	/* shares the file test10, on the uri g_service_url + "test10" */
+	ws.unshareFile(mp);
+	ws.sharePath("directory_test2", mp);
+
+	var temp_success = false;
+	ws.addEventListener("test10", function(e)
+	                        {
+
+								var response = e.connection.response;
+
+								e.connection.request.uri = "/wrong path/" + "directory_test2/textfile";
+								response.setResponseHeader("Test-Header", "test-value");
+								try
+								{
+									response.closeAndRedispatch(); /* sends the request to file */
+								}
+								catch (e)
+								{
+									temp_success = true;
+									response.write("success");
+									response.close();
+								}
+
+
+	                        }, false);
+
+	var xhr = new XMLHttpRequest();
+
+	xhr.open("GET", g_service_url + "test10", true);
+
+	xhr.onreadystatechange = function()
+	{
+		if (xhr.readyState == 4)
+		{
+			clearTimeout(timeoutid);
+			verify(xhr.status == 200 && temp_success == true && xhr.responseText  == "success");
+			ST_passed();
+	    }
+	};
+
+	timeoutid = setTimeout("ST_failed('Testing Share directory and closeAndRedispatch security TIMEOUT: webserver did not respond', 'webserver.ot', 0)", 5000);
+	xhr.send("");
+}
+
+test("Response cookie Header security test")
+	async;
+	language ecmascript;
+	{
+	var timeoutid = -1;
+	ws.addEventListener("test11", function(e)
+	                        {
+								var request = e.connection.request;
+								var response = e.connection.response;
+								var success = false;
+								try
+								{
+									response.setResponseHeader('Set-Cookie', 'Id="1234"; Domain="evil";');
+									/* failure */
+									response.setStatusCode(401);
+									response.close();
+									return
+
+								}
+								catch(e)
+								{
+									if (e.message.substring(0,18) != "Security violation")
+									{
+										response.setStatusCode(402);
+										response.write("security message 1: " + e.message.substring(0,18) );
+										response.close();
+										return;
+									}
+									/* success */
+								}
+
+
+								try
+								{
+									response.setResponseHeader('Set-Cookie', 'Id="1234"; path="evil";');
+									response.setStatusCode(403);
+									response.close();
+									return;
+								}
+								catch(e)
+								{
+									if (e.message.substring(0,18) != "Security violation")
+									{
+										response.setStatusCode(405);
+										response.write("security message 2: " + e.message );
+										response.close();
+										return;
+									}
+									/* success */
+								}
+
+								try
+								{
+									response.setResponseHeader('Set-Cookie', 'Id="1234"; domain="'+ ws.hostName + '";  path="'+ ws.currentServicePath);
+									/* success */
+								}
+								catch(e)
+								{
+									response.setStatusCode(406);
+									response.write("security message 3: " + e.message );
+									response.close();
+									return;
+								}
+
+								response.write("success");
+								response.close();
+
+	                        }, false);
+
+
+	var xhr = new XMLHttpRequest();
+
+	xhr.open("GET", g_service_url + "test11", true);
+
+	xhr.onreadystatechange = function()
+	{
+		if (xhr.readyState == 4)
+		{
+			clearTimeout(timeoutid);
+
+			verify(xhr.status == 200);
+			verify(xhr.responseText == "success");
+			ST_passed();
+	    }
+	};
+
+	timeoutid = setTimeout("ST_failed('Response cookie Header security test TIMEOUT: webserver did not respond', 'webserver.ot', 0)", 5000);
+	xhr.send("testing_post");
+}
+
+test("Response cookie Header test")
+	async;
+	language ecmascript;
+	{
+	var timeoutid = -1;
+	ws.addEventListener("test11_5", function(e)
+	                        {
+								var request = e.connection.request;
+								var response = e.connection.response;
+								var success = false;
+								try
+								{
+									response.setResponseHeader('Set-Cookie', 'Id="1234"; domain="'+ g_server /*ws.hostName*/ + '";  path="'+ ws.currentServicePath+'"');
+									/* success */
+								}
+
+								catch(e)
+								{
+									response.setStatusCode(403);
+									response.write("security message 4: " + e.message + " for " + g_server + " ( would " + ws.hostName + " be fine?) - " + ws.currentServicePath);
+									response.close();
+									return;
+								}
+
+								response.write("success");
+								response.close();
+
+	                        }, false);
+
+
+	var xhr = new XMLHttpRequest();
+
+	xhr.open("GET", g_service_url + "test11_5", true);
+
+	xhr.onreadystatechange = function()
+	{
+		if (xhr.readyState == 4)
+		{
+			clearTimeout(timeoutid);
+			verify(xhr.responseText == "success");
+			verify(xhr.status == 200);
+			ST_passed();
+	    }
+	};
+
+	timeoutid = setTimeout("ST_failed('Response cookie Header test TIMEOUT: webserver did not respond', 'webserver.ot', 0)", 5000);
+	xhr.send("testing_post");
+}
+
+test("Body items test")
+	async;
+	language ecmascript;
+	{
+	var timeoutid = -1;
+	verify(opera.io != null);
+	verify(opera.io.webserver != null);
+
+	ws.addEventListener("test12", function(e)
+	                	        {
+									var response = e.connection.response;
+									var request = e.connection.request;
+
+									var items = request.getItem("item");
+
+									var items1 = request.getItem("item1");
+
+									if (items.length != 2 || items[0] != "val1" || items[1] != "val2"  || items1[0] != "item1value")
+									{
+										response.setStatusCode(404);
+										response.close();
+										return;
+									}
+
+									var bodyItems = request.bodyItems;
+
+									if (bodyItems["item"][0] != "val1" || bodyItems["item"][1] != "val2"   || bodyItems["item1"][0] != "item1value")
+									{
+										response.setStatusCode(404);
+										response.close();
+										return;
+									}
+
+									if (request.body != body)
+									{
+										response.setStatusCode(404);
+										response.close();
+										return;
+									}
+
+									response.write("success");
+									response.close();
+
+	       		                 }, false);
+
+
+	/* Do an xhr request to the localhost:port/selftest/test12 here */
+
+	var xhr = new XMLHttpRequest();
+
+	xhr.open("POST", g_service_url + "test12", true);
+	xhr.setRequestHeader("Content-type", "multipart/form-data, boundary=AaB03x");
+
+	var body = 	'--AaB03x\r\n';
+	body +=		'content-disposition: form-data; name="item"\r\n\r\n';
+	body +=		'val1\r\n';
+	body +=		'--AaB03x\r\n';
+	body +=		'content-disposition: form-data; name="item"\r\n\r\n';
+	body +=		'val2\r\n';
+	body +=		'--AaB03x\r\n';
+	body +=		'content-disposition: form-data; name="item1"\r\n\r\n';
+	body +=		'item1value\r\n';
+	body +=		'--AaB03x--\r\n';
+
+	xhr.onreadystatechange = function()
+	{
+		if (xhr.readyState == 4)
+		{
+			clearTimeout(timeoutid);
+			verify(xhr.status == 200 && xhr.responseText == "success");
+			ST_passed();
+		}
+	};
+
+	timeoutid = setTimeout("ST_failed('Body items test TIMEOUT: webserver did not respond', 'webserver.ot', 0)", 5000);
+	xhr.send(body);
+}
+
+test("Testing Share file and closeAndRedispatch with status code")
+	async;
+	language ecmascript;
+	{
+	var timeoutid = -1;
+	var filetext = "<html><body>This is served from file </body></html>";
+
+	var mp = opera.io.filesystem.mountSystemDirectory("storage", "foo5");
+	var fs = mp.open("test13.txt", "w");
+	fs.write(filetext);
+	fs.close();
+
+ 	/* shares the file test13.txt, on the uri g_service_url + "test13.txt" */
+	ws.sharePath("test13.txt", mp.resolve("test13.txt"));
+
+	ws.addEventListener("test13.txt", function(e)
+	                        {
+								var response = e.connection.response;
+								response.setStatusCode(302);
+								response.setResponseHeader("Test-Header", "test-value");
+								response.setResponseHeader("Content-Type", "test/type");
+
+								response.closeAndRedispatch(); /* sends the request to file */
+	                        }, false);
+
+	var xhr = new XMLHttpRequest();
+
+	xhr.open("GET", g_service_url + "test13.txt", true);
+
+	xhr.onreadystatechange = function()
+	{
+		if (xhr.readyState == 4)
+		{
+			clearTimeout(timeoutid);
+			verify(xhr.status == 302);
+			verify(xhr.getResponseHeader("Test-Header") == "test-value");
+			verify(xhr.getResponseHeader("Content-Type") == "test/type");
+			ST_passed();
+	    }
+	};
+
+	timeoutid = setTimeout("ST_failed('Testing Share file and closeAndRedispatch with status code TIMEOUT: webserver did not respond', 'webserver.ot', 0)", 5000);
+	xhr.send("");
+}
+
+test("Testing that 4xx doesn't return last-modified header")
+	async;
+	language ecmascript;
+	{
+	var timeoutid = -1;
+	var filetext = "<html><body>This is served from file </body></html>";
+
+	var xhr = new XMLHttpRequest();
+
+	xhr.open("GET", g_service_url + "test14", true);
+
+	xhr.onreadystatechange = function()
+	{
+		if (xhr.readyState == 4)
+		{
+			clearTimeout(timeoutid);
+			var last_modified_header = xhr.getResponseHeader("Last-Modified");
+			verify(xhr.status == 404);
+			verify(last_modified_header == null);
+			ST_passed();
+	    }
+	};
+
+	timeoutid = setTimeout("ST_failed('Testing that 4xx doesn\'t return last-modified header TIMEOUT: webserver did not respond', 'webserver.ot', 0)", 5000);
+	xhr.send("");
+}
+
+test("Upload files test")
+	async;
+	language ecmascript;
+	{
+	var timeoutid = -1;
+	verify(opera.io != null);
+	verify(opera.io.webserver != null);
+
+	ws.addEventListener("test15", function(e)
+	                	        {
+									var response = e.connection.response;
+									var request = e.connection.request;
+
+									var items = request.getItem("item");
+
+									var items1 = request.getItem("item1");
+
+									if (items.length != 1 || items[0] != "val")
+									{
+										ST_failed("Items length: " + items.length + " - Val: " + items[0], "webserver.ot", 0);
+
+										response.setStatusCode(404);
+										response.close();
+										return;
+									}
+
+									var bodyItems = request.bodyItems;
+
+									if (bodyItems["item"][0] != "val" )
+									{
+										ST_failed("Body val: " + bodyItems["item"][0], "webserver.ot", 0);
+
+										response.setStatusCode(404);
+										response.close();
+										return;
+									}
+
+									if (request.body != body)
+									{
+										ST_failed("request.body != body", "webserver.ot", 0);
+
+										response.setStatusCode(404);
+										response.close();
+										return;
+									}
+									var files = request.files;
+
+									if (files.length != 2)
+									{
+										ST_failed("File length: " + files.length + " instead of 2", "webserver.ot", 0);
+
+										response.setStatusCode(404);
+										response.close();
+										return;
+									}
+
+									var fs0 = files[0].open("", "r");
+									var fs1 = files[1].open("", "r")
+
+									var line0 = fs0.readLine();
+									var line1 = fs1.readLine();
+
+									if (line0 != "This is the content of file 1" || line1 != "This is the content of file 2")
+									{
+										ST_failed("Content 1: " + line0 + " - content 2: " + line1, "webserver.ot", 0);
+
+										response.setStatusCode(404);
+										response.close();
+										return
+									}
+
+									fs0.close();
+									fs1.close();
+
+									response.write("success");
+									response.close();
+
+									opera.postError("Upload Success - 1(" + files[0].name + "): " + line0 + " - 2(" + files[1].name + "): " + line1);
+	       		                 }, false);
+
+
+	/* Do an xhr request to the localhost:port/selftest/test15 here */
+
+	var xhr = new XMLHttpRequest();
+
+	xhr.open("POST", g_service_url + "test15", true);
+	xhr.setRequestHeader("Content-type", "multipart/form-data, boundary=AaB03x");
+
+	var body = 	'--AaB03x\r\n';
+	body +=		'content-disposition: file; name=filename1; filename="filename1"\r\n';
+	body +=		'Content-Type: text/plain\r\n\r\n';
+	body +=		'This is the content of file 1\r\n';
+	body +=		'--AaB03x\r\n';
+	body +=		'content-disposition: form-data; name="item"\r\n\r\n';
+	body +=		'val\r\n';
+	body +=		'--AaB03x\r\n';
+	body +=		'content-disposition: file; name="filename2"; filename="filename1"\r\n';
+	body +=		'Content-Type: text/plain\r\n\r\n';
+	body +=		'This is the content of file 2\r\n';
+	body +=		'--AaB03x--\r\n';
+
+	xhr.onreadystatechange = function()
+	{
+		if (xhr.readyState == 4)
+		{
+			clearTimeout(timeoutid);
+			verify(xhr.status == 200 && xhr.responseText == "success");
+			ST_passed();
+		}
+	};
+
+	timeoutid = setTimeout("ST_failed('Upload files test TIMEOUT: webserver did not respond', 'webserver.ot', 0)", 5000);
+	xhr.send(body);
+}
+
+test("Upload files - violations")
+	async;
+	language ecmascript;
+	{
+	var timeoutid = -1;
+	verify(opera.io != null);
+	verify(opera.io.webserver != null);
+
+	ws.addEventListener("test16", function(e)
+	                	        {
+									var response = e.connection.response;
+									var request = e.connection.request;
+
+									var files = request.files;
+
+									if (files.length != 1)
+									{
+										ST_failed("Files: " + files.length + " instead of 1", "webserver.ot", 0);
+
+										response.setStatusCode(404);
+										response.close();
+										return;
+									}
+
+									response.write("success");
+									response.close();
+	       		                 }, false);
+
+
+	/* Do an xhr request to the localhost:port/selftest/test16 here */
+
+	var xhr = new XMLHttpRequest();
+
+	xhr.open("POST", g_service_url + "test16", true);
+	xhr.setRequestHeader("Content-type", "multipart/form-data-fake, boundary=AaB03x");
+
+	var body = 	'--AaB03x\r\n';
+	body +=		'content-disposition: file; name=filename1; filename="filename1"\r\n';
+	body +=		'Content-Type: text/plain\r\n\r\n';
+	body +=		'This is the content of file 1\r\n';
+	body +=		'--AaB03x\r\n';
+	body +=		'content-disposition: form-data; name="item"\r\n\r\n';
+	body +=		'val\r\n';
+	body +=		'--AaB03x\r\n';
+	body +=		'content-disposition: file; name=filename2; filename="filename1"\r\n';
+	body +=		'Content-Type-Fake: text/plain\r\n\r\n';
+	body +=		'This is the content of file 2\r\n';
+	body +=		'--AaB03x--\r\n';
+
+	xhr.onreadystatechange = function()
+	{
+		if (xhr.readyState == 4)
+		{
+			clearTimeout(timeoutid);
+			verify(xhr.status == 200 && xhr.responseText == "success");
+			ST_passed();
+		}
+	};
+
+	timeoutid = setTimeout("ST_failed('Upload files - violations TIMEOUT: webserver did not respond', 'webserver.ot', 0)", 5000);
+	xhr.send(body);
+}
+
+test("Upload files of 1024 KB")
+	async;
+	language ecmascript;
+	{
+	var timeoutid = -1;
+	verify(opera.io != null);
+	verify(opera.io.webserver != null);
+	var num_kb=1024;
+
+	ws.addEventListener("test17", function(e)
+	                	        {
+									var response = e.connection.response;
+									var request = e.connection.request;
+
+									var files = request.files;
+
+									if (files.length != 1)
+									{
+										ST_failed("Files: " + files.length + " instead of 1", "webserver.ot", 0);
+
+										response.setStatusCode(404);
+										response.close();
+										return;
+									}
+
+									opera.postError("Successfully uploaded a file of " + files[0].fileSize + " bytes");
+
+									response.write("success: "+files[0].fileSize);
+									response.close();
+	       		                 }, false);
+
+
+	/* Do an xhr request to the localhost:port/selftest/test16 here */
+
+	var xhr = new XMLHttpRequest();
+
+	xhr.open("POST", g_service_url + "test17", true);
+	xhr.setRequestHeader("Content-type", "multipart/form-data-fake, boundary=AaB03x");
+
+	var str_big=generateBigString(num_kb);
+
+	var body = 	'--AaB03x\r\n';
+	body +=		'content-disposition: file; name=filename1; filename="filename1"\r\n';
+	body +=		'Content-Type: text/plain\r\n\r\n';
+	body +=		str_big + '\r\n';
+	body +=		'--AaB03x\r\n';
+
+	xhr.onreadystatechange = function()
+	{
+		if (xhr.readyState == 4)
+		{
+			clearTimeout(timeoutid);
+			verify(xhr.status == 200);
+			var expected="success: "+(num_kb*1024);
+
+			if(xhr.responseText != expected)
+				ST_failed('Response is wrong: "' + xhr.responseText + '" instead of "' + expected + '"' , 'webserver.ot', 0);
+			else
+				ST_passed();
+		}
+	};
+
+	timeoutid = setTimeout("ST_failed('Upload files of 1024 KB TIMEOUT: webserver did not respond', 'webserver.ot', 0)", 5000);
+	xhr.send(body);
+}
+
+
+test("Bytes Transferred") require TRANSFERS_TYPE;
+	{
+	TRANSFERS_TYPE uploaded=g_webserver->GetBytesUploaded();
+	TRANSFERS_TYPE downloaded=g_webserver->GetBytesDownloaded();
+
+	output("Bytes uploaded: %d - Byte downloaded: %d\n", (UINT32)uploaded, (UINT32)downloaded);
+	verify(uploaded>1000);
+	verify(downloaded>1000);
+}
+
+test("Users log")
+	{
+	UINT32 users=g_webserver->GetLastUsersCount(300);
+
+	output("Users in the last 300 seconds: %d\n", users);
+
+	verify(users>0);
+}
+
+//%253cscript%253e%20-%20&lt;script&gt;
+test("escaping 1") { escapeTest("%3cscript%3e - &lt;script&gt;", "%3cscript%3e%20-%20&lt;script&gt;"); }
+test("escaping 2") { escapeTest("%F8 %F8", "%F8%20%F8"); }
+test("escaping 3") { escapeTest("%F8%F8", "%F8%F8"); }
+test("escaping 4") { escapeTest("test_-+#$^*(){}[]@!|~`", "test_-+#$%5E*()%7B%7D[]@!%7C~%60"); }
+test("escaping 5") { escapeTest("abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"); }
+
+test("getContentType")
+language ecmascript;
+{
+	var txtmime = ws.getContentType("test.html");
+	var default_mime="";
+
+	verify(txtmime=="text/html");
+
+	txtmime = ws.getContentType(".html");
+	verify(txtmime=="text/html");
+
+	txtmime = ws.getContentType("...html");
+	verify(txtmime=="text/html");
+
+	txtmime = ws.getContentType("html");
+	verify(txtmime=="text/html");
+
+	txtmime = ws.getContentType("abc");
+	verify(txtmime==default_mime);
+
+	var mp = opera.io.filesystem.mountSystemDirectory("storage", "shareContentType");
+
+	createFile(mp, "testContentType.html", "success");
+
+	txtmime = ws.getContentType(mp.resolve("testContentType.html"));
+	verify(txtmime=="text/html");
+
+	mp.deleteDirectory("testDir", false);
+	mp.deleteDirectory("html", false);
+
+	var dir=mp.createDirectory("testDir");
+	txtmime = ws.getContentType(dir);
+	verify(txtmime==default_mime);
+
+	var dir2=mp.createDirectory("html");
+	txtmime = ws.getContentType(dir2);
+	verify(txtmime==default_mime);
+}
+
+test("UPnP Service discovery")
+language ecmascript;
+require UPNP_SERVICE_DISCOVERY;
+require UPNP_SUPPORT;
+require undefined LINGOGI;
+{
+	var devices=opera.nearbyDevices;
+	var list="\nDevice List:\n";
+
+	for(var i=0; i<devices.length; i++)
+	{
+		var dev=devices[i];
+
+		list+=i+": " +dev.uniteUser+"."+dev.uniteDeviceName+": " + dev.name + " (" + dev.description + ") - " + dev.url + "\n";
+		list+="      Services: " + dev.services.length + "\n";
+		for(var j=0; j<dev.services.length; j++)
+		{
+			list+="          " + dev.services[j].name + ": " + dev.services[j].url + "\n";
+		}
+
+	}
+
+	opera.postError(list);
+}
+
+test("icons")
+language ecmascript;
+require GADGET_SUPPORT;
+{
+	var list="\nSubServers List (" + ws.services.length + "):\n";
+
+	for(var i=0; i<ws.services.length; i++)
+	{
+		var srv=ws.services[i];
+
+		list+=i+": " +srv.name + " has " + srv.icons.length + " icons";
+		for(var j=0; j<srv.icons.length; j++)
+		{
+			var icon=srv.icons[j]
+		}
+	}
+
+	opera.postError(list);
+}
+
+test("Request Contect-Type")
+async;
+language ecmascript;
+{
+	var timeoutid = -1;
+	verify(opera.io.webserver != null);
+	verify(ws != null && "server is not running");
+
+	opera.postError("Request Contect-Type 1");
+
+	ws.addEventListener("test_content_type", function(e)
+										{
+											if (typeof(ws) == "undefined")
+												opera.postError("WebServer undefined!");
+											else if (typeof(e.connection) == "undefined")
+												opera.postError("Connection undefined!");
+											else
+											{
+												var wreq = e.connection.request;
+												var wres = e.connection.response;
+
+												if (typeof(wres) == "undefined")
+													opera.postError("Response undefined!");
+												else if (typeof(wreq) == "undefined")
+													wres.write("REQUEST undefined");
+												else if (typeof(wreq.body) == "undefined")
+													wres.write("BODY undefined");
+												else if (wreq.body != '<pass/>')
+													wres.write("FAIL");
+												else
+													wres.write("PASS");
+
+												wres.close();
+											}
+										}, false);
+
+	opera.postError("Request Contect-Type 2");
+	/* Do an xhr request to the localhost:port/selftest/test0 here */
+
+	var xhr = new XMLHttpRequest();
+	xhr.open("POST", g_service_url + "test_content_type", true);
+	xhr.setRequestHeader('Content-type', 'application/xml');
+	opera.postError("Request Contect-Type 3");
+	xhr.onreadystatechange = function()
+	{
+		if (xhr.readyState == 4)
+		{
+			clearTimeout(timeoutid);
+
+			if(xhr.responseText && xhr.responseText.indexOf('PASS') != -1)
+				ST_passed();
+			else
+				ST_failed("response: " + xhr.responseText);
+		}
+	};
+
+	xhr.send('<pass/>');
+
+	opera.postError("Request Contect-Type 4");
+
+	timeoutid = setTimeout("ST_failed('Request Contect-Type TIMEOUT: webserver did not respond', 'webserver.ot', 0)", 5000);
+}
+
+// Enable ASD, or "ASD replica test" cannot succeed
+test("Enable ASD")
+require undefined LINGOGI;
+{
+#if defined(UPNP_SUPPORT) && defined (UPNP_SERVICE_DISCOVERY)
+	g_webserver->EnableUPnPServicesDiscovery();
+#endif
+	
+	OpString central_server_uri;
+	OpString8 token;
+
+#ifdef WEB_UPLOAD_SERVICE_LIST
+	central_server_uri.Set("https://asd.opera.com/1.0/register");
+	token.Set("SelfTestToken");
+
+	g_webserver->StartServiceDiscovery(central_server_uri, token);
+#endif
+}
+
+test("ASD replica test")
+	async;
+	language ecmascript;
+	require GOGI;
+	require undefined LINGOGI;
+	{
+	pasteInClipboard("ASD replica test", "http://" + g_server + "/_asd/services");
+}
+
+test ("MatchServer(localhost), CORE-31656")
+	{
+	ServerName_Pointer sn = g_url_api->GetServerName("localhost", TRUE);
+	if (g_webserver->GetLocalListeningPort() != 80)
+	{
+		verify(!g_webserver->MatchServer(sn.operator ServerName *(), 80));
+		verify(!g_webserver->MatchServerAdmin(sn.operator ServerName *(), 80));
+		verify(!g_webserver->MatchServerAdmin("localhost"));
+		verify(!g_webserver->MatchServerAdmin("localhost:80"));
+	}
+	verify(g_webserver->MatchServer(sn.operator ServerName *(), g_webserver->GetLocalListeningPort()));
+	verify(g_webserver->MatchServerAdmin(sn.operator ServerName *(), g_webserver->GetLocalListeningPort()));
+
+	char buf[21]; /* ARRAY OK 2010-09-21 roarl */
+	op_snprintf(buf, 21, "localhost:%u", g_webserver->GetLocalListeningPort());
+	verify(g_webserver->MatchServerAdmin(buf));
+}
+
+
+////////////////////////////// Please leave Direct sockets test at the end of the file  //////////
+test("Direct Sockets delete")
+require WEBSERVER_DIRECT_SOCKET_SUPPORT;
+{
+	WebserverDirectServerSocket *socket=OP_NEW(WebserverDirectServerSocket, ());
+	OpStringC8 rendezvous_client_ip;
+
+	WebServerConnection *conn=OP_NEW(WebServerConnection, ());
+
+	verify(conn!=NULL);
+	verify(socket!=NULL);
+	if(conn && socket)
+	{
+		conn->Construct(socket, NULL, TRUE, TRUE
+		#ifdef WEBSERVER_RENDEZVOUS_SUPPORT
+			, FALSE, rendezvous_client_ip
+		#endif
+		);
+
+		OP_DELETE(socket);
+		OP_DELETE(conn);   // It should not crash here!!!
+	}
+}
+
+
+test("Direct sockets - setup")
+require WEBSERVER_DIRECT_SOCKET_SUPPORT;
+{
+	for(int i=0; i<BUF_SIZE; i++)
+		buf[i]=(char)(i%251);
+
+	for(int j=0; j<MEDIUM_SIZE; j++)
+		buf3[j]=(char)(j%251);
+
+	verify(OpStatus::IsSuccess(srv->GetSocketAddress(addr)));
+	verify(OpStatus::IsSuccess(cli->Accept(srv)));
+	verify(OpStatus::IsSuccess(cli->Connect(addr)));
+
+	srv->SetClientSocket(cli);
+}
+
+test("Direct sockets - 1KB") async;
+require WEBSERVER_DIRECT_SOCKET_SUPPORT;
+{
+	if( !OpStatus::IsSuccess(cli->Send(buf,1024)))
+		ST_failed("Unable to send data");
+}
+
+
+test("Direct sockets - big send test") async;
+require WEBSERVER_DIRECT_SOCKET_SUPPORT;
+{
+	srv->SetListener(dr_big);
+
+	dw->Write(cli, buf, BUF_SIZE, BUF_SIZE);
+}
+
+test("Direct sockets - one big send - multiple receives") async;
+require WEBSERVER_DIRECT_SOCKET_SUPPORT;
+{
+	srv->SetListener(dr_big_mul);
+
+	dw->Write(cli, buf, BUF_SIZE, BUF_SIZE);
+}
+
+test("Direct sockets - two small sends - one receive") async;
+require WEBSERVER_DIRECT_SOCKET_SUPPORT;
+{
+	dr_32K->SetThreshold(16384);
+
+	srv->SetListener(dr_32K);
+
+	dw->Write(cli, buf, 16384, 16384);
+	dw->Write(cli, buf3, 16384, 16384, FALSE);
+}
+
+test("Direct sockets - two small sends - buffer size is a prime number") async;
+require WEBSERVER_DIRECT_SOCKET_SUPPORT;
+{
+	dr_32K->SetThreshold(16384);
+
+	srv->SetListener(dr_32K);
+
+	dw->Write(cli, buf, 16384, 1031);
+	dw->Write(cli, buf3, 16384, 1019, FALSE);
+}
+
+test("Direct sockets - two small sends - buffer size is prime - receiver size is prime") async;
+require WEBSERVER_DIRECT_SOCKET_SUPPORT;
+{
+	dr_prime->SetThreshold(16384);
+
+	srv->SetListener(dr_prime);
+
+	dw->Write(cli, buf, 16384, 1031);
+	dw->Write(cli, buf3, 16384, 1019, FALSE);
+}
+
+
+test("Direct sockets - multiple sends of one buffer - multiple receives") async;
+require WEBSERVER_DIRECT_SOCKET_SUPPORT;
+{
+	dr_big_mul->RestoreExpectedBytes();
+	srv->SetListener(dr_big_mul);
+
+	dw->Write(cli, buf, BUF_SIZE, 16384);
+}
+
+test("Direct sockets - multiple sends of one buffer - multiple receives - buffer size is a prime number") async;
+require WEBSERVER_DIRECT_SOCKET_SUPPORT;
+{
+	dr_32K->SetThreshold(0);
+	srv->SetListener(dr_32K);
+
+	dw->Write(cli, buf3, MEDIUM_SIZE, 1019);
+}
+
+test("Direct sockets - multiple sends of two buffers - multiple receives") async;
+require WEBSERVER_DIRECT_SOCKET_SUPPORT;
+{
+	dr_big_mul->SetThreshold(MEDIUM_SIZE);
+	srv->SetListener(dr_big_mul);
+
+	dw->Write(cli, buf3, MEDIUM_SIZE, MEDIUM_SIZE);
+	dw->Write(cli, buf, BUF_SIZE-MEDIUM_SIZE, 16384, FALSE);
+}
+////////////////////////////// Please leave Direct sockets test at the end of the file  //////////

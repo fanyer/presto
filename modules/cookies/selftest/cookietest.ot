@@ -1,0 +1,366 @@
+/* -*- Mode: c++; tab-width: 4; indent-tabs-mode: t; c-basic-offset: 4 -*-
+**
+** Copyright (C) 2004-2006 Opera Software ASA.  All rights reserved.
+**
+** This file is part of the Opera web browser.  It may not be distributed
+** under any circumstances.
+**
+** Yngve N. Pettersen
+*/
+
+group "cookies test 1";
+require init;
+
+language c++;
+
+include "core/pch.h";
+include "modules/url/url_man.h";
+
+require PUBSUFFIX_ENABLED;
+
+include "modules/cookies/cookie_man.h";
+include "modules/formats/hdsplit.h";
+include "modules/formats/argsplit.h";
+include "modules/cache/cache_selftest.h";
+include "modules/cache/cache_st_helpers.h";
+
+include "modules/pubsuffix/selftest/suffixiterator.h";
+
+global {
+  Cookie_Manager *cookie_storage = NULL;
+#ifdef DISK_CACHE_SUPPORT
+  MultiContext *mctx;  // Manage Multiple cahce contexts
+#endif // DISK_CACHE_SUPPORT
+  URL_CONTEXT_ID ctx_cookies1;   // Save the cookies
+  URL_CONTEXT_ID ctx_cookies2;   // Load the cookies (used to simulate a restart)
+  
+
+  BOOL	InitServerName(const OpStringC8 &name, BOOL found_ip)
+  {
+	ServerName *server = g_url_api->GetServerName(name, TRUE);
+	if(!server)
+	  return FALSE;
+
+	server->SetHTTP_Lookup_Succceded(found_ip);
+	server->SetCookieDNSExpires(g_timecache->CurrentTime() + 365*24*60*60);
+	server->SetCookieDNS_Lookup_Done(found_ip ? CookieDNS_Succeded: CookieDNS_Failed);
+	return TRUE;
+  }
+
+  const char *cookieheaders[] = {
+		"Set-Cookie: name1=value1; domain=\".invalid.com\"; path=\"/\"\r\n"
+		"Set-Cookie: name2=value2; domain=\".somewhere.invalid.com\"; path=\"/\"\r\n"
+		"Set-Cookie: name3=value3; domain=\".somewhere.invalid.no\"; path=\"/\"\r\n"
+  };
+
+  PubSuffixTestIterator *iterator = NULL;
+}
+
+setup 
+{
+#ifdef DISK_CACHE_SUPPORT
+	mctx=OP_NEW(MultiContext, (TRUE));
+#endif // DISK_CACHE_SUPPORT
+}
+
+table urlset(const char *, const char *, BOOL, BOOL, BOOL)
+{
+  {"http://www.invalid.com/", "http://www.invalid.com/", TRUE, FALSE, FALSE},
+  {"http://www.somewhere.invalid.com/", "http://www.somewhere.invalid.com/", TRUE, TRUE, FALSE},
+  {"http://www.somewhere.invalid.no/", "http://www.somewhere.invalid.no/", FALSE, FALSE, TRUE},
+  {"http://www.invalid.no/", "http://www.invalid.no/", FALSE, FALSE, FALSE},
+  {"http://somewhere.invalid.no/", "http://somewhere.invalid.no/", FALSE, FALSE, TRUE},
+  {"http://somewhere-else.invalid.no/", "http://somewhere-else.invalid.no/", FALSE, FALSE, FALSE},
+
+  {"http://www.invalid.com/", "http://www.somewhere.invalid.com/", TRUE, FALSE, FALSE},
+  {"http://www.invalid.no/", "http://www.somewhere.invalid.com/", FALSE, FALSE, FALSE}
+}
+
+exit {
+	if (cookie_storage) cookie_storage->PreDestructStep();
+	OP_DELETE(cookie_storage);
+	cookie_storage = NULL;
+
+	OP_DELETE(iterator);
+	iterator = NULL;
+
+#ifdef DISK_CACHE_SUPPORT
+	OP_DELETE(mctx);
+#endif // DISK_CACHE_SUPPORT
+}
+
+test("Initialized")
+{
+	cookie_storage = OP_NEW(Cookie_Manager, ());
+	verify(cookie_storage != NULL);
+
+	TRAPD(op_err,cookie_storage->InitL(OPFILE_ABSOLUTE_FOLDER));
+	verify_success(op_err);
+
+	iterator = OP_NEW(PubSuffixTestIterator, ());
+	verify(iterator != NULL);
+
+	verify_success(iterator->Construct());
+}
+
+table SuffixFetches (char *, ServerName::DomainType)
+{
+	{"com", ServerName::DOMAIN_TLD},
+	{"no", ServerName::DOMAIN_TLD}
+}
+
+foreach (domain, domaintype) from SuffixFetches
+{
+	test("Fetch/Test domain dot-" domain)
+		async;
+		require success "Initialized";
+	{
+		iterator->StartTest(domain, domaintype);
+	}
+}
+
+subtest SetURL(URL &url, const char *url_name)
+{
+	verify (url_name != NULL);
+
+	url = g_url_api->GetURL(url_name);
+
+	verify(!url.IsEmpty());
+}
+
+subtest SetCookie(URL &url, const char *cookie_hdr)
+{
+	verify(cookie_hdr != NULL);
+	verify(!url.IsEmpty());
+	verify(!url.GetContextId());
+
+	HeaderList cookies(KeywordIndex_HTTP_MIME);
+
+	verify_success(cookies.SetValue((char *) cookie_hdr));
+
+	TRAPD(op_err, cookie_storage->HandleCookiesL(url.GetRep(), cookies));
+	verify_success(op_err);
+	cookie_storage->StartProcessingCookies();
+}
+
+subtest GetCookies(URL &url, const char **cookie_string)
+{
+	verify(cookie_string != NULL);
+	verify(!url.GetContextId());
+
+	int version = 0;
+	int max_version = 0;
+	BOOL already_have_password = FALSE;
+	BOOL already_have_authentication = FALSE;
+	BOOL have_password = FALSE;
+	BOOL has_password = FALSE;
+	TRAPD(op_err, *cookie_string = cookie_storage->GetCookiesL(url.GetRep(), version, max_version, already_have_password, already_have_authentication, have_password, has_password));
+	verify_success(op_err);
+	//verify(*cookie_string != NULL);
+}
+
+subtest SetCookieContext(URL &url, const char *cookie_hdr)
+{
+	verify(cookie_hdr != NULL);
+	verify(!url.IsEmpty());
+
+	HeaderList cookies(KeywordIndex_HTTP_MIME);
+
+	verify_success(cookies.SetValue((char *) cookie_hdr));
+
+	TRAPD(op_err, urlManager->HandleCookiesL(url.GetRep(), cookies, url.GetContextId()));
+	verify_success(op_err);
+	urlManager->StartProcessingCookies();
+}
+
+
+subtest GetCookiesContext(URL &url, const char **cookie_string)
+{
+	verify(cookie_string != NULL);
+
+	int version = 0;
+	int max_version = 0;
+	BOOL already_have_password = FALSE;
+	BOOL already_have_authentication = FALSE;
+	BOOL have_password = FALSE;
+	BOOL has_password = FALSE;
+	TRAPD(op_err, *cookie_string = g_url_api->GetCookiesL(url, version, max_version, already_have_password, already_have_authentication, have_password, has_password));
+	verify_success(op_err);
+	//verify(*cookie_string != NULL);
+}
+
+subtest CheckCookie(const char *cookie_string, const char *name, const char *value, BOOL supposed_present)
+{
+	ParameterList args;
+
+	//verify(cookie_string != NULL);
+
+	verify_success(args.SetValue(cookie_string, PARAM_SEP_SEMICOLON));
+
+	Parameters *cookie =args.GetParameter(name);
+
+	if(supposed_present)
+	{
+		verify(cookie != NULL);
+		verify(cookie->GetValue().Compare(value) == 0);
+	}
+	else
+	{
+		verify(cookie == NULL);
+	}
+}
+
+test ("Cookie_Domains")
+	require success "Initialized";
+{
+	TRAPD(op_err, cookie_storage->ClearCookiesCommitL(TRUE));
+	verify_success(op_err);
+
+	iterate (set_url_name, get_url_name, val1_set, val2_set, val3_set) from urlset
+	{
+		URL set_url = URL();
+		URL get_url = URL();
+
+		verify(SetURL(set_url, set_url_name));
+		verify(SetURL(get_url, get_url_name));
+
+		verify(SetCookie(set_url, cookieheaders[0]));
+
+		const char *cookie_string = NULL;
+		verify(GetCookies(get_url, &cookie_string));
+
+		verify(CheckCookie(cookie_string, "name1", "value1", val1_set));
+		verify(CheckCookie(cookie_string, "name2", "value2", val2_set));
+		verify(CheckCookie(cookie_string, "name3", "value3", val3_set));
+
+		cookie_storage->ClearCookiesCommitL(TRUE);
+	}
+}
+
+test ("Cookie_String_With_Empty_Value_with_assignment")
+	require success "Initialized";
+{
+	TRAPD(op_err, cookie_storage->ClearCookiesCommitL(TRUE));
+	verify(OpStatus::IsSuccess(op_err));
+
+	URL url = URL();
+	verify(SetURL(url, "http://example.com/empty1"));
+
+	verify(SetCookie(url, "Set-Cookie: a=1; domain=\".example.com\"; path=\"/\"\r\n"));
+	verify(SetCookie(url, "Set-Cookie: b=; domain=\".example.com\"; path=\"/\"\r\n"));
+	verify(SetCookie(url, "Set-Cookie: c=3; domain=\".example.com\"; path=\"/\"\r\n"));
+
+	const char *cookie_string = NULL;
+	verify(GetCookies(url, &cookie_string));
+
+	verify_string(cookie_string, "a=1; b=; c=3");
+}
+
+test ("Cookie_String_With_Empty_Value_without_assignment")
+	require success "Initialized";
+{
+	TRAPD(op_err, cookie_storage->ClearCookiesCommitL(TRUE));
+	verify(OpStatus::IsSuccess(op_err));
+
+	URL url = URL();
+	verify(SetURL(url, "http://example.com/empty2"));
+
+	verify(SetCookie(url, "Set-Cookie: a=1; domain=\".example.com\"; path=\"/\"\r\n"));
+	verify(SetCookie(url, "Set-Cookie: b; domain=\".example.com\"; path=\"/\"\r\n"));
+	verify(SetCookie(url, "Set-Cookie: c=3; domain=\".example.com\"; path=\"/\"\r\n"));
+
+	const char *cookie_string = NULL;
+	verify(GetCookies(url, &cookie_string));
+
+	verify_string(cookie_string, "a=1; b; c=3");
+}
+
+
+test ("Cookie_String_With_Empty_Value_with_and_without_assignment")
+	require success "Initialized";
+{
+	TRAPD(op_err, cookie_storage->ClearCookiesCommitL(TRUE));
+	verify(OpStatus::IsSuccess(op_err));
+
+	URL url = URL();
+	verify(SetURL(url, "http://example.com/empty3"));
+
+	verify(SetCookie(url, "Set-Cookie: a=1; domain=\".example.com\"; path=\"/\"\r\n"));
+	verify(SetCookie(url, "Set-Cookie: b=; domain=\".example.com\"; path=\"/\"\r\n"));
+	verify(SetCookie(url, "Set-Cookie: c=3; domain=\".example.com\"; path=\"/\"\r\n"));
+
+	const char *cookie_string = NULL;
+	verify(GetCookies(url, &cookie_string));
+
+	verify_string(cookie_string, "a=1; b=; c=3");
+
+	verify(SetCookie(url, "Set-Cookie: b; domain=\".example.com\"; path=\"/\"\r\n"));
+	verify(GetCookies(url, &cookie_string));
+
+	verify_string(cookie_string, "a=1; c=3; b"); // b is moved to the end of the string
+
+	verify(SetCookie(url, "Set-Cookie: b=; domain=\".example.com\"; path=\"/\"\r\n"));
+	verify(GetCookies(url, &cookie_string));
+
+	verify_string(cookie_string, "a=1; c=3; b=");
+}
+
+/// Save the cookies in a context, to check persistence (CORE-30416)
+test("Cookie_save")
+require DISK_CACHE_SUPPORT;
+{
+	verify_success(mctx->CreateNewContext(ctx_cookies1, UNI_L("cookies_save"), TRUE));
+
+	TRAPD(op_err, cookie_storage->ClearCookiesCommitL(TRUE));
+	verify(OpStatus::IsSuccess(op_err));
+
+	CacheHelpers ch;
+	URL url=ch.CacheBogusURLRetrieve(ctx_cookies1, 1, FALSE, FALSE);
+
+	// Set cookie_file_read...
+	const char *cookie_string = NULL;
+	verify(GetCookiesContext(url, &cookie_string));
+
+	verify(SetCookieContext(url, "Set-Cookie: cook_a=1; domain=\".example.tld\"; path=\"/\"; max-age=3600\r\n"));
+	verify(SetCookieContext(url, "Set-Cookie: cook_b=; domain=\".example.tld\"; path=\"/\"; max-age=3600\r\n"));
+	verify(SetCookieContext(url, "Set-Cookie: cook_c; domain=\".example.tld\"; path=\"/\"; max-age=3600\r\n"));
+
+	verify(GetCookiesContext(url, &cookie_string));
+
+	verify_string(cookie_string, "cook_a=1; cook_b=; cook_c");
+
+	// Save the cookies
+	urlManager->WriteFiles();
+
+	// Set another value to be sure that we load the cookies from a different context, during the next selftest
+	verify(SetCookieContext(url, "Set-Cookie: cook_a=2; domain=\".example.tld\"; path=\"/\"\r\n"));
+	verify(SetCookieContext(url, "Set-Cookie: cook_b=2; domain=\".example.tld\"; path=\"/\"\r\n"));
+	verify(SetCookieContext(url, "Set-Cookie: cook_c=2; domain=\".example.tld\"; path=\"/\"\r\n"));
+
+	verify(GetCookiesContext(url, &cookie_string));
+
+	verify_string(cookie_string, "cook_a=2; cook_b=2; cook_c=2");
+}
+
+/// Load the cookies (in another context) and check their value (CORE-30416)
+test("Cookie_load")
+require DISK_CACHE_SUPPORT;
+{
+	CacheHelpers ch;
+
+	urlManager->Debug_AcceptOverlappingContexts();
+	verify_success(mctx->CreateNewContext(ctx_cookies2, UNI_L("cookies_save"), FALSE));
+
+	URL url=ch.CacheBogusURLRetrieve(ctx_cookies2, 1, FALSE, FALSE);
+
+	const char *cookie_string = NULL;
+	verify(GetCookiesContext(url, &cookie_string));
+
+	verify_string(cookie_string, "cook_a=1; cook_b=; cook_c");
+}
+
+test("Delete the contexts")
+require DISK_CACHE_SUPPORT;
+{
+	mctx->RemoveFoldersAndContexts();
+}

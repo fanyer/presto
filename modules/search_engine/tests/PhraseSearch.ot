@@ -1,0 +1,341 @@
+group "search_engine.phrasesearch";
+
+require SEARCH_ENGINE;
+require SEARCH_ENGINE_PHRASESEARCH;
+
+include "modules/search_engine/SingleBTree.h";
+include "modules/search_engine/PhraseSearch.h";
+include "modules/search_engine/tests/test_util.h";
+
+global
+{
+
+template <typename KEY> class BTree : public SingleBTree<KEY>
+{
+	char num;
+	const uni_char* m_dir;
+public:
+	BTree(const uni_char* dir, int items, int tree_num) : SingleBTree<KEY>(&DefDescriptor<KEY>::Compare)
+	{
+		num = tree_num + 'a';
+		m_dir = dir;
+		OpString s;
+		OpStatus::Ignore(s.AppendFormat(UNI_L("%sdata/btree%c.bt"), dir, num));
+		delete_file(s.CStr());
+		OpStatus::Ignore(s.Append(UNI_L("-j")));
+		delete_file(s.CStr());
+		s.Empty();
+		OpStatus::Ignore(s.AppendFormat(UNI_L("%sdata/btree%c.bt"), dir, num));
+		OpStatus::Ignore(SingleBTree<KEY>::Open(s.CStr(), BlockStorage::OpenReadWrite, 12 + 4 + items * (4 + sizeof(KEY))));
+	}
+	~BTree(void)
+	{
+		OpStatus::Ignore(SingleBTree<KEY>::Close());
+		OpString s;
+		OpStatus::Ignore(s.AppendFormat(UNI_L("%sdata/btree%c.bt"), m_dir, num));
+		delete_file(s.CStr());
+	}
+};
+
+class TestDocumentSource : public AutoDeleteDocumentSource<int>
+{
+public:
+	TestDocumentSource(const uni_char **documents) : m_documents(documents) {}
+
+	virtual uni_char *AcquireDocument(const int &item)
+	{
+		return UniSetNewStr(m_documents[item]);
+	}
+
+protected:
+	const uni_char **m_documents;
+};
+
+}
+
+test("PhraseFilter") leakcheck;
+	file uni dir "";
+{
+	BTree<int> b(dir, 5, 1);
+	SearchIterator<int> *r;
+	PhraseMatcher matcher;
+	int doc, query;
+	const int num_docs = 6, num_queries = 11;
+	const uni_char *documents[num_docs];
+	const uni_char *queries[num_queries];
+	const uni_char *phrases[num_queries];
+	const char *matches[num_docs];
+	TestDocumentSource doc_source(documents);
+	int errors = 0;
+
+	documents[0] = UNI_L("to be, or not to be");
+	documents[1] = UNI_L("http://to-to.be.or.not/to/be");
+	documents[2] = UNI_L("To. Be. To. Be. Or. Not. To. Be");
+	documents[3] = UNI_L(",tobeornottobe");
+	documents[4] = UNI_L("");
+	documents[5] = NULL;
+
+	queries[0] = UNI_L("not\"to+be+or+not\"+");
+	queries[1] = UNI_L("be,");
+	queries[2] = UNI_L("\"/to\"bee");
+	queries[3] = UNI_L("\"to.be or \" \"or not  to be\" /to/b");
+	queries[4] = UNI_L(" \" to. be. ");
+	queries[5] = UNI_L("\"to be or no");
+	queries[6] = UNI_L("\"to be or no ");
+	queries[7] = UNI_L(",");
+	queries[8] = UNI_L("\"to\"");
+	queries[9] = UNI_L("");
+	queries[10]= NULL;
+
+	phrases[0] = UNI_L("\"to be or not\"");
+	phrases[1] = UNI_L("be,-");
+	phrases[2] = UNI_L("/to");
+	phrases[3] = UNI_L("\"to.be or\" \"or not to be\" /to/b-");
+	phrases[4] = UNI_L("\"to. be.\"");
+	phrases[5] = UNI_L("\"to be or no\"-");
+	phrases[6] = UNI_L("\"to be or no\"");
+	phrases[7] = UNI_L(",-");
+	phrases[8] = UNI_L("");
+	phrases[9] = UNI_L("");
+	phrases[10]= UNI_L("");
+
+	matches[0] = "XX   X XXXX";
+	matches[1] = "X XXXX  XXX";
+	matches[2] = "X   XX  XXX";
+	matches[3] = "       XXXX";
+	matches[4] = "        XXX";
+	matches[5] = "        XXX";
+
+	for (doc=0; doc<num_docs; ++doc)
+		verify_success(b.Insert(doc));
+
+	for (query=0; query<num_queries; query++)
+	{
+		verify_success(matcher.Init(queries[query], PhraseMatcher::AllPhrases | PhraseMatcher::PrefixSearch));
+		OpAutoArray<uni_char> ph(matcher.GetPhrases());
+		if (uni_strcmp(ph.get(), phrases[query]) != 0)
+		{
+			char* q1 = uni_down_strdup(queries[query]);
+			char* q2 = uni_down_strdup(phrases[query]);
+			char* q3 = uni_down_strdup(ph.get());
+			output("\nQuery <%s> should be understood as <%s>, was <%s>\n", q1, q2, q3);
+			op_free(q1);
+			op_free(q2);
+			op_free(q3);
+			errors++;
+			continue;
+		}
+
+		r = b.Search(0, operatorGE);
+		verify(r != NULL);
+	
+		FilterIterator<int> res(r, OP_NEW(PhraseFilter<int>, (queries[query], doc_source, PhraseMatcher::AllPhrases | PhraseMatcher::PrefixSearch)));
+		verify_success(res.Error());
+
+		doc = 0;
+		verify((res.End() && res.Empty()) || (!res.End() && !res.Empty()));
+		if (!res.Empty())
+		{
+			do
+			{
+				while (doc < res.Get())
+				{
+					if (matches[doc][query] == 'X')
+					{
+						char* q = uni_down_strdup(phrases[query]);
+						char* d = uni_down_strdup(documents[doc]);
+						output("\nQuery <%s> should find doc <%s>\n", q, d);
+						op_free(q);
+						op_free(d);
+						errors++;
+					}
+					doc++;
+				}
+				if (matches[doc][query] == ' ')
+				{
+					char* q = uni_down_strdup(phrases[query]);
+					char* d = uni_down_strdup(documents[doc]);
+					output("\nQuery <%s> should not find doc <%s>\n", q, d);
+					op_free(q);
+					op_free(d);
+					errors++;
+				}
+				doc++;
+			}
+			while (res.Next());
+		}
+		verify(res.End());
+		while (doc < num_docs)
+		{
+			if (matches[doc][query] == 'X')
+			{
+				char* q = uni_down_strdup(phrases[query]);
+				char* d = uni_down_strdup(documents[doc]);
+				output("\nQuery <%s> should find doc <%s>\n", q, d);
+				op_free(q);
+				op_free(d);
+				errors++;
+			}
+			doc++;
+		}
+	}
+	verify(errors == 0);
+}
+
+test("PhraseMatcher, QuotedPhrases") leakcheck;
+{
+	PhraseMatcher matcher;
+	OpAutoArray<uni_char> ph;
+	verify_success(matcher.Init(UNI_L("\"to be or not,to be\" \x5408\x6c17\x9053 [BTS]"),
+			PhraseMatcher::QuotedPhrases));
+	ph.reset(matcher.GetPhrases());
+	verify_string(ph.get(), UNI_L("\"to be or not to be\""));
+	verify(matcher.Matches(UNI_L("to be, or not to be")));
+	verify(!matcher.Matches(UNI_L("to be \f or not to be")));
+}
+
+test("PhraseMatcher, PunctuationPhrases") leakcheck;
+{
+	PhraseMatcher matcher;
+	OpAutoArray<uni_char> ph;
+	verify_success(matcher.Init(UNI_L("\"to be or not, to be\""),
+			PhraseMatcher::PunctuationPhrases));
+	ph.reset(matcher.GetPhrases());
+	verify_string(ph.get(), UNI_L("not,"));
+	verify(matcher.Matches(UNI_L("be not, or be")));
+	verify_success(matcher.Init(UNI_L("\"to be or not , to be\""),
+			PhraseMatcher::PunctuationPhrases));
+	ph.reset(matcher.GetPhrases());
+	verify_string(ph.get(), UNI_L(","));
+}
+
+test("PhraseMatcher, QuotedPhrases|PunctuationPhrases") leakcheck;
+{
+	PhraseMatcher matcher;
+	OpAutoArray<uni_char> ph;
+	verify_success(matcher.Init(UNI_L("\"to be or not,to be\""),
+			PhraseMatcher::QuotedPhrases|PhraseMatcher::PunctuationPhrases));
+	ph.reset(matcher.GetPhrases());
+	verify_string(ph.get(), UNI_L("\"to be or not,to be\""));
+}
+
+test("PhraseMatcher, CJKPhrases") leakcheck;
+{
+	PhraseMatcher matcher;
+	OpAutoArray<uni_char> ph;
+	verify_success(matcher.Init(UNI_L("\x201CPractice\x3000<\x5408\x6c17\x9053>\x201D \"Hello, world!\" [BTS]"), PhraseMatcher::CJKPhrases));
+	ph.reset(matcher.GetPhrases());
+	verify_string(ph.get(), UNI_L("\x5408\x6c17\x9053"));
+	verify(matcher.Matches(UNI_L("What is \x5408\x6c17\x9053?")));
+	verify(matcher.Matches(UNI_L("abc\x5408\x6c17\x9053\x306e")));
+	verify(matcher.Matches(UNI_L("\x306e\x5408\x6c17\x9053ghi")));
+	verify(!matcher.Matches(UNI_L("\x5408\x6c17\x306e\x9053")));
+	verify_success(matcher.Init(UNI_L("\x5408\x6c17\x9053 \x9053\x306e"), PhraseMatcher::CJKPhrases));
+	verify(matcher.Matches(UNI_L("\x5408\x6c17\x9053\x306e")));
+	verify_success(matcher.Init(UNI_L("\"abc\x5408\x6c17\x9053ghi# a\""), PhraseMatcher::CJKPhrases));
+	ph.reset(matcher.GetPhrases());
+	verify_string(ph.get(), UNI_L("abc\x5408\x6c17\x9053ghi"));
+	verify(matcher.Matches(UNI_L("Abc abc\x5408\x6c17\x9053ghi abc")));
+}
+
+test("PhraseMatcher, CJKPhrases|QuotedPhrases") leakcheck;
+{
+	PhraseMatcher matcher;
+	OpAutoArray<uni_char> ph;
+	verify_success(matcher.Init(UNI_L("\x201EPractice\x3000<\x5408\x6c17\x9053>\x201F \"Hello, world!\" [BTS]"),
+			PhraseMatcher::CJKPhrases|PhraseMatcher::QuotedPhrases));
+	ph.reset(matcher.GetPhrases());
+	verify_string(ph.get(), UNI_L("\"Practice \x5408\x6c17\x9053\" \"Hello world\""));
+}
+
+test("PhraseMatcher, CJKPhrases|PunctuationPhrases") leakcheck;
+{
+	PhraseMatcher matcher;
+	OpAutoArray<uni_char> ph;
+	verify_success(matcher.Init(UNI_L("\x301DPractice\x3000<\x5408\x6c17\x9053>\x301E \"Hello, world!\" [BTS]"),
+			PhraseMatcher::CJKPhrases|PhraseMatcher::PunctuationPhrases));
+	ph.reset(matcher.GetPhrases());
+	verify_string(ph.get(), UNI_L("<\x5408\x6c17\x9053> Hello, world! [BTS]"));
+}
+
+test("PhraseMatcher, AllPhrases") leakcheck;
+{
+	PhraseMatcher matcher;
+	OpAutoArray<uni_char> ph;
+	verify_success(matcher.Init(UNI_L("\x301FPractice\x3000<\x5408\x6c17\x9053>\xFF02 \"Hello, world!\" [BTS]"),
+			PhraseMatcher::AllPhrases));
+	ph.reset(matcher.GetPhrases());
+	verify_string(ph.get(), UNI_L("\"Practice <\x5408\x6c17\x9053>\" \"Hello, world!\" [BTS]"));
+}
+
+test("PhraseMatcher, FullSearch")
+{
+	PhraseMatcher matcher;
+	OpAutoArray<uni_char> ph;
+	verify_success(matcher.Init(UNI_L("Practice\x3000<\x5408\x6c17\x9053> and\"Hello, world!\"or [BTS] so"),
+			PhraseMatcher::NoPhrases|PhraseMatcher::FullSearch));
+	ph.reset(matcher.GetPhrases());
+	verify_string(ph.get(), UNI_L("Practice \x5408 \x6c17 \x9053 and Hello world or BTS so"));
+
+	verify_success(matcher.Init(UNI_L("Practice\x3000<\x5408\x6c17\x9053> and\"Hello, world!\"or [BTS] so"),
+			PhraseMatcher::AllPhrases|PhraseMatcher::FullSearch));
+	ph.reset(matcher.GetPhrases());
+	verify_string(ph.get(), UNI_L("Practice <\x5408\x6c17\x9053> and \"Hello, world!\" or [BTS] so"));
+}
+
+test("PhraseMatcher, DontCopyInputString") leakcheck;
+{
+	PhraseMatcher matcher;
+	OpAutoArray<uni_char> ph;
+	verify_success(matcher.Init(UNI_L("\x201CPractice\x3000<\x5408\x6c17\x9053>\x201D \"Hello, world!\" [BTS]"),
+			PhraseMatcher::AllPhrases | PhraseMatcher::DontCopyInputString));
+	ph.reset(matcher.GetPhrases());
+	verify_string(ph.get(), UNI_L("\"Practice <\x5408\x6c17\x9053>\" \"Hello, world!\" [BTS]"));
+}
+
+test("PhraseMatcher::AppendHighlight")
+{
+	const char* text_c =
+"Therefore, to be possess'd with double pomp,  "
+"To guard a title that was rich before,  "
+"To gild refined gold, to paint the lily,  "
+"To throw a perfume on the violet,  "
+"To smooth the ice, or add another hue  "
+"Unto the rainbow, or with taper-light  "
+"To seek the beauteous eye of heaven to garnish,  "
+"Is wasteful and ridiculous excess...";
+	const char* query_c = 
+"\"To gild refined gold\" \"gild refined\" \"gold to\" \"before to\" "
+"therefore to to ice, refined excess taper- light the";
+	const char* expected_c = 
+"<b>Therefore</b>, <b>to</b> be possess'd with double pomp, "
+"<b>To</b> guard a title that was rich <b>before, "
+"To gild refined gold, to</b> paint <b>the</b> lily, "
+"<b>To</b> throw a perfume on <b>the</b> violet, "
+"<b>To</b> smooth <b>the</b> <b>ice,</b> or add another hue "
+"Unto <b>the</b> rainbow, or with <b>taper-light</b> "
+"<b>To</b> seek <b>th</b>";
+	PhraseMatcher matcher;
+	OpString text, query, expected, result;
+	text.Set(text_c);
+	query.Set(query_c);
+	expected.Set(expected_c);
+
+	verify_success(matcher.Init(query.CStr(),
+			PhraseMatcher::AllPhrases | PhraseMatcher::FullSearch | PhraseMatcher::DontCopyInputString));
+	verify_success(matcher.AppendHighlight(result, text.CStr(), 245, UNI_L("<b>"), UNI_L("</b>"), 5));
+	verify_string(result, expected);
+}
+
+test("Allow word breaks in Katakana, bug CORE-22150")
+{
+	const uni_char* text = UNI_L("\x306E\x30C8\x30DE\x30C8\x30BD\x30FC\x30B9");
+	const uni_char* query = UNI_L("\x30C8\x30DE\x30C8"); 
+	const uni_char* expected = UNI_L("\x306E<b>\x30C8\x30DE\x30C8</b>\x30BD\x30FC\x30B9");
+	PhraseMatcher matcher;
+	OpString result;
+
+	verify_success(matcher.Init(query, PhraseMatcher::AllPhrases | PhraseMatcher::FullSearch));
+	verify_success(matcher.AppendHighlight(result, text, 200, UNI_L("<b>"), UNI_L("</b>"), 5));
+	verify_string(result, expected);
+}

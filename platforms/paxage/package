@@ -1,0 +1,759 @@
+#!/usr/bin/perl
+# -*- tab-width: 4; fill-column: 80 -*-
+
+=head1 NAME
+
+B<package> - The UNIX packaging system
+
+=head1 DESCRIPTION
+
+The new generation of the UNIX packaging system is designed to be invoked from
+the makefiles as part of the build process. As opposed to the old design where
+packaging was a special step performed by the build system, the new packaging
+system runs on the same host where the code was compiled, and can easily be
+tested on a developer's workstation without requiring an expensive build system
+cycle.
+
+A secondary purpose of the packaging system is to generate the F<run> directory
+when making debug builds on developers' workstations. This directory contains a
+complete directoty layout suitable for debugging and a wrapper script that
+starts Opera under gdb.
+
+=head1 MANIFEST
+
+The packaging system processes the same packaging manifest as the packaging
+systems for other platforms: F<adjunct/resources/package.xml>. Parsing of the
+manifest is delegated to the L<Shipping> package in ubs/common. See that
+module's documentation for description of the format.
+
+While the concept of other platforms' packaging systems is to only list resource
+files in the manifest, and to add other files such as the Opera binary by
+hardcoded magic, the amount and complexity of such magic has become
+unmaintainable on UNIX. For this reason, the UNIX packaging system also
+processes the second manifest file: F<platforms/paxage/manifest.xml>. It
+describes all other files that have to be included in the UNIX packages, such as
+the binaries, icons, UNIX-specific INI files, and even metadata such as the RPM
+spec file. With this approach, the amount of magic in the code of the packaging
+system can be kept to minimum; the few special cases that exist today are
+documented in the L<Handlers::DesktopHandler> module.
+
+To support the complex logic required for UNIX packaging, the system supports a
+number of extensions to the manifest syntax, used in the secondary manifest
+file.
+
+=over
+
+=item compress
+
+The C<compress> attribute to the C<file> element specifies that the file is to
+be compressed. A suffix such as F<.gz> or F<.bz2> will be added to the name
+automatically. Possible values are C<gzip> and C<bzip2>.
+
+=item mode
+
+The C<mode> attribute to the C<file> element specifies the type of the file.
+Possible values are:
+
+=over
+
+=item file (default)
+
+A normal file. Installed with permissions 644.
+
+=item script
+
+A script. Installed with permissions 755.
+
+=item bin
+
+A binary. Stripped (except when installing into the F<run> directory) and
+installed with permissions 755.
+
+=item so
+
+A shared library. Stripped (except when installing into the F<run> directory)
+and installed with permissions 644.
+
+=item link
+
+A symlink. Requires C<linkdir> attribute.
+
+=back
+
+=item linkdir
+
+The C<linkdir> attribute to the C<file> element defining a symlink specifies the
+directory where the target of a symlink is. This should be one of the directory
+tags defined in the directory layout file, such as C<RESOURCES>.
+
+=item linkfile
+
+The C<linkfile> attribute to the C<file> element defining a symlink specifies
+the name of the file which is the target of a symlink. The default is the same
+as the name of the symlink itself. Macro substitutions are allowed in this
+attribute (see L<"MACRO LANGUAGE"> below).
+
+=item name
+
+The C<name> attribute to the C<file>, C<concat> and C<zip> elements, which is
+already handled by ubscommon, allows macro substitutions (see L<"MACRO
+LANGUAGE"> below). They are also allowed in target-specific filename attributes
+such as C<deb> for Debian packages. Note that if macros are used in the C<name>
+attribute, the C<from> attribute must be specified explicitly because macros are
+not supported there.
+
+=item process
+
+The C<process> attribute to the C<file> element, which is already handled by
+ubscommon, supports an additional value:
+
+=over
+
+=item macro
+
+The files are to be handled by the macro processor (see L<"MACRO LANGUAGE">
+below).
+
+=back
+
+=item scandeps
+
+If the C<scandeps> attribute to the C<file> element is set to C<true>, this file
+will be scanned for library dependencies. Applicable to binaries and shared
+libraries. The package dependencies will include any shared libraries the file
+requires. Possible values: C<true> and C<false> (default).
+
+=back
+
+=head1 LAYOUT FILES
+
+The layout XML files, which are read by the common L<Shipping> module, define
+the location of each directory in the file system. Instead of using one such
+file per operating system, as the old UNIX packaging system used to do, the new
+system uses one per package type. The F<platforms/paxage/layout> directory
+contains the following layout files:
+
+=over
+
+=item deb.layout.xml
+
+Directory layout for Debian packages.
+
+=item rpm.layout.xml
+
+Directory layout for RPM packages.
+
+=item tar.layout.xml
+
+Directory layout for tarballs. Also used for the F<run> directory.
+
+=back
+
+All paths defined in the layout files are relative to the prefix (F</usr> for
+Debian and RPM packages, changeable for tarballs), which allows packages to be
+relocatable.
+
+=head2 Special Locations
+
+This packaging system supports an extension in the layout files: special
+locations. They allow to place some files into metadata directories located
+outside the package directory tree. The following special locations are defined:
+
+=over
+
+=item @@DEBIAN
+
+The F<DEBIAN> directory for Debian packaging metadata, such as the F<control>
+file. Supported when the package type is C<deb>.
+
+=item @@RPM
+
+The home directory for C<rpmbuild>, containing subdirectories like F<SPECS>,
+F<SOURCES> etc. Supported when the package type is C<rpm>.
+
+=back
+
+=head1 MACRO LANGUAGE
+
+Specifying C<macro> as the value for the C<process> attribute to the C<source>
+element in a manifest XML file enables macro processing of the files listed
+inside that element. The macro language allows to define most of the dynamic
+logic used to generate various files such as wrapper scripts outside of Perl
+code.
+
+Most of the text in the input file is simply copied into the output file. Two
+types of constructs are recognized in the input file and treated specially:
+directives and substitutions.
+
+=head2 Directives
+
+A directive starts with C<@@> and occupies an entire line. Whitespace is allowed
+at the start of it (before C<@@>).
+
+=over
+
+=item @@#
+
+A comment, not to be included in the output file. Allows to include non-public
+comments that don't end up in builds.
+
+=item @@ifdef, @@ifndef, @@elifdef, @@elifndef, @@else, @@endif
+
+C<@@ifdef> includes the following lines if the symbol is defined. Symbols that
+can be tested for include target symbols (such as C<unix>, C<i386>, C<rpm>,
+C<alien>) and anything defined with C<@@define>. Even a symbol defined with
+C<@@define> to have empty expansion yields a positive result on this test.
+
+C<@@ifndef> has the reverse meaning compared to C<@@ifdef>.
+
+C<@@elifdef> and C<@@elifdef> blocks can optionally follow, meaning I<else if
+defined> and I<else if not defined>, respectively.
+
+An optional C<@@else> block, if present, must be last in the conditional group.
+
+The conditional group must be terminated with C<@@endif>.
+
+Conditionals can be nested. The C<@@elifdef>, C<@@elifndef>, C<@@else> and
+C<@@endif> must be in the same source file as the directive that opened the
+conditional group.
+
+Example:
+
+ @@ifdef deb
+ This is a Debian package!
+ @@elifdef rpm
+ This is an RPM package!
+ @@else
+ This is something else.
+ @@endif
+
+=item @@define
+
+C<@@define symbol value> defines I<symbol> to I<value>. This overrides any
+previous definition. The value can be empty. The symbol can be tested for with
+conditional directives and used in substitutions. If I<value> contains
+substitutions, they are evaluated immediately.
+
+=item @@undef
+
+C<@@undef symbol> clears any previous definition of I<symbol>. Note that this is
+not the same as defining the symbol to an empty value. After a symbol has been
+removed with C<@@undef>, conditional tests on it will be negative, and using it
+in a substitution will produce an error.
+
+=item @@error
+
+C<@@error text> aborts macro processing and signals an error, giving I<text> as
+the error description. The typical use is in an C<@@else> block of a long
+conditional.
+
+=back
+
+=head2 Substitutions
+
+A substitution has the format C<@@{expression}>. Whitespace is not allowed
+inside a substitution.
+
+Substitutions can appear anywhere on any lines that are not directives, as well
+as in the right-hand side of the C<@@define> directive. Substitutions cannot be
+nested to achieve indirection.
+
+=over
+
+=item @@{PREFIX}
+
+Expands to the installation prefix, such as F</usr>. For tarballs, this is not
+known in advance and hence left unexpanded, to be replaced later by the install
+script.
+
+=item @@{SUFFIX}, @@{_SUFFIX}, @@{USUFFIX}
+
+Expand to @@{CONF:suffix}, @@{CONF:_suffix} and @@{CONF:usuffix}, respectively.
+For tarballs, these are not known in advance and hence left unexpanded, to be
+replaced later by the install script.
+
+=item @@{ABS:directory}
+
+Expands to the absolute path (including the prefix) to the C<directory> which
+must be specified as one of the directory symbols defined in the layout file.
+
+=item @@{REL:directory}
+
+Expands to the relative path (without the prefix) to the C<directory> which
+must be specified as one of the directory symbols defined in the layout file.
+
+=item @@{CONF:parameter}
+
+Expands to the value of a configuration parameter. The following parameters are
+defined:
+
+=over
+
+=item arch
+
+CPU architecture. Either C<i386> or C<x86_64>.
+
+=item build
+
+Build number.
+
+=item buildroot
+
+Top-level directory containing files produced by the compilation, usually the
+same as I<source>.
+
+=item debugger
+
+The debugger to be used by the wrapper script in the F<run> directory.
+
+=item develdir
+
+Path to the F<run> directory.
+
+=item os
+
+Operating system. Either C<Linux> or C<FreeBSD>.
+
+=item output
+
+Directory where packages will be placed.
+
+=item package_type
+
+The type of package being built. One of C<deb>, C<rpm>, C<tar>, C<devel>.
+
+=item product
+
+The product name, either C<opera> or begins with C<opera->.
+
+=item ship_conf
+
+Path to the layout file used.
+
+=item source
+
+Top-level directory containing Opera sources.
+
+=item stem
+
+The name for the resulting package without the suffix.
+
+=item strip_command
+
+The command to be used for stripping binaries.
+
+=item suffix
+
+The suffix to be appended to Opera filenames, such as C<-next> or an empty
+string.
+
+=item _suffix
+
+Capitalized version of C<suffix>, dashes replaced with spaces.
+
+=item temp
+
+Temporary directory used by the current package configuration.
+
+=item temp_root
+
+Top-level temporary directory.
+
+=item usuffix
+
+Uppercase version of C<suffix>.
+
+=item version
+
+Product version (not including the build number).
+
+=back
+
+=item @@{FILES:type}
+
+Expands to a value computed from the list of all files installed so far, in the
+manifest order, not including the file currently being processed. Because of
+this ordering issue, metadata such as various file lists should be listed at the
+end of the manifest file.
+
+The following types are supported:
+
+=over
+
+=item installedsize
+
+Supported for Debain pacakges. Expands to the total size of all files installed
+into the main filesystem (but not into the DEBIAN metadata directory).
+
+=item iterate
+
+Supported for tarballs. Produces lines for the C<iterate> function of the
+tarball install script.
+
+=item md5sums
+
+Supported for Debian packages. Produces the content for the C<md5sums> metadata
+file.
+
+=item requires
+
+Supported for RPM packages. Produces the list of requirements resulting from
+dependency scanning of files where the C<requires> attribute was set to C<true>.
+
+=item shlibdeps
+
+Supported for Debian packages. Produces a list of library dependencies derived
+from those binaries where the C<scandeps> attribute was set to C<true>.
+
+=item subtree:directory
+
+Supported for RPM packages. Produces the list of absolute paths to files under
+the specified directory. The directory is referenced by its symbolic tag as
+defined in the layout XML file.
+
+=back
+
+=item @@{TIME:format}
+
+Expands to the current time in the specified format. See L<strftime(3)> for
+details on the time format strings. Invoking this substitution repeatedly will
+produce the same expansions because the current time is taken once at the
+beginning of the packaging session.
+
+=item @@{symbol}
+
+Expands to the value of I<symbol> as defined by a C<@@define> directive. Macro
+processing fails with an error if I<symbol> is not defined, but succeeds if it's
+defined to an empty string.
+
+=back
+
+=head1 OWNER
+
+Alexey Feldgender L<mailto:alexeyf@opera.com>
+
+=head1 SEE ALSO
+
+Run C<package --help> for usage information.
+
+=cut
+
+use strict;
+use warnings;
+use diagnostics;
+use FindBin;
+use lib "$FindBin::Bin/src", "$FindBin::Bin/../../ubs/common", "$FindBin::Bin/../../ubs/common/package";
+use Getopt::Long qw(:config bundling);
+use POSIX qw(LC_ALL);
+use Cwd;
+use Time::localtime;
+
+use PackageConfig;
+use Scheduler;
+use FileCache;
+use RepackBundle;
+use DepTracker;
+
+sub detectVersion($)
+{
+	my $version_file = shift;
+	local *CPP;
+	open CPP, "echo VER_SHORT_NUM | cpp -P -include '$version_file' - |" or die "Cannot read $version_file";
+	my $version = '';
+	while (<CPP>) {
+		s/\s//g;
+		$version .= $_;
+	}
+	die "Cannot parse version '$version'" unless ($version =~ /^[0-9.]+$/);
+	return $version;
+}
+
+sub readListFile($$$)
+{
+	my $list_file = shift;
+	my $repack_bundle = shift;
+	my $dep_tracker = shift;
+	my @list = ();
+
+	local *LIST;
+	open LIST, '<', $list_file;
+	while(<LIST>)
+	{
+		s/\s*(#.*)?$//;
+		s/^\s*//;
+		push @list, $_ unless /^$/;
+	}
+
+	$repack_bundle->add($list_file) if $repack_bundle;
+	$dep_tracker->add($list_file) if $dep_tracker;
+
+	return @list;
+}
+
+sub usage()
+{
+	print STDERR <<'EOF';
+Usage:
+    package [options] [package-type[:product-name] ...]
+
+Package types:
+    devel
+        Pseudo package type that creates a "run" directory at top level
+        simulating an Opera installation for testing.
+    tar
+        Tarball.
+    deb
+        Debian package.
+    rpm
+        RPM package.
+
+Any explicitly specified name must be either "opera" or begin with "opera-". The
+default is "opera-devel" for package type "devel" and "opera" for other package
+types.
+
+Options:
+    --os OS
+        Target operating system. Default: autodetect.
+    --arch ARCH
+        Target architecture. Default: autodetect.
+    --version VER
+        Product version. Default: autodetect.
+    --build BUILD
+    -b BUILD
+        Build number. Default: 9999.
+    --manifest MANIFEST
+    -m MANIFEST
+        Use MANIFEST as the manifest file. This option can be repeated. If none
+        are specified, adjunct/resources/package.xml and
+        platforms/paxage/manifest.xml in the source directory are assumed, but
+        if some files are specified, then none are assumed. Note that the order
+        matters, so you probably want to list the latter file last.
+    --labs-name NAME
+    -L NAME
+        Opera Labs product name, such as "Hardware Acceleration". This only
+        affects the opera-labs product.
+    --target TARGET
+    -t TARGET
+        Add extra target symbol TARGET. Can be repeated.
+    --define MACRO=VALUE
+    -d MACRO=VALUE
+        Define MACRO to VALUE. Can be repeated.
+    --macros FILE
+    -M FILE
+        Process macro definitions in FILE, discarding the output, before any
+        other macro processing (but after -d above). The default setting is
+        platforms/paxage/global.inc.
+    --debugger COMMAND
+        Use COMMAND to run Opera in the developer wrapper script.
+        Default: "exec gdb -ex run --args" (start under gdb).
+    --strip COMMAND
+        Use COMMAND to strip binaries. Default: strip.
+    --repack-bundle
+    -r
+        Produce a repack bundle for rebuilding of packages of the specified
+        types.
+    --only-repack-bundle
+    -R
+        Implies --repack-bundle. Produce a repack bundle for rebuilding of
+        packages of the specified types, but skip the packages themselves.
+    --timestamp FILE
+    -T FILE
+        Touch FILE upon success. Also, produce a makefile snippet FILE.d
+        listing all files attempted or used in packaging as dependencies of
+        FILE, for inclusion in a makefile.
+    --clean always|auto|never
+        always
+            Always clean up temporary files after packaging.
+        auto
+            Clean up temporary files after successful packaging (default).
+        never
+            Do not clean up temporary files after packaging.
+    --buildroot DIR
+    -B DIR
+        Build root directory where files to be packaged can be found. May be
+        repeated. The directories will be considered in the order listed,
+        followed by the top level source directory
+    --output DIR
+        Directory for generated packages, defaults to packages under the top
+        level source directory.
+    --output-devel DIR
+        Directory for the "devel" pseudo-package, defaults to run under the
+        top level source directory.
+    --selftest
+        Run selftests (instead of building any packages).
+		Requires TAP::Harness.
+    --help
+        Show this help message.
+EOF
+	exit(1);
+}
+
+{
+	POSIX::setlocale(&LC_ALL, 'C');
+
+	my $operadir = $FindBin::Bin;
+	$operadir =~ s|/[^/]+/[^/]+/?$||;
+
+	my $master_conf = {};
+	$master_conf->{starttime} = localtime;
+	$master_conf->{build} = '9999';
+	$master_conf->{source} = $operadir;
+	$master_conf->{buildroot} = [];
+	$master_conf->{init_targets} = [];
+	$master_conf->{outdir} = "$master_conf->{source}/packages";
+	$master_conf->{develdir} = "$master_conf->{source}/run";
+	$master_conf->{macro_file} = "$master_conf->{source}/platforms/paxage/global.inc";
+	$master_conf->{strip_command} = 'strip';
+	$master_conf->{strip} = 1;
+	$master_conf->{make_repack_bundle} = 0;
+	$master_conf->{only_repack_bundle} = 0;
+
+	my $clean = 'auto';
+	my $quiet = 0;
+	my $verbose = 0;
+	my $selftest = 0;
+	GetOptions('os=s' => \$master_conf->{os},
+			   'arch=s' => \$master_conf->{arch},
+			   'build|b=i' => \$master_conf->{build},
+			   'version=s' => \$master_conf->{version},
+			   'manifest|m=s@' => \$master_conf->{manifest_files},
+			   'labs-name|L=s' => \$master_conf->{labs_name},
+			   'target|t=s@' => \$master_conf->{init_targets},
+			   'define|d=s%' => \$master_conf->{defines},
+			   'macros|M=s' => \$master_conf->{macro_file},
+			   'debugger=s' => \$master_conf->{debugger},
+			   'strip=s' => \$master_conf->{strip_command},
+			   'repack-bundle|r' => \$master_conf->{make_repack_bundle},
+			   'only-repack-bundle|R' => \$master_conf->{only_repack_bundle},
+			   'timestamp|T=s' => \$master_conf->{timestamp},
+			   'clean=s' => \$clean,
+			   'buildroot|B=s@' => \$master_conf->{buildroot},
+			   'output=s' => \$master_conf->{outdir},
+			   'output-devel=s' => \$master_conf->{develdir},
+			   'selftest' => \$selftest,
+			   'verbose|v' => \$verbose,
+			   'quiet|q' => \$quiet,
+			   'help|?' => \&usage) or usage();
+
+	die 'Invalid value specified for --clean' unless grep $_ eq $clean, qw(auto always never);
+	die '--labs-name must be specified to build opera-labs' if !$master_conf->{labs_name} && grep /:opera-labs$/, @ARGV;
+
+	usage() unless @ARGV || $selftest;
+	$master_conf->{package_types} = [@ARGV];
+	$master_conf->{outdir} = Cwd::realpath($master_conf->{outdir});
+	$master_conf->{develdir} = Cwd::realpath($master_conf->{develdir});
+	$master_conf->{temp_root} = "$master_conf->{outdir}/temp";
+	$master_conf->{verbosity} = $quiet ? 0 : $verbose ? 2 : 1;
+	$master_conf->{manifest_files} = [
+		"$master_conf->{source}/adjunct/resources/package.xml",
+		"$master_conf->{source}/platforms/paxage/manifest.xml"] unless $master_conf->{manifest_files};
+	$master_conf->{version} = detectVersion("$operadir/adjunct/quick/quick-version.h") unless $master_conf->{version};
+	$master_conf->{make_repack_bundle} = 1 if $master_conf->{only_repack_bundle};
+
+	foreach my $item (@{$master_conf->{buildroot}}) {
+		$item = Cwd::realpath($item);
+	}
+
+	unless ($master_conf->{os})
+	{
+		$master_conf->{os} = `uname -s`;
+		chomp $master_conf->{os};
+	}
+
+	unless ($master_conf->{arch})
+	{
+		for (`uname -m`) {
+			chomp;
+			if (/^(i86pc|i[3-6]86)$/)
+			{
+				$master_conf->{arch} = 'i386';
+			}
+			elsif (/^amd64$/)
+			{
+				$master_conf->{arch} = 'x86_64';
+			}
+			else
+			{
+				$master_conf->{arch} = $_;
+			}
+		}
+	}
+
+	my $status = 1;
+
+	File::Path::rmtree($master_conf->{temp_root});
+
+	my $cache_preseed = "$master_conf->{source}/preseed";
+	$cache_preseed = undef unless -d $cache_preseed;
+	$master_conf->{cache} = new FileCache("$master_conf->{temp_root}/cache", $cache_preseed);
+	$master_conf->{scheduler} = new Scheduler;
+
+	if ($selftest) {
+		require TAP::Harness;
+		my $harness = TAP::Harness->new({verbosity => $verbose, color => 1});
+		my $result = $harness->runtests(<$FindBin::Bin/t/*.t>);
+		exit ($result->all_passed() ? 0 : 1);
+	}
+
+	if ($master_conf->{make_repack_bundle}) {
+		$master_conf->{repack_bundle} = new RepackBundle($master_conf);
+		$master_conf->{repack_bundle}->add("$master_conf->{source}/platforms/paxage/package");
+		$master_conf->{repack_bundle}->addDir("$master_conf->{source}/platforms/paxage/src");
+		while (glob "$master_conf->{source}/ubs/common/package/*.pm") {
+			$master_conf->{repack_bundle}->add($_);
+		}
+	}
+
+	if ($master_conf->{timestamp}) {
+		$master_conf->{dep_tracker} = new DepTracker($master_conf);
+		$master_conf->{dep_tracker}->add("$master_conf->{source}/platforms/paxage/package");
+		$master_conf->{dep_tracker}->addDir("$master_conf->{source}/platforms/paxage/src");
+		while (glob "$master_conf->{source}/ubs/common/package/*.pm") {
+			$master_conf->{dep_tracker}->add($_);
+		}
+	}
+
+	$master_conf->{languages} = [readListFile("$master_conf->{source}/adjunct/resources/lang_list.txt",
+		$master_conf->{repack_bundle}, $master_conf->{dep_tracker})];
+	$master_conf->{regions} = [readListFile("$master_conf->{source}/adjunct/resources/region_list.txt",
+		$master_conf->{repack_bundle}, $master_conf->{dep_tracker})];
+
+	foreach my $package_type (@{$master_conf->{package_types}}) {
+		my $conf = new PackageConfig($master_conf);
+		$package_type =~ /^([[:alnum:]-]+)(?::(opera(?:-[[:alnum:]-]+)?))?$/ or die "Invalid value specified for a package type: $package_type";
+		$conf->{package_type} = $1;
+		$conf->{product} = $2 // ($1 eq 'devel' ? 'opera' : 'opera-next');
+		$conf->prepare();
+		print "Packaging $conf->{product} as $conf->{package_type}\n";
+		$status &&= $conf->run($master_conf->{only_repack_bundle});
+	}
+
+	$status &&= $master_conf->{repack_bundle}->done() if $master_conf->{repack_bundle};
+
+	my $tasks = $master_conf->{scheduler}->taskCount();
+	print "Waiting for $tasks background packaging tasks to complete\n" if $tasks;
+	$status = $master_conf->{scheduler}->done() && $status;
+
+	if ($clean eq 'always' || $clean eq 'auto' && $status)
+	{
+		File::Path::rmtree($master_conf->{temp_root});
+	}
+
+	my @out_files = $master_conf->{scheduler}->filesProduced();
+	if (@out_files) {
+		print "Generated packages:\n";
+		local *LIST;
+		open LIST, '>', "$master_conf->{outdir}/packages.list";
+		foreach (@out_files) {
+			print "\t$_\n";
+			print LIST "$_\n";
+		}
+	} else {
+		unlink "$master_conf->{outdir}/packages.list";
+		rmdir $master_conf->{outdir};
+	}
+
+	$master_conf->{dep_tracker}->done() if $master_conf->{dep_tracker} && $status;
+
+	exit !$status;
+}

@@ -1,0 +1,626 @@
+/* -*- Mode: c++; tab-width: 4; indent-tabs-mode: t; c-basic-offset: 4 -*-
+ *
+ * Copyright (C) 1995-2011 Opera Software AS.  All rights reserved.
+ *
+ * This file is part of the Opera web browser.
+ * It may not be distributed under any circumstances.
+ */
+
+group "hardcore.channels";
+language c++;
+
+include "modules/hardcore/timer/optimer.h";
+include "modules/hardcore/component/OpComponent.h";
+include "modules/hardcore/component/Messages.h";
+include "modules/opdata/OpData.h";
+
+global
+{
+	class TestTimerListener : public OpTimerListener
+	{
+		OpTimer m_timer;
+
+	public:
+		TestTimerListener()
+		{
+			m_timer.SetTimerListener(this);
+			m_timer.Start(100);
+		}
+
+		void OnTimeOut(OpTimer*)
+		{
+			ST_failed("Test timed out.");
+		}
+		
+		void Stop()
+		{
+			m_timer.Stop();
+		}
+
+	};
+	TestTimerListener g_test_listener;
+
+	class ChannelListener
+	{
+	protected:
+		TestTimerListener* m_test_listener;
+		ChannelListener(TestTimerListener* test_listener)
+			: m_test_listener(test_listener) {}
+
+		void Succeed()
+		{
+			m_test_listener->Stop();
+			ST_passed();
+		}
+
+		void Fail(const char* s)
+		{
+			m_test_listener->Stop();
+			ST_failed(s);
+		}
+	};
+
+	class FirstChannel
+		: public ChannelListener, public OpMessageListener
+	{
+	public:
+			
+		OpChannel *a;
+
+		FirstChannel(TestTimerListener* test_listener) 
+			: ChannelListener(test_listener)
+			, a(NULL)
+		{
+			m_connected = false;
+		}
+		
+		~FirstChannel()
+		{
+			OP_DELETE(a);
+		}
+		
+		virtual OP_STATUS ProcessMessage(const OpTypedMessage* message)
+		{
+			switch (message->GetType())
+			{
+				case OpPeerConnectedMessage::Type:
+					return ProcessMessage(OpPeerConnectedMessage::Cast(message));
+					
+				case OpNumberMessage::Type:
+					return ProcessMessage(OpNumberMessage::Cast(message));
+
+				case OpPeerDisconnectedMessage::Type:
+					return ProcessMessage(OpPeerDisconnectedMessage::Cast(message));
+
+				default:
+					Fail("FirstChannel received unexpected message type.");
+			}
+
+			return OpStatus::ERR;
+		}
+		
+		OP_STATUS ProcessMessage(const OpNumberMessage* message)
+		{
+			switch (message->GetNumber()) {
+				case 1: return a->SendMessage(OpNumberMessage::Create(2));
+				case 3: Succeed(); return OpStatus::OK;
+				case 4:
+					if (!a->IsDirected())
+					{
+						Succeed();
+						return OpStatus::OK;
+					}
+					else
+					{
+						Fail("On receiving 4, a is expected to be undirected");
+						return OpStatus::OK;
+					} 
+				default:
+					OpString8 err;
+					err.AppendFormat("Unexpected FirstChannel %d", message->GetNumber());
+					Fail(err.CStr());return OpStatus::ERR; 
+				}
+		}
+
+		OP_STATUS ProcessMessage(OpPeerConnectedMessage* message)
+		{
+			m_connected = true;
+			
+			if (!a || !a->IsConnected())
+				{
+					Fail("FirstChannel received PeerConnected message, but is not connected.");
+					return OpStatus::ERR;
+				}
+			return OpStatus::OK;
+		}
+		
+		OP_STATUS ProcessMessage(OpPeerDisconnectedMessage* message)
+		{
+			m_connected = false;
+							
+			if (!a)
+				{
+					Fail("SecondChannel received PEER_DISCONNECTED message, but is not connected.");
+					return OpStatus::ERR;
+				}
+			return OpStatus::OK;
+		}
+		
+		bool IsConnected() { return m_connected; }
+
+	private:
+		bool m_connected;
+	};
+
+class SecondChannel
+		: public ChannelListener, public OpMessageListener
+	{
+		public:
+		
+		OpChannel *b;
+		OpChannel *c;
+
+		SecondChannel(TestTimerListener* test_listener) 
+			: ChannelListener(test_listener)
+			, b(NULL)
+			, c(NULL)
+		{
+			m_connected = false;
+		}
+		
+		~SecondChannel()
+		{
+			OP_DELETE(b);
+			OP_DELETE(c);
+		}
+
+		virtual OP_STATUS ProcessMessage(const OpTypedMessage* message)
+		{
+			switch (message->GetType())
+			{				
+				case OpNumberMessage::Type:
+					return ProcessMessage(OpNumberMessage::Cast(message));
+
+				case OpPeerDisconnectedMessage::Type:
+					return ProcessMessage(OpPeerDisconnectedMessage::Cast(message));
+
+				default:
+					Fail("SecondChannel received unexpected message type.");
+			}
+
+			return OpStatus::ERR;
+		}
+		
+		OP_STATUS ProcessMessage(const OpNumberMessage* message)
+		{
+			switch (message->GetNumber()) {
+				case 2:
+					if (c)
+					{
+						if (c->IsConnected())
+						{
+							Fail("Expected c to be not connected");
+							return OpStatus::ERR;
+						}
+						c->Connect();
+						if (!c->IsConnected())
+						{
+							Fail("Expected c to be connected");
+							return OpStatus::ERR;
+						}
+					}
+					else
+						Succeed();
+					return OpStatus::OK;
+				default:
+					OpString8 err;
+					err.AppendFormat("Unexpected SecondChannel %d", message->GetNumber());
+					Fail(err.CStr());return OpStatus::ERR; 
+				}
+		}
+		
+		OP_STATUS ProcessMessage(OpPeerDisconnectedMessage* message)
+		{
+			m_connected = false;
+			if (c)
+			{
+				if (!c->IsConnected())
+				{
+					Fail("SecondChannel received PEER_DISCONNECTED message, but c is not connected.");
+					return OpStatus::ERR;
+				}
+				return message->Reply(OpNumberMessage::Create(3));
+			}
+			if (!b)
+				{
+					Fail("SecondChannel received PEER_DISCONNECTED message, but is not connected.");
+					return OpStatus::ERR;
+				}
+			Succeed();
+			return OpStatus::OK;
+		}
+
+		bool IsConnected() { return m_connected; }
+
+	private:
+		bool m_connected;
+	};
+
+class TestConnected
+		: public OpMessageListener
+	{
+		public:
+		size_t count_connected;
+		 
+		TestConnected() : count_connected(0) {} 
+		
+		virtual ~TestConnected() {} 
+
+		virtual OP_STATUS ProcessMessage(const OpTypedMessage* message)
+		{
+            if (message->GetType() == OpPeerConnectedMessage::Type)
+                count_connected++;
+            return OpStatus::OK;
+        } 		
+	};
+
+	
+#define async_verify(x) do { if (!(x)) ST_failed(#x); } while (0)
+#define async_verify_success(x) do { if (OpStatus::IsError(x)) ST_failed(#x); } while (0)
+}
+test("Testing two channels")
+async;
+{
+	/*
+	* a <----------------- directed ------ b
+	* b->Connect():
+	* a <--- OpPeerConnectedMessage ------ b
+	* a <--- (1) ------------------------- b
+	* on receiving (1):
+	* a ---- (2) ------------------------> b
+	* verify:
+	* a: on receiving (1): fail if a is not connected, thus verify that we received OpPeerConnectedMessage
+	* b: pass on receiving (2), thus verify that a received 1 and a is connected to b.
+	*/
+	
+	FirstChannel* a_listener = OP_NEW(FirstChannel,(&g_test_listener));
+	ST_delete_after_group(a_listener);
+	OpChannel* a = a_listener->a = g_component->CreateChannel();
+
+	async_verify(a);
+	async_verify_success(a->AddMessageListener(a_listener));
+	
+	SecondChannel* b_listener = OP_NEW(SecondChannel,(&g_test_listener));
+	ST_delete_after_group(b_listener);
+	OpChannel* b = b_listener->b = g_component->CreateChannel(a->GetAddress());
+	
+	async_verify(b);
+	async_verify_success(b->AddMessageListener(b_listener, true));
+	
+	async_verify(!a->IsDirected());
+	async_verify(b->IsDirected());
+	async_verify(!b->IsConnected());
+	async_verify(!a->IsConnected());
+	async_verify_success(b->Connect());
+	async_verify(b->IsConnected());
+	async_verify(!a->IsConnected());
+	async_verify_success(b->SendMessage(OpNumberMessage::Create(1)));
+}
+
+test("Testing three channels - redirect the first channel")
+async;
+{
+	/*
+	* a <----------------- directed ------ b
+	* b->Connect():
+	* a <--- OpPeerConnectedMessage ------ b
+	* a <--- (1) ------------------------- b
+	* a ---- (2) ------------------------> b
+	* a <----------------- directed ------ c
+	* c->Connect(): 
+	* a <--- OpPeerConnectedMessage ------ c
+	* a ---- OpPeerDisconnectedMessage --> b
+	* a <--- (3) ------------------------- b
+	* verify:
+	* b: on receiving (2), connect c (initially directed to a) thus we disconnect a from b. 
+	* after connected c to a, channel b received OpPeerDisconnectedMessage and b is not connected to a anymore. 
+	* b verifies that c is connected and sends (3) to a to conclude the test. 
+	* The test passes when a receives (3).	
+	*/
+	
+	FirstChannel* a_listener = OP_NEW(FirstChannel,(&g_test_listener));
+	ST_delete_after_group(a_listener);
+	OpChannel* a = a_listener->a = g_component->CreateChannel();
+	
+	async_verify(a);
+	async_verify_success(a->AddMessageListener(a_listener));
+	
+	SecondChannel* b_listener = OP_NEW(SecondChannel,(&g_test_listener));
+	OpChannel* b = b_listener->b = g_component->CreateChannel(a->GetAddress());
+	ST_delete_after_group(b_listener);
+	
+	async_verify(b);
+	async_verify_success(b->AddMessageListener(b_listener, true));
+		
+	async_verify(!a->IsDirected());
+	async_verify(b->IsDirected());
+	async_verify(!b->IsConnected());
+	async_verify(!a->IsConnected());
+	async_verify_success(b->Connect());
+	async_verify(b->IsConnected());
+	async_verify(!a->IsConnected());
+	async_verify_success(b->SendMessage(OpNumberMessage::Create(1)));
+	
+	OpChannel* c = b_listener->c = g_component->CreateChannel(a->GetAddress());
+	async_verify(c);
+	async_verify_success(c->AddMessageListener(b_listener, true));
+	async_verify_success(b->SendMessage(OpNumberMessage::Create(3)));
+}
+
+test("Testing destroy channel after receiving connect msg")
+async;
+{
+	/*
+	* a <----------------- directed ------ b
+	* b->Connect():
+	* a <--- OpPeerConnectedMessage ------ b
+	* a <--- (1) ------------------------- b
+	* OP_DELETE(b)
+	* a <--- OpPeerDisconnectedMessage --- b
+	* a --(4)-> a
+	* on receiving (1):
+	* a ---- (2) ------------------------> b - will not be delivered because b is deleted
+	* verify:
+	* (previous test verified that a receives OpPeerConnectedMessage and is connected to b)
+	* verify that a receives OpPeerDisconnectedMessage by sending (4) to itself.
+	* a: On handling (4), pass if a is not connected and not directed.
+	*/
+	FirstChannel* a_listener = OP_NEW(FirstChannel,(&g_test_listener));
+	ST_delete_after_group(a_listener);
+	OpChannel* a = a_listener->a = g_component->CreateChannel();
+
+	async_verify(a);
+	async_verify_success(a->AddMessageListener(a_listener));
+	
+	SecondChannel* b_listener = OP_NEW(SecondChannel,(&g_test_listener));
+	ST_delete_after_group(b_listener);
+	OpChannel* b = b_listener->b = g_component->CreateChannel(a->GetAddress());
+	
+	async_verify(b);
+	async_verify_success(b->AddMessageListener(b_listener, true));
+	
+	async_verify(!a->IsDirected());
+	async_verify(b->IsDirected());
+	async_verify(!b->IsConnected());
+	async_verify(!a->IsConnected());
+	async_verify_success(b->Connect());
+	async_verify(b->IsConnected());
+	async_verify(!a->IsConnected());
+	async_verify_success(b->SendMessage(OpNumberMessage::Create(1)));
+	OP_DELETE(b);
+	b_listener->b = NULL;
+	async_verify_success(g_component->SendMessage(OpNumberMessage::Create(4, a->GetAddress(), a->GetAddress())));
+}
+
+test("Testing destroy channel after receiving connect msg")
+async;
+{
+	/*
+	* a <----------------- directed ------ b
+	* b->Connect():
+	* a <--- OpPeerConnectedMessage ------ b
+	* OP_DELETE(b)
+	* a <--- OpPeerDisconnectedMessage --- b
+	* a --(4)-> a
+	* verify:
+	* (previous test verified that a receives OpPeerConnectedMessage and is connected to b)
+	* verify that a receives OpPeerDisconnectedMessage by sending (4) to itself.
+	* a: On handling (4), pass if a is not connected and not directed.
+	*/
+	FirstChannel* a_listener = OP_NEW(FirstChannel,(&g_test_listener));
+	ST_delete_after_group(a_listener);
+	OpChannel* a = a_listener->a = g_component->CreateChannel();
+
+	async_verify(a);
+	async_verify_success(a->AddMessageListener(a_listener));
+	
+	SecondChannel* b_listener = OP_NEW(SecondChannel,(&g_test_listener));
+	ST_delete_after_group(b_listener);
+	OpChannel* b = b_listener->b = g_component->CreateChannel(a->GetAddress());
+	
+	async_verify(b);
+	async_verify_success(b->AddMessageListener(b_listener, true));
+	
+	async_verify(!a->IsDirected());
+	async_verify(b->IsDirected());
+	async_verify(!b->IsConnected());
+	async_verify(!a->IsConnected());
+	async_verify_success(b->Connect());
+	OP_DELETE(b);
+	b_listener->b = NULL;
+	async_verify_success(g_component->SendMessage(OpNumberMessage::Create(4, a->GetAddress(), a->GetAddress())));
+}
+
+test("Testing undirect channel after receiving connect msg")
+async;
+{
+	/*
+	* a <----------------- directed ------ b
+	* b->Connect():
+	* a <--- OpPeerConnectedMessage ------ b
+	* b->Undirect();
+	* a <--- OpPeerDisconnectedMessage --- b
+	* a --(4)-> a
+	* verify:
+	* (previous test verified that a receives OpPeerConnectedMessage and is connected to b)
+	* verify that a receives OpPeerDisconnectedMessage by sending (4) to itself.
+	* a: On handling (4), pass if a is not connected and not directed.
+	*/
+	FirstChannel* a_listener = OP_NEW(FirstChannel,(&g_test_listener));
+	ST_delete_after_group(a_listener);
+	OpChannel* a = a_listener->a = g_component->CreateChannel();
+
+	async_verify(a);
+	async_verify_success(a->AddMessageListener(a_listener));
+	
+	SecondChannel* b_listener = OP_NEW(SecondChannel,(&g_test_listener));
+	ST_delete_after_group(b_listener);
+	OpChannel* b = b_listener->b = g_component->CreateChannel(a->GetAddress());
+	
+	async_verify(b);
+	async_verify_success(b->AddMessageListener(b_listener, true));
+	
+	async_verify(!a->IsDirected());
+	async_verify(b->IsDirected());
+	async_verify(!b->IsConnected());
+	async_verify(!a->IsConnected());
+	async_verify_success(b->Connect());
+	b->Undirect();
+	b_listener->b = NULL;
+	async_verify_success(g_component->SendMessage(OpNumberMessage::Create(4, a->GetAddress(), a->GetAddress())));
+}
+
+test("Testing direct channel after receiving connect msg")
+async;
+{
+	/*
+	* a <----------------- directed ------ b
+	* b->Connect():
+	* a <--- OpPeerConnectedMessage ------ b
+	* a <--- (1) ------------------------- b
+	* b->Direct();
+	* a <--- OpPeerDisconnectedMessage --- b
+	* a --(4)-> a
+	* on receiving (1):
+	* a ---- (2) ------------------------> b
+	* verify:
+	* (previous test verified that a receives OpPeerConnectedMessage and is connected to b)
+	* verify that a receives OpPeerDisconnectedMessage by sending (4) to itself.
+	* a: On handling (4), pass if a is not connected and not directed.
+	*/
+	FirstChannel* a_listener = OP_NEW(FirstChannel,(&g_test_listener));
+	ST_delete_after_group(a_listener);
+	OpChannel* a = a_listener->a = g_component->CreateChannel();
+
+	async_verify(a);
+	async_verify_success(a->AddMessageListener(a_listener));
+	
+	SecondChannel* b_listener = OP_NEW(SecondChannel,(&g_test_listener));
+	ST_delete_after_group(b_listener);
+	OpChannel* b = b_listener->b = g_component->CreateChannel(a->GetAddress());
+
+	async_verify(b);
+	async_verify_success(b->AddMessageListener(b_listener, true));
+	
+	async_verify(!a->IsDirected());
+	async_verify(b->IsDirected());
+	async_verify(!b->IsConnected());
+	async_verify(!a->IsConnected());
+	async_verify_success(b->Connect());
+	async_verify(b->IsConnected());
+	async_verify(!a->IsConnected());
+	async_verify_success(b->SendMessage(OpNumberMessage::Create(1)));
+	
+	OpChannel* c = g_component->CreateChannel(a->GetAddress());
+	async_verify(c);
+	
+	b->Direct(c->GetAddress());
+	async_verify_success(g_component->SendMessage(OpNumberMessage::Create(4, a->GetAddress(), a->GetAddress())));
+}
+
+test("Channel in Undirected state receives messages")
+async;
+{
+	FirstChannel* a_listener = OP_NEW(FirstChannel,(&g_test_listener));
+	ST_delete_after_group(a_listener);
+	OpChannel* ch = a_listener->a = g_component->CreateChannel();
+	
+	async_verify(ch);
+	async_verify_success(ch->AddMessageListener(a_listener));
+	async_verify_success(g_component->SendMessage(OpNumberMessage::Create(3, OpMessageAddress(0,0,0), ch->GetAddress())));
+
+#undef async_verify_success
+#undef async_verify
+}
+
+test("OpChannel_SendMessage() undirected returns error")
+{
+	UniString msg;
+	verify_success(msg.SetConstData(UNI_L("echo")));
+	OpChannel* ch = g_component->CreateChannel();
+	verify_status(ch->SendMessage(OpTextMessage::Create(msg)), OpStatus::ERR_NO_SUCH_RESOURCE);
+	OP_DELETE(ch);
+}
+
+test("OpChannel_SendMessage(NULL)")
+{
+	OpChannel* ch = g_component->CreateChannel();
+	verify_status(ch->SendMessage(NULL), OpStatus::ERR_NO_MEMORY);
+	verify_status(ch->SendMessage(NULL, 0), OpStatus::ERR_NULL_POINTER);
+	OP_DELETE(ch);
+}
+
+test("Testing AddressExists")
+{		
+	/*
+	* create an underected channel
+	* get the channel address
+	* verify that the channel address exists
+	* delete the channel
+	* verify  that the address does not exist
+	*/
+	OpChannel* ch = g_component->CreateChannel();
+	OpMessageAddress channel_address= ch->GetAddress();
+	verify(g_component->AddressExists(channel_address));
+   	OP_DELETE(ch);
+	verify(!g_component->AddressExists(channel_address));	
+}
+
+table test_connected_table (const char* testname, OpChannel::State state, bool silent, size_t expected_count)
+{
+    { "undirected",        OpChannel::UNDIRECTED, false, 0 },
+    { "undirected+silent", OpChannel::UNDIRECTED, true,  0 },
+    { "directed",          OpChannel::DIRECTED,   false, 0 },
+    { "directed+silent",   OpChannel::DIRECTED,   true,  0 },
+    { "connected",         OpChannel::CONNECTED,  false, 1 },
+    { "connected+silent",  OpChannel::CONNECTED,  true,  0 },
+}
+
+foreach (testname, state, silent, expected_count) from test_connected_table
+{
+    test("OpChannel::AddMessageListener(" testname ")")
+    {
+        OpChannel::State s = state;
+        OpChannel* other = NULL;
+        OpChannel* a = NULL;
+        // Initialise a as specified:
+        if (s >= OpChannel::DIRECTED)
+        {
+            other = g_opera->CreateChannel();
+            verify(other);
+            a = g_opera->CreateChannel(other->GetAddress());
+        }
+        else
+            a = g_opera->CreateChannel();
+        verify(a);
+        if (s >= OpChannel::DIRECTED)
+            verify(a->IsDirected());
+        if (s >= OpChannel::CONNECTED)
+        {
+            a->Connect();
+            verify(a->IsConnected());
+        }
+
+        // Add a test-listener
+        TestConnected listener;
+        verify_success(a->AddMessageListener(&listener, silent));
+        /* verify that the test-listener received the expected count of
+         * OpPeerConnectedMessage:s: */
+        verify(listener.count_connected == expected_count);
+    }
+    finally
+    {
+        OP_DELETE(a);
+        OP_DELETE(other);
+    }
+} 

@@ -1,0 +1,396 @@
+// svg.search.ot
+group "svg.search";
+
+require SVG_SUPPORT;
+require SVG_DOM;
+require SVG_FULL_11;
+require init;
+require SVG_SUPPORT_SEARCH_HIGHLIGHTING;
+
+include "modules/display/vis_dev.h";
+include "modules/svg/src/svgpch.h";
+include "modules/svg/src/SVGManagerImpl.h";
+include "modules/svg/src/AttrValueStore.h";
+include "modules/svg/src/SVGImageImpl.h";
+include "modules/svg/src/SVGTextTraverse.h";
+include "modules/svg/src/SVGDocumentContext.h";
+include "modules/doc/frm_doc.h";
+include "modules/layout/cascade.h";
+
+global 
+{
+	class SelftestSearchHelper
+	{
+		private:
+			SearchData* data;
+			SelectionElm* sel;
+			SVGDocumentContext* doc_ctx;
+			HTML_Element* elm;
+			LayoutProperties* cascade;
+			Head prop_list;
+			SVGTextArguments tparams;
+		public:
+			SelftestSearchHelper() : data(NULL), sel(NULL) {}
+			~SelftestSearchHelper() { OP_DELETE(data); prop_list.Clear(); }
+
+			BOOL Init(HTML_Element* textroot_elm)
+			{
+				doc_ctx = AttrValueStore::GetSVGDocumentContext(textroot_elm);
+				if (!doc_ctx)
+					return FALSE;
+
+				HLDocProfile* hld_prof = doc_ctx->GetHLDocProfile();
+				cascade = LayoutProperties::CreateCascade(textroot_elm, prop_list,
+														  LAYOUT_WORKPLACE(hld_prof));
+				sel = NULL;
+				elm = NULL;
+				return cascade != NULL;
+			}
+
+			BOOL Search(const uni_char* str)
+			{
+				LogicalDocument *logdoc = state.doc->GetLogicalDocument();
+				if(data)
+				{
+					OP_DELETE(data);
+				}
+
+				data = new SearchData(TRUE, FALSE, FALSE, TRUE, FALSE);
+				if(!data)
+					return FALSE;
+
+				data->SetSearchText(str);
+				OpStatus::Ignore(logdoc->FindAllMatches(data, NULL, 0));
+
+				return TRUE;
+			}
+
+			BOOL GetFirst(BOOL set_elm = TRUE)
+			{
+				sel = state.doc->GetHtmlDocument()->GetFirstSelectionElm();
+				if(!sel)
+					return FALSE;
+
+				if(set_elm)
+					elm = sel->GetSelection()->GetStartElement();
+
+				tparams.SetupTextSelection(doc_ctx, elm);
+
+				tparams.doc_ctx = doc_ctx;
+				tparams.current_element = elm;
+				tparams.props = cascade->GetProps();
+
+				tparams.SetupTextSelectionForFragment();
+				return TRUE;
+			}
+
+			BOOL GetNext(BOOL set_elm = TRUE)
+			{
+				sel = (SelectionElm*)sel->Suc();
+				if(!sel)
+					return FALSE;
+				
+				if(set_elm)
+					elm = sel->GetSelection()->GetStartElement();
+
+				if (elm != tparams.current_element)
+				{
+					tparams.SetupTextSelection(doc_ctx, elm);
+					tparams.current_element = elm;
+					tparams.SetupTextSelectionForFragment();
+				}
+				else
+				{
+					tparams.GetNextSelection(doc_ctx, elm, *cascade->GetProps());
+				}
+				return TRUE;
+			}
+
+			BOOL CheckSelectionRange(int expected_min, int expected_max)
+			{
+				if(!tparams.SelectionActive())
+					return FALSE;
+				if(tparams.selected_min_idx != expected_min)
+				{
+					output("Expected selected_min_idx == %d, got %d.", expected_min, tparams.selected_min_idx);
+					return FALSE;
+				}
+				
+				if(tparams.selected_max_idx != expected_max)
+				{
+					output("Expected selected_max_idx == %d, got %d.", expected_max, tparams.selected_max_idx);
+					return FALSE;
+				}
+
+				return TRUE;
+			}
+	};
+}
+
+xml {
+//! <?xml version="1.0" standalone="no"?>
+//! <svg viewBox="0 0 1000 300" version="1.1"
+//!      xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink">
+//!   <defs>
+//!     <path id="MyPath"
+//!           d="M 100 200 
+//!              C 200 100 300   0 400 100
+//!              C 500 200 600 300 700 200
+//!              C 800 100 900 100 900 100" />
+//!   </defs>
+//!   <desc>Example toap01 - simple text on a path</desc>
+//! 
+//!   <use xlink:href="#MyPath" fill="none" stroke="red"  />
+//!   <text font-family="Verdana" font-size="42.5" fill="blue" >
+//!     <textPath xlink:href="#MyPath">
+//!       We go up, then we go down, then up again
+//!     </textPath>
+//!   </text>
+//! 
+//!   <!-- Show outline of canvas using 'rect' element -->
+//!   <rect x="1" y="1" width="998" height="298"
+//!         fill="none" stroke="blue" stroke-width="2" />
+//! </svg>
+};
+
+test("TextPath single char")
+{
+	SelftestSearchHelper search;
+	verify(search.Init(find_element("textPath",1)));
+
+	verify(search.Search(UNI_L("e")));
+	verify(search.GetFirst());
+	verify(search.CheckSelectionRange(1, 2));
+	verify(search.GetNext());
+	verify(search.CheckSelectionRange(12, 13));
+	verify(search.GetNext());
+	verify(search.CheckSelectionRange(16, 17));
+	verify(search.GetNext());
+	verify(search.CheckSelectionRange(29, 30));
+	verify(search.GetNext() == FALSE);
+}
+
+xml {
+//! <?xml version="1.0" encoding="UTF-8"?>
+//! <svg version='1.1' xmlns='http://www.w3.org/2000/svg' xmlns:xlink='http://www.w3.org/1999/xlink'>
+//!   <textArea x='10' y='20' width="80%" font-size='18px'>
+//!     t<tbreak/>t<tbreak/>t
+//!   </textArea>
+//! </svg>
+};
+
+test("No whitespace single char textarea")
+{
+	SelftestSearchHelper search;
+	verify(search.Init(find_element("textArea",1)));
+
+	verify(search.Search(UNI_L("t")));
+	verify(search.GetFirst());
+	verify(search.CheckSelectionRange(0, 1));
+	verify(search.GetNext());
+	verify(search.CheckSelectionRange(0, 1));
+	verify(search.GetNext());
+	verify(search.CheckSelectionRange(0, 1));
+	verify(search.GetNext() == FALSE);
+}
+
+xml {
+//! <?xml version="1.0" encoding="UTF-8"?>
+//! <svg version='1.1' xmlns='http://www.w3.org/2000/svg' xmlns:xlink='http://www.w3.org/1999/xlink' xml:space="preserve">
+//!   <textArea x='10' y='20' width="80%" font-size='18px'>
+//!     t <tbreak/> t <tbreak/> t
+//!   </textArea>
+//! </svg>
+};
+
+test("Whitespace and xml:space=preserve single char textarea")
+{
+	SelftestSearchHelper search;
+	verify(search.Init(find_element("textArea",1)));
+
+	verify(search.Search(UNI_L("t")));
+	verify(search.GetFirst());
+	verify(search.CheckSelectionRange(5, 6));
+	verify(search.GetNext());
+	verify(search.CheckSelectionRange(1, 2));
+	verify(search.GetNext());
+	verify(search.CheckSelectionRange(1, 2));
+	verify(search.GetNext() == FALSE);
+}
+
+xml {
+//! <?xml version="1.0" encoding="UTF-8"?>
+//! <svg version='1.1' xmlns='http://www.w3.org/2000/svg' xmlns:xlink='http://www.w3.org/1999/xlink'>
+//!   <textArea x='10' y='20' width="80%" font-size='18px'>
+//!     t <tbreak/> t <tbreak/> t
+//!   </textArea>
+//! </svg>
+};
+
+test("Whitespace single char textarea")
+{
+	SelftestSearchHelper search;
+	verify(search.Init(find_element("textArea",1)));
+
+	verify(search.Search(UNI_L("t")));
+	verify(search.GetFirst());
+	verify(search.CheckSelectionRange(0, 1));
+	verify(search.GetNext());
+	verify(search.CheckSelectionRange(0, 1));
+	verify(search.GetNext());
+	verify(search.CheckSelectionRange(0, 1));
+	verify(search.GetNext() == FALSE);
+}
+
+xml {
+//! <svg version='1.1' xmlns='http://www.w3.org/2000/svg' xmlns:xlink='http://www.w3.org/1999/xlink'>
+//!   <text x='100' y='200' font-size='18px' fill='black'><tspan font-weight='bold' fill='crimson'>a</tspan> a</text>
+//! </svg>
+};
+
+test("tspan single char")
+{
+	SelftestSearchHelper search;
+	verify(search.Init(find_element("text",1)));
+
+	verify(search.Search(UNI_L("a")));
+	verify(search.GetFirst());
+	verify(search.CheckSelectionRange(0, 1));
+	verify(search.GetNext());
+	verify(search.CheckSelectionRange(1, 2));
+	verify(search.GetNext() == FALSE);
+}
+
+xml {
+//! <?xml version="1.0" standalone="no"?>
+//! <svg viewBox="0 0 1000 300" version="1.1"
+//!      xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink">
+//!   <defs>
+//!     <path id="MyPath"
+//!           d="M 100 200 
+//!              C 200 100 300   0 400 100
+//!              C 500 200 600 300 700 200
+//!              C 800 100 900 100 900 100" />
+//!   </defs>
+//!   <desc>Example toap02 - tspan within textPath</desc>
+//! 
+//!   <use xlink:href="#MyPath" fill="none" stroke="red"  />
+//!   <text font-family="Verdana" font-size="42.5" fill="blue" >
+//!     <textPath xlink:href="#MyPath">
+//!       We go 
+//!       <tspan dy="-30" fill="red" >
+//!         up
+//!       </tspan>
+//!       <tspan dy="30">
+//!         ,
+//!       </tspan>
+//!       then we go down, then up again
+//!     </textPath>
+//!   </text>
+//! 
+//!   <!-- Show outline of canvas using 'rect' element -->
+//!   <rect x="1" y="1" width="998" height="298"
+//!         fill="none" stroke="blue" stroke-width="2" />
+//! </svg>
+};
+
+test("Textpath with tspan single char")
+disabled;
+{
+	SelftestSearchHelper search;
+	verify(search.Init(find_element("text",1)));
+
+	verify(search.Search(UNI_L("u")));
+	verify(search.GetFirst());
+	verify(search.CheckSelectionRange(0, 1));
+	verify(search.GetNext());
+	verify(search.CheckSelectionRange(22, 23));
+	verify(search.GetNext() == FALSE);
+}
+
+xml {
+//! <svg version='1.1' xmlns='http://www.w3.org/2000/svg' xmlns:xlink='http://www.w3.org/1999/xlink'>
+//! <text x='100' y='150' font-size='18px' fill='black'>a <tspan font-weight='bold' fill='crimson'><a xlink:href='mylink.html'>a</a></tspan> a a<tspan> a </tspan> a</text>
+//! </svg>
+};
+
+test("Whitespace, links and tspans")
+{
+	SelftestSearchHelper search;
+	verify(search.Init(find_element("text",1)));
+
+	verify(search.Search(UNI_L("a")));
+	verify(search.GetFirst());
+	verify(search.CheckSelectionRange(0, 1));
+	verify(search.GetNext());
+	verify(search.CheckSelectionRange(0, 1));
+	verify(search.GetNext());
+	verify(search.CheckSelectionRange(1, 2));
+	verify(search.GetNext());
+	verify(search.CheckSelectionRange(3, 4));
+	verify(search.GetNext());
+	verify(search.CheckSelectionRange(1, 2));
+	verify(search.GetNext());
+	verify(search.CheckSelectionRange(1, 2));
+	verify(search.GetNext() == FALSE);
+}
+
+xml {
+//! <svg xmlns='http://www.w3.org/2000/svg' xmlns:xlink='http://www.w3.org/1999/xlink'>
+//!  <textArea x='10' y='20' width="80%" font-size='18px'>
+//!    textextextext
+//!  </textArea>
+//!</svg>
+};
+
+test("Overlapping matches")
+{
+	SelftestSearchHelper search;
+	verify(search.Init(find_element("textArea",1)));
+
+	verify(search.Search(UNI_L("text")));
+	verify(search.GetFirst());
+	verify(search.CheckSelectionRange(0, 4));
+	verify(search.GetNext());
+	verify(search.CheckSelectionRange(3, 7));
+	verify(search.GetNext());
+	verify(search.CheckSelectionRange(6, 10));
+	verify(search.GetNext());
+	verify(search.CheckSelectionRange(9, 13));
+	verify(search.GetNext() == FALSE);
+}
+
+xml {
+//! <svg xmlns='http://www.w3.org/2000/svg' xmlns:xlink='http://www.w3.org/1999/xlink'>
+//!  <textArea x='10' y='20' width="80%" font-size='18px'>
+//!    tex<tspan fill="red">text</tspan>ext<tspan fill="red">ex</tspan> t
+//!  </textArea>
+//!</svg>
+};
+
+test("Overlapping matches across elements")
+disabled;
+{
+	SelftestSearchHelper search;
+	verify(search.Init(find_element("textArea",1)));
+
+	verify(search.Search(UNI_L("text")));
+	verify(search.GetFirst());
+	verify(search.CheckSelectionRange(0, 3));
+	verify(search.GetNext());
+
+	verify(search.GetFirst(FALSE));
+	verify(search.GetNext());
+	verify(search.CheckSelectionRange(0, 1));
+	verify(search.GetNext());
+	verify(search.CheckSelectionRange(0, 4));	
+	verify(search.GetNext());
+	verify(search.CheckSelectionRange(3, 4));
+	verify(search.GetNext());
+
+	verify(search.GetFirst(FALSE));
+	verify(search.GetNext(FALSE));
+	verify(search.GetNext(FALSE));
+	verify(search.CheckSelectionRange(0, 3));
+	verify(search.GetNext() == FALSE);
+}

@@ -1,0 +1,692 @@
+/* -*- Mode: c++; tab-width: 4; indent-tabs-mode: t; c-basic-offset: 4 -*- */
+group "wand";
+require init;
+
+require WAND_SUPPORT;
+
+language C++;
+
+include "modules/wand/wandmanager.h";
+include "modules/wand/wandmanager.h"; // Testing double inclusion
+
+include "modules/wand/wand_internal.h";
+
+include "modules/forms/formvalue.h";
+include "modules/doc/frm_doc.h";
+include "modules/dochand/win.h";
+include "modules/logdoc/htm_elm.h";
+include "modules/url/url_dns_man.h";
+
+global
+{
+	WandManager* test_wand_manager = NULL;
+
+	class TestWandListener : public WandListener
+	{
+	public:
+		int m_submit_call_count;
+		int m_select_match_call_count;
+		int m_wand_login_added_call_count;
+		int m_wand_login_removed_call_count;
+		int m_wand_page_added_call_count;
+		int m_wand_page_removed_call_count;
+		WandManager* m_wand_manager;
+		WandPage* m_expected_removed_wand_page;
+		WandLogin* m_expected_removed_wand_login;
+
+		TestWandListener(WandManager* wand_manager=0) :
+			m_submit_call_count(0),
+			m_select_match_call_count(0),
+			m_wand_login_added_call_count(0),
+			m_wand_login_removed_call_count(0),
+			m_wand_page_added_call_count(0),
+			m_wand_page_removed_call_count(0),
+			m_wand_manager(wand_manager),
+			m_expected_removed_wand_page(0),
+			m_expected_removed_wand_login(0)
+		{
+			if (m_wand_manager)
+				m_wand_manager->AddListener(this);
+		}
+
+		virtual ~TestWandListener() {}
+
+		virtual OP_STATUS OnSubmit(WandInfo* info)
+		{
+			m_submit_call_count++;
+			OP_ASSERT(info);
+			info->ReportAction(WAND_STORE);
+			return OpStatus::OK;
+		}
+
+		virtual OP_STATUS OnSelectMatch(WandMatchInfo* info)
+		{
+			m_select_match_call_count++;
+			OP_ASSERT(info);
+			info->Cancel();
+			return OpStatus::OK;
+		}
+
+		virtual void OnWandLoginAdded(int index)
+		{
+			m_wand_login_added_call_count++;
+		}
+
+		virtual void OnWandLoginRemoved(int index)
+		{
+			if (m_wand_manager && m_expected_removed_wand_login)
+			{
+				WandLogin* login = m_wand_manager->GetWandLogin(index);
+				/* try to verify that we can still access the login that is
+				 * about to be removed by accessing a member. This should
+				 * verify the fix for crash bug DSK-330075: */
+				if (login->IsEqualTo(m_expected_removed_wand_login))
+					m_expected_removed_wand_login = login;
+				else
+					m_expected_removed_wand_login = 0;
+			}
+			m_wand_login_removed_call_count++;
+		}
+
+		virtual void OnWandPageAdded(int index)
+		{
+			m_wand_page_added_call_count++;
+		}
+
+		virtual void OnWandPageRemoved(int index)
+		{
+			if (m_wand_manager && m_expected_removed_wand_page)
+			{
+				WandPage* page = m_wand_manager->GetWandPage(index);
+				/* try to verify that we can still access the page that is
+				 * about to be removed by calling IsMatching(). This should
+				 * verify the fix for crash bug DSK-330075: */
+				if (page->IsMatching(m_expected_removed_wand_page))
+					m_expected_removed_wand_page = page;
+				else
+					m_expected_removed_wand_page = 0;
+			}
+			m_wand_page_removed_call_count++;
+		}
+	};
+}
+
+setup
+{
+	// prefetch t so the forms below don't lag and the test runs quicker.
+	URL t = g_url_api->GetURL(UNI_L("http://t"));
+	if (t.GetServerName() != NULL)
+		g_url_dns_manager->Resolve(t.GetServerName(), NULL);
+}
+
+test("WandPage - creation")
+{
+	WandPage* page = OP_NEW(WandPage, ());
+	OP_DELETE(page);
+	WandPage page2;
+}
+
+test("WandPage - objects")
+{
+	WandPage page;
+	verify(page.CountObjects() == 0);
+	verify(OpStatus::IsSuccess(page.SelftestAddObjectInfo(UNI_L("myname"), UNI_L("myvalue"), FALSE, TRUE, TRUE)));
+	verify(page.CountObjects() == 1);
+	verify(page.GetObject(0));
+
+	WandObjectInfo* object = page.GetObject(0);
+	verify(object);
+	verify(!object->is_password);
+	verify(object->is_changed);
+	verify(!object->name.IsEmpty());
+	verify(!object->value.IsEmpty());
+	verify(uni_str_eq(object->name.CStr(), "myname"));
+	verify(uni_str_eq(object->value.CStr(), "myvalue"));
+}
+
+test("WandProfile - creation")
+{
+	WandProfile* profile = OP_NEW(WandProfile, (g_wand_manager));
+	OP_DELETE(profile);
+	WandProfile profile2(g_wand_manager);
+}
+
+test("WandAutoPasswordSession")
+  disabled; // Private class in wandmanager.cpp, Used in WandManager::Open
+{
+	WandAutoPasswordSession session;
+}
+
+html
+{
+	//! <html><body>dummy window</body></html>
+}
+
+test("WandInfo")
+{
+	WandPage* page = OP_NEW(WandPage, ());
+	verify(page);
+	WandInfo wandinfo(g_wand_manager, page, state.doc->GetWindow());
+	// The destructor of WandInfo should have deleted page. How to verify?
+}
+
+test("WandLogin")
+{
+	WandLogin login;
+}
+
+test("WandDataStorageEntry")
+	require WAND_EXTERNAL_STORAGE;
+{
+	WandDataStorageEntry entry;
+	verify(OpStatus::IsSuccess(entry.Set(UNI_L("name"), UNI_L("pwd"))));
+	verify(entry.username.Compare(UNI_L("name")) == 0);
+	verify(entry.password.Compare(UNI_L("pwd")) == 0);
+}
+
+html
+{
+	//! <html><body><form><input name=name><input type=password name=pwd><input type=submit name=sub></form></body></html>
+}
+test("WandManager")
+{
+	verify(g_wand_manager);
+
+	WandManager* wand_manager = OP_NEW(WandManager, ());
+	verify(wand_manager);
+	test_wand_manager = wand_manager;
+
+	OpFile dummy_file;
+	OpStatus::Ignore(wand_manager->Open(dummy_file, FALSE)); // Dummy file to create an empty manager
+
+	verify(wand_manager->CountProfiles() == 1);
+
+	verify(!wand_manager->IsUsing(state.doc));
+	verify(!wand_manager->IsWandOperationInProgress(state.doc->GetWindow()));
+
+	verify(!wand_manager->Usable(state.doc));
+
+	wand_manager->SetActive(FALSE);
+	wand_manager->SetActive(TRUE);
+
+	wand_manager->SetCurrentProfile(0);
+	verify(wand_manager->GetCurrentProfile() == 0);
+	WandProfile* profile = wand_manager->GetProfile(0);
+	verify(profile);
+
+	HTML_Element* form = NULL;
+	HTML_Element* name_input = NULL;
+	HTML_Element* pwd_input = NULL;
+	HTML_Element* submit_input = NULL;
+	HTML_Element* elm = state.doc->GetDocRoot();
+	while (elm)
+	{
+		if (elm->IsMatchingType(HE_FORM, NS_HTML))
+			form = elm;
+		else if (elm->IsMatchingType(HE_INPUT, NS_HTML) &&
+			elm->GetInputType() == INPUT_TEXT)
+			name_input = elm;
+		else if (elm->IsMatchingType(HE_INPUT, NS_HTML) &&
+			elm->GetInputType() == INPUT_PASSWORD)
+			pwd_input = elm;
+		else if (elm->IsMatchingType(HE_INPUT, NS_HTML) &&
+			elm->GetInputType() == INPUT_SUBMIT)
+			submit_input = elm;
+		elm = elm->NextActual();
+	}
+
+	verify(form);
+	verify(name_input);
+	verify(pwd_input);
+	verify(submit_input);
+
+	OpAutoPtr<WandPage> page_to_store(OP_NEW(WandPage, ()));
+	verify(page_to_store.get());
+	verify(OpStatus::IsSuccess(page_to_store->CollectDataFromDocument(state.doc, submit_input, form, 0, 0, 0, 0)));
+	verify(OpStatus::IsSuccess(page_to_store->SetUrl(state.doc, form)));
+	verify(OpStatus::IsSuccess(wand_manager->Store(state.doc->GetWindow(), page_to_store.release())));
+
+	verify(!wand_manager->HasMatch(state.doc, name_input)); // Since it wasn't changed it shouldn't be saved
+
+	page_to_store.reset(OP_NEW(WandPage, ()));
+	verify(page_to_store.get());
+	FormValue* form_value = name_input->GetFormValue();
+	verify(form_value);
+	verify(OpStatus::IsSuccess(form_value->SetValueFromText(name_input, UNI_L("myname"))));
+	//	form_value->SetIsChangedFromOriginalByUser(name_input);
+	form_value->SetIsChangedFromOriginal(name_input);
+
+	verify(OpStatus::IsSuccess(page_to_store->CollectDataFromDocument(state.doc, submit_input, form, 0, 0, 0, 0)));
+	verify(OpStatus::IsSuccess(page_to_store->SetUrl(state.doc, form)));
+	verify(OpStatus::IsSuccess(wand_manager->Store(state.doc->GetWindow(), page_to_store.release())));
+
+	verify(wand_manager->HasMatch(state.doc, name_input));
+
+	WandPage* page = profile->FindPage(state.doc);
+	verify(page);
+
+	// FIXME: Reset name to empty before the Use call and check that
+	// it was set after the Use call
+	wand_manager->Use(state.doc, NO, FALSE);
+
+	wand_manager->DeleteWandPages(state.doc);
+
+	verify(wand_manager->GetWandPageCount() < 1000);
+}
+finally
+{
+	OP_DELETE(test_wand_manager);
+	test_wand_manager = NULL;
+}
+
+test("Ecommerce")
+	require WAND_ECOMMERCE_SUPPORT;
+{
+	verify(!WandManager::IsECommerceName(UNI_L("foo")));
+}
+
+table wanddatabases (const char *) filelist "files" name "wand_v?.dat";
+
+test("Reading an old wand database: $(source)")
+	multi wanddatabases (source);
+{
+	OpString filename;
+	verify(OpStatus::IsSuccess(filename.Set(source)));
+
+	OpFile wandfile;
+	verify(OpStatus::IsSuccess(wandfile.Construct(filename.CStr())));
+
+	WandManager* wand_manager = OP_NEW(WandManager, ());
+	verify(wand_manager);
+	test_wand_manager = wand_manager;
+	verify(OpStatus::IsSuccess(wand_manager->Open(wandfile, FALSE)));
+
+	verify(wand_manager->CountProfiles() == 1); // personal
+	WandProfile* profile = wand_manager->GetProfile(0); // personal
+
+	verify(profile->GetType() == WAND_PERSONAL_PROFILE);
+
+	verify(wand_manager->GetWandPageCount() == 2); // Two pages, my.opera.com and myrealbox
+	WandPage* page_one = wand_manager->GetWandPage(0);
+	verify(page_one);
+	WandPage* page_two = wand_manager->GetWandPage(1);
+	verify(page_two);
+
+	if (page_one->GetUrl().Compare("http://my.opera.com/community/") == 0)
+	{
+		verify(page_two->GetUrl().Compare("https://myrealbox.com/a") == 0);
+	}
+	else
+	{
+		verify(page_one->GetUrl().Compare("https://myrealbox.com/a") == 0);
+		verify(page_two->GetUrl().Compare("http://my.opera.com/community/") == 0);
+	}
+}
+finally
+{
+	OP_DELETE(test_wand_manager);
+	test_wand_manager = NULL;
+}
+
+html
+{
+	//! <html><body><form action="http://t/">
+	//! <input name="foo" value="mytxt"><input name="pwd" type="password" value="mypwd">
+	//! </form></body></html>
+}
+test("Triggering listeners")
+{
+	WandManager* wand_manager = OP_NEW(WandManager, ());
+	verify(wand_manager);
+	test_wand_manager = wand_manager;
+
+	OpFile dummy_file;
+	OpStatus::Ignore(wand_manager->Open(dummy_file, FALSE)); // Dummy file to create an empty manager
+
+	verify(wand_manager->GetWandPageCount() == 0); // empty
+	TestWandListener listener;
+	wand_manager->AddListener(&listener);
+	wand_manager->RemoveListener(&listener);
+	wand_manager->AddListener(&listener);
+
+	HTML_Element* text_input = find_element("input", 1);
+	HTML_Element* pwd_input = find_element("input", 2);
+	HTML_Element* form_elm = find_element("form", 1);
+
+	verify(text_input);
+	verify(pwd_input);
+	verify(form_elm);
+
+	pwd_input->GetFormValue()->SetIsChangedFromOriginal(pwd_input);
+	text_input->GetFormValue()->SetIsChangedFromOriginal(text_input);
+
+	wand_manager->SetActive(TRUE);
+	OP_STATUS status = wand_manager->SubmitPage(state.doc, NULL, form_elm, 0, 0, 0, 0, 0, FALSE, NULL);
+	verify (OpStatus::IsSuccess(status));
+
+	verify (listener.m_submit_call_count == 1);
+	verify (listener.m_wand_page_added_call_count == 1);
+	verify (listener.m_select_match_call_count == 0);
+	verify (listener.m_wand_login_added_call_count == 0);
+	verify (listener.m_wand_login_removed_call_count == 0);
+	verify (listener.m_wand_page_removed_call_count == 0);
+}
+finally
+{
+	OP_DELETE(test_wand_manager);
+	test_wand_manager = NULL;
+}
+
+html
+{
+	//! <html><body><form action="http://t/">
+	//! <input name="foo" value="mytxt"><input name="pwd" type="password" value="mypwd">
+	//! </form></body></html>
+}
+
+test("Data was saved correctly from webpage")
+{
+	WandManager* wand_manager = OP_NEW(WandManager, ());
+	verify(wand_manager);
+	test_wand_manager = wand_manager;
+
+	verify(!wand_manager->GetIsSecurityEncrypted() || !"Can't run wand selftests with master password enabled since that would trigger password dialogs");
+
+	OpFile dummy_file;
+	OpStatus::Ignore(wand_manager->Open(dummy_file, FALSE)); // Dummy file to create an empty manager
+
+	verify(wand_manager->GetWandPageCount() == 0); // empty
+	TestWandListener listener(wand_manager);
+
+	HTML_Element* text_input = find_element("input", 1);
+	HTML_Element* pwd_input = find_element("input", 2);
+	HTML_Element* form_elm = find_element("form", 1);
+
+	verify(text_input);
+	verify(pwd_input);
+	verify(form_elm);
+
+	pwd_input->GetFormValue()->SetIsChangedFromOriginal(pwd_input);
+	text_input->GetFormValue()->SetIsChangedFromOriginal(text_input);
+
+	wand_manager->SetActive(TRUE);
+	OP_STATUS status = wand_manager->SubmitPage(state.doc, NULL, form_elm, 0, 0, 0, 0, 0, FALSE, NULL);
+	verify (OpStatus::IsSuccess(status));
+
+	verify(wand_manager->GetWandPageCount() == 1);
+	WandPage* wand_page = wand_manager->GetWandPage(0);
+	verify(wand_page);
+	verify(wand_page->CountObjects() == 2);
+	WandObjectInfo* info = wand_page->GetObject(0);
+	verify(info);
+	verify(info->is_changed);
+	verify(!info->is_password);
+	verify(info->name.Compare("foo") == 0);
+	verify(info->value.Compare("mytxt") == 0);
+
+	WandSecurityWrapper security;
+	if (security.Enable(state.doc->GetWindow()) != OpStatus::OK)
+		verify(!"Failed to setup password for decrypting data");
+
+	WandPassword expected_pwd;
+	verify(OpStatus::IsSuccess(expected_pwd.Set(UNI_L("mypwd"), TRUE)));
+	OpString decrypted;
+	verify(OpStatus::IsSuccess(expected_pwd.Decrypt(decrypted)));
+	verify(decrypted.Compare("mypwd") == 0);
+
+	info = wand_page->GetObject(1);
+	verify(info);
+	verify(info->is_changed);
+	verify(info->is_password);
+	verify(info->name.Compare("pwd") == 0);
+	verify(info->value.IsEmpty());
+
+	const uni_char* username = NULL;
+	verify(wand_page->FindUserName(username, state.doc) == WandPage::FIND_USER_OK);
+	verify(username);
+	verify(uni_str_eq(username, "mytxt"));
+	WandPassword* pwd = wand_page->FindPassword();
+	verify(pwd);
+	decrypted.Empty();
+	verify(OpStatus::IsSuccess(pwd->Decrypt(decrypted)));
+	verify(decrypted.Compare("mypwd") == 0);
+#ifdef SYNC_HAVE_PASSWORD_MANAGER
+	OpStatus::Ignore(wand_manager->ClearAll(TRUE, FALSE, FALSE, FALSE));
+#else	
+	OpStatus::Ignore(wand_manager->ClearAll());
+#endif	
+	verify(wand_manager->GetWandPageCount() == 0); // empty
+}
+finally
+{
+	OP_DELETE(test_wand_manager);
+	test_wand_manager = NULL;
+}
+
+test("WandMatchInfo#1")
+{
+	WandMatchInfo* info = OP_NEW(WandMatchInfo, (state.doc, g_wand_manager->GetProfile(0)));
+	info->Cancel(); // This should have deleted info. How to verify?
+}
+
+test("WandLogin#1")
+{
+	WandSecurityWrapper security;
+	security.EnableWithoutWindow();
+
+	WandManager* wand_manager = OP_NEW(WandManager, ());
+	verify(wand_manager);
+	test_wand_manager = wand_manager;
+
+	TestWandListener listener(wand_manager);
+
+#ifndef WAND_FUNCTIONS_NOT_MADE_ASYNC_YET
+	verify(OpStatus::IsSuccess(wand_manager->StoreLoginWithoutWindow(UNI_L("myId"), UNI_L("myUser"), UNI_L("myPwd"))));
+#else
+	verify(!"StoreLogin isn't made async yet");
+#endif // WAND_FUNCTIONS_NOT_MADE_ASYNC_YET
+
+	verify(listener.m_submit_call_count == 0);
+	verify(listener.m_wand_page_added_call_count == 0);
+	verify(listener.m_select_match_call_count == 0);
+	verify(listener.m_wand_login_added_call_count == 1);
+	verify(listener.m_wand_login_removed_call_count == 0);
+	verify(listener.m_wand_page_removed_call_count == 0);
+
+	WandLogin* login = wand_manager->FindLogin(UNI_L("myId"), 0);
+	verify(login);
+
+	login = wand_manager->FindLogin(UNI_L("yId"), 0);
+	verify(!login);
+
+	login = wand_manager->FindLogin(UNI_L("myId"), 1);
+	verify(!login);
+
+#ifndef WAND_FUNCTIONS_NOT_MADE_ASYNC_YET
+	verify(OpStatus::IsSuccess(wand_manager->StoreLoginWithoutWindow(UNI_L("myId"), UNI_L("myUser"), UNI_L("myPwd"))));
+#else
+	verify(!"StoreLogin isn't made async yet");
+#endif // WAND_FUNCTIONS_NOT_MADE_ASYNC_YET
+
+	verify(listener.m_submit_call_count == 0);
+	verify(listener.m_wand_page_added_call_count == 0);
+	verify(listener.m_select_match_call_count == 0);
+	verify(listener.m_wand_login_added_call_count == 1);
+	verify(listener.m_wand_login_removed_call_count == 0);
+	verify(listener.m_wand_page_removed_call_count == 0);
+
+#ifndef WAND_FUNCTIONS_NOT_MADE_ASYNC_YET
+	verify(OpStatus::IsSuccess(wand_manager->StoreLoginWithoutWindow(UNI_L("myId"), UNI_L("myUser2"), UNI_L("myPwd"))));
+#else
+	verify(!"StoreLogin isn't made async yet");
+#endif // WAND_FUNCTIONS_NOT_MADE_ASYNC_YET
+
+	verify(listener.m_submit_call_count == 0);
+	verify(listener.m_wand_page_added_call_count == 0);
+	verify(listener.m_select_match_call_count == 0);
+	verify(listener.m_wand_login_added_call_count == 2);
+	verify(listener.m_wand_login_removed_call_count == 0);
+	verify(listener.m_wand_page_removed_call_count == 0);
+
+	login = wand_manager->FindLogin(UNI_L("myId"), 1);
+	verify(login);
+
+	listener.m_expected_removed_wand_login = wand_manager->FindLogin(UNI_L("myId"), UNI_L("myUser"));
+	wand_manager->DeleteLogin(UNI_L("myId"), UNI_L("myUser"));
+
+	verify(listener.m_submit_call_count == 0);
+	verify(listener.m_wand_page_added_call_count == 0);
+	verify(listener.m_select_match_call_count == 0);
+	verify(listener.m_wand_login_added_call_count == 2);
+	verify(listener.m_wand_login_removed_call_count == 1);
+	verify(listener.m_wand_page_removed_call_count == 0);
+	verify(listener.m_expected_removed_wand_login != 0);
+	listener.m_expected_removed_wand_login = 0;
+
+	login = wand_manager->FindLogin(UNI_L("myId"), 0);
+	verify(login);
+	login = wand_manager->FindLogin(UNI_L("myId"), 1);
+	verify(!login);
+
+#ifdef SYNC_HAVE_PASSWORD_MANAGER
+	OpStatus::Ignore(wand_manager->ClearAll(TRUE, FALSE, FALSE, FALSE));
+#else	
+	OpStatus::Ignore(wand_manager->ClearAll());
+#endif	
+
+	verify(listener.m_submit_call_count == 0);
+	verify(listener.m_wand_page_added_call_count == 0);
+	verify(listener.m_select_match_call_count == 0);
+	verify(listener.m_wand_login_added_call_count == 2);
+	verify(listener.m_wand_login_removed_call_count == 2);
+	verify(listener.m_wand_page_removed_call_count == 0);
+
+	login = wand_manager->FindLogin(UNI_L("myId"), 0);
+	verify(!login);
+}
+finally
+{
+	OP_DELETE(test_wand_manager);
+	test_wand_manager = NULL;
+}
+
+html
+{
+	//! <html><body><form action="http://t/">
+	//! <input name="foo" value="mytxt"><input name="pwd" type="password" value="mypwd">
+	//! </form></body></html>
+}
+
+
+test("WandPage-Fetch")
+{
+	WandManager* wand_manager = OP_NEW(WandManager, ());
+	verify(wand_manager);
+	test_wand_manager = wand_manager;
+
+	verify(!wand_manager->GetIsSecurityEncrypted() || !"Can't run wand selftests with master password enabled since that would trigger password dialogs");
+
+	OpFile dummy_file;
+	OpStatus::Ignore(wand_manager->Open(dummy_file, FALSE)); // Dummy file to create an empty manager
+
+	verify(wand_manager->GetWandPageCount() == 0); // empty
+	TestWandListener listener(wand_manager);
+
+	HTML_Element* text_input = find_element("input", 1);
+	HTML_Element* pwd_input = find_element("input", 2);
+	HTML_Element* form_elm = find_element("form", 1);
+
+	verify(text_input);
+	verify(pwd_input);
+	verify(form_elm);
+
+	pwd_input->GetFormValue()->SetIsChangedFromOriginal(pwd_input);
+	text_input->GetFormValue()->SetIsChangedFromOriginal(text_input);
+
+	wand_manager->SetActive(TRUE);
+	OP_STATUS status = wand_manager->SubmitPage(state.doc, NULL, form_elm, 0, 0, 0, 0, 0, FALSE, NULL);
+	verify (OpStatus::IsSuccess(status));
+
+	verify(wand_manager->GetWandPageCount() == 1);
+
+	WandPage* page = wand_manager->GetWandPage(0);
+
+	// Shortcut since we wouldn't be allowed to apply the data
+	// normally since the url won't work. Or will it?
+
+	pwd_input->GetFormValue()->SetValueFromText(pwd_input, UNI_L(""));
+	text_input->GetFormValue()->SetValueFromText(text_input, UNI_L(""));
+
+	int num_matching;
+	WandSecurityWrapper security;
+	if (security.Enable(state.doc->GetWindow()) != OpStatus::OK)
+		verify(!"Failed to setup password for decrypting data");
+	verify(OpStatus::IsSuccess(page->Fetch(state.doc, NULL, num_matching, FALSE)));
+	verify(num_matching == 2);
+
+	OpString field_value;
+	verify(OpStatus::IsSuccess(pwd_input->GetFormValue()->GetValueAsText(pwd_input, field_value)));
+	verify(field_value.Compare("mypwd") == 0);
+
+	field_value.Empty();
+	verify(OpStatus::IsSuccess(text_input->GetFormValue()->GetValueAsText(text_input, field_value)));
+	verify(field_value.Compare("mytxt") == 0);
+}
+finally
+{
+	OP_DELETE(test_wand_manager);
+	test_wand_manager = NULL;
+}
+
+html
+{
+	//! <html><body><form action="http://t/">
+	//! <input name="foo" value="mytxt"><input name="pwd" type="password" value="mypwd">
+	//! </form></body></html>
+}
+
+test("WandPage-Remove")
+require success "WandPage-Fetch";
+{
+	WandManager* wand_manager = OP_NEW(WandManager, ());
+	verify(wand_manager);
+	test_wand_manager = wand_manager;
+
+	verify(!wand_manager->GetIsSecurityEncrypted() || !"Can't run wand selftests with master password enabled since that would trigger password dialogs");
+
+	OpFile dummy_file;
+	OpStatus::Ignore(wand_manager->Open(dummy_file, FALSE)); // Dummy file to create an empty manager
+
+	verify(wand_manager->GetWandPageCount() == 0); // empty
+	TestWandListener listener(wand_manager);
+
+	HTML_Element* text_input = find_element("input", 1);
+	HTML_Element* pwd_input = find_element("input", 2);
+	HTML_Element* form_elm = find_element("form", 1);
+
+	verify(text_input);
+	verify(pwd_input);
+	verify(form_elm);
+
+	pwd_input->GetFormValue()->SetIsChangedFromOriginal(pwd_input);
+	text_input->GetFormValue()->SetIsChangedFromOriginal(text_input);
+
+	wand_manager->SetActive(TRUE);
+	verify(listener.m_wand_page_added_call_count == 0);
+	verify(listener.m_wand_page_removed_call_count == 0);
+	verify_success(wand_manager->SubmitPage(state.doc, NULL, form_elm, 0, 0, 0, 0, 0, FALSE, NULL));
+	verify(wand_manager->GetWandPageCount() == 1);
+	verify(listener.m_wand_page_added_call_count == 1);
+	verify(listener.m_wand_page_removed_call_count == 0);
+
+	WandPage* page = wand_manager->GetWandPage(0);
+	listener.m_expected_removed_wand_page = page;
+	wand_manager->DeleteWandPage(0);
+	verify(listener.m_wand_page_removed_call_count == 1);
+	verify(listener.m_expected_removed_wand_page == page);
+}
+finally
+{
+	OP_DELETE(test_wand_manager);
+	test_wand_manager = NULL;
+}

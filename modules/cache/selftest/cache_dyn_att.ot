@@ -1,0 +1,467 @@
+/* -*- Mode: c++; tab-width: 4; indent-tabs-mode: t; c-basic-offset: 4 -*-
+ *
+ * Copyright (C) 2004-2010 Opera Software ASA.  All rights reserved.
+ *
+ * This file is part of the Opera web browser.
+ * It may not be distributed under any circumstances.
+ *
+ * Luca Venturi
+ */
+group "cache attributes";
+
+require init;
+require DISK_CACHE_SUPPORT;
+require DYNAMIC_FOLDER_SUPPORT;
+require CACHE_FAST_INDEX;
+include "modules/cache/simple_stream.h";
+include "modules/cache/cache_int.h";
+include "modules/cache/cache_common.h";
+include "modules/url/url_man.h";
+include "modules/dochand/winman.h";
+include "modules/content_filter/content_filter.h";
+include "modules/url/url_dynattr.h";
+include "modules/url/url_dynattr_int.h";
+include "modules/cache/cache_st_helpers.h";
+include "modules/cache/cache_selftest.h";
+include "modules/pi/network/OpSocketAddress.h";
+
+global
+{
+	#define END_URL 3
+	
+	URL CreateURL(UINT32 size, URL_CONTEXT_ID context)
+	{
+		OpString url_path;
+		
+		url_path.AppendFormat(UNI_L("http://testsuites.oslo.opera.com/core/networking/http/cache/data/cache.php?size=%d&type=text/javascript&id=001-%d"), size, cur_id++);
+		
+		return g_url_api->GetURL (url_path.CStr(), context);
+	}
+	
+	class WaitURLs: public MessageObject
+	{
+	private:
+		int waiting;
+		URL *test_urls;
+		OpFileFolder custom_folder;
+		int expected_main;
+		int expected_test;
+		int last_main;
+		int last_custom;
+		int last_count;
+		int last_equals;  // Number of times that the number of files did not change
+		MessageHandler *mh;
+		
+	public:
+		WaitURLs(int how_many, URL *tests, OpFileFolder folder, MessageHandler *mex_handler): expected_main(0), expected_test(0)  { waiting=how_many; test_urls=tests; custom_folder=folder; mh=mex_handler; last_main=-1; last_custom=-1; last_count = -1; last_equals=0; }
+		
+		void SetExpectedFiles(int main, int test) { expected_main=main; expected_test=test; }
+		void SetWaiting(int num) { waiting=num; }
+		
+		virtual void HandleCallback(OpMessage msg, MH_PARAM_1 par1, MH_PARAM_2 par2)
+		{
+			if(msg==MSG_URL_DATA_LOADED)
+			{
+				for(UINT32 i=0; i<END_URL; i++)
+				{
+					if((UINT32)test_urls[i].Id()==(UINT32)par1 && test_urls[i].Status(FALSE)==URL_LOADED)
+					{
+						waiting--;
+						output("URL %d loaded - %d remaining.\n", i, waiting);
+						
+						if(!waiting)
+							ST_passed();
+					}
+				}
+			}
+			else if(msg==MSG_URL_LOADING_FAILED)
+			{
+				for(UINT32 i=0; i<END_URL; i++)
+				{
+					if((UINT32)test_urls[i].Id()==(UINT32)par1 && 
+						(	test_urls[i].Status(FALSE)==URL_LOADED || 
+							test_urls[i].Status(FALSE)==URL_LOADING_ABORTED || 
+							test_urls[i].Status(FALSE)==URL_LOADING_FAILURE))
+						ST_failed("URL %d failed to load.\n", i);
+				}
+				
+				ST_failed("URL ID %d failed to load with error %d.\n", (UINT32)par1, (UINT32)par2);
+			}
+			else if(msg==MSG_URLMAN_DELETE_SOMEFILES)
+			{
+				int num_main=CacheHelpers::CheckDirectory(OPFILE_CACHE_FOLDER);
+				int num_custom=CacheHelpers::CheckDirectory(custom_folder);
+				int global_count=(int)urlManager->GetNumFilesToDelete();
+				
+				if(last_main==num_main && last_custom==num_custom && last_count==global_count)
+					last_equals++;
+				else
+					last_equals=0;
+				
+				if(	(num_main>expected_main || num_custom>expected_test) &&	last_equals<10)
+				{
+					last_main=num_main;
+					last_custom=num_custom;
+					last_count=global_count;
+					output("Deleting: still %d files in main dir and %d in custom dir - stalled Attempt %d - Files in global delete list: %d\n", last_main, last_custom, last_equals, last_count);
+					mh->PostDelayedMessage(MSG_URLMAN_DELETE_SOMEFILES, 0, 0, 1000);  // Wait to delete the files
+				}
+				else
+				{
+					if(num_main != expected_main)
+						ST_failed("Main directory contains %d files instead of %d!", num_main, expected_main);
+					
+					if(num_custom != expected_test)
+						ST_failed("Test directory contains %d files instead of %d!", num_custom, expected_test);
+						
+					ST_passed();
+				}
+			}
+		}
+	};
+	
+	int CheckIndex(OpFileFolder folder)
+	{
+		int n=0;
+		DiskCacheEntry entry;
+		UINT32 record_tag;
+		int record_len;
+		OpConfigFileReader scache;
+		OpFile f;
+		
+		if(OpStatus::IsError(f.Construct(DiskCacheFile, folder)))
+		{
+			ST_failed("Impossible to create dcache4.url file object");
+		
+			return 0;	
+		}
+		
+		if(OpStatus::IsError(f.Open(OPFILE_READ)))
+		{
+			ST_failed("Impossible to open the cache index");
+		
+			return 0;	
+		}
+		
+		if(OpStatus::IsError(scache.Construct(&f, FALSE)))
+		{
+			ST_failed("Impossible to construct the cache reader");
+			
+			return 0;
+		}
+		
+		#if CACHE_SMALL_FILES_SIZE>0
+			OpStatus::Ignore(entry.ReserveSpaceForEmbeddedContent(CACHE_SMALL_FILES_SIZE));
+		#endif
+		
+		BOOL exists;
+		OpFileLength file_size;
+		
+		if( OpStatus::IsError(f.Exists(exists)) ||
+			!exists ||
+			OpStatus::IsError(f.GetFileLength(file_size)) ||
+			file_size==0)
+		{
+			ST_failed("Impossible to construct the cache reader");
+			
+			return 0;
+		}
+		
+		while(OpStatus::IsSuccess(scache.ReadNextRecord(record_tag, record_len)) && record_len>0)
+		{
+			if(record_tag==1)
+				n++;
+		}
+		
+		scache.Close();
+		
+		return n;
+	}
+	
+	URL_CONTEXT_ID ctx_dyn;
+	OpFileFolder custom_folder;
+	UINT32 cur_id;
+	OP_STATUS op_err;
+	OpMessage messages[]={MSG_URL_DATA_LOADED, MSG_URL_LOADING_FAILED, MSG_URLMAN_DELETE_SOMEFILES};
+	WaitURLs *wait;
+	MessageHandler *mh;
+	URL test_urls[END_URL];
+	URL empty_url;
+	URL_LoadPolicy policy;
+	
+	// Dynamic attributes
+	URL_DynamicUIntAttributeHandler *flag_handler;
+	URL_DynamicUIntAttributeHandler *int_handler;
+	URL_DynamicStringAttributeHandler *str_handler;
+	URL::URL_Uint32Attribute  flag_attr;
+	URL::URL_Uint32Attribute  int_attr;
+	URL::URL_StringAttribute  str_attr;
+	
+	MultiContext mctx; // Only used to automactially set the cache preferences to meaningful values for these tests
+}
+
+
+setup
+{
+	cur_id=0;
+	ctx_dyn=urlManager->GetNewContextID();
+	
+	g_folder_manager->AddFolder(OPFILE_CACHE_FOLDER, UNI_L("dyn_att"),&custom_folder);
+	
+}
+
+exit
+{
+	mh->UnsetCallBacks(wait);
+	OP_DELETE(mh);
+	mh=NULL;
+	OP_DELETE(wait);
+	wait=NULL;
+	
+	OP_DELETE(flag_handler);
+	OP_DELETE(int_handler);
+	OP_DELETE(str_handler);
+}
+
+test("Delete index")
+{
+	OpFile f;
+	BOOL exists;
+	
+	verify(OpStatus::IsSuccess(f.Construct(DiskCacheFile, custom_folder)));
+	verify(OpStatus::IsSuccess(f.Exists(exists)));
+	
+	if(exists)
+		verify(OpStatus::IsSuccess(f.Delete(TRUE)));
+}
+
+// Needs to be done after the index has been deleted
+test("Init")
+{
+	urlManager->AddContextL(ctx_dyn, custom_folder, custom_folder, custom_folder, custom_folder, FALSE);
+	mh=OP_NEW(MessageHandler, (NULL));
+	wait=OP_NEW(WaitURLs, (END_URL, test_urls, custom_folder, mh));
+	mh->SetCallBackList(wait, 0, messages, 3);
+	
+	flag_handler=OP_NEW(URL_DynamicUIntAttributeHandler, (1,1,TRUE));
+	int_handler=OP_NEW(URL_DynamicUIntAttributeHandler, (1,2,TRUE));
+	str_handler=OP_NEW(URL_DynamicStringAttributeHandler, (1,3,TRUE));
+}
+
+// Put a file in the context cache
+test("Put Files") async;
+{
+	wait->SetWaiting(1);
+	test_urls[0]=CreateURL(64, ctx_dyn);
+
+	if(OpStatus::IsError(test_urls[0].LoadDocument(mh, empty_url, policy)))
+	  ST_failed("Load Url failed!");
+}
+
+
+// Test for dynamic attributes
+test("write dynamic attributes")
+{
+	OpString8 test;
+	OpString8 test2;
+	
+	flag_attr = URL::KNoInt;
+	int_attr = URL::KNoInt;
+	str_attr = URL::KNoStr;
+	flag_handler->SetIsFlag(TRUE);
+	
+	TRAP(op_err, flag_attr = g_url_api->RegisterAttributeL(flag_handler));
+	verify(OpStatus::IsSuccess(op_err));
+	verify(flag_attr >= URL::KFirstUintDynamicAttributeItem);
+	
+	TRAP(op_err, int_attr = g_url_api->RegisterAttributeL(int_handler));
+	verify(OpStatus::IsSuccess(op_err));
+	verify(int_attr >= URL::KFirstUintDynamicAttributeItem);
+	
+	TRAP(op_err, str_attr = g_url_api->RegisterAttributeL(str_handler));
+	verify(OpStatus::IsSuccess(op_err));
+	verify(int_attr >= URL::KFirstUintDynamicAttributeItem);
+	
+	// Set and check the dynamic attributes
+	verify(OpStatus::IsSuccess(test.Set("String Test attribute")));
+	verify(OpStatus::IsSuccess(test_urls[0].SetAttribute(flag_attr, TRUE)));
+	verify(OpStatus::IsSuccess(test_urls[0].SetAttribute(int_attr, 123)));
+	verify(OpStatus::IsSuccess(test_urls[0].SetAttribute(str_attr, test)));
+	
+	verify(!!test_urls[0].GetAttribute(flag_attr)==TRUE);
+	verify(test_urls[0].GetAttribute(int_attr)==123);
+	verify(OpStatus::IsSuccess(test_urls[0].GetAttribute(str_attr, test2)));
+	verify(!test.Compare(test2));
+	
+	// Check the Multimedia attribute
+	verify(!test_urls[0].GetAttribute(URL::KMultimedia));
+	verify(OpStatus::IsSuccess(test_urls[0].SetAttribute(URL::KMultimedia, TRUE)));
+	verify(test_urls[0].GetAttribute(URL::KMultimedia));
+	
+	// Check the KMIME_Type_Was_NULL attribute
+	verify(!test_urls[0].GetAttribute(URL::KMIME_Type_Was_NULL));
+	verify(OpStatus::IsSuccess(test_urls[0].SetAttribute(URL::KMIME_Type_Was_NULL, TRUE)));
+	verify(test_urls[0].GetAttribute(URL::KMIME_Type_Was_NULL));
+	
+	// Check the KLoadedFromNetType attribute
+	verify((OpSocketAddressNetType)test_urls[0].GetAttribute(URL::KLoadedFromNetType) == NETTYPE_PRIVATE);
+	verify(OpStatus::IsSuccess(test_urls[0].SetAttribute(URL::KLoadedFromNetType, (UINT)NETTYPE_LOCALHOST)));
+	verify((OpSocketAddressNetType)test_urls[0].GetAttribute(URL::KLoadedFromNetType) == NETTYPE_LOCALHOST);
+	
+	// Save on the disk
+	TRAPD(rc, urlManager->WriteCacheIndexesL(TRUE, FALSE));
+}
+
+// Count the files in the index
+test("count index files")
+{
+	// The index should have all the entries, not just the one on disk
+	int n=CheckIndex(custom_folder);
+	
+	output("Files in the custom index: %d\n", n);
+	
+	verify(n==1);	
+}
+
+
+
+// Create another file
+test("Put Files 2") async;
+{
+	wait->SetWaiting(1);
+	test_urls[1]=CreateURL(64, ctx_dyn);
+	
+	// Check that the dynamic attributres are not present
+	if(test_urls[1].GetAttribute(flag_attr)!=FALSE)
+		ST_failed("Flag attribute not cleared");
+	if(test_urls[1].GetAttribute(int_attr)!=0)
+		ST_failed("Int attribute not cleared");
+	
+	if(test_urls[1].GetAttribute(URL::KMultimedia)!=0)
+		ST_failed("Multimedia attribute not cleared");
+	if(test_urls[1].GetAttribute(URL::KMIME_Type_Was_NULL)!=0)
+		ST_failed("KMIME_Type_Was_NULL attribute not cleared");
+	
+	OpString test2;
+	
+	test_urls[1].GetAttribute(str_attr, test2);
+		
+	if(test2.HasContent())
+		ST_failed("String attribute not empty");
+
+	if(OpStatus::IsError(test_urls[1].LoadDocument(mh, empty_url, policy)))
+	  ST_failed("Load Url failed!");
+}
+
+
+// Load the dynamic attributes from the cache
+test("Check values")
+{
+	OpString expected_mimetype;
+	OpString test2;
+	OpString test3;
+	
+	// Check that the dynamic attributres are not present
+	verify(test_urls[1].GetAttribute(flag_attr)==FALSE);
+	verify(test_urls[1].GetAttribute(int_attr)==0);
+	verify(OpStatus::IsSuccess(test_urls[1].GetAttribute(str_attr, test2)));
+	verify(!test2.HasContent());
+	verify(test_urls[1].GetAttribute(URL::KMultimedia)==0);
+	verify(test_urls[1].GetAttribute(URL::KMIME_Type_Was_NULL)==0);
+	verify((OpSocketAddressNetType)test_urls[1].GetAttribute(URL::KLoadedFromNetType) == NETTYPE_PRIVATE);
+
+	expected_mimetype.Set("text/javascript");
+	test_urls[1].GetAttribute(URL::KServerMIME_Type, test3);
+
+	verify(test3.Compare(expected_mimetype) == 0);
+	
+	// Save and remove the context
+	urlManager->RemoveContext(ctx_dyn, FALSE);
+}
+
+test("Recreating the context")
+{
+	ctx_dyn=urlManager->GetNewContextID();
+	
+	urlManager->Debug_AcceptOverlappingContexts();
+	urlManager->AddContextL(ctx_dyn, custom_folder, custom_folder, custom_folder, custom_folder, FALSE);
+}
+
+// Create a new URL using the same url. This time it will be loaded from the cache
+test("Put Files 3") async;
+{
+	OpString page;
+	
+	RETURN_IF_ERROR(test_urls[0].GetAttribute(URL::KPathAndQuery_L, page));
+	
+	// Complete the URL
+	page.Insert(0, "http://testsuites.oslo.opera.com");
+	
+	wait->SetWaiting(1);
+	test_urls[2]=g_url_api->GetURL (page.CStr(), ctx_dyn);
+	
+	// Check that the dynamic attributes are not present
+	if(!!test_urls[2].GetAttribute(flag_attr)!=TRUE)
+		ST_failed("Flag attribute not retrieved");
+	if(test_urls[2].GetAttribute(int_attr)!=123)
+		ST_failed("Int attribute not retrieved");
+	
+	OpString test2;
+	
+	test_urls[2].GetAttribute(str_attr, test2);
+		
+	if(!test2.HasContent())
+		ST_failed("String attribute not retrieved");
+		
+	if(!test_urls[2].GetAttribute(URL::KMultimedia))
+		ST_failed("Multimedia attribute not retrieved");
+		
+	if(!test_urls[2].GetAttribute(URL::KMIME_Type_Was_NULL))
+		ST_failed("KMIME_Type_Was_NULL attribute not retrieved");
+		
+	if((OpSocketAddressNetType)test_urls[2].GetAttribute(URL::KLoadedFromNetType)!=NETTYPE_LOCALHOST)
+		ST_failed("KLoadedFromNetType attribute not retrieved");
+
+	if(OpStatus::IsError(test_urls[2].LoadDocument(mh, empty_url, policy)))
+	  ST_failed("Load Url failed!");
+}
+
+// Check the attributes value
+test("Check values")
+{
+	OpString test;
+	OpString test2;
+	OpString test3;
+	OpString expected_mimetype;
+	
+	// Check that the dynamic attributes are present
+	verify(OpStatus::IsSuccess(test.Set("String Test attribute")));
+	verify(!!test_urls[2].GetAttribute(flag_attr)==TRUE);
+	verify(test_urls[2].GetAttribute(int_attr)==123);
+	verify(OpStatus::IsSuccess(test_urls[2].GetAttribute(str_attr, test2)));
+	verify(!test.Compare(test2));
+	verify(test_urls[2].GetAttribute(URL::KMultimedia));
+	verify(!test_urls[2].GetAttribute(URL::KMIME_Type_Was_NULL));  // LoadDocument() actually overrides KMIME_Type_Was_NULL, which is fine
+	
+	// After calling LoadDocument, the value of KLoadedFromNetType attribute should be set back to NETTYPE_PRIVATE
+	verify((OpSocketAddressNetType)test_urls[2].GetAttribute(URL::KLoadedFromNetType)==NETTYPE_PRIVATE);
+
+	expected_mimetype.Set("text/javascript");
+	test_urls[2].GetAttribute(URL::KServerMIME_Type, test3);
+
+	verify(test3.Compare(expected_mimetype) == 0);
+}
+
+test("Try Delete the index again")
+{
+	urlManager->RemoveContext(ctx_dyn, FALSE);
+	
+	OpFile f;
+	BOOL exists;
+	
+	verify(OpStatus::IsSuccess(f.Construct(DiskCacheFile, custom_folder)));
+	verify(OpStatus::IsSuccess(f.Exists(exists)));
+	
+	if(exists)
+		verify(OpStatus::IsSuccess(f.Delete(TRUE)));
+}

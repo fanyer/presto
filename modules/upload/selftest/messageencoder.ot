@@ -1,0 +1,185 @@
+/* -*- Mode: c++; tab-width: 4; indent-tabs-mode: t; c-basic-offset: 4 -*-
+ *
+ * Copyright (C) 1995-2009 Opera Software AS.  All rights reserved.
+ *
+ * This file is part of the Opera web browser.	It may not be distributed
+ * under any circumstances.
+ *
+ * @author Arjan van Leeuwen (arjanl)
+ */
+
+group "upload.messageencoder";
+
+include "modules/upload/upload.h";
+
+global
+{
+	// Test values
+	#define PLAIN_BODY1			"plain text\n"
+	#define EXPECTED_BODY1		"plain text\r\n"
+	#define USE_CHARSET			"utf-8"
+
+	// Test values
+	#define PLAIN_BODY2			"plain text\r\n"
+	#define HTML_BODY			"<html><body>html text</body></html>\r\n"
+	#define ATTACHMENT			"this is an attachment\r\n"
+	#define ATTACHMENT_FILENAME "temp_messageencoder_attachment.txt"
+	#define ATTACHMENT_FILENAME2 "\xF8l.txt"
+	#define ATTACHMENT_ENCODED	"Content-Disposition: attachment; filename=" ATTACHMENT_FILENAME "\r\n" \
+								"Content-Type: text/plain; name=" ATTACHMENT_FILENAME "\r\n" \
+								"Content-Transfer-Encoding: 7bit\r\n" \
+								"\r\n" \
+								ATTACHMENT
+	#define ATTACHMENT_ENCODED2	"Content-Disposition: attachment; filename*=utf-8''%C3%B8l.txt\r\n" \
+								"Content-Type: text/plain; name==?utf-8?Q?=C3=B8l.txt?=\r\n" \
+								"Content-Transfer-Encoding: 7bit\r\n" \
+								"\r\n" \
+								ATTACHMENT
+}
+
+subtest StringContains(const OpStringC8& big, const OpStringC8& little)
+{
+	if (big.Find(little) == KNotFound)
+	{
+		output("\"%s\" does not contain \"%s\": ", big.CStr() ? big.CStr() : "", little.CStr() ? little.CStr() : "");
+		return FALSE;
+	}
+	return TRUE;
+}
+
+test("Create message with plain text")
+{
+	// Create text/plain part
+	OpAutoPtr<Upload_OpString8> plain_text_part (OP_NEW(Upload_OpString8, ()));
+	verify_trap(plain_text_part->InitL(PLAIN_BODY1, "text/plain", USE_CHARSET));
+
+	verify_trap(plain_text_part->PrepareUploadL(UPLOAD_7BIT_TRANSFER));
+	verify_trap(plain_text_part->ResetL());
+
+	unsigned length       = (unsigned)plain_text_part->CalculateLength();
+	uint32 remaining      = length;
+	OpString8 raw_body;
+	unsigned char* target = reinterpret_cast<unsigned char*>(raw_body.Reserve(length));
+	BOOL     done         = FALSE;
+
+	target = plain_text_part->OutputContent(target, remaining, done);
+	*target = 0;
+	verify(done);
+
+	verify(StringContains(raw_body, EXPECTED_BODY1));
+}
+
+test("Create message with plain text and HTML body and attachment")
+{
+	OpFile attachment_file;
+
+	// Create text/plain part
+	OpAutoPtr<Upload_OpString8> plain_text_part (OP_NEW(Upload_OpString8, ()));
+	verify_trap(plain_text_part->InitL(PLAIN_BODY2, "text/plain", USE_CHARSET));
+
+	// Create text/html part
+	OpAutoPtr<Upload_OpString8> html_text_part (OP_NEW(Upload_OpString8, ()));
+	verify_trap(html_text_part->InitL(HTML_BODY, "text/html", USE_CHARSET));
+
+	// Create multipart/alternative part
+	OpAutoPtr<Upload_Multipart> text_part (OP_NEW(Upload_Multipart, ()));
+	verify_trap(text_part->InitL("multipart/alternative"));
+	text_part->AddElement(plain_text_part.release());
+	text_part->AddElement(html_text_part.release());
+
+	// Create attachment part
+	verify_success(attachment_file.Construct(UNI_L(ATTACHMENT_FILENAME), OPFILE_TEMP_FOLDER));
+	verify_success(attachment_file.Open(OPFILE_WRITE));
+	verify_success(attachment_file.Write(ATTACHMENT, op_strlen(ATTACHMENT)));
+	verify_success(attachment_file.Close());
+
+	OpAutoPtr<Upload_URL> attachment_part (OP_NEW(Upload_URL, ()));
+	verify_trap(attachment_part->InitL(attachment_file.GetFullPath(), attachment_file.GetName(), "attachment", 0, USE_CHARSET));
+
+	// Create top-level multipart/mixed
+	OpAutoPtr<Upload_Multipart> top_level_part (OP_NEW(Upload_Multipart, ()));
+	verify_trap(top_level_part->InitL("multipart/mixed"));
+	top_level_part->AddElement(text_part.release());
+	top_level_part->AddElement(attachment_part.release());
+
+	// Output top-level part
+	verify_trap(top_level_part->PrepareUploadL(UPLOAD_7BIT_TRANSFER));
+	verify_trap(top_level_part->ResetL());
+
+	unsigned length       = (unsigned)top_level_part->CalculateLength();
+	uint32 remaining      = length;
+	OpString8 raw_body;
+	unsigned char* target = reinterpret_cast<unsigned char*>(raw_body.Reserve(length));
+	BOOL     done         = FALSE;
+
+	target = top_level_part->OutputContent(target, remaining, done);
+	*target = 0;
+	verify(done);
+
+	verify(StringContains(raw_body, PLAIN_BODY2));
+	verify(StringContains(raw_body, HTML_BODY));
+	verify(StringContains(raw_body, ATTACHMENT_ENCODED));
+}
+finally
+{
+	attachment_file.Close();
+	attachment_file.Delete();
+}
+
+test("Force Quoted Printable Content-Type name, CORE-30386")
+{
+	OpFile attachment_file;
+
+	// Create text/plain part
+	OpAutoPtr<Upload_OpString8> plain_text_part (OP_NEW(Upload_OpString8, ()));
+	verify_trap(plain_text_part->InitL(PLAIN_BODY2, "text/plain", USE_CHARSET));
+
+	// Create text/html part
+	OpAutoPtr<Upload_OpString8> html_text_part (OP_NEW(Upload_OpString8, ()));
+	verify_trap(html_text_part->InitL(HTML_BODY, "text/html", USE_CHARSET));
+
+	// Create multipart/alternative part
+	OpAutoPtr<Upload_Multipart> text_part (OP_NEW(Upload_Multipart, ()));
+	verify_trap(text_part->InitL("multipart/alternative"));
+	text_part->AddElement(plain_text_part.release());
+	text_part->AddElement(html_text_part.release());
+
+	// Create attachment part
+	verify(OpStatus::IsSuccess(attachment_file.Construct(UNI_L(ATTACHMENT_FILENAME2), OPFILE_TEMP_FOLDER)));
+	verify(OpStatus::IsSuccess(attachment_file.Open(OPFILE_WRITE)));
+	verify(OpStatus::IsSuccess(attachment_file.Write(ATTACHMENT, op_strlen(ATTACHMENT))));
+	verify(OpStatus::IsSuccess(attachment_file.Close()));
+
+	OpAutoPtr<Upload_URL> attachment_part (OP_NEW(Upload_URL, ()));
+	verify_trap(attachment_part->InitL(attachment_file.GetFullPath(), attachment_file.GetName(), "attachment", 0, USE_CHARSET));
+	attachment_part->SetForceQPContentTypeName(TRUE);
+
+	// Create top-level multipart/mixed
+	OpAutoPtr<Upload_Multipart> top_level_part (OP_NEW(Upload_Multipart, ()));
+	verify_trap(top_level_part->InitL("multipart/mixed"));
+	top_level_part->AddElement(text_part.release());
+	top_level_part->AddElement(attachment_part.release());
+
+	// Output top-level part
+	verify_trap(top_level_part->PrepareUploadL(UPLOAD_7BIT_TRANSFER));
+	verify_trap(top_level_part->ResetL());
+
+	unsigned length       = (unsigned)top_level_part->CalculateLength();
+	uint32 remaining      = length;
+	OpString8 raw_body;
+	unsigned char* target = reinterpret_cast<unsigned char*>(raw_body.Reserve(length));
+	BOOL     done         = FALSE;
+
+	target = top_level_part->OutputContent(target, remaining, done);
+	*target = 0;
+	verify(done);
+
+	verify(StringContains(raw_body, PLAIN_BODY2));
+	verify(StringContains(raw_body, HTML_BODY));
+	verify(StringContains(raw_body, ATTACHMENT_ENCODED2));
+}
+finally
+{
+	attachment_file.Close();
+	attachment_file.Delete();
+}

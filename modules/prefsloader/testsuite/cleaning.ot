@@ -1,0 +1,604 @@
+/* -*- Mode: c++; tab-width: 4; indent-tabs-mode: t; c-basic-offset: 4 -*-
+**
+** Copyright (C) 2009 Opera Software ASA.  All rights reserved.
+**
+** This file is part of the Opera web browser.  It may not be distributed
+** under any circumstances.
+**
+** Martin Olsson
+*/
+
+group "prefsloader.cleaning";
+require init;
+require PREFS_DOWNLOAD;
+
+include "modules/prefsloader/prefsloadmanager.h";
+include "modules/prefs/prefsmanager/prefsmanager.h";
+include "modules/prefs/prefsmanager/collections/pc_display.h";
+include "modules/prefs/prefsmanager/collections/pc_network.h";
+include "modules/prefs/prefsmanager/collections/pc_doc.h";
+include "modules/hardcore/timer/optimer.h";
+include "modules/util/adt/opvector.h";
+
+// -- Global variables ---------------------------------------------------
+
+global
+{
+	/**
+	 * Various types of verifications that can be scheduled to happen
+	 * after the preference XML has been downloaded and applied.
+	 */
+	enum DeferredAssertType
+	{
+		VERIFY_NOT_OVERRIDDEN = 1,
+		VERIFY_OVERRIDDEN,
+		VERIFY_USER_AGENT,
+		VERIFY_SCALE,
+		VERIFY_COMPATMODE_OVERRIDE,
+	};
+
+	/**
+	 * Data container that holds information about a deferred assert that will
+	 * be verified after the preference XML has been downloaded and applied. */
+	class PostUpdateAssert
+	{
+	public:
+		PostUpdateAssert(DeferredAssertType assert_type, const uni_char *hostname, int expected_int_pref_value = -1)
+			: m_assert_type(assert_type), m_hostname(hostname), m_expected_int_pref_value(expected_int_pref_value)
+		{
+		}
+
+		/**
+		 * Evaluates the truthiness of the assert. If the assert fails the parent
+		 * testcase will be failed as well and FALSE will be returned. */
+		BOOL HoldsTrue()
+		{
+			switch (m_assert_type)
+			{
+				case VERIFY_NOT_OVERRIDDEN:
+					if (g_prefsManager->IsHostOverridden(m_hostname, TRUE))
+					{
+						char *latin1_hostname = uni_down_strdup(m_hostname);
+						ST_failed("expected hostname '%s' _NOT_ to be overridden", latin1_hostname);
+						op_free(latin1_hostname);
+						return FALSE;
+					}
+					break;
+				case VERIFY_OVERRIDDEN:
+					if (!g_prefsManager->IsHostOverridden(m_hostname, TRUE))
+					{
+						char *latin1_hostname = uni_down_strdup(m_hostname);
+						ST_failed("expected hostname '%s' to be overridden", latin1_hostname);
+						op_free(latin1_hostname);
+						return FALSE;
+					}
+					break;
+				case VERIFY_USER_AGENT:
+					return AssertIntPref("User Agent", m_expected_int_pref_value, g_pcnet->GetIntegerPref(PrefsCollectionNetwork::UABaseId, m_hostname));
+				case VERIFY_SCALE:
+					return AssertIntPref("Scale", m_expected_int_pref_value, g_pcdisplay->GetIntegerPref(PrefsCollectionDisplay::Scale, m_hostname));
+				case VERIFY_COMPATMODE_OVERRIDE:
+					return AssertIntPref("CompatModeOverride", m_expected_int_pref_value, g_pcdoc->GetIntegerPref(PrefsCollectionDoc::CompatModeOverride, m_hostname));
+				default:
+					ST_failed("Something is very very wrong with the test code.");
+					return FALSE;
+			}
+			return TRUE;
+		}
+	private:
+		DeferredAssertType	m_assert_type;
+		const uni_char		*m_hostname;
+		int			m_expected_int_pref_value;
+
+		BOOL AssertIntPref(const char* which_pref_str, int expected_pref_value, int actual_pref_value)
+		{
+			if (actual_pref_value != expected_pref_value)
+			{
+				char *latin1_hostname = uni_down_strdup(m_hostname);
+				ST_failed("expected hostname '%s' to have preference '%s' set to %d but found value %d", latin1_hostname, which_pref_str, expected_pref_value, actual_pref_value);
+				op_free(latin1_hostname);
+				return FALSE;
+			}
+			return TRUE;
+		}
+	};
+
+	/**
+	 * A helper class which prepares a "data url" and then let's the prefsloader
+	 * code download and apply the preference XML from that URL. After the preference
+	 * XML has been applied, a set of asserts runs to validate that the prefsloader
+	 * code applied the preference XML correctly.
+	 *
+	 * A lot of the code in this class works around the fact that the selftest system
+	 * is not great for asynchronous tests. For example, auto failing an async testcase
+	 * after X seconds should be standard functionality and it would also be nice to have
+	 * a generic facility in the selftest module for running a set of verify() statements
+	 * once the async operation finished.
+	 */
+	class PrefsLoaderTester : public OpEndChecker, public OpTimerListener
+	{
+	public:
+		/**
+		 * Starts a download from the specified data_url (this download happens in a
+		 * asynchronous fashion and the Dipose() function is called once the download
+		 * has been finished and all the preference XML has been applied. */
+		void StartAsyncDownloadL(const char *data_url)
+		{
+			m_url = g_url_api->GetURL(data_url);
+			if (m_url.IsEmpty())
+			{
+				ST_failed("Failed setting up data URL.\n");
+				LEAVE(OpStatus::ERR);
+			}
+
+			// Setup "OnTimeOut" function on this object as
+			// the expire callback for stalled downloads.
+			m_timer.SetTimerListener(this);
+			m_timer.Start(3000);
+
+			// Feed the data URL to the loader (and pass "this" as the
+			// OpEndChecker listener so we will get IsEnd() and Dispose() calls.
+			if (OpStatus::IsError(g_PrefsLoadManager->InitLoader(m_url, this)))
+			{
+				// Test will fail when the timer runs out so we don't bother to fail it here.
+				output("g_PrefsLoadManager->InitLoader() returned an error.\n");
+			}
+		}
+
+		/* OpTimerListener */
+		virtual void OnTimeOut(OpTimer *)
+		{
+			ST_failed("Download didn't succeed fast enough.");
+		}
+
+		/* OpEndChecker.IsEnd() is called after primary parsing of the preference XML.
+		 * A string containing a space separated list of all affected hostnames is passed
+		 * to the IsEnd() function and the intention is that clients could potentially use
+		 * this to show an APPROVE/DENY dialog asking "Want to update preferences for this
+		 * list of hosts?" */
+		virtual BOOL IsEnd(OpStringC hostnames)
+		{
+			// Note : OpStringC16 implements the == operator but not the != operator. Arrgh.
+			if (!(hostnames == m_expected_hostnames))
+			{
+				ST_failed("the PrefsLoader passed an incorrect list of affected hostnames to OpEndChecker.IsEnd()");
+
+				/* Abort: test has already failed, no use in continuing preference XML parsing. */
+				return TRUE;
+			}
+			/* Don't abort: list of affected hosts looks correct so let's apply these updates. */
+			return FALSE;
+		}
+
+		/* OpEndChecker - Called by preference XML parser when it's finished processing the XML. */
+		virtual void Dispose()
+		{
+			/* We have now succesfully downloaded and processed the preference XML,
+			 * let's validate all requested post-update assertions to ensure that the
+			 * update did all the preferences changes it was supposed to do. */
+			for (UINT32 i = 0; i < m_post_update_asserts.GetCount(); ++i)
+			{
+				if (!m_post_update_asserts.Get(i)->HoldsTrue())
+					return;
+			}
+			// This testcase is now finished; thus reset all the "expected" data.
+			// Also we don't need the asserts anymore and the same PrefsLoaderTester
+			// object will be reused again for the next testcase (the reason this
+			// object is global in the first place is because the finally{} clause
+			// doesn't work for async test cases).
+			m_expected_hostnames.Set("");
+			m_post_update_asserts.DeleteAll();
+
+			ST_passed();
+		}
+
+		/**
+		 * Set the list of expected "affected hostnames". Before applying any preference
+		 * updates the PrefsLoader code will pass over a list of "affected hostnames"
+		 * through the IsEnd() function and the test cases will assert that the hostnames
+		 * coming from PrefsLoader are identical to the string passed to this function. */
+		void SetExpectedAffectedHostnames(const uni_char *expected_affected_hostnames)
+		{
+			m_expected_hostnames.Set(expected_affected_hostnames);
+		}
+
+		/**
+		 * Schedules an assert (that will run once all preference XML updates have been applied)
+		 * that ensures that the specified hostname is or isn't overridden. */
+		void AddAssertOverridden(const uni_char *hostname, BOOL expected_overridden)
+		{
+			DeferredAssertType assert_type = expected_overridden ? VERIFY_OVERRIDDEN : VERIFY_NOT_OVERRIDDEN;
+			PostUpdateAssert* assert = OP_NEW(PostUpdateAssert, (assert_type, hostname));
+			m_post_update_asserts.Add(assert);
+		}
+
+		/**
+		 * Schedules an assert (that will run once all preference XML updates have been applied) that
+		 * ensures that the prefs system returns the specified user agent for the specified hostname  */
+		void AddAssertIntPref(DeferredAssertType assert_type, const uni_char *hostname, int expected_int_pref_value)
+		{
+			PostUpdateAssert* assert = OP_NEW(PostUpdateAssert, (assert_type, hostname, expected_int_pref_value));
+			m_post_update_asserts.Add(assert);
+		}
+
+	private:
+		URL				m_url;
+		OpTimer				m_timer;
+		OpString			m_expected_hostnames;
+		OpAutoVector<PostUpdateAssert>	m_post_update_asserts;
+	};
+	PrefsLoaderTester *prefsloader_tester;
+}
+
+setup
+{
+	prefsloader_tester = OP_NEW(PrefsLoaderTester, ());
+}
+
+exit
+{
+	OP_DELETE(prefsloader_tester);
+}
+
+// -- Tests --------------------------------------------------------------
+
+test("Checking for g_PrefsLoadManager")
+{
+	verify(g_PrefsLoadManager);
+}
+
+test("spoof as MSIE for www.example.com")
+	require SUPPORT_DATA_URL;
+	async;
+{
+	const char *data_url =
+		"data:application/x-opera-configuration-siteprefs,"
+		"<?xml version=\"1.0\" encoding=\"ISO-8859-1\"?>"
+		"<preferences>"
+		  "<host name=\"www.example.com\">"
+		    "<section name=\"User Agent\">"
+		      "<pref name=\"Spoof UserAgent ID\" value=\"3\"/>"
+		    "</section>"
+		  "</host>"
+		"</preferences>"
+	;
+
+	prefsloader_tester->SetExpectedAffectedHostnames(UNI_L("www.example.com"));
+	prefsloader_tester->AddAssertOverridden(UNI_L("www.example.com"), TRUE);
+	prefsloader_tester->AddAssertIntPref(VERIFY_USER_AGENT, UNI_L("www.example.com"), UA_MSIE /* == 3 */);
+	TRAPD(rc, prefsloader_tester->StartAsyncDownloadL(data_url));
+	if (OpStatus::IsError(rc))
+	{
+		ST_failed("StartAsyncDownloadL() returned an error.");
+	}
+}
+
+test("spoof as Mozilla for www.example.com")
+	require SUPPORT_DATA_URL;
+	async;
+{
+	const char *data_url =
+		"data:application/x-opera-configuration-siteprefs,"
+		"<?xml version=\"1.0\" encoding=\"ISO-8859-1\"?>"
+		"<preferences>"
+		  "<host name=\"www.example.com\">"
+		    "<section name=\"User Agent\">"
+		      "<pref name=\"Spoof UserAgent ID\" value=\"2\"/>"
+		    "</section>"
+		  "</host>"
+		"</preferences>"
+	;
+
+	prefsloader_tester->SetExpectedAffectedHostnames(UNI_L("www.example.com"));
+	prefsloader_tester->AddAssertOverridden(UNI_L("www.example.com"), TRUE);
+	prefsloader_tester->AddAssertIntPref(VERIFY_USER_AGENT, UNI_L("www.example.com"), UA_Mozilla /* == 2 */);
+	TRAPD(rc, prefsloader_tester->StartAsyncDownloadL(data_url));
+	if (OpStatus::IsError(rc))
+	{
+		ST_failed("StartAsyncDownloadL() returned an error.");
+	}
+}
+
+test("spoof as different browsers for several news websites")
+	require SUPPORT_DATA_URL;
+	async;
+{
+	const char *data_url =
+		"data:application/x-opera-configuration-siteprefs,"
+		"<?xml version=\"1.0\" encoding=\"ISO-8859-1\"?>"
+		"<preferences>"
+		  "<host name=\"www.cnn.com\">"
+		    "<section name=\"User Agent\">"
+		      "<pref name=\"Spoof UserAgent ID\" value=\"2\"/>"
+		    "</section>"
+		  "</host>"
+		  "<host name=\"news.bbc.co.uk\">"
+		    "<section name=\"User Agent\">"
+		      "<pref name=\"Spoof UserAgent ID\" value=\"3\"/>"
+		    "</section>"
+		  "</host>"
+		  "<host name=\"www.msnbc.msn.com\">"
+		    "<section name=\"User Agent\">"
+		      "<pref name=\"Spoof UserAgent ID\" value=\"1\"/>"
+		    "</section>"
+		  "</host>"
+		"</preferences>"
+	;
+
+	prefsloader_tester->SetExpectedAffectedHostnames(UNI_L("www.cnn.com news.bbc.co.uk www.msnbc.msn.com"));
+	prefsloader_tester->AddAssertOverridden(UNI_L("www.cnn.com"), TRUE);
+	prefsloader_tester->AddAssertIntPref(VERIFY_USER_AGENT, UNI_L("www.cnn.com"), UA_Mozilla /* == 2 */);
+	prefsloader_tester->AddAssertOverridden(UNI_L("news.bbc.co.uk"), TRUE);
+	prefsloader_tester->AddAssertIntPref(VERIFY_USER_AGENT, UNI_L("news.bbc.co.uk"), UA_MSIE /* == 3 */);
+	prefsloader_tester->AddAssertOverridden(UNI_L("www.msnbc.msn.com"), TRUE);
+	prefsloader_tester->AddAssertIntPref(VERIFY_USER_AGENT, UNI_L("www.msnbc.msn.com"), UA_Opera /* == 1 */);
+	TRAPD(rc, prefsloader_tester->StartAsyncDownloadL(data_url));
+	if (OpStatus::IsError(rc))
+	{
+		ST_failed("StartAsyncDownloadL() returned an error.");
+	}
+}
+
+test("update spoofs for different browsers for news websites")
+	require SUPPORT_DATA_URL;
+	async;
+	require success "spoof as different browsers for several news websites";
+{
+	const char *data_url =
+		"data:application/x-opera-configuration-siteprefs,"
+		"<?xml version=\"1.0\" encoding=\"ISO-8859-1\"?>"
+		"<preferences>"
+		  "<host name=\"www.cnn.com\">"
+		    "<section name=\"User Agent\">"
+		      "<pref name=\"Spoof UserAgent ID\" value=\"3\"/>"
+		    "</section>"
+		  "</host>"
+		  "<host name=\"news.bbc.co.uk\">"
+		    "<section name=\"User Agent\">"
+		      "<pref name=\"Spoof UserAgent ID\" value=\"1\"/>"
+		    "</section>"
+		  "</host>"
+		"</preferences>"
+	;
+
+	prefsloader_tester->SetExpectedAffectedHostnames(UNI_L("www.cnn.com news.bbc.co.uk"));
+	prefsloader_tester->AddAssertOverridden(UNI_L("www.cnn.com"), TRUE);
+	prefsloader_tester->AddAssertIntPref(VERIFY_USER_AGENT, UNI_L("www.cnn.com"), UA_MSIE /* == 3 */);
+	prefsloader_tester->AddAssertOverridden(UNI_L("news.bbc.co.uk"), TRUE);
+	prefsloader_tester->AddAssertIntPref(VERIFY_USER_AGENT, UNI_L("news.bbc.co.uk"), UA_Opera /* == 1 */);
+	// the msnbc spoof should still remain intact from the previous testcase (see "require success" clause).
+	prefsloader_tester->AddAssertOverridden(UNI_L("www.msnbc.msn.com"), TRUE);
+	prefsloader_tester->AddAssertIntPref(VERIFY_USER_AGENT, UNI_L("www.msnbc.msn.com"), UA_Opera /* == 1 */);
+	TRAPD(rc, prefsloader_tester->StartAsyncDownloadL(data_url));
+	if (OpStatus::IsError(rc))
+	{
+		ST_failed("StartAsyncDownloadL() returned an error.");
+	}
+}
+
+test("remove spoof for one of the news websites")
+	require SUPPORT_DATA_URL;
+	async;
+	require success "update spoofs for different browsers for news websites";
+{
+	const char *data_url =
+		"data:application/x-opera-configuration-siteprefs,"
+		"<?xml version=\"1.0\" encoding=\"ISO-8859-1\"?>"
+		"<preferences>"
+		  "<host name=\"news.bbc.co.uk\" clean=\"1\">"
+		  "</host>"
+		"</preferences>"
+	;
+
+	prefsloader_tester->SetExpectedAffectedHostnames(UNI_L("news.bbc.co.uk"));
+	// removing bbc spoof should not affect CNN spoof
+	prefsloader_tester->AddAssertOverridden(UNI_L("www.cnn.com"), TRUE);
+	prefsloader_tester->AddAssertIntPref(VERIFY_USER_AGENT, UNI_L("www.cnn.com"), UA_MSIE /* == 3 */);
+	// the spoof for BBC should now be completely removed
+	prefsloader_tester->AddAssertOverridden(UNI_L("news.bbc.co.uk"), FALSE);
+	// removing bbc spoof should not affect MSNBC spoof
+	prefsloader_tester->AddAssertOverridden(UNI_L("www.msnbc.msn.com"), TRUE);
+	prefsloader_tester->AddAssertIntPref(VERIFY_USER_AGENT, UNI_L("www.msnbc.msn.com"), UA_Opera /* == 1 */);
+	TRAPD(rc, prefsloader_tester->StartAsyncDownloadL(data_url));
+	if (OpStatus::IsError(rc))
+	{
+		ST_failed("StartAsyncDownloadL() returned an error.");
+	}
+}
+
+test("removing non-existent spoof should not cause problems")
+	require SUPPORT_DATA_URL;
+	async;
+	require success "remove spoof for one of the news websites";
+{
+	const char *data_url =
+		"data:application/x-opera-configuration-siteprefs,"
+		"<?xml version=\"1.0\" encoding=\"ISO-8859-1\"?>"
+		"<preferences>"
+		  "<host name=\"news.bbc.co.uk\" clean=\"1\">"
+		  "</host>"
+		"</preferences>"
+	;
+
+	prefsloader_tester->SetExpectedAffectedHostnames(UNI_L("news.bbc.co.uk"));
+	// trying to remove non-existent BBC spoof should not affect CNN spoof
+	prefsloader_tester->AddAssertOverridden(UNI_L("www.cnn.com"), TRUE);
+	prefsloader_tester->AddAssertIntPref(VERIFY_USER_AGENT, UNI_L("www.cnn.com"), UA_MSIE /* == 3 */);
+	// the spoof for BBC should now be completely removed
+	prefsloader_tester->AddAssertOverridden(UNI_L("news.bbc.co.uk"), FALSE);
+	// trying to remove non-existent BBC spoof should not affect MSNBC spoof
+	prefsloader_tester->AddAssertOverridden(UNI_L("www.msnbc.msn.com"), TRUE);
+	prefsloader_tester->AddAssertIntPref(VERIFY_USER_AGENT, UNI_L("www.msnbc.msn.com"), UA_Opera /* == 1 */);
+	TRAPD(rc, prefsloader_tester->StartAsyncDownloadL(data_url));
+	if (OpStatus::IsError(rc))
+	{
+		ST_failed("StartAsyncDownloadL() returned an error.");
+	}
+}
+
+test("use clean attribute on host and add new UA spoof to that host")
+	require SUPPORT_DATA_URL;
+	async;
+	require success "removing non-existent spoof should not cause problems";
+{
+	const char *data_url =
+		"data:application/x-opera-configuration-siteprefs,"
+		"<?xml version=\"1.0\" encoding=\"ISO-8859-1\"?>"
+		"<preferences>"
+		  "<host name=\"news.bbc.co.uk\" clean=\"1\">"
+		    "<section name=\"User Agent\">"
+		      "<pref name=\"Spoof UserAgent ID\" value=\"2\"/>"
+		    "</section>"
+		  "</host>"
+		"</preferences>"
+	;
+
+	prefsloader_tester->SetExpectedAffectedHostnames(UNI_L("news.bbc.co.uk"));
+	// should not affect CNN spoof
+	prefsloader_tester->AddAssertOverridden(UNI_L("www.cnn.com"), TRUE);
+	prefsloader_tester->AddAssertIntPref(VERIFY_USER_AGENT, UNI_L("www.cnn.com"), UA_MSIE /* == 3 */);
+	// a new UA spoof for BBC should have been added
+	prefsloader_tester->AddAssertOverridden(UNI_L("news.bbc.co.uk"), TRUE);
+	prefsloader_tester->AddAssertIntPref(VERIFY_USER_AGENT, UNI_L("news.bbc.co.uk"), UA_Mozilla /* == 2 */);
+	// should not affect MSNBC spoof
+	prefsloader_tester->AddAssertOverridden(UNI_L("www.msnbc.msn.com"), TRUE);
+	prefsloader_tester->AddAssertIntPref(VERIFY_USER_AGENT, UNI_L("www.msnbc.msn.com"), UA_Opera /* == 1 */);
+	TRAPD(rc, prefsloader_tester->StartAsyncDownloadL(data_url));
+	if (OpStatus::IsError(rc))
+	{
+		ST_failed("StartAsyncDownloadL() returned an error.");
+	}
+}
+
+test("removing all spoofs using clean_all attribute")
+	require SUPPORT_DATA_URL;
+	async;
+	require success "use clean attribute on host and add new UA spoof to that host";
+{
+	const char *data_url =
+		"data:application/x-opera-configuration-siteprefs,"
+		"<?xml version=\"1.0\" encoding=\"ISO-8859-1\"?>"
+		"<preferences clean_all=\"1\">"
+		"</preferences>"
+	;
+
+	prefsloader_tester->SetExpectedAffectedHostnames(UNI_L("*"));
+	prefsloader_tester->AddAssertOverridden(UNI_L("www.cnn.com"), FALSE);
+	prefsloader_tester->AddAssertOverridden(UNI_L("news.bbc.co.uk"), FALSE);
+	prefsloader_tester->AddAssertOverridden(UNI_L("www.msnbc.msn.com"), FALSE);
+	TRAPD(rc, prefsloader_tester->StartAsyncDownloadL(data_url));
+	if (OpStatus::IsError(rc))
+	{
+		ST_failed("StartAsyncDownloadL() returned an error.");
+	}
+}
+
+test("clean_all and then adding two new UA spoofs")
+	require SUPPORT_DATA_URL;
+	async;
+	require success "removing all spoofs using clean_all attribute";
+{
+	const char *data_url =
+		"data:application/x-opera-configuration-siteprefs,"
+		"<?xml version=\"1.0\" encoding=\"ISO-8859-1\"?>"
+		"<preferences clean_all=\"1\">"
+		  "<host name=\"www.cnn.com\">"
+		    "<section name=\"User Agent\">"
+		      "<pref name=\"Spoof UserAgent ID\" value=\"2\"/>"
+		    "</section>"
+		  "</host>"
+		  "<host name=\"www.starbucks.com\">"
+		    "<section name=\"User Agent\">"
+		      "<pref name=\"Spoof UserAgent ID\" value=\"3\"/>"
+		    "</section>"
+		  "</host>"
+		"</preferences>"
+	;
+
+	prefsloader_tester->SetExpectedAffectedHostnames(UNI_L("*"));
+	prefsloader_tester->AddAssertOverridden(UNI_L("www.cnn.com"), TRUE);
+	prefsloader_tester->AddAssertIntPref(VERIFY_USER_AGENT, UNI_L("www.cnn.com"), UA_Mozilla /* == 2 */);
+	prefsloader_tester->AddAssertOverridden(UNI_L("www.starbucks.com"), TRUE);
+	prefsloader_tester->AddAssertIntPref(VERIFY_USER_AGENT, UNI_L("www.starbucks.com"), UA_MSIE /* == 3 */);
+	// since we used clean_all no previous spoofs should remain
+	prefsloader_tester->AddAssertOverridden(UNI_L("news.bbc.co.uk"), FALSE);
+	prefsloader_tester->AddAssertOverridden(UNI_L("www.msnbc.msn.com"), FALSE);
+	TRAPD(rc, prefsloader_tester->StartAsyncDownloadL(data_url));
+	if (OpStatus::IsError(rc))
+	{
+		ST_failed("StartAsyncDownloadL() returned an error.");
+	}
+}
+
+test("apply multiple overridden prefs for a single host")
+	require SUPPORT_DATA_URL;
+	async;
+	require success "clean_all and then adding two new UA spoofs";
+{
+	const char *data_url =
+		"data:application/x-opera-configuration-siteprefs,"
+		"<?xml version=\"1.0\" encoding=\"ISO-8859-1\"?>"
+		"<preferences>"
+		  "<host name=\"www.starbucks.com\">"
+		    "<section name=\"User Prefs\">"
+		      "<pref name=\"Scale\" value=\"200\"/>"
+		      "<pref name=\"CompatMode Override\" value=\"1\"/>"
+		    "</section>"
+		  "</host>"
+		"</preferences>"
+	;
+
+	prefsloader_tester->SetExpectedAffectedHostnames(UNI_L("www.starbucks.com"));
+	prefsloader_tester->AddAssertOverridden(UNI_L("www.cnn.com"), TRUE);
+	prefsloader_tester->AddAssertIntPref(VERIFY_USER_AGENT, UNI_L("www.cnn.com"), UA_Mozilla /* == 2 */);
+	// user agent should be preserved from last spoof update
+	prefsloader_tester->AddAssertOverridden(UNI_L("www.starbucks.com"), TRUE);
+	prefsloader_tester->AddAssertIntPref(VERIFY_USER_AGENT, UNI_L("www.starbucks.com"), UA_MSIE /* == 3 */);
+	// verify that new int pref overrides have been properly appended to the existing starbucks override
+	prefsloader_tester->AddAssertIntPref(VERIFY_SCALE, UNI_L("www.starbucks.com"), 200);
+	prefsloader_tester->AddAssertIntPref(VERIFY_COMPATMODE_OVERRIDE, UNI_L("www.starbucks.com"), 1);
+	// since we used clean_all no previous spoofs should remain
+	prefsloader_tester->AddAssertOverridden(UNI_L("news.bbc.co.uk"), FALSE);
+	prefsloader_tester->AddAssertOverridden(UNI_L("www.msnbc.msn.com"), FALSE);
+	TRAPD(rc, prefsloader_tester->StartAsyncDownloadL(data_url));
+	if (OpStatus::IsError(rc))
+	{
+		ST_failed("StartAsyncDownloadL() returned an error.");
+	}
+}
+
+test("clean_all=0 should not clear overrides")
+	require SUPPORT_DATA_URL;
+	async;
+	require success "apply multiple overridden prefs for a single host";
+{
+	const char *data_url =
+		"data:application/x-opera-configuration-siteprefs,"
+		"<?xml version=\"1.0\" encoding=\"ISO-8859-1\"?>"
+		"<preferences clean_all=\"0\">"
+		  "<host name=\"www.opera.com\">"
+		    "<section name=\"User Prefs\">"
+		      "<pref name=\"Scale\" value=\"150\"/>"
+		    "</section>"
+		  "</host>"
+		"</preferences>"
+	;
+
+	prefsloader_tester->SetExpectedAffectedHostnames(UNI_L("www.opera.com"));
+	// CNN spoof should remain because we're using clean_all="0"
+	prefsloader_tester->AddAssertOverridden(UNI_L("www.cnn.com"), TRUE);
+	prefsloader_tester->AddAssertIntPref(VERIFY_USER_AGENT, UNI_L("www.cnn.com"), UA_Mozilla /* == 2 */);
+	// user agent should be preserved from last spoof update
+	prefsloader_tester->AddAssertOverridden(UNI_L("www.starbucks.com"), TRUE);
+	prefsloader_tester->AddAssertIntPref(VERIFY_USER_AGENT, UNI_L("www.starbucks.com"), UA_MSIE /* == 3 */);
+	prefsloader_tester->AddAssertIntPref(VERIFY_SCALE, UNI_L("www.starbucks.com"), 200);
+	prefsloader_tester->AddAssertIntPref(VERIFY_COMPATMODE_OVERRIDE, UNI_L("www.starbucks.com"), 1);
+	// this host should have been appended in the last XML update
+	prefsloader_tester->AddAssertOverridden(UNI_L("www.opera.com"), TRUE);
+	prefsloader_tester->AddAssertIntPref(VERIFY_SCALE, UNI_L("www.opera.com"), 150);
+	TRAPD(rc, prefsloader_tester->StartAsyncDownloadL(data_url));
+	if (OpStatus::IsError(rc))
+	{
+		ST_failed("StartAsyncDownloadL() returned an error.");
+	}
+}

@@ -1,0 +1,787 @@
+/* -*- Mode: c++; tab-width: 4; indent-tabs-mode: t; c-basic-offset: 4 -*- */
+
+group "widgets.ime";
+
+require WIDGETS_IME_SUPPORT;
+
+include "modules/widgets/OpWidget.h";
+include "modules/widgets/OpEdit.h";
+include "modules/widgets/OpMultiEdit.h";
+include "modules/widgets/WidgetContainer.h";
+include "modules/libgogi/pi_impl/mde_opview.h";
+include "modules/display/coreview/coreview.h";
+include "modules/pi/OpInputMethod.h";
+include "modules/pi/OpView.h";
+include "modules/doc/frm_doc.h";
+include "modules/forms/piforms.h";
+
+global
+{
+	// dummy OpView, to test IME events to OpView. also a CoreView, so
+	// it can be set on a VisualDevice
+	class TestView : public CoreView, public MDE_OpView
+	{
+	public:
+		TestView() : m_changed(FALSE) {}
+		OpView* GetOpView() { return this; }
+		virtual void SetInputTextChanged() { m_changed = TRUE; }
+		BOOL m_changed;
+	};
+
+	/**
+	   dummy IME listener - counts number of times OnStartComposing
+	   and OnStopComposing has been called
+	 */
+	class DummyOpInputMethodListener : public OpInputMethodListener
+	{
+	public:
+		DummyOpInputMethodListener() : m_view(0) { Reset(); }
+		~DummyOpInputMethodListener() { if (m_view) m_view->SetInputMethodListener(g_im_listener); }
+
+		void Reset() { m_start_count = m_stop_count = 0; }
+		void ListenTo(OpView* view);
+		unsigned int GetStartCount() { return m_start_count; }
+		unsigned int GetStopCount() { return m_stop_count; }
+
+		virtual IM_WIDGETINFO OnStartComposing(OpInputMethodString* imstring, IM_COMPOSE compose = IM_COMPOSE_NEW) { ++ m_start_count; return m_imwidgetinfo; }
+		virtual IM_WIDGETINFO OnCompose() { return m_imwidgetinfo; }
+		virtual void OnCommitResult() { return; }
+		virtual void OnStopComposing(BOOL cancel) { ++ m_stop_count; }
+		virtual void OnCandidateShow(BOOL visible) { }
+		virtual IM_WIDGETINFO GetWidgetInfo() { return m_imwidgetinfo; }
+
+#ifdef IME_RECONVERT_SUPPORT
+		virtual void OnPrepareReconvert(const uni_char*& str, int& sel_start, int& sel_stop) { }
+		virtual void OnReconvertRange(int sel_start, int sel_stop) { }
+#endif
+	private:
+		OpView* m_view;
+		unsigned int m_start_count;
+		unsigned int m_stop_count;
+		IM_WIDGETINFO m_imwidgetinfo;
+	};
+	void DummyOpInputMethodListener::ListenTo(OpView* view)
+	{
+		if (m_view)
+			m_view->SetInputMethodListener(g_im_listener);
+		m_view = view;
+		Reset();
+		if (m_view)
+			m_view->SetInputMethodListener(this);
+	}
+
+	class WaitForIMESpawningObject : public OpTimerListener
+	{
+	public:
+		WaitForIMESpawningObject(DummyOpInputMethodListener* listener,
+								 OpTypedObject::Type type, const uni_char* expected,
+								 unsigned int timeout, unsigned int bail,
+								 BOOL release_focus = TRUE);
+		~WaitForIMESpawningObject() { if (m_release_focus) m_ime_listener->ListenTo(0); }
+		void OnTimeOut(OpTimer* timer);
+	private:
+		void Pass() { OP_DELETE(this); ST_passed(); }
+		void Fail(const char* reason) { OP_DELETE(this); ST_failed(reason); }
+
+		DummyOpInputMethodListener* m_ime_listener;
+		OpTypedObject::Type m_type;
+		const uni_char* const m_expected;
+		const unsigned int m_timeout, m_bail;
+		const BOOL m_release_focus;
+		double m_created;
+		OpTimer m_timer;
+	};
+	WaitForIMESpawningObject::WaitForIMESpawningObject(DummyOpInputMethodListener* listener,
+													   OpTypedObject::Type type, const uni_char* expected,
+													   unsigned int timeout, unsigned int bail,
+													   BOOL release_focus/* = TRUE*/)
+		: m_ime_listener(listener)
+		, m_type(type)
+		, m_expected(expected)
+		, m_timeout(timeout), m_bail(bail)
+		, m_release_focus(release_focus)
+		, m_created(g_op_time_info->GetWallClockMS())
+	{
+		m_timer.SetTimerListener(this);
+		OnTimeOut(&m_timer);
+	}
+	void WaitForIMESpawningObject::OnTimeOut(OpTimer* timer)
+	{
+		/**
+		   target has to be fetched each time-out because of eg the
+		   facebook switcheroo
+		 */
+		OpWidget* w = 0;
+		OpInputContext* ic = g_input_manager->GetKeyboardInputContext();
+		if (ic && ic->GetType() == m_type)
+			w = static_cast<OpWidget*>(ic);
+		// IME spawned
+		if (w && !w->IMESuppressed() && m_ime_listener->GetStartCount())
+		{
+			const char* result = 0;
+			OpString content;
+			if (m_ime_listener->GetStartCount() != 1)
+				result = "incorrect number of calls to OnStartComposing";
+			else if (OpStatus::IsError(w->GetText(content)))
+				result = "OOM";
+			else if (m_expected && content.Compare(m_expected))
+				result = "content mismatch";
+
+			// destroy IME
+			if (m_release_focus)
+			{
+				g_input_manager->SetKeyboardInputContext(state.doc->GetVisualDevice(), FOCUS_REASON_MOUSE);
+
+				if (!result && m_ime_listener->GetStartCount() != m_ime_listener->GetStopCount())
+					result = "unbalanced number of calls to OnStartComposing/OnStopComposing";
+			}
+
+			result ? Fail(result) : Pass();
+		}
+		else
+		{
+			const double now = g_op_time_info->GetWallClockMS();
+			if (m_created + m_bail < now)
+				Fail("timeout");
+			else
+				m_timer.Start(m_timeout);
+		}
+	}
+	/**
+	   helper function to wait for IME spawning, since this is done
+	   asynchronously for widgets that have an onfocus
+	   listener. listener should be set to listen to the relevant
+	   OpView, and IME spawning should be triggered (by eg focusing a
+	   widget) before calling.
+
+	   what with the facebook switcharoo and suchlike, widget is not
+	   used after setting focus to it. instead g_input_manager is
+	   polled for an OpInputContext (assumed to be a widget) matching
+	   type.
+
+	   if IME is successfully spawned, ST_passed() will be called. on
+	   failure or timeout, ST_failed(...) will be called.
+
+	   IME is considered to be successfully spawned if:
+
+	   * number of calls to OnStartComposing is 1
+	   * number of calls to OnStartComposing equals number of calls to
+	     OnStopComposing
+	   * contents of widget (from a call to GetText(OpString&))
+	     matches expected
+
+	   @param listener the DummyOpInputMethodListener used to listen
+	   for IME events (should be set to listen to an OpView before
+	   calling)
+	   @param type the type of the widget that is expected to spawn
+	   the IME
+	   @param expected the expected contents of the widget that
+	   spawned the IME. If NULL, the check is not performed.
+	   @param release_focus if TRUE, destroy IME by releasing focus
+	   when IME is spawned (or timeout occurs). if TRUE, will also
+	   reset OpView listener is listening to.
+	 */
+	void WaitForIMESpawning(DummyOpInputMethodListener* listener,
+							OpTypedObject::Type type, const uni_char* expected = 0,
+							BOOL release_focus = TRUE)
+	{
+		WaitForIMESpawningObject* o = OP_NEW(WaitForIMESpawningObject, (listener,
+																		type, expected,
+																		50, 5000,
+																		release_focus));
+		if (!o)
+			ST_failed("OOM");
+	}
+
+	/**
+		Check whether widget is OpScrollbar and its parent is OpMultilineEdit,
+		and the parent has properly shown/hidden caret.
+
+		@param [in] widget An widget which should be OpScrollbar whose parent is to be checked.
+		@param [in] should_be_shown If TRUE, the function makes sure caret is shown.
+		            If FALSE, the function makes sure caret is hidden.
+
+		@return TRUE if all checks successfully passed, FALSE otherwise.
+	*/
+	BOOL CheckScrollbarParentCaret(OpWidget* widget, BOOL should_be_shown)
+	{
+		if (!widget || widget->GetType() != OpTypedObject::WIDGET_TYPE_SCROLLBAR)
+			return FALSE;
+		OpInputContext* after_parent = widget->GetParentInputContext();
+		if (after_parent->GetType() != OpTypedObject::WIDGET_TYPE_MULTILINE_EDIT)
+			return FALSE;
+		OpMultilineEdit* after_parent_me = static_cast<OpMultilineEdit*>(after_parent);
+		if (after_parent_me->TCGetInfo()->show_caret != should_be_shown)
+			return FALSE;
+		return TRUE;
+	}
+
+	BOOL IsIMESpawning(DummyOpInputMethodListener* ime_listener, BOOL release_focus=TRUE)
+	{
+		OpWidget* w = 0;
+		OpInputContext* ic = g_input_manager->GetKeyboardInputContext();
+		w = static_cast<OpWidget*>(ic);
+		// IME spawned
+		if (w && (w->IMESuppressed() || ime_listener->GetStartCount()))
+		{
+			// destroy IME
+			if (release_focus)
+				g_input_manager->SetKeyboardInputContext(state.doc->GetVisualDevice(), FOCUS_REASON_MOUSE);
+			return TRUE;
+		}
+		return FALSE;
+	}
+
+	DummyOpInputMethodListener st_g_ime_listener;
+	OpWidget* st_g_widget;
+}
+setup
+{
+	st_g_widget = 0;
+}
+exit
+{
+	st_g_ime_listener.ListenTo(0);
+}
+
+html
+{
+//! <html>
+//!   <head>
+//!     <style type="text/css">
+//!       #fb1_p, #fb2_p { position: absolute; top: 0; left: 0; }
+//!       #fb1_p { visibility: hidden; }
+//!       #fb2_p { z-index: -1; }
+//!     </style>
+//!     <script type="text/javascript">
+//!       function switcheroo(text_to_password) {
+//!         var t = document.getElementById('fb1_t');
+//!         var p = document.getElementById('fb1_p');
+//!
+//!         if (text_to_password) {
+//!           t.style.visibility = "hidden";
+//!           p.style.visibility = "visible";
+//!           p.focus();
+//!         }
+//!         else {
+//!           t.style.visibility = "visible";
+//!           p.style.visibility = "hidden";
+//!         }
+//!       }
+//!
+//!       function focus_text() {
+//!         var t = document.getElementById('fb2_t');
+//!         var p = document.getElementById('fb2_p');
+//!         t.style.visibility = "hidden";
+//!         p.focus();
+//!       }
+//!       function focus_pw() {
+//!         var p = document.getElementById('fb2_p');
+//!       }
+//!       function unfocus_pw() {
+//!         var t = document.getElementById('fb2_t');
+//!         var p = document.getElementById('fb2_p');
+//!         t.style.visibility = "visible";
+//!       }
+//!     </script>
+//!   </head>
+//!   <body>
+//!     <div>
+//!       <p>regular input field - no focus listener</p>
+//!       <input type="text"></input>
+//!     </div>
+//!
+//!     <div>
+//!       <p>input field with focus listener</p>
+//!       <input type="text" value="original" onfocus="this.value='replaced'" onblur="this.value='original'"></input>
+//!     </div>
+//!
+//!     <div>
+//!       <p>regular input field focused form elsewhere - click button to focus</p>
+//!       <input type="text" id="else_1"></input>
+//!       <input type="button" value="focus" onclick="document.getElementById('else_1').focus()"></input>
+//!     </div>
+//!
+//!     <div>
+//!       <p>input field with focus listener focused form elsewhere - click button to focus</p>
+//!       <input type="text" id="else_2" value="original" onfocus="this.value='replaced'" onblur="this.value='original'"></input>
+//!       <input type="button" value="focus" onclick="document.getElementById('else_2').focus()"></input>
+//!     </div>
+//!
+//!     <div>
+//!       <p>facebook-esque switcheroo (input field over password field) without focus event on password field</p>
+//!       <div  style="position: relative">
+//! 	<input type="text" id="fb1_t" value="password" onfocus="switcheroo(true)"></input>
+//! 	<input type="password" id="fb1_p" value="secret" onblur="switcheroo(false)"></input>
+//!       </div>
+//!     </div>
+//!
+//!     <div>
+//!       <p>facebook-esque switcheroo (input field over password field) with focus event on password field</p>
+//!       <div  style="position: relative">
+//! 	<input type="text" id="fb2_t" value="password" onfocus="focus_text()"></input>
+//! 	<input type="password" id="fb2_p" value="secret" onfocus="focus_pw()" onblur="unfocus_pw()"></input>
+//!       </div>
+//!
+//!     <div>
+//!       <p>textarea - no focus listener</p>
+//!       <textarea></textarea>
+//!     </div>
+//!
+//!     <div>
+//!       <p>textarea with focus listener</p>
+//!       <textarea onfocus="this.value='replaced'" onblur="this.value='original'">original</textarea>
+//!     </div>
+//!   </body>
+//! </html>
+};
+table edit_indices_values(unsigned int, const char*, OpTypedObject, const uni_char*)
+{
+	{ 1, "input", OpTypedObject::WIDGET_TYPE_EDIT, UNI_L("") }
+	{ 2, "input", OpTypedObject::WIDGET_TYPE_EDIT, UNI_L("replaced") }
+	{ 3, "input", OpTypedObject::WIDGET_TYPE_EDIT, UNI_L("") }
+	{ 5, "input", OpTypedObject::WIDGET_TYPE_EDIT, UNI_L("replaced") }
+	{ 7, "input", OpTypedObject::WIDGET_TYPE_EDIT, UNI_L("secret") }
+	{ 9, "input", OpTypedObject::WIDGET_TYPE_EDIT, UNI_L("secret") }
+
+	{ 1, "textarea", OpTypedObject::WIDGET_TYPE_MULTILINE_EDIT, UNI_L("") }
+	{ 2, "textarea", OpTypedObject::WIDGET_TYPE_MULTILINE_EDIT, UNI_L("replaced") }
+}
+
+foreach (index, tag, type, str) from edit_indices_values
+{
+	test("IME spawning - $(index) - spawn") async;
+	{
+		// get view
+		OpView* view = state.doc->GetVisualDevice()->GetOpView();
+		if (!view)
+			ST_failed("failed to obtain OpView");
+
+		// get widget
+		HTML_Element* elm = find_element(tag, index);
+		if (!elm || !elm->GetFormObject())
+			ST_failed("failed to obtain input element");
+		st_g_widget = elm->GetFormObject()->GetWidget();
+		if (!st_g_widget || st_g_widget->GetType() != type)
+			ST_failed("failed to obtain widget");
+
+		// spawn IME
+		st_g_ime_listener.ListenTo(view);
+		g_input_manager->SetKeyboardInputContext(st_g_widget, FOCUS_REASON_MOUSE);
+		WaitForIMESpawning(&st_g_ime_listener, type, str, FALSE);
+	}
+	test("IME spawning - $(index) - cleanup")
+	{
+		if (st_g_widget)
+		{
+			g_input_manager->SetKeyboardInputContext(state.doc->GetVisualDevice(), FOCUS_REASON_MOUSE);
+			st_g_widget = 0;
+		}
+		if (st_g_ime_listener.GetStartCount() != st_g_ime_listener.GetStopCount())
+			ST_failed("failed to destroy IME");
+	}
+	finally
+	{
+		st_g_ime_listener.ListenTo(0);
+	}
+}
+
+// test for situations like eg DSK-280454 - causes an OnFocus with
+// FOCUS_REASON_ACTIVATE without triggering event listener
+html
+{
+//! <html>
+//!   <body>
+//!     <input type="text" value="original" onfocus="this.value='replaced'" onblur="this.value='original'"></input>
+//!   </body>
+//! </html>
+}
+test("restoring focus to IME - focus") async;
+{
+	// get view
+	OpView* view = state.doc->GetVisualDevice()->GetOpView();
+	if (!view)
+		ST_failed("failed to obtain OpView");
+
+	// get widget
+	HTML_Element* elm = find_element("input");
+	if (!elm || elm->Type() != HE_INPUT || !elm->GetFormObject())
+		ST_failed("failed to obtain input element");
+	st_g_widget = elm->GetFormObject()->GetWidget();
+	if (!st_g_widget || st_g_widget->GetType() != OpTypedObject::WIDGET_TYPE_EDIT)
+		ST_failed("failed to obtain widget");
+
+	// spawn IME
+	st_g_ime_listener.ListenTo(view);
+	g_input_manager->SetKeyboardInputContext(st_g_widget, FOCUS_REASON_MOUSE);
+	WaitForIMESpawning(&st_g_ime_listener, OpTypedObject::WIDGET_TYPE_EDIT, UNI_L("replaced"), FALSE);
+}
+test("restoring focus to IME - restore") async;
+require success "restoring focus to IME - focus";
+{
+	// destroy IME
+	g_input_manager->SetKeyboardInputContext(state.doc->GetVisualDevice(), FOCUS_REASON_MOUSE);
+	if (st_g_ime_listener.GetStartCount() != st_g_ime_listener.GetStopCount())
+		ST_failed("failed to destroy IME");
+
+	st_g_ime_listener.Reset();
+	g_input_manager->RestoreKeyboardInputContext(st_g_widget, 0, FOCUS_REASON_ACTIVATE);
+	WaitForIMESpawning(&st_g_ime_listener, OpTypedObject::WIDGET_TYPE_EDIT, UNI_L("replaced"));
+}
+test("restoring focus to IME - cleanup")
+{
+	st_g_widget = 0;
+	st_g_ime_listener.ListenTo(0);
+}
+
+// test that changes to widget while IME is active are propagated
+test("GOGI_OPERA_EVT_IME_TEXT_UPDATE - OpEdit")
+{
+	OpEdit* edit = 0;
+	TestView tv;
+	OpInputMethodString imstr;
+
+	verify(OpStatus::IsSuccess(OpEdit::Construct(&edit)));
+	edit->SetVisualDevice(state.doc->GetVisualDevice());
+
+	// spoof IME
+	edit->OnStartComposing(&imstr, IM_COMPOSE_ALL);
+	verify(!tv.m_changed);
+
+	// temporarily replace the visual device's core view with the test
+	// view when changing the contents of the edit field, so any
+	// events go to the test view.
+	VisualDevice* vd = state.doc->GetVisualDevice();
+	CoreView* old = vd->GetView();
+	vd->SetView(&tv);
+	OP_STATUS s = edit->SetText(UNI_L("changed"));
+	vd->SetView(old);
+	verify(OpStatus::IsSuccess(s));
+
+	// SetText should generate a call to OpView::SetInputTextChanged
+	verify(tv.m_changed);
+}
+finally
+{
+	if (edit)
+	{
+		edit->OnStopComposing(TRUE);
+		edit->Delete();
+	}
+}
+
+// test that changes to widget while IME is active are propagated
+test("GOGI_OPERA_EVT_IME_TEXT_UPDATE - OpMultilineEdit")
+{
+	OpMultilineEdit* edit = 0;
+	TestView tv;
+	OpInputMethodString imstr;
+
+	verify(OpStatus::IsSuccess(OpMultilineEdit::Construct(&edit)));
+	edit->SetVisualDevice(state.doc->GetVisualDevice());
+
+	// spoof IME
+	edit->OnStartComposing(&imstr, IM_COMPOSE_ALL);
+	verify(!tv.m_changed);
+
+	// temporarily replace the visual device's core view with the test
+	// view when changing the contents of the edit field, so any
+	// events go to the test view.
+	VisualDevice* vd = state.doc->GetVisualDevice();
+	CoreView* old = vd->GetView();
+	vd->SetView(&tv);
+	OP_STATUS s = edit->SetText(UNI_L("changed"));
+	vd->SetView(old);
+	verify(OpStatus::IsSuccess(s));
+
+	// SetText should generate a call to OpView::SetInputTextChanged
+	verify(tv.m_changed);
+}
+finally
+{
+	if (edit)
+	{
+		edit->OnStopComposing(TRUE);
+		edit->Delete();
+	}
+}
+
+// Following tests are brethren of tests from forms/selftest/formobject.ot
+// with additional IME checking including onfocus handler.
+html
+{
+	//! <script type="text/javascript">
+	//! var focus_no = 0;
+	//! var blur_no = 0;
+	//! function loaded()  {
+	//! 	document.querySelector('body').style.height = window.innerHeight * 2;
+	//! }
+	//! function focused()  {
+	//! 	document.querySelectorAll('p')[0].textContent = ++focus_no;
+	//! }
+	//! function blured()  {
+	//! 	document.querySelectorAll('p')[1].textContent = ++blur_no;
+	//! }
+	//! setInterval(function(){
+	//! 	document.querySelectorAll('p')[2].textContent = document.activeElement.id;
+	//! }, 100);
+	//! </script>
+	//! <style>
+	//! 	body { padding: 0px; margin: 0px; }
+	//! 	textarea { margin: 0px; padding: 0px; width: 100px; height: 100px; overflow-y: scroll;overflow-x: scroll;overflow-wrap: normal}
+	//! </style>
+	//! <body id="body" onload="loaded()">
+	//! <textarea id="textarea" onfocus="focused()" onblur="blured()">ac nibh id diam feugiat consectetur at a dolor. Pellentesque habitant morbi tristique senectus et netus et malesuada fames ac turpis egestas. Donec accumsan ullamcorper dapibus. Vestibulum nec mauris a neque bibendum tempor at vitae odio. Quisque dui enim, malesuada vel pellentesque suscipit, blandit sed felis. Lorem ipsum dolor sit amet, consectetur adipiscing elit. Duis sed mattis nunc. Maecenas eu dolor dolor, sed tempor urna. Pellentesque turpis mi, gravida a rutrum vel, venenatis adipiscing lorem. Quisque aliquam dignissim libero vitae dapibus. Nunc hendrerit libero eu lorem mollis faucibus. Fusce vitae quam tortor, eget blandit tellus. Sed nec nunc sapien. Ut accumsan imperdiet orci et condimentum. Morbi rutrum tempus lorem, quis gravida felis sodales quis. In aliquam feugiat ante, a porta tortor fermentum id. Etiam mattis consectetur dolor, a luctus sem sodales ut.
+	//!
+	//! In tristique, nibh ac accumsan lacinia, metus dolor sollicitudin nisi, sed aliquet nibh mauris non quam. Cum sociis natoque penatibus et magnis dis parturient montes, nascetur ridiculus mus. Quisque tincidunt tristique purus, non pretium est dapibus ac. Quisque quis velit ipsum, id volutpat nibh. Fusce commodo orci vitae sem sollicitudin fermentum. Aenean ut tortor sed mauris laoreet molestie sit amet quis mi. Duis posuere sem in magna imperdiet pellentesque. Praesent quis luctus nisi. Duis luctus turpis nec nisi euismod gravida. Nulla nisl sem, vestibulum eget semper a, mollis in nulla. Sed sit amet ligula purus. Donec volutpat, justo a gravida blandit, odio lacus mollis sem, non posuere tortor erat non sem. Class aptent taciti sociosqu ad litora torquent per conubia nostra, per inceptos himenaeos. Sed non sapien vel nisi interdum vehicula. Sed neque augue, vehicula sed posuere egestas, congue ut erat. Donec in ligula tortor, accumsan tincidunt lacus.
+	//!
+	//! Pellentesque tellus risus, dapibus at volutpat ut, consequat ac sem. Sed pulvinar hendrerit aliquet. Nunc sollicitudin erat ornare turpis tincidunt dictum sit amet non ipsum. Nam porta nibh vel felis condimentum vel accumsan quam molestie. Nulla facilisi. Vestibulum a iaculis purus. Cras euismod dolor eu purus viverra vestibulum. Vestibulum interdum lobortis urna quis vehicula. Aliquam ut diam sed massa malesuada tristique cursus nec orci. Nullam in purus velit, nec mattis lacus. Etiam sed purus vel orci aliquam porta. Duis posuere arcu a elit eleifend et tempus turpis blandit. Nulla ut risus nec leo venenatis vulputate a ut quam. Pellentesque lobortis mauris et est condimentum aliquam. Vivamus ac libero ligula, nec adipiscing augue. Vivamus sit amet feugiat risus. Vestibulum iaculis bibendum turpis. Sed interdum semper orci id faucibus.</textarea>
+	//!
+	//! <p>&nbsp;</p>
+	//! <p>&nbsp;</p>
+	//! <p>&nbsp;</p>
+	//! </body>
+}
+
+// 1. Click scrollbar of textarea.
+// 2. Move scroll down with keypress.
+// 3. Click text inside textarea.
+// 4. Restore focus to visual device.
+test("IME and scrollbar - two mouse clicks 1.")
+require undefined MOUSELESS;
+{
+	// get view
+	VisualDevice *vd = state.doc->GetVisualDevice();
+	CoreView *top_view = vd->GetContainerView();
+	OpView* view = vd->GetOpView();
+	verify(view);
+	st_g_ime_listener.ListenTo(view);
+
+	// 1. Click on the scrollbar left arrow - focus OpMultilineWidget,
+	// set input context into OpScrollbar (and not TextAreaObject).
+	OpPoint p(3, 100-3);
+	top_view->MouseMove(p, SHIFTKEY_NONE);
+	top_view->MouseDown(p, MOUSE_BUTTON_1, 1, SHIFTKEY_NONE);
+	top_view->MouseUp(p, MOUSE_BUTTON_1, SHIFTKEY_NONE);
+
+	OpWidget* after = OpWidget::GetFocused();
+	verify(CheckScrollbarParentCaret(after,  FALSE));
+	verify(!IsIMESpawning(&st_g_ime_listener));
+}
+
+test("IME and scrollbar - two mouse clicks 2.")
+require undefined MOUSELESS;
+require success "IME and scrollbar - two mouse clicks 1.";
+{
+	// get view
+	VisualDevice *vd = state.doc->GetVisualDevice();
+	OpView* view = vd->GetOpView();
+	verify(view);
+	st_g_ime_listener.ListenTo(view);
+	OpWidget* before = OpWidget::GetFocused();
+	verify(before);
+	verify(before->GetType() == OpTypedObject::WIDGET_TYPE_SCROLLBAR);
+
+	// 2. Keyboard move down - make sure input context won't change.
+	g_input_manager->InvokeKeyPressed(OP_KEY_DOWN, SHIFTKEY_NONE);
+	OpWidget* after = OpWidget::GetFocused();
+	verify(before == after);
+	verify(CheckScrollbarParentCaret(after,  FALSE));
+	verify(!IsIMESpawning(&st_g_ime_listener));
+}
+
+test("IME and scrollbar - two mouse clicks 3.") async;
+require undefined MOUSELESS;
+require success "IME and scrollbar - two mouse clicks 2.";
+{
+	// get view
+	VisualDevice *vd = state.doc->GetVisualDevice();
+	CoreView *top_view = vd->GetContainerView();
+	OpView* view = vd->GetOpView();
+	if (!view)
+		ST_failed("failed to obtain OpView");
+	else
+	{
+		st_g_ime_listener.ListenTo(view);
+		OpWidget* before = OpWidget::GetFocused();
+		if (!before)
+			ST_failed("Nothing focused.");
+		else if (before->GetType() != OpTypedObject::WIDGET_TYPE_SCROLLBAR)
+			ST_failed("Scrollbar should be focused.");
+		else
+		{
+			// 3. Click text inside textarea - set input context into TextAreaObject,
+			// show IME and caret.
+			OpPoint p(3, 50);
+			top_view->MouseMove(p, SHIFTKEY_NONE);
+			top_view->MouseDown(p, MOUSE_BUTTON_1, 1, SHIFTKEY_NONE);
+			top_view->MouseUp(p, MOUSE_BUTTON_1, SHIFTKEY_NONE);
+
+			OpWidget* after = OpWidget::GetFocused();
+			if(before == after || !after || after->GetType() != OpTypedObject::WIDGET_TYPE_MULTILINE_EDIT)
+				ST_failed("Wrong focus.");
+			else
+			{
+				OpMultilineEdit* after_medit = static_cast<OpMultilineEdit*>(after);
+				if (after_medit->GetFocusComesFromScrollbar())
+					ST_failed("focus_comes_from_scrollbar flag should be reset.");
+				else if (CheckScrollbarParentCaret(before,  TRUE))
+					WaitForIMESpawning(&st_g_ime_listener, OpTypedObject::WIDGET_TYPE_MULTILINE_EDIT);
+				else
+					ST_failed("Wrong scrollbar caret.");
+			}
+		}
+	}
+}
+
+test("IME and scrollbar - two mouse clicks 4.")
+require success "IME and scrollbar - two mouse clicks 3.";
+{
+	VisualDevice *vd = state.doc->GetVisualDevice();
+	OpView* view = vd->GetOpView();
+	verify(view);
+	st_g_ime_listener.ListenTo(view);
+	// destroy IME
+	g_input_manager->SetKeyboardInputContext(state.doc->GetVisualDevice(), FOCUS_REASON_MOUSE);
+	verify(st_g_ime_listener.GetStartCount() == st_g_ime_listener.GetStopCount());
+	st_g_ime_listener.Reset();
+	st_g_ime_listener.ListenTo(0);
+}
+
+// 1. Click scrollbar of textarea.
+// 2. Hit enter key.
+// 3. Restore focus to visual device.
+test("IME and scrollbar - mouse and keyboard 1.")
+require undefined MOUSELESS;
+{
+	// get view
+	VisualDevice *vd = state.doc->GetVisualDevice();
+	CoreView *top_view = vd->GetContainerView();
+	OpView* view = vd->GetOpView();
+	verify(view);
+
+	// 0. Click outside textarea to unfocus it
+	// (clear state from previous selftests).
+	OpPoint p0(3, 200);
+	top_view->MouseMove(p0, SHIFTKEY_NONE);
+	top_view->MouseDown(p0, MOUSE_BUTTON_1, 1, SHIFTKEY_NONE);
+	top_view->MouseUp(p0, MOUSE_BUTTON_1, SHIFTKEY_NONE);
+
+	st_g_ime_listener.ListenTo(view);
+
+	// 1. Click on the scrollbar left arrow.
+	OpPoint p(3, 100-3);
+	top_view->MouseMove(p, SHIFTKEY_NONE);
+	top_view->MouseDown(p, MOUSE_BUTTON_1, 1, SHIFTKEY_NONE);
+	top_view->MouseUp(p, MOUSE_BUTTON_1, SHIFTKEY_NONE);
+
+	OpWidget* after = OpWidget::GetFocused();
+	verify(CheckScrollbarParentCaret(after,  FALSE));
+	verify(!IsIMESpawning(&st_g_ime_listener));
+}
+
+test("IME and scrollbar - mouse and keyboard 2.") async;
+require undefined MOUSELESS;
+require success "IME and scrollbar - mouse and keyboard 1.";
+{
+	// get view
+	VisualDevice *vd = state.doc->GetVisualDevice();
+	OpView* view = vd->GetOpView();
+	if (!view)
+		ST_failed("failed to obtain OpView");
+	else
+	{
+		st_g_ime_listener.ListenTo(view);
+		OpWidget* before = OpWidget::GetFocused();
+
+		// 2. Hit enter key - put focus inside TextAreaObject, show IME and caret.
+		g_input_manager->InvokeKeyPressed(OP_KEY_ENTER, SHIFTKEY_NONE);
+		OpWidget* after = OpWidget::GetFocused();
+		if(before == after)
+			ST_failed("Focus unchanged.");
+		else if (CheckScrollbarParentCaret(before,  TRUE))
+			WaitForIMESpawning(&st_g_ime_listener, OpTypedObject::WIDGET_TYPE_MULTILINE_EDIT);
+		else
+			ST_failed("Wrong scrollbar caret.");
+	}
+}
+
+test("IME and scrollbar - mouse and keyboard 3.")
+require success "IME and scrollbar - mouse and keyboard 2.";
+{
+	VisualDevice *vd = state.doc->GetVisualDevice();
+	OpView* view = vd->GetOpView();
+	verify(view);
+	st_g_ime_listener.ListenTo(view);
+	// destroy IME
+	g_input_manager->SetKeyboardInputContext(state.doc->GetVisualDevice(), FOCUS_REASON_MOUSE);
+	verify(st_g_ime_listener.GetStartCount() == st_g_ime_listener.GetStopCount());
+	st_g_ime_listener.Reset();
+	st_g_ime_listener.ListenTo(0);
+}
+
+// 1. Click scrollbar of textarea.
+// 2. Hit escape key.
+// 3. Scrol main window down with keypress.
+test("IME and scrollbar - mouse and keyboard outside 1.")
+require undefined MOUSELESS;
+{
+	// get view
+	VisualDevice *vd = state.doc->GetVisualDevice();
+	CoreView *top_view = vd->GetContainerView();
+	OpView* view = vd->GetOpView();
+	verify(view);
+
+	// 0. Click outside textarea to unfocus it
+	// (clear state from previous selftests).
+	OpPoint p0(3, 200);
+	top_view->MouseMove(p0, SHIFTKEY_NONE);
+	top_view->MouseDown(p0, MOUSE_BUTTON_1, 1, SHIFTKEY_NONE);
+	top_view->MouseUp(p0, MOUSE_BUTTON_1, SHIFTKEY_NONE);
+
+	st_g_ime_listener.ListenTo(view);
+
+	// 1. Click on the scrollbar left arrow.
+	OpPoint p(3, 100-3);
+	top_view->MouseMove(p, SHIFTKEY_NONE);
+	top_view->MouseDown(p, MOUSE_BUTTON_1, 1, SHIFTKEY_NONE);
+	top_view->MouseUp(p, MOUSE_BUTTON_1, SHIFTKEY_NONE);
+
+	OpWidget* after = OpWidget::GetFocused();
+	verify(CheckScrollbarParentCaret(after,  FALSE));
+	verify(!IsIMESpawning(&st_g_ime_listener));
+}
+
+test("IME and scrollbar - mouse and keyboard outside 2.")
+require undefined MOUSELESS;
+require success "IME and scrollbar - mouse and keyboard outside 1.";
+{
+	// get view
+	VisualDevice *vd = state.doc->GetVisualDevice();
+	OpView* view = vd->GetOpView();
+	verify(view);
+
+	st_g_ime_listener.ListenTo(view);
+	OpWidget* before = OpWidget::GetFocused();
+	verify(before);
+	verify(before->GetType() == OpTypedObject::WIDGET_TYPE_SCROLLBAR);
+	OpWidget* before_parent = before->GetParent();
+	verify(before_parent);
+	verify(before_parent->GetType() == OpTypedObject::WIDGET_TYPE_MULTILINE_EDIT);
+	OpMultilineEdit* before_parent_medit = static_cast<OpMultilineEdit*>(before_parent);
+
+	// 2. Hit escape key - put focus in document, don't show IME nor caret.
+	g_input_manager->InvokeKeyPressed(OP_KEY_ESCAPE, SHIFTKEY_NONE);
+	OpWidget* after = OpWidget::GetFocused();
+	verify(!after);
+
+	g_input_manager->InvokeKeyPressed(OP_KEY_DOWN, SHIFTKEY_NONE);
+	OpScrollbar* scroll_x;
+	OpScrollbar* scroll_y;
+	vd->GetScrollbarObjects(&scroll_x, &scroll_y);
+	verify(scroll_y->GetValue() != 0);
+	verify(CheckScrollbarParentCaret(before,  FALSE));
+	verify(!IsIMESpawning(&st_g_ime_listener));
+	verify(!before_parent_medit->GetFocusComesFromScrollbar());
+}
+

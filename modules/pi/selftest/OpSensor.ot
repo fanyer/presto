@@ -1,0 +1,104 @@
+/* -*- Mode: c++; tab-width: 4; indent-tabs-mode: t; c-basic-offset: 4 -*-
+**
+** Copyright (C) 1995-2010 Opera Software ASA.  All rights reserved.
+**
+** This file is part of the Opera web browser.  It may not be distributed
+** under any circumstances.
+*/
+
+group "pi.OpSensor";
+
+require PI_SENSOR;
+
+include "modules/hardcore/timer/optimer.h";
+include "modules/pi/device_api/OpSensor.h";
+
+global
+{
+	class SelftestSensorListener : public OpSensorListener, public OpTimerListener
+	{
+	public:
+		SelftestSensorListener() : m_sensor(NULL), m_expects_destroy(FALSE)
+		{
+			m_timer.SetTimerListener(this);
+		}
+		virtual void OnNewData(OpSensor* sensor, const OpSensorData* value)
+		{
+			m_timer.Stop();
+			if (!m_expects_destroy)
+				sensor->SetListener(NULL);
+
+			if (sensor != m_sensor)
+				ST_failed("sensor != m_sensor");
+			else if (!value)
+				ST_failed("value == NULL");
+			else if (!m_expects_destroy)
+				ST_passed();
+		}
+
+		virtual void OnSensorDestroyed(const OpSensor* sensor)
+		{
+			m_timer.Stop();
+			if (sensor != m_sensor)
+				ST_failed("sensor != m_sensor");
+			else if (m_expects_destroy)
+				ST_passed();
+		}
+
+		virtual void OnSensorNeedsCalibration(OpSensor* sensor)
+		{
+		}
+
+		virtual void OnTimeOut(OpTimer* timer)
+		{
+			m_sensor->SetListener(NULL);
+			ST_failed("Timed out");
+		}
+		OpSensor* m_sensor;
+		OpTimer m_timer;
+		BOOL m_expects_destroy;
+	};
+
+	OpSensor* current_sensor;
+	SelftestSensorListener sensor_listener;
+}
+
+table sensor_types
+{
+	{ SENSOR_TYPE_ACCELERATION },
+	{ SENSOR_TYPE_LINEAR_ACCELERATION },
+	{ SENSOR_TYPE_ORIENTATION },
+	{ SENSOR_TYPE_ROTATION_SPEED },
+}
+
+foreach (type) from sensor_types
+{
+	test ("Supports type : $(type)")
+	{
+		current_sensor = NULL;
+		verify_success(OpSensor::Create(&current_sensor, type));
+		verify(current_sensor);
+		verify(current_sensor->GetType() == type);
+
+	}
+
+	test ("[$(type)]Check if sensor returns any data")
+		async;
+		require success "Supports type : $(type)";
+	{
+		sensor_listener.m_sensor = current_sensor;
+		sensor_listener.m_expects_destroy = FALSE;
+		current_sensor->SetListener(&sensor_listener);
+		sensor_listener.m_timer.Start(10000);
+	}
+
+	test ("[$(type)]Check if sensor notifies about being deleted")
+		async;
+		require success "Supports type : $(type)";
+	{
+		sensor_listener.m_sensor = current_sensor;
+		sensor_listener.m_expects_destroy = TRUE;
+		current_sensor->SetListener(&sensor_listener);
+		OP_DELETE(current_sensor);
+	}
+}

@@ -1,0 +1,671 @@
+/* -*- Mode: c; tab-width: 4; c-basic-offset: 4 -*-
+ *
+ * Copyright (C) 2010 Opera Software AS.  All rights reserved.
+ *
+ * This file is part of the Opera web browser.
+ * It may only be distributed as agreed with Opera Software.
+ */
+
+group "opera_auth.opera_account_manager";
+
+require OPERA_AUTH_SUPPORT;
+require PREFS_HAVE_OPERA_ACCOUNT;
+
+include "modules/opera_auth/opera_account_manager.h";
+include "modules/opera_auth/opera_auth_module.h";
+include "modules/prefs/prefsmanager/collections/pc_webserver.h";
+include "modules/prefs/prefsmanager/collections/pc_opera_account.h";
+
+global
+{
+	class OperaAccountManagerTester : public CoreOperaAccountManager::Listener
+	{
+	public:
+		BOOL m_loginStateChangeExpected;
+		BOOL m_expectedLoginState;
+		CoreOperaAccountManager::OperaAccountError m_expectedLoginError;
+		BOOL m_loginInProgress;
+		BOOL m_deviceRegisteredChangeExpected;
+		BOOL m_expectedDeviceRegisteredState;
+		CoreOperaAccountManager::OperaAccountError m_expectedDeviceRegisteredError;
+		BOOL m_deviceRegisteredInProgress;
+		BOOL m_selftestFailed;
+		BOOL m_selftestRunning;
+
+		OperaAccountManagerTester()
+		{
+			m_selftestRunning = FALSE;
+		}
+
+		void Start()
+		{
+			m_loginStateChangeExpected = FALSE;
+			m_expectedLoginState = FALSE;
+			m_expectedLoginError = CoreOperaAccountManager::OPERA_ACCOUNT_SUCCESS;
+			m_loginInProgress = FALSE;
+			m_deviceRegisteredChangeExpected = FALSE;
+			m_expectedDeviceRegisteredState = FALSE;
+			m_expectedDeviceRegisteredError = CoreOperaAccountManager::OPERA_ACCOUNT_SUCCESS;
+			m_deviceRegisteredInProgress = FALSE;
+			m_selftestFailed = FALSE;
+			m_selftestRunning = TRUE;
+		}
+
+		void Fail(const char* error)
+		{
+			if (m_selftestRunning && !m_selftestFailed)
+				ST_failed(error);
+			m_selftestFailed = TRUE;
+			m_selftestRunning = g_opera_account_manager->IsRequestInProgress();
+		}
+
+		void Pass()
+		{
+			if (m_selftestFailed || g_opera_account_manager->IsRequestInProgress())
+			{
+				Fail("Illegal selftest state");
+				return;
+			}
+			if (m_selftestRunning && !m_selftestFailed)
+				ST_passed();
+			m_selftestRunning = FALSE;
+		}
+
+		BOOL CheckInitialState(BOOL ok)
+		{
+			Start();
+			if (!ok)
+				Fail("Wrong initial state");
+			return ok;
+		}
+
+		void ExpectLoginStateChange(BOOL logged_in, CoreOperaAccountManager::OperaAccountError error, BOOL in_progress)
+		{
+			if (m_loginStateChangeExpected)
+				Fail("OnAccountLoginStateChange not called");
+
+			m_loginStateChangeExpected = TRUE;
+			m_expectedLoginState = logged_in;
+			m_expectedLoginError = error;
+			m_loginInProgress = in_progress;
+		}
+
+		void ExpectDeviceRegisteredChange(BOOL device_registered, CoreOperaAccountManager::OperaAccountError error, BOOL in_progress)
+		{
+			if (m_deviceRegisteredChangeExpected)
+				Fail("OnAccountDeviceRegisteredChange not called");
+
+			m_deviceRegisteredChangeExpected = TRUE;
+			m_expectedDeviceRegisteredState = device_registered;
+			m_expectedDeviceRegisteredError = error;
+			m_deviceRegisteredInProgress = in_progress;
+		}
+
+		BOOL CheckSynchronousTermination(BOOL ok = TRUE, CoreOperaAccountManager::OperaAccountError expectedError = CoreOperaAccountManager::OPERA_ACCOUNT_SUCCESS)
+		{
+			if (g_opera_account_manager->IsRequestInProgress())
+				Fail("Request should terminate synchronously");
+			else if (m_loginStateChangeExpected)
+				Fail("OnAccountLoginStateChange not called");
+			else if (m_deviceRegisteredChangeExpected)
+				Fail("OnAccountDeviceRegisteredChange not called");
+			else if (!ok || g_opera_account_manager->LastError() != expectedError)
+				Fail("Wrong final state");
+			return m_selftestRunning;
+		}
+
+		BOOL CheckAsynchronousProgress(BOOL ok = TRUE, CoreOperaAccountManager::OperaAccountError expectedError = CoreOperaAccountManager::OPERA_ACCOUNT_SUCCESS)
+		{
+			if (!g_opera_account_manager->IsRequestInProgress())
+				Fail("Request should be asynchronous");
+			else if (!ok || g_opera_account_manager->LastError() != expectedError)
+				Fail("Wrong intermediate state");
+			return m_selftestRunning;
+		}
+
+		virtual void OnAccountLoginStateChange()
+		{
+			if (!m_selftestRunning)
+				return;
+
+			if (!m_loginStateChangeExpected)
+				Fail("Unexpected OnAccountLoginStateChange");
+			else if (m_expectedLoginState != g_opera_account_manager->IsLoggedIn())
+				Fail("OnAccountLoginStateChange: Wrong login state");
+			else if (m_expectedLoginError != g_opera_account_manager->LastError() &&
+					 g_opera_account_manager->LastError() == CoreOperaAccountManager::OPERA_ACCOUNT_REQUEST_ERROR)
+				Fail("Unexpected communication error (perhaps auth-test.opera.com is down?)");
+			else if (m_expectedLoginError != g_opera_account_manager->LastError())
+				Fail("OnAccountLoginStateChange: Wrong error state");
+			else if (m_loginInProgress != g_opera_account_manager->IsRequestInProgress())
+				Fail("OnAccountLoginStateChange: Request should be asynchronous");
+			else if (!m_loginInProgress)
+				Pass();
+
+			m_loginStateChangeExpected = FALSE;
+		}
+
+#ifdef WEBSERVER_RENDEZVOUS_SUPPORT
+		virtual void OnAccountDeviceRegisteredChange()
+		{
+			if (!m_selftestRunning)
+				return;
+
+			if (!m_deviceRegisteredChangeExpected)
+				Fail("Unexpected OnAccountDeviceRegisteredChange");
+			else if (m_expectedDeviceRegisteredState != g_opera_account_manager->IsDeviceRegistered())
+				Fail("OnAccountDeviceRegisteredChange: Wrong device registered state");
+			else if (m_expectedDeviceRegisteredError != g_opera_account_manager->LastError())
+				Fail("OnAccountDeviceRegisteredChange: Wrong error state");
+			else if (m_deviceRegisteredInProgress != g_opera_account_manager->IsRequestInProgress())
+				Fail("OnAccountDeviceRegisteredChange: Request should be asynchronous");
+			else if (!m_deviceRegisteredInProgress)
+				Pass();
+
+			m_deviceRegisteredChangeExpected = FALSE;
+		}
+#endif
+	};
+
+	OpString username;
+	OpString password;
+	OpString new_password;
+	OpString email;
+	OpString device;
+	OperaAccountManagerTester account_test;
+	BOOL initialized;
+}
+
+setup
+{
+	initialized = FALSE;
+	OpStringC test_server(UNI_L("https://auth-test.opera.com/xml"));
+	OP_MEMORY_VAR OP_STATUS status = OpStatus::OK;
+	if (OpStatus::IsSuccess(status))
+		TRAP(status, status = g_pcopera_account->WriteStringL(PrefsCollectionOperaAccount::ServerAddress, test_server));
+	if (OpStatus::IsSuccess(status))
+		TRAP(status, status = g_pcopera_account->ResetStringL(PrefsCollectionOperaAccount::Username));
+	if (OpStatus::IsSuccess(status))
+		TRAP(status, status = g_pcopera_account->WriteIntegerL(PrefsCollectionOperaAccount::SavePassword, 0));
+#ifdef WEBSERVER_RENDEZVOUS_SUPPORT
+	if (OpStatus::IsSuccess(status))
+		TRAP(status, status = g_pcwebserver->ResetStringL(PrefsCollectionWebserver::WebserverDevice));
+	if (OpStatus::IsSuccess(status))
+		TRAP(status, status = g_pcwebserver->ResetStringL(PrefsCollectionWebserver::WebserverHashedPassword));
+	if (OpStatus::IsSuccess(status))
+		TRAP(status, status = g_pcwebserver->ResetStringL(PrefsCollectionWebserver::WebserverUser));
+#endif
+
+	if (OpStatus::IsSuccess(status))
+		status = username.AppendFormat(UNI_L("test%06d"), (unsigned int)op_time(0) % 1000000);
+	if (OpStatus::IsSuccess(status))
+		status = password.Set("*****");
+	if (OpStatus::IsSuccess(status))
+		status =  new_password.Set("*****2");
+	if (OpStatus::IsSuccess(status))
+		status = email.AppendFormat(UNI_L("%ls@opera.com"), username.CStr());
+	if (OpStatus::IsSuccess(status))
+		status = device.Set("device");
+
+	if (OpStatus::IsSuccess(status))
+		status = g_opera_account_manager->AddListener(&account_test);
+
+	if (OpStatus::IsSuccess(status))
+		initialized = TRUE;
+}
+
+exit
+{
+	if (g_opera_account_manager)
+		g_opera_account_manager->RemoveListener(&account_test);
+
+	if (g_pcopera_account)
+	{
+		TRAPD(s, g_pcopera_account->ResetStringL(PrefsCollectionOperaAccount::ServerAddress));
+		TRAP(s, g_pcopera_account->ResetStringL(PrefsCollectionOperaAccount::Username));
+		TRAP(s, g_pcopera_account->ResetIntegerL(PrefsCollectionOperaAccount::SavePassword));
+	#ifdef WEBSERVER_RENDEZVOUS_SUPPORT
+		TRAP(s, g_pcwebserver->ResetStringL(PrefsCollectionWebserver::WebserverDevice));
+		TRAP(s, g_pcwebserver->ResetStringL(PrefsCollectionWebserver::WebserverHashedPassword));
+		TRAP(s, g_pcwebserver->ResetStringL(PrefsCollectionWebserver::WebserverUser));
+	#endif
+		OpStatus::Ignore(s);
+	}
+}
+
+test("Initialize")
+{
+	verify(initialized);
+}
+
+test("Create account, short username") async;
+	require success "Initialize";
+{
+	if (account_test.CheckInitialState(!g_opera_account_manager->IsLoggedIn()))
+	{
+		OpStringC uname(UNI_L("aa"));
+		account_test.ExpectLoginStateChange(FALSE, CoreOperaAccountManager::OPERA_ACCOUNT_USERNAME_TOO_SHORT, FALSE);
+		g_opera_account_manager->CreateAccount(uname, password, email, FALSE);
+		account_test.CheckSynchronousTermination();
+	}
+}
+
+test("Create account, long username") async;
+	require success "Initialize";
+{
+	if (account_test.CheckInitialState(!g_opera_account_manager->IsLoggedIn()))
+	{
+		OpStringC uname(UNI_L("a234567890123456789012345678901"));
+		account_test.ExpectLoginStateChange(FALSE, CoreOperaAccountManager::OPERA_ACCOUNT_USERNAME_TOO_LONG, FALSE);
+		g_opera_account_manager->CreateAccount(uname, password, email, FALSE);
+		account_test.CheckSynchronousTermination();
+	}
+}
+
+test("Create account, invalid chars in username") async;
+	require success "Initialize";
+{
+	if (account_test.CheckInitialState(!g_opera_account_manager->IsLoggedIn()))
+	{
+		OpStringC uname(UNI_L("aa_"));
+		account_test.ExpectLoginStateChange(FALSE, CoreOperaAccountManager::OPERA_ACCOUNT_USERNAME_CONTAINS_INVALID_CHARACTERS, FALSE);
+		g_opera_account_manager->CreateAccount(uname, password, email, FALSE);
+		account_test.CheckSynchronousTermination();
+	}
+}
+
+test("Create account, short password") async;
+	require success "Initialize";
+{
+	if (account_test.CheckInitialState(!g_opera_account_manager->IsLoggedIn()))
+	{
+		OpStringC pword(UNI_L("****"));
+		account_test.ExpectLoginStateChange(FALSE, CoreOperaAccountManager::OPERA_ACCOUNT_PASSWORD_TOO_SHORT, FALSE);
+		g_opera_account_manager->CreateAccount(username, pword, email, FALSE);
+		account_test.CheckSynchronousTermination();
+	}
+}
+
+test("Create account, long password") async;
+	require success "Initialize";
+{
+	if (account_test.CheckInitialState(!g_opera_account_manager->IsLoggedIn()))
+	{
+		OpString pword;
+		for (int i=0; i<257; i++)
+			if (OpStatus::IsError(pword.Append("*")))
+				account_test.Fail("Out of memory");
+		account_test.ExpectLoginStateChange(FALSE, CoreOperaAccountManager::OPERA_ACCOUNT_PASSWORD_TOO_LONG, FALSE);
+		g_opera_account_manager->CreateAccount(username, pword, email, FALSE);
+		account_test.CheckSynchronousTermination();
+	}
+}
+
+test("Create account, invalid email") async;
+	require success "Initialize";
+{
+	if (account_test.CheckInitialState(!g_opera_account_manager->IsLoggedIn()))
+	{
+		OpStringC eml(UNI_L("me@"));
+		account_test.ExpectLoginStateChange(FALSE, CoreOperaAccountManager::OPERA_ACCOUNT_EMAIL_ADDRESS_INVALID, FALSE);
+		g_opera_account_manager->CreateAccount(username, password, eml, FALSE);
+		account_test.CheckSynchronousTermination();
+	}
+}
+
+test("Create account, invalid email (server checked)") async;
+	require success "Initialize";
+{
+	if (account_test.CheckInitialState(!g_opera_account_manager->IsLoggedIn()))
+	{
+		OpStringC eml(UNI_L("me@com"));
+		account_test.ExpectLoginStateChange(FALSE, CoreOperaAccountManager::OPERA_ACCOUNT_SUCCESS, TRUE);
+		g_opera_account_manager->CreateAccount(username, password, eml, FALSE);
+		account_test.ExpectLoginStateChange(FALSE, CoreOperaAccountManager::OPERA_ACCOUNT_EMAIL_ADDRESS_INVALID, FALSE);
+		account_test.CheckAsynchronousProgress();
+	}
+}
+
+test("Create account, user exists") async;
+	require success "Initialize";
+{
+	if (account_test.CheckInitialState(!g_opera_account_manager->IsLoggedIn()))
+	{
+		OpStringC uname(UNI_L("roarl"));
+		account_test.ExpectLoginStateChange(FALSE, CoreOperaAccountManager::OPERA_ACCOUNT_SUCCESS, TRUE);
+		g_opera_account_manager->CreateAccount(uname, password, email, FALSE);
+		account_test.ExpectLoginStateChange(FALSE, CoreOperaAccountManager::OPERA_ACCOUNT_USER_ALREADY_EXISTS, FALSE);
+		account_test.CheckAsynchronousProgress();
+	}
+}
+
+test("Create account, email exists") async;
+	require success "Initialize";
+{
+	if (account_test.CheckInitialState(!g_opera_account_manager->IsLoggedIn()))
+	{
+		OpStringC eml(UNI_L("roarl@opera.com"));
+		account_test.ExpectLoginStateChange(FALSE, CoreOperaAccountManager::OPERA_ACCOUNT_SUCCESS, TRUE);
+		g_opera_account_manager->CreateAccount(username, password, eml, FALSE);
+		account_test.ExpectLoginStateChange(FALSE, CoreOperaAccountManager::OPERA_ACCOUNT_EMAIL_ADDRESS_ALREADY_IN_USE, FALSE);
+		account_test.CheckAsynchronousProgress();
+	}
+}
+
+test("Create account") async;
+	require success "Initialize";
+{
+	if (account_test.CheckInitialState(
+		!g_opera_account_manager->IsLoggedIn() &&
+		!g_opera_account_manager->GetSavePasswordSetting()))
+	{
+		account_test.ExpectLoginStateChange(FALSE, CoreOperaAccountManager::OPERA_ACCOUNT_SUCCESS, TRUE);
+		g_opera_account_manager->CreateAccount(username, password, email, TRUE);
+
+		account_test.ExpectLoginStateChange(TRUE, CoreOperaAccountManager::OPERA_ACCOUNT_SUCCESS, FALSE);
+		account_test.CheckAsynchronousProgress(
+			!g_opera_account_manager->IsLoggedIn() &&
+			g_opera_account_manager->GetUsername().IsEmpty() &&
+			g_opera_account_manager->GetSavePasswordSetting());
+	}
+}
+
+test("Create account, alredy logged in") async;
+	require success "Create account";
+{
+	if (account_test.CheckInitialState(
+		g_opera_account_manager->IsLoggedIn() &&
+		g_opera_account_manager->GetUsername().Compare(username) == 0))
+	{
+		account_test.ExpectLoginStateChange(TRUE, CoreOperaAccountManager::OPERA_ACCOUNT_ALREADY_LOGGED_IN, FALSE);
+		g_opera_account_manager->CreateAccount(username, password, email, FALSE);
+		account_test.CheckSynchronousTermination();
+	}
+}
+
+test("Login, alredy logged in") async;
+	require success "Create account";
+{
+	if (account_test.CheckInitialState(
+		g_opera_account_manager->IsLoggedIn()))
+	{
+		account_test.ExpectLoginStateChange(TRUE, CoreOperaAccountManager::OPERA_ACCOUNT_ALREADY_LOGGED_IN, FALSE);
+		g_opera_account_manager->Login(username, password, FALSE);
+		account_test.CheckSynchronousTermination();
+	}
+}
+
+test("Logout") async;
+	require success "Create account";
+{
+	if (account_test.CheckInitialState(
+		g_opera_account_manager->IsLoggedIn() &&
+		g_opera_account_manager->GetUsername().Compare(username) == 0))
+	{
+		account_test.ExpectLoginStateChange(FALSE, CoreOperaAccountManager::OPERA_ACCOUNT_SUCCESS, FALSE);
+		g_opera_account_manager->Logout();
+		account_test.CheckSynchronousTermination();
+	}
+}
+
+test("Logout, already logged out") async;
+	require success "Logout";
+{
+	if (account_test.CheckInitialState(
+		!g_opera_account_manager->IsLoggedIn()))
+	{
+		g_opera_account_manager->Logout();
+		if (account_test.CheckSynchronousTermination(
+			!g_opera_account_manager->IsLoggedIn()))
+			account_test.Pass();
+	}
+}
+
+test("Register device, not logged in") async;
+	require success "Logout";
+	require WEBSERVER_RENDEZVOUS_SUPPORT;
+{
+	if (account_test.CheckInitialState(
+		!g_opera_account_manager->IsLoggedIn() &&
+		!g_opera_account_manager->IsDeviceRegistered()))
+	{
+		account_test.ExpectDeviceRegisteredChange(FALSE, CoreOperaAccountManager::OPERA_ACCOUNT_NOT_LOGGED_IN, FALSE);
+		g_opera_account_manager->RegisterDevice(device, FALSE);
+		account_test.CheckSynchronousTermination();
+	}
+}
+
+test("Login, wrong password") async;
+	require success "Logout";
+{
+	if (account_test.CheckInitialState(
+		!g_opera_account_manager->IsLoggedIn()))
+	{
+		OpStringC pwd(UNI_L("*****!"));
+		account_test.ExpectLoginStateChange(FALSE, CoreOperaAccountManager::OPERA_ACCOUNT_SUCCESS, TRUE);
+		g_opera_account_manager->Login(username, pwd, FALSE);
+		account_test.ExpectLoginStateChange(FALSE, CoreOperaAccountManager::OPERA_ACCOUNT_INVALID_USERNAME_PASSWORD, FALSE);
+		account_test.CheckAsynchronousProgress();
+	}
+}
+
+test("Login") async;
+	require success "Logout";
+{
+	if (account_test.CheckInitialState(
+		!g_opera_account_manager->IsLoggedIn() &&
+		g_opera_account_manager->GetUsername().Compare(username) == 0))
+	{
+		account_test.ExpectLoginStateChange(FALSE, CoreOperaAccountManager::OPERA_ACCOUNT_SUCCESS, TRUE);
+		g_opera_account_manager->Login(username, password, FALSE);
+
+		account_test.ExpectLoginStateChange(TRUE, CoreOperaAccountManager::OPERA_ACCOUNT_SUCCESS, FALSE);
+		account_test.CheckAsynchronousProgress(
+			!g_opera_account_manager->IsLoggedIn() &&
+			g_opera_account_manager->GetUsername().Compare(username) == 0 &&
+			!g_opera_account_manager->GetSavePasswordSetting());
+	}
+}
+
+test("Register device, invalid devicename") async;
+	require success "Login";
+	require WEBSERVER_RENDEZVOUS_SUPPORT;
+{
+	if (account_test.CheckInitialState(
+		g_opera_account_manager->IsLoggedIn() &&
+		!g_opera_account_manager->IsDeviceRegistered()))
+	{
+		OpStringC dev(UNI_L("www.paypal.com%00"));
+		account_test.ExpectDeviceRegisteredChange(FALSE, CoreOperaAccountManager::OPERA_ACCOUNT_DEVICE_NAME_INVALID, FALSE);
+		g_opera_account_manager->RegisterDevice(dev, FALSE);
+		account_test.CheckSynchronousTermination();
+	}
+}
+
+test("Register device, invalid devicename (server checked)") async;
+	require success "Login";
+	require WEBSERVER_RENDEZVOUS_SUPPORT;
+{
+	if (account_test.CheckInitialState(
+		g_opera_account_manager->IsLoggedIn() &&
+		!g_opera_account_manager->IsDeviceRegistered()))
+	{
+		OpStringC dev(UNI_L("www.paypal.com"));
+		account_test.ExpectDeviceRegisteredChange(FALSE, CoreOperaAccountManager::OPERA_ACCOUNT_SUCCESS, TRUE);
+		g_opera_account_manager->RegisterDevice(dev, FALSE);
+		account_test.ExpectDeviceRegisteredChange(FALSE, CoreOperaAccountManager::OPERA_ACCOUNT_DEVICE_NAME_INVALID, FALSE);
+		account_test.CheckAsynchronousProgress();
+	}
+}
+
+test("Register device") async;
+	require success "Login";
+	require WEBSERVER_RENDEZVOUS_SUPPORT;
+{
+	if (account_test.CheckInitialState(
+		g_opera_account_manager->IsLoggedIn() &&
+		!g_opera_account_manager->IsDeviceRegistered()))
+	{
+		account_test.ExpectDeviceRegisteredChange(FALSE, CoreOperaAccountManager::OPERA_ACCOUNT_SUCCESS, TRUE);
+		g_opera_account_manager->RegisterDevice(device, FALSE);
+		account_test.ExpectDeviceRegisteredChange(TRUE, CoreOperaAccountManager::OPERA_ACCOUNT_SUCCESS, FALSE);
+		account_test.CheckAsynchronousProgress();
+	}
+}
+
+test("Register device, new name") async;
+	require success "Register device";
+	require WEBSERVER_RENDEZVOUS_SUPPORT;
+{
+	if (account_test.CheckInitialState(
+		g_opera_account_manager->IsLoggedIn() &&
+		g_opera_account_manager->IsDeviceRegistered()))
+	{
+		OpStringC dev(UNI_L("device2"));
+		account_test.ExpectDeviceRegisteredChange(FALSE, CoreOperaAccountManager::OPERA_ACCOUNT_SUCCESS, TRUE);
+		g_opera_account_manager->RegisterDevice(dev, FALSE);
+		account_test.ExpectDeviceRegisteredChange(TRUE, CoreOperaAccountManager::OPERA_ACCOUNT_SUCCESS, FALSE);
+		account_test.CheckAsynchronousProgress();
+	}
+}
+
+test("Unregister device") async;
+	require success "Register device";
+	require WEBSERVER_RENDEZVOUS_SUPPORT;
+{
+	if (account_test.CheckInitialState(
+		g_opera_account_manager->IsLoggedIn() &&
+		g_opera_account_manager->IsDeviceRegistered()))
+	{
+		account_test.ExpectDeviceRegisteredChange(FALSE, CoreOperaAccountManager::OPERA_ACCOUNT_SUCCESS, FALSE);
+		g_opera_account_manager->ReleaseDevice();
+		account_test.CheckAsynchronousProgress();
+	}
+}
+
+test("Unregister device, already unregistered") async;
+	require success "Unregister device";
+	require WEBSERVER_RENDEZVOUS_SUPPORT;
+{
+	if (account_test.CheckInitialState(
+		g_opera_account_manager->IsLoggedIn() &&
+		!g_opera_account_manager->IsDeviceRegistered()))
+	{
+		g_opera_account_manager->ReleaseDevice();
+		if (account_test.CheckSynchronousTermination(
+			!g_opera_account_manager->IsDeviceRegistered()))
+			account_test.Pass();
+	}
+}
+
+test("Logout by modifying Username pref") async;
+	require success "Login";
+{
+	if (account_test.CheckInitialState(
+		g_opera_account_manager->IsLoggedIn()))
+	{
+		OpStringC uname(UNI_L("roarl"));
+		account_test.ExpectLoginStateChange(FALSE, CoreOperaAccountManager::OPERA_ACCOUNT_SUCCESS, FALSE);
+		TRAPD(status, status = g_pcopera_account->WriteStringL(PrefsCollectionOperaAccount::Username, uname));
+		account_test.CheckSynchronousTermination();
+	}
+}
+
+test("Pending request & Abort") async;
+	require success "Logout by modifying Username pref";
+{
+	if (account_test.CheckInitialState(
+		!g_opera_account_manager->IsLoggedIn()))
+	{
+		account_test.ExpectLoginStateChange(FALSE, CoreOperaAccountManager::OPERA_ACCOUNT_SUCCESS, TRUE);
+		g_opera_account_manager->Login(username, password, FALSE);
+		g_opera_account_manager->CreateAccount(username, password, email, FALSE);
+
+		if (account_test.CheckAsynchronousProgress(
+			!g_opera_account_manager->IsLoggedIn(),
+			CoreOperaAccountManager::OPERA_ACCOUNT_REQUEST_ALREADY_IN_PROGRESS))
+		{
+			account_test.ExpectLoginStateChange(FALSE, CoreOperaAccountManager::OPERA_ACCOUNT_REQUEST_ABORTED, FALSE);
+			g_opera_account_manager->Abort();
+			account_test.CheckSynchronousTermination();
+		}
+	}
+}
+
+test("Bad server") async;
+	require success "Pending request & Abort";
+{
+	OpStringC test_server(UNI_L("https://auth-test-bad.opera.com/xml"));
+	OP_MEMORY_VAR OP_STATUS status = OpStatus::OK;
+	TRAP(status, status = g_pcopera_account->WriteStringL(PrefsCollectionOperaAccount::ServerAddress, test_server));
+	if (OpStatus::IsSuccess(status))
+		TRAP(status, status = g_pcopera_account->ResetStringL(PrefsCollectionOperaAccount::Username));
+
+	if (account_test.CheckInitialState(
+		OpStatus::IsSuccess(status) &&
+		!g_opera_account_manager->IsLoggedIn()))
+	{
+		account_test.ExpectLoginStateChange(FALSE, CoreOperaAccountManager::OPERA_ACCOUNT_SUCCESS, TRUE);
+		g_opera_account_manager->Login(username, password, TRUE);
+		account_test.ExpectLoginStateChange(FALSE, CoreOperaAccountManager::OPERA_ACCOUNT_REQUEST_ERROR, FALSE);
+		account_test.CheckAsynchronousProgress();
+	}
+}
+
+test("change password wrong previous password") async;
+		require success "Create account";
+{
+	const uni_char *test_server = UNI_L("http://auth-test.opera.com/xml");
+	if (account_test.CheckInitialState(TRUE))
+	{
+		OP_MEMORY_VAR OP_STATUS status = OpStatus::OK;
+		TRAP(status, status = g_pcopera_account->WriteStringL(PrefsCollectionOperaAccount::ServerAddress, test_server));
+		if (OpStatus::IsSuccess(status))
+			TRAP(status, status = g_pcopera_account->ResetStringL(PrefsCollectionOperaAccount::Username));
+				
+		account_test.ExpectLoginStateChange(g_opera_account_manager->IsLoggedIn(), CoreOperaAccountManager::OPERA_ACCOUNT_SUCCESS, TRUE);
+		g_opera_account_manager->ChangePassword(username, UNI_L("wrongoldpassword"), new_password, TRUE);
+		
+		account_test.ExpectLoginStateChange(FALSE, CoreOperaAccountManager::OPERA_ACCOUNT_INVALID_USERNAME_PASSWORD, FALSE);
+		account_test.CheckAsynchronousProgress();
+	}
+}
+
+test("change password") async;
+	require success "change password wrong previous password";
+{
+	const uni_char *test_server = UNI_L("http://auth-test.opera.com/xml");
+	if (account_test.CheckInitialState(TRUE))
+	{
+		OP_MEMORY_VAR OP_STATUS status = OpStatus::OK;
+		TRAP(status, status = g_pcopera_account->WriteStringL(PrefsCollectionOperaAccount::ServerAddress, test_server));
+		if (OpStatus::IsSuccess(status))
+			TRAP(status, status = g_pcopera_account->ResetStringL(PrefsCollectionOperaAccount::Username));
+				
+		account_test.ExpectLoginStateChange(g_opera_account_manager->IsLoggedIn(), CoreOperaAccountManager::OPERA_ACCOUNT_SUCCESS, TRUE);
+		g_opera_account_manager->ChangePassword(username, password, new_password, TRUE);
+		
+		account_test.ExpectLoginStateChange(TRUE, CoreOperaAccountManager::OPERA_ACCOUNT_SUCCESS, FALSE);
+		account_test.CheckAsynchronousProgress();
+	}
+}
+
+test("Login new password") async;
+	require success "change password";
+{
+	g_opera_account_manager->Logout();
+		
+	if (account_test.CheckInitialState(
+		!g_opera_account_manager->IsLoggedIn() &&
+		g_opera_account_manager->GetUsername().Compare(username) == 0))
+	{
+		account_test.ExpectLoginStateChange(FALSE, CoreOperaAccountManager::OPERA_ACCOUNT_SUCCESS, TRUE);
+		g_opera_account_manager->Login(username, new_password, FALSE);
+
+		account_test.ExpectLoginStateChange(TRUE, CoreOperaAccountManager::OPERA_ACCOUNT_SUCCESS, FALSE);
+		account_test.CheckAsynchronousProgress(
+			!g_opera_account_manager->IsLoggedIn() &&
+			g_opera_account_manager->GetUsername().Compare(username) == 0 &&
+			!g_opera_account_manager->GetSavePasswordSetting());
+	}
+}

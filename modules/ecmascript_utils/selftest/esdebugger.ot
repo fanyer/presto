@@ -1,0 +1,1371 @@
+
+/* -*- Mode: c++; tab-width: 4; indent-tabs-mode: t; c-basic-offset: 4 -*-
+**
+** Copyright (C) 2007-2010 Opera Software ASA.  All rights reserved.
+**
+** This file is part of the Opera web browser.  It may not be distributed
+** under any circumstances.
+**
+** Johannes Hoff
+**
+** Note: All breakpoints must be resumed immediately, since the html
+**       blocks are blocking.
+*/
+
+group "ESUtils.Debugger";
+require init;
+require ECMASCRIPT_DEBUGGER;
+require PREFS_HAS_PREFSFILE;
+
+include "modules/ecmascript_utils/esdebugger.h";
+include "modules/hardcore/mh/mh.h";
+include "modules/util/adt/opvector.h";
+include "modules/dochand/winman.h";
+include "modules/doc/frm_doc.h";
+include "modules/prefs/prefsmanager/collections/pc_js.h";
+
+constant OBJECT_HISTORY_MAX_SIZE=5;
+constant MAGIC_TAG=1337;
+
+global
+{
+	class DumbAccepter : public ES_DebugWindowAccepter
+	{
+		Window* selftest_window;
+	public:
+		DumbAccepter() : selftest_window(0) {}
+
+		virtual BOOL AcceptWindow(Window* window)
+		{
+			return window == selftest_window;
+		}
+
+		void SetSelftestWindow(Window* window)
+		{
+			selftest_window = window;
+		}
+
+		Window* GetSelftestWindow() const { return selftest_window; }
+	};
+
+	class DumbDebugger
+		: public ES_DebugFrontend,
+		  public MessageObject
+	{
+		void output_dbg(const char* msg) {
+			//output(msg);
+		}
+		void output_dbg(const uni_char* msg) { output_dbg(ST_down(msg)); }
+
+		class ThreadNode : public Link
+		{
+			int         id, parent_id;
+			ThreadNode *parent;
+			Head        children;
+		public:
+			ThreadNode(int id, int parent_id=0)
+				: id(id), parent_id(parent_id), parent(NULL)
+			{
+			}
+			~ThreadNode()
+			{
+				if (parent && InList())
+					Out();
+				for (ThreadNode *n = (ThreadNode *)children.First();
+					 n;
+					 n = (ThreadNode *)n->Suc())
+				{
+					n->parent = NULL;
+				}
+				children.Clear();
+			}
+
+			void addChild(ThreadNode *node)
+			{
+				node->Into(&children);
+				node->parent = this;
+			}
+
+			ThreadNode *find(int id)
+			{
+				if (this->id == id)
+					return this;
+				for (ThreadNode *n = (ThreadNode *)children.First();
+					 n;
+					 n = (ThreadNode *)n->Suc())
+				{
+					if (n->id == id)
+						return n;
+					ThreadNode *child = n->find(id);
+					if (child)
+						return child;
+				}
+				return NULL;
+			}
+
+			BOOL hasChildren() const
+			{
+				return !children.Empty();
+			}
+
+		};
+
+	public:
+
+		class ExamineHistory
+		{
+		public:
+
+			ExamineHistory()
+				: chains(NULL), protochain(NULL), count(0), it(NULL)
+			{
+			}
+
+			~ExamineHistory()
+			{
+				Clear();
+			}
+
+			void Clear()
+			{
+				OP_DELETE(protochain);
+				protochain = NULL;
+				it = NULL;
+				chains = NULL;
+				count = 0;
+			}
+
+			ES_DebugObjectChain *chains;	// results set in ExamineObjectsReply
+			ES_DebugObjectChain *protochain;
+			unsigned count;
+			ES_DebugObjectInfo *it;
+
+		} examine_history;
+
+		// Keeps track of the N last Eval'ed objects.
+		class ObjectHistory
+		{
+		public:
+
+			ObjectHistory()
+				: size(0)
+			{
+			}
+
+			void AddObject(unsigned object_id)
+			{
+				// Move objects
+				for(unsigned i = OBJECT_HISTORY_MAX_SIZE-1; i>0; --i)
+					objects[i] = objects[i-1];
+
+				objects[0] = object_id;
+
+				if(size < OBJECT_HISTORY_MAX_SIZE)
+					++size;
+			}
+
+			void Clear()
+			{
+				size = 0;
+			}
+
+			unsigned objects[OBJECT_HISTORY_MAX_SIZE]; // ARRAY OK andersr 2009-11-03
+			unsigned size;
+
+		} object_history;
+
+		enum {
+			max_event_name_len = 20,
+			max_threads = 180, // highest thread ID that will be used (guesstimate)
+		};
+
+		enum EvalResult
+		{
+			EVAL_RESULT_INVALID = -1,
+			EVAL_RESULT_ZERO = 0,
+			EVAL_RESULT_ONE = 1,
+			EVAL_RESULT_OBJECT,
+			EVAL_RESULT_MAX
+		};
+
+		ThreadNode *root;
+		BOOL        build_tree;
+		BOOL        tree_is_valid, threads_are_valid;
+		int calls_to_newscript, calls_to_stopped_at, calls_to_backtrace_reply, last_backtrace_depth, calls_to_js_recurse;
+		int calls_to_thread_started, runtimes_in_runtimesreply;
+		int parse_errors;
+		int last_error_line;
+		unsigned current_script_id;
+		int eval_result[EVAL_RESULT_MAX];
+		uni_char* last_script_source;
+		uni_char last_event_name[max_event_name_len+1]; // ARRAY OK stanislavj 2009-05-26
+		OpINT32Vector backtrace_variables;
+		bool stopped_at_thread[max_threads];
+		enum Mode { MODE_DEFAULT, MODE_EVAL, MODE_BACKTRACE, MODE_STEPINTO, MODE_EVAL_WINDOW_FRAME_1 } mode;
+		unsigned last_dbg_runtime_id;
+		unsigned last_dbg_thread_id;
+		OpString property_name;	// name to look for, when empty no check is done
+
+		DumbAccepter accepter;
+
+		DumbDebugger()
+			: root(NULL), build_tree(FALSE), last_script_source(0)
+		{
+			reset();
+			ES_DebugFrontend::ConstructEngineBackend(&accepter);
+			FramesDocument::SetAlwaysCreateDOMEnvironment(TRUE);
+			g_main_message_handler->SetCallBack(this, MSG_ES_DBG_SELFTEST_COMMAND, 0);
+		}
+
+		~DumbDebugger() {
+			ES_DebugFrontend::Detach();
+			g_main_message_handler->UnsetCallBack(this, MSG_ES_DBG_SELFTEST_COMMAND, 0);
+			op_free(last_script_source);
+			reset();
+			OP_DELETE(root);
+			FramesDocument::SetAlwaysCreateDOMEnvironment(FALSE);
+		}
+
+		void reset(Mode mode = MODE_DEFAULT) {
+			OP_DELETE(root);
+			root = OP_NEW(ThreadNode, (0));
+			build_tree = TRUE;
+			tree_is_valid = TRUE;
+			threads_are_valid = TRUE;
+			calls_to_stopped_at = 0;
+			calls_to_newscript = 0;
+			calls_to_backtrace_reply = 0;
+			calls_to_js_recurse = 0;
+			calls_to_thread_started = 0;
+			parse_errors = 0;
+			last_error_line = 0;
+			current_script_id = 0;
+			last_event_name[0] = 0;
+			unsigned i;
+			for (i=0; i < EVAL_RESULT_MAX; ++i)
+				eval_result[i] = -1;
+			for (i=0; i < max_threads; ++i)
+				stopped_at_thread[i] = false;
+			this->mode = mode;
+			backtrace_variables.Clear();
+			runtimes_in_runtimesreply = 0;
+			property_name.Set(UNI_L(""));
+		}
+
+		virtual OP_STATUS RuntimeStarted(unsigned dbg_runtime_id, const ES_DebugRuntimeInformation* runtimeinfo)
+		{
+			output_dbg("In RuntimeStarted\n");
+			last_dbg_runtime_id = dbg_runtime_id;
+			return OpStatus::OK;
+		}
+
+		virtual OP_STATUS RuntimeStopped(unsigned dbg_runtime_id, const ES_DebugRuntimeInformation* runtimeinfo)
+		{
+			output_dbg("In RuntimeStopped\n");
+			return OpStatus::OK;
+		}
+
+		virtual OP_STATUS RuntimesReply(unsigned tag, OpVector<ES_DebugRuntimeInformation>& runtimes)
+		{
+			output_dbg("In RuntimesReply\n");
+			runtimes_in_runtimesreply = runtimes.GetCount();
+			return OpStatus::OK;
+		}
+		virtual OP_STATUS NewScript(unsigned dbg_runtime_id, ES_DebugScriptData *data, const ES_DebugRuntimeInformation *runtimeinfo = NULL)
+		{
+			output_dbg("In NewScript\n");
+			if (data->source) {
+				output_dbg(data->source);
+				op_free(last_script_source);
+				last_script_source = uni_strdup(data->source);
+			} else {
+				output_dbg("No source\n");
+				op_free(last_script_source);
+				last_script_source = 0;
+			}
+			calls_to_newscript++;
+			return OpStatus::OK;
+		}
+		virtual OP_STATUS ParseError(unsigned dbg_runtime_id, ES_ErrorInfo *err)
+		{
+			parse_errors++;
+			last_error_line = err->error_position.GetRelativeLine();
+			return OpStatus::OK;
+		}
+		virtual OP_STATUS ThreadStarted(unsigned dbg_runtime_id, unsigned dbg_thread_id, unsigned dbg_parent_thread_id, ThreadType type, const uni_char *namespace_uri, const uni_char *event_type, const ES_DebugRuntimeInformation *runtimeinfo = NULL)
+		{
+			output_dbg("In ThreadStarted\n");
+			if (dbg_thread_id == 0)
+			{
+				threads_are_valid = FALSE;
+				//OP_ASSERT(!"Invalid thread ID, cannot be 0");
+				return OpStatus::ERR;
+			}
+			if (build_tree)
+			{
+				//OP_ASSERT(root != NULL);
+				if (root->find(dbg_thread_id) != NULL) // Thread is already started, error
+				{
+					tree_is_valid = FALSE;
+					//OP_ASSERT(!"duplicate thread");
+					return OpStatus::ERR;
+				}
+				ThreadNode *parent = root->find(dbg_parent_thread_id);
+				if (parent == NULL) // Thread parent is not yet started or has already finished
+				{
+					tree_is_valid = FALSE;
+					//OP_ASSERT(!"invalid parent");
+					return OpStatus::ERR;
+				}
+				//OP_ASSERT(parent != NULL);
+				ThreadNode *node = OP_NEW(ThreadNode, (dbg_thread_id, dbg_parent_thread_id));
+				parent->addChild(node);
+			}
+			if (type == THREAD_TYPE_EVENT)
+			{
+				uni_strncpy(last_event_name, event_type, max_event_name_len);
+				last_event_name[max_event_name_len] = 0;
+			}
+			calls_to_thread_started++;
+			last_dbg_thread_id = dbg_thread_id;
+			return OpStatus::OK;
+		}
+
+		virtual OP_STATUS ThreadMigrated(unsigned dbg_thread_id, unsigned dbg_from_runtime_id, unsigned dbg_to_runtime_id)
+		{
+			return OpStatus::OK;
+		}
+
+		virtual OP_STATUS ThreadFinished(unsigned dbg_runtime_id, unsigned dbg_thread_id, ThreadStatus status, ES_DebugReturnValue *dbg_return_value)
+		{
+			output_dbg("In ThreadFinished\n");
+			OP_DELETE(dbg_return_value);
+			if (dbg_thread_id == 0)
+			{
+				threads_are_valid = FALSE;
+				//OP_ASSERT(!"Invalid thread ID, cannot be 0");
+				return OpStatus::ERR;
+			}
+			if (build_tree)
+			{
+				//OP_ASSERT(root != NULL);
+				ThreadNode *node = root->find(dbg_thread_id);
+				if (node == NULL) // thread is not currently running
+				{
+					tree_is_valid = FALSE;
+					//OP_ASSERT(!"Invalid thread ID, thread not running");
+					return OpStatus::ERR;
+				}
+				if (node->hasChildren()) // A finished thread most not have any children running
+				{
+					tree_is_valid = FALSE;
+					//OP_ASSERT(!"Finished thread still has active children");
+					return OpStatus::ERR;
+				}
+				OP_DELETE(node);
+			}
+			return OpStatus::OK;
+		}
+		virtual OP_STATUS StoppedAt(unsigned dbg_runtime_id, unsigned dbg_thread_id, const ES_DebugStoppedAtData &data)
+		{
+			output_dbg("In StoppedAt\n");
+			if (dbg_thread_id == 0)
+			{
+				threads_are_valid = FALSE;
+				//OP_ASSERT(!"Invalid thread ID, cannot be 0");
+				return OpStatus::ERR;
+			}
+			if (build_tree)
+			{
+				//OP_ASSERT(root != NULL);
+				if (root->find(dbg_thread_id) == NULL) // the stopped thread is not currently running
+				{
+					tree_is_valid = FALSE;
+					//OP_ASSERT(!"Invalid thread ID, thread not running.");
+					return OpStatus::ERR;
+				}
+			}
+			calls_to_stopped_at++;
+			OP_ASSERT(dbg_thread_id < max_threads);
+			if (dbg_thread_id < max_threads) stopped_at_thread[dbg_thread_id] = true;
+			if (mode == MODE_STEPINTO) {
+				if (current_script_id == 0) current_script_id = data.position.scriptid;
+				if (current_script_id != data.position.scriptid) calls_to_stopped_at--; // don't count other scripts than the current
+			}
+			g_main_message_handler->PostMessage(MSG_ES_DBG_SELFTEST_COMMAND, dbg_runtime_id, dbg_thread_id);
+
+			return OpStatus::OK;
+		}
+
+		virtual void HandleCallback(OpMessage msg, MH_PARAM_1 par1, MH_PARAM_2 par2)
+		{
+			OP_ASSERT(msg == MSG_ES_DBG_SELFTEST_COMMAND);
+			unsigned dbg_runtime_id = par1;
+			unsigned dbg_thread_id = par2;
+			if (mode == MODE_BACKTRACE) {
+
+				unsigned length = 0;
+				ES_DebugStackFrame *stack = NULL;
+
+				Backtrace(dbg_runtime_id, dbg_thread_id, 15, length, stack);
+
+				{
+					calls_to_backtrace_reply++;
+					last_backtrace_depth = length;
+
+					calls_to_js_recurse = 0;
+					for (int framenum = 0; framenum < last_backtrace_depth; ++framenum) {
+						if (stack[framenum].function.id &&
+							stack[framenum].function.info->flags.packed.is_function &&
+							uni_strcmp(stack[framenum].function.info->function_name, UNI_L("recurse")) == 0)
+						{
+							calls_to_js_recurse++;
+						}
+						backtrace_variables.Add(stack[framenum].variables);
+					}
+				}
+
+				OP_DELETEA(stack);
+
+			}
+			else if (mode == MODE_EVAL) {
+				const uni_char* script = UNI_L("7*7-7");
+				Eval(EVAL_RESULT_ZERO, dbg_runtime_id, dbg_thread_id, 0, script, uni_strlen(script), 0, 0);
+
+
+				ES_DebugVariable* var = OP_NEW(ES_DebugVariable, ());
+				var->name = UNI_L("seven");
+				var->value.type = VALUE_NUMBER;
+				var->value.value.number = 7;
+
+				script = UNI_L("seven");
+
+				Eval(EVAL_RESULT_ONE, dbg_runtime_id, dbg_thread_id, 0, script, uni_strlen(script), var, 1);
+				OP_DELETE(var);
+			} else if (mode == MODE_EVAL_WINDOW_FRAME_1) {
+				const uni_char* script = UNI_L("window");
+				Eval(EVAL_RESULT_OBJECT, dbg_runtime_id, dbg_thread_id, 1, script, uni_strlen(script), 0, 0);
+			}
+
+			ES_DebugFrontend::Mode step_mode = (mode == MODE_STEPINTO) ? STEPINTO : RUN;
+
+			Continue(dbg_runtime_id, step_mode);
+		}
+
+		virtual OP_STATUS EvalReply(unsigned tag, EvalStatus status, const ES_DebugValue &result)
+		{
+			if (status == EVAL_STATUS_CANCELLED)
+				return OpStatus::OK;
+
+			output_dbg("In EvalReply\n");
+			OP_ASSERT(tag < EVAL_RESULT_MAX);
+			OP_ASSERT(status == EVAL_STATUS_FINISHED);
+
+			switch(tag)
+			{
+			case EVAL_RESULT_ZERO:
+			case EVAL_RESULT_ONE:
+				OP_ASSERT(result.type == VALUE_NUMBER);
+				eval_result[tag] = static_cast<int>(result.value.number);
+				break;
+			case EVAL_RESULT_OBJECT:
+				if(result.type == VALUE_OBJECT)
+				{
+					object_history.AddObject(result.value.object.id);
+					ST_passed();
+				}
+				else
+					ST_failed("The result of eval was not an object");
+				break;
+			default:
+				return OpStatus::ERR;
+			}
+			return OpStatus::OK;
+		}
+
+		OP_STATUS ExamineObjects(unsigned count, unsigned *object_ids)
+		{
+			if(count == 0)
+				return OpStatus::ERR;
+
+			examine_history.Clear();
+
+			OP_STATUS status = Examine(last_dbg_runtime_id, count, object_ids, TRUE, FALSE, NULL, examine_history.chains, 0);
+
+			return status;
+		}
+
+
+		ES_DebugObjectInfo* copyprotochain(ES_DebugObjectInfo* s)
+		{
+			ES_DebugObjectInfo* dest = OP_NEW(ES_DebugObjectInfo, ());
+			if(dest)
+			{
+				dest->flags = s->flags;
+				dest->flags.packed.delete_class_name = 1;
+				dest->flags.packed.delete_function_name = 1;
+				dest->class_name = op_strdup(s->class_name);
+				if(s->function_name)
+					dest->function_name = uni_strdup(s->function_name);
+				dest->prototype.id = s->prototype.id;
+				if(s->prototype.info)
+					dest->prototype.info = copyprotochain(s->prototype.info);
+			}
+			return dest;
+		}
+
+		OP_STATUS ExamineObjectsReply(unsigned int,unsigned int object_count, ES_DebugObjectChain *result)
+		{
+			examine_history.chains = result;
+			examine_history.count = object_count;
+
+			if(property_name.HasContent())
+			{
+				BOOL found_property = FALSE;
+
+				// Find property name
+				for(unsigned i = 0; i<examine_history.chains->prop.properties_count; ++i)
+				{
+					ES_DebugObjectProperties::Property *p = examine_history.chains->prop.properties + i;
+
+					if(uni_strcmp(p->name, property_name.CStr()) == 0)
+					{
+						found_property = TRUE;
+						break;
+					}
+				}
+
+				if(found_property && examine_history.chains->prototype && examine_history.chains->prototype->prop.object.info)
+				{
+					if(op_strcmp(examine_history.chains->prototype->prop.object.info->class_name, "Object") == 0)
+						ST_passed();
+					else
+						ST_failed("did not find property of correct type");
+				}
+				else
+					ST_failed("did not find property");
+			}
+			else
+				ST_passed();
+
+			//only check once
+			property_name.Empty();
+
+			// take a copy of the proto-chain since result is owned by ES_EngineDebugBackendGetPropertyListener
+			if(!examine_history.protochain)
+			{
+				examine_history.protochain = OP_NEW(ES_DebugObjectChain, ());
+				examine_history.protochain->prop.object.info = copyprotochain(examine_history.chains->prop.object.info);
+				examine_history.it = examine_history.protochain->prop.object.info;
+			}
+			return OpStatus::OK;
+		}
+
+		OP_STATUS EvalObject(const uni_char *script)
+		{
+			return Eval(EVAL_RESULT_OBJECT, last_dbg_runtime_id, 0, 0, script, uni_strlen(script), NULL, 0);
+		}
+
+	} *dumb_debugger;
+
+	int pref_browser_js;
+	int pref_user_js;
+}
+
+setup
+{
+	dumb_debugger = OP_NEW(DumbDebugger, ());
+
+#ifdef PREFS_WRITE
+	// Get the initial values for these prefs.
+# ifdef DOM_BROWSERJS_SUPPORT
+	RETURN_IF_LEAVE(pref_browser_js = g_pcjs->GetIntegerPref(PrefsCollectionJS::BrowserJSSetting));
+# endif
+	RETURN_IF_LEAVE(pref_user_js = g_pcjs->GetIntegerPref(PrefsCollectionJS::UserJSEnabled));
+
+	// Disable.
+# ifdef DOM_BROWSERJS_SUPPORT
+	RETURN_IF_LEAVE(OpStatus::Ignore(g_pcjs->WriteIntegerL(PrefsCollectionJS::BrowserJSSetting, 0)));
+# endif
+	RETURN_IF_LEAVE(OpStatus::Ignore(g_pcjs->WriteIntegerL(PrefsCollectionJS::UserJSEnabled, 0)));
+#endif
+}
+
+exit
+{
+	OP_DELETE(dumb_debugger);
+	dumb_debugger = NULL;
+
+#ifdef PREFS_WRITE
+	// Restore initial values.
+# ifdef DOM_BROWSERJS_SUPPORT
+	OpStatus::Ignore(g_pcjs->WriteIntegerL(PrefsCollectionJS::BrowserJSSetting, pref_browser_js));
+# endif
+	OpStatus::Ignore(g_pcjs->WriteIntegerL(PrefsCollectionJS::UserJSEnabled, pref_user_js));
+#endif
+}
+
+html
+{
+	"<html>"
+		"<head>"
+		"<title>DEBUGGER WINDOW - DEBUG ME!</title>" // Debug only this window
+		"</head>"
+		"<body>"
+		"</body>"
+	"</html>"
+}
+
+test("Setup window filtering")
+{
+	Window* selftest_window = 0;
+	for ( Window* w = g_windowManager->FirstWindow() ; w != NULL ; w = w->Suc() )
+	{
+		if (w->GetWindowTitle() && uni_strcmp(w->GetWindowTitle(), UNI_L("DEBUGGER WINDOW - DEBUG ME!")) == 0)
+		{
+			verify(selftest_window == 0);
+			selftest_window = w;
+		}
+	}
+	verify(selftest_window != 0);
+	dumb_debugger->accepter.SetSelftestWindow(selftest_window);
+}
+
+table StopTypesTable(StopType, char*, BOOL)
+{
+	{ STOP_TYPE_SCRIPT, "script", TRUE }
+	{ STOP_TYPE_EXCEPTION, "exception", FALSE }
+	{ STOP_TYPE_ERROR, "error", FALSE }
+	{ STOP_TYPE_ABORT, "abort", FALSE }
+	//{ STOP_TYPE_DEBUGGER_STATEMENT, "debugger_statement", TRUE } // Not implemented yet
+}
+
+foreach (stop_type, name, default_value) from StopTypesTable
+{
+	test("Default value for stopping at " name)
+	{
+		BOOL value(FALSE);
+		verify(OpStatus::IsSuccess(dumb_debugger->GetStopAt(stop_type, value)));
+		verify(value == default_value);
+	}
+}
+
+foreach (stop_type, name, default_value) from StopTypesTable
+{
+	test("Changing value for stopping at " name)
+	{
+		BOOL value(default_value);
+		verify(OpStatus::IsSuccess(dumb_debugger->SetStopAt(stop_type, !default_value)));
+		verify(OpStatus::IsSuccess(dumb_debugger->GetStopAt(stop_type, value)));
+		verify(value != default_value);
+
+		verify(OpStatus::IsSuccess(dumb_debugger->SetStopAt(stop_type, FALSE)));
+		verify(OpStatus::IsSuccess(dumb_debugger->GetStopAt(stop_type, value)));
+		verify(!value);
+	}
+}
+
+test("Notification of new scripts (before loading)")
+{
+	verify(dumb_debugger->calls_to_newscript == 0);
+}
+
+html
+{
+	"<html>"
+		"<head>"
+		"</head>"
+		"<body>"
+			"<script>var foo = 'bar';</script>"
+		"</body>"
+	"</html>"
+}
+
+test("Notification of new scripts (after loading)")
+{
+	verify(dumb_debugger->calls_to_newscript == 1);
+
+	verify(dumb_debugger->last_script_source != 0);
+	verify(uni_strcmp(dumb_debugger->last_script_source, UNI_L("var foo = 'bar';")) == 0);
+}
+
+test("Breakpoints before breaking")
+{
+	verify(dumb_debugger->calls_to_stopped_at == 0);
+	verify(OpStatus::IsSuccess(dumb_debugger->SetStopAt(STOP_TYPE_SCRIPT, TRUE)));
+}
+
+html { "<html><head><script>0</script></head><body></body></html>" }
+
+test("Breaking on new script")
+	require success "Breakpoints before breaking";
+{
+	verify(dumb_debugger->calls_to_stopped_at > 0);
+	verify(OpStatus::IsSuccess(dumb_debugger->SetStopAt(STOP_TYPE_SCRIPT, FALSE)));
+	dumb_debugger->calls_to_stopped_at = 0;
+}
+
+html { "<html><head><script>0</script></head><body></body></html>" }
+
+test("Disabling stop at script should have immediate effect")
+	require success "Breaking on new script";
+{
+	verify(dumb_debugger->calls_to_stopped_at == 0);
+}
+
+html { "<html><head></head><body><script>debugger;</script></body></html>" }
+
+test("Breaking on debugger statement")
+	require success "Disabling stop at script should have immediate effect";
+{
+	verify(dumb_debugger->calls_to_stopped_at == 1);
+}
+finally
+{
+	dumb_debugger->reset();
+}
+
+html { "<html><head></head><body><script>var a = function() { debugger; }; a();</script></body></html>" }
+
+test("Breaking on debugger statement in function (bug 276678)")
+	require success "Breaking on debugger statement";
+{
+	verify(dumb_debugger->calls_to_stopped_at == 1);
+}
+finally
+{
+	dumb_debugger->reset(DumbDebugger::MODE_BACKTRACE);
+}
+
+html
+{
+	"<html>"
+		"<head>"
+		"</head>"
+		"<body>"
+		"<script>function recurse(depth){ if(depth<=1) debugger; else recurse(depth-1); }; recurse(10);</script>"
+		"</body>"
+	"</html>"
+}
+
+test("Callstack")
+	require success "Breaking on debugger statement in function (bug 276678)";
+{
+	verify(dumb_debugger->calls_to_stopped_at == 1);
+	verify(dumb_debugger->calls_to_backtrace_reply == 1);
+	verify(dumb_debugger->last_backtrace_depth >= 10);
+	verify(dumb_debugger->calls_to_js_recurse == 10);
+}
+finally
+{
+	dumb_debugger->reset(DumbDebugger::MODE_EVAL);
+}
+
+test("Adding breakpoint on event")
+	require success "Disabling stop at script should have immediate effect";
+{
+	dumb_debugger->calls_to_stopped_at = 0;
+	ES_DebugBreakpointData data;
+	data.type = ES_DebugBreakpointData::TYPE_EVENT;
+	data.data.event.event_type = UNI_L("load");
+	data.data.event.namespace_uri = NULL;
+	data.window_id = dumb_debugger->accepter.GetSelftestWindow()->Id();
+	verify(OpStatus::IsSuccess(dumb_debugger->AddBreakpoint(7, data)));
+}
+
+html
+{
+	"<html>"
+		"<head>"
+		"</head>"
+		"<script>"
+		"function big_whoop() { return 5; }"
+		"function treasure() { return big_whoop(); }"
+		"</script>"
+		"<body onload=\"var one = treasure();\">"
+		"</body>"
+	"</html>"
+}
+
+test("Breaking on event (bug 274977)")
+	delay pre 1; // Required to ensure the "load" event is triggered
+	require success "Adding breakpoint on event";
+{
+	verify(OpStatus::IsSuccess(dumb_debugger->RemoveBreakpoint(7)));
+	verify(dumb_debugger->calls_to_stopped_at == 1);
+}
+finally
+{
+	if (dumb_debugger->HasBreakpoint(7))
+		dumb_debugger->RemoveBreakpoint(7);
+	dumb_debugger->reset(DumbDebugger::MODE_EVAL);
+}
+
+
+html
+{
+	"<html>"
+		"<head>"
+		"</head>"
+		"<body>"
+		"<script>debugger;</script>"
+		"</body>"
+	"</html>"
+}
+
+test("Eval")
+	require success "Breaking on event (bug 274977)";
+{
+	verify(dumb_debugger->eval_result[0] == 42);
+	verify(dumb_debugger->eval_result[1] == 7);
+}
+finally
+{
+	dumb_debugger->reset();
+}
+
+html
+{
+	"<html>"
+		"<head>"
+		"</head>"
+		"<body onload=\"var one=1;\">"
+		"</body>"
+	"</html>"
+}
+
+test("Reporting event name (bug 274978)")
+	delay pre 1;
+	require success "Breaking on debugger statement";
+{
+	verify(uni_strcmp(dumb_debugger->last_event_name, UNI_L("load")) == 0);
+}
+finally
+{
+	dumb_debugger->reset(DumbDebugger::MODE_STEPINTO);
+}
+
+html
+{
+	"<html>"
+		"<head>"
+		"</head>"
+		"<body>"
+		"<script>"
+			"function a() { var foo=1; };\n"
+			"debugger;\n"
+			"a();\n"
+		"</script>"
+		"</body>"
+	"</html>"
+}
+
+test("Stepping into functions (bug 278547)")
+	require success "Breaking on debugger statement";
+{
+	// Should stop like this (line containing <script> is line 1): 3,4,2,2.
+	verify(dumb_debugger->calls_to_stopped_at == 4);
+}
+finally
+{
+	dumb_debugger->reset();
+}
+
+html
+{
+	"<html>"
+		"<head>"
+		"</head>"
+		"<body>"
+		"<script>"
+			"var foo=1;"
+		"</script>"
+		"</body>"
+	"</html>"
+}
+
+test("Stepping out of the script should not affect the next script")
+	require success "Stepping into functions (bug 278547)";
+{
+	verify(dumb_debugger->calls_to_stopped_at == 0);
+}
+finally
+{
+	dumb_debugger->reset(DumbDebugger::MODE_BACKTRACE);
+}
+
+html
+{
+	"<html>"
+		"<head>"
+		"</head>"
+		"<body>"
+		"<script>"
+			"var a =function()\n"
+			"{\n"
+			"var t = 'hallo';\n"
+			"debugger;\n"
+			"}\n"
+			"var b =function()\n"
+			"{\n"
+			"var t = 'nice';\n"
+			"a();\n"
+			"}\n"
+			"var c =function()\n"
+			"{\n"
+			"var t = 'here';\n"
+			"b();\n"
+			"}\n"
+			"c();\n"
+		"</script>"
+		"</body>"
+	"</html>"
+}
+
+test("Variable object is correct (bug 279651)")
+	require success "Breaking on debugger statement in function (bug 276678)";
+{
+	verify(dumb_debugger->calls_to_backtrace_reply == 1);
+	verify(dumb_debugger->last_backtrace_depth == 4);
+	verify(dumb_debugger->backtrace_variables.GetCount() == 4);
+	dumb_debugger->backtrace_variables.Sort();                  // This function sorts AND REMOVES DUPLICATES, so
+	verify(dumb_debugger->backtrace_variables.GetCount() == 4); // this one triggers if not all 'variables' objects in the list were unique
+}
+finally
+{
+	dumb_debugger->reset();
+}
+
+html
+{
+	"<html>"
+		"<head>"
+		"</head>"
+		"<body>"
+		"<script>"
+			"var foo=1;"
+		"</script>"
+		"</body>"
+	"</html>"
+}
+
+test("Step into should not leak to non-child threads")
+	require success "Stepping into functions (bug 278547)";
+{
+	verify(dumb_debugger->calls_to_stopped_at == 0);
+}
+finally
+{
+	dumb_debugger->reset(DumbDebugger::MODE_STEPINTO);
+}
+
+html
+{
+	"<html>"
+		"<head>"
+		"</head>"
+		"<body>"
+		"<script>"
+			"debugger;\n"
+			"var a = document.createExpression(\n"
+			"	\"a:b\",\n"
+			"	{\n"
+			"		lookupNamespaceURI:\n"
+			"		function (prefix) {\n"
+			"			return \"uri\";\n"
+			"		}\n"
+			"	}\n"
+			"	)\n"
+		"</script>"
+		"</body>"
+	"</html>"
+}
+
+test("Step into must affect child threads")
+	require success "Step into should not leak to non-child threads";
+{
+	int unique_ids = 0;
+	for (unsigned i=0; i < DumbDebugger::max_threads; ++i)
+		if (dumb_debugger->stopped_at_thread[i]) unique_ids++;
+	verify(unique_ids == 2); // Main script and call to lookupNameSpaceURI
+}
+finally
+{
+	dumb_debugger->reset();
+}
+
+html
+{
+	"<html>"
+	"<head>"
+	"<title></title>"
+	"<script language=\"javascript\">"
+	"var count = 0;"
+	"var instance;"
+	""
+	"function interval()"
+	"{"
+	"	count += 1;"
+	"	if (count >= 15)"
+	"		clearInterval(instance);"
+	"}"
+	""
+	"onload = function()"
+	"{"
+	"	instance = setInterval(interval, 1);"
+	"}"
+	"</script>"
+	"</head>"
+	"<body>"
+	"</body>"
+	"</html>"
+}
+
+test("Thread-started every iteration of SetInterval (bug 309808)")
+	delay pre 1;
+{
+	verify(dumb_debugger->calls_to_thread_started >= 15);
+}
+finally
+{
+	dumb_debugger->reset();
+}
+
+html
+{
+	"<html>"
+	"<body>"
+	"<div id='content'></div>"
+	"<script language='javascript'>"
+	"var a = 1;"
+	"document.getElementById('content').innerHTML='Main thread<br>';"
+	""
+	"</script>"
+	"<script language='javascript'>"
+	"var ele=document.documentElement.appendChild(document.createElementNS('http://www.w3.org/1999/xhtml','script'));"
+	"ele.onload = function(){this.parentNode.innerHTML+='Sub thread<br/>'; this.parentNode.removeChild(this);};"
+	"ele.src='javascript:var b = 2;document.getElementById(\"content\").innerHTML+=\"Injected thread<br>\";';"
+	"</script>"
+	"</body>"
+	"</html>"
+}
+test("Thread parent/child relationship must stay intact (bug 326901)")
+	delay pre 1;
+{
+	verify(dumb_debugger->tree_is_valid);
+	verify(dumb_debugger->threads_are_valid);
+}
+finally
+{
+	dumb_debugger->reset();
+}
+
+
+html
+{
+"<html>"
+"<body>"
+"<div id='content'>div stuff</div>"
+"<script language='javascript'>"
+"var cnt = 1;"
+"var interval;"
+"function foo()"
+"{"
+"  document.getElementById('content').innerHTML='thread ' + cnt + '<br>';"
+"  cnt++;"
+"  if (cnt > 5)"
+"	  window.clearInterval(interval);"
+"}"
+"interval = window.setInterval('foo()', 50);"
+"</script>"
+"</body>"
+"</html>"
+}
+test("Thread parent/child relationship must stay intact with intervals (bug 326901)")
+	delay pre 1;
+{
+	verify(dumb_debugger->tree_is_valid);
+	verify(dumb_debugger->threads_are_valid);
+}
+finally
+{
+	dumb_debugger->reset();
+}
+
+
+html
+{
+"<html>"
+"<body>"
+"<div id='content'>div stuff</div>"
+"<script language='javascript'>"
+"var cnt = 1;"
+"var interval;"
+"function foo()"
+"{"
+"  document.getElementById('content').innerHTML='thread ' + cnt + '<br>';"
+"  cnt++;"
+	"var ele=document.documentElement.appendChild(document.createElementNS('http://www.w3.org/1999/xhtml','script'));"
+	"ele.onload = function(){this.parentNode.innerHTML+='Sub thread<br/>'; this.parentNode.removeChild(this);};"
+	"ele.src='javascript:var b = 2;document.getElementById(\"content\").innerHTML+=\"Injected thread<br>\";';"
+"  if (cnt > 5)"
+"	  window.clearInterval(interval);"
+"}"
+"interval = window.setInterval('foo()', 50);"
+"</script>"
+"</body>"
+"</html>"
+}
+test("Thread parent/child relationship must stay intact with intervals2 (bug 326901)")
+	delay pre 1;
+{
+	verify(dumb_debugger->tree_is_valid);
+	verify(dumb_debugger->threads_are_valid);
+}
+finally
+{
+	dumb_debugger->reset();
+}
+
+html
+{
+//! <html><head><title>Shockwave Flash and JavaScript evals</title></head>
+//! <body>
+//! <h1>Shockwave Flash and JavaScript evals</h1>
+//! <div class="content">
+//!   <p>This test starts the Flash plugin which in turn will trigger internal javascript evalutations.
+//!      These evals should not be sent to the debugger and the parent/child relationship must stay intact.</p>
+//!   <p>
+//!     <embed src="data:application/x-shockwave-flash;base64,Q1dTBpwAAAB4nCtg4F/AwGDEwMDDyODM9P////0M6gwMDIwMBYz+ExpEDDcwMpw5c4ZRBCjGIGh6vrsn8ofj78u2cvyNXzYcYGhjY2MEqmWw5+EHyjMxsDCyxRcn5hWDOfWcKkCamaH8N4/z/w1SO3gVmBj2MM00Nv7PAAEaDLmVIakVJQydbGxMQIViPTwNDkBxAAauI0oNCg==" quality="high" width="159" height="91" type="application/x-shockwave-flash" pluginspage="http://www.macromedia.com/go/getflashplayer"></embed>
+//!   </p>
+//! </div>
+//! </body>
+//! </html>
+}
+test("Thread parent/child relationship must stay intact with plugins (bug 326901)")
+	require success "Thread parent/child relationship must stay intact with intervals2 (bug 326901)";
+	delay pre 1;
+{
+	verify(dumb_debugger->tree_is_valid);
+	verify(dumb_debugger->threads_are_valid);
+}
+finally
+{
+	dumb_debugger->reset();
+}
+
+html
+{
+	"<html>"
+	"<head>"
+	"<title></title>"
+	"<script language=\"javascript\">"
+	"eval('var a = 1;\\na = a + 1;\\ndebugger;');"
+	"</script>"
+	"</head>"
+	"<body>"
+	"</body>"
+	"</html>"
+}
+
+test("Debuggig eval (bug 327856)")
+	delay pre 1;
+{
+	verify(dumb_debugger->last_script_source);
+	verify(uni_strcmp(dumb_debugger->last_script_source, UNI_L("var a = 1;\na = a + 1;\ndebugger;")) == 0);
+	verify(dumb_debugger->calls_to_stopped_at == 1);
+}
+finally
+{
+	dumb_debugger->reset();
+}
+
+html { "<html><head><script>0</script></head><body></body></html>" }
+
+test("Get runtimes")
+{
+	OpUINTPTRVector runtimes;
+	verify(OpStatus::IsSuccess(dumb_debugger->Runtimes(999, runtimes, FALSE)));
+	verify(dumb_debugger->runtimes_in_runtimesreply == 1);
+	verify(OpStatus::IsSuccess(dumb_debugger->Runtimes(999, runtimes, TRUE)));
+	verify(dumb_debugger->runtimes_in_runtimesreply == 1);
+}
+finally { dumb_debugger->reset(); }
+
+html { "<html><head><script>0</script></head><body>"
+		"<p><iframe src=\"data:text/html,%3C!doctype%20html%3E%3Cscript%3Ea%3D1%3C%2Fscript%3E%3Ch1%3Eiframe%201%3C%2Fh1%3E%0D%0A%0D%0A\"></iframe>"
+		"</body></html>" }
+
+test("Get runtimes inside frames (bug 362541)")
+{
+	OpUINTPTRVector runtimes;
+	verify(OpStatus::IsSuccess(dumb_debugger->Runtimes(999, runtimes, FALSE)));
+	verify(dumb_debugger->runtimes_in_runtimesreply == 2);
+	verify(OpStatus::IsSuccess(dumb_debugger->Runtimes(999, runtimes, TRUE)));
+	verify(dumb_debugger->runtimes_in_runtimesreply == 2);
+}
+finally { dumb_debugger->reset(); }
+
+html { "<html><head><script>function () { foo(); </script></head>"
+	   "<body><p>foo</p></body></html>" }
+
+test("Scripts with parser errors must be reported (CORE-16384)")
+{
+	verify(dumb_debugger->parse_errors == 1);
+	verify(dumb_debugger->last_error_line == 1);
+}
+finally { dumb_debugger->reset(DumbDebugger::MODE_EVAL_WINDOW_FRAME_1); }
+
+html
+{
+	"<html>"
+			"<head>"
+			"</head>"
+			"<body>"
+			"<script>"
+					"var foo = function(){ debugger; }\n"
+					"foo.apply(this);"
+			"</script>"
+			"</body>"
+	"</html>"
+}
+
+test("Eval in lexical rib (CORE-21502)")
+	require success "Breaking on debugger statement";
+	delay pre 1;
+{
+	verify(dumb_debugger->calls_to_stopped_at == 1); // Make sure the test ran
+	// The only test is that Opera has not crashed
+}
+finally
+{
+	dumb_debugger->reset();
+}
+
+html
+{
+	"<html>"
+		"<head><title>introducing the foo object</title></head>"
+		"<body>"
+			"<script>foo = { color: \"red\" }</script>"
+		"</body>"
+	"</html>"
+}
+
+test("Eval global foo")
+	async;
+{
+	if( OpStatus::IsError( dumb_debugger->EvalObject(UNI_L("foo") ) ) )
+		ST_failed("Eval failed");
+}
+
+test("Examine simple object")
+	require success "Eval global foo";
+	async;
+{
+	if(dumb_debugger->object_history.size == 0)
+		ST_failed("No objects");
+
+	OP_STATUS setstat = dumb_debugger->property_name.Set(UNI_L("color"));
+	OP_STATUS examinestat = dumb_debugger->ExamineObjects(1, dumb_debugger->object_history.objects);
+	if(OpStatus::IsError(setstat) || OpStatus::IsError(examinestat))
+		ST_failed("ExamineObjects failed");
+}
+finally
+{
+	dumb_debugger->object_history.Clear();
+}
+
+test("Eval <html>")
+	async;
+{
+	if(OpStatus::IsError(dumb_debugger->EvalObject(UNI_L("document.getElementsByTagName('html')[0]"))))
+		ST_failed("Eval failed");
+	else
+		ST_passed();
+}
+
+test("Examine <html>")
+	require success "Eval <html>";
+	async;
+{
+	dumb_debugger->examine_history.Clear();
+	OP_STATUS status = dumb_debugger->ExamineObjects(1, dumb_debugger->object_history.objects);
+	if(OpStatus::IsError(status))
+		ST_failed("Eval failed");
+	else
+		ST_passed();
+}
+finally
+{
+	dumb_debugger->object_history.Clear();
+}
+
+table HtmlProto(const char *)
+{
+	{"HTMLHtmlElement"}
+	{"HTMLHtmlElementPrototype"}
+	{"HTMLElementPrototype"}
+	{"ElementPrototype"}
+	{"NodePrototype"}
+	{"Object"}
+}
+
+foreach (html_proto) from HtmlProto
+{
+	test("Check <html> prototype " html_proto)
+		require success "Examine <html>";
+	{
+		verify(dumb_debugger->examine_history.it);
+
+		const char *classname = dumb_debugger->examine_history.it->class_name;
+		verify(op_strcmp(html_proto, classname) == 0);
+
+		dumb_debugger->examine_history.it = dumb_debugger->examine_history.it->prototype.info;
+	}
+}
+
+test("Eval document")
+	async;
+{
+	if(OpStatus::IsError(dumb_debugger->EvalObject(UNI_L("document"))))
+		ST_failed("Eval failed");
+}
+
+test("Examine document")
+	require success "Eval document";
+	async;
+{
+	dumb_debugger->examine_history.Clear();
+	OP_STATUS status = dumb_debugger->ExamineObjects(1, dumb_debugger->object_history.objects);
+	if(OpStatus::IsError(status))
+		ST_failed("ExamineObjects failed");
+	// success is reported in ExamineObjectsReply
+}
+finally
+{
+	dumb_debugger->object_history.Clear();
+}
+
+table DocumentProto(const char *)
+{
+	{"HTMLDocument"}
+	{"HTMLDocumentPrototype"}
+	{"DocumentPrototype"}
+	{"NodePrototype"}
+	{"Object"}
+}
+
+foreach (document_proto) from DocumentProto
+{
+	test("Check Document prototype " document_proto)
+		require success "Examine document";
+	{
+		verify(dumb_debugger->examine_history.protochain->prop.object.info);
+
+		const char *classname = dumb_debugger->examine_history.it->class_name;
+		verify(op_strcmp(document_proto, classname) == 0);
+
+		dumb_debugger->examine_history.it = dumb_debugger->examine_history.it->prototype.info;
+	}
+}

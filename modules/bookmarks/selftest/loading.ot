@@ -1,0 +1,103 @@
+/*-*- Mode: c++; tab-width: 4; indent-tabs-mode: t; c-basic-offset: 4; c-file-style:"stroustrup" -*-
+**
+** Copyright (C) 2000-2010 Opera Software ASA.  All rights reserved.
+**
+** This file is part of the Opera web browser.  It may not be distributed
+** under any circumstances.
+*/
+group "bookmarks.loading";
+require CORE_BOOKMARKS_SUPPORT;
+require CORE_SPEED_DIAL_SUPPORT;
+
+include "modules/bookmarks/bookmark_ini_storage.h";
+include "modules/bookmarks/bookmark_manager.h"; 
+include "modules/bookmarks/speeddial_manager.h";
+include "modules/bookmarks/bookmark_ini_storage.h";
+
+global
+{
+	class BookmarkTestListener : public BookmarkManagerListener
+	{
+	public:
+		virtual void OnBookmarksSaved(OP_STATUS ret, UINT32 operation_count) { }
+		virtual void OnBookmarksLoaded(OP_STATUS ret, UINT32 operation_count)
+			{
+				if (OpStatus::IsSuccess(ret))
+					ST_passed();
+				else
+					ST_failed("Could not load bookmarks.\n");
+			}
+#ifdef SUPPORT_DATA_SYNC
+		virtual void OnBookmarksSynced(OP_STATUS ret)
+			{
+			}
+#endif // SUPPORT_DATA_SYNC
+		virtual void OnBookmarkAdded(BookmarkItem *bookmark) { }
+		virtual void OnBookmarkDeleted(BookmarkItem *bookmark) { }
+		virtual void OnBookmarkChanged(BookmarkItem *bookmark) { }
+	};
+
+	BookmarkManager *manager = NULL;
+	BookmarkIniStorage *ini_storage = NULL;
+	SpeedDialManager *sd_manager = NULL;
+	BookmarkTestListener *listener = NULL;
+
+	// Cache the real global bookmark manager that we will replace
+	BookmarkManager *real_bm_manager = g_bookmark_manager;
+}
+
+test("Set up loading test")
+	file uni data_file "bookmarks_speeddial.ini";
+{
+	// Create a local bookmark manager
+	verify(manager = OP_NEW(BookmarkManager, ()));
+	verify_success(manager->Init());
+	manager->SetMaxBookmarkCount(32);
+	manager->SetSaveBookmarksTimeout(BookmarkManager::NO_AUTO_SAVE, 1000);
+
+	// Make it the global manager for this test
+	g_bookmark_manager = manager;
+
+	// Create a local speed dial manager
+	verify(sd_manager = OP_NEW(SpeedDialManager, ()));
+	verify_success(sd_manager->Init());
+
+	// Create test listener
+	verify(listener = OP_NEW(BookmarkTestListener, ()));
+	manager->RegisterBookmarkManagerListener(listener);
+
+	// Create INI storage handler
+	verify(ini_storage = OP_NEW(BookmarkIniStorage, (manager)));
+	verify_success(ini_storage->OpenLoad(data_file, OPFILE_ABSOLUTE_FOLDER));
+	verify_success(manager->SetStorageProvider(ini_storage));
+}
+
+test("BAOAN-36: Loading oversized speed dial folder")
+	require success "Set up loading test";
+	async;
+{
+	// Now load the file; test is a success if we do not crash here
+	if (!OpStatus::IsSuccess(manager->LoadBookmarks()))
+		ST_failed("Could not load bookmarks.\n");
+}
+
+exit
+{
+	// Prefer killing the speeddial manager before resetting the global
+	// bookmark manager.
+	OP_DELETE(sd_manager);
+
+	// Kill listener
+	if (manager)
+		manager->UnregisterBookmarkManagerListener(listener);
+	OP_DELETE(listener);
+
+	// Reset global bookmark manager
+	g_bookmark_manager = real_bm_manager;
+
+	// Kill bookmark manager and storage
+	if (manager)
+		manager->Destroy();
+	OP_DELETE(manager);
+	OP_DELETE(ini_storage);
+}

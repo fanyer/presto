@@ -1,0 +1,150 @@
+/* -*- Mode: c++; tab-width: 4; indent-tabs-mode: t; c-basic-offset: 4; -*-
+**
+** Copyright (C) 2002-2008 Opera Software AS.  All rights reserved.
+**
+** This file is part of the Opera web browser.  It may not be distributed
+** under any circumstances.
+*/
+
+group "windowcommander.OpTransferManager";
+
+require initialization;
+require WINDOW_COMMANDER_TRANSFER;
+
+include "modules/windowcommander/OpTransferManager.h";
+
+global
+{
+	class TransferManagerListener : public OpTransferManagerListener
+	{
+	public:
+		virtual BOOL OnTransferItemAdded(OpTransferItem* transferItem, BOOL is_populating=FALSE, double last_speed=0) { return TRUE; }
+		virtual void OnTransferItemRemoved(OpTransferItem* transferItem) { }
+		virtual void OnTransferItemStopped(OpTransferItem* transferItem) { }
+		virtual void OnTransferItemResumed(OpTransferItem* transferItem) { }
+		virtual BOOL OnTransferItemCanDeleteFiles(OpTransferItem* transferItem) { return TRUE; }
+		virtual void OnTransferItemDeleteFiles(OpTransferItem* transferItem) { }
+	};
+
+	class TransferListener : public OpTransferListener
+	{
+	public:
+		virtual void OnProgress(OpTransferItem* transferItem, TransferStatus status)
+		{
+			switch (status)
+			{
+			case TRANSFER_FAILED:
+				ST_failed("TransferListener::OnProgress() status = TRANSFER_FAILED");
+				break;
+
+			case TRANSFER_DONE:
+				ST_passed();
+				break;
+			}
+		}
+
+		virtual void OnReset(OpTransferItem* transferItem) { }
+		virtual void OnRedirect(OpTransferItem* transferItem, URL* redirect_from, URL* redirect_to) { }
+	};
+
+	TransferManagerListener transfer_manager_listener;
+	TransferListener transfer_listener;
+
+	OpTransferItem* transfer_item;
+}
+
+setup
+{
+	transfer_item = 0;
+}
+
+exit
+{
+	if (transfer_item)
+		g_transferManager->ReleaseTransferItem(transfer_item);
+}
+
+test("check initial state")
+{
+	verify(g_transferManager->GetTransferItemCount() == 0);
+	verify(!g_transferManager->GetTransferItem(0));
+}
+
+test("set OpTransferManagerListener")
+	require success "check initial state";
+{
+	verify(OpStatus::IsSuccess(g_transferManager->AddTransferManagerListener(&transfer_manager_listener)));
+}
+
+test("create transfer item")
+	require success "set OpTransferManagerListener";
+{
+	OpString filename;
+
+	verify(OpStatus::IsSuccess(g_folder_manager->GetFolderPath(OPFILE_SELFTEST_DATA_FOLDER, filename)));
+	verify(OpStatus::IsSuccess(filename.AppendFormat(UNI_L("modules%cwindowcommander%cselftest%cdump%cdownloaded-file"), PATHSEPCHAR, PATHSEPCHAR, PATHSEPCHAR, PATHSEPCHAR)));
+
+	verify(OpStatus::IsSuccess(g_transferManager->GetTransferItem(&transfer_item, UNI_L("http://www.opera.com/"))));
+	verify(g_transferManager->GetTransferItemCount() == 1);
+	verify(g_transferManager->GetTransferItem(0) == transfer_item);
+
+	verify(OpStatus::IsSuccess(transfer_item->SetFileName(filename.CStr())));
+	transfer_item->SetAction(OpTransferItem::ACTION_SAVE);
+	verify(transfer_item->GetAction() == OpTransferItem::ACTION_SAVE);
+
+	transfer_item->Stop();
+	verify(!transfer_item->GetIsRunning());
+	verify(transfer_item->GetShowTransfer());
+}
+
+test("create transfer item with escaped url")
+	require success "set OpTransferManagerListener";
+{
+	OpTransferItem* my_transfer_item = 0;
+	OpTransferItem* my_transfer_item2 = 0;
+
+	OpString filename;
+	verify(OpStatus::IsSuccess(g_folder_manager->GetFolderPath(OPFILE_SELFTEST_DATA_FOLDER, filename)));
+	verify(OpStatus::IsSuccess(filename.AppendFormat(UNI_L("modules%cwindowcommander%cselftest%cdump%cdownloaded-file-2"), PATHSEPCHAR, PATHSEPCHAR, PATHSEPCHAR, PATHSEPCHAR)));
+
+	BOOL already_created = FALSE;
+	verify(OpStatus::IsError(g_transferManager->GetTransferItem(&my_transfer_item, 0)));
+
+	int count_items = g_transferManager->GetTransferItemCount();
+	verify(OpStatus::IsSuccess(g_transferManager->GetTransferItem(&my_transfer_item, UNI_L("http://127.0.0.1/some url with spaces to escape"), &already_created)));
+	verify(!already_created);
+	verify(g_transferManager->GetTransferItemCount() == count_items+1);
+	verify(g_transferManager->GetTransferItem(count_items) == my_transfer_item);
+
+	// Test that calling GetTransferItem again with the same url
+	// (escaped and not escaped) returns the same transfer item
+	verify(OpStatus::IsSuccess(g_transferManager->GetTransferItem(&my_transfer_item2, UNI_L("http://127.0.0.1/some url with spaces to escape"), &already_created)));
+	verify(already_created);
+	verify(my_transfer_item2 == my_transfer_item);
+
+	verify(OpStatus::IsSuccess(g_transferManager->GetTransferItem(&my_transfer_item2, UNI_L("http://127.0.0.1/some%20url%20with%20spaces%20to%20escape"), &already_created)));
+	verify(already_created);
+	verify(my_transfer_item2 == my_transfer_item);
+}
+finally
+{
+	if (my_transfer_item2 && my_transfer_item2 != my_transfer_item)
+		g_transferManager->ReleaseTransferItem(my_transfer_item2);
+	if (my_transfer_item)
+		g_transferManager->ReleaseTransferItem(my_transfer_item);
+}
+
+test("transfer file")
+	require success "create transfer item";
+	async;
+{
+	transfer_item->SetTransferListener(&transfer_listener);
+	transfer_item->Clear();
+	transfer_item->Continue();
+}
+
+test("unset OpTransferManagerListener")
+	require success "transfer file";
+{
+	verify(OpStatus::IsSuccess(g_transferManager->RemoveTransferManagerListener(&transfer_manager_listener)));
+}

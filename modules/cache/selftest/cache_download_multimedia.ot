@@ -1,0 +1,1248 @@
+/* -*- Mode: c++; tab-width: 4; indent-tabs-mode: t; c-basic-offset: 4 -*-
+** Test of the Multimedia cache in a real context: download (from Unite) using URL
+**
+** Copyright (C) 2004-2010 Opera Software ASA.  All rights reserved.
+**
+** This file is part of the Opera web browser.  It may not be distributed
+** under any circumstances.
+**
+** Luca Venturi
+*/
+
+group "cache download multimedia";
+require init;
+require DISK_CACHE_SUPPORT;
+require WEBSERVER_SUPPORT;
+require MULTIMEDIA_CACHE_SUPPORT;
+include "modules/cache/cache_selftest.h";
+include "modules/cache/cache_st_helpers.h";
+include "modules/cache/cache_ctxman_multimedia.h";
+include "modules/prefs/prefsmanager/collections/pc_network.h";
+
+#include "cache_html.oth";
+
+global
+{
+	#define SEG1_START 32768
+	#define SEG1_END (32768+16383)
+	
+	#define SEG2_START 16000
+	#define MIME_JS "text/javascript"
+	
+	// Actions to perform
+	enum TestAction {
+		/// Execute a partial download
+		PartialDownload,
+		/// Execute a full download
+		FullDownload,
+		/// Execute a partial download and then stop immediately
+		StopLoading,
+		/// Check of the size (len is the size)
+		FileSize,
+		/// Compare the cache of an URL with a file
+		Compare,
+		/// Verify the number of byte transfered with Unite (start is the minimum, len is the maximum)
+		Transfer
+	};
+
+	OpFileDescriptor *GetCacheFileDescriptor(URL &url)
+	{
+		OP_STATUS ops;
+
+		if(url.GetRep() && url.GetRep()->GetDataStorage() && url.GetRep()->GetDataStorage()->GetCacheStorage())
+		  return ((File_Storage *)(url.GetRep()->GetDataStorage()->GetCacheStorage()))->AccessReadOnly(ops);
+
+		return NULL;
+	}
+		
+	MultiContext *mctx;
+	
+	// Semi-Managed contexts 
+	URL_CONTEXT_ID ctx;			// Context used to write on the cache
+	URL_CONTEXT_ID ctx_read;	// Context used to read from the cache
+	URL_CONTEXT_ID ctx_close;	// Context used to test the closing of Opera
+	URL_CONTEXT_ID ctx_reload;	// Context used to test the reload
+	URL_CONTEXT_ID ctx_reload2;	// Context used to test the reload
+	URL_CONTEXT_ID ctx_reload3;	// Context used to test the reload
+	
+	// Managed folders
+	OpFileFolder multimedia_folder;
+	OpFileFolder multimedia_folder_close;
+	OpFileFolder multimedia_folder_reload;
+	
+	URL binary_url;
+	URL binary_url2;
+	URL binary_url3;
+	URL binary_url_cache;
+	URL binary_url3_cache;
+	URL reload_url;
+	URL reload_url2;
+	URL reload_url3;
+	URL reload_url4;
+	URL text_url;
+	URL close_url;
+	URL external_url;
+	URL external_url2;
+	URL test_url_unite_16;
+	URL test_url_unite_16_seek;
+	URL test_url_unite_64;
+	URL test_url_unite_256;
+	URL test_url_unite_256_2;
+	URL test_url_external;
+	URL test_url_server_16;
+	URL test_url_server_64;
+	URL test_url_server_16_2;
+	URL test_url_server_64_2;
+	URL test_url_server_image;
+	URL test_url_server_image_2;
+	URL test_url_server_image_3;
+	CS_MessageHandler *mh;
+	OpFileLength binary_size=0;
+	OpFileLength text_size=0;
+	OpFile file16_unite;
+	OpFile file64_unite;
+	OpFile file256_unite;
+	OpFileDescriptor *fd_image;
+	UniteCacheTester uct;
+	MMCacheTest *mmct1;
+	MMCacheTest *mmct2;
+	MMCacheTest *mmct3;
+	OP_STATUS op_err_g;
+	UINT32 reload_total_transfer=(UINT32)-1;
+	UINT32 reload_partial_transfer=(UINT32)-1;
+	WaitSingleURL *wait;
+}
+
+setup
+{
+	mctx=OP_NEW(MultiContext, (TRUE));
+	uct.SetWindow(state.GetWindow());
+	mh=OP_NEW(CS_MessageHandler, ());
+	wait=uct.CreateDefaultMessageObject(FALSE);
+	if(wait)
+		wait->SetNumberOfLoading(-1);
+	mh->SetDefaultMessageObject(wait);
+	mmct1=NULL;
+	mmct2=NULL;
+	mmct3=NULL;
+}
+
+exit
+{
+	OP_DELETE(mh);
+	OP_DELETE(mmct1);
+	OP_DELETE(mmct2);
+	OP_DELETE(mmct3);
+	OP_DELETE(mctx);
+	OP_DELETE(wait);
+}
+
+/**
+  Check the status after the load.
+  @param rep URL Rep to check
+  @param media_size expected size of the file
+  @param expected_transfer if (UINT32)-1, no check performed, else it will be checked that GetNewBytesTransferred() has the same value of expected_transfer
+*/
+subtest FullLoadCheck(URL_Rep *rep, OpFileLength media_size, UINT32 expected_total_transfer, BOOL follow_redir)
+{
+	if(follow_redir)
+	{
+		URL url_redir=rep->GetAttribute(URL::KMovedToURL);
+		
+		if(!url_redir.IsEmpty())
+			return FullLoadCheck(url_redir.GetRep(), media_size, expected_total_transfer, follow_redir);
+	}
+	MMCacheTest mmct(rep);
+	
+	verify(mmct.GetUnsortedCount()==1);
+	verify(mmct.GetSortedCount()==1);
+	if(OpStatus::IsError(mmct.CheckSortedSegment(0, 0, media_size)))
+		return 0;  // reduce error pollution
+		
+	if(OpStatus::IsError(mmct.CheckUnsortedSegment(0, 0, media_size)))
+		return 0; // reduce error pollution
+		
+	mmct.CheckPartialCoverage(0, TRUE, TRUE, media_size);
+	verify(media_size == CacheTester::GetPartialCoverage(rep, follow_redir));
+	
+	if((UINT32)-1!=expected_total_transfer)
+	{
+		UINT32 trnf=uct.GetFullBytesTrasferred();
+		
+		if(trnf!=expected_total_transfer)
+			output("Bytes transferred: %d instead of %d!", trnf, expected_total_transfer);
+		verify(trnf == expected_total_transfer);
+	}
+	
+	// Just check that the retransmission control is working properly
+	//verify(uct.GetNewBytesTransferred() == 0);
+}
+
+test ("Capability check")
+{
+#ifdef CACHE_URL_RANGE_INTEGRATION
+	output("Cache-URL integration ENABLED");
+#else
+	output("Cache-URL integration DISBLED");
+#endif
+}
+
+test("Start WebServer if required") async;
+{
+	uct.StartWebServer();
+}
+
+test("Check WebServer and create the service")
+require success "Start WebServer if required";
+async;
+{
+	uct.StartService(UNI_L("mmcache_selftest"), UNI_L("webserver/mmcache_selftest_service/"));
+}
+
+test("Create contexts")
+{
+	ctx=urlManager->GetNewContextID();
+	ctx_read=urlManager->GetNewContextID();
+	ctx_close=urlManager->GetNewContextID();
+	ctx_reload=urlManager->GetNewContextID();
+	ctx_reload2=urlManager->GetNewContextID();
+	ctx_reload3=urlManager->GetNewContextID();
+
+	verify_success(CacheFileTest::CreateEmptyCacheDir(UNI_L("multimedia"), multimedia_folder));
+	verify_success(CacheFileTest::CreateEmptyCacheDir(UNI_L("multimedia_close"), multimedia_folder_close));
+	verify_success(CacheFileTest::CreateEmptyCacheDir(UNI_L("multimedia_reload"), multimedia_folder_reload));
+ 
+	Context_Manager_Multimedia::CreateManager(ctx, multimedia_folder, multimedia_folder, FALSE, PrefsCollectionNetwork::DiskCacheSize);
+	Context_Manager_Multimedia::CreateManager(ctx_close, multimedia_folder_close, multimedia_folder_close, FALSE, PrefsCollectionNetwork::DiskCacheSize);
+	Context_Manager_Multimedia::CreateManager(ctx_reload, multimedia_folder_reload, multimedia_folder_reload, FALSE, PrefsCollectionNetwork::DiskCacheSize);
+	
+	verify_success(mctx->AddContext(urlManager->FindContextManager(ctx)));
+	verify_success(mctx->AddContext(urlManager->FindContextManager(ctx_close)));
+	verify_success(mctx->AddContext(urlManager->FindContextManager(ctx_reload)));
+}
+
+test("Share the binary file")
+file uni path_binary "BinaryTest.fil";
+file uni path_text "TextTest.txt";
+require success "Check WebServer and create the service";
+{
+	verify(OpStatus::IsSuccess(uct.Share(path_binary, "binary", &binary_size, binary_url, ctx)));
+	verify(OpStatus::IsSuccess(uct.Share(path_binary, "binary2", NULL, binary_url2, ctx)));
+	verify(OpStatus::IsSuccess(uct.Share(path_binary, "binary3", NULL, binary_url3, ctx)));
+	verify(OpStatus::IsSuccess(uct.Share(path_text, "text", &text_size, text_url, ctx)));
+	verify(OpStatus::IsSuccess(uct.Share(path_text, "text_close", &text_size, close_url, ctx_close)));
+}
+
+test("Share 16KB file with Unite")
+require success "Check WebServer and create the service";
+file uni path_16 "16kb.fil";
+{
+	OpFileLength size_16;
+	
+	verify(OpStatus::IsSuccess(uct.Share(path_16, "16kb.bin", &size_16, test_url_unite_16, ctx)));
+	verify(size_16==16384);
+	verify(OpStatus::IsSuccess(uct.Share(path_16, "16kb_seek.bin", &size_16, test_url_unite_16_seek, ctx)));
+	
+	verify(size_16==16384);
+	verify_success(file16_unite.Construct(path_16));
+	verify_success(file16_unite.Open(OPFILE_READ));
+}
+
+test("Share 64KB file with Unite")
+file uni path_64 "64kb.fil";
+require success "Check WebServer and create the service";
+{
+	OpFileLength size_64;
+	
+	verify(OpStatus::IsSuccess(uct.Share(path_64, "64kb.bin", &size_64, test_url_unite_64, ctx)));
+	
+	verify(size_64==65536);
+	verify_success(file64_unite.Construct(path_64));
+	verify_success(file64_unite.Open(OPFILE_READ));
+}
+
+test("Share 256KB file with Unite")
+require success "Check WebServer and create the service";
+file uni path_256 "256kb.fil";
+{
+	OpFileLength size_256;
+	
+	verify(OpStatus::IsSuccess(uct.Share(path_256, "256kb.bin", &size_256, test_url_unite_256, ctx)));
+	
+	verify(size_256==65536*4);
+	verify_success(file256_unite.Construct(path_256));
+	verify_success(file256_unite.Open(OPFILE_READ));
+	
+	verify(OpStatus::IsSuccess(uct.Share(path_256, "256kb_2.bin", &size_256, test_url_unite_256_2, ctx)));
+	verify(size_256==65536*4);
+}
+
+test("Seek to 0 - Second half download")
+async;
+{
+	MMCacheTest::PartialDownload(test_url_unite_16_seek, 8192, 16384, mh, &file16_unite);
+}
+
+/// If there are problem with the seek to 0, it will fail
+test("Seek to 0 - First half download")
+async;
+{
+	MMCacheTest::PartialDownload(test_url_unite_16_seek, 0, 8192, mh, &file16_unite);
+}
+
+/////////////////////////////// Basic tests
+// Check if closing Opera delete the files...
+test("Close")
+require success "Check WebServer and create the service";
+{
+	// Populate the context
+	CacheHelpers::CacheBogusURLs(ctx_close, 100, 256*1024, 32, 5*1024*1024, NULL, 0, FALSE, FALSE);
+	
+	// Count the files
+	TRAPD(rc, urlManager->WriteCacheIndexesL(FALSE, FALSE));
+	int start=CacheHelpers::CheckDirectory(multimedia_folder_close);
+	
+	// Remove the context: it should not delete the files
+	urlManager->RemoveContext(ctx_close, FALSE);
+	mctx->ForgetContext(ctx_close, TRUE, TRUE);
+	
+	// Verify
+	int end=CacheHelpers::CheckDirectory(multimedia_folder_close);
+	
+	output("Files: %d ==> %d ", start, end);
+	verify(start==end);
+}
+
+// Check a file small enough to fit on a container (but it should not!) and to not fill the buffer of DataStream
+test("Complete text download with Multimedia attribute")
+async;
+require success "Check WebServer and create the service";
+{
+	OpString url_path;
+	OpString8 url_path8;
+
+	url_path.AppendFormat(UNI_L("http://localhost:%d/mmcache_selftest/text"), g_webserver->GetLocalListeningPort());
+	url_path8.Set(url_path.CStr());
+	
+	output("Downloading %s\n", url_path8.CStr());
+	
+	text_url=g_url_api->GetURL(url_path.CStr(), ctx);
+	
+	MMCacheTest::FullDownload(text_url, mh);
+}
+
+test("Check URL::KMultimediaCacheSize")
+{
+	BOOL streaming, ram, embedded_storage;
+
+	verify(text_url.GetRep() && text_url.GetRep()->GetDataStorage() && text_url.GetRep()->GetDataStorage()->GetCacheStorage());
+
+	text_url.GetRep()->GetDataStorage()->GetCacheStorage()->GetCacheInfo(streaming, ram, embedded_storage);
+
+	if(streaming)
+	{
+		OpFileLength size;
+	
+		text_url.GetAttribute(URL::KMultimediaCacheSize, &size);
+	
+		int pref_size = g_pcnet->GetIntegerPref(PrefsCollectionNetwork::MultimediaStreamSize);
+
+		verify(size == 1024 * OpFileLength(pref_size));
+	}
+}
+
+// Check a file small enough to fit on a container (but it should not!) and to not fill the buffer of DataStream
+test("Complete 16 KB external text download with Multimedia attribute")
+async;
+require success "Check WebServer and create the service";
+{
+	external_url=CacheTester::GetURLTestServerSize(ctx, 16384, "16-1", MIME_JS);
+	
+	MMCacheTest::FullDownload(external_url, mh);
+}
+
+test("Complete binary download with Multimedia attribute")
+async;
+require success "Check WebServer and create the service";
+{
+	binary_url=uct.GetURL("binary", ctx);
+	MMCacheTest::FullDownload(binary_url, mh);
+}
+
+test("Partial download - 1: one segment of 16383 bytes")
+async;
+require URL_ENABLE_HTTP_RANGE_SPEC;
+require success "Check WebServer and create the service";
+{
+	binary_url2=uct.GetURL("binary2", ctx);
+	MMCacheTest::PartialDownload(binary_url2, SEG1_START, SEG1_END, mh);
+}
+
+test("Partial download - 2: 3 segments - part A - 1 KB")
+require URL_ENABLE_HTTP_RANGE_SPEC;
+async;
+require success "Check WebServer and create the service";
+{
+	binary_url3=uct.GetURL("binary3", ctx);
+	MMCacheTest::PartialDownload(binary_url3, SEG2_START+1000, SEG2_START+1999, mh);
+}
+
+test("Check GetNextMissingCoverage()")
+require URL_ENABLE_HTTP_RANGE_SPEC;
+{
+	OpFileLength start;
+	OpFileLength len;
+	
+	verify_success(binary_url3.GetNextMissingCoverage(start, len));
+	verify(start==0);
+	verify(len==SEG2_START+1000);
+}
+
+test("Partial download - 2: 3 segments - part B - 3 KB")
+require URL_ENABLE_HTTP_RANGE_SPEC;
+async;
+require success "Check WebServer and create the service";
+{
+	MMCacheTest::PartialDownload(binary_url3, SEG2_START+10000, SEG2_START+12999, mh);
+}
+
+test("Partial download - 2: 3 segments - part C - 1 KB")
+require URL_ENABLE_HTTP_RANGE_SPEC;
+async;
+require success "Check WebServer and create the service";
+{
+	MMCacheTest::PartialDownload(binary_url3, SEG2_START, SEG2_START+999, mh);
+}
+
+test("Check GetNextMissingCoverage()")
+require URL_ENABLE_HTTP_RANGE_SPEC;
+{
+	OpFileLength start;
+	OpFileLength len;
+	
+	verify_success(binary_url3.GetNextMissingCoverage(start, len));
+	verify(start==0);
+	verify(len==SEG2_START);
+}
+
+
+test("Check if cache text file is fine")
+file uni path_text "TextTest.txt";
+require success "Check WebServer and create the service";
+{
+	OpFileLength size=0;
+	
+	CacheFileTest::VerifyFileSign(text_url, "OMCF", size, FALSE);
+	verify(OpStatus::IsSuccess(CacheFileTest::VerifyFileContent(text_url, path_text)));
+	verify(size>text_size+16);
+}
+
+test("Check if cache binary file is fine")
+file uni path_binary "BinaryTest.fil";
+require success "Check WebServer and create the service";
+{
+	OpFileLength size=0;
+	
+	CacheFileTest::VerifyFileSign(binary_url, "OMCF", size, FALSE);
+	verify(OpStatus::IsSuccess(CacheFileTest::VerifyFileContent(binary_url, path_binary)));
+	verify(size>binary_size+16);
+}
+
+test("Check segment - 1")
+require success "Check WebServer and create the service";
+{
+	mmct1=OP_NEW(MMCacheTest, (binary_url.GetRep()));
+	
+	verify(mmct1);
+	verify(mmct1->GetUnsortedCount()==1);
+	verify(mmct1->GetSortedCount()==1);
+	verify_success(mmct1->CheckSortedSegment(0, 0, binary_size));
+	verify_success(mmct1->CheckUnsortedSegment(0, 0, binary_size));
+}
+
+test("Check if cache binary file 2 is fine")
+file uni path_binary "BinaryTest.fil";
+require success "Check WebServer and create the service";
+{
+	OpFileLength size=0;
+	
+	CacheFileTest::VerifyFileSign(binary_url2, "OMCF", size, FALSE);
+	verify(OpStatus::IsSuccess(CacheFileTest::VerifyFileContent(binary_url2, path_binary)));
+	verify(size>SEG1_END-SEG1_START+16);
+}
+
+test("Check segment - 2")
+require success "Check WebServer and create the service";
+{
+	mmct2=OP_NEW(MMCacheTest, (binary_url2.GetRep()));
+	
+	verify(mmct2);
+	verify(mmct2->GetUnsortedCount()==1);
+	verify(mmct2->GetSortedCount()==1);
+	verify_success(mmct2->CheckSortedSegment(0, SEG1_START, SEG1_END-SEG1_START+1));
+	verify_success(mmct2->CheckUnsortedSegment(0, SEG1_START, SEG1_END-SEG1_START+1));
+}
+
+test("Check if cache binary file 3 is fine")
+file uni path_binary "BinaryTest.fil";
+require success "Check WebServer and create the service";
+{
+	OpFileLength size=0;
+	
+	CacheFileTest::VerifyFileSign(binary_url3, "OMCF", size, FALSE);
+	verify(OpStatus::IsSuccess(CacheFileTest::VerifyFileContent(binary_url3, path_binary)));
+	verify(size>5000+16);
+}
+
+test("Check segments - 3")
+require success "Check WebServer and create the service";
+{
+	mmct3=OP_NEW(MMCacheTest, (binary_url3.GetRep()));
+	
+	verify(mmct3);
+	verify(mmct3->GetUnsortedCount()==3);
+	verify(mmct3->GetSortedCount()==2);
+	
+	verify_success(mmct3->CheckUnsortedSegment(0, SEG2_START+1000, 1000));
+	verify_success(mmct3->CheckUnsortedSegment(1, SEG2_START+10000, 3000));
+	verify_success(mmct3->CheckUnsortedSegment(2, SEG2_START, 1000));
+	
+	verify_success(mmct3->CheckSortedSegment(0, SEG2_START, 2000));
+	verify_success(mmct3->CheckSortedSegment(1, SEG2_START+10000, 3000));
+}
+
+// Manual check, to verify that Multimedia_Storage::GetSortedCoverage() can recycle StorageSegment elements
+test("Check segments - 3 - manual")
+require success "Check WebServer and create the service";
+{
+	OpAutoVector<StorageSegment> segs;
+	Multimedia_Storage *ms=(Multimedia_Storage *) (binary_url3.GetRep()->GetDataStorage() ? binary_url3.GetRep()->GetDataStorage()->GetCacheStorage() : NULL);
+
+	verify(ms);
+	
+	ms->GetUnsortedCoverage(segs, 0, FILE_LENGTH_MAX);
+	
+	// Unsorted check
+	verify(segs.GetCount()==3);
+	verify(segs.Get(0)->content_start==SEG2_START+1000);
+	verify(segs.Get(0)->content_length==1000);
+	verify(segs.Get(1)->content_start==SEG2_START+10000);
+	verify(segs.Get(1)->content_length==3000);
+	verify(segs.Get(2)->content_start==SEG2_START);
+	verify(segs.Get(2)->content_length==1000);
+	
+	// Sorted recycle
+	ms->GetSortedCoverage(segs, 0, FILE_LENGTH_MAX, FALSE);
+	
+	verify(segs.GetCount()==3);
+	verify(segs.Get(0)->content_start==SEG2_START);
+	verify(segs.Get(0)->content_length==1000);
+	verify(segs.Get(1)->content_start==SEG2_START+1000);
+	verify(segs.Get(1)->content_length==1000);
+	verify(segs.Get(2)->content_start==SEG2_START+10000);
+	verify(segs.Get(2)->content_length==3000);
+	
+	// Sorted recycle (with merge) and delete of 1 segment
+	ms->GetSortedCoverage(segs, 0, FILE_LENGTH_MAX, TRUE);
+	
+	verify(segs.GetCount()==2);
+	verify(segs.Get(0)->content_start==SEG2_START);
+	verify(segs.Get(0)->content_length==2000);
+	verify(segs.Get(1)->content_start==SEG2_START+10000);
+	verify(segs.Get(1)->content_length==3000);
+	
+	// Sorted recycle (with merge) and delete of more than 1 segment
+	verify_success(segs.Add(OP_NEW(StorageSegment, ())));
+	verify_success(segs.Add(OP_NEW(StorageSegment, ())));
+	verify_success(segs.Add(OP_NEW(StorageSegment, ())));
+	verify(segs.GetCount()==5);
+	
+	ms->GetSortedCoverage(segs, 0, FILE_LENGTH_MAX, TRUE);
+	
+	verify(segs.GetCount()==2);
+	verify(segs.Get(0)->content_start==SEG2_START);
+	verify(segs.Get(0)->content_length==2000);
+	verify(segs.Get(1)->content_start==SEG2_START+10000);
+	verify(segs.Get(1)->content_length==3000);
+	
+	// Check that the array can grow
+	ms->GetSortedCoverage(segs, 0, FILE_LENGTH_MAX, FALSE);
+	
+	verify(segs.GetCount()==3);
+	verify(segs.Get(0)->content_start==SEG2_START);
+	verify(segs.Get(0)->content_length==1000);
+	verify(segs.Get(1)->content_start==SEG2_START+1000);
+	verify(segs.Get(1)->content_length==1000);
+	verify(segs.Get(2)->content_start==SEG2_START+10000);
+	verify(segs.Get(2)->content_length==3000);
+
+	// Check that NULLs are tolerated
+	OP_DELETE(segs.Get(1));
+	segs.Replace(1, NULL);
+	ms->GetSortedCoverage(segs, 0, FILE_LENGTH_MAX, FALSE);
+	
+	verify(segs.GetCount()==3);
+	verify(segs.Get(0)->content_start==SEG2_START);
+	verify(segs.Get(0)->content_length==1000);
+	verify(segs.Get(1)->content_start==SEG2_START+1000);
+	verify(segs.Get(1)->content_length==1000);
+	verify(segs.Get(2)->content_start==SEG2_START+10000);
+	verify(segs.Get(2)->content_length==3000);
+}
+
+
+
+//////////////////////////////// Downloads with URL - also check external webservers
+/// Test with a different HTTP server
+test("Ask to the Opera test server - 16 KB")
+{
+	test_url_server_16=CacheTester::GetURLTestServerSize(ctx, 16384, "16-2", MIME_JS);
+	test_url_server_16_2=CacheTester::GetURLTestServerSize(ctx, 16384, "16-3", MIME_JS);;
+}
+
+/// Test with a different HTTP server
+test("Ask to the Opera test server - 64 KB")
+{
+	test_url_server_64=CacheTester::GetURLTestServerSize(ctx, 65536, "64-4", MIME_JS);
+	test_url_server_64_2=CacheTester::GetURLTestServerSize(ctx, 65536, "64-5", MIME_JS);
+	
+	test_url_server_image=CacheTester::GetURLTestServerSize(ctx, 65536, "64-6", MIME_JS);
+	test_url_server_image_2=CacheTester::GetURLTestServerSize(ctx, 65536, "64-7", MIME_JS);
+	test_url_server_image_3=CacheTester::GetURLTestServerSize(ctx, 65536, "64-8", MIME_JS);
+	
+	// FIXME: the test_url_server_image* URLs were supposed to be tested against an image. However, because of a mistake,
+	// they have been tested against the previous page. Attempting to test with the image, create several errors not so
+	// easy to solve. It would be nice to solve these problems in the future.
+	// As a temporary solution, the URLs have been explicitely set to wrong URLs, as they work...
+	
+	/*OpString url_path;
+	
+	url_path.Set(UNI_L("http://testsuites.oslo.opera.com/core/graphimages/png/ibench/Images/gradient.png?a=1"));
+	test_url_server_image=g_url_api->GetURL(url_path.CStr(), ctx);
+	
+	url_path.Set(UNI_L("http://testsuites.oslo.opera.com/core/graphimages/png/ibench/Images/gradient.png?a=2"));
+	test_url_server_image_2=g_url_api->GetURL(url_path.CStr(), ctx);
+	
+	url_path.Set(UNI_L("http://testsuites.oslo.opera.com/core/graphimages/png/ibench/Images/gradient.png?a=3"));
+	test_url_server_image_3=g_url_api->GetURL(url_path.CStr(), ctx);*/
+}
+
+table TableRanges(TestAction, OpFileLength, OpFileLength, char*, URL, OpFileDescriptor *, BOOL, BOOL)
+{
+  	// "Normal" 16KB download, with a segment out of order and some double requests
+  	{ PartialDownload, 0, 1024, "Unite 16 - 0", test_url_unite_16, ((OpFileDescriptor *)&file16_unite), FALSE, FALSE },
+  	{ PartialDownload, 1024, 1024, "Unite 16 - 1", test_url_unite_16, ((OpFileDescriptor *)&file16_unite), FALSE, FALSE },
+  	{ PartialDownload, 2048, 1024, "Unite 16 - 2", test_url_unite_16, ((OpFileDescriptor *)&file16_unite), FALSE, FALSE },
+  	{ PartialDownload, 3072, 1024, "Unite 16 - 3", test_url_unite_16, ((OpFileDescriptor *)&file16_unite), FALSE, FALSE },
+  	{ StopLoading, 8192, 4096, "Unite 16 - 4", test_url_unite_16, ((OpFileDescriptor *)&file16_unite), FALSE, FALSE }, // Segment should not be loaded, but I guess it could be timing dependent
+  	{ PartialDownload, 4096, 4096, "Unite 16 - back step", test_url_unite_16, ((OpFileDescriptor *)&file16_unite), FALSE, FALSE },
+  	{ PartialDownload, 1024, 1024, "Unite 16 - 1 bis", test_url_unite_16, ((OpFileDescriptor *)&file16_unite), TRUE, FALSE },
+  	{ PartialDownload, 2048, 1024, "Unite 16 - 2 bis", test_url_unite_16, ((OpFileDescriptor *)&file16_unite), TRUE, FALSE },
+  	{ PartialDownload, 12288, 4096, "Unite 16 - 5", test_url_unite_16, ((OpFileDescriptor *)&file16_unite), FALSE, FALSE },
+  	{ PartialDownload, 8192, 4096, "Unite 16 - 4", test_url_unite_16, ((OpFileDescriptor *)&file16_unite), FALSE, FALSE },  // Load the missing segment
+  	/// Check the size
+  	{ FileSize, 0, 16384, "Unite 16 - size", test_url_unite_16, ((OpFileDescriptor *)&file16_unite), FALSE, FALSE },
+  
+  	// 64 KB range download in one shot
+  	{ PartialDownload, 0, 65536, "Unite 64 - Full download with 1 range", test_url_unite_64, ((OpFileDescriptor *)&file64_unite), FALSE, FALSE },
+  	/// Check the size
+  	{ FileSize, 0, 65536, "Unite 64 - size", test_url_unite_64, ((OpFileDescriptor *)&file64_unite), FALSE, FALSE },
+  
+  	// 256 KB range download in one shot
+  	{ PartialDownload, 0, 65536*4, "Unite 256 - Range download with 1 range", test_url_unite_256, ((OpFileDescriptor *)&file256_unite), FALSE, FALSE },
+  	/// Check the size
+  	{ FileSize, 0, 65536*4, "Unite 256 - size", test_url_unite_256, ((OpFileDescriptor *)&file256_unite), FALSE, FALSE },
+  
+  	// 256 KB full download
+  	{ FullDownload, 0, 0, "Unite 256 - FULL download", test_url_unite_256_2, ((OpFileDescriptor *)&file256_unite), FALSE, FALSE },
+  	/// Check the size
+  	{ FileSize, 0, 65536*4, "Unite 256 FULL- size", test_url_unite_256_2, ((OpFileDescriptor *)&file256_unite), FALSE, FALSE },
+  	
+  	/// Compare partial and full
+  	{ Compare, 0, 0, "Compare Unite 256", test_url_unite_256, GetCacheFileDescriptor(test_url_unite_256_2), FALSE, FALSE };
+  	
+  	/// Partial 16 KB of an image (dynamic content is not range friendly...) from Opera
+  	{ PartialDownload, 1024, 1024, "External image 16 - 0", test_url_server_image_3, NULL, FALSE, FALSE },
+  	{ PartialDownload, 2048, 2048, "External image 16 - 1", test_url_server_image_3, NULL, TRUE, FALSE },
+  	{ PartialDownload, 4096, 4096, "External image 16 - 2", test_url_server_image_3, NULL, TRUE, FALSE },
+  	{ StopLoading, 8192, 8192, "External image 16 - stop", test_url_server_image_3, NULL, FALSE, FALSE }, // Segment should not be loaded, but I guess it could be timing dependent
+  	{ PartialDownload, 8192, 8192, "External image 16 - 3", test_url_server_image_3, NULL, TRUE, FALSE },
+  	{ PartialDownload, 0, 1024, "External image 16 - 4", test_url_server_image_3, NULL, FALSE, FALSE },
+  	/// Check the size
+  	{ FileSize, 0, 16384, "External image 16 - size", test_url_server_image_3, NULL, FALSE, TRUE },
+  	
+  	// Range double reading (forgiving)
+  	{ PartialDownload, 1024, 1024, "Unite 16 - 1 ter", test_url_unite_16, ((OpFileDescriptor *)&file16_unite), TRUE, FALSE },
+  	{ PartialDownload, 2048, 1024, "Unite 16 - 2 ter", test_url_unite_16, ((OpFileDescriptor *)&file16_unite), TRUE, FALSE },
+  	{ StopLoading, 2048, 1024, "Unite 16 - 2 quater", test_url_unite_16, ((OpFileDescriptor *)&file16_unite), TRUE, FALSE },
+  	{ PartialDownload, 2048, 1024, "Unite 16 - 2 quinquies", test_url_unite_16, ((OpFileDescriptor *)&file16_unite), TRUE, FALSE },
+  	
+  	// Range double reading (unforgiving)
+   	{ PartialDownload, 12288, 4096, "Unite 16 - 5", test_url_unite_16, ((OpFileDescriptor *)&file16_unite), FALSE, FALSE },
+   	{ Transfer, 0, 0, "Unite double - 1", test_url_unite_16, NULL, FALSE, TRUE },
+  
+	/// 64 KB range download in one shot from Opera 
+   	{ PartialDownload, 0, 65536, "External 64 - 0", test_url_server_64, NULL, FALSE, FALSE },
+   	/// Check the size
+   	{ FileSize, 0, 65536, "External 64 - size", test_url_server_64, NULL, FALSE, FALSE },
+   	
+   	/// 64 KB full download from Opera 
+   	{ FullDownload, 0, 0, "External 64 FULL - 0", test_url_server_64_2, NULL, FALSE, FALSE },
+   	/// Check the size
+   	{ FileSize, 0, 65536, "External 64 FULL - size", test_url_server_64_2, NULL, FALSE, FALSE },
+
+   	/// Compare partial and full, for Opera
+  	{ Compare, 0, 0, "Compare External 64", test_url_server_64, GetCacheFileDescriptor(test_url_server_64_2), FALSE, FALSE };
+  	
+  	/// Image full download from Opera 
+   	{ FullDownload, 0, 0, "External Image FULL - 0", test_url_server_image, NULL, FALSE, FALSE },
+   	
+   	/// Image range download in one shot from Opera 
+   	{ PartialDownload, 0, CacheTester::GetCacheFileLen(test_url_server_image), "External Image", test_url_server_image_2, NULL, FALSE, FALSE },
+   	/// Check the size
+   	{ FileSize, 0, CacheTester::GetCacheFileLen(test_url_server_image), "External image - size", test_url_server_image_2, NULL, FALSE, FALSE },
+   	
+   	/// Compare partial and full, for the external image
+   	{ Compare, 0, 0, "Compare External image", test_url_server_image, GetCacheFileDescriptor(test_url_server_image_2), FALSE, FALSE };
+}
+
+foreach (test_type, start, len, desc, test_url, file_desc, bypass, require_range_cache) from TableRanges
+{
+	test("Partial download test: " desc)
+	require URL_ENABLE_HTTP_RANGE_SPEC;
+	async;
+	require success "Check WebServer and create the service";
+	{
+		BOOL enabled=TRUE;
+		
+		if(require_range_cache)
+		{
+		#ifndef CACHE_URL_RANGE_INTEGRATION
+			enabled = FALSE;
+		#endif
+		}
+
+		if(enabled && !test_url.GetRep())
+			ST_failed("URL_Rep NULL");
+		else if(enabled)
+		{
+			OpFileDescriptor *fd_compare = file_desc;
+			
+			if(test_type==FileSize)
+			{
+				if(!test_url.GetRep() || !test_url.GetRep()->GetDataStorage() || !test_url.GetRep()->GetDataStorage()->GetCacheStorage())
+					ST_failed("URL storage NULL!");
+				else
+				{
+					BOOL available=FALSE;
+					OpFileLength length=0;
+					
+					test_url.GetRep()->GetDataStorage()->GetCacheStorage()->Flush();
+					
+					/// Check that the first segment is of the right length
+					test_url.GetPartialCoverage(0, available, length, TRUE);
+					if(!available)
+						ST_failed("Beginning not available: missing %d bytes", (int)length);
+					else if(length!=len)
+						ST_failed("Length wrong: %d vs %d", (int)length, (int)len);
+					else
+					{
+						// Check missing segments
+						OpFileLength miss_start;
+						OpFileLength miss_len;
+						
+						test_url.GetNextMissingCoverage(miss_start, miss_len);
+						
+						if(miss_len!=FILE_LENGTH_NONE)
+							ST_failed("Unexpected Missing segment! %d - %d ", (int)miss_start, (int)miss_len);
+						else
+						{
+							/// Check that there are not other segments
+							test_url.GetPartialCoverage(len+1, available, length, TRUE);
+							if(available || length)
+								ST_failed("Unexpected segment!");
+							else
+								ST_passed();
+						}
+					}
+				}
+			}
+			else if(test_type==PartialDownload || test_type==StopLoading)
+			{
+				CacheTester::BypassAsserts(test_url, bypass);
+				MMCacheTest::PartialDownload(test_url, start, (OpFileLength)(start + len - 1), mh, file_desc);
+		
+				if(test_type == StopLoading) // Stop immediately the loading
+				{
+					if(!test_url.GetRep()->GetDataStorage())
+						ST_failed("DataStorage NULL");
+					else if(!test_url.GetRep()->GetDataStorage()->GetCacheStorage())
+						ST_failed("CacheStorage NULL");
+					else if(test_url.GetRep()->GetDataStorage()->GetCacheStorage()->GetCacheType()!=URL_CACHE_DISK)
+						ST_failed("Wrong cache type");
+					else
+					{
+						test_url.StopLoading(NULL);
+						
+						// Check cache type invariance
+						if(test_url.GetRep()->GetDataStorage()->GetCacheStorage()->GetCacheType()!=URL_CACHE_DISK)
+							ST_failed("Wrong cache type 2");
+						else
+							ST_passed();
+					}
+				}
+			}
+			else if(test_type==FullDownload)
+			{
+				MMCacheTest::FullDownload(test_url, mh);
+			}
+			else if(test_type==Compare)
+			{
+				OpFileDescriptor *fd=GetCacheFileDescriptor(test_url);
+				OpFileLength len1=0;
+				OpFileLength len2=0;
+				
+				if(!fd || !fd_compare)
+					ST_failed("At least one missing File...");
+				else
+				{
+					fd->GetFileLength(len1);
+					fd_compare->GetFileLength(len2);
+				}
+					
+				if(len1!=len2)
+					ST_failed("File Length is different: %d vs %d", (int)len1, (int)len2);
+				else if(len1)
+				{
+					char buf1[1024];	// ARRAY OK 2010-05-19 lucav
+					char buf2[1024];	// ARRAY OK 2010-05-19 lucav
+					BOOL ok=TRUE;
+					
+					while(len1 && ok)
+					{
+						OpFileLength read1;
+						OpFileLength read2;
+						OP_STATUS ops1=fd->Read(buf1, 1024, &read1);
+						OP_STATUS ops2=fd_compare->Read(buf2, 1024, &read2);
+						
+						if(OpStatus::IsError(ops1) || OpStatus::IsError(ops2) || read1!=read2)
+						{
+							ST_failed("Read error after %d bytes", (int)(len2-len1));
+							
+							ok=FALSE;
+						}
+						
+						for(OpFileLength i=0; i<read1 && ok; i++)
+						{
+							if(buf1[i]!=buf2[i])
+							{
+								ST_failed("Read error after %d bytes: %d != %d", (int)(len2-len1+i), (int)buf1[i], (int)buf2[i]);
+								
+								ok=FALSE;
+							}
+						}
+						
+						len1-=1024;	
+					}
+					
+					if(ok)
+						ST_passed();
+				}
+				
+				OP_DELETE(fd);
+				OP_DELETE(fd_compare);
+			}
+			else if(test_type==Transfer)
+			{
+				int bytes=uct.GetLastTransfer();
+				
+				if(bytes>=(int)start && bytes<=(int)len)
+					ST_passed();
+				else
+					ST_failed("Bytes transfered: %d - expected range: %d-%d", (UINT32)bytes, (UINT32)start, (UINT32)len);
+			}
+		}
+		else
+		{
+			output("Range cache DISABLED!   ");
+			ST_passed();
+		}
+	}
+}
+
+//////////////////////////////// Reload tests
+test("Reload: creation")
+async;
+{
+	reload_url=uct.GetURL("binary", ctx_reload);
+	
+	if(CacheTester::GetPartialCoverage(reload_url.GetRep(), FALSE))
+		ST_failed("Partial coverage 1 not as expected: %d vs 0", CacheTester::GetPartialCoverage(reload_url.GetRep(), FALSE));
+	
+	reload_total_transfer=uct.GetFullBytesTrasferred();
+	MMCacheTest::FullDownload(reload_url, mh);
+}
+
+test("Reload: check")
+{
+	UINT32 new_transfer=uct.GetFullBytesTrasferred();
+	
+	reload_partial_transfer=new_transfer-reload_total_transfer;
+	output("Transfer: %d - size: %d", (int)reload_partial_transfer, (int)binary_size);
+	verify(reload_partial_transfer>binary_size && reload_partial_transfer<binary_size+1024);
+
+	verify(FullLoadCheck(reload_url.GetRep(), binary_size, new_transfer, FALSE));
+
+	reload_total_transfer=uct.GetFullBytesTrasferred();
+	
+	
+	/*MMCacheTest mmct(reload_url.GetRep());
+	
+	verify(mmct.GetUnsortedCount()==1);
+	verify(mmct.GetSortedCount()==1);
+	mmct.CheckSortedSegment(0, 0, binary_size);
+	mmct.CheckUnsortedSegment(0, 0, binary_size);
+	mmct.CheckPartialCoverage(0, TRUE, TRUE, binary_size);
+	verify(binary_size == CacheTester::GetPartialCoverage(reload_url.GetRep(), FALSE));
+	
+	reload_transfer=uct.GetNewBytesTransferred();
+	
+	// Just check that the retransmission control is working properly
+	verify(uct.GetNewBytesTransferred() == 0);*/
+}
+
+test("Reload: reload")
+async;
+{
+	MMCacheTest::FullDownloadUnconditional(reload_url, mh);
+}
+
+test("Reload: recheck")
+{
+	verify(FullLoadCheck(reload_url.GetRep(), binary_size, reload_total_transfer+reload_partial_transfer, FALSE));
+	verify(reload_total_transfer+reload_partial_transfer==uct.GetFullBytesTrasferred());
+	reload_total_transfer=uct.GetFullBytesTrasferred();
+	
+	/*MMCacheTest mmct(reload_url.GetRep());
+	
+	// The file has been reloaded from Unite
+	verify(uct.GetNewBytesTransferred() == reload_transfer);
+	
+	// Cache unaffected
+	verify(mmct.GetUnsortedCount()==1);
+	verify(mmct.GetSortedCount()==1);
+	mmct.CheckSortedSegment(0, 0, binary_size);
+	mmct.CheckUnsortedSegment(0, 0, binary_size);
+	mmct.CheckPartialCoverage(0, TRUE, TRUE, binary_size);
+	verify(binary_size == CacheTester::GetPartialCoverage(reload_url.GetRep(), FALSE));*/
+}
+
+test("Restart simulation (new context, same directory)")
+{
+	verify_success(CacheTester::SaveFiles(ctx_reload));
+	verify_success(CacheTester::WriteIndex(ctx_reload));
+	verify((int)binary_size==(int)CacheFileTest::GetCacheFileSize(reload_url.GetRep(), TRUE));
+	
+	Context_Manager_Multimedia::CreateManager(ctx_reload2, multimedia_folder_reload, multimedia_folder_reload, FALSE, PrefsCollectionNetwork::DiskCacheSize);
+	
+	verify_success(mctx->AddContext(urlManager->FindContextManager(ctx_reload2)));
+		
+	Context_Manager_Multimedia::CreateManager(ctx_reload3, multimedia_folder_reload, multimedia_folder_reload, FALSE, PrefsCollectionNetwork::DiskCacheSize);
+	
+	Context_Manager *new_ctx=urlManager->FindContextManager(ctx_reload3);
+	
+	verify_success(mctx->AddContext(new_ctx));
+	
+	// Avoid file overlapping (write on files already present in the disk), as this is not meant to be tested in this situation
+	for(int i=0; i<100; i++)
+		new_ctx->IncFileStr();
+}
+
+test("Reload after restart simulation")
+async;
+{
+	reload_url2=uct.GetURL("binary", ctx_reload2);
+	
+	// As the URL is loaded from the cache, the size should already be correct
+	if(binary_size != CacheTester::GetPartialCoverage(reload_url2.GetRep(), FALSE))
+		ST_failed("Partial coverage 2 not as expected: %d vs %d", CacheTester::GetPartialCoverage(reload_url2.GetRep(), FALSE), binary_size);
+	
+	if((int)binary_size!=(int)CacheFileTest::GetCacheFileSize(reload_url.GetRep(), TRUE))
+	    ST_failed("Cache file size not as expected for reload_url");
+		
+    output(" Reload in context %d ", ctx_reload2);
+	MMCacheTest::FullDownloadUnconditional(reload_url2, mh);
+}
+
+test("Reload: recheck again")
+{
+	verify(FullLoadCheck(reload_url2.GetRep(), binary_size, reload_total_transfer+reload_partial_transfer, FALSE));
+	verify(reload_total_transfer+reload_partial_transfer==uct.GetFullBytesTrasferred());
+	reload_total_transfer=uct.GetFullBytesTrasferred();
+	
+	/*verify(reload_url2.GetRep() != reload_url.GetRep());
+	
+	MMCacheTest mmct(reload_url2.GetRep());
+	
+	// The file has been reloaded from Unite
+	verify(uct.GetNewBytesTransferred() == reload_transfer);
+	
+	// Cache unaffected
+	verify(mmct.GetUnsortedCount()==1);
+	verify(mmct.GetSortedCount()==1);
+	mmct.CheckSortedSegment(0, 0, binary_size);
+	mmct.CheckUnsortedSegment(0, 0, binary_size);
+	mmct.CheckPartialCoverage(0, TRUE, TRUE, binary_size);
+	
+	verify(binary_size == CacheTester::GetPartialCoverage(reload_url2.GetRep(), FALSE));*/
+}
+
+test("Old Reload")
+async;
+{
+	reload_url2=uct.GetURL("binary", ctx_reload2);
+	
+	// As the URL is loaded from the cache, the size should already be correct
+	if(binary_size != CacheTester::GetPartialCoverage(reload_url2.GetRep(), FALSE))
+		ST_failed("Partial coverage 3 not as expected: %d vs %d", CacheTester::GetPartialCoverage(reload_url2.GetRep(), FALSE), binary_size);
+		
+	MMCacheTest::FullDownloadOldReload(reload_url2, mh);
+}
+
+test("Old Reload check")
+{
+	verify(FullLoadCheck(reload_url2.GetRep(), binary_size, reload_total_transfer+reload_partial_transfer, FALSE));
+	verify(reload_total_transfer+reload_partial_transfer==uct.GetFullBytesTrasferred());
+	reload_total_transfer=uct.GetFullBytesTrasferred();
+}
+
+test("Show reload info")
+{
+	int urls=mctx->CheckIndex(ctx_reload2, TRUE);
+	
+	OpString8 name1;
+	OpString8 name2;
+	
+	name1.Set(reload_url.GetAttribute(URL::KFileName).CStr());
+	name2.Set(reload_url2.GetAttribute(URL::KFileName).CStr());
+	
+	output("Num URLs: %d - Contexts: %d vs %d - File: %s vs %s\n", urls, reload_url.GetContextId(), reload_url2.GetContextId(), name1.CStr(), name2.CStr());
+	verify(urls==1);
+}
+
+test("Reload with redirect: install services")
+language ecmascript;
+{
+	InstallRedirect("redir", "binary", "text/html", 301);
+	InstallRedirect("redir16", "16kb.bin", "text/html", 301);
+}
+
+test("Reload with redirect small: creation")
+async;
+{
+	reload_url4=uct.GetURL("redir16", ctx_reload3);
+	
+	if(CacheTester::GetPartialCoverage(reload_url4.GetRep(), TRUE))
+		ST_failed("Partial coverage 4 not as expected: %d vs 0", CacheTester::GetPartialCoverage(reload_url4.GetRep(), TRUE));
+	
+	output("Transfer before Reload with redirect: %d - %d\n", (int)reload_total_transfer, (int)uct.GetFullBytesTrasferred());
+	if(reload_total_transfer!=uct.GetFullBytesTrasferred())
+		ST_failed("Unexpected background transfer: %d vs %d", (int)reload_total_transfer, (int)uct.GetFullBytesTrasferred());
+	else
+		MMCacheTest::FullDownload(reload_url4, mh);
+}
+
+test("Reload with redirect small: check")
+{
+	OpFileLength size_16=16384;
+	//verify(FullLoadCheck(reload_url4.GetRep(), binary_size, reload_transfer));
+	output("Expected transfer: %d + %d similar to %d\n", (int)reload_total_transfer, (int)size_16, (int)uct.GetFullBytesTrasferred());
+
+	verify(FullLoadCheck(reload_url4.GetRep(), size_16, (UINT32)-1, TRUE));
+
+	// Transfer of the full file plus a bit of redirect
+	verify(reload_total_transfer+size_16<uct.GetFullBytesTrasferred() && reload_total_transfer+size_16+1024>=uct.GetFullBytesTrasferred());
+	reload_total_transfer=uct.GetFullBytesTrasferred();
+}
+
+
+test("Reload with redirect big: creation")
+async;
+{
+	reload_url3=uct.GetURL("redir", ctx_reload3);
+	
+	if(CacheTester::GetPartialCoverage(reload_url3.GetRep(), TRUE))
+		ST_failed("Partial coverage 5 not as expected: %d vs 0", CacheTester::GetPartialCoverage(reload_url3.GetRep(), TRUE));
+	
+	output("Transfer before Reload with redirect: %d - %d\n", (int)reload_total_transfer, (int)uct.GetFullBytesTrasferred());
+	if(reload_total_transfer!=uct.GetFullBytesTrasferred())
+		ST_failed("Unexpected background transfer: %d vs %d", (int)reload_total_transfer, (int)uct.GetFullBytesTrasferred());
+	else
+		MMCacheTest::FullDownload(reload_url3, mh);
+}
+
+test("Reload with redirect big: check")
+{
+	//verify(FullLoadCheck(reload_url3.GetRep(), binary_size, reload_transfer));
+	output("Expected transfer: %d + %d similar to %d\n", (int)reload_total_transfer, (int)reload_partial_transfer, (int)uct.GetFullBytesTrasferred());
+
+	verify(FullLoadCheck(reload_url3.GetRep(), binary_size, (UINT32)-1, TRUE));
+
+	// Transfer of the full file plus a bit of redirect
+	verify(reload_total_transfer+reload_partial_transfer<uct.GetFullBytesTrasferred() && reload_total_transfer+reload_partial_transfer+1024>=uct.GetFullBytesTrasferred());
+	reload_total_transfer=uct.GetFullBytesTrasferred();
+}
+
+test("Reload with redirect: Old Reload")
+async;
+{
+	reload_url2=uct.GetURL("redir", ctx_reload3);
+	
+	// As the URL is loaded from the cache, the size should already be correct
+	if(binary_size != CacheTester::GetPartialCoverage(reload_url2.GetRep(), TRUE))
+		ST_failed("Partial coverage 6 not as expected: %d vs %d", (int)CacheTester::GetPartialCoverage(reload_url2.GetRep(), TRUE), binary_size);
+		
+	MMCacheTest::FullDownloadOldReload(reload_url2, mh);
+}
+
+/*test("Recheck everything")
+{
+	verify(FullLoadCheck(reload_url.GetRep(), binary_size, reload_total_transfer+reload_partial_transfer));
+	verify(reload_total_transfer+reload_partial_transfer==uct.GetFullBytesTrasferred());
+	reload_total_transfer=uct.GetFullBytesTrasferred();
+
+	//verify(FullLoadCheck(reload_url2.GetRep(), binary_size, (UINT32)-1));
+	//verify(FullLoadCheck(reload_url3.GetRep(), binary_size, (UINT32)-1));
+}*/
+
+test("Show redir info")
+require success "Reload with redirect: Old Reload";
+{
+	int urls=mctx->CheckIndex(ctx_reload3, TRUE);
+	
+	OpString8 name1;
+	OpString8 name2;
+	OpString8 name3;
+	
+	name1.Set(reload_url.GetAttribute(URL::KFileName).CStr());
+	name2.Set(reload_url2.GetAttribute(URL::KFileName).CStr());
+	name3.Set(reload_url3.GetAttribute(URL::KFileName).CStr());
+	
+	int size2=(int)CacheFileTest::GetCacheFileSize(reload_url2.GetRep(), TRUE);
+	int size3=(int)CacheFileTest::GetCacheFileSize(reload_url3.GetRep(), TRUE);
+	
+	output("Num URLs: %d - Contexts: %d vs %d vs %d - File: %s vs %s vs %s - Size: %d vs %d vs %d\n", urls, reload_url.GetContextId(), reload_url2.GetContextId(), reload_url3.GetContextId(), name1.CStr(), name2.CStr(), name3.CStr(), binary_size, size2, size3);
+	verify(size2==size3);
+	verify(size2==(int)binary_size);
+}
+
+
+//////////////////////////////// More tests after unsharing the files
+
+
+test("Unshare the files")
+require success "Check WebServer and create the service";
+{
+	verify(OpStatus::IsSuccess(uct.UnShare("binary")));
+	verify(OpStatus::IsSuccess(uct.UnShare("binary2")));
+	verify(OpStatus::IsSuccess(uct.UnShare("binary3")));
+	verify(OpStatus::IsSuccess(uct.UnShare("text")));
+}
+
+test("Recreate context")
+{
+	TRAPD(rc, urlManager->WriteCacheIndexesL(TRUE, FALSE));
+	urlManager->Debug_AcceptOverlappingContexts();
+	//urlManager->AddContextL(ctx_read, multimedia_folder, multimedia_folder, multimedia_folder, FALSE);
+	Context_Manager_Multimedia::CreateManager(ctx_read, multimedia_folder, multimedia_folder);
+}
+
+test("From cache - complete binary download with Multimedia attribute")
+async;
+require success "Check WebServer and create the service";
+{
+	binary_url_cache=uct.GetURL("binary", ctx_read);
+	
+	MMCacheTest::FullDownloadNoReload(binary_url_cache, mh);
+}
+
+test("From cache - Partial download: 3 segments - part A - 1 KB")
+require URL_ENABLE_HTTP_RANGE_SPEC;
+async;
+require success "Check WebServer and create the service";
+{
+	binary_url3_cache=uct.GetURL("binary3", ctx_read);
+	
+	MMCacheTest::PartialDownloadNoReload(binary_url3_cache, SEG2_START+1000, SEG2_START+1999, mh);
+}
+
+test("From cache - Partial download: 3 segments - part B - 3 KB")
+require URL_ENABLE_HTTP_RANGE_SPEC;
+async;
+require success "Check WebServer and create the service";
+{
+	MMCacheTest::PartialDownloadNoReload(binary_url3_cache, SEG2_START+10000, SEG2_START+12999, mh);
+}
+
+test("From cache - Partial download: 3 segments - part C - 1 KB")
+require URL_ENABLE_HTTP_RANGE_SPEC;
+async;
+require success "Check WebServer and create the service";
+{
+	MMCacheTest::PartialDownloadNoReload(binary_url3_cache, SEG2_START, SEG2_START+999, mh);
+}
+
+test("From cache - Check segment - 1")
+require success "Check WebServer and create the service";
+{
+	OP_DELETE(mmct1);
+	mmct1=OP_NEW(MMCacheTest, (binary_url_cache.GetRep()));
+	
+	verify(mmct1);
+	verify(mmct1->GetUnsortedCount()==1);
+	verify(mmct1->GetSortedCount()==1);
+	verify_success(mmct1->CheckSortedSegment(0, 0, binary_size));
+	verify_success(mmct1->CheckUnsortedSegment(0, 0, binary_size));
+}
+
+test("From cache - Check if cache binary file 3 is fine")
+file uni path_binary "BinaryTest.fil";
+require success "Check WebServer and create the service";
+{
+	OpFileLength size=0;
+	
+	CacheFileTest::VerifyFileSign(binary_url3_cache, "OMCF", size, FALSE);
+	verify(OpStatus::IsSuccess(CacheFileTest::VerifyFileContent(binary_url3_cache, path_binary)));
+	verify(size>5000+16);
+}
+
+test("From cache - Check segments - 3")
+require success "Check WebServer and create the service";
+{
+	OP_DELETE(mmct3);
+	mmct3=OP_NEW(MMCacheTest, (binary_url3_cache.GetRep()));
+	
+	verify(mmct3);
+	verify(mmct3->GetUnsortedCount()==3);
+	verify(mmct3->GetSortedCount()==2);
+	
+	verify_success(mmct3->CheckUnsortedSegment(0, SEG2_START+1000, 1000));
+	verify_success(mmct3->CheckUnsortedSegment(1, SEG2_START+10000, 3000));
+	verify_success(mmct3->CheckUnsortedSegment(2, SEG2_START, 1000));
+	
+	verify_success(mmct3->CheckSortedSegment(0, SEG2_START, 2000));
+	verify_success(mmct3->CheckSortedSegment(1, SEG2_START+10000, 3000));
+}
+
+test("Restore WebServer if required")
+require success "Check WebServer and create the service";
+{
+	uct.StopWebServer();
+}
+
+test("Delete context directory")
+{
+	urlManager->RemoveContext(ctx_read, TRUE);
+
+	mctx->RemoveFoldersAndContexts();
+}

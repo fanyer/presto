@@ -1,0 +1,220 @@
+/* -*- Mode: c++; tab-width: 4; indent-tabs-mode: t; c-basic-offset: 4 -*-
+**
+** Copyright (C) 2004-2006 Opera Software ASA.  All rights reserved.
+**
+** This file is part of the Opera web browser.  It may not be distributed
+** under any circumstances.
+**
+** Yngve N. Pettersen
+*/
+
+group "cookies test 2";
+
+require init;
+
+language c++;
+
+include "core/pch.h";
+include "modules/url/url_man.h";
+include "modules/prefs/prefsmanager/collections/pc_network.h";
+
+require PUBSUFFIX_ENABLED;
+
+include "modules/cookies/cookie_man.h";
+include "modules/formats/hdsplit.h";
+include "modules/formats/argsplit.h";
+
+include "modules/pubsuffix/selftest/suffixiterator.h";
+
+
+global {
+  Cookie_Manager *cookie_storage = NULL;
+
+  BOOL	InitServerName(const OpStringC8 &name, BOOL found_ip)
+  {
+	ServerName *server = g_url_api->GetServerName(name, TRUE);
+	if(!server)
+	  return FALSE;
+
+	server->SetHTTP_Lookup_Succceded(found_ip);
+	server->SetCookieDNSExpires(g_timecache->CurrentTime() + 365*24*60*60);
+	server->SetCookieDNS_Lookup_Done(found_ip ? CookieDNS_Succeded: CookieDNS_Failed);
+	return TRUE;
+  }
+
+  const char *cookieheaders[] = {
+		"Set-Cookie2: name1=value1; version=1; domain=\".invalid.com\"; path=\"/\"\r\n"
+		"Set-Cookie2: name2=value2; version=1; domain=\".somewhere.invalid.com\"; path=\"/\"\r\n"
+		"Set-Cookie2: name3=value3; version=1; domain=\".somewhere.invalid.no\"; path=\"/\"\r\n"
+  };
+
+  PubSuffixTestIterator *iterator = NULL;
+}
+
+table urlset(const char *, BOOL, BOOL, BOOL)
+{
+  {"http://www.invalid.com/", TRUE, FALSE, FALSE},
+  {"http://www.somewhere.invalid.com/", TRUE, TRUE, FALSE},
+  {"http://www.somewhere.invalid.no/", FALSE, FALSE, TRUE},
+  {"http://www.invalid.no/", FALSE, FALSE, FALSE},
+  {"http://somewhere.invalid.no/", FALSE, FALSE, TRUE},
+  {"http://somewhere-else.invalid.no/", FALSE, FALSE, FALSE}
+}
+
+exit {
+	if (cookie_storage) cookie_storage->PreDestructStep();
+	OP_DELETE(cookie_storage);
+	cookie_storage = NULL;
+
+	OP_DELETE(iterator);
+	iterator = NULL;
+}
+
+test("Initialized")
+{
+	cookie_storage = OP_NEW(Cookie_Manager, ());
+	verify(cookie_storage != NULL);
+
+	TRAPD(op_err,cookie_storage->InitL(OPFILE_ABSOLUTE_FOLDER));
+	verify_success(op_err);
+
+	iterator = OP_NEW(PubSuffixTestIterator, ());
+	verify(iterator != NULL);
+
+	verify_success(iterator->Construct());
+}
+
+table SuffixFetches (char *, ServerName::DomainType)
+{
+	{"com", ServerName::DOMAIN_TLD},
+	{"no", ServerName::DOMAIN_TLD}
+}
+
+foreach (domain, domaintype) from SuffixFetches
+{
+	test("Fetch/Test domain dot-" domain)
+		async;
+		require success "Initialized";
+	{
+		iterator->StartTest(domain, domaintype);
+	}
+}
+
+subtest SetURL(URL &url, const char *url_name)
+{
+	verify (url_name != NULL);
+
+	url = g_url_api->GetURL(url_name);
+
+	verify(!url.IsEmpty());
+}
+
+subtest SetCookie(URL &url, const char *cookie_hdr)
+{
+	verify(cookie_hdr != NULL);
+	verify(!url.IsEmpty());
+
+	HeaderList cookies(KeywordIndex_HTTP_MIME);
+
+	verify_success(cookies.SetValue((char *) cookie_hdr));
+
+	TRAPD(op_err, cookie_storage->HandleCookiesL(url.GetRep(), cookies));
+	verify_success(op_err);
+	cookie_storage->StartProcessingCookies();
+}
+
+subtest GetCookies(URL &url, const char **cookie_string)
+{
+	verify(cookie_string != NULL);
+
+	int version = 0;
+	int max_version = 0;
+	BOOL already_have_password = FALSE;
+	BOOL already_have_authentication = FALSE;
+	BOOL have_password = FALSE;
+	BOOL has_password = FALSE;
+	TRAPD(op_err, *cookie_string = cookie_storage->GetCookiesL(url.GetRep(), version, max_version, already_have_password, already_have_authentication, have_password, has_password));
+	verify_success(op_err);
+	if(*cookie_string)
+	{
+		verify(max_version == 1);
+	}
+	//verify(*cookie_string != NULL);
+}
+
+subtest CheckCookie(const char *cookie_string, const char *name, const char *value, BOOL supposed_present, const char *domain, const char *path)
+{
+	ParameterList args;
+
+	//verify(cookie_string != NULL);
+
+	verify_success(args.SetValue(cookie_string, PARAM_SEP_SEMICOLON));
+
+	Parameters *cookie =args.GetParameter(name);
+
+	if(supposed_present)
+	{
+		verify(cookie != NULL);
+		verify(cookie->GetValue().Compare(value) == 0);
+
+		BOOL got_domain = FALSE;
+		BOOL got_path = FALSE;
+		cookie = cookie->Suc();
+		while(cookie != NULL)
+		{
+			verify(cookie->Name());
+			if(cookie->Name() == NULL || *(cookie->Name()) != '$')
+			   break;
+
+			if(cookie->GetName().CompareI("$domain") == 0)
+			{
+				cookie->StripQuotes();
+				verify(domain && cookie->GetValue().Compare(domain) == 0);
+				got_domain = TRUE;
+			}
+			else if(cookie->GetName().CompareI("$path") == 0)
+			{
+				cookie->StripQuotes();
+				verify(path && cookie->GetValue().Compare(path) == 0);
+				got_path = TRUE;
+			}
+
+			cookie = cookie->Suc();
+		}
+		verify(got_domain);
+		verify(got_path);
+	}
+	else
+	{
+		verify(cookie == NULL);
+	}
+}
+
+test ("Cookie_Domains")
+	require success "Initialized";
+	require PREFS_WRITE;
+{
+	BOOL old_cookiesv2_setting = g_pcnet->GetIntegerPref(PrefsCollectionNetwork::EnableCookiesV2);
+	RETURN_IF_LEAVE(g_pcnet->WriteIntegerL(PrefsCollectionNetwork::EnableCookiesV2, TRUE));
+
+	TRAPD(op_err, cookie_storage->ClearCookiesCommitL(TRUE));
+	verify_success(op_err);
+
+	iterate (url_name, val1_set, val2_set, val3_set) from urlset
+	{
+		URL url = URL();
+
+		verify(SetURL(url, url_name));
+
+		verify(SetCookie(url, cookieheaders[0]));
+
+		const char *cookie_string = NULL;
+		verify(GetCookies(url, &cookie_string));
+
+		verify(CheckCookie(cookie_string, "name1", "value1", val1_set, ".invalid.com", "/"));
+		verify(CheckCookie(cookie_string, "name2", "value2", val2_set, ".somewhere.invalid.com", "/"));
+		verify(CheckCookie(cookie_string, "name3", "value3", val3_set, ".somewhere.invalid.no", "/"));
+	}
+
+	RETURN_IF_LEAVE(g_pcnet->WriteIntegerL(PrefsCollectionNetwork::EnableCookiesV2, old_cookiesv2_setting));
+}

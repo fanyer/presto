@@ -1,0 +1,877 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01//EN">
+<html lang="en" dir="ltr">
+<head>
+ <meta http-equiv="Content-Type" content="text/html;charset=iso-8859-1">
+ <title>Table layout</title>
+ <link rev="made" href="mailto:mstensho@opera.com">
+ <link rel="stylesheet" href="../../coredoc/coredoc.css" type="text/css" media="all">
+ <link rel="contents" href="../../coredoc/index.html" type="text/html" title="Core API">
+
+ <style>
+  #minmax-t th:first-child, #colspan-expand-t td:first-child { white-space: nowrap; }
+  blockquote { margin-left: 2em; font-family:monospace; color:green; }
+  .coderef::before { color:gray; content:"code reference: "; }
+  .coderef { display:inline; background:#ffd; border:1px dashed black; padding:1px; line-height:1.7em; }
+  .code { border:1px dashed black; padding:5px; white-space:pre-wrap; color:green; background:#eee; }
+  .consider { background:#ffd; font-style:italic; }
+  .consider::before { content: "[NOTE: "; }
+  .consider::after { content: "] "; }
+ </style>
+
+</head>
+
+<body>
+ <h1>Table layout</h1>
+ <p>
+  Copyright &copy; 1995-2010 Opera Software AS. All rights reserved.
+  This file is part of the Opera web browser. It may not be distributed
+  under any circumstances.
+  <br>
+  $Id: tables.html,v 1.11.1252.1.104.1 2010/03/17 15:10:22 mstensho Exp $
+ </p>
+
+ <h2>Introduction</h2>
+
+ <p>This document attempts to describe the table layout algorithm used
+ in Opera - in particular the automatic table layout algorithm. The
+ CSS spec <a
+ href="http://www.w3.org/TR/CSS21/tables.html#auto-table-layout">doesn't
+ even attempt to describe this algorithm decently</a>. It does however
+ state that <a
+ href="http://www.w3.org/TR/CSS21/tables.html#q1">&quot;For the
+ automatic table layout algorithm, some widely deployed
+ implementations have achieved relatively close
+ interoperability&quot;</a>. And we're trying our best to do exactly
+ that, mostly by following IE as closely as
+ possible/reasonable. Mozilla behavior is also taken into account.</p>
+
+ <p>NOTE: This specification is not yet complete. It does not describe
+ rowspan or height calculation.</p>
+
+ <h2>Overview</h2>
+
+ <p>Table layout requires two passes in the layout engine. In the <a
+ href="#pass-1">first (initial) pass</a>, width information (desired
+ width, percentage) about each cell and column box is gathered and
+ stored in a <a href="#column-array">column array</a>. The <a
+ href="#minmax">minimum and maximum</a> width of each cell is also
+ calculated. When all cell minimum and maximum widths have been found,
+ the total table minimum and maximum width is calculated. In the <a
+ href="#pass-2">second (final) pass</a>, the total width of the table
+ is calculated, followed by calculating the <a
+ href="#distribute-space">width of each column</a>. Then every cell is
+ reflowed according to the new column widths.</p>
+
+ <h2><a name="minmax">Definition of minimum, maximum, desired and percentage width</a></h2>
+
+ <p>Definition of the different width types - minimum, maximum,
+ desired and percentage width - in the context of table box,
+ table-cell box and <a href="#column-array">column array</a>:</p>
+
+ <table border="1" id="minmax-t">
+  <tr>
+
+   <th></th>
+
+   <th width="20%">minimum width</th>
+
+   <th width="20%">maximum width</th>
+
+   <th width="20%">desired width</th>
+
+   <th width="20%">percentage width</th>
+
+   <th width="20%">containing block for resolving percentages</th>
+
+  </tr>
+  <tr>
+
+   <th>table-cell box</th>
+
+   <td>widest unbreakable piece of content (widest unbreakable word,
+   widest piece of replaced content, widest block, etc.)</td>
+
+   <td>width when ignoring all implicit line-breaks (wrapping)</td>
+
+   <td>CSS property 'width' or HTML attribute 'width' specified on the
+   cell</td>
+
+   <td>CSS property 'width' or HTML attribute 'width' specified on the
+   cell</td>
+
+   <td>table box</td>
+
+  </tr>
+  <tr>
+
+   <th><a href="#column-array">column</a> array</th>
+
+   <td>largest minimum width among all cells belonging to the column,
+   including border and padding</td>
+
+   <td>largest maximum width among all cells belonging to the column,
+   including border and padding</td>
+
+   <td>Largest desired width among all cells belonging to the column,
+   including border or padding, or the desired width of the column
+   box, if it is larger. Ignored if percentage width is present</td>
+
+   <td>Largest percentage width among all cells belonging to the
+   column, or the percentage width of the column box, if it is
+   larger. Overrides desired width, if present.</td>
+
+   <td>table box, excluding border-spacing, table padding and
+   border</td>
+
+  </tr>
+  <tr>
+
+   <th>table box</th>
+
+   <td>Sum of all columns' minimum width, plus table border and
+   padding, plus border-spacing around <a
+   href="#referenced-column">referenced columns</a></td>
+
+   <td>Defined <a href="#table-minmax">here</a></td>
+
+   <td>CSS property 'width' or HTML attribute 'width' specified on the
+   table</td>
+
+   <td>CSS property 'width' or HTML attribute 'width' specified on the
+   table</td>
+
+   <td>table box, excluding border-spacing, table padding and
+   border</td>
+
+  </tr>
+ </table>
+
+ <ul>
+
+  <li>Special rules for cells with colspan &gt; 1 apply</li>
+
+  <li>Resolving column percentages in a table with auto width is
+  described <a href="#auto-percent">here</a></li>
+
+  <li>There is also a width type called <i>normal minimum
+  width</i>. This will always be the "true" minimum width. It is
+  always the same as <i>minimum width</i> in normal layout mode, while
+  in other layout modes (ERA) <i>minimum width</i> may be less than
+  <i>normal minimum width</i>. In non-normal layout modes, <i>minimum
+  width</i> is sqeezed aggressively. Replaced content may be shrunk,
+  and words may e.g. be split over several lines, if containing block
+  width is insufficient.<br> This will always be true: minimum width
+  &lt;= normal minimum width &lt;= maximum width</li>
+
+  <li>Observe the fact that minimum and maximum widths are never
+  affected by the width of the table or the containing block of the
+  table</li>
+
+ </ul>
+
+ <p>How to calculate minimum and maximum widths is described in
+   greater detail in the documentation of the
+   <a href="minmax.html">min/max width calculation and propagation
+   algorithm.</a></p>
+
+ <h2><a name="column-array">The column array</a></h2>
+
+ <div class="coderef">ColumnInfo</div>
+
+ <p>An array of columns is created and updated when laying out cell
+ and column boxes. A table cell with colspan <i>colspan</i> belongs to
+ <i>colspan</i> entries in the column array (or, more often simply called
+ &quot;columns&quot;). A column box with span <i>span</i> defines
+ <i>span</i> entries in the column array. The first table cell in a
+ table-row belongs to the first column (and <i>colspan-1</i> following
+ columns) (unless it is pushed to a successive column by a cell with
+ rowspan on a preceding row). The next cell in a row belongs to the
+ column (or, with colspan, columns) following the last column occupied
+ by the previous cell. A column entry refers to zero or one column
+ box. It contains width information about (but does not directly refer
+ to) zero or more cells.</p>
+
+ <p>For ERA, when TrueTables are enabled, each entry also keeps track
+ of how many non-colspanned cells in each column are suitable
+ (positive) or unsuitable (negative) for TrueTables.</p>
+
+ <h2>Layout algorithm details</h2>
+
+ <div class="coderef">TableContent::ComputeSize(),
+ TableContent::Layout()</div>
+
+ <p>This chapter deals with the entire algorithm used for automatic
+ table layout, step by step.</p>
+
+ <p>Very many (but not all) of the other layout box types require only
+ one layout pass. This is however only possible if the width of a box
+ can be calculated without laying it out first. This is not the case
+ for table boxes. Two passes are required.</p>
+
+ <h3><a name="pass-1">Initial layout pass (measure pass)</a></h3>
+
+ <p>Before we can calculate the width of the table, we need to know
+ the desired, percentage, minimum and maximum width of each of its <a
+ href="#column-array">columns</a>. Before we can calculate that, we
+ must know the desired, percentage, minimum and maximum width of each
+ cell box. The only way to find this, is by laying out every cell box
+ (without knowing their size).</p>
+
+ <h4>Lay out every column and cell box</h4>
+
+ <div class="coderef">TableCellBox::Layout(),
+ TableContent::UpdateColumnWidths(),
+ TableContent::CalculateColumnMinMaxWidths()</div>
+
+ <p>For each table-cell box, feed the table's column array with
+ desired, percentage, content minimum and maximum width. For each
+ column box, feed the table's column array with desired and percentage
+ width.</p>
+
+ <p>Cell or column box width values
+ (minimum/maximum/desired/percentage) replace values in the <a
+ href="#column-array">column array</a> if a value is higher than what
+ is already stored in the column array. A cell with desired width
+ specified will constrain maximum width to desired width - it may be
+ less, but not more. Note that this rule may cause a column's minimum
+ width to be larger than its maximum width, which reduces the chance
+ of the column receiving excess space later, when <a
+ href="#distribute-space">distributing available table width</a>.
+
+ <p>Column box desired/percentage width is honored only if the <a
+ href="#column-array">column</a> contains at least one non-colspanned
+ cell with auto width. The column box's desired width is propagated to
+ such cells.</p>
+
+ Cell and column widths are fed to the layout engine in plain document
+ element order. In fact, order is irrelevant, unless there are cells
+ with colspan &gt; 1. In that case we feed them sorted on their
+ colspan, ascendingly. This way the column minimum and maximum widths
+ become as narrow as possible. If there are two or more cells with the
+ same colspan in the table, feed them in layout stack order -
+ i.e. first row first. This makes us pretty compatible with IE. In
+ Firefox and Konqueror, on the other hand, row order seems to make no
+ difference.</p>
+
+ <h5>TrueTable detection</h5>
+
+ <div class="coderef">Content::IsTrueTableCandidate()</div>
+
+ <p>In TrueTable mode (typically enabled in SSR and CSSR mode), each
+ table cell with colspan == 1 needs to specify if its content may look
+ like it is content of something that should be regarded a table
+ logically, i.e. not a table that is a table just for the sake of
+ visual page layout. A cell is either suitable for TrueTables (<span
+ class="coderef">POSITIVE</span>), unsuitable for TrueTables (<span
+ class="coderef">NEGATIVE</span>), or neutral (<span
+ class="coderef">NEUTRAL</span>). Numeric text content will increase
+ the likelihood of a cell becoming suitable for TrueTables. Other text
+ and replaced content will decrease it. Cells with colspan != 1 are
+ always neutral. Numeric text content is words that start with a
+ digit, '+', ',', '-', '.', '/', ':', ';' or '%'.</p>
+
+ <p>Exact algorithm: Cells and non-replaced blocks keep track of the
+ number of how many lines or child blocks or tables that should
+ contribute positively to TrueTable detection, and how many of them
+ should contribute negatively. Neutral lines or child blocks are not
+ counted. The detection algorithm works recursively.</p>
+
+ <p>A positive line is a line whose width comprises two thirds or more
+ of numeric text content (and one third or less of other text content,
+ margins, border, padding, replaced content, inline-blocks and
+ inline-tables). The remaining lines are negative, except for the ones
+ that have no content at all. Such lines are neutral.</p>
+
+ <p>A positive block is an in-flow, non-replaced block which has more
+ positive than negative lines, in-flow blocks or tables. The remaining
+ in-flow blocks are negative, except for the ones that consist of only
+ one negative line, and the maximum width of that line is less than
+ 2em. Such blocks are neutral.</p>
+
+ <p>A table is positive if it is an in-flow, block level table that
+ was found to be a TrueTable or SmallTable. In-flow, block level
+ tables found NOT to be a TrueTable will disable TrueTable and
+ SmallTable detection for all ancestor tables (so that they all end up
+ being displayed in single columns). Note that NOT being a TrueTable
+ includes being a SmallTable in this case.</p>
+
+ <p>Replaced in-flow blocks are negative.</p>
+
+ <p>Absolutely positioned and floated content is neutral.</p>
+
+ <p>The table cell then follows the same algorithm as in-flow,
+ non-replaced blocks to find out if it is suitable for TrueTables. It
+ propagates the result to its parent table, which will keep track of
+ how many cells in each column are suitable or unsuitable for
+ TrueTables. The final destiny of the table with regards to TrueTable
+ / SmallTable detection will take place when all its cells have been
+ laid out. This is described later.</p>
+
+ <h5>Colspanned cells</h5>
+
+ <p>Minimum (and maximum) width of a colspanned cell may never be less
+ than 1px more than border-spacing multiplied with one less than the
+ columns that it spans, including any <a
+ href="#referenced-column">unreferenced columns</a>.</p>
+
+ In other words:
+
+ <blockquote>minimum width >= (colspan - 1) * (horizontal border
+ spacing + 1)</blockquote>
+
+ <p>Example: Minimum width of a cell that has a colspan of 50 in a table
+ with horizontal border-spacing of 10px must be at least:</p>
+
+ <blockquote>(50-1) * (10px + 1px) = 539px</blockquote>
+
+ <p>If the desired / percentage / minimum / maximum width of a
+ colspanned cell exceeds the total already set on the columns that it
+ spans, the extra width must be distributed, so that the colspanned
+ cell fits. Here is what to do, in the following order (note that, as
+ always in automatic table layout, desired width and percentage width
+ are mutually exclusive; percentage wins, desired width is
+ ignored):</p>
+
+ <table border="1" id="colspan-expand-t">
+
+  <tr>
+
+   <th>width type</th>
+
+   <th>distribution algorithm</th>
+
+  </tr>
+  <tr>
+
+   <td>percentage</td>
+
+   <td>Distribute extra percentage (what's more than already set on
+   the columns) across columns that don't yet have any percentage
+   set. The larger maximum width, the larger portion of the percentage
+   will be given to a column. If there is no maximum width, distribute
+   extra percentage evenly on said columns. If all columns already
+   have a percentage set, do nothing.</td>
+
+  </tr>
+  <tr>
+
+   <td>desired</td>
+
+   <td>Adjust maximum width of the columns that don't have a desired width
+   (using extra space). NOTE: Existing desired widths of the columns are not
+   changed - that aligns us with all major browsers better. The final widths
+   might still then become greater after the <a href="#distribute-space">
+   regular column width distribution algorithm</a>.</td>
+
+  </tr>
+  <tr>
+
+   <td>normal minimum</td>
+
+   <td>Use <a href="#distribute-space">regular column width
+   distribution algorithm</a>. If total percentage on the spanned
+   columns exceeds 100, scale them down to a total of 100% instead of
+   ignoring excess percentage. Total percentage of all columns in the
+   table is irrelevant.</td>
+
+  </tr>
+  <tr>
+
+   <td>minimum</td>
+
+   <td>Use <a href="#distribute-space">regular column width
+   distribution algorithm</a>. If total percentage on the spanned
+   columns exceeds 100, scale them down to a total of 100% instead of
+   ignoring excess percentage. Total percentage of all columns in the
+   table is irrelevant.</td>
+
+  </tr>
+  <tr>
+
+   <td>maximum</td>
+
+   <td>Use <a href="#distribute-space-excess">excess space
+   distribution part of regular column width distribution
+   algorithm</a>.</td>
+
+  </tr>
+
+ </table>
+
+ <h4><a name="table-minmax">Find total table minimum and maximum widths</a></h4>
+
+ <div class="coderef">TableContent::ComputeMinMaxWidth()</div>
+
+ <p>All cell and column boxes have contributed to the table's column
+ array at this point, and based on this information, we can calculate
+ the table's minimum and maximum widths, which will be used to
+ determine the width of the table, as well as being propagated to
+ parents. Table minimum width is the sum of the minimum width of each
+ column plus table border, padding, and the border-spacing around each
+ <a href="#referenced-column">referenced</a> column. Table maximum
+ width is the sum of the maximum width, or the minimum width if it is
+ larger, of each column plus table border, padding, and the
+ border-spacing around each <a
+ href="#referenced-column">referenced</a> column.</p>
+
+ <h5><a name="auto-percent">Percentage columns in auto width tables</a></h5>
+
+ <p>Percents in <a href="#column-array">columns</a> are relative to
+ the containing block, which is the table. If the table width is auto,
+ the containing block is unknown (auto width on a table doesn't mean
+ use width of containing block, but rather a form of shrink-to-fit).
+ The table width used will then depend on the column percentage and
+ maximum widths. If percentage columns increase the table's maximum
+ width, it is important that this increase is not propagated to
+ parents. The maximum width <i>CMW</i> of a column with a percentage
+ of <i>CP</i> requires that <i>CMW</i> pixels be at most
+ <i>CP</i> percent of the maximum width <i>TMW</i> of the table:</p>
+
+ <blockquote>CMW <= TMW * CP / 100</blockquote>
+
+ <p>or:</p>
+
+ <blockquote>TMW >= CMW * 100 / CP</blockquote>
+
+ <p>Example: A 25% wide column with a maximum width of 50px requires
+ the maximum width of the table to be greater than 50px * 100 / 25 =
+ 200px.</p>
+
+ <p>Details: Iterate over all columns and add the total maximum width
+ of all non-percent based columns <i>NPW</i> together. This will serve
+ as a base for a table maximum width that takes percentages into
+ account.<br> The highest allowed total percentage <i>TP</i> for all
+ columns is 100. Cope with excess percentage by truncating the
+ percentage of the column that causes the total to exceed 100, so that
+ the total becomes 100 nevertheless. Ignore percentage on remaining
+ columns with percentage set, but find the highest maximum width value
+ among them <i>IMW</i>. It may have to serve as fallback base for new
+ table maximum width.</p>
+
+ <p>Done with column iteration. Next step: If <i>NPW</i> is non-zero,
+ pretend that this is the width of the &quot;unclaimed
+ percentage&quot; in the table (100-<i>TP</i> percent, in other
+ words). To be able to satisfy the percentage on the columns with no
+ percentage set, table maximum width must be at least:</p>
+
+ <blockquote>NPW * 100 / (100 - TP)</blockquote>
+
+ <p>If <i>TP</i> is 100 here, table maximum width becomes infinity
+ (since no table width can satisfy percentage widths then). If
+ <i>NPW</i> is 0, but <i>IMW</i> isn't, <i>IMW</i> is used as a
+ fallback: Pretend that <i>IMW</i> represents 1% of the table maximum
+ width; in other words, make sure that table maximum width is
+ <i>IMW</i> * 100 or more. <span class="consider">Is this an important
+ feature in IE worth copying, or is it just a bug?</span> We now have
+ a maximum width that is large enough to satisfy percentage widths,
+ and at the same time keep cell content of non-percentage columns from
+ wrapping. What remains is to make sure that the maximum width is
+ large enough to keep cell content of each percentage column from
+ wrapping as well. For each percent-based column, make sure that table
+ maximum width is at least:</p>
+
+ <blockquote>CMW * 100 / CP</blockquote>
+
+ <p>where CMW is the column's maximum width and CP is the column's
+ percentage value. We assume that percentage total is 100 in this
+ step, instead of using the actual value.</p>
+
+ <p><span class="consider">Firefox behaves differently here: it uses
+ the smallest, not the largest, percentage value set on a cell in the
+ <a href="#column-array">column array</a>. This may result in a larger
+ a table maximum width. It seems like a logical thing to do, but
+ currently, neither Opera nor IE do this.</span></p>
+
+ <h5>Tables with no columns</h5>
+
+ <p>A table with no columns (i.e. no cell or column boxes) uses the
+ largest minimum and maximum widths of any captions in the table as
+ its minimum and maximum width.</p>
+
+ <h4>Request reflow</h4>
+
+ <div class="coderef">TableContent::UpdateScreen()</div>
+
+ <p>Minimum and maximum width of the table and all its <a
+ href="#column-array">columns</a> have been determined. Now we need
+ another reflow to lay out table cells with their correct width. They
+ can get their correct width in the second pass because the <a
+ href="#column-array">column</a> widths can be calculated. The column
+ widths can be calculated because the <a href="#minmax">minimum and
+ maximum</a> widths of the table have been found.</p>
+
+ <h4>Detect TrueTable / SmallTable (ERA)</h4>
+
+ <div class="coderef">TableContent::FinishLayout()</div>
+
+ <p>This section only applies if TrueTables are enabled in the current
+ rendering mode, which is typically the case in CSSR.</p>
+
+ <p>In CSSR mode, most tables will be displayed in a single column,
+ since available width is very limited, so that columns would become
+ uselessly narrow otherwise. However, in some cases we want to display
+ a table as a regular table - when the table is found to be a "real
+ table" (as opposed to a table used to get some desired layout)
+ (TrueTable), or when the table's maximum width is small enough to fit
+ within the containing block (SmallTable). There is very little
+ difference between TrueTables and SmallTables, apart from the way
+ they are detected.</p>
+
+ <p>Each cell in the table has already been examined (<span
+ class="coderef">enum TRUE_TABLE_CANDIDATE</span>), and have been
+ found to be either suitable for TrueTables (<span
+ class="coderef">POSITIVE</span>), unsuitable for TrueTables (<span
+ class="coderef">NEGATIVE</span>), or neutral (<span
+ class="coderef">NEUTRAL</span>).</p>
+
+ <p>Now each column will be examined. If the column has more suitable
+ than unsuitable cells for TrueTable, the column is defined as
+ suitable for TrueTable. If the column has fewer suitable than
+ unsuitable cells for TrueTable, the column is defined as unsuitable
+ for TrueTable. If the column has the same number of suitable as
+ unsuitable cells for TrueTable, the column is neutral.</p>
+
+ <p>If there are any columns suitable for TrueTable, and that number
+ is at least twice as many as the number of unsuitable columns for
+ TrueTable, then the table becomes a TrueTable.</p>
+
+ <p>If the table did not become a TrueTable, but its maximum width
+ does not exceed available width for the table, the table is a
+ SmallTable.</p>
+
+ <p>If the table is neither a TrueTable nor a SmallTable (and
+ TrueTables are enabled in the current rendering mode), the table will
+ be displayed in a single column.</p>
+
+ <h3><a name="pass-2">Final layout pass</a></h3>
+
+ <p>In the final layout pass, minimum and maximum widths of the table
+ and each of its columns are known, and layout of table boxes with
+ their final and correct width can be done. When a table box has
+ already been laid out, but needs a reflow because its containing
+ block width has changed, it will skip directly to this second layout
+ pass, since minimum and maximum widths are not affected by containing
+ block width changes.</p>
+
+ <h4>Calculate table width</h4>
+
+ <div class="coderef">TableContent::CalculateTableWidth()</div>
+
+ <p>A table will be at least as wide as its minimum width. <a
+ href="#minmax">Desired or percentage</a> table width is honored if it
+ exceeds the minimum width of the table. If no desired width is
+ specified, use the smaller of table maximum width and table
+ containing block width as table width.</p>
+
+ In other words - if desired or percentage width is specified:
+
+ <blockquote>table width = MAX(desired width, minimum
+ width)</blockquote>
+
+ If no desired or percentage width is specified:
+
+ <blockquote>table width = MIN(MAX(minimum width, containing block
+ width), maximum width)</blockquote>
+
+ <h4>Calculate column widths</h4>
+
+ <div class="coderef">TableContent::CalculateColumnWidths()</div>
+
+ <p>Distribute available width - table width without padding, border
+ and border-spacing across the <a
+ href="#column-array">columns</a>.</p>
+
+ <h5>Single column mode</h5>
+
+ <p>If the table is in single column mode (ERA), all column widths
+ will simply be set to the available table width (they are going to be
+ laid out on separate lines anyway). Single column mode is used when
+ explicitly enabled for the rendering mode, or if TrueTables are
+ enabled (typically SSR and CSSR) and this table was found not to be a
+ TrueTable or SmallTable.</p>
+
+ <h5>Flexible columns</h5>
+
+ <p>If flexible columns are enabled for the rendering mode (typically
+ all ERA modes but MSR), it will apply as long as the table was found
+ not to be a SmallTable (if it is a SmallTable, all column maximum
+ widths can be satisfied anyway). If it applies, a table row is
+ allowed to wrap if the total <i>minimum width</i> of the columns
+ exceeds available width. If this happens, satisfy <i>minimum
+ width</i> of each column (starting at the first column in the table),
+ as long as the total width doesn't exceed available width. If there
+ is unsatisfied <i>normal minimum width</i> for the columns examined
+ so far, distribute as much of it as possible (exactly how will be
+ described in a later version of this document). Then wrap to a new
+ "row" and repeat what was just done for the previous "row", for as
+ many columns as there are room for. Repeat this as long as there are
+ columns left to examine.</p>
+
+ <p>If the rows don't wrap, use the following width distribution
+ algorithm, just as in normal layout mode:</p>
+
+ <h5>Regular width distribution</h5>
+
+ <p>This algorithm is described in detail in the <a
+ href="#distribute-space">regular column width distribution
+ algorithm</a> chapter. In short, step by step: start by satisfying
+ minimum widths of each column. If there is more space left, satisfy
+ percentage column widths. If there is more space left, satisfy
+ desired width. If there is enough space left to satisfy maximum
+ widths of each column with no desired or percentage width, do
+ that. If there is more space left after this, distribute it all by
+ stretching each column with no desired or percentage width relative
+ to their maximum width. If there are no such columns, stretch columns
+ with desired width with non-zero minimum width. If there are no such
+ columns, stretch columns with percentage width with non-zero minimum
+ width. If there are no such columns, all columns have zero minimum
+ width. Stretch all columns relative to their desired width. If no
+ columns have a desired width, stretch all columns evenly.</p>
+
+ <h4>Lay out every column and cell box</h4>
+
+ <div class="coderef">TableCellBox::Layout(),
+ TableContent::UpdateColumnWidths()</div>
+
+ <p>Here we go again... However, this time we know the actual size of
+ the <a href="#column-array">columns</a>, so calculating cell widths
+ is possible. The border-box of a cell is the same as the total width
+ of the column(s) that it spans, plus any border-spacing between each
+ column.</p>
+
+ <h4>Check if reflow is needed</h4>
+
+ <div class="coderef">TableContent::UpdateScreen()</div>
+
+ <p>If any minimum or maximum widths changed during this layout pass,
+ we need another reflow, since such changes may affect <a
+ href="#column-array">column</a> widths.</p>
+
+ <h2><a name="referenced-column">Definition of 'referenced column'</a></h2>
+
+ <p>A column that is the first column for at least one cell box is
+ defined as <i>referenced</i>. Colspan &gt; 1 and excess column boxes
+ may cause <i>unreferenced</i> columns - columns in which no cell
+ starts.</p>
+
+ <p>Consider the following example:</p>
+
+ <pre class="code">
+&lt;table cellpadding=&quot;0&quot; cellspacing=&quot;10&quot; border=&quot;1&quot;&gt;
+ &lt;tr&gt;
+  &lt;td&gt;this cell should use all available table space&lt;/td&gt;
+ &lt;/tr&gt;
+ &lt;tr&gt;
+  &lt;td colspan=&quot;5&quot;&gt;even if this cell spans 4 more columns&lt;/td&gt;
+ &lt;/tr&gt;
+&lt;/table&gt;</pre>
+
+<p>This table has 5 columns. Only 1 of them is <i>referenced</i> (by 2
+cells). The remaining 4 are <i>unreferenced</i>.</p>
+
+<p>Another example, but defining excess column boxes instead of using
+colspan:</p>
+
+ <pre class="code">
+&lt;table cellpadding=&quot;0&quot; cellspacing=&quot;10&quot; border=&quot;1&quot;&gt;
+ &lt;col&gt;&lt;/col&gt;
+ &lt;col&gt;&lt;/col&gt;
+ &lt;col&gt;&lt;/col&gt;
+ &lt;col&gt;&lt;/col&gt;
+ &lt;col&gt;&lt;/col&gt;
+ &lt;tr&gt;
+  &lt;td&gt;these two cells combined&lt;/td&gt;
+  &lt;td&gt;should use all available table space&lt;/td&gt;
+ &lt;/tr&gt;
+&lt;/table&gt;</pre>
+
+ <p>There are 5 column boxes, but only the 2 first ones are
+ <i>referenced</i>.</p>
+
+ <p>Unreferenced columns don't take up any space. Border-spacing
+ between them is distributed among referenced columns.</p>
+
+ <p>The concept of referencedness is not defined in the HTML spec
+ (which simply says that all columns contribute to table width, but it
+ does mention that it is an error if the number of referenced columns
+ do not equal the number of columns defined by COL/COLGROUP, if
+ any). However, both MSIE and Firefox have this concept.
+ Konqueror/Safari has to, albeit somewhat &quot;buggy&quot;.</p>
+
+ <h2><a name="distribute-space">Column width distribution algorithm</a></h2>
+
+ <div class="coderef">ColumnCalculation,
+ TableContent::DistributeSpace()</div>
+
+ <p>Here is the complete step-by-step description of the width
+ distribution algorithm to use when distributing width across a
+ certain set of columns. It is used when setting all column widths
+ based on final table width. It is also used expanding column minimum,
+ normal minimum or maximum widths due to colspan.</p>
+
+ <p>Desired width and percentage width are mutually exclusive in this
+ algorithm; if both are set on a column, desired width is ignored.</p>
+
+ <p><b>Algorithm input:</b> Column selection; start column and number
+ of columns. Minimum total number of pixels to occupy by the selected
+ columns (also called <i>available space</i> or
+ <i>available width</i>). Minimum width, maximum width, desired width,
+ percentage width of each selected column</p>
+
+ <p><b>Algorithm output:</b> New width of each selected column. The
+ sum of the selected columns' widths must be equal to available
+ width.</p>
+
+ <h3>Check percentage</h3>
+
+ <p>Sanity check and correction of percentage widths:</p>
+ <p><b>For automatic table layout:</b> Make sure that
+ the percentage width of all columns combined doesn't exceed 100, and
+ adjust values if necessary: Start with the first column and
+ accumulate percentage values for each column. If the number exceeds
+ 100 at a column, truncate that column's percentage value so that the
+ <i>total percentage</i> becomes 100. Remove percentage values from
+ all remaining columns.</p>
+ <p><b>For fixed table layout:</b> If the percentage width of all columns
+ exceeds 100, reduce the percentage of each column proportionally, so that
+ the sum will become exactly 100.</p>
+
+ <p>This is only done when calculating all columns of a table, not
+ when expanding column min/max widths due to colspan. In that case,
+ percentages are scaled down to sum 100% (only the columns selected
+ are considered).</p>
+
+ <h3>Set start width</h3>
+
+ <p>When setting final column widths based on table widths, or when
+ expanding columns' minimum widths due to colspan, start by setting
+ each column width to its minimum width. When expanding normal minimum
+ width due to colspan, start by setting each column to its normal
+ minimum width instead. When expanding maximum width due to colspan,
+ start by setting each column to its maximum width.</p>
+
+ <p>The widths may only be increased after this step; they will never
+ shrink.</p>
+
+ <p>When expanding maximum width due to colspan, skip to the step
+ where excess space is distributed now. This is necessary because what
+ many of the following steps attempt to do has already been
+ achieved.</p>
+
+ <h3>[ERA] Attempt to satisfy normal minimum widths</h3>
+
+ <p>This part only relevant when when column start width is minimum
+ width.</p>
+
+ <p>If there is space left to distribute at this point, and layout
+ mode is non-normal (ERA, AMSR, CSSR, etc.), attempt to increase
+ column widths from minimum width to &quot;normal minimum
+ width&quot;. Columns should really only be narrower than normal
+ minimum width if absolutely inevitable, so regaining this space is
+ first priority. If there is enough space to satisfy normal minimum
+ width of each column completely, just do that. Otherwise, distribute
+ extra space by giving more to columns with larger difference between
+ minimum width and normal minimum width.</p>
+
+ <h3>Attempt to satisfy percentage widths</h3>
+
+ <p>If there is still space left to distribute, widen each
+ percentage-based column to satisfy their percentage
+ setting. Percentages are relative to <i>available space</i>, unless
+ total minimum width of non-percentage columns constitute a larger
+ portion of the table than the unused percentage:</p>
+
+ <blockquote>non-percentage columns' minimum widths > (100 - total
+ percentage) * available width</blockquote>
+
+ <p>If this is true, column percentages are scaled down so that new
+ total percentage multiplied with space left equals the difference
+ between <i>available space</i> and non-percentage columns' minimum
+ widths. Also, if there are only percentage columns in the table,
+ percentage values are scaled up so that summed they become
+ 100%.</p>
+
+ <p>Columns whose percentage resolves to a width less than their
+ minimum width count as non-percentage columns in this
+ step. Otherwise, more space than available might be distributed.</p>
+
+ <h3>Attempt to satisfy desired widths</h3>
+
+ <p>If there is still space left, attempt to satisfy the desired width
+ of each column. If there is enough space to satisfy them all
+ completely, just do that. Otherwise, increase the width of each
+ unsatisfied column to the difference between current width and
+ desired width scaled down so that complete increase equals amount of
+ space left.</p>
+
+ <h3>Attempt to satisfy maximum widths</h3>
+
+ <p>If there is still space left, attempt to satisfy the maximum width
+ of each column width no desired nor percentage width. If this would
+ use more space than available, make no changes and skip to the next
+ step in this algorithm.</p>
+
+ <h3><a name="distribute-space-excess">Excess space - distribute any
+ remaining space</a></h3>
+
+ <p>If there is still space left, find one set of columns that have
+ certain characteristics (presence of desired width, minimum width,
+ percentage) in common, and assign ALL remaining space to them. There
+ are four types of sets, and here is the list, in order of preference,
+ and how remaining space is distributed for them:</p>
+
+ <table border="1">
+  <col width="50%"></col>
+  <col width="50%"></col>
+
+  <tr>
+
+   <th>Condition (column set characteristics)</th>
+
+   <th>Action (distribution method)</th>
+
+  </tr>
+  <tr>
+
+   <td>columns with auto (no percentage AND no desired) width AND
+   non-zero minimum width<br><br>
+
+   Note: In quirks mode, if a <a href="#column-array">column's</a>
+   maximum width exceeds desired width, desired width is ignored (and
+   the column behaves as if it had auto width). <span
+   class="consider">IE always ignores desired width exceeded by
+   maximum width, while Opera, Konqueror and Firefox only do that in
+   quirks mode</span></td>
+
+   <td>widen each column relative to its unsatisfied maximum width
+   (difference between width so far and maximum width)</td>
+
+  </tr>
+  <tr>
+
+   <td>columns with desired width (and no percentage)</td>
+
+   <td>widen each column by the larger of each column's minimum width
+   and desired width relative to the sum of total of the larger of
+   desired width and minimum width of each column</td>
+
+  </tr>
+  <tr>
+
+   <td>columns with percentage</td>
+
+   <td>widen each column relative to their percentage</td>
+
+  </tr>
+  <tr>
+
+   <td>all columns</td>
+
+   <td>widen each column relative to their maximum width, or, if none
+   has maximum width, distribute remaining space evenly</td>
+
+  </tr>
+ </table>
+
+</body>
+</html>

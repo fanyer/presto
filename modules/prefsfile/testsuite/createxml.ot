@@ -1,0 +1,630 @@
+/* -*- Mode: c++; tab-width: 4; indent-tabs-mode: t; c-basic-offset: 4 -*-
+**
+** Copyright (C) 2004-2007 Opera Software ASA.  All rights reserved.
+**
+** This file is part of the Opera web browser.  It may not be distributed
+** under any circumstances.
+**
+** Peter Karlsson
+*/
+
+group "prefsfile.xml.create";
+require initialization;
+require PREFS_HAS_PREFSFILE;
+require PREFS_READ;
+require PREFS_WRITE;
+require PREFS_HAS_XML;
+
+include "modules/prefsfile/prefsfile.h";
+include "modules/util/opfile/opfile.h";
+
+// -- Global variables ---------------------------------------------------
+
+global
+{
+	PrefsFile *pfp;
+	OpFile *ofp, *gofp;
+}
+
+setup
+{
+	pfp = NULL;
+	ofp = NULL;
+	gofp = NULL;
+
+	// Create a new file for the test
+	ofp = OP_NEW(OpFile, ());
+	ofp->Construct(UNI_L("created.xml"), OPFILE_HOME_FOLDER);
+	BOOL exists = FALSE;
+	ofp->Exists(exists);
+	if (exists)
+	{
+		ofp->Delete();
+	}
+
+#ifdef PREFSFILE_WRITE_GLOBAL
+	// Create a global file for the write test
+	gofp = OP_NEW(OpFile, ());
+	gofp->Construct(UNI_L("createdg.xml"), OPFILE_HOME_FOLDER);
+	BOOL gexists = FALSE;
+	gofp->Exists(gexists);
+	if (gexists)
+	{
+		gofp->Delete();
+	}
+#endif
+
+	// Create the PrefsFile object
+	pfp = OP_NEW(PrefsFile, (PREFS_XML));
+	pfp->ConstructL();
+	pfp->SetFileL(ofp);
+#ifdef PREFSFILE_WRITE_GLOBAL
+	pfp->SetGlobalFileL(gofp);
+#endif
+}
+
+// -- Check setup --------------------------------------------------------
+
+test("Checking that the local file object was copied properly")
+{
+	// GetFile() regular API
+	OpFileDescriptor *fdp = pfp->GetFile();
+	verify(fdp);
+	verify(fdp->Type() == OPFILE);
+	const uni_char *fdpname = static_cast<OpFile *>(fdp)->GetSerializedName();
+	verify(fdpname);
+	const uni_char *ofpname = ofp->GetSerializedName();
+	verify(ofpname);
+	verify(uni_strcmp(fdpname, ofpname) == 0);
+
+	// GetFile() const API
+	const PrefsFile *constpfp = pfp;
+	const OpFileDescriptor *constfdp = constpfp->GetFile();
+	verify(constfdp);
+	verify(constfdp->Type() == OPFILE);
+	const uni_char *constfdpname = static_cast<const OpFile *>(constfdp)->GetSerializedName();
+	verify(constfdpname);
+	verify(uni_strcmp(constfdpname, ofpname) == 0);
+}
+
+test("Checking that the global file object was copied properly")
+	require PREFSFILE_GETGLOBALFILE;
+{
+	OpFileDescriptor *globalfdp = pfp->GetGlobalFile();
+#ifdef PREFSFILE_WRITE_GLOBAL
+	verify(globalfdp);
+	verify(globalfdp->Type() == OPFILE);
+	const uni_char *globalfdpname = static_cast<OpFile *>(globalfdp)->GetSerializedName();
+	verify(globalfdpname);
+	const uni_char *gofpname = gofp->GetSerializedName();
+	verify(gofpname);
+	verify(uni_strcmp(globalfdpname, gofpname) == 0);
+#else
+	verify(!globalfdp);
+#endif
+}
+
+test("Checking global fixed file object")
+	require PREFSFILE_GETFIXEDFILE;
+{
+	OpFileDescriptor *fixedfdp = pfp->GetGlobalFixedFile();
+	verify(!fixedfdp);
+}
+
+// -- Load the file ------------------------------------------------------
+
+test("Loading a non-existant XML file")
+{
+	TRAPD(rc, pfp->LoadAllL());
+	verify(OpStatus::IsSuccess(rc));
+}
+
+// -- Write strings ------------------------------------------------------
+
+table newstrings(const uni_char *, const uni_char *, const uni_char *)
+{
+	// Simple
+	{ UNI_L("Section1"), UNI_L("StringKey1"), UNI_L("Value1") },
+	{ UNI_L("Section1"), UNI_L("StringKey2"), UNI_L("Value2") },
+	{ UNI_L("Section2"), UNI_L("StringKey1"), UNI_L("Value1") },
+	{ UNI_L("Section2"), UNI_L("StringKey2"), UNI_L("Value2") },
+	// Complex
+	{ UNI_L("Section3"), UNI_L("="),          UNI_L("Value1") },
+	{ UNI_L("Section3"), UNI_L("\""),         UNI_L("Value2") },
+	{ UNI_L("Section3"), UNI_L("\"\""),       UNI_L("Value3") },
+	{ UNI_L("Section3"), UNI_L("\"=\""),      UNI_L("Value4") },	// Not supported
+	{ UNI_L("Section3"), UNI_L("[Section1]"), UNI_L("Value5") },
+	{ UNI_L("Section3"), UNI_L("["),          UNI_L("Value6") },
+	{ UNI_L("Section3"), UNI_L("]"),          UNI_L("Value7") },
+	{ UNI_L("Section3"), UNI_L("/"),          UNI_L("Value8") },
+	{ UNI_L("Section3"), UNI_L(";"),          UNI_L("Value9") },
+	{ UNI_L("Section3"), UNI_L("<key>"),      UNI_L("<data>") },
+	{ UNI_L("Section3"), UNI_L("&#foo"),      UNI_L("&#xbar") },
+	{ UNI_L("Section3"), UNI_L("Nul"),        NULL },
+	{ UNI_L("Section3"), UNI_L("Empty"),      UNI_L("") },
+	{ UNI_L("Section3"), UNI_L("Spaced"),     UNI_L("   ") },
+	// Some more sections to trigger section hashing (if enabled)
+	{ UNI_L("Section4"), UNI_L("Key"),        UNI_L("Value") },
+	{ UNI_L("Section5"), UNI_L("Key"),        UNI_L("Value") },
+	{ UNI_L("Section6"), UNI_L("Key"),        UNI_L("Value") },
+	{ UNI_L("Section7"), UNI_L("Key"),        UNI_L("Value") },
+	{ UNI_L("Section8"), UNI_L("Key"),        UNI_L("Value") },
+	{ UNI_L("Section9"), UNI_L("Key"),        UNI_L("Value") },
+}
+
+test("Writing strings to empty XML file")
+	require PREFSFILE_WRITE;
+{
+	iterate(section, key, value) from newstrings
+	{
+		OP_MEMORY_VAR OP_STATUS rc1 = OpStatus::OK;
+		TRAPD(rc2, rc1 = pfp->WriteStringL(section, key, value));
+		verify(OpStatus::IsSuccess(rc2));
+		verify(OpStatus::IsSuccess(rc1));
+	}
+}
+
+test("Checking that strings were cached")
+	require success "Writing strings to empty XML file";
+{
+	OpString s;
+
+	iterate(section, key, value) from newstrings
+	{
+		TRAPD(rc, pfp->ReadStringL(section, key, s));
+		verify(OpStatus::IsSuccess(rc));
+		verify(s.Compare(value) == 0);
+	}
+}
+
+// -- Write integers -----------------------------------------------------
+
+table newints(const uni_char *, const uni_char *, int)
+{
+	// Simple
+	{ UNI_L("Section1"), UNI_L("IntegerKey1"), 42 },
+	{ UNI_L("Section1"), UNI_L("IntegerKey2"), 4711 },
+	{ UNI_L("Section2"), UNI_L("IntegerKey1"), 4711 },
+	{ UNI_L("Section2"), UNI_L("IntegerKey2"), 42 },
+	// Complex
+	{ UNI_L("Section4"), UNI_L("="),          1 },
+	{ UNI_L("Section4"), UNI_L("\""),         2 },
+	{ UNI_L("Section4"), UNI_L("\"\""),       3 },
+	{ UNI_L("Section4"), UNI_L("[Section1]"), 4 },
+	{ UNI_L("Section4"), UNI_L("["),          5 },
+	{ UNI_L("Section4"), UNI_L("]"),          6 },
+}
+
+test("Writing integers to empty XML file")
+	require PREFSFILE_WRITE;
+{
+	iterate(section, key, value) from newints
+	{
+		OP_MEMORY_VAR OP_STATUS rc1 = OpStatus::OK;
+		TRAPD(rc2, rc1 = pfp->WriteIntL(section, key, value));
+		verify(OpStatus::IsSuccess(rc2));
+		verify(OpStatus::IsSuccess(rc1));
+	}
+}
+
+test("Checking that integers were cached")
+	require success "Writing integers to empty XML file";
+{
+	OP_MEMORY_VAR int x;
+
+	iterate(section, key, value) from newints
+	{
+		TRAPD(rc, x = pfp->ReadIntL(section, key, -1));
+		verify(OpStatus::IsSuccess(rc));
+		verify(x == value);
+	}
+}
+
+// -- Test modifying the value -------------------------------------------
+
+test("Modifying integers")
+	require PREFSFILE_WRITE;
+{
+	// Change the values to something else
+	OP_MEMORY_VAR int x;
+
+	iterate(section, key, value) from newints
+	{
+		OP_MEMORY_VAR OP_STATUS rc1 = OpStatus::OK;
+		TRAPD(rc2, rc1 = pfp->WriteIntL(section, key, 123456789));
+		verify(OpStatus::IsSuccess(rc2));
+		verify(OpStatus::IsSuccess(rc1));
+
+		TRAPD(rc, x = pfp->ReadIntL(section, key, -1));
+		verify(OpStatus::IsSuccess(rc));
+		verify(x == 123456789);
+	}
+
+	// Now change them back
+	iterate(section, key, value) from newints
+	{
+		OP_MEMORY_VAR OP_STATUS rc1 = OpStatus::OK;
+		TRAPD(rc2, rc1 = pfp->WriteIntL(section, key, value));
+		verify(OpStatus::IsSuccess(rc2));
+		verify(OpStatus::IsSuccess(rc1));
+
+		TRAPD(rc, x = pfp->ReadIntL(section, key, -1));
+		verify(OpStatus::IsSuccess(rc));
+		verify(x == value);
+	}
+}
+
+test("Modifying strings: increasing length")
+	require PREFSFILE_WRITE;
+{
+	OpString s;
+
+	// Test increasing string lengths (reallocates container)
+	iterate(section, key, value) from newstrings
+	{
+		OP_MEMORY_VAR OP_STATUS rc1 = OpStatus::OK;
+		OpString newvalue;
+		newvalue.Set(value);
+		newvalue.Append("...longer");
+		TRAPD(rc2, rc1 = pfp->WriteStringL(section, key, newvalue));
+		verify(OpStatus::IsSuccess(rc2));
+		verify(OpStatus::IsSuccess(rc1));
+
+		TRAPD(rc3, pfp->ReadStringL(section, key, s));
+		verify(OpStatus::IsSuccess(rc3));
+		verify(s.Compare(newvalue) == 0);
+	}
+}
+
+test("Modifying strings: changing back")
+	require PREFSFILE_WRITE;
+{
+	OpString s;
+
+	// Test changing strings back (no reallocation)
+	iterate(section, key, value) from newstrings
+	{
+		OP_MEMORY_VAR OP_STATUS rc1 = OpStatus::OK;
+		TRAPD(rc2, rc1 = pfp->WriteStringL(section, key, value));
+		verify(OpStatus::IsSuccess(rc2));
+		verify(OpStatus::IsSuccess(rc1));
+
+		TRAPD(rc3, pfp->ReadStringL(section, key, s));
+		verify(OpStatus::IsSuccess(rc3));
+		verify(s.Compare(value) == 0);
+	}
+}
+
+test("Modifying strings: setting to NULL")
+	require PREFSFILE_WRITE;
+{
+	OpString s;
+
+	// Test changing into null strings (no reallocation)
+	iterate(section, key, value) from newstrings
+	{
+		OP_MEMORY_VAR OP_STATUS rc1 = OpStatus::OK;
+		TRAPD(rc2, rc1 = pfp->WriteStringL(section, key, NULL));
+		verify(OpStatus::IsSuccess(rc2));
+		verify(OpStatus::IsSuccess(rc1));
+
+		TRAPD(rc3, pfp->ReadStringL(section, key, s));
+		verify(OpStatus::IsSuccess(rc3));
+		verify(s.CStr() == NULL);
+	}
+}
+
+test("Modifying strings: changing back")
+	require PREFSFILE_WRITE;
+{
+	OpString s;
+
+	// Test changing strings back (will reallocate since it has lost
+	// information about the allocated length)
+	iterate(section, key, value) from newstrings
+	{
+		OP_MEMORY_VAR OP_STATUS rc1 = OpStatus::OK;
+		TRAPD(rc2, rc1 = pfp->WriteStringL(section, key, value));
+		verify(OpStatus::IsSuccess(rc2));
+		verify(OpStatus::IsSuccess(rc1));
+
+		TRAPD(rc3, pfp->ReadStringL(section, key, s));
+		verify(OpStatus::IsSuccess(rc3));
+		verify(s.Compare(value) == 0);
+	}
+}
+
+// -- Write data to the global file --------------------------------------
+
+test("Writing data to the global file")
+	require PREFSFILE_WRITE_GLOBAL;
+{
+	// Write global strings that exist locally
+	OP_MEMORY_VAR OP_STATUS rc1, rc2 = OpStatus::OK;
+	TRAP(rc1, rc2 = pfp->WriteStringGlobalL(UNI_L("Section1"), UNI_L("StringKey1"),  UNI_L("Global")));
+	verify(OpStatus::IsSuccess(rc1));
+	verify(OpStatus::IsSuccess(rc2));
+	TRAP(rc1, rc2 = pfp->WriteIntGlobalL(   UNI_L("Section1"), UNI_L("IntegerKey1"), 666));
+	verify(OpStatus::IsSuccess(rc1));
+	verify(OpStatus::IsSuccess(rc2));
+
+	// Check that we read the local value
+	OpString s;
+	TRAP(rc1, pfp->ReadStringL(UNI_L("Section1"), UNI_L("StringKey1"), s));
+	verify(OpStatus::IsSuccess(rc1));
+	verify(s.Compare(UNI_L("Value1")) == 0);
+
+	OP_MEMORY_VAR int x;
+	TRAP(rc1, x = pfp->ReadIntL(UNI_L("Section1"), UNI_L("IntegerKey1"), -1));
+	verify(OpStatus::IsSuccess(rc1));
+	verify(x == 42);
+
+	// Write global strings that do not exist locally
+	TRAP(rc1, rc2 = pfp->WriteStringGlobalL("GlobalSection1", "GlobalStringKey1",  UNI_L("Global")));
+	verify(OpStatus::IsSuccess(rc1));
+	verify(OpStatus::IsSuccess(rc2));
+	TRAP(rc1, rc2 = pfp->WriteIntGlobalL(   "GlobalSection1", "GlobalIntegerKey1", 666));
+	verify(OpStatus::IsSuccess(rc1));
+	verify(OpStatus::IsSuccess(rc2));
+
+	// Check that we read the global value
+	TRAP(rc1, pfp->ReadStringL(UNI_L("GlobalSection1"), UNI_L("GlobalStringKey1"), s));
+	verify(OpStatus::IsSuccess(rc1));
+	verify(s.Compare(UNI_L("Global")) == 0);
+
+	TRAP(rc1, x = pfp->ReadIntL(UNI_L("GlobalSection1"), UNI_L("GlobalIntegerKey1"), -1));
+	verify(OpStatus::IsSuccess(rc1));
+	verify(x == 666);
+}
+
+// -- Dump to disk and read it back --------------------------------------
+
+test("Dumping data to disk")
+{
+	TRAPD(rc, pfp->CommitL(TRUE, TRUE));
+	verify(OpStatus::IsSuccess(rc));
+}
+
+test("Creating a new PrefsFile object for the file")
+{
+	OP_DELETE(pfp);
+	pfp = NULL;
+
+	pfp = OP_NEW(PrefsFile, (PREFS_XML));
+	pfp->ConstructL();
+	pfp->SetFileL(ofp);
+#ifdef PREFSFILE_WRITE_GLOBAL
+	pfp->SetGlobalFileL(gofp);
+#endif
+}
+
+// -- Check that the data is intact --------------------------------------
+
+test("Checking that strings were written properly")
+	require success "Dumping data to disk";
+	require success "Creating a new PrefsFile object for the file";
+{
+	OpString s;
+
+	iterate(section, key, value) from newstrings
+	{
+		TRAPD(rc, pfp->ReadStringL(section, key, s));
+		verify(OpStatus::IsSuccess(rc));
+//output("section=%s key=%s want='%s' rc=%d", ST_down(section), ST_down(key), value ? ST_down(value) : "null", rc);
+//output(" got='%s'\n", s.CStr() ? ST_down(s.CStr()) : "null");
+		verify(s.Compare(value) == 0);
+	}
+}
+
+test("Checking that integers were written properly")
+	require success "Dumping data to disk";
+	require success "Creating a new PrefsFile object for the file";
+{
+	OP_MEMORY_VAR int x;
+
+	iterate(section, key, value) from newints
+	{
+		TRAPD(rc, x = pfp->ReadIntL(section, key, -1));
+		verify(OpStatus::IsSuccess(rc));
+		verify(x == value);
+	}
+}
+
+test("Checking that global data was written properly")
+	require success "Dumping data to disk";
+	require success "Creating a new PrefsFile object for the file";
+	require PREFSFILE_WRITE_GLOBAL;
+{
+	OP_STATUS rc1;
+
+	// Check that we read the global value
+	OpString s;
+	TRAP(rc1, pfp->ReadStringL(UNI_L("GlobalSection1"), UNI_L("GlobalStringKey1"), s));
+	verify(OpStatus::IsSuccess(rc1));
+	verify(s.Compare(UNI_L("Global")) == 0);
+
+	OP_MEMORY_VAR int x;
+	TRAP(rc1, x = pfp->ReadIntL(UNI_L("GlobalSection1"), UNI_L("GlobalIntegerKey1"), -1));
+	verify(OpStatus::IsSuccess(rc1));
+	verify(x == 666);
+}
+
+// -- Delete everything --------------------------------------------------
+
+test("Deleting all local data")
+	require success "Checking that integers were written properly";
+	require PREFS_DELETE_ALL_SECTIONS;
+{
+	TRAPD(rc, pfp->DeleteAllSectionsL());
+
+	OpString s;
+
+	iterate(section, key, value) from newstrings
+	{
+#ifdef PREFSFILE_WRITE_GLOBAL
+		if (uni_strcmp(key, UNI_L("StringKey1")) != 0) // Written to global file
+#endif
+		{
+			TRAPD(rc, pfp->ReadStringL(section, key, s, UNI_L("n/a")));
+			verify(OpStatus::IsSuccess(rc));
+			verify(s.Compare(UNI_L("n/a")) == 0);
+		}
+	}
+
+	OP_MEMORY_VAR int x;
+
+	iterate(section, key, value) from newints
+	{
+#ifdef PREFSFILE_WRITE_GLOBAL
+		if (uni_strcmp(key, UNI_L("IntegerKey1")) != 0) // Written to global file
+#endif
+		{
+			TRAPD(rc, x = pfp->ReadIntL(section, key, -1));
+			verify(OpStatus::IsSuccess(rc));
+			verify(-1 == x);
+		}
+	}
+}
+
+// -- Dump to disk and read it back (now empty) --------------------------
+
+test("Dumping the now empty file to disk")
+	require PREFS_DELETE_ALL_SECTIONS;
+{
+	TRAPD(rc, pfp->CommitL(TRUE, TRUE));
+	verify(OpStatus::IsSuccess(rc));
+}
+
+test("Creating a new PrefsFile object for the now empty file")
+	require PREFS_DELETE_ALL_SECTIONS;
+{
+	OP_DELETE(pfp);
+	pfp = NULL;
+
+	pfp = OP_NEW(PrefsFile, (PREFS_XML));
+	pfp->ConstructL();
+	pfp->SetFileL(ofp);
+#ifdef PREFSFILE_WRITE_GLOBAL
+	pfp->SetGlobalFileL(gofp);
+#endif
+}
+
+// -- Check that the file is indeed empty now ----------------------------
+
+test("Check that the file is indeed empty now")
+	require success "Deleting all local data";
+	require success "Dumping the now empty file to disk";
+	require success "Creating a new PrefsFile object for the now empty file";
+{
+	OpString s;
+
+	iterate(section, key, value) from newstrings
+	{
+#ifdef PREFSFILE_WRITE_GLOBAL
+		if (uni_strcmp(key, UNI_L("StringKey1")) != 0) // Written to global file
+#endif
+		{
+			TRAPD(rc, pfp->ReadStringL(section, key, s, UNI_L("n/a")));
+			verify(OpStatus::IsSuccess(rc));
+			verify(s.Compare(UNI_L("n/a")) == 0);
+		}
+	}
+
+	OP_MEMORY_VAR int x;
+
+	iterate(section, key, value) from newints
+	{
+#ifdef PREFSFILE_WRITE_GLOBAL
+		if (uni_strcmp(key, UNI_L("IntegerKey1")) != 0) // Written to global file
+#endif
+		{
+			TRAPD(rc, x = pfp->ReadIntL(section, key, -1));
+			verify(OpStatus::IsSuccess(rc));
+			verify(-1 == x);
+		}
+	}
+}
+
+test("Check that global data is still present")
+	require success "Check that the file is indeed empty now";
+	require PREFSFILE_WRITE_GLOBAL;
+{
+	OP_STATUS rc1;
+
+	// Values that were previously overwritten
+	OpString s;
+	TRAP(rc1, pfp->ReadStringL(UNI_L("Section1"), UNI_L("StringKey1"), s));
+	verify(OpStatus::IsSuccess(rc1));
+	verify(s.Compare(UNI_L("Global")) == 0);
+
+	OP_MEMORY_VAR int x;
+	TRAP(rc1, x = pfp->ReadIntL(UNI_L("Section1"), UNI_L("IntegerKey1"), -1));
+	verify(OpStatus::IsSuccess(rc1));
+	verify(x == 666);
+
+	// Values that always have yielded the global value
+	TRAP(rc1, pfp->ReadStringL(UNI_L("GlobalSection1"), UNI_L("GlobalStringKey1"), s));
+	verify(OpStatus::IsSuccess(rc1));
+	verify(s.Compare(UNI_L("Global")) == 0);
+
+	TRAP(rc1, x = pfp->ReadIntL(UNI_L("GlobalSection1"), UNI_L("GlobalIntegerKey1"), -1));
+	verify(OpStatus::IsSuccess(rc1));
+	verify(x == 666);
+}
+
+test("Deleting all global data")
+	require success "Check that global data is still present";
+	require PREFSFILE_WRITE_GLOBAL;
+{
+	BOOL deleted = FALSE;
+	TRAPD(rc, deleted = pfp->DeleteKeyGlobalL(UNI_L("Section1"), UNI_L("StringKey1")));
+	verify(OpStatus::IsSuccess(rc));
+	verify(deleted);
+
+	OpString s;
+	TRAP(rc, pfp->ReadStringL(UNI_L("Section1"), UNI_L("StringKey1"), s, UNI_L("undefined")));
+	verify(OpStatus::IsSuccess(rc));
+	verify(s.Compare(UNI_L("undefined")) == 0);
+
+	deleted = FALSE;
+	TRAP(rc, deleted = pfp->DeleteKeyGlobalL(UNI_L("Section1"), UNI_L("IntegerKey1")));
+	verify(OpStatus::IsSuccess(rc));
+	verify(deleted);
+
+	deleted = FALSE;
+	TRAP(rc, deleted = pfp->DeleteSectionGlobalL(UNI_L("GlobalSection1")));
+	verify(OpStatus::IsSuccess(rc));
+	verify(deleted);
+
+	TRAP(rc, pfp->ReadStringL(UNI_L("GlobalSection1"), UNI_L("GlobalStringKey1"), s, UNI_L("undefined")));
+	verify(OpStatus::IsSuccess(rc));
+	verify(s.Compare(UNI_L("undefined")) == 0);
+}
+
+
+// -- Global cleanup -----------------------------------------------------
+
+exit
+{
+	pfp->Reset();
+	OP_DELETE(pfp);
+
+	// Remove the generated file
+	BOOL exists = FALSE;
+	ofp->Exists(exists);
+	if (exists)
+	{
+		ofp->Delete();
+	}
+	OP_DELETE(ofp);
+
+#ifdef PREFSFILE_WRITE_GLOBAL
+	BOOL gexists = FALSE;
+	gofp->Exists(gexists);
+	if (gexists)
+	{
+		gofp->Delete();
+	}
+	OP_DELETE(gofp);
+#endif
+}

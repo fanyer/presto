@@ -1,0 +1,217 @@
+/* -*- Mode: c++; tab-width: 4; indent-tabs-mode: t; c-basic-offset: 4 -*- */
+
+group "webfeeds.parser";
+require init;
+require WEBFEEDS_BACKEND_SUPPORT;
+
+include "modules/webfeeds/src/webfeedparser.h";
+include "modules/webfeeds/src/webfeed.h";
+
+language C++;
+
+global
+{
+	class SelftestParserListener : public WebFeedParserListener
+	{
+	private:
+		WebFeed* last_parsed_feed;
+	public:
+		SelftestParserListener() : last_parsed_feed(NULL) {}
+		~SelftestParserListener() { if (last_parsed_feed) last_parsed_feed->DecRef(); }
+		WebFeed* GetFeed() { return last_parsed_feed; }
+		
+		virtual void OnEntryLoaded(OpFeedEntry* entry, OpFeedEntry::EntryStatus, BOOL new_entry) {}
+		virtual void ParsingDone(WebFeed* feed, OpFeed::FeedStatus status) { if (status == OpFeed::STATUS_OK) { last_parsed_feed = feed; feed->IncRef(); } }
+		virtual void ParsingStarted() {}
+	};
+	
+	const char* rss_data;
+	const char *atom_data1, *atom_data2;
+}
+
+setup
+{
+	rss_data = "<?xml version=\"1.0\" encoding=\"utf-8\"?>"
+        "<rss version=\"0.91\">"
+        "<channel>"
+        "  <title>Opera Press Releases &amp;amp; News</title>"
+        "  <link>http://www.opera.com/pressreleases</link>"
+        "  <author>Opera Software</author>"
+        "  <description>The latest press releases from Opera Software</description>"
+        "  <language>en-us</language>"
+        "  <item>"
+        "    <title><![CDATA[October 17, 2005: Opera Software Releases Browsers in Hindi and Punjabi: Only Current Browser Supporting Both Languages]]></title>"
+        "    <link>http://www.opera.com/pressreleases/en/2005/10/17/</link>"
+        "  </item>"
+        "  <item>"
+        "    <title><![CDATA[October 14, 2005: Nokia N70 from T-Mobile with Opera Browser]]></title>"
+        "    <link>http://www.opera.com/pressreleases/en/2005/10/14/</link>"
+        "  </item>"
+        "</channel>"
+        "</rss>";
+
+    atom_data1 = "<?xml version=\"1.0\" encoding=\"utf-8\"?>"
+		"<feed xmlns=\"http://www.w3.org/2005/Atom\">"
+		"  <title type=\"xhtml\" xml:lang=\"en\">"
+		"    <div xmlns=\"http://www.w3.org/1999/xhtml\" lang=\"en\" dir=\"ltr\">GAME ON!!!1</div>"
+		"  </title>"
+		"  <link href=\"http://my.opera.com/mustache/\"/>"
+		"  <link rel=\"self\" href=\"http://my.opera.com/mustache/blog/xml/atom/blog\"/>"
+		"  <author>"
+		"    <name>The Mustache Club</name>"
+		"    <email>mustacheclub@example.com.invalid</email>"
+		"  </author>"
+		"  <id>http://my.opera.com/mustache/blog/</id>"
+		"  <updated>2005-11-09T12:36:44Z</updated>"
+		"<entry>"
+		"  <title ty";
+    
+    atom_data2 = "pe=\"xhtml\" xml:lang=\"en\">"
+		"    <div xmlns=\"http://www.w3.org/1999/xhtml\" lang=\"en\" dir=\"ltr\">My future participation is questionable.</div>"
+		"  </title>"
+		"  <link href=\"http://my.opera.com/mustache/blog/show.dml/59149\"/>"
+    	"  <link href=\"http://my.opera.com/desktopteam/blog/atom\" rel=\"related\"/>"
+		"  <id>http://my.opera.com/mustache/blog/59149</id>"
+		"  <updated>2005-11-09T12:36:44Z</updated>"
+		"  <content xml:lang=\"en\" type=\"xhtml\"><div xmlns=\"http://www.w3.org/1999/xhtml\" lang=\"en\" dir=\"ltr\">At the moment, my competitors are in the process of having me disqualified, with ridiculous reasoning that I am not able to grow a mustache.  You can feel it with your finger. Really!<br/><br/></div></content>"
+		"</entry>"
+		"<entry>"
+		"<title>Base 64 test</title>"
+		"  <link href=\"http://my.opera.com/mustache/blog/show.dml/59149x\"/>"
+		"  <id>http://my.opera.com/mustache/blog/59149x</id>"
+		"  <updated>2005-11-19T12:36:43Z</updated>"
+		"  <content xml:lang=\"en\" mode=\"Base64\" type=\"application/octet-stream\">"
+				"VGhpcyBpcyAAYmFzZTY0Lg=="      // "This is \0base64." in Base 64
+		"</content>"
+		"</entry>"
+		"</feed>";
+}
+
+table expected_links(OpFeedLinkElement::LinkRel, const char*)
+{
+	{ OpFeedLinkElement::Alternate, "http://my.opera.com/mustache/blog/show.dml/59149" }
+	{ OpFeedLinkElement::Related, "http://my.opera.com/desktopteam/blog/atom" }
+}
+
+test("RSS Parsing")
+{
+	SelftestParserListener parser_listener;
+	WebFeedParser parser(&parser_listener);
+	OpString url;
+	url.Set(UNI_L("http://www.opera.com/pressreleases"));
+	parser.Init(url);
+
+	verify(parser.Parse(rss_data, op_strlen(rss_data), TRUE) == OpStatus::OK);
+	OpFeed* feed = parser_listener.GetFeed();
+	verify(feed != NULL);
+	verify(feed->GetStatus() == OpFeed::STATUS_OK);
+
+	const uni_char* title = feed->GetTitle()->Data();
+	verify(uni_strcmp(title, UNI_L("Opera Press Releases &amp; News")) == 0);
+
+	verify(uni_str_eq(feed->GetAuthor(), UNI_L("Opera Software")));
+
+	// check that we got all entries
+	verify(feed->GetTotalCount() == 2);
+	verify(feed->GetUnreadCount() == 2);
+}
+
+test("Atom parsing")
+{
+	SelftestParserListener parser_listener;
+	WebFeedParser atom_parser(&parser_listener);
+	OpString url;
+	url.Set(UNI_L("http://my.opera.com/mustache/blog/"));
+	atom_parser.Init(url);
+
+	UINT max_age = g_webfeeds_api->GetDefMaxAge();
+	g_webfeeds_api->SetDefMaxAge(0);
+
+	verify(atom_parser.Parse(atom_data1, op_strlen(atom_data1), FALSE) == OpStatus::OK);
+	verify(!atom_parser.IsFailed());
+	verify(atom_parser.Parse(atom_data2, op_strlen(atom_data2), TRUE) == OpStatus::OK);
+	verify(!atom_parser.IsFailed());
+
+	WebFeed* atom_feed = parser_listener.GetFeed();
+	verify(atom_feed != NULL);
+	verify(atom_feed->GetStatus() == OpFeed::STATUS_OK);
+	((WebFeedsAPI_impl*)g_webfeeds_api)->AddFeed(atom_feed);
+
+	g_webfeeds_api->SetDefMaxAge(max_age);
+
+	// check title
+	const uni_char* title = atom_feed->GetTitle()->Data();
+	const uni_char* correct_page_title = UNI_L("    GAME ON!!!1  ");
+	verify(uni_str_eq(title, correct_page_title));
+
+	// try setting user defined title
+	OpString user_title, read_title;
+	verify(user_title.Set("Mustache Club") == OpStatus::OK);
+	verify(atom_feed->SetUserDefinedTitle(user_title) == OpStatus::OK);
+	verify(atom_feed->GetUserDefinedTitle(read_title) == OpStatus::OK);
+	verify(read_title == user_title);
+
+	// check that original title remains unchanged
+	verify(uni_str_eq(title, correct_page_title));
+
+	// check author
+	WebFeedPersonElement* author = atom_feed->AuthorElement();
+	verify(author != NULL);
+	verify(author->Name().Compare("The Mustache Club") == 0);
+	verify(author->Email().Compare("mustacheclub@example.com.invalid") == 0);
+
+	OpFeedEntry* op_entry = atom_feed->GetEntryById(1);
+	verify(op_entry != NULL);
+
+	unsigned link_no = 0;
+	iterate (expected_rel, expected_uri) from expected_links
+	{
+		verify(link_no < op_entry->LinkCount());
+
+		verify(op_entry->GetLink(link_no)->Relationship() == expected_rel);
+		OpString8 url_string;
+		verify(op_entry->GetLink(link_no)->URI().GetAttribute(URL::KName, url_string) == OpStatus::OK);
+		verify(url_string.Compare(expected_uri) == 0);
+
+		link_no++;
+	}
+	
+	WebFeedEntry* entry = (WebFeedEntry*)atom_feed->GetEntryById(2);
+	verify(entry != NULL);
+
+	// Check that we can get the same feed back from the API
+	verify(g_webfeeds_api->GetFeedById(atom_feed->GetId()) == atom_feed);
+
+	// Check subscription
+	verify(atom_feed->IsSubscribed() == FALSE);
+	atom_feed->Subscribe();
+	verify(atom_feed->IsSubscribed());
+
+	// Iterate through all and make sure we have the feed among the subscribed
+	UINT total_feeds;
+	UINT* all_ids = g_webfeeds_api->GetAllFeedIds(total_feeds, TRUE);
+	verify(all_ids);
+	BOOL found = FALSE;
+	for (unsigned i = 0; i < total_feeds; i++)
+		if (g_webfeeds_api->GetFeedById(all_ids[i]) == atom_feed)
+		{
+			found = TRUE;
+			break;
+		}
+	OP_DELETEA(all_ids);
+
+	atom_feed->UnSubscribe();
+	verify(atom_feed->IsSubscribed() == FALSE);
+	verify(found);
+
+	verify(atom_feed->GetTotalCount() == 2);
+	verify(atom_feed->GetUnreadCount() == 2);
+
+	// content contains a 0-byte, check that full content is received:
+	const unsigned char* data; UINT length;
+	verify(entry->GetContent()->IsBinary());
+	entry->GetContent()->Data(data, length);
+	verify(length == 16);
+	verify(op_strcmp((char*)data, "This is ") == 0);
+	verify(op_strncmp((char*)data+9, "base64.", 7) == 0);
+}

@@ -1,0 +1,114 @@
+// -*- Mode: c++; tab-width: 4; indent-tabs-mode: t; c-basic-offset: 4 -*-
+//
+// Copyright (C) 2003-2010 Opera Software AS.  All rights reserved.
+//
+// This file is part of the Opera web browser.  It may not be distributed
+// under any circumstances.
+//
+// Øyvind Østlund
+//
+ 
+group "operainstaller.handleinfo";
+require init;
+require MSWIN;
+
+include "platforms/windows/installer/HandleInfo.h";
+include "platforms/windows/installer/ProcessModel.h";
+include "platforms/windows/windows_ui/winshell.h";
+
+language C++;
+
+global
+{
+	OpString selftest_folder;
+	OpString locked_file_name;
+	OpString file_locker_name;
+	DWORD	 process_id;
+} 
+
+setup
+{
+	selftest_folder.Set(__FILE__);
+	int i = selftest_folder.FindLastOf(PATHSEPCHAR);
+	selftest_folder.Delete(i);
+	selftest_folder.Append(UNI_L("\\data\\"));
+
+	//locled_file_name.Set(selftest_folder.CStr());
+	locked_file_name.Set(UNI_L("opera_installer_locked_file.odt"));
+
+	//file_locker_name.Append(selftest_folder.CStr());
+	file_locker_name.Set(UNI_L("opera_install_file_lock.exe"));
+}
+
+exit
+{
+	ProcessTools::TerminateApp(process_id, 5000);
+}
+
+test("Find process locking file and terminate")
+{
+	OpString locked_file_path;
+	locked_file_path.Set(selftest_folder.CStr());
+	locked_file_path.Append(locked_file_name.CStr());
+	verify(32 < (int)ShellExecute(g_main_hwnd, NULL, file_locker_name.CStr(), locked_file_path.CStr(), selftest_folder.CStr(), SW_NORMAL));
+
+	Sleep(1000);
+	HandleInfo h;
+	RETURN_IF_ERROR(h.Init());
+
+	OpAutoVector<ProcessItem> p;
+	h.IsFileInUse(locked_file_path.CStr(), p, TRUE);
+
+	ProcessItem* pi = p.Get(0);
+
+	if (pi)
+	{
+		process_id = pi->GetProcessID();
+		verify(OpStatus::IsSuccess(ProcessTools::TerminateApp(process_id, 5000)));
+	}
+
+	verify(p.GetCount() >= 1);
+	verify(pi);
+	verify(pi->GetProcessPath());
+	verify(uni_stricmp(pi->GetProcessPath(), file_locker_name.CStr()));
+}
+
+test("Terminate application gracefully")
+{
+	OpString locked_file_path;
+	locked_file_path.Set(selftest_folder.CStr());
+	locked_file_path.Append(locked_file_name.CStr());
+	verify(32 < (int)ShellExecute(g_main_hwnd, NULL, file_locker_name.CStr(), locked_file_path.CStr(), selftest_folder.CStr(), SW_NORMAL));
+
+	Sleep(1000);
+	HandleInfo h;
+	RETURN_IF_ERROR(h.Init());
+
+	OpAutoVector<ProcessItem> p;
+	h.IsFileInUse(locked_file_path.CStr(), p, TRUE);
+
+	ProcessItem* pi = p.Get(0);
+
+	verify(pi);
+
+	DWORD exit_code;
+	HANDLE process_handle = OpenProcess(PROCESS_QUERY_INFORMATION, FALSE, pi->GetProcessID());
+
+	verify(process_handle != NULL);
+	verify(GetExitCodeProcess(process_handle, &exit_code) != 0);
+	verify(exit_code == STILL_ACTIVE);
+
+	pi->TerminateProcessGracefully();
+
+	UINT i = 0;
+
+	while (i++ < 20 && GetExitCodeProcess(process_handle, &exit_code) != 0 && exit_code == STILL_ACTIVE)
+		Sleep(50);
+
+	verify(GetExitCodeProcess(process_handle, &exit_code) != 0);
+	verify(exit_code != STILL_ACTIVE);
+
+	verify(pi);
+	verify(pi->GetProcessPath());
+	verify(uni_stricmp(pi->GetProcessPath(), file_locker_name.CStr()));
+}

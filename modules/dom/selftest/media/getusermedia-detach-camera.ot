@@ -1,0 +1,201 @@
+/* -*- Mode: c++; tab-width: 4; indent-tabs-mode: t; c-basic-offset: 4 -*-
+ *
+ * Copyright (C) 2012 Opera Software AS.  All rights reserved.
+ *
+ * This file is part of the Opera web browser.
+ * It may not be distributed under any circumstances.
+ */
+
+group "DOM.Media.getUserMedia.Detach";
+
+require init;
+require DOM_STREAM_API_SUPPORT;
+require USE_DUMMY_OP_CAMERA_IMPL;
+require SECMAN_SET_USERCONSENT;
+
+include "modules/dochand/win.h";
+include "modules/security_manager/include/security_manager.h";
+include "modules/windowcommander/OpWindowCommander.h";
+include "modules/windowcommander/src/WindowCommander.h";
+include "platforms/dummy_pi_impl/pi_impl/DummyOpCamera.h";
+
+language c++;
+
+global
+{
+	class CountingPermissionListener : public NullPermissionListener
+	{
+	public:
+		CountingPermissionListener() : m_ask_count(0)
+		{}
+
+		virtual void OnAskForPermission(OpWindowCommander* wic, PermissionCallback* callback)
+		{
+			if (callback->Type() == PermissionCallback::PERMISSION_TYPE_CAMERA_REQUEST)
+			{
+				++m_ask_count;
+				callback->OnAllowed();
+			}
+			else
+				NullPermissionListener::OnAskForPermission(wic, callback);
+		}
+
+		// Call this before each test to reset the state
+		void Reset()
+		{
+			m_ask_count = 0;
+		}
+
+		unsigned AskForPermissionCount() { return m_ask_count; }
+	private:
+		unsigned m_ask_count;
+	};
+
+	CountingPermissionListener g_counting_permission_listener;
+	DummyOpCameraManager* g_dummy_camera_manager = static_cast<DummyOpCameraManager*>(g_op_camera_manager);
+
+	OpPermissionListener* original_permission_listener;
+}
+
+setup
+{
+	WindowCommander* wic = state.GetWindow()->GetWindowCommander();
+	original_permission_listener = wic->GetPermissionListener();
+	wic->SetPermissionListener(&g_counting_permission_listener);
+}
+
+exit
+{
+	if (state.GetWindow())
+		state.GetWindow()->GetWindowCommander()->SetPermissionListener(original_permission_listener);
+}
+
+test("Detach camera while active - Setup")
+{
+	// Attach camera
+	verify_success(g_dummy_camera_manager->AttachCamera());
+	verify(g_dummy_camera_manager->HasCamera());
+
+	// Revoke permissions
+	verify_success(g_secman_instance->SetUserConsent(state.GetWindow(),
+		OpPermissionListener::PermissionCallback::PERMISSION_TYPE_CAMERA_REQUEST,
+		OpPermissionListener::PermissionCallback::PERSISTENCE_TYPE_RUNTIME,
+		OpSecurityManager::GetSelftestHostName(), ASK));
+
+	g_counting_permission_listener.Reset();
+}
+
+test("Detach camera while active - Request camera access and detach")
+	async;
+	language ecmascript;
+	require success "Detach camera while active - Setup";
+{
+	var timeoutId
+
+	function onTimeout()
+	{
+		ST_failed("Timeout", 0, 0);
+	}
+
+	function onStreamEnded()
+	{
+		if (timeoutId)
+			clearTimeout(timeoutId);
+		ST_passed();
+	}
+
+	function onUserMediaSuccess(stream)
+	{
+		stream.onended = onStreamEnded;
+		opera.detachDummyCamera();
+		timeoutId = setTimeout(onTimeout, 1000);
+	}
+
+	function onUserMediaError(error)
+	{
+		ST_failed("getUserMedia error: " + error.code, 0, 0);
+	}
+
+	timeoutId = setTimeout(onTimeout, 1000);
+	try {
+		navigator.getUserMedia({ video: true }, onUserMediaSuccess, onUserMediaError);
+	}
+	catch(e)
+	{
+		ST_failed("getUserMedia has thrown an exception: " + e, 0, 0);
+	}
+}
+
+test("Detach camera while active - Verify results")
+	require success "Detach camera while active - Request camera access and detach";
+{
+	verify(g_counting_permission_listener.AskForPermissionCount() == 1);
+}
+
+test("Detach camera while active - Cleanup")
+{
+	verify_success(g_dummy_camera_manager->AttachCamera());
+}
+
+
+test("Try to use camera when it's not available - Setup")
+{
+	// Detach camera
+	g_dummy_camera_manager->DetachCamera();
+	verify(!g_dummy_camera_manager->HasCamera());
+
+	// Revoke permissions
+	verify_success(g_secman_instance->SetUserConsent(state.GetWindow(),
+		OpPermissionListener::PermissionCallback::PERMISSION_TYPE_CAMERA_REQUEST,
+		OpPermissionListener::PermissionCallback::PERSISTENCE_TYPE_RUNTIME,
+		OpSecurityManager::GetSelftestHostName(), ASK));
+
+	g_counting_permission_listener.Reset();
+}
+
+test("Try to use camera when it's not available - Request camera access")
+	language ecmascript;
+	require success "Try to use camera when it's not available - Setup";
+	async;
+{
+	var timeoutId
+
+	function onTimeout()
+	{
+		ST_failed("Timeout", 0, 0);
+	}
+
+	function onUserMediaSuccess()
+	{
+		if (timeoutId)
+			clearTimeout(timeoutId);
+		ST_failed("onUserMediaSuccess called", 0, 0);
+	}
+
+	function onUserMediaError()
+	{
+		if (timeoutId)
+			clearTimeout(timeoutId);
+		ST_passed();
+	}
+
+	timeoutId = setTimeout(onTimeout, 1000);
+	try {
+		navigator.getUserMedia({ video: true }, onUserMediaSuccess, onUserMediaError);
+	}
+	catch(e)
+	{
+		ST_failed("Unexcpected exception caught: " + e);
+	}
+}
+
+test("Try to use camera when it's not available - Verify results")
+	require success "Try to use camera when it's not available - Request camera access";
+{
+	verify(g_counting_permission_listener.AskForPermissionCount() == 0);
+}
+
+test("Try to use camera when it's not available - Cleanup")
+{
+	verify_success(g_dummy_camera_manager->AttachCamera());
+}

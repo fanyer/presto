@@ -1,0 +1,1427 @@
+/* -*- Mode: c++; tab-width: 4; indent-tabs-mode: t; c-basic-offset: 4; c-file-style:"stroustrup" -*-
+**
+** Copyright (C) 1995-2007 Opera Software AS.  All rights reserved.
+**
+** This file is part of the Opera web browser.  It may not be distributed
+** under any circumstances.
+**
+** Tests developed for checking the functionalities exposed to the extensions.
+**
+** Luca Venturi
+**
+*/
+
+group "content_filter.ext";
+require URL_FILTER;
+
+include "modules/content_filter/content_filter.h";
+include "modules/pi/OpSystemInfo.h";
+include "modules/url/url2.h";
+include "modules/url/url_man.h";
+
+// should all be blocked
+table Table_blocked(const uni_char*)
+{
+	{ UNI_L("148x800") }
+	{ UNI_L("http://148x800") }
+	{ UNI_L("https://abaco148x800ciao") }
+	{ UNI_L("148y800148z800148x800") }
+	{ UNI_L("e-mailpaysu.com/") }
+	{ UNI_L("ee-mailpaysu.com/") }
+	{ UNI_L("http://e-mailpaysu.com/") }
+	{ UNI_L("https://e-mailpaysu.com/test") }
+	{ UNI_L("test://e-mailpaysu.com/test") }
+	{ UNI_L("yimg.com/.yahoo.com/flash/sw") }
+	{ UNI_L("http://yimg.com/.yahoo.com/flash/sw") }
+	{ UNI_L("https://yimg.com/test.yahoo.com/flash/1sw2") }
+	{ UNI_L("https://yimg.com/test.yahoo.com/flash/sysw") }
+	
+}
+
+// none of these should be blocked
+table Table_not_blocked(const uni_char*)
+{
+	{ UNI_L("1481x800") }
+	{ UNI_L("http://148x8200") }
+	{ UNI_L("https://abaco1_48x800ciao") }
+	{ UNI_L("148y800148y800148y800") }
+	{ UNI_L("e--mailpaysu.com/") }
+	{ UNI_L("-mailpaysu.com/") }
+	{ UNI_L("http://e-mailpaysu.comm/") }
+	{ UNI_L("https://e-mailpaysu..com/test") }
+	{ UNI_L("test://e--mailpaysu.com/test") }
+	{ UNI_L("yimg.com/.yahooo.com/flash/sw") }
+	{ UNI_L("http://yimg.com/.yahoo.com/flashes/sw") }
+	{ UNI_L("https://yimg.com/test.yahoo.com/flash/sy") }
+	{ UNI_L("http://blocked.by.extensions.com") }
+}
+
+global
+{
+	URLFilter* urlfilterNormal;
+	URLFilter* urlfilterOpera;
+	URLFilter* urlfilterDuplicates;
+	URLFilter* urlfilterEmpty;
+	URLFilter* urlfilterInclusion;
+	URLFilter* urlfilterRemove;
+	OpGadget *ext1_ptr;
+	OpGadget *ext2_ptr;
+	const uni_char *url_test; // Test URL for extensions
+	const uni_char *url_test2; // Test URL for extensions
+
+	class PassFilter: public URLFilterExtensionListener
+	{
+	private:
+		/// Number of matches required to pass the test
+		int matches;
+
+	public:
+		PassFilter(int matches) { this->matches=matches; }
+		
+		virtual void URLBlocked(const uni_char* url, OpWindowCommander* wic, DOMLoadContext *dom_ctx)
+		{
+			matches--;
+
+			if(!matches)
+			{
+				ST_passed();
+				OP_DELETE(this);
+			}
+			else
+				output("Matches still required: %d", matches);
+		}
+
+		virtual void URLUnBlocked(const uni_char* url, OpWindowCommander* wic, DOMLoadContext *dom_ctx)
+		{
+		}
+
+	#ifdef SELFTEST
+		virtual void URLAllowed(const uni_char* url, OpWindowCommander* wic, DOMLoadContext *dom_ctx)
+		{
+		}
+	#endif // SELFTEST
+	};
+}
+
+setup
+{
+	ext1_ptr = (OpGadget *)1;  // Just a pointer to nowhere
+	ext2_ptr = (OpGadget *)2;  // Just a different pointer to nowhere
+	url_test=UNI_L("http://blocked.by.extensions.com");
+	url_test2=UNI_L("http://allowed.by.extensions.com");
+}
+
+exit
+{
+	OP_DELETE(urlfilterNormal);
+	OP_DELETE(urlfilterOpera);	
+	OP_DELETE(urlfilterDuplicates);
+	OP_DELETE(urlfilterEmpty);
+	OP_DELETE(urlfilterInclusion);
+	OP_DELETE(urlfilterRemove);
+
+	urlfilterNormal = NULL;
+	urlfilterOpera = NULL;
+	urlfilterDuplicates = NULL;
+	urlfilterEmpty = NULL;
+	urlfilterInclusion = NULL;
+	urlfilterRemove = NULL;
+}
+
+table TableAlgorithms(FilterAlgorithm, char *, URLFilter*, URLFilter*, URLFilter*, URLFilter*, URLFilter*, URLFilter*)
+{
+  { FILTER_FAST, " FAST ", urlfilterNormal, urlfilterOpera, urlfilterDuplicates, urlfilterEmpty, urlfilterInclusion, urlfilterRemove },
+  { FILTER_SLOW, " SLOW ", urlfilterNormal, urlfilterOpera, urlfilterDuplicates, urlfilterEmpty, urlfilterInclusion, urlfilterRemove },
+  { FILTER_ADAPTIVE, " ADAPTIVE ", urlfilterNormal, urlfilterOpera, urlfilterDuplicates, urlfilterEmpty, urlfilterInclusion, urlfilterRemove }
+}
+
+test("create object")
+{
+	urlfilterNormal = OP_NEW(URLFilter, ());
+	urlfilterOpera = OP_NEW(URLFilter, ());
+	urlfilterDuplicates = OP_NEW(URLFilter, ());
+	urlfilterEmpty = OP_NEW(URLFilter, ());
+	urlfilterInclusion = OP_NEW(URLFilter, ());
+	urlfilterRemove = OP_NEW(URLFilter, ());
+
+	verify(urlfilterNormal != NULL);
+	verify(urlfilterOpera != NULL);
+	verify(urlfilterDuplicates != NULL);
+	verify(urlfilterEmpty != NULL);
+	verify(urlfilterInclusion != NULL);
+	verify(urlfilterRemove != NULL);
+}
+
+test("Load Big List") require success "create object"; timer;
+file uni path "data/filterlist2.ini";
+{
+	OpString path_str;
+	OP_STATUS status = OpStatus::ERR;
+	
+	verify_success(path_str.Set(path));
+
+	TRAPD(err, status = urlfilterNormal->InitL(path_str));
+	
+	verify_success(err);
+	verify_success(status);
+}
+
+test("Load Opera Pages")
+file uni path "data/opera_pages.ini";
+{
+	OpString path_str;
+	OP_STATUS status = OpStatus::ERR;
+	
+	verify_success(path_str.Set(path));
+
+	TRAPD(err, status = urlfilterOpera->InitL(path_str));
+	
+	verify_success(err);
+	verify_success(status);
+}
+	
+foreach (alg, descr, urlfilter, urlfilterOperaAbout, urlfilterDuplicates, urlfilterEmpty, urlfilterInclusion, urlfilterRemove) from TableAlgorithms
+{
+	test("Test Blocked " descr) require success "create object";
+	{
+		// should be blocked
+		iterate (block_url) from Table_blocked
+		{
+			BOOL load = TRUE;
+			
+			verify_success(urlfilter->CheckURL(block_url, load));
+			if(load)
+			{
+				OpString8 str;
+				
+				str.Set(block_url);
+				
+				ST_failed("URL %s not blocked!", str.CStr());
+			}
+			verify(load == FALSE);
+		}
+	}
+	
+	test("Test Allowed - " descr) require success "create object";
+	{
+		// should not be blocked
+		iterate (block_url) from Table_not_blocked
+		{
+			BOOL load = FALSE;
+			
+			verify_success(urlfilter->CheckURL(block_url, load));
+			verify(load == TRUE);
+		}
+	}
+	
+	test("opera pages and about - check ini mistake" descr) require CF_DONT_BLOCK_OPERA_PROTOCOLS;
+	{
+		BOOL load = FALSE;
+		
+		verify_success(urlfilterOperaAbout->CheckURL(UNI_L("about:blank"), load));
+		verify(load==TRUE);
+		
+		load=FALSE;
+		verify_success(urlfilterOperaAbout->CheckURL(UNI_L("about:opera"), load));
+		verify(load==TRUE);
+		
+		load=FALSE;
+		verify_success(urlfilterOperaAbout->CheckURL(UNI_L("opera:about"), load));
+		verify(load==TRUE);
+	}
+
+	test("opera:debug DISABLED" descr) require CF_BLOCK_OPERA_DEBUG;
+	{
+		BOOL load=TRUE;
+		
+		verify_success(urlfilterOperaAbout->CheckURL(UNI_L("opera:debug"), load));
+		verify(load==FALSE);
+		
+		verify_success(urlfilterOperaAbout->AddURLString(UNI_L("opera:debug"), FALSE, NULL));
+		
+		// Opera pages list force an exclusion in opera:*
+		verify_success(urlfilterOperaAbout->CheckURL(UNI_L("opera:debug"), load));
+		verify(load==FALSE);
+	}
+
+	test("opera:debug ENABLED" descr) require undefined CF_BLOCK_OPERA_DEBUG;
+	{
+		BOOL load=TRUE;
+		
+		verify_success(urlfilterOperaAbout->CheckURL(UNI_L("opera:debug"), load));
+		#ifdef CF_DONT_BLOCK_OPERA_PROTOCOLS
+			verify(load==TRUE);
+		#else
+			verify(load==FALSE);
+		#endif
+	}
+	
+	test("Add a filter from an extension")
+	{
+		FilterURLnode *node = OP_NEW(FilterURLnode, ());
+		BOOL load=TRUE;
+		
+		// URL allowed
+		verify_success(urlfilter->CheckURL(url_test, load));
+		verify(load==TRUE);
+		
+		node->SetURL(UNI_L("*extensions*"));
+		node->SetIsExclude(TRUE);
+		
+		// Verify that there are no filters set by estensions
+		verify(urlfilter->GetCount(TRUE) == urlfilter->GetCount(FALSE));
+		
+		UINT32 num_main=urlfilter->GetCount(TRUE);
+		
+		// Block on the main list
+		verify_success(urlfilter->AddURL(node, NULL, NULL));
+		verify_success(urlfilter->CheckURL(url_test, load));
+		verify(load==FALSE);
+		
+		verify(urlfilter->GetCount(TRUE) == num_main+1);
+		verify(urlfilter->GetCount(FALSE) == num_main+1);
+		
+		// Allow again, removing from the main list
+		verify_success(urlfilter->DeleteURL(node, TRUE));
+		verify_success(urlfilter->CheckURL(url_test, load));
+		verify(load==TRUE);
+		
+		verify(urlfilter->GetCount(TRUE) == num_main);
+		verify(urlfilter->GetCount(FALSE) == num_main);
+		verify(urlfilter->GetCountExtensionLists() == 0);
+
+		// Block from the first extension
+		FilterURLnode *node2 = OP_NEW(FilterURLnode, ());
+		
+		node2->SetURL(UNI_L("*.extensions*"));
+		node2->SetIsExclude(TRUE);
+		
+		verify_success(urlfilter->AddURL(node2, ext1_ptr, NULL));
+		verify_success(urlfilter->CheckURL(url_test, load));
+		verify(load==FALSE);
+		verify(urlfilter->GetCountExtensionLists() == 1);
+		
+		verify(urlfilter->GetCount(TRUE) == num_main+1);
+		verify(urlfilter->GetCount(FALSE) == num_main);
+		
+		// Try removing from the main list (no effect)
+		load=TRUE;
+		verify_success(urlfilter->DeleteURL(node2, TRUE));
+		verify_success(urlfilter->CheckURL(url_test, load));
+		verify(load==FALSE);
+		
+		verify(urlfilter->GetCount(TRUE) == num_main+1);
+		verify(urlfilter->GetCount(FALSE) == num_main);
+		
+		// Block also from the second extension (no practical effects, but we have a double block)
+		FilterURLnode *node3 = OP_NEW(FilterURLnode, ());
+		
+		node3->SetURL(UNI_L("*extensions.*"));
+		node3->SetIsExclude(TRUE);
+		
+		verify_success(urlfilter->AddURL(node3, ext2_ptr, NULL));
+		verify_success(urlfilter->CheckURL(url_test, load));
+		verify(load==FALSE);
+		
+		verify(urlfilter->GetCountExtensionLists() == 2);
+		
+		verify(urlfilter->GetCount(TRUE) == num_main+2);
+		verify(urlfilter->GetCount(FALSE) == num_main);
+		
+		// Try removing from the wrong extension (no effects)
+		load=FALSE;
+		verify(!urlfilter->DeleteURL(node2, TRUE, ext2_ptr));
+		verify_success(urlfilter->CheckURL(url_test, load));
+		verify(load==FALSE);
+		
+		verify(urlfilter->GetCount(TRUE) == num_main+2);
+		verify(urlfilter->GetCount(FALSE) == num_main);
+		verify(urlfilter->GetCountExtensionLists() == 2);
+		
+		// Try removing again from the wrong extension (no effects)
+		load=FALSE;
+		verify(!urlfilter->DeleteURL(node3, TRUE, ext1_ptr));
+		verify_success(urlfilter->CheckURL(url_test, load));
+		verify(load==FALSE);
+		
+		verify(urlfilter->GetCount(TRUE) == num_main+2);
+		verify(urlfilter->GetCount(FALSE) == num_main);
+		verify(urlfilter->GetCountExtensionLists() == 2);
+		
+		// Removing from the first extension (no practical effects, but we have only one block now)
+		load=FALSE;
+		verify(urlfilter->DeleteURL(node2, TRUE, ext1_ptr));
+		verify_success(urlfilter->CheckURL(url_test, load));
+		verify(load==FALSE);
+		
+		verify(urlfilter->GetCount(TRUE) == num_main+1);
+		verify(urlfilter->GetCount(FALSE) == num_main);
+		verify(urlfilter->GetCountExtensionLists() == 1);
+	
+		// Removing also from the second extension (now it's allowed again)
+		load=FALSE;
+		verify(urlfilter->DeleteURL(node3, TRUE, ext2_ptr));
+		verify_success(urlfilter->CheckURL(url_test, load));
+		verify(load==TRUE);
+		verify(urlfilter->GetCountExtensionLists() == 0);
+		
+		verify(urlfilter->GetCount(TRUE) == num_main);
+		verify(urlfilter->GetCount(FALSE) == num_main);
+	}
+	
+	test("Empty main, but filtered from extensions")
+	{
+		FilterURLnode *node = OP_NEW(FilterURLnode, ());
+		BOOL load=TRUE;
+		
+		verify(urlfilterEmpty->GetCount(TRUE) == 0);
+		verify(urlfilterEmpty->GetCountExtensionLists() == 0);
+		
+		// URL allowed
+		verify_success(urlfilterEmpty->CheckURL(url_test, load));
+		verify(load==TRUE);
+		
+		node->SetURL(UNI_L("*extensions*"));
+		node->SetIsExclude(TRUE);
+		
+		// Block from the first extension
+		verify_success(urlfilterEmpty->AddURL(node, ext1_ptr, NULL));
+		verify_success(urlfilterEmpty->CheckURL(url_test, load));
+		
+		verify(urlfilterEmpty->GetCount(TRUE) == 1);
+		verify(urlfilterEmpty->GetCount(FALSE) == 0);
+		verify(urlfilterEmpty->GetCountExtensionLists() == 1);
+		verify(load==FALSE);
+		
+		load = TRUE;
+		
+		// Remove, to free memory
+		verify(urlfilterEmpty->DeleteURL(node, TRUE, ext1_ptr));
+		verify_success(urlfilterEmpty->CheckURL(url_test, load));
+		
+		verify(urlfilterEmpty->GetCount(TRUE) == 0);
+		verify(urlfilterEmpty->GetCount(FALSE) == 0);
+		verify(urlfilterEmpty->GetCountExtensionLists() == 0);
+		verify(load==TRUE);
+	}
+	
+	test("Test Inclusion")
+	{
+		FilterURLnode *nodeIn = OP_NEW(FilterURLnode, ());
+		FilterURLnode *nodeEx = OP_NEW(FilterURLnode, ());
+		BOOL load=TRUE;
+		
+		verify(urlfilterInclusion->GetCount(TRUE) == 0);
+		verify(urlfilterInclusion->GetCountExtensionLists() == 0);
+		
+		urlfilterInclusion->SetExclusion(FALSE);
+		
+		// URL allowed
+		verify_success(urlfilterInclusion->CheckURL(url_test, load));
+		verify(load==TRUE);
+		
+		// Block (from first extension) everything
+		nodeEx->SetURL(UNI_L("http://blo*"));
+		nodeEx->SetIsExclude(TRUE);
+		
+		verify_success(urlfilterInclusion->AddURL(nodeEx, ext1_ptr, NULL));
+		verify_success(urlfilterInclusion->CheckURL(url_test, load));
+		verify(load==FALSE);
+		
+		verify(urlfilterInclusion->GetCount(TRUE) == 1);
+		verify(urlfilterInclusion->GetCount(FALSE) == 0);
+		
+		// Allow from second extension, but it should still be blocked
+		nodeIn->SetURL(UNI_L("*extensions*"));
+		nodeIn->SetIsExclude(FALSE);
+		
+		load=TRUE;
+		verify_success(urlfilterInclusion->AddURL(nodeIn, ext2_ptr, NULL));
+		verify_success(urlfilterInclusion->CheckURL(url_test, load));
+		verify(load==FALSE);
+		
+		verify(urlfilterInclusion->GetCount(TRUE) == 2);
+		verify(urlfilterInclusion->GetCount(FALSE) == 0);
+
+		// Removed from inclusion: blocked again
+		verify(urlfilterInclusion->DeleteURL(nodeIn, FALSE, ext2_ptr));
+		verify_success(urlfilterInclusion->CheckURL(url_test, load));
+		verify(load==FALSE);
+		
+		verify(urlfilterInclusion->GetCount(TRUE) == 1);
+		verify(urlfilterInclusion->GetCount(FALSE) == 0);
+		
+		// Removed from exclusion: allowed again
+		verify(urlfilterInclusion->DeleteURL(nodeEx, TRUE, ext1_ptr));
+		verify_success(urlfilterInclusion->CheckURL(url_test, load));
+		verify(load==TRUE);
+		
+		verify(urlfilterInclusion->GetCount(TRUE) == 0);
+		verify(urlfilterInclusion->GetCount(FALSE) == 0);
+	}
+
+	test("Test remove an extension")
+	{
+		BOOL load=TRUE;
+		
+		verify(urlfilterRemove->GetCount(TRUE) == 0);
+		verify(urlfilterRemove->GetCountExtensionLists() == 0);
+		
+		// Check that the URL is allowed
+		verify_success(urlfilterRemove->CheckURL(url_test, load));
+		verify(load==TRUE);
+		verify_success(urlfilterRemove->CheckURL(url_test2, load));
+		verify(load==TRUE);
+		
+		urlfilterRemove->SetExclusion(FALSE);
+		
+		// Add the rule for the first extension
+		verify_success(urlfilterRemove->AddURLString(UNI_L("http://bloc*"), TRUE, ext1_ptr));
+		verify_success(urlfilterRemove->AddURLString(UNI_L("http://blo2*"), FALSE, ext1_ptr));
+		verify_success(urlfilterRemove->AddURLString(UNI_L("http://blo3*"), TRUE, ext1_ptr));
+		
+		load = TRUE;
+		verify_success(urlfilterRemove->CheckURL(url_test, load));
+		verify(load==FALSE);
+		load = TRUE;
+		verify_success(urlfilterRemove->CheckURL(url_test2, load));
+		verify(load==TRUE);
+		
+		verify(urlfilterRemove->GetCount(TRUE) == 3);
+		verify(urlfilterRemove->GetCount(FALSE) == 0);
+		
+		// Add the rule for the second extension
+		verify_success(urlfilterRemove->AddURLString(UNI_L("http://all*"), TRUE, ext2_ptr));
+		
+		verify(urlfilterRemove->GetCount(TRUE) == 4);
+		verify(urlfilterRemove->GetCount(FALSE) == 0);
+		
+		load = TRUE;
+		verify_success(urlfilterRemove->CheckURL(url_test, load));
+		verify(load==FALSE);
+		load = TRUE;
+		verify_success(urlfilterRemove->CheckURL(url_test2, load));
+		verify(load==FALSE);
+		
+		// Remove extension 1 at runtime
+		verify_success(urlfilterRemove->RemoveExtension(ext1_ptr));
+		
+		load = TRUE;
+		verify_success(urlfilterRemove->CheckURL(url_test, load));
+		verify(load==TRUE);
+		load = TRUE;
+		verify_success(urlfilterRemove->CheckURL(url_test2, load));
+		verify(load==FALSE);
+		
+		verify(urlfilterRemove->GetCount(TRUE) == 1);
+		verify(urlfilterRemove->GetCount(FALSE) == 0);
+		
+		// Remove extension 2 at runtime
+		verify_success(urlfilterRemove->RemoveExtension(ext2_ptr));
+		
+		load = TRUE;
+		verify_success(urlfilterRemove->CheckURL(url_test, load));
+		verify(load==TRUE);
+		load = TRUE;
+		verify_success(urlfilterRemove->CheckURL(url_test2, load));
+		verify(load==TRUE);
+		
+		verify(urlfilterRemove->GetCount(TRUE) == 0);
+		verify(urlfilterRemove->GetCount(FALSE) == 0);
+	}
+	
+	test("Test Duplicated " descr) require success "create object"; timer;
+	{
+		FilterURLnode *node1 = OP_NEW(FilterURLnode, ());
+		BOOL node_acquired;
+		
+		UINT32 n=urlfilterRemove->GetCount(TRUE);
+		
+		verify(n==0);
+		
+		// Add the rule for the first extension
+		node1->SetURL(UNI_L("http://test*"));
+		node1->SetIsExclude(TRUE);
+		
+		verify_success(urlfilterRemove->AddURL(node1, ext1_ptr, &node_acquired));
+		verify(urlfilterRemove->GetCount(TRUE) == n+1);
+		verify(node_acquired);
+		
+		// Test duplication with the same object
+		verify_success(urlfilterRemove->AddURL(node1, ext1_ptr, &node_acquired));
+		verify(urlfilterRemove->GetCount(TRUE) == n+1);
+		verify(!node_acquired);
+		
+		// Test duplication with the same pattern but different object
+		FilterURLnode *node2 = OP_NEW(FilterURLnode, ());
+		
+		node2->SetURL(UNI_L("http://test*"));
+		node2->SetIsExclude(TRUE);
+		verify_success(urlfilterRemove->AddURL(node2, ext1_ptr, &node_acquired));
+		verify(urlfilterRemove->GetCount(TRUE) == n+1);
+		verify(!node_acquired);
+		OP_DELETE(node2);
+		
+		urlfilterRemove->RemoveAllExtensions();
+		verify(urlfilterRemove->GetCount(TRUE) == 0);
+	}
+}
+
+/// Tests that the rules mechanism is more or less working for patterns added by extensions
+test("Filter rules basic extensions tests")
+{
+	FilterURLnode *nodeEx = OP_NEW(FilterURLnode, (TRUE));
+	BOOL load = FALSE;
+	URLFilter urlfilterRules;
+	HTMLLoadContext ctx(RESOURCE_STYLESHEET, NULL);
+	FilterRule *frAlways = OP_NEW(DebugRuleAlways, ());
+	FilterRule *frNever = OP_NEW(DebugRuleNever, ());
+	
+	// Test without patterns
+	load = FALSE;
+	urlfilterRules.CheckURL(UNI_L("http://www.good.com"), load, NULL);
+    verify(load==TRUE);
+	load = FALSE;
+	urlfilterRules.CheckURL(UNI_L("http://www.evil.org/test"), load, NULL);
+    verify(load==TRUE);
+
+	// Add the patterns via extensions
+	nodeEx->SetURL(UNI_L("http://*.evil.*"));
+	urlfilterRules.AddURL(nodeEx, ext1_ptr, NULL);
+	
+    // Test without rules
+	load = FALSE;
+	urlfilterRules.CheckURL(UNI_L("http://www.good.com"), load, NULL);
+    verify(load==TRUE);
+	urlfilterRules.CheckURL(UNI_L("http://www.evil.org/test"), load, NULL);
+    verify(load==FALSE);
+
+	// Add a rule that never matches, which invalidates the match
+	verify_success(nodeEx->AddRule(frNever));
+	load=FALSE;
+	urlfilterRules.CheckURL(UNI_L("http://www.good.com"), load, NULL, &ctx);
+    verify(load==TRUE);
+	load=FALSE;
+	urlfilterRules.CheckURL(UNI_L("http://www.evil.org/test"), load, NULL, &ctx);
+    verify(load==TRUE);
+
+	// Remove the previous rule and add a rule that always matches, which restore the match
+	verify_success(nodeEx->RemoveRule(frNever, TRUE));
+	verify_success(nodeEx->AddRule(frAlways));
+	load=FALSE;
+	urlfilterRules.CheckURL(UNI_L("http://www.good.com"), load, NULL, &ctx);
+    verify(load==TRUE);
+	urlfilterRules.CheckURL(UNI_L("http://www.evil.org/test"), load, NULL, &ctx);
+    verify(load==FALSE);
+
+	// Remove the RULE that always matches, but the match is still valid
+	verify_success(nodeEx->RemoveRule(frAlways, TRUE));
+	load=FALSE;
+	urlfilterRules.CheckURL(UNI_L("http://www.good.com"), load, NULL, &ctx);
+    verify(load==TRUE);
+	urlfilterRules.CheckURL(UNI_L("http://www.evil.org/test"), load, NULL, &ctx);
+    verify(load==FALSE);
+}
+
+/// Tests multiple URLs with the same context, to check if they are loaded or blocked properly
+subtest TestMultiURLs(const char *desc, URLFilter &urlfilterRules, URL *urls, UINT num_urls, HTMLLoadContext *ctx, BOOL *ar_load)
+{
+	for(UINT i=0; i<num_urls; i++)
+	{
+		OpString8 desc2;
+
+		verify_success(desc2.AppendFormat("%s - %d", desc, i+1));
+
+		TestSinglePattern(desc2.CStr(), urlfilterRules, &urls[i], ar_load[i], ctx);
+	}
+}
+
+/// Tests multiple URLs with the same context, to check if they are loaded or blocked properly
+subtest TestMultiURLsSameResult(const char *desc, URLFilter &urlfilterRules, URL *urls, UINT num_urls, HTMLLoadContext *ctx, BOOL load)
+{
+	for(UINT i=0; i<num_urls; i++)
+	{
+		OpString8 desc2;
+
+		verify_success(desc2.AppendFormat("%s - %d", desc, i+1));
+
+		TestSinglePattern(desc2.CStr(), urlfilterRules, &urls[i], load, ctx);
+	}
+}
+
+subtest TestMultiPatterns(const char *desc, URLFilter &urlfilterRules, const uni_char *url, BOOL load_no_ctx, HTMLLoadContext *ar_ctx, BOOL *ar_load, UINT num_ctx)
+{
+	verify(url);
+	verify(ar_ctx);
+	verify(ar_load);
+
+	// Test without context
+	BOOL load;
+
+	output(desc);
+	load=!load_no_ctx;
+	urlfilterRules.CheckURL(url, load, NULL, NULL);
+    verify(load==load_no_ctx, url load error withot context);
+
+	BOOL ok=TRUE;
+
+	for(UINT i=0; i<num_ctx; i++)
+	{
+		load=!ar_load[i];
+		urlfilterRules.CheckURL(url, load, NULL, &ar_ctx[i]);
+		if(load!=ar_load[i])
+		{
+		  output("X(%d) ", i);
+		  ok=FALSE;
+		}
+	}
+
+	verify(ok);
+	output("\n");
+}
+
+subtest TestSinglePattern(const char *desc, URLFilter &urlfilterRules, URL *url, BOOL expected_load, HTMLLoadContext *ctx)
+{
+	BOOL load = !expected_load;
+	output(desc);
+	output("\n");
+
+	urlfilterRules.CheckURL(url, load, NULL, ctx);
+	verify(load == expected_load);
+}
+
+/// Tests that the rules mechanism is working for "In Domain" and "Not In Domain" and "3rd parties" rules, at content_filter level
+test("Low Level - Rules - InDomain and NotIDomain")
+{
+	FilterURLnode *nodeFB = OP_NEW(FilterURLnode, (TRUE));
+	FilterURLnode *nodeAll = OP_NEW(FilterURLnode, (TRUE));
+	URLFilter urlfilterRules;
+	URLFilter urlfilterRulesMulti;
+	URL url_CNN=urlManager->GetURL("http://www.cnn.com");
+	URL url_Repubblica=urlManager->GetURL("http://www.repubblica.it");
+	URL url_Google=urlManager->GetURL("http://www.google.no");
+	URL url_FB=urlManager->GetURL("http://www.facebook.com");
+	URL url_FB2=urlManager->GetURL("http://facebook.com");
+	HTMLLoadContext ctx_CNN = HTMLLoadContext(RESOURCE_UNKNOWN, url_CNN);
+	HTMLLoadContext ctx_Repubblica = HTMLLoadContext(RESOURCE_UNKNOWN, url_Repubblica);
+	HTMLLoadContext ctx_Google = HTMLLoadContext(RESOURCE_UNKNOWN, url_Google);
+	HTMLLoadContext ctx_FB = HTMLLoadContext(RESOURCE_UNKNOWN, url_FB);
+	HTMLLoadContext ctx_FB2 = HTMLLoadContext(RESOURCE_UNKNOWN, url_FB2);
+	HTMLLoadContext ar_ctx[]={ ctx_CNN, ctx_Repubblica, ctx_Google, ctx_FB, ctx_FB2};
+	BOOL ar_load[]={TRUE, TRUE, TRUE, TRUE, TRUE};
+	BOOL ar_load_true[]={TRUE, TRUE, TRUE, TRUE, TRUE};
+	BOOL ar_load_false[]={FALSE, FALSE, FALSE, FALSE, FALSE};
+	int num_contexts=5;
+
+	FilterRule *rule_CNN = OP_NEW(RuleInDomain, (url_CNN));
+	FilterRule *rule_Repubblica = OP_NEW(RuleInDomain, (url_Repubblica));
+	FilterRule *rule_NotGoogle = OP_NEW(RuleNotInDomain, (url_Google));
+	FilterRule *rule_NotFB = OP_NEW(RuleNotInDomain, (url_FB));
+	FilterRule *rule_NotFB2 = OP_NEW(RuleNotInDomainDeep, (url_FB2));
+	FilterRule *rule_3rd = OP_NEW(RuleThirdParty, ());
+	RuleGroupAND *rule_group_and = OP_NEW(RuleGroupAND, ());
+	RuleGroupOR *rule_group_or = OP_NEW(RuleGroupOR, ());
+	
+	// Test double "not in domain": Blocks everything out of Google and Facebook (allows everything only in Google and Facebook)
+	nodeAll->SetURL(UNI_L("http://*.*"));
+	verify_success(rule_group_and->AddRule(rule_NotGoogle));
+	verify_success(rule_group_and->AddRule(rule_NotFB));
+	verify_success(nodeAll->AddRule(rule_group_and));
+	urlfilterRulesMulti.AddURL(nodeAll, ext1_ptr, NULL);
+
+	ar_load[0] = ar_load[1] = ar_load[4] = FALSE;
+
+	TestMultiPatterns("Everything allowed only in Google and Facebook", urlfilterRulesMulti, UNI_L("http://www.libero.if"), TRUE, ar_ctx, ar_load, num_contexts);
+
+	verify_success(rule_group_and->RemoveRule(rule_NotGoogle, FALSE));
+	verify_success(rule_group_and->RemoveRule(rule_NotFB, FALSE));
+	ar_load[0] = ar_load[1] = ar_load[2] = ar_load[3] = ar_load[4] = TRUE;
+
+	// Test without patterns
+	TestMultiPatterns("No patterns", urlfilterRules, UNI_L("http://www.facebook.com/login"), TRUE, ar_ctx, ar_load_true, num_contexts);
+
+	// Always block Facebook
+	nodeFB->SetURL(UNI_L("http://*.facebook.*"));
+	urlfilterRules.AddURL(nodeFB, ext1_ptr, NULL);
+	TestMultiPatterns("No FB", urlfilterRules, UNI_L("http://www.facebook.com/login"), FALSE, ar_ctx, ar_load_false, num_contexts);
+
+	// Block Facebook on cnn.com
+	verify_success(rule_group_or->AddRule(rule_CNN));
+	verify_success(nodeFB->AddRule(rule_group_or));
+	ar_load[0] = FALSE;
+	TestMultiPatterns("No FB in CNN", urlfilterRules, UNI_L("http://www.facebook.com/login"), TRUE, ar_ctx, ar_load, num_contexts);
+
+	// Block Facebook in repubblica.it
+	verify_success(rule_group_or->AddRule(rule_Repubblica));
+	ar_load[1] = FALSE;
+	TestMultiPatterns("No FB in CNN and Repubblica", urlfilterRules, UNI_L("http://www.facebook.com/login"), TRUE, ar_ctx, ar_load, num_contexts);
+
+	// Block Facebook not in google.no
+	verify_success(nodeFB->RemoveRule(rule_group_or, TRUE));
+	verify_success(nodeFB->AddRule(rule_NotGoogle));
+	ar_load[3] = FALSE;
+	ar_load[4] = FALSE;
+	TestMultiPatterns("FB only in Google", urlfilterRules, UNI_L("http://www.facebook.com/login"), TRUE, ar_ctx, ar_load, num_contexts);
+
+	// Remove Google, and everything is blocked now
+	verify_success(nodeFB->RemoveRule(rule_NotGoogle, TRUE));
+	ar_load[2] = FALSE;
+	TestMultiPatterns("No FB 2", urlfilterRules, UNI_L("http://www.facebook.com/login"), FALSE, ar_ctx, ar_load, num_contexts);
+
+	// Block outside of www.facebook.com
+	verify_success(nodeFB->AddRule(rule_NotFB));
+	ar_load[3] = TRUE;
+	TestMultiPatterns("No FB in 3rd parties", urlfilterRules, UNI_L("http://www.facebook.com/login"), TRUE, ar_ctx, ar_load, num_contexts);
+
+	// Block outside of facebook.com
+	verify_success(nodeFB->RemoveRule(rule_NotFB, TRUE));
+	verify_success(nodeFB->AddRule(rule_NotFB2));
+	ar_load[4] = TRUE;
+	TestMultiPatterns("No FB outside of FB", urlfilterRules, UNI_L("http://www.facebook.com/login"), TRUE, ar_ctx, ar_load, num_contexts);
+
+	// Remove all the rules, so FB always blocked
+	verify_success(nodeFB->RemoveRule(rule_NotFB2, TRUE));
+	ar_load[4] = TRUE;
+	TestMultiPatterns("No FB", urlfilterRules, UNI_L("http://www.facebook.com/login"), FALSE, ar_ctx, ar_load_false, num_contexts);
+
+	// 3rd block: FB blocked outside of its domain
+	verify_success(nodeFB->AddRule(rule_3rd));
+	TestMultiPatterns("No FB outside of FB 2", urlfilterRules, UNI_L("http://www.facebook.com/login"), TRUE, ar_ctx, ar_load, num_contexts);
+}
+
+/// Deeper testing of third party rules, at content_filter level
+test("Low Level - Rule Third party")
+{
+	URL url_CNN=urlManager->GetURL("http://www.cnn.com");
+	URL url_TheRegister=urlManager->GetURL("http://www.theregister.co.uk");
+	URL url_Wired=urlManager->GetURL("http://www.wired.co.uk");
+	URL url_FB=urlManager->GetURL("http://www.facebook.com");
+	URL url_FB2=urlManager->GetURL("http://facebook.com");
+	URL url_FB3=urlManager->GetURL("http://test.facebook.com");
+	URL url_Unite1a=urlManager->GetURL("http://home.operatest.operaunite.com");
+	URL url_Unite1b=urlManager->GetURL("http://work.operatest.operaunite.com");
+	URL url_Unite2=urlManager->GetURL("http://home.operatest2.operaunite.com");
+	URL url_Modena1=urlManager->GetURL("http://comune.modena.it");
+	URL url_Modena2=urlManager->GetURL("http://test.modena.it");
+	URL url_Bologna=urlManager->GetURL("http://comune.bologna.it");
+	URL url_MapCamera=urlManager->GetURL("http://www.mapcamera.co.jp");
+	URL url_Yodobashi=urlManager->GetURL("http://www.yodobashi.co.jp");
+	
+	HTMLLoadContext ctx_CNN = HTMLLoadContext(RESOURCE_UNKNOWN, url_CNN);
+	HTMLLoadContext ctx_TheRegister = HTMLLoadContext(RESOURCE_UNKNOWN, url_TheRegister);
+	HTMLLoadContext ctx_Wired = HTMLLoadContext(RESOURCE_UNKNOWN, url_Wired);
+	HTMLLoadContext ctx_FB = HTMLLoadContext(RESOURCE_UNKNOWN, url_FB);
+	HTMLLoadContext ctx_FB2 = HTMLLoadContext(RESOURCE_UNKNOWN, url_FB2);
+	HTMLLoadContext ctx_FB3 = HTMLLoadContext(RESOURCE_UNKNOWN, url_FB3);
+	HTMLLoadContext ctx_Unite1a = HTMLLoadContext(RESOURCE_UNKNOWN, url_Unite1a);
+	HTMLLoadContext ctx_Unite1b = HTMLLoadContext(RESOURCE_UNKNOWN, url_Unite1b);
+	HTMLLoadContext ctx_Unite2 = HTMLLoadContext(RESOURCE_UNKNOWN, url_Unite2);
+	HTMLLoadContext ctx_Modena1 = HTMLLoadContext(RESOURCE_UNKNOWN, url_Modena1);
+	HTMLLoadContext ctx_Modena2 = HTMLLoadContext(RESOURCE_UNKNOWN, url_Modena2);
+	HTMLLoadContext ctx_Bologna = HTMLLoadContext(RESOURCE_UNKNOWN, url_Bologna);
+	HTMLLoadContext ctx_MapCamera = HTMLLoadContext(RESOURCE_UNKNOWN, url_MapCamera);
+	HTMLLoadContext ctx_Yodobashi = HTMLLoadContext(RESOURCE_UNKNOWN, url_Yodobashi);
+	RuleThirdParty rule;
+
+	// FB is enabled on its domain
+	verify(!rule.MatchRule(&url_FB, &ctx_FB));
+	verify(!rule.MatchRule(&url_FB, &ctx_FB2));
+	verify(!rule.MatchRule(&url_FB, &ctx_FB3));
+
+	// FB is blocked on other domains
+	verify(rule.MatchRule(&url_FB, &ctx_CNN));
+	verify(rule.MatchRule(&url_FB, &ctx_TheRegister));
+	verify(rule.MatchRule(&url_FB, &ctx_Wired));
+
+	// Pub suffix check - towns of .it domains: comune.modena.it blocked on test.modena.it and viceversa
+	verify(!rule.MatchRule(&url_Modena1, &ctx_Modena1));
+	verify(rule.MatchRule(&url_Modena1, &ctx_Modena2));
+	
+	verify(rule.MatchRule(&url_Modena2, &ctx_Modena1));
+	verify(!rule.MatchRule(&url_Modena2, &ctx_Modena2));
+	
+	verify(rule.MatchRule(&url_Modena1, &ctx_Bologna));
+	verify(rule.MatchRule(&url_Modena2, &ctx_CNN));
+
+	// Pub suffix check - .co.jp: Map Camera blocked on Yodobashi Camera, and viceversa
+	verify(!rule.MatchRule(&url_MapCamera, &ctx_MapCamera));
+	verify(rule.MatchRule(&url_MapCamera, &ctx_Yodobashi));
+	
+	verify(rule.MatchRule(&url_Yodobashi, &ctx_MapCamera));
+	verify(!rule.MatchRule(&url_Yodobashi, &ctx_Yodobashi));
+	
+	verify(rule.MatchRule(&url_MapCamera, &ctx_FB));
+	verify(rule.MatchRule(&url_Yodobashi, &ctx_CNN));
+
+	// Pub suffix check - co.uk: The register blocked on The Inquirer, and viceversa
+	verify(!rule.MatchRule(&url_TheRegister, &ctx_TheRegister));
+	verify(rule.MatchRule(&url_TheRegister, &ctx_Wired));
+	
+	verify(rule.MatchRule(&url_Wired, &ctx_TheRegister));
+	verify(!rule.MatchRule(&url_Wired, &ctx_Wired));
+	
+	verify(rule.MatchRule(&url_TheRegister, &ctx_CNN));
+	verify(rule.MatchRule(&url_TheRegister, &ctx_Unite1a));
+
+	// Pub suffix check - operaunite.com: Unite blocked on a user base
+	verify(!rule.MatchRule(&url_Unite1a, &ctx_Unite1a));
+	verify(!rule.MatchRule(&url_Unite1a, &ctx_Unite1b));
+	verify(rule.MatchRule(&url_Unite1a, &ctx_Unite2));
+
+	verify(!rule.MatchRule(&url_Unite1b, &ctx_Unite1a));
+	verify(!rule.MatchRule(&url_Unite1b, &ctx_Unite1b));
+	verify(rule.MatchRule(&url_Unite1b, &ctx_Unite2));
+
+	verify(rule.MatchRule(&url_Unite2, &ctx_Unite1a));
+	verify(rule.MatchRule(&url_Unite2, &ctx_Unite1b));
+	verify(!rule.MatchRule(&url_Unite2, &ctx_Unite2));
+}
+
+/// Check that the node is correctly filtered based on the element, at content_filter level
+test("Low Level - Rule Resources")
+{
+	URL url_FB=urlManager->GetURL("http://www.facebook.com");
+	HTMLLoadContext ctx_FB = HTMLLoadContext(RESOURCE_SUBDOCUMENT, url_FB);
+	HTMLLoadContext ctx_FB2 = HTMLLoadContext(RESOURCE_OBJECT, NULL);
+	HTMLLoadContext ctx_FB3 = HTMLLoadContext(RESOURCE_IMAGE, NULL);
+	HTMLLoadContext ctx_FB4 = HTMLLoadContext(RESOURCE_UNKNOWN, NULL);
+	HTMLLoadContext ctx_FB5 = HTMLLoadContext(RESOURCE_UNKNOWN, url_FB);
+	FilterURLnode *nodeFB = OP_NEW(FilterURLnode, (TRUE));
+	RuleResource *ruleImage = OP_NEW(RuleResource, (RESOURCE_IMAGE));
+	RuleResource *ruleObject = OP_NEW(RuleResource, (RESOURCE_OBJECT));
+	URLFilter urlfilterRules;
+	RuleGroupOR *rule_group_or = OP_NEW(RuleGroupOR, ());
+	
+	nodeFB->SetURL(UNI_L("http://*.facebook.*"));
+	urlfilterRules.AddURL(nodeFB, ext1_ptr, NULL);
+
+	verify_success(rule_group_or->AddRule(ruleImage));
+	verify_success(rule_group_or->AddRule(ruleObject));
+	verify_success(nodeFB->AddRule(rule_group_or));
+
+	// Test rule only
+	verify(!ruleImage->MatchRule(&url_FB, &ctx_FB));
+	verify(!ruleImage->MatchRule(&url_FB, &ctx_FB2));
+	verify(ruleImage->MatchRule(&url_FB, &ctx_FB3));
+	verify(!ruleImage->MatchRule(&url_FB, &ctx_FB4));
+	verify(!ruleImage->MatchRule(&url_FB, &ctx_FB5));
+
+	TestSinglePattern("FB 1", urlfilterRules, &url_FB, TRUE, NULL);
+	TestSinglePattern("FB 2", urlfilterRules, &url_FB, TRUE, &ctx_FB);
+	TestSinglePattern("FB 3", urlfilterRules, &url_FB, FALSE, &ctx_FB2);
+	TestSinglePattern("FB 4", urlfilterRules, &url_FB, FALSE, &ctx_FB3);
+	TestSinglePattern("FB 5", urlfilterRules, &url_FB, TRUE, &ctx_FB4);
+	TestSinglePattern("FB 6", urlfilterRules, &url_FB, TRUE, &ctx_FB5);
+	TestSinglePattern("FB 7", urlfilterRules, &url_FB, TRUE, &ctx_FB);
+
+	verify_success(rule_group_or->RemoveRule(ruleImage, TRUE));
+
+	TestSinglePattern("FB 2", urlfilterRules, &url_FB, TRUE, &ctx_FB3);
+}
+
+/// Tests that the rules mechanism is working for "In Domain" and "Not In Domain" and "3rd parties" rules, at the integration level.
+/// It tests the higher level functions created for DOM
+test("Integration Level - Rules - InDomain and NotIDomain")
+{
+	FilterURLnode *nodeFB = OP_NEW(FilterURLnode, (TRUE));
+	FilterURLnode *nodeAll = OP_NEW(FilterURLnode, (TRUE));
+	URLFilter urlfilterRules;
+	URLFilter urlfilterRulesMulti;
+	URL url_CNN=urlManager->GetURL("http://www.cnn.com");
+	URL url_Repubblica=urlManager->GetURL("http://www.repubblica.it");
+	URL url_Google=urlManager->GetURL("http://www.google.no");
+	URL url_FB=urlManager->GetURL("http://www.facebook.com");
+	URL url_FB2=urlManager->GetURL("http://facebook.com");
+	URL url_test=urlManager->GetURL("http://test.com");
+	URL url_mail_test=urlManager->GetURL("http://mail.test.com");
+	HTMLLoadContext ctx_CNN = HTMLLoadContext(RESOURCE_UNKNOWN, url_CNN);
+	HTMLLoadContext ctx_Repubblica = HTMLLoadContext(RESOURCE_UNKNOWN, url_Repubblica);
+	HTMLLoadContext ctx_Google = HTMLLoadContext(RESOURCE_UNKNOWN, url_Google);
+	HTMLLoadContext ctx_FB = HTMLLoadContext(RESOURCE_UNKNOWN, url_FB);
+	HTMLLoadContext ctx_FB2 = HTMLLoadContext(RESOURCE_UNKNOWN, url_FB2);
+	HTMLLoadContext ctx_test = HTMLLoadContext(RESOURCE_UNKNOWN, url_test);
+	HTMLLoadContext ctx_mail_test = HTMLLoadContext(RESOURCE_UNKNOWN, url_mail_test);
+	HTMLLoadContext ar_ctx[]={ ctx_CNN, ctx_Repubblica, ctx_Google, ctx_FB, ctx_FB2};
+	BOOL ar_load[]={TRUE, TRUE, TRUE, TRUE, TRUE};
+	BOOL ar_load_true[]={TRUE, TRUE, TRUE, TRUE, TRUE};
+	BOOL ar_load_false[]={FALSE, FALSE, FALSE, FALSE, FALSE};
+	int num_contexts=5;
+	OpVector<uni_char> not_domains;
+	OpVector<uni_char> in_domains;
+
+	verify_success(not_domains.Add((uni_char *) UNI_L("www.google.no")));
+	verify_success(not_domains.Add((uni_char *) UNI_L("www.facebook.com")));
+	
+	// Test double "not in domain": Blocks everything out of Google and Facebook (allows everything only in Google and Facebook)
+	nodeAll->SetURL(UNI_L("http://*.*"));
+	verify_success(nodeAll->AddRuleNotInDomains(not_domains));
+	urlfilterRulesMulti.AddURL(nodeAll, ext1_ptr, NULL);
+
+	ar_load[0] = ar_load[1] = ar_load[4] = FALSE;
+
+	TestMultiPatterns("Everything allowed only in Google and Facebook", urlfilterRulesMulti, UNI_L("http://www.libero.if"), TRUE, ar_ctx, ar_load, num_contexts);
+
+	nodeAll->DeleteAllRules();
+	ar_load[0] = ar_load[1] = ar_load[2] = ar_load[3] = ar_load[4] = TRUE;
+
+	// Test without patterns
+	TestMultiPatterns("No patterns", urlfilterRules, UNI_L("http://www.facebook.com/login"), TRUE, ar_ctx, ar_load_true, num_contexts);
+
+	// Always block Facebook
+	nodeFB->SetURL(UNI_L("http://*.facebook.*"));
+	urlfilterRules.AddURL(nodeFB, ext1_ptr, NULL);
+	TestMultiPatterns("No FB", urlfilterRules, UNI_L("http://www.facebook.com/login"), FALSE, ar_ctx, ar_load_false, num_contexts);
+
+	// Block Facebook on cnn.com
+	verify_success(in_domains.Add((uni_char *) UNI_L("www.cnn.com")));
+	verify_success(nodeFB->AddRuleInDomains(in_domains));
+	ar_load[0] = FALSE;
+	TestMultiPatterns("No FB in CNN", urlfilterRules, UNI_L("http://www.facebook.com/login"), TRUE, ar_ctx, ar_load, num_contexts);
+
+	// Block Facebook also on repubblica.it
+	nodeFB->DeleteAllRules();
+	verify_success(in_domains.Add((uni_char *) UNI_L("www.repubblica.it")));
+	verify_success(nodeFB->AddRuleInDomains(in_domains));
+	ar_load[1] = FALSE;
+	TestMultiPatterns("No FB in CNN and Repubblica", urlfilterRules, UNI_L("http://www.facebook.com/login"), TRUE, ar_ctx, ar_load, num_contexts);
+
+	// Block Facebook not in google
+	not_domains.Clear();
+	nodeFB->DeleteAllRules();
+	verify_success(not_domains.Add((uni_char *) UNI_L("www.google.no")));
+	verify_success(nodeFB->AddRuleNotInDomains(not_domains));
+
+	ar_load[3] = FALSE;
+	ar_load[4] = FALSE;
+	TestMultiPatterns("FB only in Google", urlfilterRules, UNI_L("http://www.facebook.com/login"), TRUE, ar_ctx, ar_load, num_contexts);
+
+	// Remove All rules, and everything is blocked now
+	nodeFB->DeleteAllRules();
+	ar_load[2] = FALSE;
+	TestMultiPatterns("No FB 2", urlfilterRules, UNI_L("http://www.facebook.com/login"), FALSE, ar_ctx, ar_load, num_contexts);
+
+	// Block outside of www.facebook.com
+	not_domains.Clear();
+	verify_success(not_domains.Add((uni_char *) UNI_L("www.facebook.com")));
+	verify_success(nodeFB->AddRuleNotInDomains(not_domains));
+
+	ar_load[3] = TRUE;
+	TestMultiPatterns("No FB in 3rd parties", urlfilterRules, UNI_L("http://www.facebook.com/login"), TRUE, ar_ctx, ar_load, num_contexts);
+
+	// Block outside of facebook.com
+	nodeFB->DeleteAllRules();
+	not_domains.Clear();
+	verify_success(not_domains.Add((uni_char *) UNI_L("facebook.com")));
+	verify_success(nodeFB->AddRuleNotInDomains(not_domains));
+
+	ar_load[4] = TRUE;
+	TestMultiPatterns("No FB outside of FB", urlfilterRules, UNI_L("http://www.facebook.com/login"), TRUE, ar_ctx, ar_load, num_contexts);
+
+	// Remove all the rules, so FB always blocked
+	nodeFB->DeleteAllRules();
+	ar_load[4] = TRUE;
+	TestMultiPatterns("No FB", urlfilterRules, UNI_L("http://www.facebook.com/login"), FALSE, ar_ctx, ar_load_false, num_contexts);
+
+	// 3rd block: FB blocked outside of its domain
+	verify_success(nodeFB->AddRuleThirdParty());
+	TestMultiPatterns("No FB outside of FB 2", urlfilterRules, UNI_L("http://www.facebook.com/login"), TRUE, ar_ctx, ar_load, num_contexts);
+
+	nodeFB->DeleteAllRules();
+	nodeAll->DeleteAllRules();
+	not_domains.Clear();
+	in_domains.Clear();
+
+	// Test "block test.com but allow mail.test.com"
+	verify_success(in_domains.Add((uni_char *) UNI_L("test.com")));
+	verify_success(not_domains.Add((uni_char *) UNI_L("mail.test.com")));
+
+	nodeAll->SetURL(UNI_L("http://*.*"));
+	verify_success(nodeAll->AddRuleInDomains(in_domains));
+
+	TestSinglePattern("FB from test.com", urlfilterRulesMulti, &url_Google, FALSE, &ctx_test);
+	TestSinglePattern("FB from mail.test.com", urlfilterRulesMulti, &url_Google, FALSE, &ctx_mail_test);
+
+	verify_success(nodeAll->AddRuleNotInDomains(not_domains));
+
+	TestSinglePattern("FB from test.com 2", urlfilterRulesMulti, &url_Google, FALSE, &ctx_test);
+	TestSinglePattern("FB from mail.test.com 2", urlfilterRulesMulti, &url_Google, TRUE, &ctx_mail_test);
+
+	nodeFB->DeleteAllRules();
+	nodeAll->DeleteAllRules();
+	not_domains.Clear();
+	in_domains.Clear();
+}
+
+/// Deeper testing of third party and not third party rules, at integration level
+/// It tests the higher level functions created for DOM
+test("Integration Level - Rule Third Party and Rule Not Third Party")
+{
+	URLFilter urlfilterRules;
+	URL url_CNN=urlManager->GetURL("http://www.cnn.com");
+	URL url_FB=urlManager->GetURL("http://www.facebook.com");
+	URL url_FB2=urlManager->GetURL("http://facebook.com");
+	URL url_FBLogin=urlManager->GetURL("http://www.facebook.com/login");
+	HTMLLoadContext ctx_CNN = HTMLLoadContext(RESOURCE_UNKNOWN, url_CNN);
+	HTMLLoadContext ctx_FB = HTMLLoadContext(RESOURCE_UNKNOWN, url_FB);
+	HTMLLoadContext ctx_FB2 = HTMLLoadContext(RESOURCE_UNKNOWN, url_FB2);
+	FilterURLnode *nodeFB = OP_NEW(FilterURLnode, (TRUE));
+
+	// Always block Facebook
+	nodeFB->SetURL(UNI_L("http://*.facebook.*"));
+	urlfilterRules.AddURL(nodeFB, ext1_ptr, NULL);
+	TestSinglePattern("No FB", urlfilterRules, &url_FBLogin, FALSE, NULL);
+	TestSinglePattern("No FB CNN", urlfilterRules, &url_FBLogin, FALSE, &ctx_CNN);
+	TestSinglePattern("No FB FB", urlfilterRules, &url_FBLogin, FALSE, &ctx_FB);
+	TestSinglePattern("No FB FB2", urlfilterRules, &url_FBLogin, FALSE, &ctx_FB2);
+
+	// Block Facebook on third party
+	verify_success(nodeFB->AddRuleThirdParty());
+	TestSinglePattern("FB 3rd", urlfilterRules, &url_FBLogin, TRUE, NULL);
+	TestSinglePattern("FB 3rd CNN", urlfilterRules, &url_FBLogin, FALSE, &ctx_CNN);
+	TestSinglePattern("FB 3rd FB", urlfilterRules, &url_FBLogin, TRUE, &ctx_FB);
+	TestSinglePattern("FB 3rd FB2", urlfilterRules, &url_FBLogin, TRUE, &ctx_FB2);
+
+	// Enable Facebook only in third party
+	nodeFB->DeleteAllRules();
+	verify_success(nodeFB->AddRuleNotThirdParty());
+	TestSinglePattern("FB no 3rd", urlfilterRules, &url_FBLogin, FALSE, NULL);
+	TestSinglePattern("FB no 3rd CNN", urlfilterRules, &url_FBLogin, TRUE, &ctx_CNN);
+	TestSinglePattern("FB no 3rd FB", urlfilterRules, &url_FBLogin, FALSE, &ctx_FB);
+	TestSinglePattern("FB no 3rd FB2", urlfilterRules, &url_FBLogin, FALSE, &ctx_FB2);
+}
+
+/// Check that the node is correctly filtered based on the element, at content_filter level
+test("Integration Level - Rule Resources")
+{
+	URL url_FB=urlManager->GetURL("http://www.facebook.com");
+	URL url_CNN=urlManager->GetURL("http://www.cnn.com");
+	HTMLLoadContext ctx_FB = HTMLLoadContext(RESOURCE_SUBDOCUMENT, url_FB);
+	HTMLLoadContext ctx_FB2 = HTMLLoadContext(RESOURCE_OBJECT, NULL);
+	HTMLLoadContext ctx_FB3 = HTMLLoadContext(RESOURCE_IMAGE, NULL);
+	HTMLLoadContext ctx_FB4 = HTMLLoadContext(RESOURCE_UNKNOWN, NULL);
+	HTMLLoadContext ctx_FB5 = HTMLLoadContext(RESOURCE_UNKNOWN, url_FB);
+	HTMLLoadContext ctx_FB6 = HTMLLoadContext(RESOURCE_IMAGE, url_FB);
+	HTMLLoadContext ctx_FBCNN = HTMLLoadContext(RESOURCE_IMAGE, url_CNN);
+	FilterURLnode *nodeFB = OP_NEW(FilterURLnode, (TRUE));
+	URLFilter urlfilterRules;
+	
+	nodeFB->SetURL(UNI_L("http://*.facebook.*"));
+	verify_success(urlfilterRules.AddURL(nodeFB, ext1_ptr, NULL));
+
+	verify_success(nodeFB->AddRuleResources(RESOURCE_IMAGE | RESOURCE_OBJECT));
+
+	TestSinglePattern("FB 1", urlfilterRules, &url_FB, TRUE, NULL);
+	TestSinglePattern("FB 2", urlfilterRules, &url_FB, TRUE, &ctx_FB);
+	TestSinglePattern("FB 3", urlfilterRules, &url_FB, FALSE, &ctx_FB2);
+	TestSinglePattern("FB 4", urlfilterRules, &url_FB, FALSE, &ctx_FB3);
+	TestSinglePattern("FB 5", urlfilterRules, &url_FB, TRUE, &ctx_FB4);
+	TestSinglePattern("FB 6", urlfilterRules, &url_FB, TRUE, &ctx_FB5);
+	TestSinglePattern("FB 7", urlfilterRules, &url_FB, TRUE, &ctx_FB);
+	TestSinglePattern("FB IMG FB", urlfilterRules, &url_FB, FALSE, &ctx_FB6);
+	TestSinglePattern("FB IMG CNN", urlfilterRules, &url_FB, FALSE, &ctx_FBCNN);
+
+	// Test with third party to check multiple rules
+	verify_success(nodeFB->AddRuleThirdParty());
+
+	TestSinglePattern("FB 2 3rd", urlfilterRules, &url_FB, TRUE, &ctx_FB);
+	TestSinglePattern("FB IMG FB 3rd", urlfilterRules, &url_FB, TRUE, &ctx_FB6);
+	TestSinglePattern("IMG CNN 3rd", urlfilterRules, &url_FB, FALSE, &ctx_FBCNN);
+
+	// Test with not third party to check multiple rules
+	nodeFB->DeleteAllRules();
+	verify_success(nodeFB->AddRuleResources(RESOURCE_IMAGE | RESOURCE_OBJECT));
+	verify_success(nodeFB->AddRuleNotThirdParty());
+
+	TestSinglePattern("FB 2 not 3rd", urlfilterRules, &url_FB, TRUE, &ctx_FB);
+	TestSinglePattern("FB IMG FB not 3rd", urlfilterRules, &url_FB, FALSE, &ctx_FB6);
+	TestSinglePattern("FB IMG CNN not 3rd", urlfilterRules, &url_FB, TRUE, &ctx_FBCNN);
+
+	// Final check without rules
+	nodeFB->DeleteAllRules();
+
+	TestSinglePattern("FB 2 no rules", urlfilterRules, &url_FB, FALSE, &ctx_FB3);
+	TestSinglePattern("FB 3 no rules", urlfilterRules, &url_FB, FALSE, &ctx_FB2);
+	TestSinglePattern("FB IMG FB not 3rd", urlfilterRules, &url_FB, FALSE, &ctx_FB6);
+	TestSinglePattern("FB IMG CNN not 3rd", urlfilterRules, &url_FB, FALSE, &ctx_FBCNN);
+}
+
+// White list test for extensions
+test("Extensions White list")
+{
+	URL url_Mail=urlManager->GetURL("http://mail.google.com");
+	URL url_Google=urlManager->GetURL("http://www.google.com");
+	URL url_News=urlManager->GetURL("http://news.google.com");
+	FilterURLnode *nodeGoogle = OP_NEW(FilterURLnode, (TRUE));
+	FilterURLnode *nodeMail = OP_NEW(FilterURLnode, (FALSE));
+	FilterURLnode *nodeMail2 = OP_NEW(FilterURLnode, (FALSE));
+	URLFilter urlfilterRules;
+	
+	nodeGoogle->SetURL(UNI_L("http://*.google.*"));
+	nodeMail->SetURL(UNI_L("http://mail.google.*"));
+	nodeMail2->SetURL(UNI_L("http://mail.google.*"));
+	urlfilterRules.AddURL(nodeGoogle, ext1_ptr, NULL);
+
+	// Test the whole google blocked
+	TestSinglePattern("Google blocked 1", urlfilterRules, &url_Google, FALSE, NULL);
+	TestSinglePattern("Google blocked 2", urlfilterRules, &url_Mail, FALSE, NULL);
+	TestSinglePattern("Google blocked 3", urlfilterRules, &url_News, FALSE, NULL);
+
+	// GMail enabled by url_filter.ini (the extension will block it anyway)
+	urlfilterRules.AddURL(nodeMail, NULL, NULL);
+
+	TestSinglePattern("Google blocked 4", urlfilterRules, &url_Google, FALSE, NULL);
+	TestSinglePattern("Google blocked 5", urlfilterRules, &url_Mail, FALSE, NULL);
+	TestSinglePattern("Google blocked 6", urlfilterRules, &url_News, FALSE, NULL);
+
+	// GMail enabled by the same extension
+	urlfilterRules.AddURL(nodeMail2, ext1_ptr, NULL);
+
+	TestSinglePattern("Google blocked 7", urlfilterRules, &url_Google, FALSE, NULL);
+	TestSinglePattern("Google blocked 8", urlfilterRules, &url_News, FALSE, NULL);
+	TestSinglePattern("GMail enabled", urlfilterRules, &url_Mail, TRUE, NULL);
+}
+
+// Test that extensions still work when Opera is in "White List" mode
+test("Opera White List")
+{
+	URL url_MyOpera=urlManager->GetURL("http://my.opera.com");
+	URL url_MyOperaLogin=urlManager->GetURL("http://my.opera.com/login");
+	URL url_Opera=urlManager->GetURL("http://www.opera.com");
+	FilterURLnode *nodeOpera = OP_NEW(FilterURLnode, (FALSE));
+	FilterURLnode *nodeMyOpera = OP_NEW(FilterURLnode, (TRUE));
+	FilterURLnode *nodeMyOpera2 = OP_NEW(FilterURLnode, (FALSE));
+	FilterURLnode *nodeInternet = OP_NEW(FilterURLnode, (TRUE));
+	URLFilter urlfilterRules;
+	URL url_Google=urlManager->GetURL("http://www.google.com");
+	
+	nodeOpera->SetURL(UNI_L("http://*.opera.*"));
+	nodeMyOpera->SetURL(UNI_L("http://my.opera.com*"));
+	nodeMyOpera2->SetURL(UNI_L("http://my.opera.com/login"));
+	nodeInternet->SetURL(UNI_L("http://*.*"));
+	urlfilterRules.AddURL(nodeOpera, NULL, NULL);
+	urlfilterRules.AddURL(nodeInternet, NULL, NULL);
+
+	// Everything blocked at the moment
+	TestSinglePattern("1: Google blocked", urlfilterRules, &url_Google, FALSE, NULL);
+	TestSinglePattern("1: Opera blocked", urlfilterRules, &url_Opera, FALSE, NULL);
+	TestSinglePattern("1: MyOpera blocked", urlfilterRules, &url_MyOpera, FALSE, NULL);
+	TestSinglePattern("1: MyOpera login blocked", urlfilterRules, &url_MyOperaLogin, FALSE, NULL);
+
+	// Convert Opera in White list mode
+	urlfilterRules.SetExclusion(FALSE);
+
+	TestSinglePattern("2: Google blocked", urlfilterRules, &url_Google, FALSE, NULL);
+	TestSinglePattern("2: Opera allowed", urlfilterRules, &url_Opera, TRUE, NULL);
+	TestSinglePattern("2: MyOpera allowed", urlfilterRules, &url_MyOpera, TRUE, NULL);
+	TestSinglePattern("2: MyOpera login allowed", urlfilterRules, &url_MyOperaLogin, TRUE, NULL);
+	
+	// Adds an extension that blocks My Opera
+	urlfilterRules.AddURL(nodeMyOpera, ext1_ptr, NULL);
+
+	TestSinglePattern("3: Google blocked", urlfilterRules, &url_Google, FALSE, NULL);
+	TestSinglePattern("3: Opera allowed", urlfilterRules, &url_Opera, TRUE, NULL);
+	TestSinglePattern("3: MyOpera blocked", urlfilterRules, &url_MyOpera, FALSE, NULL);
+	TestSinglePattern("3: MyOpera login blocked", urlfilterRules, &url_MyOperaLogin, FALSE, NULL);
+
+	// Allows while still blocking MyOpera, allow the login
+	urlfilterRules.AddURL(nodeMyOpera2, ext1_ptr, NULL);
+
+	TestSinglePattern("4: Google blocked", urlfilterRules, &url_Google, FALSE, NULL);
+	TestSinglePattern("4: Opera allowed", urlfilterRules, &url_Opera, TRUE, NULL);
+	TestSinglePattern("4: MyOpera blocked", urlfilterRules, &url_MyOpera, FALSE, NULL);
+	TestSinglePattern("4: MyOpera login allowed", urlfilterRules, &url_MyOperaLogin, TRUE, NULL);
+}
+
+/// Test related to  CT-2310
+test("ContentUnblocked")
+{
+	URL urls[6];
+	OpVector<uni_char> in_domains;
+	FilterURLnode *nodeEx = OP_NEW(FilterURLnode, (TRUE));
+	FilterURLnode *nodeIn = OP_NEW(FilterURLnode, (FALSE));
+	URLFilter urlfilterRules;
+
+	URL url_my_opera=urlManager->GetURL("http://my.opera.com");
+	urls[0]=urlManager->GetURL("http://t:8081/resources/images/pass.png");
+	urls[1]=urlManager->GetURL("http://t.oslo.osa:8081/resources/images/fail.png");
+	urls[2]=urlManager->GetURL("http://testsuites:8081/resources/images/fail.png");
+	urls[3]=urlManager->GetURL("http://testsuites.oslo.osa:8081/resources/images/pass.png");
+	urls[4]=urlManager->GetURL("http://matchpartial.aliases.t.oslo.osa:8081/resources/images/fail.png");
+	urls[5]=urlManager->GetURL("http://aaaaaaaaaabbbbbbbbbbccccccccccddddddddddeeeeeeeeeeffffffffffggg.aaaaaaaaaabbbbbbbbbbccccccccccddddddddddeeeeeeeeeeffffffffffggg.aaaaaaaaaabbbbbbbbbbccccccccccddddddddddeeeeeeeeeeffffffffffggg.aaaaaaaaaabbbbbbbbbbccccccccccdddddddddd.aliases.t.oslo.osa:8081/resources/images/pass.png");
+	HTMLLoadContext ctx_t = HTMLLoadContext(RESOURCE_UNKNOWN, urls[0]);
+	HTMLLoadContext ctx_t_oslo_osa = HTMLLoadContext(RESOURCE_UNKNOWN, urls[1]);
+	HTMLLoadContext ctx_testsuites_oslo_osa = HTMLLoadContext(RESOURCE_UNKNOWN, urls[3]);
+	HTMLLoadContext ctx_my_opera = HTMLLoadContext(RESOURCE_UNKNOWN, url_my_opera);
+	
+	verify_success(in_domains.Add((uni_char *) UNI_L("t")));
+	verify_success(in_domains.Add((uni_char *) UNI_L("testsuites.oslo.osa")));
+	verify_success(in_domains.Add((uni_char *) UNI_L("partial.aliases.t.oslo.osa")));
+	verify_success(in_domains.Add((uni_char *) UNI_L("aaaaaaaaaabbbbbbbbbbccccccccccddddddddddeeeeeeeeeeffffffffffggg.aaaaaaaaaabbbbbbbbbbccccccccccddddddddddeeeeeeeeeeffffffffffggg.aaaaaaaaaabbbbbbbbbbccccccccccddddddddddeeeeeeeeeeffffffffffggg.aaaaaaaaaabbbbbbbbbbccccccccccddddddddddee.aliases.t.oslo.osa")));
+
+	nodeEx->SetURL(UNI_L("*images/*.png*"));
+	nodeIn->SetURL(UNI_L("*images/*.png*"));
+
+	TestMultiURLsSameResult("Everything allowed", urlfilterRules, urls, 6, NULL, TRUE);
+
+	verify_success(urlfilterRules.AddURL(nodeEx, ext1_ptr, NULL));
+
+	TestMultiURLsSameResult("Everything blocked", urlfilterRules, urls, 6, NULL, FALSE);
+
+	verify_success(urlfilterRules.AddURL(nodeIn, ext1_ptr, NULL));
+
+	TestMultiURLsSameResult("Everything allowed again", urlfilterRules, urls, 6, NULL, TRUE);
+
+	nodeIn->AddRuleInDomains(in_domains);
+	TestMultiURLsSameResult("Everything blocked without context", urlfilterRules, urls, 6, NULL, FALSE);
+	TestMultiURLsSameResult("Everything allowed on domain t", urlfilterRules, urls, 6, &ctx_t, TRUE);
+	TestMultiURLsSameResult("Everything blocked on domain t.oslo.osa", urlfilterRules, urls, 6, &ctx_t_oslo_osa, FALSE);
+	TestMultiURLsSameResult("Everything allowed on domain testsuites.oslo.osa", urlfilterRules, urls, 6, &ctx_testsuites_oslo_osa, TRUE);
+	TestMultiURLsSameResult("Everything blocked on domain My Opera", urlfilterRules, urls, 6, &ctx_my_opera, FALSE);
+}
+
+
+// Tests that the events are working
+test("Events")
+async;
+{
+	URL url_Google=urlManager->GetURL("http://www.google.com");
+	FilterURLnode *nodeGoogle = OP_NEW(FilterURLnode, (TRUE));
+	FilterURLnode *nodeCom = OP_NEW(FilterURLnode, (TRUE));
+	URLFilter urlfilterRules;
+	PassFilter *pass = OP_NEW(PassFilter, (2));
+	
+	nodeGoogle->SetURL(UNI_L("http://*.google.*"));
+	nodeCom->SetURL(UNI_L("http://*.com/*"));
+	urlfilterRules.AddURL(nodeGoogle, ext1_ptr, NULL);
+	urlfilterRules.AddURL(nodeCom, ext2_ptr, NULL);
+	urlfilterRules.AddExtensionListener(ext1_ptr, pass);
+	urlfilterRules.AddExtensionListener(ext2_ptr, pass);
+
+	// Test the whole google blocked
+	TestSinglePattern("Google blocked 1", urlfilterRules, &url_Google, FALSE, NULL);
+}
+
+test("Lists poisoning")
+{
+	FilterURLnode *nodeEx1 = OP_NEW(FilterURLnode, (TRUE));
+	FilterURLnode *nodeEx2 = OP_NEW(FilterURLnode, (TRUE));
+	FilterURLnode *nodeIn1 = OP_NEW(FilterURLnode, (FALSE));
+	FilterURLnode *nodeIn2 = OP_NEW(FilterURLnode, (FALSE));
+	URLFilter urlfilterRules;
+	URL urls[4];
+	BOOL ar_load[4];
+	int num_urls = 4;
+
+	nodeEx1->SetURL(UNI_L("*facebook.com*"));
+	nodeEx2->SetURL(UNI_L("*twitter.com*"));
+	nodeIn1->SetURL(UNI_L("*twitter.com/allow*"));
+	nodeIn2->SetURL(UNI_L("*facebook.com/allow*"));
+
+	urls[0]=urlManager->GetURL("www.facebook.com/a");
+	urls[1]=urlManager->GetURL("www.facebook.com/allow/b");
+	urls[2]=urlManager->GetURL("www.twitter.com/a");
+	urls[3]=urlManager->GetURL("www.twitter.com/allow/b");
+
+	ar_load[0] = ar_load[1] = ar_load[2] = ar_load[3] = TRUE;
+
+	TestMultiURLs("No filters", urlfilterRules, urls, num_urls, NULL, ar_load);
+
+	// Add extension 1 - block only
+	ar_load[0] = ar_load[1] = FALSE;
+	urlfilterRules.AddURL(nodeEx1, ext1_ptr, NULL);
+	TestMultiURLs("Extension 1 - block only", urlfilterRules, urls, num_urls, NULL, ar_load);
+
+	// Add extension 2 - block only
+	ar_load[2] = ar_load[3] = FALSE;
+	urlfilterRules.AddURL(nodeEx2, ext2_ptr, NULL);
+	TestMultiURLs("Extension 1+2 - block only", urlfilterRules, urls, num_urls, NULL, ar_load);
+
+	// White list poisoning check
+	urlfilterRules.AddURL(nodeIn1, ext1_ptr, NULL);  // Whitelist URLs blocked by extension 2; it should have no effect
+	urlfilterRules.AddURL(nodeIn2, ext2_ptr, NULL);  // Whitelist URLs blocked by extension 1; it should have no effect
+
+	TestMultiURLs("Extension 1+2 - white list poisoning check", urlfilterRules, urls, num_urls, NULL, ar_load);
+}
+
+test("Widgets")
+{
+	FilterURLnode *node = OP_NEW(FilterURLnode, ());
+	URLFilter urlfilterRules;
+	BOOL load = FALSE;
+	URL url_CNN=urlManager->GetURL("http://www.cnn.com");
+	URL url_extension=urlManager->GetURL("http://fake-extension_domain");
+	HTMLLoadContext ctx_cnn(RESOURCE_STYLESHEET, url_CNN, NULL, FALSE);
+	HTMLLoadContext ctx_ext(RESOURCE_STYLESHEET, url_extension, NULL, TRUE);  // Context marked as created by a widget
+
+	verify(node);
+
+	// No filtering
+	load = FALSE;
+	urlfilterRules.CheckURL(UNI_L("http://www.facebook.com/test"), load, NULL, &ctx_cnn);
+    verify(load==TRUE);
+	load = FALSE;
+	urlfilterRules.CheckURL(UNI_L("http://www.facebook.com/test"), load, NULL, &ctx_ext);
+    verify(load==TRUE);
+
+	// Filtering, no rules
+	node->SetIsExclude(TRUE);
+	node->SetURL(UNI_L("*://*facebook.com*"));
+	urlfilterRules.AddURL(node, ext1_ptr, NULL);
+
+	load = TRUE;
+	urlfilterRules.CheckURL(UNI_L("http://www.facebook.com/test"), load, NULL, &ctx_cnn);
+    verify(load==FALSE);
+	load = FALSE;
+	urlfilterRules.CheckURL(UNI_L("http://www.facebook.com/test"), load, NULL, &ctx_ext);
+    verify(load==TRUE);  // Extensions are not blocked
+}
+
+test("Ghostery")
+{
+	FilterURLnode *node = OP_NEW(FilterURLnode, ());
+	URLFilter urlfilterRules;
+	BOOL load = FALSE;
+	URL url_CNN=urlManager->GetURL("http://www.cnn.com");
+	HTMLLoadContext ctx(RESOURCE_STYLESHEET, url_CNN);
+
+	verify(node);
+
+	// No filtering
+	load = FALSE;
+	urlfilterRules.CheckURL(UNI_L("http://www.facebook.com/test"), load, NULL, &ctx);
+    verify(load==TRUE);
+
+	load = FALSE;
+	urlfilterRules.CheckURL(UNI_L("http://static.ak.facebook.com/test"), load, NULL, &ctx);
+    verify(load==TRUE);
+
+	// Filtering, no rules
+	node->SetIsExclude(TRUE);
+	node->SetURL(UNI_L("*://*facebook.com*"));
+	urlfilterRules.AddURL(node, ext1_ptr, NULL);
+
+	load = TRUE;
+	urlfilterRules.CheckURL(UNI_L("http://www.facebook.com/test"), load, NULL, &ctx);
+    verify(load==FALSE);
+
+	load = TRUE;
+	urlfilterRules.CheckURL(UNI_L("http://static.ak.facebook.com/test"), load, NULL, &ctx);
+    verify(load==FALSE);
+
+	// Filtering, rules
+	OpVector<uni_char> exclude_domains;
+
+	exclude_domains.Add((uni_char *)UNI_L("extension-host.opera.com"));
+	exclude_domains.Add((uni_char *)UNI_L("static.ak.facebook.com"));
+	exclude_domains.Add((uni_char *)UNI_L("s-static.ak.facebook.com"));
+
+	verify_success(node->AddRuleNotInDomains(exclude_domains));
+
+	load = TRUE;
+	urlfilterRules.CheckURL(UNI_L("http://www.facebook.com/test"), load, NULL, &ctx);
+    verify(load==FALSE);
+
+	load = TRUE;
+	urlfilterRules.CheckURL(UNI_L("http://static.ak.facebook.com/test"), load, NULL, &ctx);
+    verify(load==FALSE);
+}

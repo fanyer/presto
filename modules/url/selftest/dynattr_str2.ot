@@ -1,0 +1,134 @@
+group "url Dynamic Attribute API string headers";
+
+//disabled;
+require init;
+require URL_ENABLE_DYNATTR_SEND_HEADER;
+
+include "core/pch.h";
+include "modules/url/url2.h";
+include "modules/url/url_man.h";
+include "modules/url/url_ds.h";
+include "modules/url/url_dynattr.h";
+include "modules/url/url_dynattr_int.h";
+include "modules/network_selftest/urldoctestman.h";
+include "modules/network_selftest/scanpass.h";
+
+global {
+
+	URL_DynamicStringAttributeHandler header_handler;
+	URL_DynamicStringAttributeHandler header_handler_fail;
+
+	URL::URL_StringAttribute header_attr;
+
+	URL_DocSelfTest_Manager *dynattr_tests = NULL;
+
+}
+
+
+setup
+{
+	header_attr = URL::KNoStr;
+
+	header_handler.SetHTTPInfo("X-DynAttr-Test1", TRUE, FALSE);
+
+	header_handler_fail.SetHTTPInfo("Content-Length", TRUE, FALSE);
+
+	dynattr_tests = OP_NEW(URL_DocSelfTest_Manager, ());
+
+}
+
+exit
+{
+	OP_DELETE(dynattr_tests);
+	dynattr_tests = NULL;
+}
+
+test("Initialized")
+{
+	verify(dynattr_tests != NULL);
+}
+
+test("Try to set blocked header as attribute, must not be allowed")
+{
+	OP_MEMORY_VAR URL::URL_StringAttribute temp_header_attr= URL::KNoStr;
+	TRAPD(op_err, temp_header_attr = g_url_api->RegisterAttributeL(&header_handler_fail));
+	verify(OpStatus::IsError(op_err));
+	verify(temp_header_attr == URL::KNoStr);
+}
+
+subtest AddScanPassTest(URL &url, URL &ref_url, const char *pass_string)
+{
+	OpAutoPtr<URL_DocSelfTest_Batch> batch(OP_NEW(URL_DocSelfTest_Batch, ()));
+
+	verify(batch.get() != NULL);
+	verify(url.IsValid());
+
+	OpAutoPtr<ScanPass_SimpleTester> test(OP_NEW(ScanPass_SimpleTester, ()));
+	verify(test.get() != NULL);
+
+	verify(OpStatus::IsSuccess(test->Construct(url, ref_url, pass_string)));
+
+	verify(batch->AddTestCase(test.release()));
+
+	verify(!batch->Empty());
+	verify(AddBatch(batch.release()));
+}
+
+subtest AddBatch(URL_DocSelfTest_Batch *batch)
+{
+	verify(batch != NULL);
+	verify(dynattr_tests->AddBatch(batch));
+}
+
+subtest StartTestSet()
+{
+	verify(dynattr_tests->SetLastBatch());
+}
+
+subtest SetUpTests()
+{
+	TRAPD(op_err, header_attr = g_url_api->RegisterAttributeL(&header_handler));
+	verify(OpStatus::IsSuccess(op_err));
+	verify(header_attr >= URL::KFirstStrDynamicAttributeItem);
+
+	URL ref_url;
+	OpString8 attr_val;
+	URL test_url = g_url_api->GetURL("http://certo.opera.com/cgi-bin/custom-header-check.cgi?hname=X-DynAttr-Test1&hvalue=foo", (const char *)NULL, TRUE);
+	verify(test_url.IsValid());
+	verify(OpStatus::IsSuccess(test_url.SetAttribute(header_attr,"foo")));
+	attr_val.Empty();
+	verify(OpStatus::IsSuccess(test_url.GetAttribute(header_attr, attr_val)));
+	verify(attr_val.Compare("foo") == 0);
+	URL test_url2 = g_url_api->GetURL("http://certo.opera.com/cgi-bin/custom-header-check.cgi?hname=X-DynAttr-Test1&hvalue=bar", (const char *)NULL, TRUE);
+	verify(test_url2.IsValid());
+	verify(OpStatus::IsSuccess(test_url2.SetAttribute(header_attr,"bar")));
+	attr_val.Empty();
+	verify(OpStatus::IsSuccess(test_url2.GetAttribute(header_attr, attr_val)));
+	verify(attr_val.Compare("bar") == 0);
+	URL test_url_fail = g_url_api->GetURL("http://certo.opera.com/cgi-bin/custom-header-check.cgi?hname=X-DynAttr-Test1&hvalue=foo", (const char *)NULL, TRUE);
+	verify(test_url_fail.IsValid());
+	verify(OpStatus::IsSuccess(test_url_fail.SetAttribute(header_attr,"bar")));
+	attr_val.Empty();
+	verify(OpStatus::IsSuccess(test_url_fail.GetAttribute(header_attr, attr_val)));
+	verify(attr_val.Compare("bar") == 0);
+	URL test_url_fail2 = g_url_api->GetURL("http://certo.opera.com/cgi-bin/custom-header-check.cgi?hname=X-DynAttr-Test2&hvalue=bar", (const char *)NULL, TRUE);
+	verify(test_url_fail2.IsValid());
+	verify(OpStatus::IsSuccess(test_url_fail2.SetAttribute(header_attr,"bar")));
+	attr_val.Empty();
+	verify(OpStatus::IsSuccess(test_url_fail2.GetAttribute(header_attr, attr_val)));
+	verify(attr_val.Compare("bar") == 0);
+
+	verify(AddScanPassTest(test_url, ref_url, "<strong>PASS</strong>"));
+	verify(AddScanPassTest(test_url2, ref_url, "<strong>PASS</strong>"));
+	verify(AddScanPassTest(test_url_fail, ref_url, "<strong>FAIL</strong>"));
+	verify(AddScanPassTest(test_url_fail2, ref_url, "<strong>FAIL</strong>"));
+}
+
+test("Send Dynamic Headers")
+async;
+require success "Initialized";
+{
+	if (!SetUpTests() ||
+		!StartTestSet())
+		ST_failed("Could not start test");
+}

@@ -1,0 +1,379 @@
+/* -*- Mode: c++; tab-width: 4; indent-tabs-mode: t; c-basic-offset: 4 -*-
+**
+** Copyright (C) 2009-2011 Opera Software ASA.  All rights reserved.
+**
+** This file is part of the Opera web browser.  It may not be distributed
+** under any circumstances.
+**
+** Peter Krefting
+*/
+
+group "gadgets.gadgetmanager";
+require GADGET_SUPPORT;
+require init;
+
+include "modules/gadgets/OpGadgetManager.h";
+include "modules/gadgets/OpGadget.h";
+include "modules/util/opfile/opmemfile.h";
+
+// -- Testing framework --------------------------------------------------
+
+subtest test_locale_setup(const char *raw, const char *expected_processed)
+{
+	verify_success(g_gadget_manager->OverrideBrowserLocale(raw));
+	// output("\nhad  '%s'\ngot  '%s'\nwant '%s' ", raw, ST_down(g_gadget_manager->GetBrowserLocale()), processed);
+	OpGadgetManager::GadgetLocaleIterator iterator = g_gadget_manager->GetBrowserLocaleIterator();
+	OpString processed;
+	while (const uni_char* locale = iterator.GetNextLocale())
+	{
+		verify_success(processed.AppendFormat(UNI_L("%s,"), locale));
+	}
+	verify_string(expected_processed, processed);
+}
+
+subtest test_find_file(BOOL traverse, const char *zipfile, const char *wanted, const char *expected, const char *expected_locale, bool should_succeed)
+{
+	OpString zipfile_path, wanted_path, expected_path, target, locale;
+	BOOL found = FALSE;
+
+	verify_success(zipfile_path.Set(zipfile));
+	OpString unused;
+	OpAutoPtr<OpGadgetClass> dummy_klass(g_gadget_manager->CreateClassWithPath(zipfile_path, URL_GADGET_INSTALL_CONTENT, NULL, unused));
+	verify(dummy_klass.get());
+	verify_success(wanted_path.Set(wanted));
+
+	verify_success(expected_path.Set(zipfile));
+	verify_success(expected_path.Append(PATHSEP));
+	verify_success(expected_path.Append(expected));
+
+	if (should_succeed)
+	{
+		verify_success(g_gadget_manager->Findi18nPath(dummy_klass.get(), wanted_path, traverse, target, found, &locale));
+		verify(found);
+		verify_string(target.CStr(), expected_path);
+		if (traverse)
+			verify_string(locale.CStr(), expected_locale);
+	}
+	else
+	{
+		verify(OpStatus::IsError(g_gadget_manager->Findi18nPath(dummy_klass.get(), wanted_path, traverse, target, found, &locale)) || !found);
+	}
+}
+
+// -- Tests --------------------------------------------------------------
+
+table setup_tests
+{
+	{ "", "" }
+	{ ",", "" } // should not crash
+	{ "en", "en," }
+	{ "en-US", "en-us,en," }
+	{ "en-US,en", "en-us,en," }
+	{ "en-CA,en-US,en", "en-ca,en,en-us," }
+	{ "sv,en-US,en", "sv,en-us,en," }
+	{ "sv-SE,sv,en-US,en", "sv-se,sv,en-us,en," }
+	{ "nb-NO,en", "nb-no,nb,en," }
+	{ "en-us,en-au,en,fr-ca,zh-hans-cn",  "en-us,en,en-au,fr-ca,fr,zh-hans-cn,zh-hans,zh," }
+	{ "en-us,en,fr-ca,en,en-ca", "en-us,en,fr-ca,fr,en-ca," }
+	{ "x-klingon,i-navajo,art-lojban", "x-klingon,i-navajo,art-lojban," }
+}
+
+foreach (input, expect) from setup_tests
+{
+	// Verify that our locale setup algorithm is in accordance with the
+	// Widgets 1.0: Packaging and Configuration specification.
+	// Note that we drop the trailing "*".
+	test("Locale normalization: " input)
+	{
+		verify(test_locale_setup(input, expect));
+	}
+}
+
+// Verify that our locale setup algorithm is in accordance with the
+// Widgets 1.0: Packaging and Configuration specification.
+// Note that we drop the trailing "*".
+test("Locale normalization: (NULL)")
+{
+	verify(test_locale_setup(NULL, ""));
+}
+
+table dummy1(const char *) filelist "testfiles/widgets/w3c_widget.wgt" recursively;
+
+test("Findi18nPath(): Primary localization")
+	file zip_file "testfiles/widgets/w3c_widget.wgt";
+{
+	// Verify that we find the first language specified in our
+	// list of supported languages.
+	verify(test_locale_setup("nb-NO,en", "nb-no,nb,en,"));
+	verify(test_find_file(TRUE, zip_file, "src" PATHSEP "main.html", "locales" PATHSEP "nb-no" PATHSEP "src" PATHSEP "main.html", "nb-no", true));
+	verify(test_find_file(FALSE,zip_file, "src" PATHSEP "main.html", "src" PATHSEP "main.html", "nb-no", true));
+}
+
+test("Findi18nPath(): Non-primary localization")
+	file zip_file "testfiles/widgets/w3c_widget.wgt";
+{
+	// Verify that we fall back to a secondary language if
+	// our primary language is not found.
+	verify(test_locale_setup("sv-SE,en", "sv-se,sv,en,"));
+	verify(test_find_file(TRUE, zip_file, "src" PATHSEP "main.html", "locales" PATHSEP "en" PATHSEP "src" PATHSEP "main.html", "en", true));
+	verify(test_find_file(FALSE,zip_file, "src" PATHSEP "main.html", "src" PATHSEP "main.html", "en", true));
+}
+
+test("Findi18nPath(): Fallback")
+	file zip_file "testfiles/widgets/w3c_widget.wgt";
+{
+	// Verify that we fall back to the generic path if
+	// none of our supported languages are found.
+	verify(test_locale_setup("sv", "sv,"));
+	verify(test_find_file(TRUE, zip_file, "src" PATHSEP "main.html", "src" PATHSEP "main.html", "en", true));
+	verify(test_find_file(FALSE,zip_file, "src" PATHSEP "main.html", "src" PATHSEP "main.html", "en", true));
+}
+
+test("Findi18nPath(): Primary localization - zipped")
+	file zip_file "testfiles/widgets/w3c_widget_zipped.wgt";
+{
+	// Verify that we find the first language specified in our
+	// list of supported languages.
+	verify(test_locale_setup("nb-NO,en", "nb-no,nb,en,"));
+	verify(test_find_file(TRUE, zip_file, "src" PATHSEP "main.html", "locales" PATHSEP "nb-no" PATHSEP "src" PATHSEP "main.html", "nb-no", true));
+	verify(test_find_file(FALSE,zip_file, "src" PATHSEP "main.html", "src" PATHSEP "main.html", "nb-no", true));
+}
+
+test("Findi18nPath(): Non-primary localization - zipped")
+	file zip_file "testfiles/widgets/w3c_widget_zipped.wgt";
+{
+	// Verify that we fall back to a secondary language if
+	// our primary language is not found.
+	verify(test_locale_setup("sv-SE,en", "sv-se,sv,en,"));
+	verify(test_find_file(TRUE, zip_file, "src" PATHSEP "main.html", "locales" PATHSEP "en" PATHSEP "src" PATHSEP "main.html", "en", true));
+	verify(test_find_file(FALSE,zip_file, "src" PATHSEP "main.html", "src" PATHSEP "main.html", "en", true));
+}
+
+test("Findi18nPath(): Fallback - zipped")
+	file zip_file "testfiles/widgets/w3c_widget_zipped.wgt";
+{
+	// Verify that we fall back to the generic path if
+	// none of our supported languages are found.
+	verify(test_locale_setup("sv", "sv,"));
+	verify(test_find_file(TRUE, zip_file, "src" PATHSEP "main.html", "src" PATHSEP "main.html", "en", true));
+	verify(test_find_file(FALSE,zip_file, "src" PATHSEP "main.html", "src" PATHSEP "main.html", "en", true));
+}
+
+test("Findi18nPath(): Reserved characters: non-native path separators")
+	file zip_file "testfiles/widgets/w3c_widget.wgt";
+{
+	verify(test_locale_setup("nb-NO,en", "nb-no,nb,en,"));
+#if PATHSEPCHAR == '/'
+	verify(test_find_file(TRUE, zip_file, "src\\main.html", "locales\\nb-no\\src\\main.html", "nb-no", false));
+#else
+	verify(test_find_file(TRUE, zip_file, "src/main.html", "locales/nb-no/src/main.html", "nb-no", false));
+#endif
+}
+
+test("Findi18nPath(): Path separator on the beginning of the path")
+	file zip_file "testfiles/widgets/w3c_widget.wgt";
+{
+	// Verify that we find the first language specified in our
+	// list of supported languages.
+	verify(test_locale_setup("nb-NO,en", "nb-no,nb,en,"));
+	verify(test_find_file(TRUE, zip_file, PATHSEP "src" PATHSEP "main.html", "locales" PATHSEP "nb-no" PATHSEP "src" PATHSEP "main.html", "nb-no", true));
+	verify(test_find_file(FALSE,zip_file, PATHSEP "src" PATHSEP "main.html", "src" PATHSEP "main.html", "nb-no", true));
+}
+
+test("CORE-23302: CreateGadget() should not duplicate icons")
+	file uni zip_file "testfiles/widgets/w3c_widget.wgt";
+{
+	OpGadget *gadget_p_1 = NULL, *gadget_p_2 = NULL;
+
+	verify_success(g_gadget_manager->CreateGadget(&gadget_p_1, zip_file, URL_GADGET_INSTALL_CONTENT));
+	verify(gadget_p_1);
+
+	UINT32 icon_count_1_before = gadget_p_1->GetGadgetIconCount();
+
+	verify_success(g_gadget_manager->CreateGadget(&gadget_p_2, zip_file, URL_GADGET_INSTALL_CONTENT));
+
+	UINT32 icon_count_1_after  = gadget_p_1->GetGadgetIconCount();
+	UINT32 icon_count_2        = gadget_p_1->GetGadgetIconCount();
+
+	verify(icon_count_1_before == icon_count_1_after);
+	verify(icon_count_1_after  == icon_count_2);
+}
+finally
+{
+	OpStatus::Ignore(g_gadget_manager->DestroyGadget(gadget_p_1));
+	if (gadget_p_1 != gadget_p_2)
+		OpStatus::Ignore(g_gadget_manager->DestroyGadget(gadget_p_2));
+}
+
+// Simple tests for IsThisAGadgetPath
+table path_fail
+{
+	{ "path containing config.xml", "testfiles/widgets/config.xml/notawidget.html" },
+	{ "zip without config.xml",     "testfiles/widgets/namematch3.wgt" },
+	{ "a random directory",         "testfiles" },
+}
+
+table path_fail_2
+{
+	{ "config.xml is directory",	"testfiles/widgets",                "configxml_dir.wgt" },
+	{ "widget 1 with .bak + c.x.b", "testfiles/widgets/namematch1.wgt", "config.xml.bak" },
+	{ "widget 2 with .bak + c.x.b", "testfiles/widgets/namematch2.wgt", "config.xml.bak" },
+	{ "widget 3 with .bak + c.x.b", "testfiles/widgets/namematch3.wgt", "config.xml.bak" },
+	{ "valid W3C widget + c.x.b",   "testfiles/widgets/w3c_widget.wgt", "config.xml.bak" },
+	{ "a random directory + c.x.b", "testfiles",                        "config.xml.bak" },
+	{ "badconfig.xml",              "testfiles/widgets/badconfig.wgt",  "badconfig.xml"  },
+}
+
+// Mention all the contained files such that
+// they get listed in the selftest_data file.
+table dummy2(const char *) filelist "testfiles/widgets/badconfig.wgt" recursively;
+table dummy3(const char *) filelist "testfiles/widgets/config.xml" recursively;
+table dummy4(const char *) filelist "testfiles/widgets/widgetfolder" recursively;
+table dummy5(const char *) filelist "testfiles/widgets/configxml_dir.wgt" recursively;
+
+table path_pass
+{
+	{ "zip with bad config.xml",    "testfiles/widgets/namematch1.wgt" },
+	{ "zip with bad config.xml",    "testfiles/widgets/namematch2.wgt" },
+	{ "valid W3C widget",           "testfiles/widgets/w3c_widget.wgt" },
+	{ "valid widget (.wgt)",        "testfiles/widgets/default.wgt" },
+	{ "valid widget (.zip)",        "testfiles/widgets/default.zip" },
+	{ "valid widget (unzipped)",    "testfiles/widgets/widgetfolder" },
+}
+
+foreach (testname, path) from path_fail
+{
+	test("IsThisAGadgetPath() " testname " should fail")
+		file uni nonwidget path;
+	{
+		verify(!g_gadget_manager->IsThisAGadgetPath(nonwidget));
+	}
+
+	test("IsThisAGadgetPath() " testname " + config.xml should fail")
+		file uni nonwidget path;
+	{
+		OpString testpath;
+		testpath.SetConcat(nonwidget, UNI_L(PATHSEP), UNI_L("config.xml"));
+		verify(!g_gadget_manager->IsThisAGadgetPath(testpath));
+	}
+}
+
+foreach (testname, path, subfile) from path_fail_2
+{
+	test("IsThisAGadgetPath() " testname " should fail")
+		file uni nonwidget path;
+	{
+		OpString testpath;
+		testpath.SetConcat(nonwidget, UNI_L(PATHSEP), UNI_L(subfile));
+		verify(!g_gadget_manager->IsThisAGadgetPath(testpath));
+	}
+}
+
+foreach (testname, path) from path_pass
+{
+	test("IsThisAGadgetPath() " testname " should pass")
+		file uni yeswidget path;
+	{
+		verify(g_gadget_manager->IsThisAGadgetPath(yeswidget));
+	}
+
+	test("IsThisAGadgetPath() " testname " + config.xml should pass")
+		file uni yeswidget path;
+	{
+		OpString testpath;
+		testpath.SetConcat(yeswidget, UNI_L(PATHSEP), UNI_L("config.xml"));
+		verify(g_gadget_manager->IsThisAGadgetPath(testpath));
+	}
+}
+
+foreach (testname, path) from path_fail
+{
+	test("CORE-33298: " testname)
+		file uni nonwidget path;
+	{
+		OpGadgetClass *test = reinterpret_cast<OpGadgetClass *>(0xDEADBEEF);
+		OpGadgetClass *untouched = test;
+		verify(OpStatus::IsError(g_gadget_manager->CreateGadgetClass(&test, nonwidget, URL_GADGET_INSTALL_CONTENT)));
+		verify(test == untouched);
+	}
+}
+
+table dump_tests
+{
+	{ GADGET_SUPPORT,    "widget",    "testfiles/widgets/w3c_widget.wgt",  "namespace=\"http://www.w3.org/ns/widgets\"", "widget type=\"widget\"",    "features=[[name=\"feature:a9bb79c1\", required=\"false\", params=[]]]" },
+	{ EXTENSION_SUPPORT, "extension", "testfiles/extensions/selftest.oex", "namespace=\"http://www.w3.org/ns/widgets\"", "widget type=\"extension\"", "description=null" },
+	{ WEBSERVER_SUPPORT, "webserver", "testfiles/unite/selftest.ua",       "namespace=\"\"",                             "widget type=\"webserver\"", "features=[[name=\"http://xmlns.opera.com/webserver\", required=\"true\", params=[[name=\"servicepath\", value=\"test\"], [name=\"type\", value=\"service\"]]]]" },
+}
+
+foreach (requirement, testname, path, line1, line2, line3) from dump_tests
+{
+	test("Dump(): " testname)
+		require GADGET_DUMP_TO_FILE;
+		require OPMEMFILE_SUPPORT;
+		require requirement;
+		file uni widget path;
+	{
+		// Dump the widget to a memory file
+		OpMemFile *memfile = OpMemFile::Create(NULL, 0, UNI_L("widgetdump.txt"));
+		verify_not_oom(memfile);
+		verify_success(g_gadget_manager->Dump(widget, memfile));
+
+		// Now look at the output to see if we can find what we expected
+		verify_success(memfile->Open(OPFILE_READ));
+		OpString8 line;
+		bool found_line1 = false, found_line2 = false, found_line3 = false;
+		while (!memfile->Eof() && OpStatus::IsSuccess(memfile->ReadLine(line)))
+		{
+			if (line.Compare(line1) == 0) found_line1 = true;
+			if (line.Compare(line2) == 0) found_line2 = true;
+			if (line.Compare(line3) == 0) found_line3 = true;
+		}
+
+		// Be helpful if we get unexpected output
+		if (!found_line1 || !found_line2 || !found_line3)
+		{
+			output("\n unexpected output: --------\n%.*s\n-------- ", static_cast<int>(memfile->GetFileLength()), memfile->GetBuffer());
+		}
+		verify(found_line1);
+		verify(found_line2);
+		verify(found_line3);
+	}
+	finally
+	{
+		OP_DELETE(memfile);
+	}
+}
+
+test("Dump(): Localization")
+	file uni widget "testfiles/widgets/w3c_widget.wgt";
+	require GADGET_DUMP_TO_FILE;
+	require OPMEMFILE_SUPPORT;
+{
+	OpMemFile *memfile = OpMemFile::Create(NULL, 0, UNI_L("widgetdump.txt"));
+
+	// Set up locale
+	verify(test_locale_setup("nb-NO,en", "nb-no,nb,en,"));
+
+	// Dump the widget to a memory file
+	verify_not_oom(memfile);
+	verify_success(g_gadget_manager->Dump(widget, memfile));
+
+	// Now look at the output to see if we can find what we expected
+	verify_success(memfile->Open(OPFILE_READ));
+	OpString8 line;
+	bool found = false;
+	while (!memfile->Eof() && OpStatus::IsSuccess(memfile->ReadLine(line)))
+	{
+		if (line.Compare("resolved start file=", 19) == 0
+		    && line.Find("locales") != KNotFound
+		    && line.Find("nb-no") != KNotFound)
+		{
+			found = true;
+		}
+	}
+	verify(found);
+}
+finally
+{
+	OP_DELETE(memfile);
+}

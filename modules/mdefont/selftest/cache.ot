@@ -1,0 +1,218 @@
+/* -*- Mode: c++; tab-width: 4; indent-tabs-mode: t; c-basic-offset: 4 -*- */
+
+group "mdefont.cache";
+require MDEFONT_MODULE;
+
+include "modules/mdefont/mdefont.h";
+
+
+test("advance cache vs glyph cache")
+require MDF_FONT_FACE_CACHE;
+require MDF_FONT_GLYPH_CACHE;
+require MDF_FONT_ADVANCE_CACHE;
+{
+    MDE_FONT* font = 0;
+
+    int n = styleManager->GetFontNumber(UNI_L("SimSun"));
+    verify(n >= 0 && "this test requires the SimSun font");
+    font = MDF_GetFont(n, 17, FALSE, FALSE);
+    verify(font);
+    verify(font->m_advance_cache);
+
+    short a, qa;
+
+
+    // step 1: fill advance cache with junk, and one relevant glyph: 'Q'
+
+    // 1a: fill l1 cache
+    for (uni_char c = 0x4e00; c <= 0x4fff; ++c)
+    {
+        verify(OpStatus::IsSuccess(font->m_advance_cache->Advance(c, a)));
+    }
+    // l1: 0x4e00 - 0x4fff
+    // l2: -
+
+    // 1b: swap, fill new l1 cache
+    for (uni_char c = 0x5000; c < 0x51ff; ++c)
+    {
+        verify(OpStatus::IsSuccess(font->m_advance_cache->Advance(c, a)));
+    }
+    // l1: 0x5000 - 0x51fe
+    // l2: 0x4e00 - 0x4fff
+
+    // 1c: insert 'Q' in advance and glyph caches, store advance for later
+    {
+        verify(OpStatus::IsSuccess(font->m_advance_cache->Advance('Q', qa)));
+    }
+    // l1: 0x5000 - 0x51fe, 'Q'
+    // l2: 0x4e00 - 0x4fff
+
+
+    // step 2: remove 'Q' from advance cache without removing it from glyph cache
+
+    // 2a: trigger swap
+    {
+        verify(OpStatus::IsSuccess(font->m_advance_cache->Advance(0x4e00, a)));
+    }
+    // l1: 0x4e00
+    // l2: 0x5000 - 0x51fe, 'Q'
+
+    // 2b: move 0x5000 - 0x51fe to l1
+    for (uni_char c = 0x5000; c <= 0x51fe; ++c)
+    {
+        verify(OpStatus::IsSuccess(font->m_advance_cache->Advance(c, a)));
+    }
+    // l1: 0x4e00, 0x5000 - 0x51fe
+    // l2: 'Q'
+
+    // 2c: insert 'q' in advance and glyph caches, to trigger swap and lose 'Q'
+    {
+        verify(OpStatus::IsSuccess(font->m_advance_cache->Advance('q', a)));
+    }
+    // l1: 'q'
+    // l2: 0x4e00, 0x5000 - 0x51fe
+
+    // step 3: request advance for 'Q', which should now be in glyph
+    // but not advance cache, and verify that the same advance is
+    // returned as first time
+    verify(OpStatus::IsSuccess(font->m_advance_cache->Advance('Q', a)));
+    verify(a == qa);
+}
+finally
+{
+	if (font)
+		MDF_ReleaseFont(font);
+}
+
+test("MDF_FontGlyphCache::MoveCache")
+require MDF_FONT_GLYPH_CACHE;
+{
+	MDF_FontGlyphCache* small_cache = 0;
+	MDF_FontGlyphCache* big_cache = 0;
+    MDE_FONT* font = 0;
+
+	// use first font - doesn't matter which one
+    font = MDF_GetFont(0, 17, FALSE, FALSE);
+    verify(font);
+
+	const BOOL render = TRUE;
+	const int size = 10;
+	const uni_char start = 'A';
+	const uni_char end = 'Z';
+	const uni_char num_glyphs = end - start + 1;
+	verify(end - start > 2*size); // need more than 2*size glyphs to trigger swap
+
+	// create small cache and put some junk in it
+	verify(OpStatus::IsSuccess(MDF_FontGlyphCache::Create(&small_cache, size, g_mdf_engine)));
+	verify(small_cache->GetSize() == size);
+	MDF_FontGlyph* glyph;
+	for (uni_char i = start; i <= end; ++i)
+		verify(OpStatus::IsSuccess(small_cache->GetChar(glyph, i, font, render)));
+	verify(small_cache->IsFull());
+
+	// create bigger cache and move data
+	verify(OpStatus::IsSuccess(MDF_FontGlyphCache::Create(&big_cache, num_glyphs, g_mdf_engine)));
+	verify(big_cache->GetSize() == num_glyphs);
+	verify(OpStatus::IsSuccess(MDF_FontGlyphCache::MoveCache(big_cache, small_cache)));
+
+	// hopefully a reasonable way to check integrity of data: small_cache
+	// should now be empty, so ref will be refetched for all glyphs
+	MDF_FontGlyph* ref;
+	for (uni_char i = end; i >= start; --i)
+	{
+		verify(OpStatus::IsSuccess(big_cache->GetChar(glyph, i, font, render)));
+		verify(OpStatus::IsSuccess(small_cache->GetChar(ref, i, font, render)));
+
+		verify(glyph->c == i);
+
+		if (render)
+		{
+			MDF_FontGlyph g1 = *glyph;
+			MDF_FontGlyph g2 = *ref;
+
+			// compare bitmaps
+			verify(g1.buffer_data->w == g2.buffer_data->w);
+			verify(g1.buffer_data->h == g2.buffer_data->h);
+			verify(!op_memcmp(g1.buffer_data->data, g2.buffer_data->data, g1.buffer_data->w * g1.buffer_data->h));
+
+			// compare rest - must be zero buffer_data
+			g1.buffer_data = g2.buffer_data = 0;
+			verify(!op_memcmp(&g1, &g2, sizeof(g1)));
+
+		}
+		else
+		{
+			// if glyph in not rendered only advance and c will be set
+			verify(glyph->advance == ref->advance);
+			verify(glyph->c == ref->c);
+		}
+	}
+
+	verify(!big_cache->IsFull());
+	// check that extra storage didn't get lost in the internal cache structure
+	const uni_char delta = 'a' - 'A';
+	for (uni_char i = start + delta; i <= end + delta; ++i)
+		verify(OpStatus::IsSuccess(big_cache->GetChar(glyph, i, font, render)));
+	// end should now be completely full
+	verify(!big_cache->IsFull());
+
+	// poor camel
+	verify(OpStatus::IsSuccess(big_cache->GetChar(glyph, '1', font, render)));
+	verify(big_cache->IsFull());
+}
+finally
+{
+	OP_DELETE(small_cache);
+	OP_DELETE(big_cache);
+
+	if (font)
+		MDF_ReleaseFont(font);
+}
+
+test("glyph cache fill")
+require MDF_FONT_GLYPH_CACHE;
+{
+	MDE_FONT* font = 0;
+
+	// use first font - doesn't matter which one
+    font = MDF_GetFont(0, 17, FALSE, FALSE);
+    verify(font && "OOM");
+
+	verify(!MDF_GlyphCacheFull(font));
+	verify(MDF_GetGlyphCacheSize(font) == MDF_GLYPH_CACHE_SIZE);
+
+	unsigned short fill = 0;
+
+	verify(MDF_GetGlyphCacheFill(font) == fill);
+
+
+	MDF_GLYPH glyph;
+
+	// load 'a' and check that this affects fill
+	verify(OpStatus::IsSuccess(MDF_GetGlyph(glyph, font, 'a')) && "OOM");
+	++ fill;
+	MDF_FreeGlyph(font, glyph);
+	verify(MDF_GetGlyphCacheFill(font) == fill);
+
+	// load 'b' and check that this affects fill
+	verify(OpStatus::IsSuccess(MDF_GetGlyph(glyph, font, 'b')) && "OOM");
+	++ fill;
+	MDF_FreeGlyph(font, glyph);
+	verify(MDF_GetGlyphCacheFill(font) == fill);
+
+	// load 'c' and check that this affects fill
+	verify(OpStatus::IsSuccess(MDF_GetGlyph(glyph, font, 'c')) && "OOM");
+	++ fill;
+	MDF_FreeGlyph(font, glyph);
+	verify(MDF_GetGlyphCacheFill(font) == fill);
+
+	// loading 'a' again shouldn't affect fill
+	verify(OpStatus::IsSuccess(MDF_GetGlyph(glyph, font, 'a')) && "OOM");
+	MDF_FreeGlyph(font, glyph);
+	verify(MDF_GetGlyphCacheFill(font) == fill);
+}
+finally
+{
+	if (font)
+		MDF_ReleaseFont(font);
+}

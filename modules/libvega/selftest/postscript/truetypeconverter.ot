@@ -1,0 +1,603 @@
+/* -*- Mode: c++; tab-width: 4; indent-tabs-mode: t; c-basic-offset: 4; c-file-style:"stroustrup" -*-
+**
+** Copyright (C) 1995-2011 Opera Software ASA.  All rights reserved.
+**
+** This file is part of the Opera web browser.  It may not be distributed
+** under any circumstances.
+*/
+
+group "libvega.postscript.truetypeconverter";
+
+require VEGA_POSTSCRIPT_PRINTING;
+
+include "modules/libvega/src/postscript/truetypeconverter.h";
+
+include "modules/libvega/src/postscript/postscriptcommandbuffer.h";
+include "modules/util/opfile/opmemfile.h";
+include "modules/util/opfile/opfile.h";
+
+constant BUFFER_SIZE = 1024*1024;
+
+global
+{
+	class SFNTTableHolder
+	{
+	public:
+		SFNTTableHolder() : data(0)
+		{
+		}
+
+		~SFNTTableHolder()
+		{
+			if ( data )
+				OP_DELETEA(data);
+		}
+
+		bool loadTableData(const char* fname, OpFileLength& size)
+		{
+			size = 0;
+			OpFile table_file;
+
+			OpString file_name;
+			if (OpStatus::IsError(file_name.Set(fname)))
+				return false;
+
+			if (OpStatus::IsError(table_file.Construct(file_name)))
+				return false;
+
+			OpFileLength length;
+			if (OpStatus::IsError(table_file.GetFileLength(length)))
+				return false;
+
+			if (OpStatus::IsError(table_file.Open(OPFILE_READ)))
+				return false;
+
+			if (!allocateTableData(length))
+			{
+				table_file.Close();
+				return false;
+			}
+
+			UINT8* pos = data;
+			OpFileLength to_read = length;
+
+			while( to_read > 0 )
+			{
+				OpFileLength bytes_read;
+				if (OpStatus::IsError(table_file.Read(pos, to_read, &bytes_read)))
+				{
+					table_file.Close();
+					return false;
+				}
+				to_read -= bytes_read;
+				pos += bytes_read;
+				size += bytes_read;
+			}
+
+			table_file.Close();
+			return true;
+		}
+
+		bool allocateTableData(OpFileLength size)
+		{
+			data = OP_NEWA(UINT8, (size_t)size);
+			if (!data)
+				return false;
+			return true;
+		}
+
+		UINT8* data;
+	};
+
+
+	class PSCommandBufferHolder
+	{
+	public:
+		PSCommandBufferHolder() : data(0), memfile(0)
+		{
+		}
+
+		~PSCommandBufferHolder()
+		{
+			if (memfile)
+				OP_DELETE(memfile);
+		}
+
+		bool init()
+		{
+			const size_t BufferSize = BUFFER_SIZE;
+			data = OP_NEWA(unsigned char, BufferSize);
+			if (!data)
+				return false;
+
+			memfile = OpMemFile::Create(data, BufferSize, TRUE);
+			if (!memfile)
+				return false;
+
+			buffer.Init(*memfile);
+			return true;
+		}
+
+
+		unsigned char* data;
+		OpFileDescriptor* memfile;
+		PostScriptCommandBuffer buffer;
+	};
+
+
+	class FontFileDataHolder
+	{
+	public:
+		FontFileDataHolder() : data(0) {}
+		~FontFileDataHolder() { if (data) OP_DELETEA(data); }
+
+		bool init(const char* path)
+		{
+			OpFile font_file;
+			OpString _path;
+
+			if (OpStatus::IsError(_path.Set(path)))
+				return false;
+
+			if (OpStatus::IsError(font_file.Construct(_path)))
+				return false;
+
+			if (OpStatus::IsError(font_file.Open(OPFILE_READ)))
+				return false;
+
+			if (OpStatus::IsError(font_file.GetFileLength(length)))
+			{
+				font_file.Close();
+				return false;
+			}
+
+			if (!allocateData(length))
+			{
+				font_file.Close();
+				return false;
+			}
+
+			OpFileLength bytes_read;
+			if (OpStatus::IsError(font_file.Read(data, length, &bytes_read))
+				|| bytes_read != length)
+			{
+				OP_DELETEA(data);
+				font_file.Close();
+				return false;
+			}
+
+			return true;
+		}
+
+		OpFileLength length;
+		UINT8* data;
+
+	private:
+		bool allocateData(OpFileLength& length)
+		{
+			data = OP_NEWA(UINT8, (size_t)length);
+			if (!data)
+				return false;
+			return true;
+		}
+
+	};
+
+
+	bool contains(OpString8& string, const char* substring)
+	{
+		return string.Find(substring, 0) != KNotFound;
+	}
+};
+
+
+test("read font from file")
+	file testfont "Vera.ttf";
+{
+	TrueTypeConverter converter;
+	FontFileDataHolder font_file_holder;
+	verify(font_file_holder.init(testfont));
+
+	verify(OpStatus::IsSuccess(converter.Init(font_file_holder.data, (UINT32)font_file_holder.length)));
+}
+
+
+test("constant values in dictionary")
+	file testfont "Vera.ttf";
+{
+	TrueTypeConverter converter;
+	FontFileDataHolder font_file_holder;
+	verify(font_file_holder.init(testfont));
+
+	verify(OpStatus::IsSuccess(converter.Init(font_file_holder.data, (UINT32)font_file_holder.length)));
+	verify(OpStatus::IsSuccess(converter.parseFont()));
+	verify(converter.getPaintType() == 0);
+}
+
+
+test("name of truetype font")
+	file testfont "Vera.ttf";
+{
+	TrueTypeConverter converter;
+	FontFileDataHolder font_file_holder;
+	verify(font_file_holder.init(testfont));
+
+	verify(OpStatus::IsSuccess(converter.Init(font_file_holder.data, (UINT32)font_file_holder.length)));
+	verify(OpStatus::IsSuccess(converter.parseFont()));
+	verify(converter.getFontName() == "BitstreamVeraSans-Roman");
+}
+
+
+test("FontBBox")
+	file testfont "Vera.ttf";
+{
+	TrueTypeConverter converter;
+	FontFileDataHolder font_file_holder;
+	verify(font_file_holder.init(testfont));
+
+	verify(OpStatus::IsSuccess(converter.Init(font_file_holder.data, (UINT32)font_file_holder.length)));
+	verify(OpStatus::IsSuccess(converter.parseFont()));
+	OpString8 font_bbox;
+	converter.getFontBBox(font_bbox);
+	verify(font_bbox == "[-183 -235 1287 928]");
+}
+
+
+test("font information: fixed pitch")
+	file testfont "Vera.ttf";
+{
+	TrueTypeConverter converter;
+	FontFileDataHolder font_file_holder;
+	verify(font_file_holder.init(testfont));
+
+	verify(OpStatus::IsSuccess(converter.Init(font_file_holder.data, (UINT32)font_file_holder.length)));
+	verify(OpStatus::IsSuccess(converter.parseFont()));
+	verify(converter.getFontInfo().getValue("isFixedPitch") == "false");
+}
+
+
+test("font information: UnderlinePosition")
+	file testfont "Vera.ttf";
+{
+	TrueTypeConverter converter;
+	FontFileDataHolder font_file_holder;
+	verify(font_file_holder.init(testfont));
+
+	verify(OpStatus::IsSuccess(converter.Init(font_file_holder.data, (UINT32)font_file_holder.length)));
+	verify(OpStatus::IsSuccess(converter.parseFont()));
+	verify(converter.getFontInfo().getValue("UnderlinePosition") == "-104");
+}
+
+
+test("font information: UnderlineThickness")
+	file testfont "Vera.ttf";
+{
+	TrueTypeConverter converter;
+	FontFileDataHolder font_file_holder;
+	verify(font_file_holder.init(testfont));
+
+	verify(OpStatus::IsSuccess(converter.Init(font_file_holder.data, (UINT32)font_file_holder.length)));
+	verify(OpStatus::IsSuccess(converter.parseFont()));
+	verify(converter.getFontInfo().getValue("UnderlineThickness") == "69");
+}
+
+
+test("font glyf table checksum")
+	file testfont "Vera.ttf";
+{
+	TrueTypeConverter converter;
+	FontFileDataHolder font_file_holder;
+	verify(font_file_holder.init(testfont));
+
+	verify(OpStatus::IsSuccess(converter.Init(font_file_holder.data, (UINT32)font_file_holder.length)));
+	verify(OpStatus::IsSuccess(converter.parseFont()));
+	UINT32 checksum = converter.getGLYFChecksum();
+	verify(checksum == 208945615);
+}
+
+
+test("font boldness")
+	file testfont "Vera.ttf";
+{
+	TrueTypeConverter converter;
+	FontFileDataHolder font_file_holder;
+	verify(font_file_holder.init(testfont));
+
+	verify(OpStatus::IsSuccess(converter.Init(font_file_holder.data, (UINT32)font_file_holder.length)));
+	verify(OpStatus::IsSuccess(converter.parseFont()));
+	verify(converter.isBold() == false);
+}
+
+
+test("font italicness")
+	file testfont "Vera.ttf";
+{
+	TrueTypeConverter converter;
+	FontFileDataHolder font_file_holder;
+	verify(font_file_holder.init(testfont));
+
+	verify(OpStatus::IsSuccess(converter.Init(font_file_holder.data, (UINT32)font_file_holder.length)));
+	verify(OpStatus::IsSuccess(converter.parseFont()));
+	verify(converter.isItalic() == false);
+}
+
+
+test("number of SFNT tables in font")
+	file testfont "Vera.ttf";
+{
+	TrueTypeConverter converter;
+	FontFileDataHolder font_file_holder;
+	verify(font_file_holder.init(testfont));
+
+	verify(OpStatus::IsSuccess(converter.Init(font_file_holder.data, (UINT32)font_file_holder.length)));
+	verify(OpStatus::IsSuccess(converter.parseFont()));
+	verify(converter.getNumberOfTables() == 9);
+}
+
+
+test("number of glyphs in font")
+	file testfont "Vera.ttf";
+{
+	TrueTypeConverter converter;
+	FontFileDataHolder font_file_holder;
+	verify(font_file_holder.init(testfont));
+
+	verify(OpStatus::IsSuccess(converter.Init(font_file_holder.data, (UINT32)font_file_holder.length)));
+	verify(OpStatus::IsSuccess(converter.parseFont()));
+	verify(converter.getNumberOfGlyphs() == 268);
+}
+
+
+
+test("postscript output")
+	require OPMEMFILE_SUPPORT;
+	file testfont "Vera.ttf";
+{
+	TrueTypeConverter converter;
+	FontFileDataHolder font_file_holder;
+	verify(font_file_holder.init(testfont));
+
+	PSCommandBufferHolder ps_command_buffer;
+	verify(ps_command_buffer.init());
+
+	verify(OpStatus::IsSuccess(converter.Init(font_file_holder.data, (UINT32)font_file_holder.length)));
+	verify(OpStatus::IsSuccess(converter.parseFont()));
+
+	OpString8 fontname;
+	fontname.Set("PostScriptFontName");
+	converter.generatePostScript(ps_command_buffer.buffer, fontname);
+
+	OpString8 result;
+	result.Set((const char*)ps_command_buffer.data);
+	verify(contains(result, "%%BeginResource: font PostScriptFontName"));
+	verify(contains(result, "%!PS-TrueTypeFont-1.0-2.0"));
+	verify(contains(result, "%%Creator: Opera"));
+	verify(contains(result, "%- Original font name: BitstreamVeraSans-Roman"));
+	verify(contains(result, "9 dict dup begin"));
+	verify(contains(result, "  /FontName /PostScriptFontName def"));
+	verify(contains(result, "  /FontType 42 def"));
+	verify(contains(result, "  /PaintType 0 def"));
+	verify(contains(result, "  /FontMatrix [1 0 0 1 0 0] def"));
+	verify(contains(result, "  /FontBBox [-183 -235 1287 928] def"));
+	verify(contains(result, "  /Encoding ["));
+	verify(contains(result, "  /FontInfo 3 dict dup begin"));
+	verify(contains(result, "  /UnderlinePosition -104 def"));
+	verify(contains(result, "  /UnderlineThickness 69 def"));
+	verify(contains(result, "  /isFixedPitch false def"));
+	verify(contains(result, "/sfnts ["));
+	verify(contains(result, "00010000000900800003001063767420FFD31D390000009C000001FC6670676D"));
+	verify(contains(result, "000000D9050200F4015400B4009C01390114013907060400044E04B4045204B8"));
+	verify(contains(result, "00010000000200000C500AEC5F0F3CF5001F080000000000BAB9F0B800000000"));
+	verify(contains(result, "00030001B8028040FFFBFE03FA1403F92503F83203F79603F60E03F5FE03F4FE"));
+	verify(contains(result, "0F053D12033C3B0D053C40FF0F033B0D033AFE0339FE033837140538FA033736"));
+	verify(contains(result, "FE031BFA031A42031911420519FE031864031716190517FE0316011005161903"));
+	verify(contains(result, "0301B80164858D012B2B2B2B2B2B2B2B2B2B2B2B2B2B2B2B2B2B2B2B2B2B2B2B"));
+	verify(contains(result, "2B2B2B2B2B2B2B2B2B2B2B2B2B2B2B2B2B2B2B2B2B2B2B2B2B2B2B2B2B2B2B2B"));
+	verify(contains(result, "2B2B2B2B2B2B2B2B2B2B2B1D00"));
+	verify(contains(result, "  /CharStrings << /.notdef 0  >> def"));
+	verify(contains(result, "end /PostScriptFontName exch definefont pop"));
+	verify(contains(result, "%%EndResource"));
+}
+
+
+test("post: fail on empty file")
+{
+	TrueTypePostTable post_parser;
+	verify(OpStatus::IsError(post_parser.parseTable(NULL, 0)));
+}
+
+
+test("post: correct table values")
+	file testfile "sfnt_post_table_type_2-2.bin";
+{
+	SFNTTableHolder table_holder;
+	OpFileLength size;
+	verify(table_holder.loadTableData(testfile, size));
+
+	TrueTypePostTable post_parser;
+	verify(OpStatus::IsSuccess(post_parser.parseTable(table_holder.data, (UINT32)size)));
+	verify(post_parser.getVersion() == 0x00020000);
+	verify(post_parser.getIsFixedPitch() == 0);
+	verify(post_parser.getUnderlinePosition() == -217);
+	verify(post_parser.getUnderlineThickness() == 150);
+}
+
+
+test("offset: can parse table")
+	file testfile "sfnt_offset_table-1.bin";
+{
+	PSCommandBufferHolder ps_command_buffer_orig;
+	PSCommandBufferHolder ps_command_buffer_rewrite;
+	verify(ps_command_buffer_orig.init());
+	verify(ps_command_buffer_rewrite.init());
+
+	OpFileLength size;
+	SFNTTableHolder table_holder;
+	verify(table_holder.loadTableData(testfile, size));
+
+	TrueTypeOffsetTable offset_parser;
+	verify(OpStatus::IsSuccess(offset_parser.parseTable(table_holder.data, (UINT32)size)));
+
+	verify(OpStatus::IsSuccess(ps_command_buffer_orig.buffer.writeHexCode(table_holder.data, (UINT32)size)));
+}
+
+
+test("offset: can generate output data")
+	file testfile "sfnt_offset_table-1.bin";
+{
+	PSCommandBufferHolder ps_command_buffer_orig;
+	PSCommandBufferHolder ps_command_buffer_rewrite;
+	verify(ps_command_buffer_orig.init());
+	verify(ps_command_buffer_rewrite.init());
+
+	OpFileLength size;
+	SFNTTableHolder table_holder;
+	verify(table_holder.loadTableData(testfile, size));
+
+	TrueTypeOffsetTable offset_parser;
+	verify(OpStatus::IsSuccess(offset_parser.parseTable(table_holder.data, (UINT32)size)));
+
+	verify(OpStatus::IsSuccess(ps_command_buffer_orig.buffer.writeHexCode(table_holder.data, (UINT32)size)));
+	verify(OpStatus::IsSuccess(offset_parser.generateSFNTData(ps_command_buffer_rewrite.buffer)));
+}
+
+test("hmtx: can parse table")
+	file testfile "sfnt_hmtx_table-1.bin";
+{
+	PSCommandBufferHolder ps_command_buffer_orig;
+	PSCommandBufferHolder ps_command_buffer_rewrite;
+	verify(ps_command_buffer_orig.init());
+	verify(ps_command_buffer_rewrite.init());
+
+	OpFileLength size;
+	SFNTTableHolder table_holder;
+	verify(table_holder.loadTableData(testfile, size));
+
+	TrueTypeHmtxTable hmtx_parser;
+	verify(OpStatus::IsSuccess(hmtx_parser.parseTable(table_holder.data, (UINT32)size, 1318, 3)));
+
+	verify(OpStatus::IsSuccess(ps_command_buffer_orig.buffer.writeHexCode(table_holder.data, (UINT32)size)));
+}
+
+
+test("hmtx: can generate output data")
+	file testfile "sfnt_hmtx_table-1.bin";
+{
+	PSCommandBufferHolder ps_command_buffer_orig;
+	PSCommandBufferHolder ps_command_buffer_rewrite;
+	verify(ps_command_buffer_orig.init());
+	verify(ps_command_buffer_rewrite.init());
+
+	OpFileLength size;
+	SFNTTableHolder table_holder;
+	verify(table_holder.loadTableData(testfile, size));
+
+	TrueTypeHmtxTable hmtx_parser;
+	verify(OpStatus::IsSuccess(hmtx_parser.parseTable(table_holder.data, (UINT32)size, 1318, 3)));
+
+	verify(OpStatus::IsSuccess(ps_command_buffer_orig.buffer.writeHexCode(table_holder.data, (UINT32)size)));
+	verify(OpStatus::IsSuccess(hmtx_parser.generateSFNTData(ps_command_buffer_rewrite.buffer)));
+}
+
+
+/**
+   compares data written to orig of that written to rewrite
+ */
+subtest CompareResult(PSCommandBufferHolder& orig, PSCommandBufferHolder& rewrite)
+{
+	OpFileLength orig_len, rewrite_len;
+	orig.memfile->GetFilePos(orig_len);
+	rewrite.memfile->GetFilePos(rewrite_len);
+	verify(orig_len == rewrite_len);
+	verify(!op_strncmp(reinterpret_cast<const char*>(orig.data),
+					   reinterpret_cast<const char*>(rewrite.data),
+					   (size_t)orig_len));
+}
+
+
+test("head: rewriting unchanged file gives identical data as input")
+	file testfile "sfnt_head_table-1.bin";
+{
+	PSCommandBufferHolder ps_command_buffer_orig;
+	PSCommandBufferHolder ps_command_buffer_rewrite;
+	verify(ps_command_buffer_orig.init());
+	verify(ps_command_buffer_rewrite.init());
+
+	OpFileLength size;
+	SFNTTableHolder table_holder;
+	verify(table_holder.loadTableData(testfile, size));
+
+	TrueTypeHeadTable head_parser;
+	verify(OpStatus::IsSuccess(head_parser.parseTable(table_holder.data, (UINT32)size)));
+
+	verify(OpStatus::IsSuccess(ps_command_buffer_orig.buffer.writeHexCode(table_holder.data, (UINT32)size)));
+	verify(OpStatus::IsSuccess(head_parser.generateSFNTData(ps_command_buffer_rewrite.buffer)));
+
+	verify(CompareResult(ps_command_buffer_orig, ps_command_buffer_rewrite));
+}
+
+
+test("hhea: rewriting unchanged file gives identical data as input")
+	file testfile "sfnt_hhea_table-1.bin";
+{
+	PSCommandBufferHolder ps_command_buffer_orig;
+	PSCommandBufferHolder ps_command_buffer_rewrite;
+	verify(ps_command_buffer_orig.init());
+	verify(ps_command_buffer_rewrite.init());
+
+	OpFileLength size;
+	SFNTTableHolder table_holder;
+	verify(table_holder.loadTableData(testfile, size));
+
+	TrueTypeHheaTable hhea_parser;
+	verify(OpStatus::IsSuccess(hhea_parser.parseTable(table_holder.data, (UINT32)size)));
+
+	verify(OpStatus::IsSuccess(ps_command_buffer_orig.buffer.writeHexCode(table_holder.data, (UINT32)size)));
+	verify(OpStatus::IsSuccess(hhea_parser.generateSFNTData(ps_command_buffer_rewrite.buffer)));
+
+	verify(CompareResult(ps_command_buffer_orig, ps_command_buffer_rewrite));
+}
+
+
+test("maxp: rewriting unchanged file gives identical data as input")
+	file testfile "sfnt_maxp_table-1.bin";
+{
+	PSCommandBufferHolder ps_command_buffer_orig;
+	PSCommandBufferHolder ps_command_buffer_rewrite;
+	verify(ps_command_buffer_orig.init());
+	verify(ps_command_buffer_rewrite.init());
+
+	OpFileLength size;
+	SFNTTableHolder table_holder;
+	verify(table_holder.loadTableData(testfile, size));
+
+	TrueTypeMaxpTable maxp_parser;
+	verify(OpStatus::IsSuccess(maxp_parser.parseTable(table_holder.data, (UINT32)size)));
+
+	verify(OpStatus::IsSuccess(ps_command_buffer_orig.buffer.writeHexCode(table_holder.data, (UINT32)size)));
+	verify(OpStatus::IsSuccess(maxp_parser.generateSFNTData(ps_command_buffer_rewrite.buffer)));
+
+	verify(CompareResult(ps_command_buffer_orig, ps_command_buffer_rewrite));
+}
+
+
+test("loca: rewriting unchanged file gives identical data as input")
+	file testfile "sfnt_loca_table-1.bin";
+{
+	PSCommandBufferHolder ps_command_buffer_orig;
+	PSCommandBufferHolder ps_command_buffer_rewrite;
+	verify(ps_command_buffer_orig.init());
+	verify(ps_command_buffer_rewrite.init());
+
+	OpFileLength size;
+	SFNTTableHolder table_holder;
+	verify(table_holder.loadTableData(testfile, size));
+
+	TrueTypeLocaTable loca_parser;
+	verify(OpStatus::IsSuccess(loca_parser.parseTable(table_holder.data, (UINT32)size, 1320, true)));
+
+	verify(OpStatus::IsSuccess(ps_command_buffer_orig.buffer.writeHexCode(table_holder.data, (UINT32)size)));
+	verify(OpStatus::IsSuccess(loca_parser.generateSFNTData(ps_command_buffer_rewrite.buffer)));
+
+	verify(CompareResult(ps_command_buffer_orig, ps_command_buffer_rewrite));
+}

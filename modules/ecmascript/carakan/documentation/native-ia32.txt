@@ -1,0 +1,147 @@
+Native code for the IA32/IA32e architecture
+===========================================
+
+The IA32 (AKA x86 or i386) and the IA32e (AKA x86-64 or amd64) are closely
+related.  They have the same basic instruction set, the same basic instruction
+encoding and largely the same operand addressing encoding.  Usually a given
+sequence of bytes form the exact same instruction with the exact same behaviour
+in both architectures.  (And, of course, every IA32e-capable processor can run
+in IA32 mode where it behaves identically to an IA32 processor.)
+
+The main difference is of course that IA32e is 64-bit.  This essentially means
+that it has 64-bit registers.  These are the same registers (general purpose and
+otherwise) as before, only they are now 64 bits wide.  They can still be used as
+32-bit registers, just as they can still be used as 16-bit or 8-bit registers.
+When used as 32-bit registers, the 32 most significant bits in the register are
+always cleared (set to all zeroes or all ones.)  While memory addresses are 64
+bits wide, operand addressing remains the same, which means that only 8-bit and
+32-bit address displacements are available, and all relative jumps and calls
+have 8 or 32 bits wide offsets.  A few instructions, like the "MOV EAX, moffset"
+variant of the MOV instruction, however, have a 64-bit address in IA32e mode.
+
+Another significant difference between the architectures is that 8 new general
+purpose registers are available in IA32e mode.  They are named R8 - R15, and
+have no special roles in the instruction set (unlike the older general purpose
+registers.)  The additional registers are accessed through the addition of an
+instruction prefix byte, called the "REX prefix," in which three individial bits
+act as a fourth, most significant, bit added to three different three-bit fields
+in the other bytes forming an instruction (for instructions that use fewer than
+three registers, some or all of these extra bits have no effect, of course.)  A
+fourth bit in the REX byte selects 64-bit operation instead of 32-bit operation,
+or 32-bit operation instead of 64-bit operation, depending on what the default
+of the instruction is.  (Most instructions default to 32-bit operation, while
+instructions that reference memory via the EBP ("base pointer") or ESP ("stack
+pointer") registers default to 64-bit operation.)
+
+Register usage
+--------------
+
+Two registers (not counting ESP) have special meaning in generated native code:
+
+  * EBP always contains a pointer to the ES_Execution_Context object
+
+  * EBX always contains a pointer to the virtual register frame (that is, it
+    points to the ES_Value_Internal that is register zero.)
+
+All other registers are used freely in the generated code.  In an arithmetic
+block's fast path, they are managed by the register allocator and can hold
+values across many bytecode instructions.  In an arithmetic block's slow path
+and between arithmetic blocks they are used locally without value preservation
+between different bytecode instructions.  They are also used as needed in the
+function prolouge and epilouge.
+
+Depending on C++ compiler, some registers might also participate in the calling
+convention when calling C++ functions.  Since no function calls are made in an
+arithmetic block's fast path, this does not affect the register allocator.
+
+  Note: the "fastcall" and "thiscall" calling conventions used by Visual Studio
+        in 32-bit mode passes the first two arguments in ECX and EDX (for
+        "thiscall", the first argument is the this object.)
+
+Stack frame
+-----------
+
+The generated native code maintain a linked stack frame structure that is
+accessible from C++ code.  This structure is very similar to the type of stack
+frames regular native code maintains for debuggability (which is disabled by
+-fomit-frame-pointer in GCC.)
+
+The first element of each stack frame is a pointer to the previous stack frame.
+The ES_Execution_State::native_stack_frame pointer points to this element.
+Following this is register frame pointer (also in EBX) and a pointer to the
+ES_Code object from which the native code was generated.  If the stack frame
+corresponds to a function call, a pointer to the arguments array, and if it
+could ever be used, a pointer to the variable object (AKA activation object.)
+When these are created on demand, the generated native code's function prolouge
+simply sets these elements to zero.  Last, for a function call stack frame,
+comes the number of arguments provided by the caller.
+
+  Note: In practice, all elements but the first are on negative offsets from the
+        stack frame pointer.
+
+Static helper functions in the class ES_NativeStackFrame provide access to the
+various elements of the native stack frame from C++ code.
+
+Calling convention
+------------------
+
+The following mechanism is used when generated native code calls a function for
+which native code has also been generated:
+
+A preliminary virtual register frame for the call is set up by the calling code
+within its virtual register frame the same way as when a function call is made
+in the bytecode interpreter; that is, with register zero being the this object,
+register one being the function to call and registers two to N being the
+arguments.  (This is done regardless of the type of function called.)
+
+Next, the number of arguments is stored in the EDI register, and the EBX
+register is moved forward to point to the new virtual register frame (that is,
+the "rel_frame_start" value multiplied by the size of ES_Value_Internal is added
+to EBX.)  After this, the called function's generated native code is called.
+
+The called function starts by setting up its native stack frame as described in
+the previous section.  It then checks that there is enough space for its virtual
+register frame by comparing 'EBX + register frame size' to the register block
+limit stored in ES_Execution_State::reg_limit, and that there is a safe amount
+of CPU stack space left by comparing ESP to the CPU stack limit stored in
+ES_Execution_State::stack_limit.  If either check fails, the function call is
+performed via a call to ES_Execution_Context::StackOrRegisterLimitExceeded()
+instead.  This C++ function allocates a virtual register frame and a new CPU
+stack block (as needed,) trampolines back into native code mode to perform the
+function call, and then returns, after which the native code simply restores the
+stack pointer and returns to its caller.
+
+After virtual register frame and CPU stack space has been ensured, the argument
+count in EDI is compared to the expected (the number of declared formal
+parameters.)  If there are fewer arguments than expected, the unspecified
+formals are initialized to undefined.  There are more arguments than expected,
+an arguments object is created by calling the function
+ES_Execution_Context::CreateArgumentsObject().
+
+Next, if the generated native code is for the constructor identity of a
+function, the this object is allocated by calling ES_Object::Make().
+
+After this, the regular function execution begines.
+
+The function epilouge is simpler: it checks whether there's an arguments object
+or a variable object by checking the corresponding elements of the native stack
+frame, and frees them by calling ES_Execution_Context::DetachArgumentsObject()
+or ES_Execution_Context::DetachVariableObject() if they exist.  Then it
+deallocates the native stack frame, sets ES_Execution_State::native_stack_frame
+to the previous stack frame, and returns.
+
+The bytecode to native code trampoline
+--------------------------------------
+
+Since the calling convention between native code is not compatible with whatever
+calling convention the C++ compiler uses, a special trampoline function is used
+to make initial call into generated native code.
+
+This trampoline function first pushes all callee-save registers onto the CPU
+stack, then sets up an initial native stack frame that acts as a terminator for
+the native stack frame chain, then sets up EBP, EBX and EDI to contain the
+correct values, after which it calls the generated native code.
+
+When the generated native code returns to the trampoline function, it sets the
+ES_Execution_State::native_stack_frame pointer to NULL, restores all callee-save
+registers from the CPU stack and returns.

@@ -1,0 +1,297 @@
+/* -*- Mode: c++; tab-width: 4; indent-tabs-mode: t; c-basic-offset: 4 -*-
+**
+** Copyright (C) 2004-2010 Opera Software ASA.  All rights reserved.
+**
+** This file is part of the Opera web browser.  It may not be distributed
+** under any circumstances.
+**
+** Yngve N. Pettersen
+*/
+
+group "libssl load Mike's toolbox TLS 1.2 test urls";
+require init;
+
+require _NATIVE_SSL_SUPPORT_;
+require USE_SSL_CERTINSTALLER;
+require _SUPPORT_TLS_1_2;
+
+language c++;
+
+include "core/pch.h";
+
+include "modules/dochand/win.h";
+include "modules/dochand/docman.h";
+include "modules/doc/frm_doc.h";
+
+include "modules/url/url_man.h";
+include "modules/libssl/sslbase.h";
+include "modules/libssl/ssl_api.h";
+include "modules/libssl/options/sslopt.h";
+include "modules/libssl/certs/certinst_base.h";
+include "modules/network_selftest/urldoctestman.h";
+include "modules/network_selftest/scanpass.h";
+include "modules/network_selftest/sslwincom.h";
+include "modules/network_selftest/ssl_waitupdate.h";
+
+include "modules/libssl/selftest/testfiles/mikestoolbox/mikestoolbox.h";
+include "modules/prefs/prefsmanager/collections/pc_network.h";
+include "modules/network_selftest/prefs_replace.h";
+
+global {
+
+	URL_DocSelfTest_Manager *libssl_tests = NULL;
+	SSL_Options *opt = NULL;
+	
+	class SimpleClientAuthListener 
+		: public BasicSSLWindowListener
+	{
+	public:
+		SimpleClientAuthListener (URL_DocSelfTest_Manager *manager, OpSSLListener *fallback)
+			: BasicSSLWindowListener(manager, fallback) {}
+
+		virtual ~SimpleClientAuthListener (){}
+		
+		virtual void OnCertificateBrowsingNeeded(OpWindowCommander* wic, SSLCertificateContext* context, SSLCertificateReason reason, SSLCertificateOption options)
+		{
+			if(context)
+			{
+				context->OnCertificateBrowsingDone(TRUE, SSL_CERT_OPTION_ACCEPT);
+				return;
+			}
+		
+			URL empty;
+			ReportFailure(empty,"Certificte dialog called when it should not have been");
+		}
+
+		virtual void OnSecurityPasswordNeeded(OpWindowCommander* wic, SSLSecurityPasswordCallback* callback)
+		{
+			if(callback)
+				callback->OnSecurityPasswordDone(FALSE, NULL, NULL);
+				
+			URL empty;
+			ReportFailure(empty,"Password dialog called when it should not have been");
+		}
+
+	};
+	SimpleClientAuthListener *listener = NULL;
+	WindowCommander *wc=NULL;
+	
+	BOOL prep_OK = FALSE;
+	
+#ifdef LIBSSL_AUTO_UPDATE
+	SSL_WaitForPendingAutoUpdate update_waiter;
+#endif
+
+	Selftest_IntegerPrefOverride sslv3;
+	Selftest_IntegerPrefOverride tls10;
+	Selftest_IntegerPrefOverride tls11;
+	Selftest_IntegerPrefOverride tls12;
+}
+
+html { "<html><body>Empty document, SSL testing with extra certificates going on. A displayed certificate dialog is a failure.</body></html>" };
+
+setup 
+{
+	urlManager->RemoveSensitiveData();
+	opt = g_ssl_api->CreateSecurityManager(FALSE, OPFILE_ABSOLUTE_FOLDER);
+
+	if(opt 	!= NULL)
+	{
+		if(OpStatus::IsSuccess(opt->Init(SSL_LOAD_ALL_STORES)))
+		{
+			g_ssl_api->UnLoadSecurityManager();
+			g_ssl_api->CommitOptionsManager(opt);
+			g_ssl_api->LockSecurityManager(TRUE);
+			
+			SSL_varvector32 cert;
+			
+			cert.SetExternalPayload((unsigned char *) MIKESTOOLBOX_CA, FALSE, ARRAY_SIZE(MIKESTOOLBOX_CA));
+			SSL_Certificate_Installer_flags flags(SSL_CA_Store,FALSE,FALSE);
+			
+			SSL_Certificate_Installer_Base * OP_MEMORY_VAR installer =NULL;
+			
+			TRAPD(op_err, installer = g_ssl_api->CreateCertificateInstallerL(cert, flags, NULL, opt));
+			if(OpStatus::IsSuccess(op_err))
+			{
+				if(installer->StartInstallation() == InstallerStatus::INSTALL_FINISHED)
+					prep_OK = TRUE;
+					
+				OP_DELETE(installer);
+			}
+		}
+	}
+
+
+	libssl_tests = OP_NEW(URL_DocSelfTest_Manager, ());
+}
+
+exit
+{
+	if(opt && opt->dec_reference() <= 0)
+		OP_DELETE(opt);
+	opt = NULL;
+	g_ssl_api->LockSecurityManager(FALSE);
+	g_ssl_api->UnLoadSecurityManager(TRUE);
+
+	OP_DELETE(libssl_tests);
+	libssl_tests = NULL;
+	
+	if(wc)
+	    wc->SetSSLListener(listener->GetFallback());
+	
+	OP_DELETE(listener);
+	listener = NULL;
+}
+
+test("Initialized")
+	require PREFS_WRITE;
+{
+	verify(libssl_tests != NULL);
+	verify(prep_OK == TRUE);
+
+    wc = state.doc->GetWindow()->GetWindowCommander();
+    verify(wc != NULL);
+    listener = OP_NEW(SimpleClientAuthListener, (libssl_tests, wc->GetSSLListener()));
+    verify(listener != NULL);
+    wc->SetSSLListener(listener);
+
+	verify(OpStatus::IsSuccess(sslv3.Construct(PrefsCollectionNetwork::EnableSSL3_0,FALSE)));
+	verify(OpStatus::IsSuccess(tls10.Construct(PrefsCollectionNetwork::EnableSSL3_1,FALSE)));
+	verify(OpStatus::IsSuccess(tls11.Construct(PrefsCollectionNetwork::EnableTLS1_1,FALSE)));
+	verify(OpStatus::IsSuccess(tls12.Construct(PrefsCollectionNetwork::EnableTLS1_2,TRUE)));
+	verify(sslv3.Active());
+	verify(tls10.Active());
+	verify(tls11.Active());
+	verify(tls12.Active());
+}
+
+subtest AddScanPassTest(URL_DocSelfTest_Batch *batch, const OpStringC8 &url, URL &ref_url, const char *pass_string, const char *extra_pass_string)
+{
+	verify(batch != NULL);
+	verify(url.HasContent());
+
+	OpAutoPtr<ScanPass_SimpleTester> test(OP_NEW(ScanPass_SimpleTester, ()));
+	verify(test.get() != NULL);
+
+	verify(OpStatus::IsSuccess(test->Construct(url, ref_url, pass_string)));
+	verify(OpStatus::IsSuccess(test->AddExtraPassString(extra_pass_string)));
+
+	verify(batch->AddTestCase(test.release()));
+}
+
+subtest AddBatch(URL_DocSelfTest_Batch *batch)
+{
+	verify(batch != NULL);
+	verify(libssl_tests->AddBatch(batch));
+}
+
+subtest StartTestSet()
+{
+	verify(libssl_tests->SetLastBatch());
+}
+
+subtest Setup_SingleSSLTest(const OpStringC8 &url, URL &ref_url, const char *pass_string)
+{
+	OpAutoPtr<URL_DocSelfTest_Batch> batch(OP_NEW(URL_DocSelfTest_Batch, ()));
+
+	verify(batch.get() != NULL);
+	batch->Construct(state.doc->GetMessageHandler());
+
+	verify(AddScanPassTest(batch.get(), url, ref_url, pass_string, NULL));
+
+	verify(!batch->Empty());
+
+	verify(AddBatch(batch.release()));
+}
+
+subtest Setup_SingleSSLTestAndCipher(int cipher_id1, int cipher_id2, const OpStringC8 &url, URL &ref_url, const char *pass_string, const char *extra_pass_string)
+{
+	SSL_CipherID searched((uint8) cipher_id1,(uint8) cipher_id2);
+	SSL_ProtocolVersion ver(3,0);
+	int i=0;
+	const SSL_CipherDescriptions *desc = NULL;
+	
+	while((desc = opt->GetCipherDescription(ver, i)) != NULL)
+	{
+		if(desc->id == searched)
+		{
+			int cipherlist[1];
+			cipherlist[0] = i;
+			
+			opt->SetCiphers(ver, 1, cipherlist);
+			break;
+		}
+		i++;
+	}
+	
+	verify(desc != NULL);
+
+	OpAutoPtr<URL_DocSelfTest_Batch> batch(OP_NEW(URL_DocSelfTest_Batch, ()));
+
+	verify(batch.get() != NULL);
+	batch->Construct(state.doc->GetMessageHandler());
+
+	verify(AddScanPassTest(batch.get(), url, ref_url, pass_string, extra_pass_string));
+
+	verify(!batch->Empty());
+
+	verify(AddBatch(batch.release()));
+}
+
+test("Load TLS 1.2")
+	require success "Initialized";
+	async;
+{
+	URL ref_url;
+	if (!Setup_SingleSSLTest("https://www.mikestoolbox.net/", ref_url, "Server Version:         TLS 1.2") ||
+		!StartTestSet())
+		ST_failed("Could not start test set");
+}
+
+test("Load TLS_RSA_WITH_AES_256_CBC_SHA256")
+	require success "Initialized";
+	async;
+{
+	URL ref_url;
+	if (!Setup_SingleSSLTestAndCipher(0x00, 0x3D , "https://www.mikestoolbox.net/", ref_url, "Server Cipher Suite:    003D  TLS_RSA_WITH_AES_256_CBC_SHA256", "Server Version:         TLS 1.2") ||
+		!StartTestSet())
+		ST_failed("Could not start test set");
+}
+
+test("Load TLS_DHE_RSA_WITH_AES_256_CBC_SHA256")
+	require success "Initialized";
+	async;
+{
+	URL ref_url;
+	if (!Setup_SingleSSLTestAndCipher(0x00, 0x6B , "https://www.mikestoolbox.net/", ref_url, "Server Cipher Suite:    006B  TLS_DHE_RSA_WITH_AES_256_CBC_SHA256", "Server Version:         TLS 1.2") ||
+		!StartTestSet())
+		ST_failed("Could not start test set");
+}
+
+test("Load TLS_DHE_RSA_WITH_AES_128_CBC_SHA256")
+	require success "Initialized";
+	async;
+{
+	URL ref_url;
+	if (!Setup_SingleSSLTestAndCipher(0x00, 0x67 , "https://www.mikestoolbox.net/", ref_url, "Server Cipher Suite:    0067  TLS_DHE_RSA_WITH_AES_128_CBC_SHA256", "Server Version:         TLS 1.2") ||
+		!StartTestSet())
+		ST_failed("Could not start test set");
+}
+
+test("Load TLS_RSA_WITH_AES_256_CBC_SHA256")
+	require success "Initialized";
+	async;
+{
+	URL ref_url;
+	if (!Setup_SingleSSLTestAndCipher(0x00, 0x3C , "https://www.mikestoolbox.net/", ref_url, "Server Cipher Suite:    003C  TLS_RSA_WITH_AES_128_CBC_SHA256", "Server Version:         TLS 1.2") ||
+		!StartTestSet())
+		ST_failed("Could not start test set");
+}
+
+test("Flush auto updates")
+	require defined LIBSSL_AUTO_UPDATE;
+	require success "Initialized";
+	async;
+{
+	update_waiter.Activate();
+}

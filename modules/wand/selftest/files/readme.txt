@@ -1,0 +1,1 @@
+wand_v3.dat, wand_v4.dat and wand_v5.dat are from bug 246388, and all contain login information from http://my.opera.com/community/forums/ and https://myrealbox.com

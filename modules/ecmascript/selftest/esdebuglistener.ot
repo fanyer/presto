@@ -1,0 +1,936 @@
+/* -*- Mode: c++; tab-width: 4; indent-tabs-mode: t; c-basic-offset: 4 -*-
+**
+** Copyright (C) 2010 Opera Software ASA.  All rights reserved.
+**
+** This file is part of the Opera web browser.  It may not be distributed
+** under any circumstances.
+*/
+
+group "ecmascript.debuglistener";
+require init;
+require ECMASCRIPT_DEBUGGER;
+require PREFS_HAS_PREFSFILE;
+include "modules/hardcore/timer/optimer.h";
+include "modules/ecmascript_utils/esdebugger.h";
+include "modules/prefs/prefsmanager/collections/pc_js.h";
+include "modules/doc/frm_doc.h";
+
+global
+{
+	// Max number of events recorded in a single test.
+	#define MAX_EVENTS 1024
+
+	// How long (in milliseconds) we should wait for
+	// before we consider a single test a failure.
+	#define TIMEOUT 500
+
+	// Magic sentinel used to terminate lists.
+	#define SENTINEL ~0u
+
+	// For the sentinel item in the list passed to SetConditions,
+	// it does not matter what the EventType is. So let's just use
+	// zero.
+	#define ESEV_NA static_cast<ES_DebugListener::EventType>(0)
+
+	/**
+	 * Provides an empty implementation of ES_DebugListener. Makes it easier to
+	 * add implementations that use only a subset of the features.
+	 */
+	class ES_DebugAdapter
+		: public ES_DebugListener
+	{
+	public:
+		virtual BOOL EnableDebugging(ES_Runtime *runtime){ return TRUE; }
+		virtual void NewScript(ES_Runtime *runtime, ES_DebugScriptData *data){};
+		virtual void ParseError(ES_Runtime *runtime, ES_ErrorInfo *err){};
+		virtual void NewContext(ES_Runtime *runtime, ES_Context *context){};
+		virtual void EnterContext(ES_Runtime *runtime, ES_Context *context){};
+		virtual void LeaveContext(ES_Runtime *runtime, ES_Context *context){};
+		virtual void DestroyContext(ES_Runtime *runtime, ES_Context *context){};
+		virtual void DestroyRuntime(ES_Runtime *runtime){};
+		virtual void DestroyObject(ES_Object *object){};
+		virtual EventAction HandleEvent(EventType type, unsigned int script_guid, unsigned int line_no){ return ESACT_CONTINUE; }
+		virtual void RuntimeCreated(ES_Runtime *runtime){};
+	}; // ES_DebugAdapter
+
+	/**
+	 * Records events seen by HandleEvent, and can issue async ST_pass/fail based
+	 * previously set pass conditions.
+	 */
+	class EventRecorder
+		: public ES_DebugAdapter
+		, public OpTimerListener
+	{
+	public:
+
+		struct Event
+		{
+			EventType type;
+			unsigned line_no;
+		};
+
+		EventRecorder();
+
+		/**
+		 * Reset the EventRecoder to its initial state.
+		 */
+		void Clear();
+
+		/**
+		 * Set a list of passing conditions (the expected event
+		 * sequence). This function will immediately check whether
+		 * the events have been received already.
+		 */
+		void SetConditions(Event *conditions);
+
+		// ES_DebugAdapter
+		BOOL EnableDebugging(ES_Runtime *runtime);
+		EventAction HandleEvent(EventType type, unsigned int script_guid, unsigned int line_no);
+
+		// OpTimerListener
+		void OnTimeOut(OpTimer* timer);
+
+	private:
+
+		struct History
+		{
+			Event events[MAX_EVENTS]; // ARRAY OK 2010-09-06 andersr
+
+			// Number of events.
+			unsigned size;
+		};
+
+		/**
+		 * Check whether the observed events so far match the passing
+		 * condtions.
+		 */
+		void CheckConditions();
+
+		// Members.
+		History history;
+		OpTimer timer;
+		Event *conditions;
+
+	}; // EventRecorder
+
+	EventRecorder::EventRecorder()
+	{
+		Clear();
+		timer.SetTimerListener(this);
+	}
+
+	void EventRecorder::Clear()
+	{
+		history.size = 0;
+		conditions = NULL;
+		timer.Stop();
+	}
+
+	void EventRecorder::SetConditions(Event *conditions)
+	{
+		this->conditions = conditions;
+		CheckConditions();
+		timer.Start(TIMEOUT);
+	}
+
+	BOOL EventRecorder::EnableDebugging(ES_Runtime *runtime)
+	{
+		return (runtime->GetFramesDocument() && runtime->GetFramesDocument()->GetWindow() == state.GetWindow());
+	}
+
+	ES_DebugListener::EventAction EventRecorder::HandleEvent(EventType type, unsigned int script_guid, unsigned int line_no)
+	{
+		if (history.size >= MAX_EVENTS)
+		{
+			// Looks like you need an event history larger than MAX_EVENTS. Please
+			// increase the value of MAX_EVENTS, or split up your testcase.
+			OP_ASSERT(!"Max event limit reached");
+			return ESACT_CONTINUE;
+		}
+
+		// Reset timer.
+		timer.Stop();
+		timer.Start(TIMEOUT);
+
+		// Add event to history.
+		Event &e = history.events[history.size++];
+		e.type = type;
+		e.line_no = line_no;
+
+		// Check for passing condition.
+		CheckConditions();
+
+		return ESACT_CONTINUE;
+	}
+
+	void EventRecorder::OnTimeOut(OpTimer* timer)
+	{
+		ST_failed("Timeout! Correct event sequence was not observed.");
+	}
+
+	void EventRecorder::CheckConditions()
+	{
+		Event *c = conditions;
+
+		while (c && c->line_no != SENTINEL)
+		{
+			unsigned idx = c - conditions;
+
+			if (idx > history.size)
+				break;
+
+			Event &e = history.events[idx];
+
+			if (c->type != e.type || c->line_no != e.line_no)
+			{
+				output("Expected event %d and line %d but got event %d and line %d!", c->type, c->line_no, e.type, e.line_no);
+				ST_failed("Test failed.");
+				return;
+			}
+
+			++c;
+		}
+
+		// This means we checked all the conditions without finding
+		// any problems.
+		if (c && c->line_no == SENTINEL)
+			ST_passed();
+	}
+
+	// Global data
+	EventRecorder event_recorder;
+	EventRecorder *er;
+	int pref_browser_js;
+	int pref_user_js;
+}
+
+setup
+{
+	er = &event_recorder;
+	g_ecmaManager->SetDebugListener(er);
+
+#ifdef PREFS_WRITE
+	// Get the initial values for these prefs.
+# ifdef DOM_BROWSERJS_SUPPORT
+	RETURN_IF_LEAVE(pref_browser_js = g_pcjs->GetIntegerPref(PrefsCollectionJS::BrowserJSSetting));
+# endif
+	RETURN_IF_LEAVE(pref_user_js = g_pcjs->GetIntegerPref(PrefsCollectionJS::UserJSEnabled));
+
+	// Disable.
+# ifdef DOM_BROWSERJS_SUPPORT
+	RETURN_IF_LEAVE(OpStatus::Ignore(g_pcjs->WriteIntegerL(PrefsCollectionJS::BrowserJSSetting, 0)));
+# endif
+	RETURN_IF_LEAVE(OpStatus::Ignore(g_pcjs->WriteIntegerL(PrefsCollectionJS::UserJSEnabled, 0)));
+#endif
+}
+
+exit
+{
+	g_ecmaManager->SetDebugListener(NULL);
+
+	// Restore initial values.
+#ifdef PREFS_WRITE
+# ifdef DOM_BROWSERJS_SUPPORT
+	OpStatus::Ignore(g_pcjs->WriteIntegerL(PrefsCollectionJS::BrowserJSSetting, pref_browser_js));
+# endif
+	OpStatus::Ignore(g_pcjs->WriteIntegerL(PrefsCollectionJS::UserJSEnabled, pref_user_js));
+#endif
+}
+
+html
+{
+	//! <script>
+	//! debugger;
+	//! </script>
+}
+
+test("Debugger statement")
+	 async;
+{
+	EventRecorder::Event conditions[] = {
+		{ ES_DebugListener::ESEV_NEWSCRIPT, 0 },
+		{ ES_DebugListener::ESEV_BREAKHERE, 2 },
+		{ ESEV_NA, SENTINEL }
+	};
+	er->SetConditions(conditions);
+
+} finally { er->Clear(); }
+
+html
+{
+	//! <script>
+	//! fruit();
+	//!
+	//! function fruit()
+	//! {
+	//!		apple = 5;
+	//! }
+	//!
+	//! var orange = apple;
+	//! </script>
+}
+
+test("Plain function call, RETURN_NO_VALUE")
+	 async;
+{
+	EventRecorder::Event conditions[] = {
+		{ ES_DebugListener::ESEV_NEWSCRIPT, 0 },
+		{ ES_DebugListener::ESEV_STATEMENT, 2 },
+		{ ES_DebugListener::ESEV_CALLSTARTING, 2 },
+		{ ES_DebugListener::ESEV_ENTERFN, 5 },
+		{ ES_DebugListener::ESEV_STATEMENT, 6 },
+		{ ES_DebugListener::ESEV_RETURN, 6 },
+		{ ES_DebugListener::ESEV_LEAVEFN, 7 },
+		{ ES_DebugListener::ESEV_CALLCOMPLETED, 2 },
+		{ ES_DebugListener::ESEV_STATEMENT, 9 },
+		{ ESEV_NA, SENTINEL }
+	};
+	er->SetConditions(conditions);
+
+} finally { er->Clear(); }
+
+html
+{
+	//! <script>
+	//! fruit();
+	//!
+	//! function fruit()
+	//! {
+	//!		apple = 5;
+	//!		return apple;
+	//! }
+	//!
+	//! var orange = apple;
+	//! </script>
+}
+
+test("Plain function call, RETURN_VALUE")
+	 async;
+{
+	EventRecorder::Event conditions[] = {
+		{ ES_DebugListener::ESEV_NEWSCRIPT, 0 },
+		{ ES_DebugListener::ESEV_STATEMENT, 2 },
+		{ ES_DebugListener::ESEV_CALLSTARTING, 2 },
+		{ ES_DebugListener::ESEV_ENTERFN, 5 },
+		{ ES_DebugListener::ESEV_STATEMENT, 6 },
+		{ ES_DebugListener::ESEV_STATEMENT, 7 },
+		{ ES_DebugListener::ESEV_RETURN, 7 },
+		{ ES_DebugListener::ESEV_LEAVEFN, 8 },
+		{ ES_DebugListener::ESEV_CALLCOMPLETED, 2 },
+		{ ES_DebugListener::ESEV_STATEMENT, 10 },
+		{ ESEV_NA, SENTINEL }
+	};
+	er->SetConditions(conditions);
+
+} finally { er->Clear(); }
+
+html
+{
+	//! <script>
+	//! fruit.call();
+	//!
+	//! function fruit()
+	//! {
+	//!		apple = 5;
+	//! }
+	//!
+	//! var orange = apple;
+	//! </script>
+}
+
+test("Function.prototype.call")
+	 async;
+{
+	EventRecorder::Event conditions[] = {
+		{ ES_DebugListener::ESEV_NEWSCRIPT, 0 },
+		{ ES_DebugListener::ESEV_STATEMENT, 2 },
+		{ ES_DebugListener::ESEV_CALLSTARTING, 2 },
+		{ ES_DebugListener::ESEV_CALLSTARTING, 0 },
+		{ ES_DebugListener::ESEV_ENTERFN, 5 },
+		{ ES_DebugListener::ESEV_STATEMENT, 6 },
+		{ ES_DebugListener::ESEV_RETURN, 6 },
+		{ ES_DebugListener::ESEV_LEAVEFN, 7 },
+		{ ES_DebugListener::ESEV_CALLCOMPLETED, 0 },
+		{ ES_DebugListener::ESEV_CALLCOMPLETED, 2 },
+		{ ES_DebugListener::ESEV_STATEMENT, 9 },
+		{ ESEV_NA, SENTINEL }
+	};
+	er->SetConditions(conditions);
+
+} finally { er->Clear(); }
+
+html
+{
+	//! <script>
+	//! o = {};
+	//!
+	//! fruit.apply(o);
+	//!
+	//! function fruit()
+	//! {
+	//!		this.apple = 5;
+	//! }
+	//!
+	//! var orange = o.apple;
+	//! </script>
+}
+
+test("Function.prototype.apply")
+	 async;
+{
+	EventRecorder::Event conditions[] = {
+		{ ES_DebugListener::ESEV_NEWSCRIPT, 0 },
+		{ ES_DebugListener::ESEV_STATEMENT, 2 },
+		{ ES_DebugListener::ESEV_STATEMENT, 4 },
+		{ ES_DebugListener::ESEV_CALLSTARTING, 4 },
+		{ ES_DebugListener::ESEV_CALLSTARTING, 0 },
+		{ ES_DebugListener::ESEV_ENTERFN, 7 },
+		{ ES_DebugListener::ESEV_STATEMENT, 8 },
+		{ ES_DebugListener::ESEV_RETURN, 8 },
+		{ ES_DebugListener::ESEV_LEAVEFN, 9 },
+		{ ES_DebugListener::ESEV_CALLCOMPLETED, 0 },
+		{ ES_DebugListener::ESEV_CALLCOMPLETED, 4 },
+		{ ES_DebugListener::ESEV_STATEMENT, 11 },
+		{ ESEV_NA, SENTINEL }
+	};
+	er->SetConditions(conditions);
+
+} finally { er->Clear(); }
+
+html
+{
+	//! <script>
+	//! var foo = {};
+	//! Object.prototype.toString.call(foo);
+	//! var bar = foo;
+	//! </script>
+}
+
+test("Object.prototype.toString.call")
+	 async;
+{
+	EventRecorder::Event conditions[] = {
+		{ ES_DebugListener::ESEV_NEWSCRIPT, 0 },
+		{ ES_DebugListener::ESEV_STATEMENT, 2 },
+		{ ES_DebugListener::ESEV_STATEMENT, 3 },
+		{ ES_DebugListener::ESEV_CALLSTARTING, 3 },
+		{ ES_DebugListener::ESEV_CALLSTARTING, 0 },
+		{ ES_DebugListener::ESEV_CALLCOMPLETED, 0 },
+		{ ES_DebugListener::ESEV_CALLCOMPLETED, 3 },
+		{ ES_DebugListener::ESEV_STATEMENT, 4 },
+		{ ESEV_NA, SENTINEL }
+	};
+	er->SetConditions(conditions);
+
+} finally { er->Clear(); }
+
+html
+{
+	//! <script>
+	//! var foo = {};
+	//! Object.prototype.toString.apply(foo, []);
+	//! var bar = foo;
+	//! </script>
+}
+
+test("Object.prototype.toString.apply")
+	 async;
+{
+	EventRecorder::Event conditions[] = {
+		{ ES_DebugListener::ESEV_NEWSCRIPT, 0 },
+		{ ES_DebugListener::ESEV_STATEMENT, 2 },
+		{ ES_DebugListener::ESEV_STATEMENT, 3 },
+		{ ES_DebugListener::ESEV_CALLSTARTING, 3 },
+		{ ES_DebugListener::ESEV_CALLSTARTING, 0 },
+		{ ES_DebugListener::ESEV_CALLCOMPLETED, 0 },
+		{ ES_DebugListener::ESEV_CALLCOMPLETED, 3 },
+		{ ES_DebugListener::ESEV_STATEMENT, 4 },
+		{ ESEV_NA, SENTINEL }
+	};
+	er->SetConditions(conditions);
+
+} finally { er->Clear(); }
+
+html
+{
+	//! <script>
+	//! function getter()
+	//! {
+	//!		return 5;
+	//! }
+	//!
+	//! o = {};
+	//! o.__defineGetter__("attr", getter);
+	//!
+	//! var foo = o.attr;
+	//! </script>
+}
+
+test("__defineGetter__")
+	 async;
+{
+	EventRecorder::Event conditions[] = {
+		{ ES_DebugListener::ESEV_NEWSCRIPT, 0 },
+		{ ES_DebugListener::ESEV_STATEMENT, 7 },
+		{ ES_DebugListener::ESEV_STATEMENT, 8 },
+		{ ES_DebugListener::ESEV_CALLSTARTING, 8 },
+		{ ES_DebugListener::ESEV_CALLCOMPLETED, 8 },
+		{ ES_DebugListener::ESEV_STATEMENT, 10 },
+		{ ES_DebugListener::ESEV_CALLSTARTING, 0 },
+		{ ES_DebugListener::ESEV_ENTERFN, 3 },
+		{ ES_DebugListener::ESEV_STATEMENT, 4 },
+		{ ES_DebugListener::ESEV_RETURN, 4 },
+		{ ES_DebugListener::ESEV_LEAVEFN, 5 },
+		{ ES_DebugListener::ESEV_CALLCOMPLETED, 0 },
+		{ ESEV_NA, SENTINEL }
+	};
+	er->SetConditions(conditions);
+
+} finally { er->Clear(); }
+
+html
+{
+	//! <script>
+	//! function setter(a)
+	//! {
+	//!		this.foo = a;
+	//! }
+	//!
+	//! o = {};
+	//! o.__defineSetter__("attr", setter);
+	//!
+	//! o.attr = 5;
+	//! </script>
+}
+
+test("__defineSetter__")
+	 async;
+{
+	EventRecorder::Event conditions[] = {
+		{ ES_DebugListener::ESEV_NEWSCRIPT, 0 },
+		{ ES_DebugListener::ESEV_STATEMENT, 7 },
+		{ ES_DebugListener::ESEV_STATEMENT, 8 },
+		{ ES_DebugListener::ESEV_CALLSTARTING, 8 },
+		{ ES_DebugListener::ESEV_CALLCOMPLETED, 8 },
+		{ ES_DebugListener::ESEV_STATEMENT, 10 },
+		{ ES_DebugListener::ESEV_CALLSTARTING, 0 },
+		{ ES_DebugListener::ESEV_ENTERFN, 3 },
+		{ ES_DebugListener::ESEV_STATEMENT, 4 },
+		{ ES_DebugListener::ESEV_RETURN, 4 },
+		{ ES_DebugListener::ESEV_LEAVEFN, 5 },
+		{ ES_DebugListener::ESEV_CALLCOMPLETED, 0 },
+		{ ESEV_NA, SENTINEL }
+	};
+	er->SetConditions(conditions);
+
+} finally { er->Clear(); }
+
+html
+{
+	//! <script>
+	//! o = {};
+	//! Object.prototype.toString = function()
+	//! {
+	//!		return "An Object";
+	//! }
+	//!
+	//! document.write(o);
+	//! </script>
+}
+
+test("Implicit string conversion")
+	 async;
+{
+	EventRecorder::Event conditions[] = {
+		{ ES_DebugListener::ESEV_NEWSCRIPT, 0 },
+		{ ES_DebugListener::ESEV_STATEMENT, 2 },
+		{ ES_DebugListener::ESEV_STATEMENT, 3 },
+		{ ES_DebugListener::ESEV_STATEMENT, 8 },
+		{ ES_DebugListener::ESEV_CALLSTARTING, 8 },
+		{ ES_DebugListener::ESEV_CALLSTARTING, 0 },
+		{ ES_DebugListener::ESEV_ENTERFN, 4 },
+		{ ES_DebugListener::ESEV_STATEMENT, 5 },
+		{ ES_DebugListener::ESEV_RETURN, 5 },
+		{ ES_DebugListener::ESEV_LEAVEFN, 6 },
+		{ ES_DebugListener::ESEV_CALLCOMPLETED, 0 },
+		{ ES_DebugListener::ESEV_CALLCOMPLETED, 8 },
+		{ ESEV_NA, SENTINEL }
+	};
+	er->SetConditions(conditions);
+
+} finally { er->Clear(); }
+
+html
+{
+	//! <script>
+	//! for (var i = 0; i < 2; i++)
+	//! {
+	//!		break;
+	//! }
+	//!
+	//! var foo = 5;
+	//! </script>
+}
+
+test("Break statement")
+	 async;
+{
+	EventRecorder::Event conditions[] = {
+		{ ES_DebugListener::ESEV_NEWSCRIPT, 0 },
+		{ ES_DebugListener::ESEV_STATEMENT, 2 },
+		{ ES_DebugListener::ESEV_STATEMENT, 4 },
+		{ ES_DebugListener::ESEV_STATEMENT, 7 },
+		{ ESEV_NA, SENTINEL }
+	};
+	er->SetConditions(conditions);
+
+} finally { er->Clear(); }
+
+html
+{
+	//! <script>
+	//! for (var i = 0; i < 2; i++)
+	//! {
+	//!		continue;
+	//! }
+	//!
+	//! var foo = 5;
+	//! </script>
+}
+
+test("Continue statement")
+	 async;
+{
+	EventRecorder::Event conditions[] = {
+		{ ES_DebugListener::ESEV_NEWSCRIPT, 0 },
+		{ ES_DebugListener::ESEV_STATEMENT, 2 },
+		{ ES_DebugListener::ESEV_STATEMENT, 4 },
+		{ ES_DebugListener::ESEV_STATEMENT, 2 },
+		{ ES_DebugListener::ESEV_STATEMENT, 4 },
+		{ ES_DebugListener::ESEV_STATEMENT, 2 },
+		{ ES_DebugListener::ESEV_STATEMENT, 7 },
+		{ ESEV_NA, SENTINEL }
+	};
+	er->SetConditions(conditions);
+
+} finally { er->Clear(); }
+
+html
+{
+	//! <script>
+	//! var a = [1, 2, 3];
+	//!
+	//! for (var i in a)
+	//!		foo = a[i];
+	//!
+	//! var bar = foo;
+	//! </script>
+}
+
+test("For-in loop iterations")
+	 async;
+{
+	EventRecorder::Event conditions[] = {
+		{ ES_DebugListener::ESEV_NEWSCRIPT, 0 },
+		{ ES_DebugListener::ESEV_STATEMENT, 2 },
+		{ ES_DebugListener::ESEV_STATEMENT, 4 },
+		{ ES_DebugListener::ESEV_STATEMENT, 5 },
+		{ ES_DebugListener::ESEV_STATEMENT, 4 },
+		{ ES_DebugListener::ESEV_STATEMENT, 5 },
+		{ ES_DebugListener::ESEV_STATEMENT, 4 },
+		{ ES_DebugListener::ESEV_STATEMENT, 5 },
+		{ ES_DebugListener::ESEV_STATEMENT, 4 },
+		{ ES_DebugListener::ESEV_STATEMENT, 7 },
+		{ ESEV_NA, SENTINEL }
+	};
+	er->SetConditions(conditions);
+
+} finally { er->Clear(); }
+
+html
+{
+	//! <script>
+	//! function Fruit()
+	//! {
+	//!		this.type = "banana";
+	//!	}
+	//!
+	//! var fruit = new Fruit();
+	//! var type = fruit.type;
+	//! </script>
+}
+
+test("Constructors")
+	 async;
+{
+	EventRecorder::Event conditions[] = {
+		{ ES_DebugListener::ESEV_NEWSCRIPT, 0 },
+		{ ES_DebugListener::ESEV_STATEMENT, 7 },
+		{ ES_DebugListener::ESEV_CALLSTARTING, 7 },
+		{ ES_DebugListener::ESEV_ENTERFN, 3 },
+		{ ES_DebugListener::ESEV_STATEMENT, 4 },
+		{ ES_DebugListener::ESEV_RETURN, 4 },
+		{ ES_DebugListener::ESEV_LEAVEFN, 5 },
+		{ ES_DebugListener::ESEV_CALLCOMPLETED, 7 },
+		{ ES_DebugListener::ESEV_STATEMENT, 8 },
+		{ ESEV_NA, SENTINEL }
+	};
+	er->SetConditions(conditions);
+
+} finally { er->Clear(); }
+
+html
+{
+	//! <script>
+	//! dance:
+	//! for (var i = 0; i < 3; i++)
+	//! {
+	//!		if (i == 1)
+	//!			break dance;
+	//! }
+	//!
+	//! var foo = 5;
+	//! </script>
+}
+
+test("Labelled for loop")
+	 async;
+{
+	EventRecorder::Event conditions[] = {
+		{ ES_DebugListener::ESEV_NEWSCRIPT, 0 },
+		{ ES_DebugListener::ESEV_STATEMENT, 3 },
+		{ ES_DebugListener::ESEV_STATEMENT, 5 },
+		{ ES_DebugListener::ESEV_STATEMENT, 3 },
+		{ ES_DebugListener::ESEV_STATEMENT, 5 },
+		{ ES_DebugListener::ESEV_STATEMENT, 6 },
+		{ ES_DebugListener::ESEV_STATEMENT, 9 },
+		{ ESEV_NA, SENTINEL }
+	};
+	er->SetConditions(conditions);
+
+} finally { er->Clear(); }
+
+html
+{
+	//! <script>
+	//! var foo = "hello";
+	//! var array = new Array(1, 2, 3);
+	//! var pass = true;
+	//! </script>
+}
+
+test("new Array")
+	 async;
+{
+	EventRecorder::Event conditions[] = {
+		{ ES_DebugListener::ESEV_NEWSCRIPT, 0 },
+		{ ES_DebugListener::ESEV_STATEMENT, 2 },
+		{ ES_DebugListener::ESEV_STATEMENT, 3 },
+		{ ES_DebugListener::ESEV_CALLSTARTING, 3 },
+		{ ES_DebugListener::ESEV_CALLCOMPLETED, 3 },
+		{ ES_DebugListener::ESEV_STATEMENT, 4 },
+		{ ESEV_NA, SENTINEL }
+	};
+	er->SetConditions(conditions);
+
+} finally { er->Clear(); }
+
+html
+{
+	//! <script>
+	//! var foo = "hello";
+	//! var bool = new Boolean(true);
+	//! var pass = true;
+	//! </script>
+}
+
+test("new Boolean")
+	 async;
+{
+	EventRecorder::Event conditions[] = {
+		{ ES_DebugListener::ESEV_NEWSCRIPT, 0 },
+		{ ES_DebugListener::ESEV_STATEMENT, 2 },
+		{ ES_DebugListener::ESEV_STATEMENT, 3 },
+		{ ES_DebugListener::ESEV_CALLSTARTING, 3 },
+		{ ES_DebugListener::ESEV_CALLCOMPLETED, 3 },
+		{ ES_DebugListener::ESEV_STATEMENT, 4 },
+		{ ESEV_NA, SENTINEL }
+	};
+	er->SetConditions(conditions);
+
+} finally { er->Clear(); }
+
+html
+{
+	//! <script>
+	//! var foo = "hello";
+	//! var date = new Date();
+	//! var pass = true;
+	//! </script>
+}
+
+test("new Date")
+	 async;
+{
+	EventRecorder::Event conditions[] = {
+		{ ES_DebugListener::ESEV_NEWSCRIPT, 0 },
+		{ ES_DebugListener::ESEV_STATEMENT, 2 },
+		{ ES_DebugListener::ESEV_STATEMENT, 3 },
+		{ ES_DebugListener::ESEV_CALLSTARTING, 3 },
+		{ ES_DebugListener::ESEV_CALLCOMPLETED, 3 },
+		{ ES_DebugListener::ESEV_STATEMENT, 4 },
+		{ ESEV_NA, SENTINEL }
+	};
+	er->SetConditions(conditions);
+
+} finally { er->Clear(); }
+
+html
+{
+	//! <script>
+	//! var foo = "hello";
+	//! var err = new Error();
+	//! var pass = true;
+	//! </script>
+}
+
+test("new Error")
+	 async;
+{
+	EventRecorder::Event conditions[] = {
+		{ ES_DebugListener::ESEV_NEWSCRIPT, 0 },
+		{ ES_DebugListener::ESEV_STATEMENT, 2 },
+		{ ES_DebugListener::ESEV_STATEMENT, 3 },
+		{ ES_DebugListener::ESEV_CALLSTARTING, 3 },
+		{ ES_DebugListener::ESEV_CALLCOMPLETED, 3 },
+		{ ES_DebugListener::ESEV_STATEMENT, 4 },
+		{ ESEV_NA, SENTINEL }
+	};
+	er->SetConditions(conditions);
+
+} finally { er->Clear(); }
+
+html
+{
+	//! <script>
+	//! var foo = "hello";
+	//! var func = new Function("a", "b", "return a + b;");
+	//! var pass = true;
+	//! </script>
+}
+
+test("new Function")
+	 async;
+{
+	EventRecorder::Event conditions[] = {
+		{ ES_DebugListener::ESEV_NEWSCRIPT, 0 },
+		{ ES_DebugListener::ESEV_STATEMENT, 2 },
+		{ ES_DebugListener::ESEV_STATEMENT, 3 },
+		{ ES_DebugListener::ESEV_CALLSTARTING, 3 },
+		{ ES_DebugListener::ESEV_CALLCOMPLETED, 3 },
+		{ ES_DebugListener::ESEV_STATEMENT, 4 },
+		{ ESEV_NA, SENTINEL }
+	};
+	er->SetConditions(conditions);
+
+} finally { er->Clear(); }
+
+html
+{
+	//! <script>
+	//! var foo = "hello";
+	//! var num = new Number(1337);
+	//! var pass = true;
+	//! </script>
+}
+
+test("new Number")
+	 async;
+{
+	EventRecorder::Event conditions[] = {
+		{ ES_DebugListener::ESEV_NEWSCRIPT, 0 },
+		{ ES_DebugListener::ESEV_STATEMENT, 2 },
+		{ ES_DebugListener::ESEV_STATEMENT, 3 },
+		{ ES_DebugListener::ESEV_CALLSTARTING, 3 },
+		{ ES_DebugListener::ESEV_CALLCOMPLETED, 3 },
+		{ ES_DebugListener::ESEV_STATEMENT, 4 },
+		{ ESEV_NA, SENTINEL }
+	};
+	er->SetConditions(conditions);
+
+} finally { er->Clear(); }
+
+html
+{
+	//! <script>
+	//! var foo = "hello";
+	//! var obj = new Object();
+	//! var pass = true;
+	//! </script>
+}
+
+test("new Object")
+	 async;
+{
+	EventRecorder::Event conditions[] = {
+		{ ES_DebugListener::ESEV_NEWSCRIPT, 0 },
+		{ ES_DebugListener::ESEV_STATEMENT, 2 },
+		{ ES_DebugListener::ESEV_STATEMENT, 3 },
+		{ ES_DebugListener::ESEV_CALLSTARTING, 3 },
+		{ ES_DebugListener::ESEV_CALLCOMPLETED, 3 },
+		{ ES_DebugListener::ESEV_STATEMENT, 4 },
+		{ ESEV_NA, SENTINEL }
+	};
+	er->SetConditions(conditions);
+
+} finally { er->Clear(); }
+
+html
+{
+	//! <script>
+	//! var foo = "hello";
+	//! var regex = new RegExp("bar", "i");
+	//! var pass = true;
+	//! </script>
+}
+
+test("new RegExp")
+	 async;
+{
+	EventRecorder::Event conditions[] = {
+		{ ES_DebugListener::ESEV_NEWSCRIPT, 0 },
+		{ ES_DebugListener::ESEV_STATEMENT, 2 },
+		{ ES_DebugListener::ESEV_STATEMENT, 3 },
+		{ ES_DebugListener::ESEV_CALLSTARTING, 3 },
+		{ ES_DebugListener::ESEV_CALLCOMPLETED, 3 },
+		{ ES_DebugListener::ESEV_STATEMENT, 4 },
+		{ ESEV_NA, SENTINEL }
+	};
+	er->SetConditions(conditions);
+
+} finally { er->Clear(); }
+
+html
+{
+	//! <script>
+	//! var foo = "hello";
+	//! var str = new String("bar", "i");
+	//! var pass = true;
+	//! </script>
+}
+
+test("new String")
+	 async;
+{
+	EventRecorder::Event conditions[] = {
+		{ ES_DebugListener::ESEV_NEWSCRIPT, 0 },
+		{ ES_DebugListener::ESEV_STATEMENT, 2 },
+		{ ES_DebugListener::ESEV_STATEMENT, 3 },
+		{ ES_DebugListener::ESEV_CALLSTARTING, 3 },
+		{ ES_DebugListener::ESEV_CALLCOMPLETED, 3 },
+		{ ES_DebugListener::ESEV_STATEMENT, 4 },
+		{ ESEV_NA, SENTINEL }
+	};
+	er->SetConditions(conditions);
+
+} finally { er->Clear(); }

@@ -1,0 +1,280 @@
+/* -*- Mode: c++; tab-width: 4; indent-tabs-mode: t; c-basic-offset: 4 -*- */
+
+group "desktop_util.string";
+
+include "modules/display/fontcache.h";
+include "modules/util/opstring.h";
+include "modules/pi/ui/OpUiInfo.h";
+include "adjunct/desktop_util/string/stringutils.h";
+
+global
+{
+	class TestExpansionProvider : public StringUtils::ExpansionProvider
+	{
+		virtual OP_STATUS GetClipboardText(OpString& text) const
+			{ return text.Set(UNI_L("CB")); }
+
+		virtual OP_STATUS GetSelectedText(OpString& text) const
+			{ return text.Set(UNI_L("ST")); }
+
+		virtual OP_STATUS GetCurrentDocFilePath(OpString& path) const
+			{ return path.Set(UNI_L("FP")); }
+
+		virtual OP_STATUS GetCurrentDocUrlName(OpString& name) const
+			{ return name.Set(UNI_L("DU")); }
+
+		virtual OP_STATUS GetCurrentClickedUrlName(OpString& name) const
+			{ return name.Set(UNI_L("LU")); }
+	};
+
+	char *oldlocale;
+	char *uni2utf8_string;
+}
+setup
+{
+	oldlocale = op_setlocale( LC_NUMERIC, NULL );
+    op_setlocale( LC_NUMERIC, "C" );
+}
+
+exit
+{
+    op_setlocale( LC_NUMERIC, oldlocale );
+	op_free(uni2utf8_string);
+}
+
+
+
+table ParameterData(const char*, const char*)
+{
+	{"",					""}
+	{"foo",					"foo"}
+	{"%",					""}
+	{"%%",					"%"}
+	{"%%%",					"%"}
+	{"%%%%",				"%%"}
+	{"%f %%TEMP%%$USER",	" %TEMP%$USER"}
+	{"% f",					"f"}
+	{"%F",					""}
+	{"%fo%%o%",				"o%o"}
+	{"%Fo%%o%",				"o%o"}
+	{"Paste %C here",		"Paste \"CB\" here"}
+	{"Paste %c here",		"Paste CB here"}
+	{"%S%s %u%U",			"\"FP\"FP DU\"DU\""}
+	{"%%%l%%OS%%$HOME%%%L",	"%LU%OS%$HOME%\"LU\""}
+	{"%T",					"\"ST\""}
+	{"%t",					"ST"}
+}
+
+subtest VerifyString(const char* expected, const uni_char* got)
+{
+	OpString8 got_str;
+	verify(OpStatus::IsSuccess(got_str.Set(got)));
+	if (!(OpStringC8(expected) == got_str))
+	{
+		ST_failed("Expected: %s, got: %s", expected, got_str.CStr());
+	}
+}
+
+/*
+test("ExpandParameters($(input))")
+	multi ParameterData(input, expected_output);
+{
+	OpString input16;
+	verify(OpStatus::IsSuccess(input16.Set(input)));
+
+	OpString output;
+	verify(OpStatus::IsSuccess(StringUtils::ExpandParameters(
+					TestExpansionProvider(), input16, output, FALSE)));
+	VerifyString(expected_output, output);
+
+	const size_t BUFFER_SIZE = 2345;
+	uni_char buffer[BUFFER_SIZE + 1];
+	verify(OpStatus::IsSuccess(g_op_system_info->ExpandSystemVariablesInString(
+				output.CStr(), buffer, BUFFER_SIZE)));
+	OpString8 expected_output_env;
+	verify(OpStatus::IsSuccess(expected_output_env.Set(buffer)));
+
+	OpString output_env;
+	verify(OpStatus::IsSuccess(StringUtils::ExpandParameters(
+					TestExpansionProvider(), input16, output_env, TRUE)));
+	VerifyString(expected_output_env, output_env);
+}
+*/
+
+/* Espen Sand */
+test("Ellipsis in strings")
+{
+        OpString data;
+        data.Set("123456789abcdefghijklmnopqrstuvwxyz123456789abcdefghijklmnopqrstuvwxyz");
+
+        OpString source;
+        source.Set(data);
+        
+        verify(g_font_cache);
+
+        FontAtt font_att;
+        g_op_ui_info->GetFont(OP_SYSTEM_FONT_UI_MENU, font_att, FALSE);
+        OpFont* font = g_font_cache->GetFont(font_att, 100);
+
+        //OpFont* font = g_op_ui_info->GetSystemFont(OP_SYSTEM_FONT_UI_MENU, font_att);
+        verify(font);
+
+        /* Should not be any dots in this string */
+        OP_STATUS rc = StringUtils::EllipticText(source, 10000, FALSE, font);
+        verify(OpStatus::IsSuccess(rc));
+        int pos = source.FindFirstOf('.');
+        verify(pos == KNotFound);
+
+        /* Should be three dots at end of string */
+        rc = StringUtils::EllipticText(source, 50, FALSE, font);
+        verify(OpStatus::IsSuccess(rc));
+        int length = source.Length();
+        pos = source.Find(UNI_L("..."));
+        verify(pos == length-3);
+        
+        /* Should be three dots somewhere close to the middle of the string */
+        source.Set(data);
+        rc = StringUtils::EllipticText(source, 50, TRUE, font);
+        verify(OpStatus::IsSuccess(rc));
+        pos = source.Find(UNI_L("..."));
+        verify(pos > 0);
+        verify(pos < length-3);
+}
+
+test("FormatByteSize works correctly")
+{
+	UINT64 number = op_pow(2,31);
+	OpString result;
+
+	verify_success(FormatByteSize(result, number));
+	verify_string(result, UNI_L("2,0 GB"));
+
+	number = op_pow(2,34);
+	verify_success(FormatByteSize(result, number));
+	verify_string(result.CStr(), UNI_L("16,0 GB"));
+
+	number = op_pow(2,16);
+	verify_success(FormatByteSize(result, number));
+	verify_string(result.CStr(), UNI_L("64 KB"));
+
+	number = op_pow(2,20);
+	verify_success(FormatByteSize(result, number));
+	verify_string(result.CStr(), UNI_L("1,0 MB"));
+
+	number = op_pow(2,3);
+	verify_success(FormatByteSize(result, number));
+	verify_string(result.CStr(), UNI_L("8 B"));
+}
+
+test("StringUtils::SplitWord can split off words")
+{
+	const uni_char* string = UNI_L("  test1 test2");
+	OpString word;
+
+	string = StringUtils::SplitWord(string, ' ', word);
+	verify(string);
+	verify_string(word.CStr(), UNI_L("test1"));
+
+	string = StringUtils::SplitWord(string, ' ', word);
+	verify(string);
+	verify_string(word.CStr(), UNI_L("test2"));
+
+	string = StringUtils::SplitWord(string, ' ', word);
+	verify(!string);
+}
+
+test("StringUtils::SplitWord repects quotes")
+{
+	const uni_char* string = UNI_L("\"test1 test2\" test3");
+	OpString word;
+
+	string = StringUtils::SplitWord(string, ' ', word);
+	verify(string);
+	verify_string(word.CStr(), UNI_L("test1 test2"));
+
+	string = StringUtils::SplitWord(string, ' ', word);
+	verify(string);
+	verify_string(word.CStr(), UNI_L("test3"));
+
+	string = StringUtils::SplitWord(string, ' ', word);
+	verify(!string);
+}
+
+test("StringUtils::ContainsAll works")
+{
+	const uni_char* haystack = UNI_L("test1 test2 test3");
+
+	const uni_char* needles1 = UNI_L("test2 test1");
+	verify(StringUtils::ContainsAll(needles1, haystack));
+
+	const uni_char* needles2 = UNI_L("test2 test4");
+	verify(!StringUtils::ContainsAll(needles2, haystack));
+}
+
+test("StringUtils::UniToUTF8 works")
+{
+	const uni_char* input = UNI_L("test1 test2 test3");
+
+	uni2utf8_string = StringUtils::UniToUTF8(input);
+	verify_string(uni2utf8_string, "test1 test2 test3");
+}
+
+test("StringUtils::Replace works")
+{
+	OpString haystack;
+	verify_success(haystack.Set("test1 test2 test3"));
+
+	const uni_char* replace_what = UNI_L("test");
+	const uni_char* replace_with = UNI_L("pass");
+	verify_success(StringUtils::Replace(haystack, replace_what, replace_with));
+
+	const uni_char* expected = UNI_L("pass1 pass2 pass3");
+	verify(haystack.Compare(expected) == 0);
+}
+
+test("StringUtils::ReplaceNewLines works")
+{
+	OpString haystack;
+	verify_success(haystack.Set("test1\ntest2\r\ntest3"));
+
+	verify_success(StringUtils::ReplaceNewLines(haystack));
+
+	const uni_char* expected = UNI_L("test1<BR>test2<BR>test3");
+	verify(haystack.Compare(expected) == 0);
+}
+
+test("StringUtils::FindDomain works")
+{
+	OpString url_string, domain;
+	unsigned int pos;
+
+	verify_success(url_string.Set("http://www.opera.com/"));
+	verify_success(StringUtils::FindDomain(url_string,domain,pos));
+	verify_string(domain, "opera.com");
+	verify(pos == 11);
+
+	verify_success(url_string.Set("https://mail.opera.com/?utm_source"));
+	verify_success(StringUtils::FindDomain(url_string,domain,pos));
+	verify_string(domain, "mail.opera.com");
+	verify(pos == 8);
+
+	verify_success(url_string.Set("http://my.opera.com/community"));
+	verify_success(StringUtils::FindDomain(url_string,domain,pos));
+	verify_string(domain, "my.opera.com");
+	verify(pos == 7);
+
+	verify_success(url_string.Set("http://www.Google.com/"));
+	verify_success(StringUtils::FindDomain(url_string,domain,pos));
+	verify_string(domain, "Google.com");
+	verify(pos == 11);
+
+	verify_success(url_string.Set("http://Google.com/"));
+	verify_success(StringUtils::FindDomain(url_string,domain,pos));
+	verify_string(domain, "Google.com");
+	verify(pos == 7);
+
+	verify_success(url_string.Set("Google.com/"));
+	verify_success(StringUtils::FindDomain(url_string,domain,pos));
+	verify_string(domain, "Google.com");
+	verify(pos == 0);
+}

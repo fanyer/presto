@@ -1,0 +1,395 @@
+/* -*- Mode: c++; tab-width: 4; indent-tabs-mode: t; c-basic-offset: 4 -*-
+**
+** Copyright (C) 2005-2010 Opera Software ASA.  All rights reserved.
+**
+** This file is part of the Opera web browser.  It may not be distributed
+** under any circumstances.
+*/
+
+group "unicode.normalize";
+require SUPPORT_UNICODE_NORMALIZE;
+
+include "modules/unicode/unicode.h";
+include "modules/util/opfile/opfile.h";
+
+// -- Global variables ---------------------------------------------------
+
+global
+{
+	// Global helper functions.
+
+	/** Convert the low nybble of a number to a hexadecimal digit. */
+	int hex(uni_char i)
+	{
+		i &= 0xf;
+		if (i >= 10)
+			return (i - 10) + 'a';
+		return i + '0';
+	}
+
+	/** Convert a string of UTF-16 Unicode code points to a list of
+	  * hexadecimal numbers.
+	  */
+	const char *describe(const uni_char * x)
+	{
+		int i;
+		char *p = describe_buf;
+		for (i = 0; x[i]; i++)
+		{
+			uni_char cur = x[i];
+			if (Unicode::IsHighSurrogate(x[i]) && Unicode::IsLowSurrogate(x[i + 1]))
+			{
+				UINT32 utf32 = Unicode::DecodeSurrogate(x[i], x[i + 1]);
+				*(p ++) = hex(utf32 >> 20);
+				*(p ++) = hex(utf32 >> 16);
+				++ i;
+				cur = utf32 & 0xFFFF;
+			}
+			*(p ++) = hex(cur >> 12);
+			*(p ++) = hex(cur >> 8);
+			*(p ++) = hex(cur >> 4);
+			*(p ++) = hex(cur);
+			*(p ++) = ' ';
+		}
+		*p = 0;
+		return describe_buf;
+	}
+
+	/** Fast convert a UTF-32 string into UTF-16 */
+	void utf32_to_utf16(const UINT32 in[100], uni_char out[200])
+	{
+		do
+		{
+			if (*in < 65536)
+			{
+				*(out ++) = *in;
+			}
+			else
+			{
+				*(out ++) = 0xD800 | uni_char((*in - 0x10000) >> 10);
+				*(out ++) = 0xDC00 | uni_char((*in) & 0x3FF);
+			}
+		} while (*(in ++));
+	}
+
+	/** Normalize to form C. */
+	inline uni_char *NFC(const uni_char *x)  { return Unicode::Normalize(x, -1, TRUE, FALSE); }
+	/** Normalize to form D. */
+	inline uni_char *NFD(const uni_char *x)  { return Unicode::Normalize(x, -1, FALSE, FALSE);}
+	/** Normalize to form KC. */
+	inline uni_char *NFKC(const uni_char *x) { return Unicode::Normalize(x, -1, TRUE, TRUE);  }
+	/** Normalize to form KD. */
+	inline uni_char *NFKD(const uni_char *x) { return Unicode::Normalize(x, -1, FALSE, TRUE); }
+
+	/** Check that that x and y are equal and output an error message if
+	  * they are not.
+	  */
+	void check(int lineno, const uni_char *x, uni_char *y)
+	{
+		processed += uni_strlen(x);
+		if (!uni_str_eq(x, y))
+		{
+			output("\n%d: Test failed! wanted %sgot ", lineno, describe(x));
+			output("%s ", describe(y));
+			fail_test++;
+		}
+		else
+		{
+			ok_test++;
+		}
+		OP_DELETEA(y);
+	}
+
+	// Global variables.
+	char describe_buf[500];		///< Buffer for describe(). /* ARRAY OK 2009-02-09 marcusc */
+	char checked[65536];		///< Remember which characters have been tested. /* ARRAY OK 2009-02-09 marcusc */
+	int fail_test;				///< Number of failed tests.
+	int ok_test;				///< Number of passed tests.
+	int processed;				///< Number of characters processed.
+	unsigned char *combdat;		///< Test data for the combining classes
+};
+
+setup
+{
+	combdat = NULL;
+}
+
+// -- Subtests -----------------------------------------------------------
+
+subtest norm_test(int lineno, const UINT32 c1_utf32[100], const UINT32 c2_utf32[100],
+				  const UINT32 c3_utf32[100], const UINT32 c4_utf32[100],
+				  const UINT32 c5_utf32[100])
+{
+	// Convert the strings to UTF-16
+	uni_char c1[200], c2[200], c3[200], c4[200], c5[200];
+	utf32_to_utf16(c1_utf32, c1);
+	utf32_to_utf16(c2_utf32, c2);
+	utf32_to_utf16(c3_utf32, c3);
+	utf32_to_utf16(c4_utf32, c4);
+	utf32_to_utf16(c5_utf32, c5);
+
+	if (fail_test > 10000)
+	{
+		return 1;
+	}
+	// 1. The following invariants must be true for all conformant implementations
+	//
+	//    NFC
+	//      c2 ==  NFC(c1) ==  NFC(c2) ==  NFC(c3)
+	//      c4 ==  NFC(c4) ==  NFC(c5)
+	//
+	//    NFD
+	//      c3 ==  NFD(c1) ==  NFD(c2) ==  NFD(c3)
+	//      c5 ==  NFD(c4) ==  NFD(c5)
+	//
+	//    NFKC
+	//      c4 == NFKC(c1) == NFKC(c2) == NFKC(c3) == NFKC(c4) == NFKC(c5)
+	//
+	//    NFKD
+	//      c5 == NFKD(c1) == NFKD(c2) == NFKD(c3) == NFKD(c4) == NFKD(c5)
+	//
+	check(lineno, c2, NFC(c1));  check(lineno, c2, NFC(c2));  check(lineno, c2, NFC(c2));
+	check(lineno, c4, NFC(c4));  check(lineno, c4, NFC(c5));
+	check(lineno, c3, NFD(c1));  check(lineno, c3, NFD(c2));  check(lineno, c3, NFD(c3));
+	check(lineno, c5, NFD(c4));  check(lineno, c5, NFD(c5));
+	check(lineno, c4, NFKC(c1)); check(lineno, c4, NFKC(c2)); check(lineno, c4, NFKC(c3));
+	check(lineno, c4, NFKC(c4)); check(lineno, c4, NFKC(c5));
+	check(lineno, c5, NFKD(c1)); check(lineno, c5, NFKD(c2)); check(lineno, c5, NFKD(c3));
+	check(lineno, c5, NFKD(c4)); check(lineno, c5, NFKD(c5));
+	return 1;
+}
+
+// -- Tests --------------------------------------------------------------
+
+test("All unicode normalization tests")
+	file uni testdata "NormalizationTest.txt";
+{
+
+	OpFile testf;
+	verify(!OpStatus::IsError(testf.Construct(testdata)));
+	OP_STATUS rc = testf.Open(OPFILE_READ);
+
+	if (!OpStatus::IsSuccess(rc))
+	{
+		output("\nCannot read %s ", ST_down(testdata));
+		verify(OpStatus::IsSuccess(rc));
+	}
+
+	fail_test = ok_test = processed = 0;
+
+	OpString8 line;
+	int lineno = 0, cnt = 0, skip_cnt = 0;
+	op_memset(checked, 0, sizeof (checked));
+	while (!testf.Eof())
+	{
+		UINT32 c[5][100];
+		UINT32 cc = 0, cl = 0, cv = 0;
+
+		OP_STATUS rc = testf.ReadLine(line);
+		if (OpStatus::IsError(rc) || line.IsEmpty())
+			break;
+
+		lineno++;
+		if (line[0] == '#')
+			continue;
+		if (line[0] == '@')
+			continue;
+
+		cnt++;
+
+		for (int i = 0; i < line.Length(); i++)
+		{
+			switch (line[i])
+			{
+			case ';':			// next string
+				c[cc][cl] = cv;
+				c[cc][cl + 1] = 0;
+				cc++;
+				cl = 0;
+				cv = 0;
+				break;
+			case ' ':			// next char
+				if (cc < 5) // but ignore the one after the fifth ; that separates it from the # !
+				{
+					c[cc][cl] = cv;
+					cl++;
+					cv = 0;
+				}
+				else
+				{
+					verify(cl == 0 && cv == 0);
+				}
+				break;
+			case '\n':
+				break;
+			case '#':
+				goto perform_test;
+			default:
+				if (line[i] >= '0' && line[i] <= '9')
+					cv = (cv << 4) | line[i] - '0';
+				else if (line[i] >= 'A' && line[i] <= 'F')
+					cv = (cv << 4) | (10 + line[i] - 'A');
+				else
+					output("Did not expect %c\n", line[i]);
+				break;
+			}
+		}
+perform_test:
+		if (cc == 5)
+		{
+			if (c[0][0] < 65536)
+				checked[c[0][0]] = 1;
+			verify(norm_test(lineno, c[0], c[1], c[2], c[3], c[4]));
+		}
+		else if (cc)
+			output("Illegal number of strings %d\n", cc);
+	}
+	if (fail_test)
+		output("%d ok, %d failed\n", ok_test, fail_test);
+	else
+	{
+//              "%10d .......................................................... Passed"
+		output("Passed\n"
+			   "  Ran %6d tests ............................................. ",
+			   ok_test + skip_cnt);
+	}
+	verify(!fail_test);
+
+}
+
+
+// Test that the remaining untested characters in the BMP normalizes to
+// themselves.
+test("All BMP characters not mentioned in the normalization tests")
+	require success "All unicode normalization tests";
+{
+	for (int i = 1; i < 65536; i++)
+	{
+		if (i == 0xD800)
+			i = 0xE000;
+		if (!checked[i])
+		{
+			uni_char a[1], *b;
+			a[0] = i;
+			b = Unicode::Normalize(a, 1, true, true);
+			if (i != b[0])
+				output("had/expected U+%04X got U+%04X ", i, b[0]);
+			verify(i == b[0]);
+			OP_DELETEA(b);
+		}
+	}
+}
+
+// Tricky test for Unicode 5.2
+test("Unicode 5.2 tricky test")
+{
+	// One of the compatibility CJK ideographs added in this version has a
+	// decomposition mapping to a unified CJK ideograph in Extension B.
+	// Implementers should check their implementations of normalization to
+	// ensure they are not assuming that no BMP character can normalize to
+	// a non-BMP character.
+
+	// toNFC(U+FA6C) = U+242EE
+	uni_char *s = NFC(UNI_L("\xFA6C"));
+	verify(s);
+	verify(Unicode::IsSurrogate(s[0]) && Unicode::IsSurrogate(s[1]));
+	verify(Unicode::DecodeSurrogate(s[0], s[1]) == 0x242EE);
+}
+finally
+{
+	OP_DELETEA(s);
+}
+
+// Test that invalid half surrogate pairs normalize to U+FFFD, the
+// replacement character
+test("Invalid input tests")
+{
+	uni_char *s = Unicode::Normalize(UNI_L("\xD800"), 1, true, true);
+	verify(s[0] == 0xFFFD);
+	OP_DELETEA(s); s = NULL;
+
+	s = Unicode::Normalize(UNI_L("\xDC00"), 1, true, true);
+	verify(s[0] == 0xFFFD);
+	OP_DELETEA(s); s = NULL;
+
+	s = Unicode::Normalize(UNI_L("\xDC00\xD800"), 2, true, true);
+	verify(s[0] == 0xFFFD);
+	OP_DELETEA(s); s = NULL;
+}
+finally
+{
+	OP_DELETEA(s);
+}
+
+test("Combining classes")
+	file uni testdata "../scripts/comb.dat";
+{
+	// Base character
+	verify(Unicode::GetCombiningClass('A') == 0);
+	// Combining character
+	verify(Unicode::GetCombiningClass(0x300) == 230);
+
+	// Check that the characters described in comb.dat give correct
+	// results.
+	// Read the entire table from the file
+	OpFile fi;
+	verify(OpStatus::IsSuccess(fi.Construct(testdata)));
+
+	OpFileLength filelength = 0;
+	verify(OpStatus::IsSuccess(fi.Open(OPFILE_READ)));
+	verify(OpStatus::IsSuccess(fi.GetFileLength(filelength)));
+	// Work around compiler warning
+	unsigned int length = static_cast<unsigned int>(filelength);
+
+	combdat = OP_NEWA(unsigned char, length);
+	verify(combdat);
+
+	OpFileLength read;
+	fi.Read(combdat, length, &read);
+	fi.Close();
+
+	// Read the data and perform the tests
+	UINT32 lastcodepoint = 0;
+	for (unsigned int i = 0; i < read; i += 4)
+	{
+		// Test data is stored in four words, first the Unicode
+		// code point as a 24-bit big endian value, followed by
+		// the combining class.
+		UINT32 codepoint = (combdat[i] << 16) | (combdat[i + 1] << 8) | combdat[i + 2];
+		char expected = combdat[i + 3];
+		if (codepoint < 0x10000)
+		{
+			// Check intermediate codepoints (all base characters)
+			for (UINT32 j = lastcodepoint + 1; j < codepoint; ++ j)
+			{
+				if (j >= 0xD800 && j <= 0xDFFF)
+					j = 0xDFFF;
+				else
+					verify(Unicode::GetCombiningClass(static_cast<uni_char>(j)) == 0);
+			}
+			lastcodepoint = codepoint;
+
+			// Check target character
+			char got = Unicode::GetCombiningClass(static_cast<uni_char>(codepoint));
+			if (got != expected)
+				output("\nFor U+%04X got %u expected %u ", codepoint, static_cast<unsigned char>(got), static_cast<unsigned char>(expected));
+			verify(got == expected);
+		}
+		else
+		{
+			uni_char high, low;
+			Unicode::MakeSurrogate(codepoint, high, low);
+			char got = Unicode::GetCombiningClass(high, low);
+			if (got != expected)
+				output("\nFor U+%04X (<%04X,%04X> got %u expected %u ", codepoint, high, low, static_cast<unsigned char>(got), static_cast<unsigned char>(expected));
+			verify(got == expected);
+		}
+	}
+}
+
+// -- Global cleanup -----------------------------------------------------
+
+exit
+{
+	OP_DELETEA(combdat);
+}

@@ -1,0 +1,954 @@
+/* -*- Mode: c++; tab-width: 4; indent-tabs-mode: t; c-basic-offset: 4 -*- */
+group "otl.vector";
+require init;
+
+language C++;
+
+include "modules/otl/vector.h";
+
+global
+{
+	class VectorTestElement
+	{
+	public:
+
+		unsigned int& count;
+		unsigned char padding0;
+		unsigned char padding1;
+		unsigned short padding2;
+		unsigned int padding3;
+
+		VectorTestElement(unsigned int& count)
+			: count(count)
+			, padding0(0xde)
+			, padding1(0xad)
+			, padding2(0xb00b)
+			, padding3(0xf00dface)
+		{
+			++count;
+		}
+
+		VectorTestElement(const VectorTestElement& v)
+			: count(v.count)
+			, padding0(v.padding0)
+			, padding1(v.padding1)
+			, padding2(v.padding2)
+			, padding3(v.padding3)
+		{
+			++count;
+		}
+
+		~VectorTestElement()
+		{
+			--count;
+		}
+	};
+
+	/**
+	 * This class is "complicated", because it keeps a copy of a string.
+	 * Whenever this object is copied, the string must be copied as well. This
+	 * requires a custom copy constructor.
+	 */
+	class ComplicatedElement
+	{
+	public:
+		ComplicatedElement(int id, const uni_char* str)
+			: m_id(id)
+			, m_string(str ? uni_strdup(str) : NULL)
+			, m_status(m_string || !str ? OpStatus::OK : OpStatus::ERR_NO_MEMORY)
+		{
+		}
+
+		ComplicatedElement(const ComplicatedElement& elm)
+			: m_id(elm.m_id)
+			, m_string(elm.m_string ? uni_strdup(elm.m_string) : NULL)
+			, m_status(m_string || !elm.m_string ? OpStatus::OK : OpStatus::ERR_NO_MEMORY)
+		{
+		}
+
+		~ComplicatedElement()
+		{
+			op_free(m_string);
+		}
+
+		bool operator==(const ComplicatedElement& elm)
+		{
+			return m_status == elm.m_status && m_id == elm.m_id
+				&& ((m_string == NULL) == (elm.m_string == NULL))
+				&& (m_string == NULL || uni_str_eq(m_string, elm.m_string));
+		}
+
+		bool operator!=(const ComplicatedElement& elm)
+		{
+			return !this->operator==(elm);
+		}
+
+		OP_STATUS GetStatus() const { return m_status; }
+		int GetId() const { return m_id; }
+		const uni_char* GetString() const { return m_string; }
+
+	private:
+		const int m_id;
+		uni_char* const m_string;
+		const OP_STATUS m_status;
+	};
+}
+
+/**
+ * Test that the ComplicatedElement component itself is working properly.
+ */
+test("Complicated element")
+	leakcheck;
+{
+	const uni_char* str = UNI_L("doom");
+
+	ComplicatedElement a(1337, str);
+	verify_success(a.GetStatus());
+	verify(a.GetId() == 1337);
+	verify(a.GetString() != str);
+	verify(uni_str_eq(a.GetString(), str));
+
+	ComplicatedElement b(1337, str);
+	verify(a == b);
+
+	ComplicatedElement c(1338, str);
+	verify(a != c);
+
+	ComplicatedElement d(1337, NULL);
+	verify(a != d);
+
+	ComplicatedElement e(1337, NULL);
+	verify(d == e);
+}
+
+foreach (TYPE) from
+{
+	{int},
+	{unsigned int},
+	{short},
+	{bool},
+	{float},
+	{double},
+	{int*},
+	{float*},
+	{void*},
+	{VectorTestElement}
+}
+{
+	test("OtlVector<$(TYPE)>, construction")
+		leakcheck;
+	{
+		OtlVector<TYPE> v;
+		verify(v.GetCapacity() == 0);
+		verify(v.GetSize() == 0);
+	}
+}
+
+/**
+ * Check that the actual capacity is equal to the calculated expected
+ * capacity.
+ *
+ * This subtest calculates the expected capacity for a OtlVector by
+ * "simulating" its growth behavior. Then, it verifies that the
+ * calculated capacity is equal to the incoming 'capacity'.
+ *
+ * @param capacity The actual capacity of the OtlVector.
+ * @param size The size of the OtlVector.
+ * @param growth The growth factor of the OtlVector.
+ */
+subtest CheckCapacity(int capacity, int size, float growth)
+{
+	// Calculated capacity.
+	int cap = 0;
+
+	// Pretend to add 'size' elements.
+	for (int i = 0; i < size; ++i)
+	{
+		// Grow if we exceed the capacity.
+		if (i + 1 > cap)
+		{
+			// Calculate new capacity.
+			int nc = static_cast<int>(cap * growth);
+
+			// Always grow by at least one.
+			cap = nc > cap ? nc : cap + 1;
+		}
+	}
+
+	verify(cap == capacity);
+}
+
+subtest PushFive(OtlVector<int>& v)
+{
+	verify_success(v.PushBack(1));
+	verify_success(v.PushBack(2));
+	verify_success(v.PushBack(3));
+	verify_success(v.PushBack(4));
+	verify_success(v.PushBack(5));
+
+	verify(v.GetSize() == 5);
+	verify(CheckCapacity(v.GetCapacity(), 5, v.GetGrowthFactor()));
+
+	verify(v[0] == 1);
+	verify(v[1] == 2);
+	verify(v[2] == 3);
+	verify(v[3] == 4);
+	verify(v[4] == 5);
+}
+
+table GrowthFactors
+{
+	{1.001f, 1.001},
+	{static_cast<float>(op_sqrt(2)), 1.414},
+	{static_cast<float>(0.5 * (1 + op_sqrt(5.0))), 1.618},
+	{2.0f, 2},
+	{10.0f, 10},
+	{100.0f, 100},
+}
+
+foreach (GROWTH, DISPLAY) from GrowthFactors
+{
+
+	test("OtlVector<int>($(DISPLAY)), adding elements")
+		leakcheck;
+	{
+		OtlVector<int> v(GROWTH);
+		verify(v.GetGrowthFactor() == GROWTH);
+
+		verify_success(v.PushBack(1));
+		verify_success(v.PushBack(2));
+		verify_success(v.PushBack(3));
+		verify_success(v.PushBack(5));
+		verify_success(v.PushBack(7));
+
+		verify(v.GetSize() == 5);
+		verify(CheckCapacity(v.GetCapacity(), 5, GROWTH));
+
+		verify(v[0] == 1);
+		verify(v[1] == 2);
+		verify(v[2] == 3);
+		verify(v[3] == 5);
+		verify(v[4] == 7);
+	}
+
+	test("OtlVector<int>($(DISPLAY)), adding many elements")
+		leakcheck;
+	{
+		OtlVector<int> v(GROWTH);
+		verify(v.GetGrowthFactor() == GROWTH);
+
+		for (int i = 0; i < 1024; ++i)
+			verify_success(v.PushBack(i));
+
+		verify(v.GetSize() == 1024);
+		verify(CheckCapacity(v.GetCapacity(), 1024, GROWTH));
+
+		for (int i = 0; i < 1024; ++i)
+			verify(v[i] == i);
+	}
+
+	test("OtlVector<int>($(DISPLAY)), removing elements from back")
+		leakcheck;
+	{
+		OtlVector<int> v(GROWTH);
+		verify(v.GetGrowthFactor() == GROWTH);
+
+		verify_success(v.PushBack(1));
+		verify_success(v.PushBack(2));
+		verify_success(v.PushBack(3));
+		verify_success(v.PushBack(5));
+		verify_success(v.PushBack(7));
+
+		verify(v.GetSize() == 5);
+		verify(CheckCapacity(v.GetCapacity(), 5, GROWTH));
+
+		verify(v[0] == 1);
+		verify(v[1] == 2);
+		verify(v[2] == 3);
+		verify(v[3] == 5);
+		verify(v[4] == 7);
+
+		v.Erase(4);
+		verify(v.GetSize() == 4);
+		v.Erase(3);
+		verify(v.GetSize() == 3);
+		v.Erase(2);
+		verify(v.GetSize() == 2);
+		v.Erase(1);
+		verify(v.GetSize() == 1);
+		v.Erase(0);
+		verify(v.GetSize() == 0);
+
+		verify_success(v.Trim());
+		verify(v.GetCapacity() == 0);
+	}
+
+	test("OtlVector<int>($(DISPLAY)), removing middle elements")
+		leakcheck;
+	{
+		OtlVector<int> v(GROWTH);
+		verify(v.GetGrowthFactor() == GROWTH);
+
+		verify_success(v.PushBack(1));
+		verify_success(v.PushBack(2));
+		verify_success(v.PushBack(3));
+		verify_success(v.PushBack(5));
+		verify_success(v.PushBack(7));
+
+		verify(v.GetSize() == 5);
+		verify(CheckCapacity(v.GetCapacity(), v.GetSize(), GROWTH));
+
+		verify(v[0] == 1);
+		verify(v[1] == 2);
+		verify(v[2] == 3);
+		verify(v[3] == 5);
+		verify(v[4] == 7);
+
+		v.Erase(2);
+		verify(CheckCapacity(v.GetCapacity(), 5, GROWTH));
+
+		verify(v[0] == 1);
+		verify(v[1] == 2);
+		verify(v[2] == 5);
+		verify(v[3] == 7);
+	}
+
+	test("OtlVector<int>($(DISPLAY)), insert element in front")
+		leakcheck;
+	{
+		OtlVector<int> v(GROWTH);
+		verify(v.GetGrowthFactor() == GROWTH);
+
+		verify(PushFive(v));
+
+		verify_success(v.Insert(0, 1337));
+		verify(v.GetSize() == 6);
+		verify(CheckCapacity(v.GetCapacity(), v.GetSize(), GROWTH));
+		verify(v[0] == 1337);
+		verify(v[1] == 1);
+		verify(v[2] == 2);
+		verify(v[3] == 3);
+		verify(v[4] == 4);
+		verify(v[5] == 5);
+	}
+
+	test("OtlVector<int>($(DISPLAY)), insert element in back")
+		leakcheck;
+	{
+		OtlVector<int> v(GROWTH);
+		verify(v.GetGrowthFactor() == GROWTH);
+
+		verify(PushFive(v));
+
+		verify_success(v.Insert(5, 1337));
+		verify(v.GetSize() == 6);
+		verify(CheckCapacity(v.GetCapacity(), v.GetSize(), GROWTH));
+		verify(v[0] == 1);
+		verify(v[1] == 2);
+		verify(v[2] == 3);
+		verify(v[3] == 4);
+		verify(v[4] == 5);
+		verify(v[5] == 1337);
+	}
+
+	test("OtlVector<int>($(DISPLAY)), inserting element near front")
+		leakcheck;
+	{
+		OtlVector<int> v(GROWTH);
+		verify(v.GetGrowthFactor() == GROWTH);
+
+		verify(PushFive(v));
+
+		verify_success(v.Insert(1, 1337));
+		verify(v.GetSize() == 6);
+		verify(CheckCapacity(v.GetCapacity(), v.GetSize(), GROWTH));
+		verify(v[0] == 1);
+		verify(v[1] == 1337);
+		verify(v[2] == 2);
+		verify(v[3] == 3);
+		verify(v[4] == 4);
+		verify(v[5] == 5);
+	}
+
+	test("OtlVector<int>($(DISPLAY)), insert element near back")
+		leakcheck;
+	{
+		OtlVector<int> v(GROWTH);
+		verify(v.GetGrowthFactor() == GROWTH);
+
+		verify(PushFive(v));
+
+		verify_success(v.Insert(4, 1337));
+		verify(v.GetSize() == 6);
+		verify(CheckCapacity(v.GetCapacity(), v.GetSize(), GROWTH));
+		verify(v[0] == 1);
+		verify(v[1] == 2);
+		verify(v[2] == 3);
+		verify(v[3] == 4);
+		verify(v[4] == 1337);
+		verify(v[5] == 5);
+	}
+
+	test("OtlVector<int>($(DISPLAY)), insert element in the middle")
+		leakcheck;
+	{
+		OtlVector<int> v(GROWTH);
+		verify(v.GetGrowthFactor() == GROWTH);
+
+		verify(PushFive(v));
+
+		verify_success(v.Insert(3, 1337));
+		verify(v.GetSize() == 6);
+		verify(CheckCapacity(v.GetCapacity(), v.GetSize(), GROWTH));
+		verify(v[0] == 1);
+		verify(v[1] == 2);
+		verify(v[2] == 3);
+		verify(v[3] == 1337);
+		verify(v[4] == 4);
+		verify(v[5] == 5);
+	}
+
+	test("OtlVector<ComplicatedElement>($(DISPLAY)), deep copy")
+		leakcheck;
+	{
+		OtlVector<ComplicatedElement> v(GROWTH);
+		verify(v.GetGrowthFactor() == GROWTH);
+
+		ComplicatedElement a(1, UNI_L("Let's"));
+		ComplicatedElement b(2, UNI_L("kick"));
+		ComplicatedElement c(3, UNI_L("some"));
+		ComplicatedElement d(4, UNI_L("ICE!"));
+
+		verify_success(a.GetStatus());
+		verify_success(b.GetStatus());
+		verify_success(c.GetStatus());
+		verify_success(d.GetStatus());
+
+		verify_success(v.PushBack(a));
+		verify_success(v.PushBack(b));
+		verify_success(v.PushBack(c));
+		verify_success(v.PushBack(d));
+
+		verify(v.GetSize() == 4);
+		verify(CheckCapacity(v.GetCapacity(), v.GetSize(), GROWTH));
+		verify(v[0] == a);
+		verify(v[1] == b);
+		verify(v[2] == c);
+		verify(v[3] == d);
+	}
+
+} // foreach body
+
+test("OtlVector<int>, removing middle elements")
+	leakcheck;
+{
+	OtlVector<int> v(1.0);
+
+	verify(v.GetGrowthFactor() == 1.0);
+	verify_success(v.PushBack(1));
+	verify_success(v.PushBack(2));
+	verify_success(v.PushBack(3));
+	verify_success(v.PushBack(5));
+	verify_success(v.PushBack(7));
+
+	verify(v.GetSize() == 5);
+	verify(v.GetCapacity() == 5);
+
+	verify(v[0] == 1);
+	verify(v[1] == 2);
+	verify(v[2] == 3);
+	verify(v[3] == 5);
+	verify(v[4] == 7);
+
+	v.Erase(2);
+	verify(v.GetSize() == 4);
+	verify(v.GetCapacity() == 5);
+
+	verify(v[0] == 1);
+	verify(v[1] == 2);
+	verify(v[2] == 5);
+	verify(v[3] == 7);
+
+	v.Erase(0);
+	verify(v.GetSize() == 3);
+	verify(v.GetCapacity() == 5);
+
+	verify(v[0] == 2);
+	verify(v[1] == 5);
+	verify(v[2] == 7);
+}
+
+test("OtlVector<int>::Find")
+	leakcheck;
+{
+	OtlVector<int> v;
+
+	verify_success(v.PushBack(42));
+	verify_success(v.PushBack(1337));
+	verify_success(v.PushBack(1984));
+
+	// Missing items:
+	verify(v.Find(654987) == -1);
+	verify(v.Find(0) == -1);
+	verify(v.Find(-1) == -1);
+
+	// Present items:
+	verify(v.Find(1337) == 1);
+	verify(v.Find(1984) == 2);
+	verify(v.Find(42) == 0);
+}
+
+test("OtlVector<int>::Find from offset")
+	leakcheck;
+{
+	OtlVector<int> v;
+
+	verify_success(v.PushBack(42));
+	verify_success(v.PushBack(42));
+	verify_success(v.PushBack(43));
+	verify_success(v.PushBack(42));
+
+	// Present items:
+	verify(v.Find(42, 0) == 0);
+	verify(v.Find(42, 1) == 1);
+	verify(v.Find(42, 2) == 3);
+	verify(v.Find(42, 3) == 3);
+}
+
+test("OtlVector<int>::Reserve")
+	leakcheck;
+{
+	OtlVector<int> v(1);
+	verify(v.GetCapacity() == 0);
+	verify_success(v.Reserve(100));
+	verify(v.GetCapacity() == 100);
+
+	for (int i = 0; i < 100; ++i)
+		verify_success(v.PushBack(i));
+	verify(v.GetCapacity() == 100);
+}
+
+test("OtlVector<int>::IsEmpty")
+	leakcheck;
+{
+	OtlVector<int> v(2);
+	verify(v.IsEmpty());
+
+	verify_success(v.PushBack(1));
+	verify(!v.IsEmpty());
+
+	// Check across current allocation boundary.
+	verify_success(v.PushBack(2));
+	verify(!v.IsEmpty());
+	verify_success(v.PushBack(3));
+	verify(!v.IsEmpty());
+}
+
+test("OtlVector<int>::SetGrowthFactor")
+	leakcheck;
+{
+	OtlVector<int> v(1.0);
+	verify(v.GetGrowthFactor() == 1.0);
+	verify(v.GetCapacity() == 0);
+
+	verify_success(v.PushBack(1));
+	verify(v.GetCapacity() == 1);
+	verify_success(v.PushBack(2));
+	verify(v.GetCapacity() == 2);
+	verify_success(v.PushBack(3));
+	verify(v.GetCapacity() == 3);
+
+	v.SetGrowthFactor(2.0);
+	verify(v.GetGrowthFactor() == 2.0);
+
+	verify_success(v.PushBack(4));
+	verify(v.GetCapacity() == 6);
+	verify_success(v.PushBack(5));
+	verify(v.GetCapacity() == 6);
+	verify_success(v.PushBack(6));
+	verify(v.GetCapacity() == 6);
+	verify_success(v.PushBack(7));
+	verify(v.GetCapacity() == 12);
+}
+
+test("OtlVector<int>::Trim")
+	leakcheck;
+{
+	OtlVector<int> v(100.0);
+	verify(v.GetGrowthFactor() == 100.0);
+	verify(v.GetCapacity() == 0);
+
+	verify_success(v.PushBack(1));
+	verify_success(v.PushBack(2));
+	verify(v.GetCapacity() == 100);
+
+	v.Trim();
+	verify(v.GetCapacity() == 2);
+	verify(v.GetSize() == 2);
+}
+
+test("OtlVector<int>::EraseByValue")
+	leakcheck;
+{
+	OtlVector<int> v;
+
+	verify_success(v.PushBack(1));
+	verify_success(v.PushBack(2));
+	verify_success(v.PushBack(3));
+	verify_success(v.PushBack(5));
+	verify_success(v.PushBack(7));
+
+	verify_success(v.EraseByValue(1));
+	verify(v[0] == 2);
+	verify(v[1] == 3);
+	verify(v[2] == 5);
+	verify(v[3] == 7);
+
+	verify_success(v.EraseByValue(5));
+	verify(v[0] == 2);
+	verify(v[1] == 3);
+	verify(v[2] == 7);
+
+	verify_success(v.EraseByValue(7));
+	verify(v[0] == 2);
+	verify(v[1] == 3);
+
+	verify_success(v.EraseByValue(3));
+	verify(v[0] == 2);
+
+	verify_success(v.EraseByValue(2));
+	verify(v.IsEmpty());
+}
+
+test("OtlVector<int>::EraseByValue from offset")
+	leakcheck;
+{
+	OtlVector<int> v;
+
+	verify_success(v.PushBack(1));
+	verify_success(v.PushBack(42));
+	verify_success(v.PushBack(2));
+	verify_success(v.PushBack(42));
+	verify_success(v.PushBack(3));
+	verify_success(v.PushBack(42));
+
+	verify(v.GetSize() == 6);
+	verify(v[0] == 1);
+	verify(v[1] == 42);
+	verify(v[2] == 2);
+	verify(v[3] == 42);
+	verify(v[4] == 3);
+	verify(v[5] == 42);
+
+	verify_success(v.EraseByValue(42, 1));
+
+	verify(v.GetSize() == 5);
+	verify(v[0] == 1);
+	verify(v[1] == 2);
+	verify(v[2] == 42);
+	verify(v[3] == 3);
+	verify(v[4] == 42);
+
+	verify_success(v.EraseByValue(42, 1));
+
+	verify(v.GetSize() == 4);
+	verify(v[0] == 1);
+	verify(v[1] == 2);
+	verify(v[2] == 3);
+	verify(v[3] == 42);
+
+	verify_success(v.EraseByValue(42, 2));
+
+	verify(v.GetSize() == 3);
+	verify(v[0] == 1);
+	verify(v[1] == 2);
+	verify(v[2] == 3);
+}
+
+table vector_erase_offset(const char* test_name, int* init_values,
+	int erase_value, size_t erase_offset, OP_STATUS erase_status,
+	int* exp_values)
+{
+	{
+		/* Test name:         */ "skip values behind offset",
+		/* Initial values:    */ { 1, 42, 2, 42, 3, 42 },
+		/* Value to erase:    */ 42,
+		/* Erase from offset: */ 2,
+		/* Exp. erase status: */ OpStatus::OK,
+		/* Expected values:   */ { 1, 42, 2, 3, 42 }
+	},
+	{
+		/* Test name:         */ "offset > size",
+		/* Initial values:    */ { 1, 42, 2, 42, 3, 42 },
+		/* Value to erase:    */ 42,
+		/* Erase from offset: */ 17,
+		/* Exp. erase status: */ OpStatus::ERR,
+		/* Expected values:   */ { 1, 42, 2, 42, 3, 42 },
+	},
+	{
+		/* Test name:         */ "element not found",
+		/* Initial values:    */ { 1, 42, 2, 42, 3, 42 },
+		/* Value to erase:    */ 1984,
+		/* Erase from offset: */ 0,
+		/* Exp. erase status: */ OpStatus::ERR,
+		/* Expected values:   */ { 1, 42, 2, 42, 3, 42 },
+	}
+}
+
+foreach (test_name, init_values, erase_value, erase_offset, erase_status, exp_values)
+	from vector_erase_offset
+{
+	test("OtlVector<int>::EraseByValue: " test_name)
+		leakcheck;
+	{
+		OtlVector<int> v;
+
+		int init[] = init_values;
+
+		// Push initial data.
+		for (unsigned int i = 0; i < ARRAY_SIZE(init); ++i)
+			verify_success(v.PushBack(init[i]));
+
+		// Verify that the layout is as expected.
+		verify(v.GetSize() == ARRAY_SIZE(init));
+
+		for (unsigned int i = 0; i < ARRAY_SIZE(init); ++i)
+			verify(v[i] == init[i]);
+
+		// Erase one item, from the offset.
+		verify(v.EraseByValue(erase_value, erase_offset) == erase_status);
+
+		int exp[] = exp_values;
+
+		// Verify that the layout is as expected.
+		verify(v.GetSize() == ARRAY_SIZE(exp));
+
+		for (unsigned int i = 0; i < ARRAY_SIZE(exp); ++i)
+			verify(v[i] == exp[i]);
+	}
+}
+
+test("OtlVector<int>::PopBack")
+	leakcheck;
+{
+	OtlVector<int> v;
+
+	verify_success(v.PushBack(1));
+	verify_success(v.PushBack(2));
+	verify_success(v.PushBack(3));
+	verify_success(v.PushBack(5));
+	verify_success(v.PushBack(7));
+
+	v.PopBack();
+	verify(v[0] == 1);
+	verify(v[1] == 2);
+	verify(v[2] == 3);
+	verify(v[3] == 5);
+
+	v.PopBack();
+	verify(v[0] == 1);
+	verify(v[1] == 2);
+	verify(v[2] == 3);
+
+	v.PopBack();
+	verify(v[0] == 1);
+	verify(v[1] == 2);
+
+	v.PopBack();
+	verify(v[0] == 1);
+
+	v.PopBack();
+	verify(v.IsEmpty());
+}
+
+test("Verify that constructors/destructors are called")
+{
+	unsigned int count = 0;
+
+	OtlVector<VectorTestElement> v(10.0);
+
+	for (int i = 0; i < 10; ++i)
+		verify_success(v.PushBack(VectorTestElement(count)));
+
+	verify(count == 10);
+
+	for (int i = 9; i > 4; --i)
+		v.Erase(i);
+	verify(count == 5);
+
+	v.Clear();
+	verify(count == 0);
+}
+
+test("OtlVector<VectorTestElement>: Corruption test")
+{
+	unsigned int count = 0;
+
+	OtlVector<VectorTestElement> v;
+
+	for (int i = 0; i < 10; ++i)
+	{
+		verify_success(v.PushBack(VectorTestElement(count)));
+		verify((v[i].padding0 ^ 0xde) == 0);
+		verify((v[i].padding1 ^ 0xad) == 0);
+		verify((v[i].padding2 ^ 0xb00b) == 0);
+		verify((v[i].padding3 ^ 0xf00dface) == 0);
+	}
+}
+
+test("OtlVector<int>: Example code")
+	leakcheck;
+{
+	// Check that the main page example code actually works.
+
+	OtlVector<int> vector;
+
+	// Adding elements:
+	verify_success(vector.PushBack(13));
+	verify_success(vector.PushBack(37));
+	verify_success(vector.PushBack(42));
+
+	// Random access:
+	verify(vector[2] == 42);
+
+	// Iteration:
+	const int expected[] = { 13, 37, 42 };
+	for (size_t i = 0; i < vector.GetSize(); ++i)
+		verify(vector[i] == expected[i]);
+
+	// Removing elements:
+	vector.PopBack(); // Removes 42
+
+	for (size_t i = 0; i < vector.GetSize(); ++i)
+		verify(vector[i] == expected[i]);
+
+	vector.Clear(); // Removes all.
+
+	verify(vector.IsEmpty());
+}
+
+/**
+ * Check that a growing OtlVector of visits a certain sequence of
+ * capacities.
+ *
+ * This subtest creates a OtlVector, and adds 'size' number elements
+ * to the OtlVector. Each time the OtlVector grows, the subtest verifies
+ * that the new capacity is equal to the next element in the specified
+ * array of capacities.
+ *
+ * @param growth The growth factor.
+ * @param size The number of elements to push to the OtlVector.
+ * @param capacities Array of capacities the OtlVector must "visit".
+ */
+subtest CheckGrowth(float growth, size_t size, const int* capacities)
+{
+	OtlVector<int> v(growth);
+
+	const int* c = capacities;
+
+	do
+	{
+		// Before adding the item, verify that the capacity is expected.
+		verify(v.GetCapacity() == (size_t)*c);
+
+		verify_success(v.PushBack(1337));
+
+		// If the OtlVector grew, we have a new expected capacity.
+		if (v.GetSize() > static_cast<size_t>(*c))
+			c++;
+
+	} while (v.GetSize() < size && *c != -1);
+
+	// This effectively verifies that 'capacities' was not too short.
+	verify(v.GetSize() == size);
+}
+
+test("OtlVector<int>(1.5f): Growth")
+	leakcheck;
+{
+	const int capacities[] = {
+		0,
+		1,
+		2,
+		3,
+		4,
+		6,
+		9,
+		13,
+		19,
+		28,
+		42,
+		63,
+		94,
+		141,
+		211,
+		316,
+		474,
+		711,
+		1066,
+		1599,
+		2398,
+		3597,
+		5395,
+		8092,
+		12138,
+		-1
+	};
+
+	verify(CheckGrowth(1.5f, 10000, capacities));
+}
+
+test("OtlVector<int>(2.0f): Growth")
+	leakcheck;
+{
+	const int capacities[] = {
+		0,
+		1,
+		2,
+		4,
+		8,
+		16,
+		32,
+		64,
+		128,
+		256,
+		512,
+		1024,
+		2048,
+		4096,
+		8192,
+		16384,
+		-1
+	};
+
+	verify(CheckGrowth(2.0f, 10000, capacities));
+}
+
+test("OtlVector<int>(9.0f): Growth")
+	leakcheck;
+{
+	const int capacities[] = {
+		0,
+		1,
+		9,
+		81,
+		729,
+		6561,
+		59049,
+		-1
+	};
+
+	verify(CheckGrowth(9.0f, 10000, capacities));
+}
+
+test("OtlVector<int>(1.0f): Growth")
+	leakcheck;
+{
+	OtlVector<int> v(1.0f);
+
+	for (int i = 0; i < 100; ++i)
+	{
+		verify(v.GetCapacity() == (size_t)i);
+		verify_success(v.PushBack(i));
+	}
+}

@@ -1,0 +1,573 @@
+/* -*- Mode: c++; tab-width: 4; indent-tabs-mode: t; c-basic-offset: 4 -*-
+ *
+ * Copyright (C) 2009 Opera Software AS.  All rights reserved.
+ *
+ * This file is part of the Opera web browser.
+ * It may not be distributed under any circumstances.
+ */
+
+group "database.opdatabase";
+
+require init;
+require SUPPORT_DATABASE_INTERNAL;
+
+language c++;
+
+include "modules/database/opdatabase.h";
+include "modules/sqlite/sqlite3.h";
+
+global
+{
+	static BOOL _verify(BOOL b, const char *msg, unsigned line_number) {
+		if(!b) {
+			char buf[1000]={0}; /* ARRAY OK 2009-04-15 joaoe */
+			op_snprintf(buf,999,"\b\b\b%d: %s should be true", line_number, msg);
+			ST_failed(buf);
+		}
+		return b;
+	}
+
+	static BOOL _verify(const void* p, const char *msg, unsigned line_number)
+	{
+		return _verify(p != NULL, msg, line_number);
+	}
+
+#undef verify
+#undef verify_success
+#undef verify_not_oom
+#define verify(b) do{if(!_verify(b,#b, __LINE__)) return OpStatus::ERR;}while(0)
+#define verify_not_oom(b) do{if(!_verify(b != NULL,#b, __LINE__)) return OpStatus::ERR_NO_MEMORY;}while(0)
+#define verify_success(b) do{OP_STATUS s=(b);if(!_verify(!OpStatus::IsError(s),#b, __LINE__)) return s;}while(0)
+
+#undef SELFTEST_URLCTXID
+#define SELFTEST_URLCTXID 0
+#undef WEBDB_SELFTEST_ORIGIN
+#define WEBDB_SELFTEST_ORIGIN UNI_L("http://opera.selftest")
+
+#undef SQL_WRAP
+#define SQL_WRAP(s) SqlText(SqlText::CONST_16BIT, UNI_L(s), sizeof(s) - 1)
+
+	PS_Manager *ps_manager;
+	SqlTransaction* transaction;
+
+	OP_STATUS GetTestDB(AutoReleaseWSDDatabasePtr& db)
+	{
+		PS_Object* ps_obj;
+		RETURN_IF_ERROR(ps_manager->GetObject(PS_ObjectTypes::KWebDatabases, WEBDB_SELFTEST_ORIGIN, UNI_L("name"), FALSE, SELFTEST_URLCTXID, &ps_obj));
+		db = static_cast<WSD_Database*>(ps_obj);
+		return OpStatus::OK;
+	}
+
+	class SqlCallback : public SqlStatement::Callback
+	{
+	public:
+		SqlCallback() : m_last_insert_id(0), m_rows_affected(0), m_error(OpStatus::OK), m_error_message(NULL) {}
+
+		~SqlCallback()
+		{
+			Reset();
+		}
+		virtual OP_STATUS HandleCallback(SqlResultSet * result_set) {
+			OP_STATUS status = HandleCallbackCustom(result_set);
+			OP_DELETE(result_set);
+			return status;
+		}
+		virtual Window*      GetWindow() { return g_selftest.utils->GetWindow(); }
+		virtual OpFileLength GetPreferredSize() { return 0; }
+		const uni_char*      GetDisplayName() { return NULL; }
+
+		OpString* OpString_Construct(const uni_char *s)
+		{
+			OpString *o = OP_NEW(OpString,());
+			if (o != NULL && OpStatus::IsSuccess(o->Set(s)))
+				return o;
+			OP_DELETE(o);
+			return o;
+		}
+		OP_STATUS HandleCallbackCustom(SqlResultSet *result_set)
+		{
+			OP_STATUS status = OpStatus::OK;
+			verify(result_set);
+
+			if (result_set->IsIterable())
+			{
+				for (unsigned i = 0, lim = result_set->GetColumnCount(); i < lim; i++)
+				{
+					const uni_char *name;
+					verify(result_set->GetColumnName(i,&name));
+					OpString* ops_name = OpString_Construct(name);
+					verify_not_oom(ops_name);
+					ANCHOR_PTR(OpString, ops_name);
+					verify_success(m_columns.Add(ops_name));
+					ANCHOR_PTR_RELEASE(ops_name);
+				}
+				verify(!result_set->IsInterruptable());
+				BOOL has_data = FALSE;
+				while(1)
+				{
+					TRAP(status, has_data = result_set->StepL());
+					verify_success(status);
+					if (!has_data)
+						break;
+
+					for(unsigned k = 0, lim = result_set->GetColumnCount(); k < lim; k++)
+					{
+						SqlValue *value = OP_NEW(SqlValue,());
+						verify_not_oom(value);
+						ANCHOR_PTR(SqlValue, value);
+						verify_success(result_set->GetValueAtIndex(k, value));
+						verify_success(m_values.Add(value));
+						ANCHOR_PTR_RELEASE(value);
+					}
+				};
+			}
+			else
+			{
+				m_last_insert_id = result_set->LastInsertId();
+				m_rows_affected = result_set->GetRowsAffected();
+			}
+
+			return OpStatus::OK;
+		}
+
+		void Reset()
+		{
+			m_columns.DeleteAll();
+			m_values.DeleteAll();
+			m_last_insert_id = 0;
+			m_rows_affected = 0;
+			OP_DELETEA(const_cast<uni_char*>(m_error_message));
+			m_error_message = NULL;
+		}
+
+		virtual OP_STATUS HandleError(OP_STATUS error, const uni_char* error_message, BOOL is_fatal)
+		{
+			OP_ASSERT(m_error_message == NULL);
+			m_error = error;
+			m_error_message = error_message;
+			return OpStatus::OK;
+		}
+
+		const uni_char* ColNameAt(unsigned idx)
+		{
+			return idx < (unsigned)m_columns.GetCount() ? m_columns.Get(idx)->CStr() : NULL;
+		}
+
+		//object allocated on stack so it will not delete itself
+		virtual void Discard() {}
+
+		OpVector<OpString> m_columns;
+		OpVector<SqlValue> m_values;
+		sqlite_rowid_t m_last_insert_id;
+		unsigned m_rows_affected;
+		OP_STATUS m_error;
+		const uni_char* m_error_message;
+		TempBuffer m_buffer;
+	};
+
+#undef verify
+	OP_STATUS status;
+}
+
+setup
+{
+	DATABASE_MODULE_ADD_CONTEXT(0, OPFILE_PERSISTENT_STORAGE_FOLDER);
+}
+
+test("manager setup")
+{
+	verify_not_oom(ps_manager = PS_Manager::NewForSelfTest());
+	transaction = NULL;
+}
+
+test("Empty query")
+{
+	AutoReleaseWSDDatabasePtr db;
+
+	verify_success(GetTestDB(db));
+	verify(db != NULL);
+	transaction = db->CreateTransactionSync(FALSE);
+
+	//test an empty select
+	verify_status(PS_Status::ERR_BAD_QUERY, transaction->ExecuteSql(SQL_WRAP(""), 0));
+}
+finally
+{
+	if (transaction != NULL)
+		OpStatus::Ignore(transaction->Release());
+	transaction = NULL;
+}
+
+test("Simple query")
+{
+	AutoReleaseWSDDatabasePtr db;
+	SqlCallback cb;
+
+	verify_success(GetTestDB(db));
+	verify(db != NULL);
+	transaction = db->CreateTransactionSync(FALSE);
+
+	//test an empty select
+	verify_success(transaction->ExecuteSql(SQL_WRAP("select 3, 2, 1, 0"), NULL, &cb));
+
+	verify(cb.m_columns.GetCount() == 4);
+	verify_string(cb.ColNameAt(0), UNI_L("3"));
+	verify_string(cb.ColNameAt(1), UNI_L("2"));
+	verify_string(cb.ColNameAt(2), UNI_L("1"));
+	verify_string(cb.ColNameAt(3), UNI_L("0"));
+
+	verify(cb.m_values.GetCount() == 4);
+	verify(cb.m_values.Get(0)->Type() == SqlValue::TYPE_INTEGER);
+	verify(cb.m_values.Get(0)->IntegerValue() == 3);
+	verify(cb.m_values.Get(1)->Type() == SqlValue::TYPE_INTEGER);
+	verify(cb.m_values.Get(1)->IntegerValue() == 2);
+	verify(cb.m_values.Get(2)->Type() == SqlValue::TYPE_INTEGER);
+	verify(cb.m_values.Get(2)->IntegerValue() == 1);
+	verify(cb.m_values.Get(3)->Type() == SqlValue::TYPE_INTEGER);
+	verify(cb.m_values.Get(3)->IntegerValue() == 0);
+}
+finally
+{
+	if (transaction != NULL)
+		OpStatus::Ignore(transaction->Release());
+	transaction = NULL;
+}
+
+test("Bad args")
+{
+	AutoReleaseWSDDatabasePtr db;
+	SqlValueList *params;
+
+	verify_success(GetTestDB(db));
+	verify(db != NULL);
+	transaction = db->CreateTransactionSync(FALSE);
+
+	{
+		verify_not_oom(params = SqlValueList::Make(2));
+		params->values[0].SetInteger(1);
+		params->values[1].SetInteger(2);
+
+		verify_status(PS_Status::ERR_BAD_BIND_PARAMETERS, transaction->ExecuteSql(SQL_WRAP("select ?"), params));
+	}
+	{
+		verify_not_oom(params = SqlValueList::Make(1));
+		params->values[0].SetInteger(1);
+
+		verify_success(transaction->ExecuteSql(SQL_WRAP("select ?"), params));
+	}
+
+	verify_status(PS_Status::ERR_BAD_BIND_PARAMETERS, transaction->ExecuteSql(SQL_WRAP("select ?"), NULL));
+
+}
+finally
+{
+	if (transaction != NULL)
+		OpStatus::Ignore(transaction->Release());
+	transaction = NULL;
+}
+
+
+test("Create, insert with parameters, select")
+{
+	AutoReleaseWSDDatabasePtr db;
+	SqlCallback cb;
+	SqlValueList *params;
+
+	verify_success(GetTestDB(db));
+	verify(db != NULL);
+	transaction = db->CreateTransactionSync(FALSE);
+
+	// create the table
+	verify_success(transaction->ExecuteSql(SQL_WRAP("create table t (id INTEGER PRIMARY KEY, data);")));
+
+	//test an empty select
+	verify_success(transaction->ExecuteSql(SQL_WRAP("select * from t"), NULL, &cb));
+	//verify(cb.m_columns.GetCount() == 2);//sqlite limitation
+	verify(cb.m_values.GetCount() == 0);
+
+	// insert a row
+	{
+		verify_not_oom(params = SqlValueList::Make(1));
+		OpAutoPtr<SqlValueList> params_ptr(params);
+		verify_success(params->values[0].SetString(UNI_L("AA"), 2));
+		params_ptr.release();
+
+		verify_success(transaction->ExecuteSql(SQL_WRAP("insert into t (data) values (?);"), params));
+
+	}
+	{
+		verify_not_oom(params = SqlValueList::Make(1));
+		params->values[0].SetInteger(9999);
+
+		verify_success(transaction->ExecuteSql(SQL_WRAP("insert into t (data) values (?);"), params));
+	}
+	// get the values
+	verify_success(transaction->ExecuteSql(SQL_WRAP("select * from t"), NULL, &cb));
+
+	verify(cb.m_columns.GetCount() == 2);
+	verify_string(cb.ColNameAt(0), UNI_L("id"));
+	verify_string(cb.ColNameAt(1), UNI_L("data"));
+
+	verify(cb.m_values.GetCount() == 4);
+	verify(cb.m_values.Get(1)->Type() == SqlValue::TYPE_STRING);
+	verify(cb.m_values.Get(3)->Type() == SqlValue::TYPE_INTEGER);
+	verify_string(cb.m_values.Get(1)->StringValue(), UNI_L("AA"));
+	verify(cb.m_values.Get(3)->IntegerValue() == 9999);
+
+	status = transaction->Release();
+	transaction = NULL;
+	verify_success(status);
+}
+finally
+{
+	if (transaction != NULL)
+		OpStatus::Ignore(transaction->Release());
+	transaction = NULL;
+}
+
+
+test("Last insert id and rows affected")
+{
+	AutoReleaseWSDDatabasePtr db;
+
+	verify_success(GetTestDB(db));
+	verify(db != NULL);
+	transaction = db->CreateTransactionSync(FALSE);
+
+	// create the table
+	verify_success(transaction->ExecuteSql(SQL_WRAP("create table t (id INTEGER PRIMARY KEY AUTOINCREMENT, data);")));
+
+	// insert a row
+	SqlCallback cb;
+	verify_success(transaction->ExecuteSql(SQL_WRAP("insert into t (data) values ('A');"), NULL, &cb));
+
+	/* sqlite's last_insert_id is not exactly predictable, under normal circumstances
+	 * this should work fine, but if the verify fails it doesn't necessarily mean there's something
+	 * wrong. */
+	verify(cb.m_last_insert_id == 1);
+	verify(cb.m_rows_affected == 1);
+	cb.Reset();
+
+	verify_success(transaction->ExecuteSql(SQL_WRAP("insert into t (data) values ('B');"), NULL, &cb));
+
+	verify(cb.m_last_insert_id == 2);
+	verify(cb.m_rows_affected == 1);
+	cb.Reset();
+
+	verify_success(transaction->ExecuteSql(SQL_WRAP("update t set data = 'C';"), NULL, &cb));
+	verify(cb.m_rows_affected == 2);
+
+	status = transaction->Release();
+	transaction = NULL;
+	verify_success(status);
+}
+finally
+{
+	if (transaction != NULL)
+		OpStatus::Ignore(transaction->Release());
+	transaction = NULL;
+}
+
+test("Too many parameters error")
+{
+	AutoReleaseWSDDatabasePtr db;
+	SqlCallback ecb;
+	SqlValueList *params;
+
+	verify_success(GetTestDB(db));
+	verify(db != NULL);
+	transaction = db->CreateTransactionSync(FALSE);
+
+	// create the table
+	verify_success(transaction->ExecuteSql(SQL_WRAP("create table t (id INTEGER PRIMARY KEY, data);")));
+
+	verify_not_oom(params = SqlValueList::Make(2));
+	OpAutoPtr<SqlValueList> params_ptr(params);
+	verify_success(params->values[0].SetString(UNI_L("AA"), 2));
+	verify_success(params->values[1].SetString(UNI_L("BB"), 2));
+	params_ptr.release();
+
+	OP_STATUS status = transaction->ExecuteSql(SQL_WRAP("insert into t (data) values (?);"), params, &ecb);
+	verify_status(PS_Status::ERR_BAD_BIND_PARAMETERS, status);
+	verify_status(PS_Status::ERR_BAD_BIND_PARAMETERS, ecb.m_error);
+
+	status = transaction->Release();
+	transaction = NULL;
+	verify_success(status);
+}
+finally
+{
+	if (transaction != NULL)
+		OpStatus::Ignore(transaction->Release());
+	transaction = NULL;
+}
+
+test("Read-only transaction")
+{
+	AutoReleaseWSDDatabasePtr db;
+
+	verify_success(GetTestDB(db));
+	verify(db != NULL);
+	transaction = db->CreateTransactionSync(TRUE);
+
+	SqlCallback ecb;
+	// create the table
+	OP_STATUS status = transaction->ExecuteSql(SQL_WRAP("create table t (id INTEGER PRIMARY KEY, data);"), NULL, &ecb);
+	verify_status(PS_Status::ERR_READ_ONLY, status);
+
+	status = transaction->Release();
+	transaction = NULL;
+	verify_success(status);
+}
+finally
+{
+	if (transaction != NULL)
+		OpStatus::Ignore(transaction->Release());
+	transaction = NULL;
+}
+
+test("Error callback -- bad sql")
+{
+	AutoReleaseWSDDatabasePtr db;
+
+	verify_success(GetTestDB(db));
+	verify(db != NULL);
+	transaction = db->CreateTransactionSync(FALSE);
+
+	SqlCallback ecb;
+	// create the table
+	verify_status(PS_Status::ERR_BAD_QUERY, transaction->ExecuteSql(SQL_WRAP("creat able t (id INTEGER PRIMARY KEY, data);"), NULL, &ecb));
+
+	status = transaction->Release();
+	transaction = NULL;
+	verify_success(status);
+}
+finally
+{
+	if (transaction != NULL)
+		OpStatus::Ignore(transaction->Release());
+	transaction = NULL;
+}
+
+test("Big ints")
+require HAVE_INT64;
+{
+	AutoReleaseWSDDatabasePtr db;
+	SqlCallback ecb;
+	SqlValueList *params;
+
+	verify_success(GetTestDB(db));
+	verify(db != NULL);
+	transaction = db->CreateTransactionSync(TRUE);
+
+	// Test 1. reading values properly from SQLite.
+	verify_success(transaction->ExecuteSql(SQL_WRAP("select 9223372036854775807 a, -9223372036854775808 b"), NULL, &ecb));
+
+	verify(ecb.m_values.GetCount() == 2);
+	verify(ecb.m_values.Get(0)->Type() == SqlValue::TYPE_INTEGER);
+	verify(ecb.m_values.Get(1)->Type() == SqlValue::TYPE_INTEGER);
+	verify(ecb.m_values.Get(0)->IntegerValue() == INT64_MAX);
+	verify(ecb.m_values.Get(1)->IntegerValue() == INT64_MIN);
+
+	ecb.Reset();
+
+	// Test 2. assigning values properly bound to the query.
+	verify_not_oom(params = SqlValueList::Make(2));
+	params->values[0].SetInteger(INT64_MAX);
+	params->values[1].SetInteger(INT64_MIN);
+
+	verify_success(transaction->ExecuteSql(SQL_WRAP("select ? a, ? b"), params, &ecb));
+
+	verify(ecb.m_values.GetCount() == 2);
+	verify(ecb.m_values.Get(0)->Type() == SqlValue::TYPE_INTEGER);
+	verify(ecb.m_values.Get(1)->Type() == SqlValue::TYPE_INTEGER);
+	verify(ecb.m_values.Get(0)->IntegerValue() == INT64_MAX);
+	verify(ecb.m_values.Get(1)->IntegerValue() == INT64_MIN);
+
+	ecb.Reset();
+
+	// Test 3. really big numbers use doubles, the number is INT64_MAX * 100
+	verify_success(transaction->ExecuteSql(SQL_WRAP("select 922337203685477580700 a"), NULL, &ecb));
+
+	verify(ecb.m_values.GetCount() == 1);
+	verify(ecb.m_values.Get(0)->Type() == SqlValue::TYPE_DOUBLE);
+	double int64_max_d = static_cast<double>(INT64_MAX);
+	verify(ecb.m_values.Get(0)->DoubleValue() > int64_max_d);
+
+	status = transaction->Release();
+	transaction = NULL;
+	verify_success(status);
+}
+finally
+{
+	if (transaction != NULL)
+		OpStatus::Ignore(transaction->Release());
+	transaction = NULL;
+}
+
+test("data file optimizations")
+{
+	AutoReleaseWSDDatabasePtr db;
+
+	{
+		// If the manager is a selftest instance or the database is memory only then the
+		// code will bypass what this test wants to check.
+		PS_Object* opdb = NULL;
+		verify_success(ps_manager->GetObject(PS_ObjectTypes::KWebDatabases,WEBDB_SELFTEST_ORIGIN,UNI_L("name"),TRUE,SELFTEST_URLCTXID,&opdb));
+		verify(opdb != NULL);
+		db = static_cast<WSD_Database*>(opdb);
+	}
+
+	transaction = db->CreateTransactionSync(FALSE);
+
+	verify(db->GetIndexEntry()->GetFileNameObj() == NULL);
+
+	SqlCallback ecb;
+	// create the table
+	verify_success(transaction->ExecuteSql(SQL_WRAP("create table t (id INTEGER PRIMARY KEY, data);"), NULL, &ecb));
+
+	verify(db->GetIndexEntry()->GetFileNameObj() != NULL);
+
+	verify_success(transaction->ExecuteSql(SQL_WRAP("drop table t;"), NULL, &ecb));
+
+	unsigned object_count;
+	verify_success(transaction->GetObjectCount(&object_count));
+	verify(object_count == 0);
+
+	verify(transaction->IsSingleTransaction());
+
+	status = transaction->Release();
+	transaction = NULL;
+	verify_success(status);
+
+	verify(db->GetIndexEntry()->GetRefCount() == 1);
+
+	db.Set(NULL);
+
+	{
+		//if the manager is a selftest instance or the database is memory only then the
+		//code will bypass what this test wants to check
+		PS_Object* opdb = NULL;
+		verify_success(ps_manager->GetObject(PS_ObjectTypes::KWebDatabases,WEBDB_SELFTEST_ORIGIN,UNI_L("name"),TRUE,SELFTEST_URLCTXID,&opdb));
+		verify(opdb != NULL);
+		db = static_cast<WSD_Database*>(opdb);
+	}
+
+	//no objects means that the data file will be deleted
+	verify(db->GetIndexEntry()->GetFileNameObj() == NULL);
+}
+finally
+{
+	//tag for later deletion
+	db->GetIndexEntry()->Delete();
+
+	if (transaction != NULL)
+		OpStatus::Ignore(transaction->Release());
+	transaction = NULL;
+}
+
+exit
+{
+	//TRAP(status,ps_manager->DumpIndexL(UNI_L("Exit")));
+	OP_DELETE(ps_manager);
+}

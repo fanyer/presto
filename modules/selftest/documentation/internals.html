@@ -1,0 +1,340 @@
+<!DOCTYPE HTML PUBLIC "-//IETF//DTD HTML//EN">
+<html>
+<head>
+<meta http-equiv="content-type" content="text/html; charset=iso-8859-1">
+<link rel=stylesheet href="manual_style.css">
+<style>
+where {
+  display: block;
+  margin-left: 10px;
+  margin-right: 10px; 
+  font-size: smaller;
+  margin-top: 5px;
+};
+
+</style>
+
+<title>The internals of the selftest system</title>
+</head>
+<body>
+<h1>The internals of the selftest system</h1>
+
+This currently very unstructured and messy document describes the
+internal workings of the selftest system, both the parser/compiler and
+the runtime.
+
+<h1>The runtime</h1>
+
+
+<h2>Initializing and running the testsuite</h2>
+
+<h3>TestSuite::main( int *argc, char *argv[] )</h3>
+
+This function should be called just after opera has been initialized,
+usually from <tt>main</tt>, <tt>WinMain</tt> or equivalent function.
+<p>
+It parses test-suite specific arguments.
+</p>
+<p>If <tt>now</tt> is supplied as part of one of them, it runs all tests
+that does not require initialization and then tries to exit opera. In
+that case this function will not return.</p>
+
+
+<p>If there is a test argument, but no
+<tt>now</tt> part, a flag is set, the testsuite arguments are removed
+from argv, and argc is decremented to match.</p>
+
+<h3>void TestSuite::run( )</h3>
+
+<p>This function should be called when opera has been fully
+initialized, just before the messageloop is entered.</p>
+
+<p>If the testsuite is to be run, this function will send a message to
+itself that causes the TestSuite::step() function to be called.</p>
+
+
+<h3>void TestSuite::step()</h3>
+
+This function is called from the message handler in opera. 
+
+<p>It runs one step of the testsuite, which basically means that it
+runs the current test, or a part of the current test if it uses delay, or requires a
+document and no window with a document is available.
+</p>
+
+<h2>Testsuite structure</h2>
+
+This information is totally useless unless you plan to change how the testsuite works.
+
+<p>
+Each testgroup is internally represented as a class implementing the TestGroup interface.
+
+<pre>
+class TestGroup
+{
+protected:
+	int TS_next_test;
+	int TS_skip_group;
+
+public:
+	virtual int TS_step() = 0;
+	virtual TestGroup *TS_next() = 0;
+	virtual void TS_init() = 0;
+	virtual void TS_exit() = 0;
+};
+</pre>
+The very first time TestSuite::step is called it creates an instance of the
+first testgroup, and calls TS_init in it.
+<p>
+The rest of the time it keeps calling TS_step in the current testgroup
+until it returns 0, then it calls TS_exit() in the current group, then
+TS_next() to get the next group, and if it did get a new group it
+calls TS_init() in it and sets it as the current group, and deletes
+the old group.</p>
+
+<p>If there are no more groups TestSuite::step prints a summary of the
+testresults and returns 0, signaling that the message loop should
+exit. This is currently done in mhpi.cpp by calling exit()
+directly.</p>
+
+<p>If TestSuite::step() returns 1, mhpi.cpp immediately posts a new
+MSG_TESTSUITE_STEP message, which will cause it to call step() again,
+if any other number is returned mhpi.cpp will simply return, this is
+used to implement asynchronous tests, they will post a
+MSG_TESTSUITE_STEP message once they are done.
+
+<tt>html</tt>, <tt>ecmascript</tt> and <tt>manual</tt> tests are always asynchronous</p>
+
+<h1>The parser</h1>
+
+The parser is a program written in <a
+href='http://pike.ida.liu.se/'>Pike</a> that locates all files with an
+extension <tt>.ot</tt> in the source directories, parses them and then
+generates a C++-file using a template file.
+
+<h1>Locating source files</h1>
+
+The program starts by recursively locating all files with a name that
+ends with <tt>.ot</tt> but does not start with <tt>.</tt>. It then parses each file
+in the order they were located (the order is, however, largely
+irrelevant).
+
+<h1>Parsing</h1>
+
+<img src='selftest_parser.png' align=right>
+
+
+<h2>Tokenization</h2>
+
+The first pass of the parsing is a simple tokenization of the input
+data, done using the Parser.Pike module in pike. This is only done if
+the .ot-file has changed since last time it was parsed. Since pike
+allows all tokens that are allowed in C++, this works surprisingly
+well.
+
+<p>
+Each token-object is annotaded with the filename and the linenumber where it was found.
+</p>
+
+<where>This code is imported from the pike runtime library, see the 
+directory &lt;pikedir&gt;/lib/modules/Parser.pmod/, files Pike.pmod and C.pmod</where>
+
+<h2>Building the tree</h2> 
+
+The tokens are then grouped in such a way that lists ({}, (), [] etc)
+are grouped, recursively, into a single node, with subnodes
+representing each element in the list. This is done since it greatly
+simplifies the other passes.
+
+<where>This code recides in the function <tt>group()</tt> in NodeUtil.pmod</where>
+
+<h2>String comments</h2>
+
+Then the parsetree is recursively searched to locate all 
+"string comments", that is, comments on the form <tt>//! &lt;text here&gt;</tt>
+which are converted to strings (in this case the string <tt>"&lt;text here&gt\n"</tt>)
+
+<where>Look no further than parse_tests.pike convert_special_comments</where>
+
+<h2>Comment removal</h2>
+
+Then all comments are removed
+<where>This one is in NodeUtil.pmod remove_comments</where>
+
+<p>After this stage the parsed tokens are serialized and saved to disk
+in a cache-file.</p>
+
+
+<h2>Table, foreach and friends</h2>
+
+After the grouping and stringification, the code is run through a
+multi-pass parser that handles the <tt>table</tt>, <tt>foreach</tt> and <tt>iterate</tt>
+keywords. It also search for classnames the be used for the
+transformation of the global secion.
+
+<p>
+The preprocessor is run once for each time a foreach or iterate is
+expanded in the parsetree, to allow foreach and iterate inside other
+foreach and iterate.
+</p>
+
+<p>tables are removed from the tree completely, and added to a global
+list of tables</p>
+
+<p>foreach is expanded by looping over the table, and then duplicating
+the nodes in the foreach block once for each loop, with the
+identifiers used in the foreach statement replaced with the values for
+the current table row, and the special syntax <tt>$(identifier)</tt> replaced
+anywhere (inside any other tokens) with the same value.
+
+<p>iterate() is basically replaced with a for loop, and as a
+side-effect sets a flag in the table that causes it to be included it
+in the generated C++-code.</p>
+
+<where>The main code can be found in the function preprocess in
+parse_tests.pike</where>
+
+<where>The token replacement code for foreach can be found in the
+NodeUtil.pmod::replace_identifier and NodeUtil.pmod::replace_macro
+functions.</where>
+
+<h2>Parsing the tree</h2>
+
+The top-level of the parsetree is then parsed to locate all other
+things handled by the selftest system, such as tests, group
+definitions, include statements etc. See the <a
+href=manual.html>manual</a> for a list of the supported keywords.
+
+<p> Once a test or group has been located, a new Group or Test object
+is created, the latter added to the list of tests in the current
+group, and the group added to a toplevel list of groups.
+
+<where>This code can be found in parse_tests.pike::parse_file (the
+while(1) loop). This function is also where the calls the passes above
+recides</where>
+
+
+<h1>Transformations</h1>
+
+The transformations are mainly performed when code is added to the
+test or group (as in the case of <tt>verify</tt> or the global section)
+
+<h2>Global section</h2>
+
+<h3>Moving definitions of class methods</h3>
+<p>
+Move out all TYPE ClassName::FunctionName( TYPE ) { } blocks to the
+toplevel scope, to be compatible with booth vc++ and gcc.
+</p>
+<p>
+In the process the ClassName has to be fixed to include the
+classname of the testgroup class.
+</p>
+<where>parse_tests.pike::recursively_fix_class_names</where>
+
+
+<h3>Rewriting toplevel variables with initialization assignments</h3>
+
+Code such as <tt>int q = 10;</tt> cannot be included directly in the
+global section, since each testgroup is converted to a class, and that
+kind of variable initialization is not allowed for class-local
+variables.
+
+<p>
+They are thus moved to the <tt>init</tt> section (thus basically is
+moved to the constructor of the class).
+
+<where>The function parse_tests.pike::move_initializers</where>
+
+<h3>Locating and moving extern declarations and defines</h3>
+
+
+All <tt>#define</tt> directives and <tt>extern</tt> declarations are moved to the
+start of the test-group, to make it possible to use them in the tests.
+
+<h2>Test sections</h2>
+
+<h3>verify</h3>
+
+
+<h1>Code generation</h1>
+
+<h2>Not up to date</h2>
+
+<h2>The template file</h2>
+
+A file named <tt>template.cpp</tt> is read. In this file the following
+strings (Note: not identifiers this time, this is a low-level replace
+without parsing) are replaced:
+
+<h3>__YEAR__</h3>
+
+The year when the file was generated. This is used to update the
+copyright header in the template file, e.g.: "Copyright (C)
+2002-__YEAR__ Opera Software AS"
+
+<h3>__TESTS__</h3>
+
+All the classes that makes up the test-groups, and in them all that
+methods that make make up the tests, and their subtests. Also all
+methods defined in classes in the tests, and the success variables
+used to indicate if a file has succeeded or not.
+
+<h3>__DEFINES__</h3>
+
+All defines and extern declarations found in the tests.
+
+<h3>__FIRST_GROUP__</h3>
+
+The name of the class that is the first testgroup. Used in the runtime
+to get it all started.
+
+<h3>__INCLUDES__</h3>
+
+All includes generated from <tt>include</tt> statements, with associated
+#line indicators that show where the include was found.
+
+<h3>__TABLES__</h3>
+
+All the tables used in the iterate.
+
+
+<where>The code that outputs code can be found in various places in
+parse_tests.pike, the easiest way to locate it is probably to go to
+the main method in parse_tests.pike and start from there.
+<p>
+However, if you look for <tt>define</tt> and <tt>call</tt> methods in the various
+classes in parse_tests.pike you will find most of the code.
+</p>
+</where>
+
+
+<h2>Dependencies</h2>
+
+The testgroups and their tests are reordered in such a way that any
+dependencies are resolved, that is, if test A depends on test B, it
+will be outputted after B. In the same way, if a test in group A
+depends on a test in group B, the group B will be called before group
+A, and currently also placed before group A in the file.
+
+<where>parse_tests.pike::resolv</where>
+
+<h2>Writing the result</h2>
+
+The final code is compared to the exising optestsuite.cpp (if any). If
+there are no changes, nothing is written.
+
+<where>parse_tests.pike::main</where>
+
+<h3>A note about #line</h3>
+
+If you open optestsuite.cpp after it has been generated, you will
+notice that there are a lot of #line statements in it, unless you are
+running the parse_test.pike program in debug mode (see
+parse_tests.pike::main, this mode is intended to be used to debug the
+testsuite generation process, not to debug tests)
+
+
+
+
+<h1>The testsuite runtime system</h1>

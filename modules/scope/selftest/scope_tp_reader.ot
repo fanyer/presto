@@ -1,0 +1,467 @@
+/* -*- Mode: c++; tab-width: 4; indent-tabs-mode: t; c-basic-offset: 4 -*-
+**
+** Copyright (C) 2008 Opera Software AS.  All rights reserved.
+**
+** This file is part of the Opera web browser.  It may not be distributed
+** under any circumstances.
+**
+** Test for decoding STP/1
+**
+** Jan Borsodi
+*/
+
+group "scope.stp_reader";
+
+require init;
+
+global {
+	// Tests the parser in regards to reading one message
+	class OtScopeProtocolReader : public OpScopeTPReader
+	{
+	public:
+		OtScopeProtocolReader(unsigned int version)
+		 : OpScopeTPReader(FALSE, version) // Turn off continous parsing and signature parsing
+		 , message(NULL)
+		 , valid(TRUE)
+		 {};
+		virtual ~OtScopeProtocolReader() {delete message;};
+
+		OP_STATUS PushData(const char *buf, size_t len, BOOL parse_message=TRUE);
+		OpScopeTPMessage *Message() const { return message; }
+		OpScopeTPMessage *ReleaseMessage();
+		BOOL IsValid() const { return valid; }
+	protected:
+		virtual OP_STATUS OnHandshakeCompleted(unsigned int version)
+		{
+			return OpStatus::OK;
+		}
+		virtual OP_STATUS OnMessageParsed(const OpScopeTPMessage &message);
+		virtual void OnError(Error error);
+
+	private:
+		OpScopeTPMessage *message;
+		BOOL valid;
+	};
+
+	OpScopeTPMessage *
+	OtScopeProtocolReader::ReleaseMessage()
+	{
+		OpScopeTPMessage *tmp = message;
+		message = NULL;
+		return tmp;
+	}
+
+	/*virtual*/
+	OP_STATUS
+	OtScopeProtocolReader::OnMessageParsed(const OpScopeTPMessage &msg)
+	{
+		if (message != NULL) // We already have a message
+		{
+			valid = FALSE;
+			return OpStatus::ERR;
+		}
+		message = OP_NEW(OpScopeTPMessage, ());
+		RETURN_OOM_IF_NULL(message);
+		return message->Copy(msg);
+	}
+
+	/*virtual*/
+	void
+	OtScopeProtocolReader::OnError(Error error)
+	{
+		valid = FALSE;
+	}
+
+	OP_STATUS
+	OtScopeProtocolReader::PushData(const char *buf, size_t len, BOOL parse_message)
+	{
+		return OnDataReady(buf, len, parse_message);
+	}
+
+	BOOL OtByteCompare(const ByteBuffer *buf, const char *expected, int len)
+	{
+		OP_ASSERT(buf != NULL);
+		int count = buf->GetChunkCount();
+		for (int cidx = 0; cidx < count; ++cidx)
+		{
+			unsigned int nbytes;
+			const char *data = buf->GetChunk(cidx, &nbytes);
+			for (unsigned int i = 0; i < nbytes; ++i)
+			{
+				if (*data++ != *expected++)
+					return FALSE;
+			}
+			len -= nbytes;
+			if (len < 0)
+				return FALSE;
+		}
+		return TRUE;
+	}
+
+	struct OtTestData
+	{
+		OtTestData()
+		    : version(~0u), tag(~0u), command_id(~0u), transport_type(-1), type(-1), status(-1), service_name()
+		{}
+		unsigned int version, tag, command_id;
+		short transport_type, type, status;
+		ByteBuffer in_data;
+		ByteBuffer expected_data;
+		OpString   service_name;
+	};
+}
+
+setup {
+}
+
+language c++;
+
+include "modules/scope/src/scope_network.h";
+include "modules/util/adt/bytebuffer.h";
+include "modules/util/opfile/opfile.h";
+include "modules/scope/src/scope_tp_message.h";
+include "modules/scope/src/scope_tp_reader.h";
+include "modules/protobuf/src/protobuf_utils.h";
+
+//test( "Detect old protocol" )
+//{
+//	char oldproto[2][4] = {{0,'1',0,'4'}, {0, '5', 0, ' '}};
+//	char newproto[5] = "STP/";
+//	for (unsigned int i = 0; i < 2; ++i)
+//		verify(OpScopeTPReader::DetectUTF16Protocol(oldproto[i]) == TRUE);
+//	verify(OpScopeTPReader::DetectUTF16Protocol(newproto) == FALSE);
+//}
+
+// This finds all the file containing input message and expected values for STP/1 messages
+// *.net.txt contains the encoded message (Note: Binary data)
+// *.parts.txt contains the expected values as separate entries
+table network_files(const char*) filelist "protocol/valid" name "*.net.txt";
+
+// This finds all the file containing input message and expected values for STP/0 messages
+// *.net.txt contains the encoded message (Note: Binary data)
+// *.parts.txt contains the expected values as separate entries
+table stp0_network_files(const char*) filelist "stp0/valid" name "*.net.txt";
+
+// This finds all the file containing input message and expected values for extended STP/0 messages
+// *.net.txt contains the encoded message (Note: Binary data)
+// *.parts.txt contains the expected values as separate entries
+table stp0_ext_network_files(const char*) filelist "stp0_ext/valid" name "*.net.txt";
+
+subtest ReadTestData(OtTestData &testdata, const char *infile)
+{
+	OpFile expected;
+	OpFileLength length;
+	BOOL exists;
+	char *expected_data = NULL;
+	unsigned int expected_length = 0;
+	OpFileLength bytes_read;
+
+	OpString expectedfile;
+	verify_success(expectedfile.SetFromUTF8(infile, op_strlen(infile)-8)); // Skip .net.txt
+	verify_success(expectedfile.Append(".parts.txt"));
+
+	testdata.version = 1;
+	// Load file containing expected data for a message
+	verify_success(expected.Construct(expectedfile));
+	verify_success(expected.Exists(exists));
+	verify(exists);
+	verify_success(expected.Open(OPFILE_READ));
+	verify_success(expected.GetFileLength(length));
+	verify_success(expected.ReadShort(testdata.transport_type));
+	verify(testdata.transport_type >= 1);
+	OpString8 name;
+	verify_success(expected.ReadLine(name));
+	verify_success(testdata.service_name.SetFromUTF8(name));
+	short tmp;
+	verify_success(expected.ReadShort(tmp));
+	verify(tmp >= 0);
+	testdata.command_id = tmp;
+	verify_success(expected.ReadShort(testdata.type));
+	verify(testdata.type >= 0);
+	verify_success(expected.ReadShort(testdata.status));
+	verify(testdata.status >= 0);
+	verify_success(expected.ReadShort(tmp));
+	verify(tmp >= 0);
+	testdata.tag = tmp;
+	verify_success(expected.ReadShort(tmp)); // cid is not used
+	OpFileLength pos;
+	verify_success(expected.GetFilePos(pos));
+	expected_length = (unsigned int)(length - pos);
+	expected_data = new char[expected_length];
+	verify_success(expected.Read(expected_data, expected_length, &bytes_read));
+	verify(bytes_read == expected_length);
+	verify_success(expected.Close());
+	testdata.expected_data.Clear();
+	verify_success(testdata.expected_data.AppendBytes(expected_data, expected_length));
+}
+finally
+{
+	delete []expected_data;
+}
+
+subtest ReadStp0TestData(OtTestData &testdata, const char *infile)
+{
+	OpFile expected;
+	OpFileLength length;
+	BOOL exists;
+	char *expected_data = NULL;
+	unsigned int expected_length = 0;
+	OpFileLength bytes_read;
+
+	OpString expectedfile;
+	expectedfile.SetFromUTF8L(infile, op_strlen(infile)-8); // Skip .net.txt
+	verify_success(expectedfile.Append(".parts.txt"));
+
+	// Load file containing expected data for a message
+	verify_success(expected.Construct(expectedfile));
+	verify_success(expected.Exists(exists));
+	verify(exists);
+	verify_success(expected.Open(OPFILE_READ));
+	verify_success(expected.GetFileLength(length));
+
+	testdata.version = OpScopeTPMessage::Version_0;
+	testdata.transport_type = OpScopeTPMessage::STP_Call;
+	OpString8 serviceName;
+	verify_success(expected.ReadLine(serviceName));
+	verify_success(testdata.service_name.Set(serviceName.CStr()));
+
+	OpFileLength pos;
+	verify_success(expected.GetFilePos(pos));
+	expected_length = (unsigned int)(length - pos);
+	expected_data = new char[expected_length];
+	verify_success(expected.Read(expected_data, expected_length, &bytes_read));
+	verify(bytes_read == expected_length);
+	verify_success(expected.Close());
+	OpString uni_expected_data;
+	verify_success(uni_expected_data.Set(expected_data, expected_length));
+	testdata.expected_data.Clear();
+	if (serviceName[0] == '*')
+	{
+		testdata.command_id = 0;
+		testdata.type = OpScopeTPMessage::JSON; // FIXME: Temporary solution
+		testdata.tag = 0;
+		testdata.status = OpScopeTPMessage::OK;
+	}
+	else
+	{
+		testdata.command_id = 0;
+		if (expected_data[0] == '[')
+			testdata.type = OpScopeTPMessage::JSON;
+		else
+			testdata.type = OpScopeTPMessage::XML;
+		testdata.tag = 0;
+		testdata.status = OpScopeTPMessage::OK;
+	}
+	verify_success(testdata.expected_data.AppendBytes((const char *)uni_expected_data.CStr(), uni_expected_data.Length()*2));
+}
+finally
+{
+	delete []expected_data;
+}
+
+subtest ReadMessageData(OtTestData &testdata, const char *infile)
+{
+	// Load file containing network data
+	OpFile in;
+	OpFileLength length;
+	BOOL exists;
+	char *in_data = NULL;
+	unsigned int data_length = 0;
+	OpFileLength bytes_read;
+
+	OpString infilename;
+	verify_success(infilename.SetFromUTF8(infile));
+	verify_success(in.Construct(infilename));
+	verify_success(in.Exists(exists));
+	verify(exists);
+	verify_success(in.Open(OPFILE_READ));
+	verify_success(in.GetFileLength(length));
+	data_length = (unsigned int)length;
+	in_data = new char[data_length];
+	verify_success(in.Read(in_data, data_length, &bytes_read));
+	verify(bytes_read == data_length);
+	verify_success(in.Close());
+	// Skip UTF-16 BOM
+	if ((unsigned char)in_data[0] == 0xfe && (unsigned char)in_data[1] == 0xff)
+		verify_success(testdata.in_data.AppendBytes(in_data + 2, data_length - 2));
+	else
+		verify_success(testdata.in_data.AppendBytes(in_data, data_length));
+}
+finally
+{
+	delete []in_data;
+}
+
+subtest VerifyMessage(const OpScopeTPMessage* msg, const OtTestData& testdata)
+{
+	verify(msg);
+	verify(msg->Version() == (enum OpScopeTPMessage::MessageVersion)(testdata.version));
+	verify(msg->TransportType() == testdata.transport_type);
+	verify(msg->Tag() == testdata.tag);
+	verify(msg->Status() == testdata.status);
+	verify_string(msg->ServiceName(), testdata.service_name);
+	verify(msg->CommandID() == testdata.command_id);
+	verify(msg->Type() == testdata.type);
+	verify(msg->Data()->Length() == testdata.expected_data.Length());
+	OpAutoArray<char> expected_data(testdata.expected_data.Copy());
+	verify(expected_data.get());
+	verify(OtByteCompare(msg->Data(), expected_data.get(), testdata.expected_data.Length()));
+}
+
+subtest ParseMessage(OtTestData &testdata, int interval_size, unsigned int version)
+{
+	char *in_data = NULL;
+	ByteBuffer incoming;
+	OtScopeProtocolReader reader(version);
+	verify_success(reader.Construct(&incoming));
+
+	in_data = testdata.in_data.Copy();
+	verify(in_data != NULL);
+	unsigned int data_length = testdata.in_data.Length();
+	if (interval_size < 0)
+		interval_size = data_length;
+	for (unsigned int i = 0; i < data_length; i += interval_size)
+	{
+		OP_STATUS status = reader.PushData(in_data + i, interval_size);
+		if (status == OpScopeTPReader::STPStatus::ERR_NOT_ENOUGH_DATA)
+			continue;
+		verify_success(status);
+	}
+	OpScopeTPMessage *msg = reader.Message();
+	verify(reader.IsValid());
+	verify(VerifyMessage(msg, testdata));
+}
+finally
+{
+	delete []in_data;
+}
+
+subtest PushAllData(OtTestData &testdata, OtScopeProtocolReader &reader)
+{
+	char *in_data = NULL;
+
+	in_data = testdata.in_data.Copy();
+	verify(in_data != NULL);
+	unsigned int data_length = testdata.in_data.Length();
+	verify_success(reader.PushData(in_data, data_length, FALSE));
+}
+finally
+{
+	delete []in_data;
+}
+
+subtest ParseNextMessage(OtTestData &testdata, OtScopeProtocolReader &reader)
+{
+	verify_success(reader.ParseNextMessage());
+	OpStackAutoPtr<OpScopeTPMessage> msg(reader.ReleaseMessage());
+	verify(reader.IsValid());
+	verify(VerifyMessage(msg.get(), testdata));
+}
+
+test( "Parse message (1 byte intervals): $(infile)" )
+    multi network_files(infile);
+{
+	OtTestData testdata;
+	verify(ReadMessageData(testdata, infile));
+	verify(ReadTestData(testdata, infile));
+    verify(ParseMessage(testdata, 1, 1));
+}
+
+test( "Parse message (1 interval): $(infile)" )
+    multi network_files(infile);
+{
+	OtTestData testdata;
+	verify(ReadMessageData(testdata, infile));
+	verify(ReadTestData(testdata, infile));
+    verify(ParseMessage(testdata, -1, 1));
+}
+
+test( "Parse multiple messages" )
+{
+	OtTestData testdata;
+	foreach (infile) from network_files
+	{
+		verify(ReadMessageData(testdata, infile));
+	}
+	ByteBuffer incoming;
+	OtScopeProtocolReader reader(1);
+	verify_success(reader.Construct(&incoming));
+	verify(PushAllData(testdata, reader));
+	foreach (infile) from network_files
+	{
+		verify(ReadTestData(testdata, infile));
+	    verify(ParseNextMessage(testdata, reader));
+	}
+}
+
+test( "STP/0: Parse message (1 byte intervals): $(infile)" )
+    multi stp0_network_files(infile);
+{
+	OtTestData testdata;
+	verify(ReadMessageData(testdata, infile));
+	verify(ReadStp0TestData(testdata, infile));
+    verify(ParseMessage(testdata, 1, 0));
+}
+
+test( "STP/0: Parse message (1 interval): $(infile)" )
+    multi stp0_network_files(infile);
+{
+	OtTestData testdata;
+	verify(ReadMessageData(testdata, infile));
+	verify(ReadStp0TestData(testdata, infile));
+    verify(ParseMessage(testdata, -1, 0));
+}
+
+test( "STP/0: Parse multiple messages" )
+{
+	OtTestData testdata;
+	foreach (infile) from stp0_network_files
+	{
+		verify(ReadMessageData(testdata, infile));
+	}
+	ByteBuffer incoming;
+	OtScopeProtocolReader reader(0);
+	verify_success(reader.Construct(&incoming));
+	verify(PushAllData(testdata, reader));
+	foreach (infile) from stp0_network_files
+	{
+		verify(ReadStp0TestData(testdata, infile));
+	    verify(ParseNextMessage(testdata, reader));
+	}
+}
+
+test( "STP/0 extended: Parse message (1 byte interval): $(infile)" )
+    multi stp0_ext_network_files(infile);
+{
+	OtTestData testdata;
+	verify(ReadMessageData(testdata, infile));
+	verify(ReadTestData(testdata, infile));
+    verify(ParseMessage(testdata, 1, 0));
+}
+
+test( "STP/0 extended: Parse message (1 interval): $(infile)" )
+    multi stp0_ext_network_files(infile);
+{
+	OtTestData testdata;
+	verify(ReadMessageData(testdata, infile));
+	verify(ReadTestData(testdata, infile));
+    verify(ParseMessage(testdata, -1, 0));
+}
+
+test( "STP/0 extended: Parse multiple messages" )
+{
+	OtTestData testdata;
+	foreach (infile) from stp0_ext_network_files
+	{
+		verify(ReadMessageData(testdata, infile));
+	}
+	ByteBuffer incoming;
+	OtScopeProtocolReader reader(0);
+	verify_success(reader.Construct(&incoming));
+	verify(PushAllData(testdata, reader));
+	foreach (infile) from stp0_ext_network_files
+	{
+		verify(ReadTestData(testdata, infile));
+	    verify(ParseNextMessage(testdata, reader));
+	}
+}

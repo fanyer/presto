@@ -1,0 +1,256 @@
+/* -*- Mode: c++; tab-width: 4; indent-tabs-mode: t; c-basic-offset: 4 -*- */
+group "doc.documentstate";
+require init;
+
+language C++;
+
+include "modules/dochand/docman.h";
+include "modules/dochand/fdelm.h";
+include "modules/dochand/win.h";
+include "modules/doc/frm_doc.h";
+include "modules/doc/html_doc.h";
+include "modules/display/vis_dev.h";
+include "modules/doc/externalinlinelistener.h";
+include "modules/url/url_api.h";
+include "modules/forms/formvalue.h";
+include "modules/forms/formvaluelist.h";
+
+global
+{
+	int scroll_pos;
+	void* expected_doc_pointer;
+}
+
+html
+{
+	//! <html><body><iframe src='data:text/html,<div style="height:2000px;width:300px;">Padding</div><br><a href="foo">Link</a><form><input name="outerpw" type="password"><input name="outertxt" type="text"><select name=s><option id=a>a<option id=b>b</select></form><br><br><br></body></html>'>
+	//! Inside iframe
+	//! </iframe></body>
+}
+test("DocumentState Setup#1")
+{
+	// Scroll document and set navigation element
+	FramesDocElm* ifrm = state.doc->GetIFrmRoot();
+	verify(ifrm);
+	ifrm = ifrm->FirstChild();
+	verify(ifrm);
+	FramesDocument* doc = ifrm->GetCurrentDoc();
+	verify(doc);
+	HTML_Element* link = NULL;
+	HTML_Element* input = NULL;
+	HTML_Element* select = NULL;
+	HTML_Element* elm = doc->GetDocRoot();
+	while (elm)
+	{
+		if (elm->IsMatchingType(HE_A, NS_HTML))
+			link = elm;
+		if (elm->IsMatchingType(HE_INPUT, NS_HTML))
+			input = elm;
+		if (elm->IsMatchingType(HE_SELECT, NS_HTML))
+			select = elm;
+		elm = elm->NextActual();
+	}
+
+	verify(link);
+	HTML_Document *html_doc = doc->GetHtmlDocument();
+	verify(html_doc);
+	html_doc->HighlightElement(link);
+	HTML_Element* current_elm = html_doc->GetNavigationElement();
+	verify(current_elm);
+	verify(link == current_elm);
+
+	verify(input);
+	FormValue* value = input->GetFormValue();
+	value->SetValueFromText(input, UNI_L("foo"));
+	value->SetIsChangedFromOriginal(input);
+
+	verify(select);
+	FormValueList* listvalue = FormValueList::GetAs(select->GetFormValue());
+	verify(OpStatus::IsSuccess(listvalue->SelectValue(select, 1, TRUE)));
+	listvalue->SetIsChangedFromOriginal(select);
+
+	// make sure DocumentState is used
+	doc->SetOverrideHistoryNavigationMode(HISTORY_NAV_MODE_COMPATIBLE);
+
+	expected_doc_pointer = doc;
+}
+
+test("DocumentState Setup - Wait before memorizing scroll position")
+require success "DocumentState Setup#1";
+language ecmascript;
+async;
+{setTimeout(function(){ST_passed();}, 1000);}
+
+test("DocumentState Setup - Wait before memorizing scroll position")
+require success "DocumentState Setup#1";
+{
+	/* FIXME: There is no requirement that visual viewport be updated
+	   synchronously (or at all), so the following test may fail: */
+
+	FramesDocument* doc = state.doc->GetIFrmRoot()->FirstChild()->GetCurrentDoc();
+	scroll_pos = doc->GetVisualViewY();
+	verify(scroll_pos > 100); // More likely 2000-ish.
+}
+
+
+test("DocumentState Setup#2")
+require success "DocumentState Setup#1";
+language ecmascript;
+{
+	document.getElementsByTagName("iframe")[0].src = "about:blank";
+}
+
+test("DocumentState Setup#3")
+require success "DocumentState Setup#2";
+{
+	FramesDocElm* ifrm = state.doc->GetIFrmRoot();
+	verify(ifrm);
+	ifrm = ifrm->FirstChild();
+	verify(ifrm);
+	FramesDocument* doc = ifrm->GetCurrentDoc();
+	verify(doc);
+	HTML_Element* elm = doc->GetDocRoot();
+	while (elm && !elm->IsMatchingType(HE_A, NS_HTML))
+	{
+		elm = elm->NextActual();
+	}
+
+	verify(!elm || !"We have not moved in history");
+
+	// So, now we have to find the previous document to check its DocumentState
+	DocumentManager* docman = doc->GetDocManager();
+	verify(docman);
+	FramesDocument* prev_doc = docman->GetHistoryPrev();
+	verify(prev_doc);
+	int steps_to_prev = 1;
+#if 0
+	if (prev_doc != expected_doc_pointer)
+	{
+		// Selftests insert an empty document between documents
+		// created by html blocks so we'll back one more step
+		DocListElm* dle = docman->CurrentDocListElm();
+		verify(dle && dle->Pred());
+		dle = dle->Pred()->Pred();
+		verify(dle);
+		prev_doc = dle->Doc();
+		steps_to_prev++;
+	}
+#endif // 0
+	verify(prev_doc == expected_doc_pointer);
+	if (prev_doc->GetLogicalDocument())
+	{
+		// We need to trigger the DocumentState code for sure, so get
+		// rid of the document.
+		prev_doc->Free(TRUE);
+	}
+	verify(!prev_doc->GetLogicalDocument() || !"We didn't get compatible history navigation");
+
+	// Move back to that document to let DocumentState do its job
+	Window* win = state.doc->GetWindow();
+	verify(win);
+	while (steps_to_prev--)
+	{
+		win->SetHistoryPrev(FALSE);
+	}
+}
+
+test("DocumentState - Wait to let the old document load")
+require success "DocumentState Setup#3";
+language ecmascript;
+async;
+{setTimeout(function(){ST_passed();}, 1000);}
+
+test("DocumentState - NavigationElement")
+require success "DocumentState Setup#3";
+disabled;
+{
+	FramesDocElm* ifrm = state.doc->GetIFrmRoot();
+	verify(ifrm);
+	ifrm = ifrm->FirstChild();
+	verify(ifrm);
+	FramesDocument* doc = ifrm->GetCurrentDoc();
+	verify(doc && doc == expected_doc_pointer);
+
+	HTML_Element* elm = doc->GetDocRoot();
+	while (elm && !elm->IsMatchingType(HE_A, NS_HTML))
+	{
+		elm = elm->NextActual();
+	}
+
+	verify(elm);
+	HTML_Document *html_doc = doc->GetHtmlDocument();
+	verify(html_doc);
+
+	HTML_Element* current_elm = html_doc->GetNavigationElement();
+	verify(current_elm);
+	verify(elm == current_elm);
+}
+
+test("DocumentState - Scrolling position")
+require success "DocumentState Setup#3";
+{
+	FramesDocElm* ifrm = state.doc->GetIFrmRoot();
+	verify(ifrm);
+	ifrm = ifrm->FirstChild();
+	verify(ifrm);
+	FramesDocument* doc = ifrm->GetCurrentDoc();
+	verify(doc && doc == expected_doc_pointer);
+	int current_scroll_pos = doc->GetVisualViewY();
+	verify(current_scroll_pos > 100); // More likely 2000-ish.
+
+	verify(current_scroll_pos == scroll_pos || !"probably restored properly, but depends on call to FramesDocument::RequestConstrainVisualViewPosToDoc().");
+}
+
+test("DocumentState - FormValue")
+require success "DocumentState Setup#3";
+{
+	FramesDocElm* ifrm = state.doc->GetIFrmRoot();
+	verify(ifrm);
+	ifrm = ifrm->FirstChild();
+	verify(ifrm);
+	FramesDocument* doc = ifrm->GetCurrentDoc();
+	verify(doc && doc == expected_doc_pointer);
+
+	HTML_Element* input = NULL;
+	HTML_Element* elm = doc->GetDocRoot();
+	while (elm)
+	{
+		if (elm->IsMatchingType(HE_INPUT, NS_HTML))
+			input = elm;
+		elm = elm->NextActual();
+	}
+
+	verify(input);
+	OpString text_val;
+	FormValue* value = input->GetFormValue();
+	value->GetValueAsText(input, text_val);
+	verify(text_val.Compare("foo") == 0);
+}
+
+test("DocumentState - FormValueList")
+require success "DocumentState Setup#3";
+{
+	FramesDocElm* ifrm = state.doc->GetIFrmRoot();
+	verify(ifrm);
+	ifrm = ifrm->FirstChild();
+	verify(ifrm);
+	FramesDocument* doc = ifrm->GetCurrentDoc();
+	verify(doc && doc == expected_doc_pointer);
+
+	HTML_Element* select = NULL;
+	HTML_Element* elm = doc->GetDocRoot();
+	while (elm)
+	{
+		if (elm->IsMatchingType(HE_SELECT, NS_HTML))
+			select = elm;
+		elm = elm->NextActual();
+	}
+
+	verify(select);
+	FormValueList* value = FormValueList::GetAs(select->GetFormValue());
+	verify(value->IsSelected(select, 1));
+}
+
+
+
+

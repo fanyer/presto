@@ -1,0 +1,439 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01//EN">
+<html lang="en" dir="ltr">
+<head>
+ <meta http-equiv="Content-Type" content="text/html;charset=iso-8859-1">
+ <title>CSS selector matching</title>
+ <link rev="made" href="mailto:rune@opera.com">
+ <link rel="stylesheet" href="../../coredoc/coredoc.css" type="text/css" media="all">
+ <link rel="contents" href="../../coredoc/index.html" type="text/html" title="Core API">
+ <style type="text/css">
+  pre { border-left: 2px solid #ddd; }
+  h1, h2, h3 { clear: both; }
+  h2 { counter-reset: figure; }
+  div.figcap { font-style: italic; margin-bottom: 0.5em; }
+  div.figcap::before {
+    content: "Figure " counter(header2) "." counter(figure) " ";
+    counter-increment: figure;
+  }
+ </style>
+</head>
+<body>
+
+<h1>CSS selector matching</h1>
+
+<h2>Introduction</h2>
+<p>
+CSS selector matching is pretty straightforward, starting with the
+subject and moving upwards in the document tree matching each of the
+simple selectors until you have a match, or a failing one. There are a
+couple of performance challenges being solved and described in this
+document. One is the problem of reloading CSS properties for as few
+elements as necessary when the dynamic pseudo state for elements
+change. The other is an inherent O(n!) complexity for descendant
+selectors (and indirect adjacent sibling selectors in CSS3).
+</p>
+
+<h2>Related modules and methods</h2>
+<p>
+<ul>
+<li>
+ style
+ <ul>
+ <li><strong>CSS_StyleRule::Match</strong> - Matches the comma
+ separated list of CSS_Selectors. Stores the highest specificity of
+ any of the matched selectors.</li>
+ <li><strong>CSS_Selector::Match(1)</strong> - Starting point for
+ matching a selector. Calls Match(2) to match the linked list of
+ simple selectors.</li>
+ <li><strong>CSS_Selector::Match(2)</strong> - Finds candidate elements
+ based on the combinators and call CSS_ctx_selector::Match to try to
+ match an element with a simple selector.</li>
+ <li><strong>CSS_SimpleSelector::Match</strong> - Calls MatchType and
+ MatchAttrs.</li>
+ <li><strong>CSS_SimpleSelector::MatchType</strong> - Matches the type
+ selector part of the simple selector.</li>
+ <li><strong>CSS_SimpleSelector::MatchAttrs</strong> - Matches the
+ selector attributes of the simple selector. This is where the pseudo
+ bits are pushed onto the pseudo stack for marking.</li>
+ </ul>
+</li>
+<li>
+ doc
+ <ul>
+ <li><strong>LayoutWorkplace::ApplyPropertyChanges</strong> - method
+ called for reloading CSS properties on element whose dynamic pseudo
+ state changes.</li>
+ </ul>
+</li>
+</ul>
+</p>
+
+<h2>Marking elements as possible targets for dynamic pseudo classes</h2>
+
+<h3>Theory and rationale</h3>
+<p>
+In order to reload properties for as few elements as possible, we
+would have had to store for a given element which other elements would
+possibly affect a selector match for that element. That would have
+required too much memory.
+</p>
+<p>
+As a simple approximation, we mark elements which are affected by
+dynamic pseudo classes with a bit per dynamic pseudo class. The
+elements are marked during selector matching. Below is a formal
+description of how document elements are marked.
+</p>
+
+<p>
+Let document <strong>D</strong> be a set of elements in a given document, and <strong>G</strong> the set of selectors from the stylesheets which apply to the document.
+</p>
+
+<p>
+Let <strong>S</strong> be a selector in <strong>G</strong> consisting
+of <em>n</em> simple selectors (simple selectors as in CSS2.1)
+<strong>s<sub>1</sub></strong> to <strong>s<sub>n</sub></strong> with
+arbitrary combinators, and <strong>s<sub>n</sub></strong> be the
+simple selector that matches the subject.
+</p>
+
+<p>
+Let <strong>S'</strong> denote the selector that consists of simple
+selectors <strong>s'<sub>1</sub></strong> to
+<strong>s'<sub>n</sub></strong> where each simple selector
+<strong>s'<sub>i</sub></strong> is the simple selector
+<strong>s<sub>i</sub></strong> from <strong>S</strong> with all
+dynamic pseudo classes removed.
+</p>
+
+<p>
+Let <strong>E</strong>, consisting of elements
+<strong>e<sub>1</sub></strong> to <strong>e<sub>n</sub></strong>,
+denote a match for selector <strong>S'</strong> where each element
+<strong>e<sub>i</sub></strong> &isin; <strong>D</strong> matches the
+simple selector <strong>s'<sub>i</sub></strong> of
+<strong>S'</strong>.
+</p>
+
+<p>
+Then, for every <strong>S</strong> &isin; <strong>G</strong>
+<ul>
+<li>For every <strong>E</strong> matching <strong>S'</strong>:
+</li>
+<ol>
+<li>Mark <strong>e<sub>i</sub></strong> with dynamic pseudo classes of
+<strong>s<sub>i</sub></strong></li>
+<li>Mark <strong>e<sub>n</sub></strong> with dynamic pseudo classes of
+<strong>s<sub>1</sub></strong> to <strong>s<sub>n-1</sub></strong></li>
+</ol>
+</ul>
+
+The reason for marking the subject <strong>e<sub>n</sub></strong> with the pseudo
+classes of all simple selectors, is that e.g. hovering one of the
+other elements of the match which has a hover pseudo class would
+trigger a match of the whole selector and cause a reload of the CSS
+properties for the subject.
+</p>
+
+<h3>Applying dynamic pseudo style</h3>
+<p>
+LayoutWorkplace::ApplyPropertyChanges is called for applying the dynamic
+pseudo style. It marks properties dirty for the elements which needs to
+reload the CSS properties based on the marked bits.
+</p>
+
+<h3>Examples</h3>
+<p>
+<ol>
+<li>
+<pre>
+selector:
+
+  div:hover input:focus
+
+document source:
+
+  &lt;div&gt; &lt;input type="text"&gt; &lt;/div&gt;
+</pre>
+The div element will be marked with hover because hovering the div
+will affect the selector match, and the input will be marked with both
+hover and focus because hovering another element in the tree (in this
+case the div), or focusing the input will require a reload of the CSS
+properties for the input.
+</li>
+<li>
+<pre>
+selector:
+
+  .myclass div:hover
+
+document source:
+
+  &lt;div class="yourclass"&gt; &lt;div&gt; &lt;/div&gt; &lt;/div&gt;
+</pre>
+No element will be marked because the class selector doesn't match. If
+the class attribute is changed to "myclass" via DOM, the div with the class
+attribute will have the CSS properties reloaded and CSS properties
+reloaded. The reload will ensure the pseudo bits are set correctly.
+</li>
+</ol>
+</p>
+
+<h3>Hover</h3>
+<p>
+Updating dynamic pseudo style for :hover is a bit different because
+when you hover an element, all its ancestors are automatically also in
+their a hovered state. So when you hover an element deep down in the
+tree, the body element is also hovered which can cause the whole
+document tree to have the CSS properties reloaded.
+</p>
+<p>
+Consider this example:
+<pre>
+selector:
+
+  body:hover div#not_hovered
+
+document source:
+
+  &lt;body&gt;
+   &lt;div&gt;
+    ...
+     &lt;div id="not_hovered" /&gt;
+    ...
+   &lt;/div&gt;
+   &lt;div&gt;
+    ...
+     &lt;div id="hovered" /&gt;
+    ...
+   &lt;/div&gt;
+  &lt;/body&gt;
+</pre>
+
+When you hover the element with id="hovered", the body element will
+also be hovered. That means that all child elements of body
+potentially will have to have their CSS properties reloaded because of
+the rules with the type of selectors as in the example above. So, the
+properties have to be reloaded for not_hovered, even though it's not
+an ancestor or descendant of the hovered element.
+</p>
+
+<h4>Hover reload properties optimization</h4>
+
+<div style="float: right; text-align: center">
+<object style="width: 400px; margin: 1em; border: 1px solid black;" data="hover.svg" type="image/svg+xml"></object>
+<a href="hover.svg">
+<div class="figcap"></div>
+</a>
+</div>
+
+<p>
+We have been re-applying hover quite inefficiently by doing:
+<ol>
+<li>Set hovered element to NULL</li>
+<li>Cleared hover style for old hovered element</li>
+<li>Set hovered element to new element</li>
+<li>Loaded properties for new hovered element</li>
+</ol>
+
+This is particularly less efficient than necessary if the two elements
+hovered between share a parent quite close in the tree which has the
+dynamic pseudo bit set.
+</p>
+
+<p>
+Say that we have a document tree like the one in Figure 3.1 and that
+we have a stylesheet applied which causes the element nodes to be
+marked with dynamic pseudo bits as indicated with the red squares. If
+we hover between the two leaf nodes marked with the number 1. The
+closest common parent (also marked 1) will have the save hover style
+when both leaf nodes are hovered. That means we can get away with
+recursively reloading the properties for the children of the closest
+common parent.
+</p>
+
+<p>
+In the case where we don't have a common parent with the dynamic
+pseudo bit set, we have to reload the sub tree for both the old and
+new hovered element starting from the top-most parent of the
+respective elements with the dynamic pseudo bit set. This is the case
+when hovering between the two nodes marked with 2 in Figure
+3.1.
+</p>
+
+<h2>Descendant selectors</h2>
+<p>
+Descendant selectors can have any number of elements between the
+matching elements of the simple selectors. This means a brute force
+can be ugly performance-wise. Consider the case where we have a
+selector of <em>n</em> div elements with descendant combinators:
+<pre>
+ div div div ... div
+</pre>
+and a document subtree consisting of n-1 div elements, assuming there
+are no div elements in the dom tree which is a parent of the subtree
+root.
+<pre>
+div
+ \
+  div
+   \
+    ...
+     \
+      div
+</pre>
+The selector will not match any of the n-1 div elements in the
+subtree. But, consider how we would match the selector from the
+subject and upwards in the dom tree. We start by matching the subject
+which is the nth div in the selector and the (n-1)th div in the
+subtree. Then, we start looking for candidates for the ascendant div,
+and start with the parent. The parent ((n-2)th div in the
+subtree) is a match for the (n-1)th div in the selector and this way,
+we continue matching the divs in the subtree and the selector up to
+the root div of the tree where we're left with an unmatched div
+ascendant div in the selector.
+</p>
+<p>
+Since this combination of divs doesn't match, we trace back to find
+the next candidate for the subject ascendant, which is the (n-3)th div
+in the subtree and continue matching from there.
+</p>
+<p>
+So, for the nth descendant selector you have n-1 candidates for a
+match. For the whole selector selector, that is
+<pre>
+(n-1)(n-2)...(1) = (n-1)!
+</pre>
+possible matches. This is just one example of the combinatory nature
+of descendant selectors that can cause performance problems. We have
+an optimization in our matching implementation, described in the next
+section, which has worked well so far.
+</p>
+<h3>The match-to-top optimization</h3>
+<p>
+To remedy the O(n!) problem described above, we have a depth first
+optimization starting with a tightest possible match for descendant
+selectors that stops the search for descendant selector candidates
+if we know that the selector cannot possibly match.
+</p>
+
+<h4>Tight partial match</h4>
+<p>
+Let <strong>E<sub>i,j</sub></strong>, consisting of elements
+<strong>e<sub>i</sub></strong> to <strong>e<sub>j</sub></strong> be a
+partial match of <strong>S</strong> with <em>1 &lt; i &le; j &le;
+n</em>.
+</p>
+<p>
+Then <strong>E<sub>i,j</sub></strong> is called a tight partial match
+iff for every descendant combinator separated
+<strong>s<sub>k</sub></strong> and <strong>s<sub>k+1</sub></strong>,
+<em>i &le; k &lt; j</em>, <strong>e<sub>k</sub></strong> is the parent
+element of <strong>e<sub>k+1</sub></strong>.
+</p>
+
+<h4>Failed top match</h4>
+<p>
+Let <strong>E<sub>i,j</sub></strong> be a partial match of
+<strong>S</strong> with <em>1 &lt; i &le; j &le; n</em>. And, let
+<strong>c<sub>n</sub></strong> be the combinator between
+<strong>s<sub>n</sub></strong> and <strong>s<sub>n+1</sub></strong>.
+</p>
+<p>
+Then <strong>E<sub>i,j</sub></strong> is called a failed top match
+iff one of these conditions hold:
+<ol>
+<li><strong>c<sub>i-1</sub></strong> is a child selector and
+<strong>e<sub>i</sub></strong> has no parent.</li>
+<li><strong>c<sub>i-1</sub></strong> is an adjacent sibling selector
+and <strong>e<sub>i</sub></strong> has no parent.</li>
+<li><strong>c<sub>i-1</sub></strong> is an indirect adjacent sibling selector and
+<strong>e<sub>i</sub></strong> has no parent.</li>
+<li><strong>c<sub>i-1</sub></strong> is a descendant selector and
+<strong>e<sub>i</sub></strong> has no ascendant element matching
+<strong>s<sub>i-1</sub></strong>.</li>
+</ol>
+</p>
+
+<h4>The stop condition</h4>
+<p>
+Let <strong>S</strong> be a selector with <em>n</em> simple selectors,
+<strong>E<sub>j,n</sub></strong> be a partial match for
+<strong>s<sub>j</sub></strong> to <strong>s<sub>n</sub></strong>,
+<em>1 &lt; j &lt; n</em>, for a subject <strong>e</strong> = <strong>e<sub>n</sub></strong>.
+</p>
+<p>
+If there is a partial match <strong>E<sub>i,j</sub></strong>, <em>1
+&lt; i &le; j</em>, sharing <strong>e<sub>j</sub></strong> with
+<strong>E<sub>j,n</sub></strong>, which is both a tight partial match,
+and a failed top match, there exists no partial match
+<strong>E<sub>1,j</sub></strong> of <strong>S<sub>1,j</sub></strong>
+and hence no match <strong>E</strong> containing the partial match
+<strong>E<sub>j,n</sub></strong> of <strong>S</strong> for the
+subject <strong>e</strong>.
+</p>
+<p>
+I don't have a formal proof for this.
+</p>
+<p>
+This means that we can stop searching for descendant selector
+candidates if we reach the top of the document without a failure for
+the tightest possible match of a selector containing descendant
+combinators.
+</p>
+<p>
+For the example with the n-1 divs above, we will get a tight partial
+match, with a failed match to top for the first candidate for every
+div we try to match. This saves us from trying out combinations of div
+descendants that we know will fail.
+</p>
+
+<h2>Indirect adjacent selectors</h2>
+<p>
+Indirect adjacent selectors have the same O(n!) performance problem as
+descendant selectors. A match-to-left optimization, orthogonal to the
+match-to-top optimization, is implemented.
+</p>
+
+<h2>The matching algorithm</h2>
+<p>Here is an outline of the actual matching algorithm</p>
+<pre>
+Match() ....
+</pre>
+To be continued... (Don't know if it's really necessary. It's quite
+simple apart from the two optimization techniques described
+above.)
+</p>
+
+<h2>Implementation notes</h2>
+
+<h3>The pseudo stack</h3>
+<p>
+During the matching we do not mark the HTML_Element objects with the
+pseudo bits before we see that the whole selector can possibly
+match. Instead we push the pseudo bits and the HTML_Element pointer
+onto a pseudo stack and commit the stack when we see that the matching
+elements on the stack is part of an <strong>S'</strong> match.
+</p>
+<p>
+Example:
+<pre>
+.nevermatch div:hover div:hover div:hover
+</pre>
+For the selector above, we push the matched div elements with a hover
+bit onto the pseudo stack, but throw them away when we find out that
+no ascendending element of the three divs have a class attribute that
+contains "nevermatch".
+</p>
+
+<h2>Possible improvements</h2>
+<p>
+<ul>
+<li>The bit marking algorithm is only correctly implemented for
+active, hover, and focus. Hover is the most crucial performance hit,
+but the UI pseudo classes from CSS3 should use the same
+algorithm.</li>
+</ul>
+</p>
+
+</body>
+</html>

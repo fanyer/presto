@@ -1,0 +1,637 @@
+/* -*- Mode: c++; tab-width: 4; indent-tabs-mode: t; c-basic-offset: 4 -*-
+**
+** Copyright (C) 2010 Opera Software ASA.  All rights reserved.
+**
+** This file is part of the Opera web browser.  It may not be distributed
+** under any circumstances.
+*/
+
+group "ecmascript.ecmascriptmanager";
+
+require init;
+require ECMASCRIPT_DEBUGGER;
+require PREFS_HAS_PREFSFILE;
+
+include "modules/ecmascript_utils/esdebugger.h";
+include "modules/prefs/prefsmanager/collections/pc_js.h";
+include "modules/doc/frm_doc.h";
+include "modules/ecmascript_utils/esasyncif.h";
+include "modules/ecmascript_utils/essched.h";
+
+global
+{
+	static BOOL _verify(BOOL b, unsigned line_number, const char *msg) {
+		if (!b) {
+			char buf[1000]={0}; /* ARRAY OK 2011-12-03 joaoe */
+			op_snprintf(buf,999,"\b\b\b%d: %s should be true", line_number, msg);
+			ST_failed(buf);
+		}
+		return b;
+	}
+#undef async_verify
+#undef async_verify_success
+#define async_verify(expr) do{if(!_verify((expr), __LINE__, #expr)) return 0;}while(0)
+#define async_verify_success(expr) async_verify(OpStatus::IsSuccess(expr))
+
+	// Forward declaration.
+	class Tester;
+
+	// An instance of this class is attached to g_ecmaManager at all times.
+	class Debugger
+		: public ES_DebugListener
+	{
+	public:
+		Debugger() : m_tester(NULL), m_context(NULL) {}
+		~Debugger() {  }
+
+		ES_Runtime* GetRuntime() { return m_runtime; }
+
+		OP_STATUS Start(Tester *tester, EventType type, unsigned line, const uni_char *script)
+		{
+			OP_DELETE(m_tester);
+			tester->SetDebugger(this);
+			m_tester = tester;
+			m_type = type;
+			m_line = line;
+
+			ES_AsyncInterface *asyncif = m_runtime ? m_runtime->GetESAsyncInterface() : NULL;
+			RETURN_VALUE_IF_NULL(asyncif, OpStatus::ERR);
+
+			// Make sure we get HandleEvent() from the Eval() below
+			asyncif->SetWantDebugging();
+			// This eval is supposed to trigger the event stream to HandleEvent
+			return asyncif->Eval(script);
+		}
+
+		// ES_DebugListener
+		virtual void NewScript(ES_Runtime *runtime, ES_DebugScriptData *data){}
+		virtual void ParseError(ES_Runtime *runtime, ES_ErrorInfo *err){}
+		virtual void NewContext(ES_Runtime *runtime, ES_Context *context){}
+		virtual void DestroyContext(ES_Runtime *runtime, ES_Context *context){}
+		virtual void DestroyRuntime(ES_Runtime *runtime){ if (runtime == m_runtime) m_runtime = NULL; }
+		virtual void DestroyObject(ES_Object *object){}
+		virtual void RuntimeCreated(ES_Runtime *runtime){
+			if (runtime->GetFramesDocument()->IsTopDocument() &&
+				runtime->GetFramesDocument()->GetWindow() == g_selftest.utils->window)
+				m_runtime = runtime;
+		}
+		virtual BOOL EnableDebugging(ES_Runtime *runtime) { return (runtime->GetFramesDocument() && runtime->GetFramesDocument()->GetWindow() == state.GetWindow()); }
+		virtual void EnterContext(ES_Runtime *runtime, ES_Context *context) { m_context = context; }
+		virtual void LeaveContext(ES_Runtime *runtime, ES_Context *context) { m_context = NULL; }
+
+		virtual EventAction HandleEvent(EventType type, unsigned int script_guid, unsigned int line_no)
+		{
+			if (this->m_type == type && this->m_line == line_no && m_tester)
+			{
+				m_tester->SetExpectedValue(m_context);				// set the exptected value to test for
+				OP_STATUS err = m_tester->PerformTest(m_runtime);	// and do the actual testing in the tester that knows how to get the type expected
+
+				if (OpStatus::IsError(err))
+					ST_failed("Could not start test");
+			}
+			return ESACT_CONTINUE;
+		}
+
+		void TesterDied() { m_tester = NULL; }
+	private:
+
+		ES_Runtime *m_runtime;
+		Tester *m_tester;
+		ES_Context *m_context;
+
+		// Conditions.
+		EventType m_type;
+		unsigned m_line;
+	}; // Debugger
+
+#define alloc_tester(type, name) \
+	type *name = OP_NEW(type, ());\
+	if (name == NULL) {\
+		ST_failed_with_status("Allocating an object of type " #type " failed", OpStatus::ERR_NO_MEMORY, __LINE__); \
+		return 0; \
+	} \
+	name->Into(&g_objects_to_delete);
+
+	AutoDeleteHead g_objects_to_delete;
+
+	class Tester: public Link
+	{
+	public:
+		Tester() : m_debugger(NULL) {}
+		virtual ~Tester() { Out(); if (m_debugger)m_debugger->TesterDied(); }
+		void SetDebugger(Debugger* p) { m_debugger = p; }
+		Debugger* GetDebugger() { return m_debugger; }
+
+		// Perform object testing based on result from getting the expected value from script stepping and the actual return value from an script Eval()
+		virtual OP_STATUS PerformTest(ES_Runtime *runtime) = 0;
+		// Set expected value in end of test based on the function we want to test
+		virtual OP_STATUS SetExpectedValue(ES_Context* context) = 0;
+
+	protected:
+		BOOL IsEqual(const ES_Value &a, const ES_Value &b)
+		{
+			if (a.type != b.type)
+				return FALSE;
+
+			switch(a.type)
+			{
+				case VALUE_BOOLEAN:
+					return (a.value.boolean == b.value.boolean);
+				case VALUE_NUMBER:
+					return (a.value.number == b.value.number);
+				case VALUE_STRING:
+					return ( uni_str_eq(a.value.string, b.value.string) );
+				case VALUE_OBJECT:
+					return (a.value.object == b.value.object);	// pointers to the same memory ?
+				case VALUE_UNDEFINED:
+					return TRUE;	// both are undefined, used for checking positive no return
+			}
+
+			return FALSE;
+		}
+
+		Debugger* m_debugger;	// attached debugger, signal when we die
+	}; // Tester
+
+	// GetExceptionValue, GetReturnValue, GetCallee and GetThis can all inherit from
+	// a class like this. GetArguments return more than one value, so a special case
+	// will be needed for that function.
+	class SingleValueTester
+		: public Tester, public ES_AsyncCallback
+	{
+	public:
+		SingleValueTester() { }
+		~SingleValueTester() { }
+
+		// Subclasses implement this function.
+		virtual void GetSingleValue(ES_Context *context, ES_Value* out) = 0;
+
+		virtual OP_STATUS PerformTest(ES_Runtime *runtime)
+		{
+			RETURN_VALUE_IF_NULL(runtime, OpStatus::ERR);
+
+			ES_AsyncInterface *asyncif = runtime->GetESAsyncInterface();
+			RETURN_VALUE_IF_NULL(asyncif, OpStatus::ERR);
+
+			// Does not emit HandleEvent()s
+			return asyncif->Eval(GetExpectedScript(), this);
+		}
+
+		// ES_AsyncCallback
+		virtual OP_STATUS HandleCallback(ES_AsyncOperation operation, ES_AsyncStatus status, const ES_Value &result)
+		{
+			if (status == ES_ASYNC_SUCCESS && IsEqual(m_expected, result))
+				ST_passed();
+			else
+				ST_failed("result differs from expected value");
+
+			OP_DELETE(this);
+
+			return OpStatus::OK;
+		}
+
+		virtual OP_STATUS HandleError(const uni_char *message, unsigned line, unsigned offset)
+		{
+			ST_failed("Error");
+			return OpStatus::OK;
+		}
+
+		OP_STATUS SetExpectedValue(ES_Context* context)
+		{
+			GetSingleValue(context, &m_expected);
+			return OpStatus::OK;
+		}
+
+		ES_Value GetExptectedValue() { return m_expected;}
+
+		// the script that is used to create the comparison value against m_expected set in SetExpectedValue()
+		void SetExpectedScript(const uni_char* script) { m_evalscript = script; }
+
+		const uni_char* GetExpectedScript() { return m_evalscript; }
+
+	private:
+		const uni_char* m_evalscript;
+		ES_Value m_expected;
+	}; // SingleValueTester
+
+	class MultiValueTester
+		: public Tester, public ES_AsyncCallback
+	{
+	public:
+		MultiValueTester() : m_values(NULL), m_valcount(0), m_index(0), m_num_expected_scripts(0), m_final_result(TRUE), m_evalscripts(NULL) {}
+		virtual ~MultiValueTester()
+		{
+			OP_DELETEA(m_values);
+			OP_DELETEA(m_evalscripts);
+		}
+
+		virtual void GetMultipleValues(ES_Context *context, int& argc, ES_Value *&argv) = 0;
+
+		virtual OP_STATUS PerformTest(ES_Runtime *runtime)
+		{
+			if(!m_valcount)
+			{
+				ST_failed("no values returned from GetMultipleValues!");
+				OP_DELETE(this);
+				return OpStatus::OK;
+			}
+
+			RETURN_VALUE_IF_NULL(runtime, OpStatus::ERR);
+
+			ES_AsyncInterface *asyncif = runtime->GetESAsyncInterface();
+			RETURN_VALUE_IF_NULL(asyncif, OpStatus::ERR);
+
+			// Does not emit HandleEvent()s
+			return asyncif->Eval(m_evalscripts[0], this);
+		}
+
+		OP_STATUS SetExpectedValue(ES_Context* context)
+		{
+			ES_Value* vals;
+			GetMultipleValues(context, m_valcount, vals);
+			m_values = OP_NEWA(ES_Value, m_valcount);
+			if(!m_values)
+				return OpStatus::ERR_NO_MEMORY;
+
+			for(int i=0; i<m_valcount; i++)
+			{
+				m_values[i] = vals[i];
+			}
+
+			return OpStatus::OK;
+		}
+
+		// ES_AsyncCallback
+		virtual OP_STATUS HandleCallback(ES_AsyncOperation operation, ES_AsyncStatus status, const ES_Value &result)
+		{
+			m_final_result = (status == ES_ASYNC_SUCCESS && m_valcount && IsEqual(m_values[m_index], result));
+
+			//last value checked, or a test failed
+			if(!m_final_result || ++m_index == m_valcount-1)
+			{
+				//returnvalue based on multiple tests
+				if(m_final_result)
+					ST_passed();
+				else
+					ST_failed("result differs from expected value");
+
+				OP_DELETE(this);
+			}
+			else
+			{
+				return Eval(m_evalscripts[m_index], this);
+			}
+
+			return OpStatus::OK;
+		}
+
+		virtual OP_STATUS HandleError(const uni_char *message, unsigned line, unsigned offset)
+		{
+			ST_failed("Error");
+			return OpStatus::OK;
+		}
+
+		OP_STATUS Eval(const uni_char *text, ES_AsyncCallback *callback)
+		{
+			ES_Runtime* runtime = GetDebugger() ? GetDebugger()->GetRuntime() : NULL;
+			RETURN_VALUE_IF_NULL(runtime, OpStatus::ERR);
+
+			ES_AsyncInterface *asyncif = runtime->GetESAsyncInterface();
+			RETURN_VALUE_IF_NULL(asyncif, OpStatus::ERR);
+
+			return asyncif->Eval(text, callback);
+		}
+
+		OP_STATUS SetExpectedScripts(const uni_char* script, ...)
+		{
+			va_list args;
+			va_start(args, script);
+
+			m_num_expected_scripts = 1;
+			while(va_arg(args,uni_char*) != NULL)
+				m_num_expected_scripts++;
+			va_end(args);
+
+			m_evalscripts = OP_NEWA(const uni_char*, m_num_expected_scripts);
+			RETURN_OOM_IF_NULL(m_evalscripts);
+
+			m_evalscripts[0] = script;
+			va_start(args, script);
+			const uni_char* evalscript = va_arg(args, const uni_char*);
+			int i=1;
+			while(evalscript)
+			{
+				m_evalscripts[i++] = evalscript;
+				evalscript = va_arg(args, const uni_char*);
+			}
+			va_end(args);
+			m_index = 0;
+			return OpStatus::OK;
+		}
+
+	protected:
+		ES_Value*	m_values;
+		int			m_valcount;
+		int			m_index;
+		int			m_num_expected_scripts;
+		BOOL		m_final_result;				// set to FALSE when a subtest fails and is not changed after
+	private:
+		const uni_char** m_evalscripts;
+
+	}; // MultiValueTester
+
+	class GetCalleeTester
+		: public SingleValueTester
+	{
+		ES_Object* m_function;
+	public:
+		virtual void GetSingleValue(ES_Context *context, ES_Value* out)
+		{
+			out->value.object = g_ecmaManager->GetCallee(context);
+			out->type = VALUE_OBJECT;
+		}
+	}; // GetCalleeTester
+
+	class GetThisTester
+		: public SingleValueTester
+	{
+	public:
+		virtual void GetSingleValue(ES_Context *context, ES_Value* out)
+		{
+			ES_Value* argv;
+			int argc;
+			ES_Object* function;
+			g_ecmaManager->GetCallDetails(context, &out->value.object, &function, &argc, &argv);
+			out->type = VALUE_OBJECT;
+		}
+	}; // GetThisTester
+
+	class GetReturnValueTester
+		: public SingleValueTester
+	{
+	public:
+		virtual void GetSingleValue(ES_Context *context, ES_Value* out)
+		{
+			g_ecmaManager->GetReturnValue(context, out);
+		}
+	}; // GetReturnValueTester
+
+	class GetExceptionValueTester
+		: public SingleValueTester
+	{
+	public:
+		virtual void GetSingleValue(ES_Context *context, ES_Value* out)
+		{
+			g_ecmaManager->GetExceptionValue(context, out);
+		}
+	}; // GetExceptionValueTester
+
+	class GetArgumentsTester
+		: public MultiValueTester
+	{
+	public:
+		virtual void GetMultipleValues(ES_Context *context, int& argc, ES_Value *&argv)
+		{
+			ES_Object* function;
+			ES_Object* this_obj;
+			g_ecmaManager->GetCallDetails(context, &this_obj, &function, &argc, &argv);
+			//we need to copy the ES_Values as they die when the context dies
+		}
+
+	}; // GetArgumentsTester
+
+	// Global data
+	Debugger debugger;
+
+	int pref_browser_js;
+	int pref_user_js;
+
+}
+
+setup
+{
+#ifdef DOM_BROWSERJS_SUPPORT
+	// Get the initial values for these prefs.
+	RETURN_IF_LEAVE(pref_browser_js = g_pcjs->GetIntegerPref(PrefsCollectionJS::BrowserJSSetting));
+	RETURN_IF_LEAVE(pref_user_js = g_pcjs->GetIntegerPref(PrefsCollectionJS::UserJSEnabled));
+
+	// Disable.
+	RETURN_IF_LEAVE(OpStatus::Ignore(g_pcjs->WriteIntegerL(PrefsCollectionJS::BrowserJSSetting, 0)));
+	RETURN_IF_LEAVE(OpStatus::Ignore(g_pcjs->WriteIntegerL(PrefsCollectionJS::UserJSEnabled, 0)));
+#endif //DOM_BROWSERJS_SUPPORT
+	g_ecmaManager->SetDebugListener(&debugger);
+}
+
+exit
+{
+	g_ecmaManager->SetDebugListener(NULL);
+#ifdef DOM_BROWSERJS_SUPPORT
+	// Restore initial values.
+	OpStatus::Ignore(g_pcjs->WriteIntegerL(PrefsCollectionJS::BrowserJSSetting, pref_browser_js));
+	OpStatus::Ignore(g_pcjs->WriteIntegerL(PrefsCollectionJS::UserJSEnabled, pref_user_js));
+#endif //DOM_BROWSERJS_SUPPORT
+}
+
+///////////////////////////////////////////////////////////////////////////////
+
+html
+{
+	//! <script>
+	//! var glob_param1;
+	//! var glob_param2;
+	//! var glob_param3;
+	//! function doit(pre, post, postpost)
+	//! { glob_param1 = pre; glob_param2=post; glob_param3=postpost; }
+	//! </script>
+}
+
+test("EcmaScript_Manager::GetArguments")
+	async;
+{
+	alloc_tester(GetArgumentsTester, tester);
+	async_verify_success(tester->SetExpectedScripts(UNI_L("glob_param1"), UNI_L("glob_param2"), UNI_L("glob_param3"), NULL));
+	async_verify_success(debugger.Start(tester, ES_DebugListener::ESEV_CALLSTARTING, 1, UNI_L("doit('hogg', 'gamle', 'biler');")));
+}
+
+html
+{
+	//! <script>
+	//! function foo()
+	//! {
+	//! 	return "bar";
+	//! }
+	//!
+	//! // Called when the test is started to trigger some debugger events.
+	//! function run()
+	//! {
+	//! 	foo();
+	//! }
+	//! </script>
+}
+
+test("EcmaScript_Manager::GetCallee, native call starting")
+	async;
+{
+	alloc_tester(GetCalleeTester, tester);
+	tester->SetExpectedScript(UNI_L("foo"));		// should return the function object 'foo'
+	async_verify_success(debugger.Start(tester, ES_DebugListener::ESEV_CALLSTARTING, 1, UNI_L("foo();")));
+}
+
+html
+{
+	//! <script>
+	//! var ourstr = "four, the number four";
+	//! function givemesome()
+	//! { return ourstr; }
+	//! </script>
+}
+
+test("EcmaScript_Manager::GetReturnValue, native call starting")
+	async;
+{
+	alloc_tester(GetReturnValueTester, tester);
+	tester->SetExpectedScript(UNI_L("ourstr"));	//returns a ES_Value string with "four, the number four" which should be the same as in ESEV_CALLCOMPLETED
+	async_verify_success(debugger.Start(tester, ES_DebugListener::ESEV_CALLCOMPLETED, 1, UNI_L("givemesome();")));
+}
+
+html
+{
+	//! <script>
+	//! function givemesome()
+	//! { var we_re_doing_nothing; }
+	//! </script>
+}
+
+test("EcmaScript_Manager::GetReturnValue, no return value from function")
+	async;
+{
+	alloc_tester(GetReturnValueTester, tester);
+	tester->SetExpectedScript(UNI_L(""));
+	async_verify_success(debugger.Start(tester, ES_DebugListener::ESEV_CALLCOMPLETED, 1, UNI_L("givemesome();")));
+}
+
+html
+{
+	//! <script>
+	//! var ex = "Test Exception has the right value";
+	//! function givemeexception(){
+	//!		throw ex;
+	//! }
+	//! </script>
+}
+
+test("EcmaScript_Manager::GetExceptionValue")
+	async;
+{
+	alloc_tester(GetExceptionValueTester, tester);
+	tester->SetExpectedScript(UNI_L("ex;"));
+	async_verify_success(debugger.Start(tester, ES_DebugListener::ESEV_EXCEPTION, 4, UNI_L("givemeexception();")));
+}
+
+html
+{
+	//! <script>
+	//! function mycircle(x,y,r) {
+	//! this.xcoord = x;
+	//! this.ycoord = y;
+	//! this.radius = r;
+	//! this.retCirc = function () { return ( Math.PI * this.radius * 2 ); };
+	//! }
+	//! var testcircle = new mycircle(3,4,5);
+	//! </script>
+}
+
+test("EcmaScript_Manager::GetThis, native call starting")
+	async;
+{
+	alloc_tester(GetThisTester, tester);
+	tester->SetExpectedScript(UNI_L("testcircle"));
+	async_verify_success(debugger.Start(tester, ES_DebugListener::ESEV_CALLSTARTING, 1, UNI_L("testcircle.retCirc();")));
+}
+
+html
+{
+	//! <script>
+	//! function Car(make, model, year)
+	//! {
+  	//!   this.make = make;
+	//!   this.model = model;
+	//!   this.year = year;
+	//!   this.crashit = function() { this.make = "CRASHED " + this.make; return this;}
+	//! }
+	//! function RentalCar(carNo, make, model, year)
+	//! {
+	//!   this.carNo = carNo;
+	//!   Car.apply(this, new Array(make, model, year));
+	//!   return this;
+	//! }
+	//! myRentalCar = new RentalCar(2134,"Ford","Mustang",1998);
+	//! </script>
+}
+
+test("EcmaScript_Manager::GetThis, Function.prototype.apply starting")
+	async;
+{
+	alloc_tester(GetThisTester, tester);
+	tester->SetExpectedScript(UNI_L("myRentalCar"));
+	async_verify_success(debugger.Start(tester, ES_DebugListener::ESEV_CALLSTARTING, 1, UNI_L("myRentalCar.crashit();")));
+}
+
+html
+{
+	//! <script>
+	//! function g() { return false; }
+	//! function f() { return this.g.apply(this, arguments); }
+	//! obj = g;
+	//! </script>
+}
+
+test("EcmaScript_Manager::GetThis, Function.prototype.apply return this applied")
+	async;
+{
+	alloc_tester(GetThisTester, tester);
+	tester->SetExpectedScript(UNI_L("obj"));
+	async_verify_success(debugger.Start(tester, ES_DebugListener::ESEV_CALLSTARTING, 3, UNI_L("f();")));
+}
+
+html
+{
+	//! <script>
+	//! var x = 10;
+	//! var o = { x: 15 };
+	//! function f(message)
+	//! {
+	//!		res = " " + message + " " + this.x;
+	//!	}
+	//! </script>
+}
+
+test("EcmaScript_Manager::GetThis, Function.prototype.call starting")
+	async;
+{
+	alloc_tester(GetThisTester, tester);
+	tester->SetExpectedScript(UNI_L("o"));
+	async_verify_success(debugger.Start(tester, ES_DebugListener::ESEV_CALLSTARTING, 0, UNI_L("f.call( o,  'one' );")));		// notice line number, first parameter will be 'this'
+}
+
+html
+{
+	//! <script>
+	//! x = { hello: "world" };	//global object
+	//!	function foo()
+	//! {
+	//!		this.givemex = function() {
+	//!			return x;
+	//!		}
+ 	//! }
+ 	//! var bra = new foo();	// evaluates directly to a string with value "bar"
+	//! </script>
+}
+
+test("EcmaScript_Manager::GetThis, constructor starting")
+	async;
+{
+	alloc_tester(GetThisTester, tester);
+	tester->SetExpectedScript(UNI_L("bra"));
+	async_verify_success(debugger.Start(tester, ES_DebugListener::ESEV_CALLSTARTING, 1, UNI_L("bra.givemex();")));
+}

@@ -1,0 +1,1125 @@
+/* -*- Mode: c++; tab-width: 4; indent-tabs-mode: t; c-basic-offset: 4 -*-
+**
+** Copyright (C) 2004-2010 Opera Software ASA.  All rights reserved.
+**
+** This file is part of the Opera web browser.  It may not be distributed
+** under any circumstances.
+**
+** Luca Venturi
+*/
+group "cache benchmarks";
+
+require init;
+require CACHE_OPTIONAL_SELFTESTS;
+include "modules/pi/OpSystemInfo.h";
+include "modules/util/opfile/opfile.h";
+include "modules/cache/cache_selftest.h";
+include "modules/cache/cache_st_helpers.h";
+
+/**
+Tests performed on a totally arbitrary index file of 7 MB (without embedded files, so there are more and smaller strings than in the real world):
+- 21534 URLs
+- 6.2 strings per URL
+- 35 bytes per String
+- total strings: 130K+ 
+- total bytes: 4.5MB+
+
+Strings >=8 bytes: 121K
+Strings >=16 bytes: 75K 
+Strings >=32 bytes: 22K
+Strings >=64 bytes: 11K
+
+Some Attributes are created very often, so they are possible targets for optimizations:
+URL(100%), File Name(100% ==> 50%), content type (99%), charset (20%),  load date(HTTP, 100%), Last modified(HTTP, 100%), and Keep Entity (HTTP, 50%)
+*/
+
+global
+{
+#define MEM_SIZE (1024*1024)
+#define DISK_SIZE (128*1024)
+#define MEM_TEST_NUM 10
+#define DISK_TEST_NUM 12
+#define READ_URLS_NUM 1024
+	
+	UINT32 mem_block[]={512, 1024, 2048, 4096, 8192, 16384, 32768, 65536, 128*1024, 256*1024 };
+	UINT32 mem_speed[MEM_TEST_NUM];
+	UINT32 disk_block[]={1, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536, 128*1024, 256*1024 };
+	UINT32 disk_speed[DISK_TEST_NUM];
+	OpFileFolder bench_folder;		// Cache folder used for disk benchmarks
+	double last_alloc_speed=0.0;
+	double reference_speed=0.0;
+#if defined DISK_CACHE_SUPPORT && defined CACHE_SELFTEST_H
+	MultiContext *mctx;
+#endif
+	URL_CONTEXT_ID ctx_read;		// Context used to check read speed of the index
+	OpFileFolder read_folder;		// Cache folder used to check read speed of the index
+	#ifdef CACHE_ST_HELPERS_H
+		CacheHelpers ch;
+	#endif
+	
+	// Wait the next clock tick, to try to minimize variance
+	double getStartTime()
+	{
+		double start_time=g_op_time_info->GetWallClockMS();
+		double next_time;
+
+		do
+		{
+			next_time=g_op_time_info->GetWallClockMS();
+		}
+		while(next_time==start_time);
+
+		return next_time;
+	}
+	
+	// Mainly test the read speed
+	BOOL testMemRead(UINT32 block_size, UINT32 &speed, OP_STATUS &ops)
+	{
+		unsigned char *buf=OP_NEWA(unsigned char, block_size);
+		int total=0;
+		int diff=0;
+		UINT32 n1=0;
+		
+		if(!buf)
+		{
+			ops=OpStatus::ERR_NO_MEMORY;
+			
+			return FALSE;
+		}
+		
+		ops=OpStatus::OK;
+		
+		// Write
+		for(UINT32 i=0; i<block_size; i++)
+		{
+			buf[i]=(unsigned char)i;
+			n1+=(unsigned char)i;
+		}
+
+		double start_time=getStartTime();
+		double end_time=start_time;
+
+		do
+		{
+			int partial=0;
+
+			while(partial<MEM_SIZE)
+			{
+				UINT32 n2=0;
+
+				// Read
+				for(UINT32 c=0; c<block_size; c++)
+					n2+=buf[c];
+
+				diff+=(n2-n1);
+				OP_ASSERT(diff==0);
+
+				partial+=block_size;
+			}
+			total+=partial;
+
+			end_time=g_op_time_info->GetWallClockMS();
+		}
+		while(end_time-start_time<500);
+
+		speed=(UINT32)(total/(end_time-start_time));
+
+		OP_DELETEA(buf);
+
+		return diff==0;
+	}
+	
+	BOOL testMem32Read(UINT32 block_size, UINT32 &speed, OP_STATUS &ops)
+	{
+		UINT32 block_size4 = block_size/4;
+		UINT32 *buf32=OP_NEWA(UINT32, block_size4);
+		int total=0;
+		int diff=0;
+		UINT32 n1=0;
+
+		if(!buf32)
+		{
+			ops=OpStatus::ERR_NO_MEMORY;
+			
+			return FALSE;
+		}
+
+		ops=OpStatus::OK;
+
+		// Write
+		for(UINT32 i=0; i<block_size4; i++)
+		{
+			buf32[i]=(unsigned char)i;
+			n1+=(unsigned char)i;
+		}
+
+		double start_time=getStartTime();
+		double end_time=start_time;
+
+		do
+		{
+			UINT32 partial=0;
+
+			while(partial<MEM_SIZE)
+			{
+				UINT32 n2=0;
+
+				// Read
+				for(UINT32 c=0; c<block_size4; c++)
+					n2+=buf32[c];
+
+				diff+=(n2-n1);
+				OP_ASSERT(diff==0);
+
+				partial+=block_size;
+			}
+			total+=partial;
+
+			end_time=g_op_time_info->GetWallClockMS();
+		}
+		while(end_time-start_time<500);
+
+		// Speed in KB
+		speed=(UINT32)(total/(end_time-start_time));
+
+		OP_DELETEA(buf32);
+
+		return diff==0;
+	}
+
+	BOOL testMemRW(UINT32 block_size, UINT32 &speed, OP_STATUS &ops)
+	{
+		unsigned char *buf=OP_NEWA(unsigned char, block_size);
+		int total=0;
+		int diff=0;
+
+		if(!buf)
+		{
+			ops=OpStatus::ERR_NO_MEMORY;
+
+			return FALSE;
+		}
+
+		ops=OpStatus::OK;
+		
+		double start_time=getStartTime();
+		double end_time=start_time;
+		
+		do
+		{
+			int partial=0;
+			
+			while(partial<MEM_SIZE)
+			{
+				int n1=0;
+				UINT32 c=0;
+
+				// Write
+				for(; c<block_size; c++)
+				{
+					buf[c]=(unsigned char)c;
+					n1+=(unsigned char)c;
+				}
+					
+				int n2=0;
+				
+				// Read
+				for(c=0; c<block_size; c++)
+					n2+=buf[c];
+					
+				diff+=(n2-n1);
+				OP_ASSERT(diff==0);
+				
+				partial+=block_size;
+			}
+			total+=partial;
+			
+			end_time=g_op_time_info->GetWallClockMS();
+		}
+		while(end_time-start_time<500);
+		
+		speed=(UINT32)(total/(end_time-start_time));
+		
+		OP_DELETEA(buf);
+		
+		return diff==0;
+	}
+	
+	BOOL testMem32RW(UINT32 block_size, UINT32 &speed, OP_STATUS &ops)
+	{
+		UINT32 block_size4 = block_size/4;
+		UINT32 *buf32=OP_NEWA(UINT32, block_size4);
+		int total=0;
+		int diff=0;
+		
+		if(!buf32)
+		{
+			ops=OpStatus::ERR_NO_MEMORY;
+			
+			return FALSE;
+		}
+		
+		ops=OpStatus::OK;
+		
+		double start_time=getStartTime();
+		double end_time=start_time;
+		
+		do
+		{
+			UINT32 partial=0;
+			
+			while(partial<MEM_SIZE)
+			{
+				UINT32 n1=0;
+				UINT32 c=0;
+
+				// Write
+				for(; c<block_size4; c++)
+				{
+					buf32[c]=c;
+					n1+=c;
+				}
+					
+				UINT32 n2=0;
+				
+				// Read
+				for(c=0; c<block_size4; c++)
+					n2+=buf32[c];
+					
+				diff+=(n2-n1);
+				OP_ASSERT(diff==0);
+				
+				partial+=block_size;
+			}
+			total+=partial;
+			
+			end_time=g_op_time_info->GetWallClockMS();
+		}
+		while(end_time-start_time<500);
+		
+		// Speed in KB
+		speed=(UINT32)(total/(end_time-start_time));
+		
+		OP_DELETEA(buf32);
+		
+		return diff==0;
+	}
+
+	// Output the speed achieved
+	void outputSpeed(const char *mex, UINT32 block_size, UINT32 speed)
+	{
+		if(speed>10000)
+			output("%s %d bytes: %d MB/s\n", mex, block_size, speed/1024);
+		else
+			output("%s %d bytes: %d KB/s\n", mex, block_size, speed);
+	}
+
+	// Output the number of operations
+	void outputOperations(const char *mex, UINT32 block_size, UINT32 num_oper)
+	{
+		if(num_oper*block_size>10*1000*1000)
+			output("%s %d bytes: %d - bandwidth: %d MB/s\n", mex, block_size, num_oper, num_oper*block_size/1024/1024);
+		else
+			output("%s %d bytes: %d - bandwidth: %d KB/s\n", mex, block_size, num_oper, num_oper*block_size/1024);
+	}
+	
+	// Strings
+	void outputStrings(const char *mex, UINT64 num)
+	{
+		if(num>10.0*1000*1000*1000)
+			output("%s : %d G\n", mex, (UINT32)(num/1024.0/1024/1024));
+		else if(num>10*1000*1000)
+			output("%s : %d M\n", mex, (UINT32)(num/1024/1024));
+		else if(num>10*1000)
+			output("%s : %d K\n", mex, (UINT32)(num/1024));
+		else
+			output("%s : %d\n", mex, (UINT32)(num));
+	}
+	
+	// Strings
+	void outputStrings(const char *mex, UINT64 num, UINT64 num2)
+	{
+		if(num>10.0*1000*1000*1000)
+			output("%s : %d G - %d iterations\n", mex, (UINT32)(num/1024.0/1024/1024), num2);
+		else if(num>10*1000*1000)
+			output("%s : %d M - %d iterations\n", mex, (UINT32)(num/1024/1024), num2);
+		else if(num>10*1000)
+			output("%s : %d K - %d iterations\n", mex, (UINT32)(num/1024), num2);
+		else
+			output("%s : %d - %d iterations\n", mex, (UINT32)(num), num2);
+	}
+}
+
+setup 
+{
+	g_folder_manager->AddFolder(OPFILE_CACHE_FOLDER, UNI_L("benchmarks"),&bench_folder);
+#if defined DISK_CACHE_SUPPORT && defined CACHE_SELFTEST_H
+	CacheFileTest::DeleteCacheDir(bench_folder);
+	mctx=OP_NEW(MultiContext, (TRUE));
+	
+	mctx->CreateNewContext(ctx_read, UNI_L("benchmarks_read"), TRUE, &read_folder);
+#endif
+}
+
+exit
+{
+	CacheFileTest::DeleteCacheDir(bench_folder);
+	
+#if defined DISK_CACHE_SUPPORT && defined CACHE_SELFTEST_H
+	OP_DELETE(mctx);
+#endif // DISK_CACHE_SUPPORT
+}
+
+// Check the speed for constructing, opening, reading the last modified time and closing a file
+test("Open close and last modified")
+timer;
+{
+	OpString filename;
+	OpString last_entry;
+	
+	double start_time=getStartTime();
+	double end_time=start_time;
+	int num_op=0;
+	
+	// Create the test file
+	OpFile t;
+	
+	verify_success(t.Construct(UNI_L("opLast.tmp"), bench_folder));
+	verify_success(t.Open(OPFILE_WRITE));
+	verify_success(t.Close());
+	
+	do
+	{
+		for(int i=0; i<100; i++)
+		{
+			OpFile f;
+			time_t last;
+			
+			verify_success(f.Construct(UNI_L("opLast.tmp"), bench_folder));
+			verify_success(f.Open(OPFILE_READ));
+			verify_success(f.GetLastModified(last));
+			verify_success(f.Close());
+			num_op++;
+		}
+		end_time=g_op_time_info->GetWallClockMS();
+	}
+	while(end_time-start_time<1000);
+	
+	output("Operations per second: %d - ", (int)(num_op*1000.0/(end_time-start_time))); 
+}
+
+// Check the speed for constructing and reading the last modified time
+test("last modified")
+timer;
+{
+	OpString filename;
+	OpString last_entry;
+	
+	double start_time=getStartTime();
+	double end_time=start_time;
+	int num_op=0;
+	
+	// Create the test file
+	OpFile t;
+	
+	verify_success(t.Construct(UNI_L("opLast.tmp"), bench_folder));
+	verify_success(t.Open(OPFILE_WRITE));
+	verify_success(t.Close());
+	
+	do
+	{
+		for(int i=0; i<100; i++)
+		{
+			OpFile f;
+			time_t last;
+			
+			verify_success(f.Construct(UNI_L("opLast.tmp"), bench_folder));
+			verify_success(f.GetLastModified(last));
+			num_op++;
+		}
+		end_time=g_op_time_info->GetWallClockMS();
+	}
+	while(end_time-start_time<1000);
+	
+	output("Operations per second: %d - ", (int)(num_op*1000.0/(end_time-start_time))); 
+}
+
+test("Write test index")
+require DISK_CACHE_SUPPORT;
+require CACHE_ST_HELPERS_H;
+timer;
+{
+	ch.CacheBogusURLs(ctx_read, 1, 1, READ_URLS_NUM);  // Write 1024 URLs in the index (being 1 byte, by default they are kept in memory)
+	CacheTester::WriteIndex(ctx_read);
+	
+	/// Return the number of files in the index, -1 if the index is not present
+	int n=CacheHelpers::CheckIndex(read_folder, TRUE);
+	
+	if(n<READ_URLS_NUM)
+		ST_failed("Wrong number of URLs in the index: %d instead of %d", n, read_folder);
+}
+
+test("Read index speed")
+require DISK_CACHE_SUPPORT;
+require CACHE_SELFTEST_H;
+timer;
+{
+	OpString filename;
+	OpString last_entry;
+	UINT32 num_entries;
+	UINT32 total_entries=0;
+	URL_CONTEXT_ID ctx_test;
+	
+	double start_time=getStartTime();
+	double end_time=start_time;
+	OpFileFolder empty_folder;		// Cache folder used to check read speed of the index
+	int num_read=0;
+	
+	g_folder_manager->AddFolder(OPFILE_CACHE_FOLDER, UNI_L("benchmarks_empty"),&empty_folder);
+	filename.Set("dcache4.url");
+	
+	do
+	{
+		urlManager->Debug_AcceptOverlappingContexts();
+		verify_success(mctx->CreateNewContext(ctx_test, read_folder, FALSE));
+		
+		num_read++;
+		num_entries=CacheTester::CheckURLsInStore(ctx_test);
+		// OP_ASSERT(num_entries>=READ_URLS_NUM && num_entries!=(UINT32)-1);
+		//TRAPD(ops, urlManager->FindContextManager(ctx_test)->TestReadIndexFileL(filename, read_folder, num_entries, last_entry));
+		
+		//verify_success(ops);
+		end_time=g_op_time_info->GetWallClockMS();
+		
+		if(num_entries!=(UINT32)-1)
+		{
+			output("URLs read in context %d: %d after %d ms\n", ctx_test, num_entries, (int)(end_time-start_time));
+			verify(num_entries>=READ_URLS_NUM);
+			total_entries+=num_entries;
+		}
+		else
+			output("No URL loaded in %d\n", ctx_test);
+	}
+#if DESKTOP_PROFILE==1
+	while(end_time-start_time<1000);
+#else
+	while(end_time==start_time);  // Avoid OOM, even if it is less precise
+#endif // DESKTOP_PROFILE
+	
+	output("%d index read per second - estimated entries speed: %d\n", (int)(num_read*1000.0/(end_time-start_time)), (int)(total_entries*1000.0/(end_time-start_time))); 
+}
+
+test("Char[1] alloc (new)")
+{
+	double start_time=getStartTime();
+	double end_time=start_time;
+	UINT32 num_alloc=0;
+	char *ptr;
+	
+	do
+	{
+		for(int i=0; i<1000; i++)
+		{
+			ptr=new char[1];
+			
+			verify(ptr);
+			
+			delete[] ptr;
+			num_alloc++;
+			verify(num_alloc!=0);  // Anti overrun!
+		}
+		
+		end_time=g_op_time_info->GetWallClockMS();
+	}
+	while(end_time-start_time<500);
+	
+	outputStrings("Strings allocated in one second", (UINT64)(num_alloc*(1000.0/(end_time-start_time))), num_alloc);
+}
+
+// Check the speed of allocating strings of fixed size
+subtest allocateChars(int size)
+{
+	double start_time=getStartTime();
+	double end_time=start_time;
+	UINT32 num_alloc=0;
+	char *ptr;
+	int wait_before_check_time=10000;
+	
+#ifdef _DEBUG
+	// In debug, OP_NEWA can set the bytes to 0, really slowing down things. Plus benchmarks are not really meaningfull in debug...
+	wait_before_check_time=(size<10000)?1000:100;
+#endif
+	
+	do
+	{
+		for(int i=0; i<wait_before_check_time; i++)
+		{
+			ptr=OP_NEWA(char, size);
+			
+			verify(ptr);
+			
+			OP_DELETEA(ptr);
+			num_alloc++;
+			verify(num_alloc!=0);  // Anti overrun!
+		}
+		
+		end_time=g_op_time_info->GetWallClockMS();
+	}
+	while(end_time-start_time<500);
+	
+	double speed=num_alloc*(1000.0/(end_time-start_time));
+	outputStrings("Allocations in one second", (UINT64)(speed), num_alloc);
+
+	if(size==1)
+	{
+		if(reference_speed==0.0)
+			reference_speed=speed;
+		else
+		{
+			double scaling=speed*100.0/reference_speed;
+			
+			output("Scaling relative to reference: %.2f%% ", (float)scaling);
+			// After all the tests, we are back to size 1.
+			// A good allocator, should not degrade after all these operations
+			// We are allowing a 3X reduction, just to well avoid noise
+			verify(scaling>33 && "Performances are not restored");
+		}
+	}
+	else if(last_alloc_speed>0)
+	{
+		double scaling=speed*100.0/last_alloc_speed;
+		
+		output("Scaling: %.2f%% ", (float)scaling);
+		// If perfromances are 10X less that at the previous size, maybe it's worth investigate what's happening
+		// during allocation / deallocation		
+		verify(scaling>10 && "Excessive performance degradation");
+	}
+	
+	last_alloc_speed=speed;
+}
+
+test("outputStrings()")
+{
+	outputStrings("1", 1);
+	outputStrings("10", 10);
+	outputStrings("100", 100);
+	
+	outputStrings("1 000", 1*1000);
+	outputStrings("10 000", 10*1000);
+	outputStrings("10 001", 10*1000+1);
+	outputStrings("100 000", 100*1000);
+	
+	outputStrings("1 000 000", 1*1000*1000);
+	outputStrings("10 000 000", 10*1000*1000);
+	outputStrings("10 000 001", 10*1000*1000+1);
+	outputStrings("100 000 000", 100*1000*1000);
+	
+	outputStrings("1 000 000 000", ((UINT64)1)*1000*1000*1000);
+	outputStrings("10 000 000 000", ((UINT64)10)*1000*1000*1000);
+	outputStrings("10 000 000 001", ((UINT64)10)*1000*1000*1000+1);
+	outputStrings("100 000 000 000", ((UINT64)100)*1000*1000*1000);
+	
+	outputStrings("1000 000 000 000", ((UINT64)1000)*1000*1000*1000);
+}
+
+test("(A) Char[1] alloc (OP_NEWA())")
+{
+	verify(allocateChars(1));
+}
+
+test("Char[16] alloc (OP_NEWA())")
+timer;
+{
+	verify(allocateChars(16));
+}
+
+test("Char[32] alloc (OP_NEWA())")
+timer;
+{
+	verify(allocateChars(32));
+}
+
+test("Char[64] alloc (OP_NEWA())")
+timer;
+{
+	verify(allocateChars(64));
+}
+
+test("Char[128] alloc (OP_NEWA())")
+timer;
+{
+	verify(allocateChars(128));
+}
+
+test("Char[256] alloc (OP_NEWA())")
+timer;
+{
+	verify(allocateChars(256));
+}
+
+test("Char[512] alloc (OP_NEWA())")
+timer;
+{
+	verify(allocateChars(512));
+}
+
+test("Char[1024] alloc (OP_NEWA())")
+timer;
+{
+	verify(allocateChars(1024));
+}
+
+test("Char[2048] alloc (OP_NEWA())")
+timer;
+{
+	verify(allocateChars(2048));
+}
+
+test("Char[4096] alloc (OP_NEWA())")
+timer;
+{
+	verify(allocateChars(4096));
+}
+
+test("Char[8192] alloc (OP_NEWA())")
+{
+	allocateChars(8192);
+}
+
+test("Char[16384] alloc (OP_NEWA())")
+{
+	allocateChars(16384);
+}
+
+test("Char[32768] alloc (OP_NEWA())")
+{
+	allocateChars(32768);
+}
+
+test("Char[65536] alloc (OP_NEWA())")
+timer;
+{
+	verify(allocateChars(65536));
+}
+
+test("(B) Char[1] alloc (OP_NEWA()) - should be unchanged from (A)")
+{
+	allocateChars(1);
+}
+
+test("OpString8 allocations")
+timer;
+{
+	double start_time=getStartTime();
+	double end_time=start_time;
+	UINT32 num_alloc=0;
+	OpString8 *ptr;
+	int wait_before_check_time=10000;
+	
+#ifdef _DEBUG
+	// In debug, OP_NEWA can set the bytes to 0, really slowing down things. Plus benchmarks are not really meaningfull in debug...
+	wait_before_check_time=1000;
+#endif
+	
+	do
+	{
+		for(int i=0; i<wait_before_check_time; i++)
+		{
+			ptr=OP_NEW(OpString8, ());
+			
+			verify(ptr);
+			
+			OP_DELETE(ptr);
+			num_alloc++;
+			verify(num_alloc!=0);  // Anti overrun!
+		}
+		
+		end_time=g_op_time_info->GetWallClockMS();
+	}
+	while(end_time-start_time<500);
+	
+	outputStrings("Strings allocated in one second", (UINT64)(num_alloc*(1000.0/(end_time-start_time))), num_alloc);
+}
+
+// Write and count 50 characters
+test("OpString8 operations (50 characters)")
+timer;
+{
+	double start_time=getStartTime();
+	double end_time=start_time;
+	UINT32 num_alloc=0;
+	OpString8 *ptr;
+	const char *test="0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklm";
+	
+	do
+	{
+		for(int i=0; i<5000; i++)
+		{
+			ptr=OP_NEW(OpString8, ());
+			
+			verify(ptr);
+			
+			if(ptr)
+			{
+				ptr->Set(test);
+				verify(ptr->Length()==49);
+				
+				OP_DELETE(ptr);
+			}
+			num_alloc++;
+			verify(num_alloc!=0);  // Anti overrun!
+		}
+		
+		end_time=g_op_time_info->GetWallClockMS();
+	}
+	while(end_time-start_time<500);
+	
+	outputStrings("Strings created, copied, counted and deleted in one second", (UINT64)(num_alloc*(1000.0/(end_time-start_time))), num_alloc);
+}
+
+// Set, count and delete 50 characters
+test("OpString8 Set, Lenght and Delete (50 characters)")
+timer;
+{
+	double start_time=getStartTime();
+	double end_time=start_time;
+	UINT32 num_set=0;
+	OpString8 str;
+	const char *test="0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklm";
+	
+	do
+	{
+		for(int i=0; i<5000; i++)
+		{
+			verify_success(str.Set(test));
+			verify(str.Length()==49);
+			str.Empty();
+			verify(!str.DataPtr());
+			num_set++;
+			verify(num_set!=0);  // Anti overrun!
+		}
+		
+		end_time=g_op_time_info->GetWallClockMS();
+	}
+	while(end_time-start_time<500);
+	
+	outputStrings("Strings Set() and counted in one second", (UINT64)(num_set*(1000.0/(end_time-start_time))), num_set);
+}
+
+// Set and count 50 characters
+test("OpString8 Set and Lenght (50 characters)")
+{
+	double start_time=getStartTime();
+	double end_time=start_time;
+	UINT32 num_set=0;
+	OpString8 str;
+	const char *test="0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklm";
+	
+	do
+	{
+		for(int i=0; i<5000; i++)
+		{
+			verify_success(str.Set(test));
+			verify(str.Length()==49);
+			num_set++;
+			verify(num_set!=0);  // Anti overrun!
+		}
+		
+		end_time=g_op_time_info->GetWallClockMS();
+	}
+	while(end_time-start_time<500);
+	
+	outputStrings("Strings Set() and counted in one second", (UINT64)(num_set*(1000.0/(end_time-start_time))), num_set);
+}
+
+// Count 50 characters
+test("OpString8 Lenght (50 characters)")
+timer;
+{
+	double start_time=getStartTime();
+	double end_time=start_time;
+	UINT32 num_length=0;
+	OpString8 str;
+	
+	verify_success(str.Set("0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklm"));
+	
+	do
+	{
+		for(int i=0; i<10000; i++)
+		{
+			verify(str.Length()==49);
+			num_length++;
+			verify(num_length!=0);  // Anti overrun!
+		}
+		
+		end_time=g_op_time_info->GetWallClockMS();
+	}
+	while(end_time-start_time<500);
+	
+	outputStrings("Strings counted in one second", (UINT64)(num_length*(1000.0/(end_time-start_time))), num_length);
+}
+
+// Count how many times the time can be accessed in one second
+test("Time access")
+timer;
+{
+	double start_time=getStartTime();
+	double end_time=start_time;
+	UINT32 num_times=0;
+	
+	do
+	{
+		num_times++;
+		
+		end_time=g_op_time_info->GetWallClockMS();
+	}
+	while(end_time-start_time<500);
+	
+	outputStrings("GetWallClockMS() calls in one second", (UINT64)(num_times*(1000.0/(end_time-start_time))), num_times);
+}
+
+
+
+// Writing speed, as the buffer increase
+subtest testDiskWriteSpeed(UINT32 block_size, UINT32 &speed, BOOL del_files)
+{
+	unsigned char *buf=OP_NEWA(unsigned char, block_size); // Buffer uninitialized, it's fine
+	OpFileLength total=0;
+	OpFile f;
+	OpString str;
+
+	verify_success(str.AppendFormat(UNI_L("Write_%d"), block_size));
+
+	double start_time=getStartTime();
+	double end_time=start_time;
+
+	// Opening time must be part of the speed test
+	verify_success(f.Construct(str.CStr(), bench_folder));
+	verify_success(f.Open(OPFILE_WRITE));
+
+	do
+	{
+		OpFileLength partial=0;
+
+		while(partial<DISK_SIZE)
+		{
+			OP_STATUS ops=f.Write(buf, block_size);
+		
+			if(!OpStatus::IsSuccess(ops))  // Avoid a memory leak signaled by Coverity
+			{
+				OP_DELETEA(buf);
+				buf=NULL;
+				verify(FALSE); // Signal the Error
+			}
+		
+			partial+=block_size;
+		}
+		total+=partial;
+
+		end_time=g_op_time_info->GetWallClockMS();
+	}
+	while(end_time-start_time<1000);
+
+	verify_success(f.Close()); // Closing time must be part of the speed test
+	end_time=g_op_time_info->GetWallClockMS();
+	speed=(UINT32)(total/(end_time-start_time));
+
+	OP_DELETEA(buf);
+	if(del_files)
+		f.Delete();
+}
+
+// Test the number of disk write operations possibile as the size of the file increase
+// del_files==0: no delete
+// del_files==1: delete each file after another (less disk stress, less accuracy)
+// del_files==2: delete all the files together (more disk stress, more accuracy)
+subtest testDiskWriteOperations(UINT32 block_size, UINT32 &num_oper, int del_files)
+{
+	unsigned char *buf=OP_NEWA(unsigned char, block_size); // Buffer uninitialized, it's fine
+	OpFileLength total=0;
+
+	double start_time=getStartTime();
+	double end_time=start_time;
+
+	num_oper=0;
+
+	do
+	{
+		OpString str;
+		OpFile f;
+		OpFileLength partial=0;
+
+		verify_success(str.AppendFormat(UNI_L("Oper_%d_%d"), block_size, num_oper++));
+
+		// Opening time must be part of the speed test
+		verify_success(f.Construct(str.CStr(), bench_folder));
+		verify_success(f.Open(OPFILE_WRITE));
+
+		OP_STATUS ops=f.Write(buf, block_size);
+		
+		if(!OpStatus::IsSuccess(ops))  // Avoid a memory leak signaled by Coverity
+		{
+			OP_DELETEA(buf);
+			buf=NULL;
+			verify(FALSE); // Signal the Error
+		}
+		partial+=block_size;
+		total+=partial;
+
+		verify_success(f.Close()); // Closing time must be part of the speed test
+		if(del_files==1)
+			f.Delete();
+
+		end_time=g_op_time_info->GetWallClockMS();
+	}
+	while(end_time-start_time<500);
+
+	num_oper=(UINT32)((num_oper*1024)/(end_time-start_time));
+
+	OP_DELETEA(buf);
+
+	// Delete the files
+	for(UINT32 i=0; i<num_oper && del_files==2; i++)
+	{
+		OpString str;
+		OpFile f;
+
+		verify_success(str.AppendFormat(UNI_L("Oper_%d_%d"), block_size, i));
+
+		verify_success(f.Construct(str.CStr(), bench_folder));
+		verify_success(f.Delete());
+	}
+}
+
+test("Memory Read speed test")
+{
+	UINT32 max_speed=0;
+	UINT32 max_block=0;
+	OP_STATUS ops = OpStatus::OK;
+
+	for(int i=0; i<MEM_TEST_NUM; i++)
+	{
+		if(!testMemRead(mem_block[i], mem_speed[i], ops) || OpStatus::IsError(ops))
+			break; // OOM?
+
+		outputSpeed("Memory read speed for", mem_block[i], mem_speed[i]);
+
+		if(mem_speed[i]>max_speed)
+		{
+			max_block=mem_block[i];
+			max_speed=mem_speed[i];
+		}
+	}
+
+	if(OpStatus::IsError(ops))
+		output("*** Test interrupted for an OOM, which can be expected...\n");
+
+	outputSpeed("Best memory read speed achieved with", max_block, max_speed);
+
+	testMem32Read(mem_block[0], mem_speed[0], ops);
+
+	if(OpStatus::IsError(ops))
+		output("*** 32 Bits Test interrupted for an OOM, which can be expected...\n");
+
+	outputSpeed("32 bits Read Memory speed for", mem_block[0], mem_speed[0]);
+}
+
+test("Memory Write+Read speed test")
+{
+	UINT32 max_speed=0;
+	UINT32 max_block=0;
+	OP_STATUS ops=OpStatus::OK;
+	
+	for(int i=0; i<MEM_TEST_NUM; i++)
+	{
+		testMemRW(mem_block[i], mem_speed[i], ops);
+		
+		if(!testMemRW(mem_block[i], mem_speed[i], ops) || OpStatus::IsError(ops))
+			break; // OOM?
+			
+		outputSpeed("Memory RW speed for", mem_block[i], mem_speed[i]);
+	  
+		if(mem_speed[i]>max_speed)
+		{
+			max_block=mem_block[i];
+			max_speed=mem_speed[i];
+		}
+	}
+	
+	if(OpStatus::IsError(ops))
+		output("*** Test interrupted for an OOM, which can be expected...\n");
+	
+	outputSpeed("Best memory RW speed achieved with", max_block, max_speed);
+
+	testMem32RW(mem_block[0], mem_speed[0], ops);
+
+	if(OpStatus::IsError(ops))
+		output("*** 32 Bits Test interrupted for an OOM, which can be expected...\n");
+
+	outputSpeed("32 bits RW Memory speed for", mem_block[0], mem_speed[0]);
+}
+
+// Less stress, very strange numbers... on desktop, operations seem to be performed in memory...
+test("Disk Write Operations 1")
+{
+	UINT32 max_speed=0;
+	// UINT32 max_block=0;
+
+	for(int i=0; i<DISK_TEST_NUM; i++)
+	{
+		verify(testDiskWriteOperations(disk_block[i], disk_speed[i], 1));
+
+		outputOperations("Operations for", disk_block[i], disk_speed[i]);
+
+		if(disk_speed[i]>max_speed)
+		{
+			// max_block=disk_block[i];
+			max_speed=disk_speed[i];
+		}
+	}
+
+	//outputOperations("Best Operations speed achieved with", max_block, max_speed);
+}
+
+test("Disk Write Speed test")
+{
+	UINT32 max_speed=0;
+	UINT32 max_block=0;
+
+	for(int i=0; i<DISK_TEST_NUM; i++)
+	{
+		verify(testDiskWriteSpeed(disk_block[i], disk_speed[i], i>0));
+
+		outputSpeed("Disk speed for", disk_block[i], disk_speed[i]);
+
+		if(disk_speed[i]>max_speed)
+		{
+			max_block=disk_block[i];
+			max_speed=disk_speed[i];
+		}
+	}
+
+	outputSpeed("Best Disk speed achieved with", max_block, max_speed);
+}
+
+// More accurate test
+test("Disk Write Operations 2")
+{
+	UINT32 max_speed=0;
+	UINT32 max_block=0;
+
+	for(int i=0; i<DISK_TEST_NUM; i++)
+	{
+		verify(testDiskWriteOperations(disk_block[i], disk_speed[i], 2));
+
+		outputOperations("Operations for", disk_block[i], disk_speed[i]);
+
+		if(disk_speed[i]>max_speed)
+		{
+			max_block=disk_block[i];
+			max_speed=disk_speed[i];
+		}
+	}
+
+	outputOperations("Best Operations speed achieved with", max_block, max_speed);
+}

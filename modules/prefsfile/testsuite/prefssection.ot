@@ -1,0 +1,496 @@
+/* -*- Mode: c++; tab-width: 4; indent-tabs-mode: t; c-basic-offset: 4 -*-
+**
+** Copyright (C) 2006-2008 Opera Software ASA.  All rights reserved.
+**
+** This file is part of the Opera web browser.  It may not be distributed
+** under any circumstances.
+**
+** Peter Karlsson
+*/
+group "prefsfile.api.prefssection";
+
+include "modules/prefsfile/prefssection.h";
+include "modules/prefsfile/impl/backend/prefssectioninternal.h";
+include "modules/prefsfile/prefsentry.h";
+include "modules/prefsfile/impl/backend/prefsentryinternal.h";
+include "modules/util/opstrlst.h";
+
+// -- Global variables ---------------------------------------------------
+
+global
+{
+	PrefsSectionInternal *section1, *section2, *section3, *section4;
+	int section1len;
+
+	Head sections;
+}
+
+setup
+{
+	section1 = NULL;
+	section1len = 0;
+	section2 = NULL;
+	section3 = NULL;
+	section4 = NULL;
+}
+
+// -- Set up test environment --------------------------------------------
+
+table testdata(const uni_char *, const uni_char *)
+{
+	{ UNI_L("Key 1"),	UNI_L("Value 1") },
+	{ UNI_L("Key 2"),	UNI_L("Value 2") },
+	{ UNI_L("Empty"),	NULL },
+}
+
+table testdata2(const uni_char *, const uni_char *)
+{
+	{ UNI_L("Key 1"),	UNI_L("New Value 1") },
+	{ UNI_L("Key 3"),	UNI_L("Value 3") },
+	{ UNI_L("Empty"),	NULL },
+}
+
+test("Setup")
+{
+	section1 = OP_NEW(PrefsSectionInternal, ());
+	verify(section1);
+	TRAPD(rc, section1->ConstructL(UNI_L("My Section")));
+	verify(OpStatus::IsSuccess(rc));
+
+	iterate (key, value) from testdata
+	{
+		TRAP(rc, section1->SetL(key, value));
+		verify(OpStatus::IsSuccess(rc));
+		++ section1len;
+	}
+	section1->Into(&sections);
+
+	section2 = OP_NEW(PrefsSectionInternal, ());
+	verify(section2);
+	TRAP(rc, section2->ConstructL(UNI_L("My Other Section")));
+	section2->Into(&sections);
+}
+
+// -- Publically exposed API ---------------------------------------------
+
+test("PrefsSection::Name()")
+	require success "Setup";
+{
+	verify(uni_strcmp(section1->Name(), UNI_L("My Section")) == 0);
+	verify(uni_strcmp(section2->Name(), UNI_L("My Other Section")) == 0);
+}
+
+test("PrefsSection::Number()")
+	require success "Setup";
+{
+	verify(section1->Number() == section1len);
+	verify(section2->Number() == 0);
+}
+
+test("PrefsSection::Get()")
+	require success "Setup";
+{
+	iterate (key, value) from testdata
+	{
+		const uni_char *readvalue = section1->Get(key);
+		if (value)
+		{
+			verify(readvalue);
+			verify(uni_strcmp(value, readvalue) == 0);
+		}
+		else
+		{
+			verify(!readvalue);
+		}
+
+		verify(!section2->Get(key));
+	}
+}
+
+test("PrefsSection::FindEntry()")
+	require success "Setup";
+{
+	PrefsSection *ps1 = section1;
+	PrefsSection *ps2 = section2;
+
+	iterate (key, value) from testdata
+	{
+		PrefsEntry *entry = ps1->FindEntry(key);
+		verify(entry);
+		if (value)
+		{
+			verify(entry->Get());
+			verify(uni_strcmp(value, entry->Get()) == 0);
+		}
+		else
+		{
+			verify(!entry->Get());
+		}
+		verify(uni_strcmp(key, entry->Key()) == 0);
+
+		verify(!ps2->FindEntry(key));
+	}
+}
+
+test("PrefsSection::Entries()")
+	require success "Setup";
+{
+	const PrefsEntry *entries = section1->Entries();
+	verify(entries);
+
+	/* Check that length is correct, and that all entries are good */
+	int gotlength = 0;
+	while (entries)
+	{
+		++ gotlength;
+		BOOL found = FALSE;
+		iterate (key, value) from testdata
+		{
+			PrefsEntryInternal *compareentry = section1->FindEntry(key);
+			if (compareentry == entries)
+				found = TRUE;
+		}
+		verify(found);
+		entries = entries->Suc();
+	}
+	verify(gotlength == section1len);
+
+	verify(!section2->Entries());
+}
+
+test("PrefsSection::GetKeyListL()")
+	require success "Setup";
+	require USE_UTIL_OPSTRING_LIST;
+{
+	OpString_list
+	    * OP_MEMORY_VAR keylist1 = NULL,
+	    * OP_MEMORY_VAR keylist2 = NULL;
+	TRAPD(rc, keylist1 = section1->GetKeyListL());
+	verify(OpStatus::IsSuccess(rc));
+	verify(keylist1);
+
+	/* Check that all keys are there */
+	verify((int) keylist1->Count() == section1len);
+	iterate(key, value) from testdata
+	{
+		BOOL found = FALSE;
+		for (unsigned int i = 0; i < keylist1->Count(); ++ i)
+		{
+			if (keylist1->Item(i).Compare(key) == 0)
+				found = TRUE;
+		}
+		verify(found);
+	}
+
+	/* Check that section 2 gives no list */	
+	TRAP(rc, keylist2 = section2->GetKeyListL());
+	verify(OpStatus::IsSuccess(rc));
+	verify(!keylist2);
+}
+finally
+{
+	OP_DELETE(keylist1);
+	OP_DELETE(keylist2);
+}
+
+test("PrefsSection::CopyKeysL() simple")
+	require success "Setup";
+{
+	/* Set up */
+	section3 = OP_NEW(PrefsSectionInternal, ());
+	verify(section3);
+	TRAPD(rc, section3->ConstructL(UNI_L("Copy Section")));
+	verify(OpStatus::IsSuccess(rc));
+
+	/* Check that first copy gets everything */
+	TRAP(rc, section3->CopyKeysL(section1));
+	verify(OpStatus::IsSuccess(rc));
+	iterate (key, value) from testdata
+	{
+		const uni_char *readvalue = section3->Get(key);
+		if (value)
+		{
+			verify(readvalue);
+			verify(uni_strcmp(value, readvalue) == 0);
+		}
+		else
+		{
+			verify(!readvalue);
+		}
+	}
+}
+
+test("PrefsSection::CopyKeysL() with overwrite")
+	require success "PrefsSection::CopyKeysL() simple";
+{
+	/* Set up */
+	section4 = OP_NEW(PrefsSectionInternal, ());
+	verify(section4);
+	TRAPD(rc, section4->ConstructL(UNI_L("Source Section")));
+	verify(OpStatus::IsSuccess(rc));
+	iterate (key, value) from testdata2
+	{
+		TRAP(rc, section4->SetL(key, value));
+		verify(OpStatus::IsSuccess(rc));
+	}
+
+	/* Copy with overwrite */
+	TRAP(rc, section3->CopyKeysL(section4));
+	verify(OpStatus::IsSuccess(rc));
+
+	/* Check for blending */
+	iterate (key, value) from testdata2
+	{
+		const uni_char *readvalue = section3->Get(key);
+		if (value)
+		{
+			verify(readvalue);
+			verify(uni_strcmp(value, readvalue) == 0);
+		}
+		else
+		{
+			verify(!readvalue);
+		}
+	}
+
+	const uni_char *oldvalue = section3->Get(UNI_L("Key 2"));
+	verify(oldvalue);
+	verify(uni_strcmp(oldvalue, UNI_L("Value 2")) == 0);
+}
+
+test("PrefsSection::IsEmpty()")
+	require success "Setup";
+{
+	verify(!section1->IsEmpty());
+	verify( section2->IsEmpty());
+}
+
+test("PrefsSection::Suc()")
+	require success "Setup";
+{
+	PrefsSection *ps1 = section1;
+	PrefsSection *ps2 = section2;
+	verify(ps1->Suc() == ps2);
+}
+
+// -- Internal API -------------------------------------------------------
+
+test("PrefsSectionInternal::SetL()")
+	require success "Setup";
+	require success "PrefsSection::CopyKeysL() with overwrite";
+{
+	/* New */
+	TRAPD(rc, section4->SetL(UNI_L("Foo"), UNI_L("Bar")));
+	verify(OpStatus::IsSuccess(rc));
+	const uni_char *result1 = section4->Get(UNI_L("Foo"));
+	verify(result1);
+	verify(uni_strcmp(result1, UNI_L("Bar")) == 0);
+
+	/* Overwrite */
+	TRAP(rc, section4->SetL(UNI_L("Key 1"), UNI_L("Even Newer Value 1")));
+	verify(OpStatus::IsSuccess(rc));
+	const uni_char *result2 = section4->Get(UNI_L("Key 1"));
+	verify(result2);
+	verify(uni_strcmp(result2, UNI_L("Even Newer Value 1")) == 0);
+}
+
+test("PrefsSectionInternal::IsSameAs()")
+	require success "Setup";
+	require PREFSMAP_USE_CASE_SENSITIVE;
+{
+	verify( section1->IsSameAs(UNI_L("My Section")));
+	verify( section2->IsSameAs(UNI_L("My Other Section")));
+	verify(!section1->IsSameAs(UNI_L("My Other Section")));
+	verify(!section2->IsSameAs(UNI_L("My Section")));
+}
+
+test("PrefsSectionInternal::IsSameAs()")
+	require success "Setup";
+	require undefined PREFSMAP_USE_CASE_SENSITIVE;
+{
+	verify( section1->IsSameAs(UNI_L("my section")));
+	verify( section2->IsSameAs(UNI_L("my other section")));
+	verify(!section1->IsSameAs(UNI_L("my other section")));
+	verify(!section2->IsSameAs(UNI_L("my section")));
+}
+
+test("PrefsSectionInternal::FindEntry()")
+	require success "Setup";
+{
+	iterate (key, value) from testdata
+	{
+		PrefsEntryInternal *entry = section1->FindEntry(key);
+		verify(entry);
+		if (value)
+		{
+			verify(entry->Get());
+			verify(uni_strcmp(value, entry->Get()) == 0);
+		}
+		else
+		{
+			verify(!entry->Get());
+		}
+		verify(uni_strcmp(key, entry->Key()) == 0);
+
+		verify(!section2->FindEntry(key));
+	}
+}
+
+test("PrefsSectionInternal::NewEntryL()")
+	require success "Setup";
+	require success "PrefsSection::CopyKeysL() with overwrite";
+{
+	TRAPD(rc, section4->NewEntryL(UNI_L("New Entry"), UNI_L("Value")));
+	verify(OpStatus::IsSuccess(rc));
+	const uni_char *result = section4->Get(UNI_L("New Entry"));
+	verify(result);
+	verify(uni_strcmp(result, UNI_L("Value")) == 0);
+}
+
+test("PrefsSectionInternal::DeleteEntry()")
+	require success "PrefsSectionInternal::NewEntryL()";
+{
+	/* Delete */
+	verify(section4->FindEntry(UNI_L("New Entry")));
+	verify(section4->DeleteEntry(UNI_L("New Entry")));
+	verify(!section4->FindEntry(UNI_L("New Entry")));
+
+	/* Delete nonexistant */
+	verify(!section4->DeleteEntry(UNI_L("I do not exist, go away")));
+}
+
+test("PrefsSectionInternal::Clear()")
+	require success "PrefsSection::CopyKeysL() simple";
+{
+	verify(!section3->IsEmpty());
+	section3->Clear();
+	verify( section3->IsEmpty());
+}
+
+subtest prepare_duplicate_incorporate(PrefsSectionInternal **p1, PrefsSectionInternal **p2)
+{
+	*p1 = OP_NEW(PrefsSectionInternal, ());
+	verify(*p1);
+	TRAPD(rc, (*p1)->ConstructL(UNI_L("Source")));
+	verify(OpStatus::IsSuccess(rc));
+
+	*p2 = OP_NEW(PrefsSectionInternal, ());
+	verify(*p2);
+	TRAP(rc, (*p2)->ConstructL(UNI_L("Compare")));
+	verify(OpStatus::IsSuccess(rc));
+
+	/* Enter keys */
+	iterate(key, value) from testdata
+	{
+		TRAP(rc, (*p1)->SetL(key, value));
+		verify(OpStatus::IsSuccess(rc));
+	}
+	iterate(key, value) from testdata2
+	{
+		TRAP(rc, (*p2)->SetL(key, value));
+		verify(OpStatus::IsSuccess(rc));
+	}
+
+}
+
+subtest test_deleteduplicates(BOOL identical)
+{
+	/* Set up */
+	PrefsSectionInternal *source = NULL;
+	PrefsSectionInternal *compare = NULL;
+	verify(prepare_duplicate_incorporate(&source, &compare));
+
+	source->DeleteDuplicates(compare, identical);
+	verify(!source->Get(UNI_L("Empty"))); /* Only identical entry */
+
+	/* Different values */
+	if (identical)
+	{
+		verify( source->Get(UNI_L("Key 1")) );
+	}
+	else
+	{
+		verify(!source->Get(UNI_L("Key 1")) );
+	}
+}
+finally
+{
+	OP_DELETE(source);
+	OP_DELETE(compare);
+}
+
+test("PrefsSectionInternal::DeleteDuplicates() all")
+	require success "Setup";
+{
+	verify(test_deleteduplicates(FALSE));
+}
+
+test("PrefsSectionInternal::DeleteDuplicates() identical")
+	require success "Setup";
+{
+	verify(test_deleteduplicates(TRUE));
+}
+
+test("PrefsSectionInternal::IncorporateL()")
+	require success "Setup";
+{
+	/* Set up */
+	PrefsSectionInternal *source = NULL;
+	PrefsSectionInternal *other = NULL;
+	verify(prepare_duplicate_incorporate(&source, &other));
+
+	TRAPD(rc, source->IncorporateL(other));
+	verify(other->IsEmpty());
+	verify(source->Get(UNI_L("Key 1")));
+	verify(source->Get(UNI_L("Key 2")));
+	verify(source->Get(UNI_L("Key 3")));
+}
+finally
+{
+	OP_DELETE(source);
+	OP_DELETE(other);
+}
+
+test("PrefsSectionInternal::HashableName()")
+	require success "Setup";
+	require PREFSMAP_SECTION_HASH;
+{
+	PrefsSectionInternal *samename = NULL;
+	samename = OP_NEW(PrefsSectionInternal, ());
+	verify(samename);
+
+#ifdef PREFSMAP_USE_CASE_SENSITIVE
+	TRAPD(rc, samename->ConstructL(UNI_L("My Section")));
+#else
+	TRAPD(rc, samename->ConstructL(UNI_L("mY sEcTiOn")));
+#endif
+	verify(OpStatus::IsSuccess(rc));
+
+	verify(samename->HashableName());
+	verify(section1->HashableName());
+	verify(uni_strcmp(samename->HashableName(), section1->HashableName()) == 0);
+}
+finally
+{
+	OP_DELETE(samename);
+}
+
+test("PrefsSectionInternal::Suc()")
+	require success "Setup";
+{
+	verify(section1->Suc() == section2);
+}
+
+// -- Global cleanup -----------------------------------------------------
+
+exit
+{
+	if (section1) section1->Out();
+	OP_DELETE(section1);
+	if (section2) section2->Out();
+	OP_DELETE(section2);
+	if (section3) section3->Out();
+	OP_DELETE(section3);
+	if (section4) section4->Out();
+	OP_DELETE(section4);
+}

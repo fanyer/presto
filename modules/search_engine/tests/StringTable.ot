@@ -1,0 +1,2361 @@
+group "search_engine.stringtable";
+
+require SEARCH_ENGINE;
+
+include "modules/search_engine/StringTable.h";
+include "modules/util/opfile/opfile.h";
+include "modules/search_engine/tests/test_util.h";
+include "modules/search_engine/tests/LogPlayer.h";
+include "modules/search_engine/BlockStorage.h";
+
+global
+{
+class EmlParser
+{
+	OpFile *f;
+	OpString8 buf;
+	unsigned char *ptr, *end;
+public:
+	EmlParser(void) {f = NULL;}
+	void Construct(const uni_char *fname);
+	void Construct(const char *fname) { OpString ufname; ufname.Set(fname); Construct(ufname.CStr()); }
+	void Close(void);
+	char *ReadWord(void);
+	void StripString(OpString8 &str);
+};
+
+void EmlParser::StripString(OpString8 &str)
+{
+	if (str.CStr() != NULL)
+	{
+		char *p = str.CStr() + op_strlen(str.CStr()) - 1;
+		while (p >= str.CStr() && op_isspace(*(unsigned char *) p))
+			str.Delete((int)((p--) - str.CStr()));
+	}
+}
+
+void EmlParser::Construct(const uni_char *fname)
+{
+	f = OP_NEW(OpFile, ());
+	f->Construct(fname);
+	if (f->Open(OPFILE_READ | OPFILE_TEXT) != OpStatus::OK)
+	{
+		OP_DELETE(f);
+		f = NULL;
+		OP_ASSERT(0);
+		return;
+	}
+
+	if (f->Eof())
+	{
+		f->Close();
+		OP_DELETE(f);
+		f = NULL;
+		return;
+	}
+
+	do {
+		f->ReadLine(buf);
+		StripString(buf);
+		if (buf.Find("multipart") != -1)
+		{
+			f->Close();
+			OP_DELETE(f);
+			f = NULL;
+			return;
+		}
+	} while (!buf.IsEmpty() && !f->Eof());
+
+	if (f->Eof())
+	{
+		f->Close();
+		OP_DELETE(f);
+		f = NULL;
+		return;
+	}
+}
+
+char *EmlParser::ReadWord(void)
+{
+	unsigned char *start;
+	signed char *check;
+
+	if (f == NULL)
+		return NULL;
+
+	do {
+		do {
+			while (buf.IsEmpty() || ptr >= end)
+			{
+				f->ReadLine(buf);
+				if (f->Eof())
+				{
+					f->Close();
+					OP_DELETE(f);
+					f = NULL;
+					return NULL;
+				}
+				if ((ptr = (unsigned char *)buf.CStr()) != NULL)
+					end = ptr + op_strlen((char *)ptr);
+				else end = NULL;
+			}
+
+			while (ptr < end && *ptr < 0x80 && !op_isalnum(*ptr))
+				++ptr;
+		} while (ptr >= end);
+
+		start = ptr;
+		while (*ptr >= 0x80 || op_isalnum(*ptr))
+			++ptr;
+
+		*ptr = 0;
+
+		check = (signed char *)start;  // allow UTF-8 or ASCII
+
+		while (*check != 0)
+		{
+			if (*check  > 0)
+			{
+				++check;
+				continue;
+			}
+
+			if ((*check & 0xC0) == 0x80 && (check == (signed char*)start || check[-1] > 0))
+				break;
+			if ((*check & 0xC0) == 0xC0 && (check[1] & 0xC0) != 0x80)
+				break;
+			if ((*check & 0xF8) == 0xF8)
+				break;
+
+			++check;
+		}
+	} while (*check != 0);
+
+	return (char *)start;
+}
+
+void EmlParser::Close(void)
+{
+	if (f != NULL)
+	{
+		f->Close();
+		OP_DELETE(f);
+	}
+
+	buf.Empty();
+}
+
+class BWP
+{
+public:
+	static BOOL CompareString(const void *left, const void *right)
+	{
+		return uni_strcmp(*(uni_char **)left, *(uni_char **)right) > 0;
+	}
+};
+
+}
+
+table EmailTestFiles (const char *) filelist "data/eml/";
+
+
+test("big write preformance") disabled;
+	file uni data      "data";
+	file uni perf_ax   "data/perf.axx";
+	file uni perf_bx   "data/perf.bx";
+	file uni perf_ax_j "data/perf.axx-j";
+	file uni perf_bx_j "data/perf.bx-j";
+	file uni perf_ax_g "data/perf.axx-g";
+	file uni perf_bx_g "data/perf.bx-g";
+{
+	TVector<uni_char *> wlist1(&PtrDescriptor<uni_char>::DestructArray),
+		wlist2(&PtrDescriptor<uni_char>::DestructArray);
+	TVector<uni_char *>email(&(BWP::CompareString));
+	StringTable st;
+	int favg, fmin, fmax, empty, branch_total;
+	int distributions[10], counts[10];
+	int i, j, len, pos;
+	uni_char *word;
+	time_t start;
+	unsigned long aindex_reads = 0, aindex_cached = 0, bindex_reads = 0, bindex_cached = 0;
+	int tmp_areads, tmp_acached, tmp_breads, tmp_bcached;
+	
+#define NUM_MAILS 100
+#define NUM_WORDS 20000
+#define NUM_COMMIT 100
+		
+	for (i = 0; i < NUM_WORDS; ++i)
+	{
+		len = op_rand() % 20 + 1;
+		word = OP_NEWA(uni_char, len + 1);
+		word[len--] = 0;
+		while (len >= 0)
+			word[len--] = op_rand() % ('z' - 'a') + 'a';
+			
+		wlist1.Add(word);
+	}
+/*	for (i = 0; i < 10000; ++i)
+	{
+		word = OP_NEWA(uni_char, uni_strlen(wlist1[i]) + 1);
+		uni_strcpy(word, wlist1[i]);
+		wlist2.Add(word);
+	}*/
+	for (i = 0; i < NUM_WORDS / 2; ++i)
+	{
+		len = op_rand() % 20 + 1;
+		word = OP_NEWA(uni_char, len + 1);
+		word[len--] = 0;
+		while (len >= 0)
+			word[len--] = op_rand() % ('z' - 'a') + 'a';
+			
+		wlist2.Add(word);
+
+		word = OP_NEWA(uni_char, uni_strlen(wlist1[i]) + 1);
+		uni_strcpy(word, wlist1[i]);
+		wlist2.Add(word);
+	}
+
+	delete_file(perf_ax);
+	delete_file(perf_bx);
+	delete_file(perf_ax_j);
+	delete_file(perf_bx_j);
+	delete_file(perf_ax_g);
+	delete_file(perf_bx_g);
+	
+	st.Open(data, UNI_L("perf"));
+
+	op_time(&start);
+	
+	pos = 0;
+	for (i = 0; i < NUM_MAILS; ++i)
+	{
+		len = op_rand() % 300 + 100;
+		while (--len >= 0)
+		{
+			tmp_areads = st.GetACT()->branches_read;
+			tmp_acached = st.GetACT()->branches_cached;
+			tmp_breads = st.GetBT()->branches_read;
+			tmp_bcached = st.GetBT()->branches_cached;
+			
+			st.Insert(wlist1[pos], i);
+			
+			aindex_reads += st.GetACT()->branches_read - tmp_areads;
+			aindex_cached += st.GetACT()->branches_cached - tmp_acached;
+			bindex_reads += st.GetBT()->branches_read - tmp_breads;
+			bindex_cached += st.GetBT()->branches_cached - tmp_bcached;
+			
+			pos = (pos + 1) % wlist1.GetCount();
+		}
+			
+		if (i % NUM_COMMIT == NUM_COMMIT - 1)
+			st.PreFlush();
+		if (i > NUM_COMMIT && i % NUM_COMMIT == 24)
+			st.Flush();
+		if (i > NUM_COMMIT && i % NUM_COMMIT == 39)
+			st.Commit();
+	}
+	
+	st.Commit();
+	output("\n%i ", op_time(NULL) - start);
+	
+	output("\nA reads: %i / %i\n", aindex_reads, st.GetACT()->branches_read);
+	output("A cached: %i / %i\n", aindex_cached, st.GetACT()->branches_cached);
+	output("A writes: %i (%i created)\n", st.GetACT()->branches_written, st.GetACT()->branches_created);
+	
+	output("\nB reads: %i / %i\n", bindex_reads, st.GetBT()->branches_read);
+	output("B cached: %i / %i\n", bindex_cached, st.GetBT()->branches_cached);
+	output("B writes: %i (%i created)\n", st.GetBT()->branches_written, st.GetBT()->branches_created);
+	
+	branch_total = st.GetACT()->GetFillFactor(&favg, &fmin, &fmax, &empty, 0);
+	output("Total fill factor (%% of space used): %i%%, minimum: %i%%, maximum: %i%%, deleted: %i%% / %i\n", favg, fmin, fmax, empty, branch_total); 
+
+	branch_total = st.GetACT()->GetFillFactor(&favg, &fmin, &fmax, &empty, 1);
+	output("Parent fill factor (%% of space used): %i%%, minimum: %i%%, maximum: %i%%, deleted: %i%% / %i\n", favg, fmin, fmax, empty, branch_total); 
+
+	branch_total = st.GetACT()->GetFillFactor(&favg, &fmin, &fmax, &empty, 2);
+	output("Children fill factor (%% of space used): %i%%, minimum: %i%%, maximum: %i%%, deleted: %i%% / %i\n", favg, fmin, fmax, empty, branch_total); 
+
+	st.GetACT()->GetFillDistribution(distributions, counts, sizeof(distributions) / sizeof(int), &branch_total);
+	output("%i branches parsed\n", branch_total);
+	for (i = 0; i < (int)(sizeof(distributions) / sizeof(int)); ++i)
+	{
+		output("Fill at level %i: %i%%%% / %i\n", i, distributions[i], counts[i]);
+	}
+
+	st.Close();
+
+	st.GetACT()->branches_read = 0;
+	st.GetACT()->branches_created = 0;
+	st.GetACT()->branches_cached = 0;
+	st.GetACT()->branches_written = 0;
+	st.GetACT()->flush_count = 0;
+
+	st.GetBT()->branches_read = 0;
+	st.GetBT()->branches_created = 0;
+	st.GetBT()->branches_cached = 0;
+	st.GetBT()->branches_written = 0;
+	st.GetBT()->flush_count = 0;
+
+	aindex_reads = 0;
+	aindex_cached = 0;
+	bindex_reads = 0;
+	bindex_cached = 0;
+	
+	st.Open(data, UNI_L("perf"));
+
+	op_time(&start);
+	
+	pos = 0;
+	for (i = NUM_MAILS; i < NUM_MAILS * 2; ++i)
+	{
+		len = op_rand() % 300 + 100;
+		j = len;
+
+		email.Clear();
+		while (--j > 0)
+		{
+			email.Add(wlist2[pos]);
+			pos = (pos + 1) % wlist2.GetCount();
+		}
+		email.Sort();
+		len = email.GetCount();
+
+		while (--len >= 0)
+		{
+			tmp_areads = st.GetACT()->branches_read;
+			tmp_acached = st.GetACT()->branches_cached;
+			tmp_breads = st.GetBT()->branches_read;
+			tmp_bcached = st.GetBT()->branches_cached;
+			
+			st.Insert(email[len], i);
+//			st.Insert(wlist2[pos], i);
+			
+			aindex_reads += st.GetACT()->branches_read - tmp_areads;
+			aindex_cached += st.GetACT()->branches_cached - tmp_acached;
+			bindex_reads += st.GetBT()->branches_read - tmp_breads;
+			bindex_cached += st.GetBT()->branches_cached - tmp_bcached;
+			
+			pos = (pos + 1) % wlist2.GetCount();
+		}
+			
+		if (i % NUM_COMMIT == NUM_COMMIT - 1)
+			st.PreFlush();
+		if (i > NUM_COMMIT && i % NUM_COMMIT == 24)
+			st.Flush();
+		if (i > NUM_COMMIT && i % NUM_COMMIT == 39)
+			st.Commit();
+	}
+	
+	
+	st.Commit();
+	output("\n%i ", op_time(NULL) - start);
+	
+	output("\nA reads: %i / %i\n", aindex_reads, st.GetACT()->branches_read);
+	output("A cached: %i / %i\n", aindex_cached, st.GetACT()->branches_cached);
+	output("A writes: %i (%i created)\n", st.GetACT()->branches_written, st.GetACT()->branches_created);
+	
+	output("\nB reads: %i / %i\n", bindex_reads, st.GetBT()->branches_read);
+	output("B cached: %i / %i\n", bindex_cached, st.GetBT()->branches_cached);
+	output("B writes: %i (%i created)\n", st.GetBT()->branches_written, st.GetBT()->branches_created);
+	
+	branch_total = st.GetACT()->GetFillFactor(&favg, &fmin, &fmax, &empty, 0);
+	output("Total fill factor (%% of space used): %i%%, minimum: %i%%, maximum: %i%%, deleted: %i%% / %i\n", favg, fmin, fmax, empty, branch_total); 
+
+	branch_total = st.GetACT()->GetFillFactor(&favg, &fmin, &fmax, &empty, 1);
+	output("Parent fill factor (%% of space used): %i%%, minimum: %i%%, maximum: %i%%, deleted: %i%% / %i\n", favg, fmin, fmax, empty, branch_total); 
+
+	branch_total = st.GetACT()->GetFillFactor(&favg, &fmin, &fmax, &empty, 2);
+	output("Children fill factor (%% of space used): %i%%, minimum: %i%%, maximum: %i%%, deleted: %i%% / %i\n", favg, fmin, fmax, empty, branch_total); 
+
+	st.GetACT()->GetFillDistribution(distributions, counts, sizeof(distributions) / sizeof(int), &branch_total);
+	output("%i branches parsed\n", branch_total);
+	for (i = 0; i < (int)(sizeof(distributions) / sizeof(int)); ++i)
+	{
+		output("Fill at level %i: %i%%%% / %i\n", i, distributions[i], counts[i]);
+	}
+
+	st.Close();
+	
+	delete_file(perf_ax);
+	delete_file(perf_bx);
+}
+
+test("player") require SEARCH_ENGINE_LOG; disabled;
+	file uni data         "data";
+	file uni lexicon_ax   "data/lexicon.axx";
+	file uni lexicon_bx   "data/lexicon.bx";
+	file uni lexicon_ax_j "data/lexicon.axx-j";
+	file uni lexicon_bx_j "data/lexicon.bx-j";
+	file uni lexicon_ax_g "data/lexicon.axx-g";
+	file uni lexicon_bx_g "data/lexicon.bx-g";
+	file uni lexicon_log  "data/lexicon.log";
+	file uni ilexicon_log "data/ilexicon.log";
+{
+#if (SEARCH_ENGINE_LOG & SEARCH_ENGINE_LOG_STRINGTABLE)
+	StringTable t;
+	StringTablePlayer player;
+
+	t.Open(data, UNI_L("lexicon"));
+	OP_ASSERT(t.CheckConsistency() == OpBoolean::IS_TRUE);  // this should fail on invalid indexes
+	t.Close();
+
+	delete_file(lexicon_ax);
+	delete_file(lexicon_bx);
+	delete_file(lexicon_ax_j);
+	delete_file(lexicon_bx_j);
+	delete_file(lexicon_ax_g);
+	delete_file(lexicon_bx_g);
+	delete_file(lexicon_log);
+
+	verify_success(player.Play(t, data, UNI_L("lexicon"), ilexicon_log));
+#endif
+}
+
+test("StringTable overall")
+	file uni data       "data";
+	file uni table_ax   "data/table.axx";
+	file uni table_bx   "data/table.bx";
+	file uni table_ax_j "data/table.axx-j";
+	file uni table_bx_j "data/table.bx-j";
+{
+	StringTable t;
+	OpINT32Vector search_result, multi_result;
+
+	delete_file(table_ax);
+	delete_file(table_bx);
+	delete_file(table_ax_j);
+	delete_file(table_bx_j);
+
+	verify_success(t.Open(data, UNI_L("table")));
+	verify_success(t.Clear());
+
+	verify_success(t.Insert(UNI_L("wordA1"), 1));
+	verify_success(t.Insert(UNI_L("wordA2"), 1));
+	verify_success(t.Insert(UNI_L("wordA1"), 1));
+	verify_success(t.Insert(UNI_L("wordA1"), 2));
+	verify_success(t.Insert(UNI_L("wordA3"), 2));
+	verify_success(t.Insert(UNI_L("wordA1"), 3));
+	verify_success(t.Insert(UNI_L("wordB1"), 3));
+	verify_success(t.Insert(UNI_L("wordA2"), 3));
+
+	verify_success(t.Delete(UNI_L("wordA1"), 3));
+
+	verify_success(t.Commit());
+
+	verify_success(t.Delete(UNI_L("wordA2"), 3));
+
+	verify_success(t.Insert(UNI_L("wordA4"), 4));
+	verify_success(t.Insert(UNI_L("wordA5"), 5));
+	verify_success(t.Delete(UNI_L("wordA5"), 5));
+	verify_success(t.Insert(UNI_L("wordA6"), 6));
+
+	/* the contents of t is now:
+	  wordA1 1 2
+	  wordA2 1
+	  wordA3   2
+	  wordB1     3
+	  wordA4       4
+	  wordA6           6
+	*/
+
+	verify_success(t.Search(UNI_L("wordA"), &search_result, 8));
+
+	verify_success(t.MultiSearch(UNI_L("WoRdA1; worda3,worda6;"), &multi_result, TRUE, 0));
+
+	verify_success(t.Close());
+
+	delete_file(table_ax);
+	delete_file(table_bx);
+
+	verify(search_result.GetCount() == 4);
+	verify(search_result.Find(1) != -1 && search_result.Find(2) != -1 && search_result.Find(4) != -1 && search_result.Find(6) != -1);
+
+	verify(multi_result.GetCount() == 3);
+	verify(multi_result.Find(1) != -1 && multi_result.Find(2) != -1 && multi_result.Find(6) != -1);
+}
+
+test("StringTable MultiBlock")
+	file uni data       "data";
+	file uni table_ax   "data/table.axx";
+	file uni table_bx   "data/table.bx";
+	file uni table_ax_j "data/table.axx-j";
+	file uni table_bx_j "data/table.bx-j";
+{
+	StringTable t;
+	OpINT32Vector multi_result;
+
+	delete_file(table_ax);
+	delete_file(table_bx);
+	delete_file(table_ax_j);
+	delete_file(table_bx_j);
+
+	verify_success(t.Open(data, UNI_L("table")));
+	verify_success(t.Clear());
+
+	verify_success(t.InsertBlock(UNI_L("Soon you won't have to smuggle your DS browser from Japan! With a release date scheduled for October 6, 2006, DS\n fans"), 1));
+	verify_success(t.InsertBlock(UNI_L("DS fans will soon be browsing the Internet with Opera at WiFi hotspots all over Europe. Let the countdown begin."), 2));
+
+	verify_success(t.Commit());
+
+	verify_success(t.MultiSearch(UNI_L("\r\n/DS ;fans"), &multi_result, FALSE, 0));
+
+	verify_success(t.Close());
+
+	delete_file(table_ax);
+	delete_file(table_bx);
+
+	verify(multi_result.GetCount() == 2);
+	verify(multi_result.Get(0) != multi_result.Get(1));
+}
+
+test("StringTable MultiBlock with phrases")
+	require SEARCH_ENGINE_PHRASESEARCH;
+	file uni data       "data";
+	file uni table_ax   "data/table.axx";
+	file uni table_bx   "data/table.bx";
+	file uni table_ax_j "data/table.axx-j";
+	file uni table_bx_j "data/table.bx-j";
+{
+	StringTable t;
+	OpINT32Vector multi_result;
+	class TestDocumentSource: public OpVector<OpStringC16>, public DocumentSource<INT32>
+	{
+	public:
+		const uni_char *GetDocument(const INT32& item) {
+			return Get((UINT32)item)->CStr();
+		}
+	} documents;
+	const int num_queries = 6;
+	const uni_char *queries[num_queries];
+	UINT32 matches[num_queries];
+	int i,j;
+
+	delete_file(table_ax);
+	delete_file(table_bx);
+	delete_file(table_ax_j);
+	delete_file(table_bx_j);
+
+	verify_success(t.Open(data, UNI_L("table")));
+	verify_success(t.Clear());
+
+	documents.Insert(0, OP_NEW(OpStringC16, (UNI_L("Soon you won't have to smuggle your DS browser from Japan! With a release date scheduled for October 6, 2006, DS\n fans"))));
+	documents.Insert(1, OP_NEW(OpStringC16, (UNI_L("Soon you won't have to smuggle your DS browser from Japan. With a release date scheduled for October 6, 2006, D.S. fans"))));
+	documents.Insert(2, OP_NEW(OpStringC16, (UNI_L("DS fans will soon be browsing the Internet with Opera at WiFi hotspots all over Europe. Let the countdown begin."))));
+	documents.Insert(3, OP_NEW(OpStringC16, (UNI_L("People wouldn't like a DS with a fan, since it would be noisy"))));
+
+	queries[0] = UNI_L("\r\nwon't you Japan!");
+	queries[1] = UNI_L("\"Opera Internet\"");
+	queries[2] = UNI_L("\"fans DS\"");
+	queries[3] = UNI_L("\"DS fans\"");
+	queries[4] = UNI_L("DS fan "); // Last word should not be considered prefix
+	queries[5] = UNI_L("[with]"); // All documents have the word, so the cutoff limit of 3 should turn phrase matching off
+
+	matches[0] = (1<<0);
+	matches[1] = 0;
+	matches[2] = 0;
+	matches[3] = (1<<0)+(1<<2);
+	matches[4] = (1<<3);
+	matches[5] = (1<<0)+(1<<1)+(1<<2)+(1<<3);
+
+	for (i=0; i<(int)documents.GetCount(); i++)
+		verify_success(t.InsertBlock(documents.GetDocument(i), i));
+
+	verify_success(t.Commit());
+
+	t.ConfigurePhraseSearch(&documents, 3);
+
+	for (i=0; i<num_queries; i++)
+	{
+		for (int method = 0; method <= 1; method++)
+		{
+			if (method == 0)
+				verify_success(t.MultiSearch(queries[i], &multi_result, FALSE, 0, PhraseMatcher::AllPhrases));
+			else
+			{
+				multi_result.Clear();
+				SearchIterator<INT32>* it = t.PhraseSearch(queries[i], 0, PhraseMatcher::AllPhrases);
+				verify_not_oom(it);
+				verify_success(it->Error());
+				while (!it->End())
+				{
+					multi_result.Add(it->Get());
+					it->Next();
+					verify_success(it->Error());
+				}
+				OP_DELETE(it);
+			}
+			for (j=0; j<(int)documents.GetCount(); j++)
+			{
+				if ((matches[i] & (1<<j)) != 0)
+					verify(multi_result.Find(j) != -1);
+				else
+					verify(multi_result.Find(j) == -1);
+			}
+		}
+	}
+
+	verify_success(t.Close());
+
+	delete_file(table_ax);
+	delete_file(table_bx);
+}
+finally
+{
+	documents.DeleteAll();
+}
+
+test("StringTable performance") disabled;
+	file uni data           "data";
+	file uni stringtable_ax "data/stringtable.axx";
+	file uni stringtable_bx "data/stringtable.bx";
+	file uni f18261         "data/18261";
+{
+	StringTable t;
+	OpINT32Vector search_result;
+	EmlParser parser;
+	OpFolderLister *dirfiles;
+	int i, j, errors;
+	unsigned w;
+	OpString uni_word;
+	char *word;
+	time_t istart, sstart;
+
+	errors = 0;
+
+	delete_file(stringtable_ax);
+	delete_file(stringtable_bx);
+
+	dirfiles = OpFile::GetFolderLister(OPFILE_ABSOLUTE_FOLDER, UNI_L("*"), f18261);
+	verify(dirfiles != NULL);
+
+	t.Open(data, UNI_L("stringtable"));
+	t.Clear();
+
+	sstart = op_time(NULL);
+
+	i = 0;
+	w = 0;
+	while (dirfiles->Next())
+	{
+		if (dirfiles->IsFolder())
+			continue;
+
+		parser.Construct(dirfiles->GetFullPath());
+
+		while ((word = parser.ReadWord()) != NULL)
+		{
+			++w;
+			uni_word.Set(word);
+			if (t.Insert(uni_word.CStr(), i) != OpStatus::OK)
+				++errors;
+		}
+
+		++i;
+
+		if (i % 200 == 0)
+			t.Flush();
+	}
+
+	t.Close();
+
+	output("\nindexing %i files (%u words) took %i s\n", i, w, op_time(NULL) - sstart);
+
+	OP_DELETE(dirfiles);
+
+	verify(errors == 0);
+
+	dirfiles = OpFile::GetFolderLister(OPFILE_ABSOLUTE_FOLDER, UNI_L("*"), f18261);
+
+	t.Open(data, UNI_L("stringtable"));
+
+	istart = op_time(NULL);
+
+	i = 0;
+	w = 0;
+
+	while (dirfiles->Next())
+	{
+		if (dirfiles->IsFolder())
+			continue;
+
+		parser.Construct(dirfiles->GetFullPath());
+
+		while ((word = parser.ReadWord()) != NULL)
+		{
+			++w;
+			uni_word.Set(word);
+			search_result.Clear();
+			t.Search(uni_word.CStr(), &search_result);
+
+			j = search_result.Search(i);
+
+			if (j >= (int)search_result.GetCount() || search_result.Get(j) != i)
+				++errors;
+		}
+
+		++i;
+	}
+
+	t.Close();
+
+	output("\nsearching %i files (%u words) took %i s\n", i, w, op_time(NULL) - istart);
+
+	parser.Close();
+
+	OP_DELETE(dirfiles);
+
+	delete_file(stringtable_ax);
+	delete_file(stringtable_bx);
+
+	verify(errors == 0);
+}
+
+test("StringTable response") require _WIN32; disabled;  // requires _WIN32 just because of Sleep()
+	file uni data       "data";
+	file uni st_resp_ax "data/st_resp.axx";
+	file uni st_resp_bx "data/st_resp.bx";
+	file uni f18261     "data/18261";
+{
+	StringTable t;
+	OpINT32Vector search_result;
+	EmlParser parser;
+	OpFolderLister *dirfiles, *delfiles;
+	int i, j, errors;
+	unsigned w;
+	OpString uni_word;
+	char *word;
+	time_t sstart, send;
+	double end_t, start_t, end2_t, start2_t;
+	int ms_average, ms_min, ms_max, ms_faverage, ms_fmin, ms_fmax, flush_count;
+	int wcount, icount, dcount;
+
+	errors = 0;
+
+	ms_average = 0;
+	ms_min = 1000000;
+	ms_max = 0;
+	ms_faverage = 0;
+	ms_fmin = 1000000;
+	ms_fmax = 0;
+	flush_count = 0;
+
+	delete_file(st_resp_ax);
+	delete_file(st_resp_bx);
+
+	dirfiles = OpFile::GetFolderLister(OPFILE_ABSOLUTE_FOLDER, UNI_L("*"), f18261);
+	delfiles = OpFile::GetFolderLister(OPFILE_ABSOLUTE_FOLDER, UNI_L("*"), f18261);
+	verify(dirfiles != NULL);
+
+	t.Open(data, UNI_L("st_resp"));
+	t.Clear();
+
+	i = 0;
+	w = 0;
+	while (dirfiles->Next() && i <= 2000)
+	{
+		if (dirfiles->IsFolder())
+			continue;
+
+		parser.Construct(dirfiles->GetFullPath());
+
+		while ((word = parser.ReadWord()) != NULL)
+		{
+			uni_word.Set(word);
+			if (t.Insert(uni_word.CStr(), i) != OpStatus::OK)
+				++errors;
+		}
+
+		++i;
+
+		if (i % 200 == 0)
+			t.Flush();
+	}
+
+	t.Flush();
+
+	while (delfiles->IsFolder())
+		delfiles->Next();
+
+	output("\n");
+
+	sstart = op_time(NULL);
+
+	while (dirfiles->Next() && i <= 12000)
+	{
+		if (dirfiles->IsFolder())
+			continue;
+
+		if ((op_rand() & 1) == 0)
+			delfiles->Next();
+
+		while (delfiles->IsFolder())
+			delfiles->Next();
+
+		parser.Construct(dirfiles->GetFullPath());
+
+		while ((word = parser.ReadWord()) != NULL)
+		{
+			++w;
+			uni_word.Set(word);
+			if (t.Insert(uni_word.CStr(), i) != OpStatus::OK)
+				++errors;
+		}
+
+/*		if (op_rand() % 25 == 0)
+		{
+			for (j = 4 + op_rand() % 16; j >= 0; --j)
+			{
+				parser.Construct(delfiles->GetFullPath());
+
+				while ((word = parser.ReadWord()) != NULL)
+				{
+					++w;
+					uni_word.Set(word);
+					if (t.Delete(uni_word.CStr(), i) != OpStatus::OK)
+						++errors;
+				}
+
+				delfiles->Next();
+
+				if ((op_rand() % 4) == 0)
+					delfiles->Next();
+
+				while (delfiles->IsFolder())
+					delfiles->Next();
+			}
+		}
+
+		if (op_rand() % 120 == 0)
+		{
+			parser.Construct(dirfiles->GetFullPath());
+
+			while ((word = parser.ReadWord()) != NULL)
+			{
+				++w;
+				uni_word.Set(word);
+				if (t.Delete(uni_word.CStr(), i) != OpStatus::OK)
+					++errors;
+			}
+		}*/
+
+		if (op_rand() % 50 == 0)
+			t.Search(UNI_L("and"), &search_result);
+
+		++i;
+
+		if (i % 200 == 0)
+		{
+/*			t.ResetFlushCounters();
+			wcount = t.CacheWordCount();
+			t.ItemCount(&icount, &dcount);
+*/
+
+			start_t = g_op_time_info->GetRuntimeMS();
+			t.PreFlush();
+			end_t = (g_op_time_info->GetRuntimeMS() - start_t);
+
+			Sleep(30000);
+
+			start2_t = g_op_time_info->GetRuntimeMS();
+			t.Flush();
+			end2_t = g_op_time_info->GetRuntimeMS() - start2_t;
+
+			++flush_count;
+			ms_average += end_t;
+			if (end_t < ms_min)
+				ms_min = end_t;
+			if (end_t > ms_max)
+				ms_max = end_t;
+
+			ms_faverage += end2_t;
+			if (end2_t < ms_fmin)
+				ms_fmin = end2_t;
+			if (end2_t > ms_fmax)
+				ms_fmax = end2_t;
+
+/*			output("Flush %2i: %8i ms (%i+%i flushes, %i words, %i/%i items) (sm %i, b %i, a %i, ac %i, lf %i, c %i, r %i)\n",
+				(i - 2000) / 200, end_t  * 1000 / CLOCKS_PER_SEC, t.AFlushes(), t.BFlushes(),
+				wcount, icount, dcount,
+				t.fsortmerge - t.flush_start, t.fbtree - t.fsortmerge, t.fact - t.fbtree, t.factcom - t.fact,
+				t.fbflush - t.factcom, t.fcommit - t.fbflush, t.fremove - t.fcommit);
+*/
+			output("Flush %2i: %8i/%8i ms\n", (i - 2000) / 200, end_t, end2_t );
+		}
+
+
+	}
+
+	t.Close();
+
+	send = op_time(NULL);
+
+	ms_average = ms_average / flush_count;
+	ms_faverage = ms_faverage / flush_count;
+
+	output("\nIndexing/unindexing %u words took %i s\n", w, send - sstart);
+	output("Average preflush time: %8i ms\n", ms_average);
+	output("Minimal preflush time: %8i ms\n", ms_min);
+	output("Maximal preflush time: %8i ms\n", ms_max);
+
+	output("Average flush time: %8i ms\n", ms_faverage);
+	output("Minimal flush time: %8i ms\n", ms_fmin);
+	output("Maximal flush time: %8i ms\n", ms_fmax);
+
+	OP_DELETE(dirfiles);
+
+	delete_file(st_resp_ax);
+	delete_file(st_resp_bx);
+
+	verify(errors == 0);
+}
+
+test("endian conversion")
+	file uni data            "data";
+	file uni eml             "data/eml";
+	file uni endianMAC_act   "data/endianMAC.act";
+	file uni endianMAC_bt    "data/endianMAC.bt";
+	file uni endianWIN32_act "data/endianWIN32.act";
+	file uni endianWIN32_bt  "data/endianWIN32.bt";
+	file uni endianMAC_act   "data/endianMAC.act";
+	file uni endianMAC_bt    "data/endianMAC.bt";
+	file uni endian_ax       "data/endian.axx";
+	file uni endian_bx       "data/endian.bx";
+{
+	StringTable t;
+	OpINT32Vector search_result;
+	EmlParser parser;
+	OpFolderLister *dirfiles;
+	int i, j, errors;
+	OpString uni_word;
+	char *word;
+
+#ifdef OPERA_BIG_ENDIAN
+	if (BlockStorage::FileExists(endianMAC_act) != OpBoolean::IS_TRUE ||
+		BlockStorage::FileExists(endianMAC_bt) != OpBoolean::IS_TRUE)
+#else
+	if (BlockStorage::FileExists(endianWIN32_act) != OpBoolean::IS_TRUE ||
+		BlockStorage::FileExists(endianWIN32_bt) != OpBoolean::IS_TRUE)
+#endif
+	{
+		output("\ndata/endian* not found, aborting ...");
+		errors = 0;
+	}
+	else {
+#ifdef OPERA_BIG_ENDIAN
+		copy_file(endianMAC_act, endian_ax);
+		copy_file(endianMAC_bt, endian_bx);
+#else
+		copy_file(endianWIN32_act, endian_ax);
+		copy_file(endianWIN32_bt, endian_bx);
+#endif
+
+/*		dirfiles = OpFile::GetFolderLister(OPFILE_ABSOLUTE_FOLDER, UNI_L("*"), eml);
+		t.Open(data, UNI_L("endian"));
+		t.Clear();
+
+		i = 0;
+		while (dirfiles->Next())
+		{
+			if (dirfiles->IsFolder())
+				continue;
+
+			parser.Construct(dirfiles->GetFullPath());
+
+			while ((word = parser.ReadWord()) != NULL)
+			{
+				uni_word.Set(word);
+				t.Insert(uni_word.CStr(), uni_atoi(dirfiles->GetFileName()));
+			}
+
+			++i;
+		}
+
+		t.Commit();
+
+		// comment lines if (IsNativeEndian()) return OpStatus::OK; in BlockStorage::ToNativeEndian to do this
+		t.ToNativeEndian();
+
+		t.Close();
+
+		OP_DELETE(dirfiles);*/
+
+		dirfiles = OpFile::GetFolderLister(OPFILE_ABSOLUTE_FOLDER, UNI_L("*"), eml);
+
+		verify_success(t.Open(data, UNI_L("endian")));
+
+		i = 0;
+		errors = 0;
+		while (dirfiles->Next())
+		{
+			if (dirfiles->IsFolder())
+				continue;
+
+			parser.Construct(dirfiles->GetFullPath());
+
+			while ((word = parser.ReadWord()) != NULL)
+			{
+				uni_word.Set(word);
+				search_result.Clear();
+				verify_success(t.Search(uni_word.CStr(), &search_result));
+
+				j = search_result.Search(uni_atoi(dirfiles->GetFileName()));
+
+				if (j >= (int)search_result.GetCount() || search_result.Get(j) != uni_atoi(dirfiles->GetFileName()))
+					++errors;
+			}
+
+			++i;
+		}
+
+		verify_success(t.Close());
+
+		parser.Close();
+
+		OP_DELETE(dirfiles);
+
+		delete_file(endian_ax);
+		delete_file(endian_bx);
+	}
+
+	verify(errors == 0);
+}
+
+
+test("StringTable delete")
+	file uni data          "data";
+	file uni eml           "data/eml";
+	file uni stdelete_ax   "data/stdelete.axx";
+	file uni stdelete_bx   "data/stdelete.bx";
+	file uni stdelete_ax_j "data/stdelete.axx-j";
+	file uni stdelete_bx_j "data/stdelete.bx-j";
+{
+	StringTable t;
+	OpINT32Vector search_result, no_result;
+	EmlParser parser;
+	OpFolderLister *dirfiles, *delfiles;
+	int i, j, sr, errors;
+	OpString uni_word;
+	char *word;
+
+	delete_file(stdelete_ax);
+	delete_file(stdelete_bx);
+	delete_file(stdelete_ax_j);
+	delete_file(stdelete_bx_j);
+
+	verify_success(t.Open(data, UNI_L("stdelete")));
+
+	verify_success(t.Insert(UNI_L("wordXa"), 1));
+	verify_success(t.Insert(UNI_L("word1b"), 1));
+	verify_success(t.Insert(UNI_L("word1c"), 1));
+	verify_success(t.Insert(UNI_L("wordXa"), 2));
+
+	verify_success(t.Delete(UNI_L("wordXa"), 2));  // 1 remains inserted
+	verify_success(t.Delete(UNI_L("word1b"), 1));  // delete inserted word, this should delete the whole record
+	verify_success(t.Delete(UNI_L("word1c"), 2));  // delete inserted word with wrong ID
+
+	verify_success(t.Commit());  // t == {wordXa/1, word1c/1}
+
+	verify_success(t.Delete(UNI_L("word1c"), 1));
+	verify_success(t.Delete(UNI_L("wordY"), 1));
+
+	verify_success(t.Commit());
+
+	search_result.Clear();
+	verify_success(t.Search(UNI_L("wordXa"), &search_result));
+
+	no_result.Clear();
+	verify_success(t.MultiSearch(UNI_L("word1b word1c wordY"), &no_result, FALSE));
+
+	verify_success(t.Close());
+
+	verify(search_result.GetCount() == 1 && search_result.Get(0) == 1);
+	verify(no_result.GetCount() == 0);
+
+	dirfiles = OpFile::GetFolderLister(OPFILE_ABSOLUTE_FOLDER, UNI_L("*"), eml);
+	delfiles = OpFile::GetFolderLister(OPFILE_ABSOLUTE_FOLDER, UNI_L("*"), eml);
+
+	verify_success(t.Open(data, UNI_L("stdelete")));
+	verify_success(t.Clear());
+
+	i = 1;
+	errors = 0;
+	j = 1;
+	while (dirfiles->Next())
+	{
+		if (dirfiles->IsFolder())
+			continue;
+
+		parser.Construct(dirfiles->GetFullPath());
+
+		while ((word = parser.ReadWord()) != NULL)
+		{
+			uni_word.Set(word);
+			if (t.Insert(uni_word.CStr(), i) != OpStatus::OK)
+				++errors;
+		}
+
+		if (i % 4 == 0 || i % 3 == 0)
+		{
+			parser.Construct(delfiles->GetFullPath());
+
+			while ((word = parser.ReadWord()) != NULL)
+			{
+				uni_word.Set(word);
+				if (t.Search(uni_word.CStr(), &search_result) != OpStatus::OK)
+					++errors;
+
+				sr = search_result.Search(j - 1);
+
+				if (sr < (int)search_result.GetCount() && search_result.Get(sr) == j - 1)
+					++errors;
+			}
+		}
+
+		++i;
+
+		if (i % 2 == 0 || i % 3 == 0)
+		{
+			++j;
+			do {
+				delfiles->Next();
+			} while (delfiles->IsFolder());
+		}
+
+		if (i % 4 == 0 || i % 3 == 0)
+		{
+			parser.Construct(delfiles->GetFullPath());
+
+			while ((word = parser.ReadWord()) != NULL)
+			{
+				uni_word.Set(word);
+				if (t.Delete(uni_word.CStr(), j - 1) != OpStatus::OK)
+					++errors;
+			}
+		}
+
+		if (i % 5 == 3)
+			verify_success(t.PreFlush());
+		if (i % 5 == 4)
+			verify_success(t.Flush());
+		if (i % 5 == 0)
+			verify_success(t.Commit());
+	}
+	verify_success(t.Close());
+
+	OP_DELETE(dirfiles);
+	OP_DELETE(delfiles);
+
+	delete_file(stdelete_ax);
+	delete_file(stdelete_bx);
+
+	verify(errors == 0);
+}
+
+test("StringTable delete file-ids")
+	file uni data          "data";
+	file uni eml           "data/eml";
+	file uni stdelete_ax   "data/stdelete.axx";
+	file uni stdelete_bx   "data/stdelete.bx";
+	file uni stdelete_ax_j "data/stdelete.axx-j";
+	file uni stdelete_bx_j "data/stdelete.bx-j";
+{
+	StringTable t;
+	OpINT32Vector search_result, no_result;
+	EmlParser parser;
+	OpFolderLister *dirfiles, *delfiles;
+	int i, j, sr, errors;
+	OpString uni_word;
+	char *word;
+
+	delete_file(stdelete_ax);
+	delete_file(stdelete_bx);
+	delete_file(stdelete_ax_j);
+	delete_file(stdelete_bx_j);
+
+	dirfiles = OpFile::GetFolderLister(OPFILE_ABSOLUTE_FOLDER, UNI_L("*"), eml);
+	delfiles = OpFile::GetFolderLister(OPFILE_ABSOLUTE_FOLDER, UNI_L("*"), eml);
+
+	verify_success(t.Open(data, UNI_L("stdelete")));
+	verify_success(t.Clear());
+
+	i = 1;
+	errors = 0;
+	j = 1;
+	while (dirfiles->Next())
+	{
+		if (dirfiles->IsFolder())
+			continue;
+
+		parser.Construct(dirfiles->GetFullPath());
+
+		while ((word = parser.ReadWord()) != NULL)
+		{
+			uni_word.Set(word);
+			if (t.Insert(uni_word.CStr(), i) != OpStatus::OK)
+				++errors;
+		}
+
+		if (i % 4 == 0 || i % 3 == 0)
+		{
+			parser.Construct(delfiles->GetFullPath());
+
+			while ((word = parser.ReadWord()) != NULL)
+			{
+				uni_word.Set(word);
+				if (t.Search(uni_word.CStr(), &search_result) != OpStatus::OK)
+					++errors;
+
+				sr = search_result.Search(j - 1);
+
+				if (sr < (int)search_result.GetCount() && search_result.Get(sr) == j - 1)
+					++errors;
+			}
+		}
+
+		++i;
+
+		if (i % 2 == 0 || i % 3 == 0)
+		{
+			++j;
+			do {
+				delfiles->Next();
+			} while (delfiles->IsFolder());
+		}
+
+		if (i % 4 == 0 || i % 3 == 0)
+		{
+			OpINT32Vector file_ids;
+			verify_success(file_ids.Add(j - 1));
+			verify_success(t.Delete(file_ids));
+		}
+
+		if (i % 5 == 3)
+			verify_success(t.PreFlush());
+		if (i % 5 == 4)
+			verify_success(t.Flush());
+		if (i % 5 == 0)
+			verify_success(t.Commit());
+	}
+	verify_success(t.Close());
+
+	OP_DELETE(dirfiles);
+	OP_DELETE(delfiles);
+
+	delete_file(stdelete_ax);
+	delete_file(stdelete_bx);
+
+	verify(errors == 0);
+}
+
+test("StringTable delete word")
+	file uni data          "data";
+	file uni eml           "data/eml";
+	file uni stdelete_ax   "data/stdelete.axx";
+	file uni stdelete_bx   "data/stdelete.bx";
+	file uni stdelete_ax_j "data/stdelete.axx-j";
+	file uni stdelete_bx_j "data/stdelete.bx-j";
+{
+	StringTable t;
+	OpINT32Vector search_result, no_result;
+	EmlParser parser;
+	OpFolderLister *dirfiles, *delfiles;
+	int i, j, k, errors;
+	OpString uni_word;
+	char *word;
+
+	delete_file(stdelete_ax);
+	delete_file(stdelete_bx);
+	delete_file(stdelete_ax_j);
+	delete_file(stdelete_bx_j);
+
+	dirfiles = OpFile::GetFolderLister(OPFILE_ABSOLUTE_FOLDER, UNI_L("*"), eml);
+	delfiles = OpFile::GetFolderLister(OPFILE_ABSOLUTE_FOLDER, UNI_L("*"), eml);
+
+	verify_success(t.Open(data, UNI_L("stdelete")));
+	verify_success(t.Clear());
+
+	i = 1;
+	errors = 0;
+	j = 1;
+	while (dirfiles->Next())
+	{
+		if (dirfiles->IsFolder())
+			continue;
+
+		parser.Construct(dirfiles->GetFullPath());
+
+		while ((word = parser.ReadWord()) != NULL)
+		{
+			uni_word.Set(word);
+			if (t.Insert(uni_word.CStr(), i) != OpStatus::OK)
+				++errors;
+		}
+
+		if (i % 4 == 0 || i % 3 == 0)
+		{
+			parser.Construct(delfiles->GetFullPath());
+
+			k = 0;
+			while ((word = parser.ReadWord()) != NULL)
+			{
+				uni_word.Set(word);
+				search_result.Clear();
+				if (k % 7 == 0 && t.Search(uni_word.CStr(), &search_result) != OpStatus::OK)
+					++errors;
+
+				// Since we just inserted a document, there can be at most one result from that document
+				if (search_result.GetCount() != 0 && (search_result.GetCount() != 1 || search_result.Get(0) != i))
+					++errors;
+
+				k++;
+			}
+		}
+
+		++i;
+
+		if (i % 2 == 0 || i % 3 == 0)
+		{
+			++j;
+			do {
+				delfiles->Next();
+			} while (delfiles->IsFolder());
+		}
+
+		if (i % 4 == 0 || i % 3 == 0)
+		{
+			parser.Construct(delfiles->GetFullPath());
+
+			k = 0;
+			while ((word = parser.ReadWord()) != NULL)
+			{
+				uni_word.Set(word);
+				if (k % 7 == 0 && t.Delete(uni_word.CStr()) != OpStatus::OK)
+					++errors;
+				k++;
+			}
+		}
+
+		if (i % 5 == 3)
+			verify_success(t.PreFlush());
+		if (i % 5 == 4)
+			verify_success(t.Flush());
+		if (i % 5 == 0)
+			verify_success(t.Commit());
+	}
+	verify_success(t.Close());
+
+	OP_DELETE(dirfiles);
+	OP_DELETE(delfiles);
+
+	delete_file(stdelete_ax);
+	delete_file(stdelete_bx);
+
+	verify(errors == 0);
+}
+
+test("StringTable phased delete")
+	file uni data          "data";
+	file uni stdelete_ax   "data/stdelete.axx";
+	file uni stdelete_bx   "data/stdelete.bx";
+	file uni stdelete_ax_j "data/stdelete.axx-j";
+	file uni stdelete_bx_j "data/stdelete.bx-j";
+{
+	OpINT32Vector search_result;
+
+	delete_file(stdelete_ax);
+	delete_file(stdelete_bx);
+	delete_file(stdelete_ax_j);
+	delete_file(stdelete_bx_j);
+
+	{
+		StringTable t;
+
+		verify_success(t.Open(data, UNI_L("stdelete")));
+
+		verify_success(t.Insert(UNI_L("INBOX"), 5));
+		verify_success(t.Insert(UNI_L("Trash"), 1));
+		verify_success(t.Insert(UNI_L("Trash"), 2));
+		verify_success(t.Insert(UNI_L("Trash"), 3));
+
+		verify_success(t.Commit());
+
+		verify_success(t.Close());
+	}
+
+	{
+		StringTable t;
+
+		verify_success(t.Open(data, UNI_L("stdelete")));
+
+		verify_success(t.Delete(UNI_L("Trash"), 2));
+		verify_success(t.Delete(UNI_L("Trash"), 3));
+
+		verify_success(t.Commit());
+		verify_success(t.Close());
+	}
+
+	{
+		StringTable t;
+
+		verify_success(t.Open(data, UNI_L("stdelete")));
+
+		verify_success(t.Search(UNI_L("Trash"), &search_result));
+
+		verify_success(t.Close());
+	}
+
+	delete_file(stdelete_ax);
+	delete_file(stdelete_bx);
+
+	verify(search_result.GetCount() == 1 && search_result.Get(0) == 1);
+}
+
+test("StringTable PreFlush")
+	file uni data        "data";
+	file uni eml         "data/eml";
+	file uni preflush_ax "data/preflush.axx";
+	file uni preflush_bx "data/preflush.bx";
+{
+	StringTable t;
+	OpINT32Vector search_result;
+	EmlParser parser;
+	OpFolderLister *dirfiles;
+	int i, j, errors;
+	unsigned w;
+	OpString uni_word;
+	char *word;
+
+	errors = 0;
+
+	delete_file(preflush_ax);
+	delete_file(preflush_bx);
+
+	dirfiles = OpFile::GetFolderLister(OPFILE_ABSOLUTE_FOLDER, UNI_L("*"), eml);
+	verify(dirfiles != NULL);
+
+	verify_success(t.Open(data, UNI_L("preflush")));
+	verify_success(t.Clear());
+
+	i = 0;
+	w = 0;
+	while (dirfiles->Next())
+	{
+		if (dirfiles->IsFolder())
+			continue;
+
+		parser.Construct(dirfiles->GetFullPath());
+
+		while ((word = parser.ReadWord()) != NULL)
+		{
+			++w;
+			uni_word.Set(word);
+			if (t.Insert(uni_word.CStr(), i) != OpStatus::OK)
+				++errors;
+		}
+
+		++i;
+
+		switch (i & 7)
+		{
+		case 1:
+			verify_success(t.PreFlush(1));
+			break;
+		case 3:
+			verify_success(t.PreFlush());
+			break;
+		case 5:
+			verify_success(t.Flush());
+		case 6:
+			verify_success(t.Commit());
+			break;
+		}
+	}
+
+	verify_success(t.Close());
+
+	OP_DELETE(dirfiles);
+
+	verify(errors == 0);
+
+	dirfiles = OpFile::GetFolderLister(OPFILE_ABSOLUTE_FOLDER, UNI_L("*"), eml);
+
+	verify_success(t.Open(data, UNI_L("preflush")));
+
+	i = 0;
+	w = 0;
+
+	while (dirfiles->Next())
+	{
+		if (dirfiles->IsFolder())
+			continue;
+
+		parser.Construct(dirfiles->GetFullPath());
+
+		while ((word = parser.ReadWord()) != NULL)
+		{
+			++w;
+			uni_word.Set(word);
+			search_result.Clear();
+			verify_success(t.Search(uni_word.CStr(), &search_result));
+
+			j = search_result.Search(i);
+
+			if (j >= (int)search_result.GetCount() || search_result.Get(j) != i)
+				++errors;
+		}
+
+		++i;
+	}
+
+	verify_success(t.Close());
+
+	parser.Close();
+
+	OP_DELETE(dirfiles);
+
+	delete_file(preflush_ax);
+	delete_file(preflush_bx);
+
+	verify(errors == 0);
+}
+
+test("StringTable PreFlush performance") disabled;
+	file uni data          "data";
+	file uni eml           "data/eml";
+	file uni preflush_ax   "data/preflush.axx";
+	file uni preflush_bx   "data/preflush.bx";
+	file uni preflush_ax_j "data/preflush.axx-j";
+	file uni preflush_bx_j "data/preflush.bx-j";
+{
+	StringTable t;
+	EmlParser parser;
+	OpFolderLister *dirfiles;
+	int i, j;
+	OpString uni_word;
+	char *word;
+	double tstart, cend, aend, send1, send2, send3;
+	int pfcount, fcount;
+
+	delete_file(preflush_ax);
+	delete_file(preflush_bx);
+	delete_file(preflush_ax_j);
+	delete_file(preflush_bx_j);
+
+	t.Open(data, UNI_L("preflush"));
+	t.Clear();
+
+	i = 0;
+	for (j = 0; j < 100; ++j)
+	{
+		dirfiles = OpFile::GetFolderLister(OPFILE_ABSOLUTE_FOLDER, UNI_L("*"), eml);
+		while (dirfiles->Next())
+		{
+			if (dirfiles->IsFolder())
+				continue;
+
+			parser.Construct(dirfiles->GetFullPath());
+
+			while ((word = parser.ReadWord()) != NULL)
+			{
+				uni_word.Set(word);
+				t.Insert(uni_word.CStr(), i);
+			}
+
+			++i;
+		}
+		OP_DELETE(dirfiles);
+	}
+
+	tstart = g_op_time_info->GetWallClockMS();
+	t.Commit();
+	cend = g_op_time_info->GetWallClockMS() - tstart;
+
+	t.Close();
+
+	t.Open(data, UNI_L("preflush"));
+	t.Clear();
+
+	i = 0;
+	for (j = 0; j < 100; ++j)
+	{
+		dirfiles = OpFile::GetFolderLister(OPFILE_ABSOLUTE_FOLDER, UNI_L("*"), eml);
+		while (dirfiles->Next())
+		{
+			if (dirfiles->IsFolder())
+				continue;
+
+			parser.Construct(dirfiles->GetFullPath());
+
+			while ((word = parser.ReadWord()) != NULL)
+			{
+				uni_word.Set(word);
+				t.Insert(uni_word.CStr(), i);
+			}
+
+			++i;
+		}
+		OP_DELETE(dirfiles);
+	}
+
+	tstart = g_op_time_info->GetWallClockMS();
+	t.PreFlush();
+	t.Flush();
+	t.Commit();
+	aend = g_op_time_info->GetWallClockMS() - tstart;
+
+	t.Close();
+
+	t.Open(data, UNI_L("preflush"));
+	t.Clear();
+
+	i = 0;
+	for (j = 0; j < 100; ++j)
+	{
+		dirfiles = OpFile::GetFolderLister(OPFILE_ABSOLUTE_FOLDER, UNI_L("*"), eml);
+		while (dirfiles->Next())
+		{
+			if (dirfiles->IsFolder())
+				continue;
+
+			parser.Construct(dirfiles->GetFullPath());
+
+			while ((word = parser.ReadWord()) != NULL)
+			{
+				uni_word.Set(word);
+				t.Insert(uni_word.CStr(), i);
+			}
+
+			++i;
+		}
+		OP_DELETE(dirfiles);
+	}
+
+	pfcount = 1;
+	tstart = g_op_time_info->GetWallClockMS();
+	while (t.PreFlush(100) == OpBoolean::IS_FALSE)
+		++pfcount;
+	send1 = g_op_time_info->GetWallClockMS() - tstart;
+
+	op_msleep(30000);
+
+	fcount = 1;
+	tstart = g_op_time_info->GetWallClockMS();
+	while (t.Flush(100) == OpBoolean::IS_FALSE)
+		++fcount;
+	send2 = g_op_time_info->GetWallClockMS() - tstart;
+
+	op_msleep(30000);
+
+	tstart = g_op_time_info->GetWallClockMS();
+	t.Commit();
+	send3 = g_op_time_info->GetWallClockMS() - tstart;
+
+	t.Close();
+
+	delete_file(preflush_ax);
+	delete_file(preflush_bx);
+
+	output("\nOne phase flush %i s, no delay between phases %i s, three-phase flush %i (%i /%i, %i /%i, %i) s\n",
+		(int)cend, (int)aend, (int)(send1 + send2 + send3), (int)send1, pfcount, (int)send2, fcount, (int)send3);
+
+	verify(1);
+}
+
+test("invalid words")
+	file uni data    "data";
+	file uni st_ax   "data/st.axx";
+	file uni st_bx   "data/st.bx";
+	file uni st_ax_j "data/st.axx-j";
+	file uni st_bx_j "data/st.bx-j";
+{
+	StringTable t;
+	uni_char *words[8];
+	int wsize;
+	OpINT32Vector docs;
+
+	wsize = 0;
+
+	delete_file(st_ax);
+	delete_file(st_bx);
+	delete_file(st_ax_j);
+	delete_file(st_bx_j);
+
+	verify_success(t.Open(data, UNI_L("st")));
+
+	verify_success(t.Insert(UNI_L("w"), 1));
+	verify_success(t.Insert(UNI_L(""), 5));
+	verify_success(t.Insert(UNI_L("\r\n"), 4));
+	verify_success(t.Insert(UNI_L("\r\n"), 1));
+	verify_success(t.Insert(UNI_L("\tt"), 3));
+
+	verify_success(t.Commit());
+
+	verify_success(t.Insert(UNI_L("w"), 1));
+	verify_success(t.Insert(UNI_L("\r"), 5));
+	verify_success(t.Insert(UNI_L("\b"), 7));
+
+	verify_success(t.Commit());
+
+	wsize = 8;
+	verify_success(t.WordSearch(UNI_L(""), words, &wsize));
+
+	verify(wsize == 2);
+
+	verify_success(t.Search(UNI_L("w"), &docs));
+
+	verify(docs.GetCount() == 1 && docs.Get(0) == 1);
+
+	verify_success(t.Search(UNI_L("t"), &docs));
+
+	verify(docs.GetCount() == 1 && docs.Get(0) == 3);
+
+	verify(t.CheckConsistency() == OpBoolean::IS_TRUE);
+
+	verify_success(t.Close());
+
+	while (wsize > 0)
+	{
+		--wsize;
+		OP_DELETEA(words[wsize]);
+	}
+
+	delete_file(st_ax);
+	delete_file(st_bx);
+}
+
+test("StringTable logging") require SEARCH_ENGINE_LOG;
+	file uni data        "data";
+	file uni table_ax    "data/table.axx";
+	file uni table_bx    "data/table.bx";
+	file uni table_ax_j  "data/table.axx-j";
+	file uni table_bx_j  "data/table.bx-j";
+	file uni table_ax_g  "data/table.axx-g";
+	file uni table_bx_g  "data/table.bx-g";
+	file uni table_log   "data/table.log";
+	file uni ptable_ax   "data/ptable.axx";
+	file uni ptable_bx   "data/ptable.bx";
+	file uni ptable_ax_j "data/ptable.axx-j";
+	file uni ptable_bx_j "data/ptable.bx-j";
+	file uni ptable_ax_g "data/ptable.axx-g";
+	file uni ptable_bx_g "data/ptable.bx-g";
+	file uni ptable_log  "data/ptable.log";
+{
+#if (SEARCH_ENGINE_LOG & SEARCH_ENGINE_LOG_STRINGTABLE)
+	StringTable t;
+	StringTablePlayer player;
+	OpINT32Vector search_result, multi_result;
+
+	delete_file(table_ax);
+	delete_file(table_bx);
+	delete_file(table_ax_j);
+	delete_file(table_bx_j);
+	delete_file(table_ax_g);
+	delete_file(table_bx_g);
+	delete_file(table_log);
+
+	delete_file(ptable_ax);
+	delete_file(ptable_bx);
+	delete_file(ptable_ax_j);
+	delete_file(ptable_bx_j);
+	delete_file(ptable_ax_g);
+	delete_file(ptable_bx_g);
+	delete_file(ptable_log);
+
+	verify_success(t.Open(data, UNI_L("table")));
+	t.Clear();
+
+	t.Insert(UNI_L("wordA1"), 1);
+	t.Insert(UNI_L("wordA2"), 1);
+	t.Insert(UNI_L("wordA1"), 1);
+	t.Insert(UNI_L("wordA1"), 2);
+	t.Insert(UNI_L("wordA3"), 2);
+	t.Insert(UNI_L("wordA1"), 3);
+	t.Insert(UNI_L("wordB1"), 3);
+	t.Insert(UNI_L("wordA2"), 3);
+
+	t.Delete(UNI_L("wordA1"), 3);
+
+	t.Commit();
+	t.Close();
+	verify_success(t.Open(data, UNI_L("table")));
+
+	t.Delete(UNI_L("wordA2"), 3);
+
+	t.Insert(UNI_L("wordA4"), 4);
+	t.Insert(UNI_L("wordA5"), 5);
+	t.Delete(UNI_L("wordA5"), 5);
+	t.Insert(UNI_L("wordA6"), 6);
+
+	/* the contents of t is now:
+	  wordA1 1 2
+	  wordA2 1
+	  wordA3   2
+	  wordB1     3
+	  wordA4       4
+	  wordA6           6
+	*/
+
+	t.Commit();
+	t.Close();
+
+	verify_success(player.Play(t, data, UNI_L("ptable"), table_log));
+
+	verify_success(t.Open(data, UNI_L("ptable")));
+
+	t.Search(UNI_L("wordA"), &search_result, 8);
+
+	t.MultiSearch(UNI_L("WoRdA1; worda3,worda6;"), &multi_result, TRUE, 0);
+
+	t.Close();
+
+	delete_file(table_ax);
+	delete_file(table_bx);
+	delete_file(ptable_ax);
+	delete_file(ptable_bx);
+	delete_file(table_log);
+	delete_file(ptable_log);
+
+	verify(search_result.GetCount() == 4);
+	verify(search_result.Find(1) != -1 && search_result.Find(2) != -1 && search_result.Find(4) != -1 && search_result.Find(6) != -1);
+
+	verify(multi_result.GetCount() == 3);
+	verify(multi_result.Find(1) != -1 && multi_result.Find(2) != -1 && multi_result.Find(6) != -1);
+#endif
+}
+
+
+test("StringTable long delete") disabled;
+	file uni data       "data";
+	file uni table_ax   "data/table.axx";
+	file uni table_bx   "data/table.bx";
+	file uni table_ax_j "data/table.axx-j";
+	file uni table_bx_j "data/table.bx-j";
+	file uni table_ax_g "data/table.axx-g";
+	file uni table_bx_g "data/table.bx-g";
+{
+	StringTable t;
+	OpINT32Vector words;
+	OpINT32Vector file_nums;
+	char word[5];  /* ARRAY OK 2010-09-24 roarl */
+	OpString uword;
+	OpINT32Vector search_result;
+	int num_words, word_length, i;
+
+	delete_file(table_ax);
+	delete_file(table_bx);
+	delete_file(table_ax_j);
+	delete_file(table_bx_j);
+	delete_file(table_ax_g);
+	delete_file(table_bx_g);
+
+	verify_success(t.Open(data, UNI_L("table")));
+	t.Clear();
+
+	word[4] = 0;
+	for (i = 0; i < 1000; ++i)
+	{
+		num_words = op_rand() % 500 + 10;
+
+		while (--num_words > 0)
+		{
+			word_length = op_rand() % 3 + 2;
+
+			word[word_length] = 0;
+			while (--word_length >= 0)
+				word[word_length] = op_rand() % ('Z' - 'A' + 1) + 'A';
+
+			words.Add(*(INT32 *)word);
+			file_nums.Add(i);
+		}
+	}
+
+	for (i = 0; i < (int)file_nums.GetCount(); ++i)
+	{
+		*(INT32 *)word = words.Get(i);
+		uword.SetFromUTF8(word);
+
+		t.Insert(uword.CStr(), file_nums.Get(i));
+	}
+
+	t.Commit();
+
+	for (i = 0; i < (int)file_nums.GetCount(); ++i)
+	{
+		*(INT32 *)word = words.Get(i);
+		uword.SetFromUTF8(word);
+
+		t.Delete(uword.CStr(), file_nums.Get(i));
+	}
+
+/*	for (i = file_nums.GetCount(); i >= 0; --i)
+	{
+		if (t.PreFlush(50) == OpBoolean::IS_TRUE)
+			break;
+	}*/
+
+	t.Commit();
+	t.Close();
+
+	delete_file(table_ax);
+	delete_file(table_bx);
+
+	verify(i >= 0);  // if i >= 0, PreFlush doesn't loop infinitely
+}
+
+test("FastPrefixSearch")
+	file uni st_         "data/st";
+	file uni st_table_ax "data/st/table.axx";
+	file uni st_table_bx "data/st/table.bx";
+{
+	StringTable st;
+	SearchIterator<INT32> *res;
+	int count, empty1, empty2, single;
+
+	verify_success(st.Open(st_, UNI_L("table")));
+	verify_success(st.Clear());
+
+	verify_success(st.InsertBlock(UNI_L("parasynthetic paragraph"), 1));
+
+	verify_success(st.InsertBlock(UNI_L("http://www.url.org/ title of the document"), 0x40000000 | 2));
+	verify_success(st.InsertBlock(UNI_L("the text of\r\n the first paragraph"), 2));
+
+	verify_success(st.InsertBlock(UNI_L("http://www.gliding.org/ title of the document"), 0x40000000 | 3));
+	verify_success(st.InsertBlock(UNI_L("a text about paraglides, one paragraph"), 3));
+
+	verify_success(st.InsertBlock(UNI_L("http://www.paralympics.org/ title of the document"), 0x40000000 | 4));
+	verify_success(st.InsertBlock(UNI_L("text about olympics of the disabled"), 4));
+
+	verify_success(st.InsertBlock(UNI_L("http://www.other.org/ title of the document"), 0x40000000 | 5));
+	verify_success(st.InsertBlock(UNI_L("this should not appear in the result"), 5));
+
+	verify_success(st.InsertBlock(UNI_L("parabolic paragraph"), 6));
+
+	verify_success(st.Commit());
+
+	count = 0;
+	res = st.PhraseSearch(UNI_L("title text para"));
+	if (res != NULL && !res->Empty() && !OpStatus::IsError(res->Error()))
+	{
+		++count;
+		while (res->Next())
+			++count;
+	}
+
+	if (res != NULL && OpStatus::IsError(res->Error()))
+		count = 0;
+
+	OP_DELETE(res);
+
+	empty1 = 0;
+	res = st.PhraseSearch(UNI_L(""));
+	if (res == NULL || !res->Empty() || OpStatus::IsError(res->Error()))
+		++empty1;
+
+	OP_DELETE(res);
+
+	empty2 = 0;
+	res = st.PhraseSearch(UNI_L("empty"));
+	if (res == NULL || !res->Empty() || OpStatus::IsError(res->Error()))
+		++empty2;
+
+	OP_DELETE(res);
+
+	single = 0;
+	res = st.PhraseSearch(UNI_L("text"));
+	if (res != NULL && !res->Empty() && !OpStatus::IsError(res->Error()))
+	{
+		++single;
+
+		while (res->Next())
+			++single;
+	}
+
+	if (res != NULL && OpStatus::IsError(res->Error()))
+		single = 0;
+
+	OP_DELETE(res);
+
+	verify_success(st.Close());
+
+	delete_file(st_table_ax);
+	delete_file(st_table_bx);
+	delete_file(st_);
+
+	verify(count == 3);
+	verify(empty1 == 0);
+	verify(empty2 == 0);
+	verify(single == 3);
+}
+
+test("FastPrefixSearch during flushing")
+	file uni st_         "data/st";
+	file uni st_table_ax "data/st/table.axx";
+	file uni st_table_bx "data/st/table.bx";
+{
+	StringTable st;
+	SearchIterator<INT32> *res;
+	int count, not_prefix;
+
+	verify_success(st.Open(st_, UNI_L("table")));
+	verify_success(st.Clear());
+
+	verify_success(st.InsertBlock(UNI_L("the text of\r\n the first paragraph"), 2));
+	verify_success(st.InsertBlock(UNI_L("a text of the first paragraph"), 1));
+
+	verify_success(st.Commit());
+
+	verify_success(st.Delete(UNI_L("the"), 2));
+
+	verify_success(st.Commit());
+
+	verify_success(st.InsertBlock(UNI_L("a text about paraglides"), 3));
+
+	verify_success(st.PreFlush());
+
+	verify_success(st.InsertBlock(UNI_L("a text about a parapluie"), 4));
+
+	verify_success(st.DeleteBlock(UNI_L("a text of the first paragraph"), 1));
+
+
+	count = 0;
+	res = st.PhraseSearch(UNI_L("text para"));
+	if (res != NULL && !res->Empty() && !OpStatus::IsError(res->Error()))
+	{
+		++count;
+		while (res->Next())
+			++count;
+	}
+
+	if (res != NULL && OpStatus::IsError(res->Error()))
+		count = 0;
+
+	OP_DELETE(res);
+
+	not_prefix = 0;
+	res = st.PhraseSearch(UNI_L("text para "));
+	if (res == NULL || !res->Empty() || OpStatus::IsError(res->Error()))
+		++not_prefix;
+
+	OP_DELETE(res);
+
+	verify_success(st.Commit());
+	verify_success(st.Close());
+
+	delete_file(st_table_ax);
+	delete_file(st_table_bx);
+	delete_file(st_);
+
+	verify(count == 3);
+	verify(not_prefix == 0);
+}
+
+test("update and delete")
+	file uni st_         "data/st";
+	file uni st_table_ax "data/st/table.axx";
+	file uni st_table_bx "data/st/table.bx";
+{
+	StringTable st;
+	TVector<INT32> res;
+
+	verify_success(st.Open(st_, UNI_L("table")));
+	verify_success(st.Clear());
+
+	verify_success(st.Insert(UNI_L("spam"), 2));
+	verify_success(st.Insert(UNI_L("spam"), 1));
+	verify_success(st.Insert(UNI_L("trash"), 3));
+
+	verify_success(st.Commit());
+
+	verify_success(st.Delete(UNI_L("spam"), 1));
+	verify_success(st.Insert(UNI_L("trash"), 1));
+	verify_success(st.Delete(UNI_L("trash"), 1));
+	verify_success(st.Delete(UNI_L("trash"), 3));
+
+	verify_success(st.Commit());
+
+	verify_success(st.Search(UNI_L("spam"), &res));
+	verify(res.GetCount() == 1 && res[0] == 2);
+
+	verify_success(st.Search(UNI_L("trash"), &res));
+	verify(res.GetCount() == 0);
+
+	verify_success(st.Delete(UNI_L("spam"), 2));
+	verify_success(st.PreFlush());
+	verify_success(st.Insert(UNI_L("trash"), 2));
+	verify_success(st.Flush());
+	verify_success(st.Delete(UNI_L("trash"), 2));
+	verify_success(st.Commit());
+	verify_success(st.Commit());
+
+	verify_success(st.Search(UNI_L("spam"), &res));
+	verify(res.GetCount() == 0);
+
+	verify_success(st.Search(UNI_L("trash"), &res));
+	verify(res.GetCount() == 0);
+
+	verify_success(st.Close());
+
+	delete_file(st_table_ax);
+	delete_file(st_table_bx);
+	delete_file(st_);
+}
+
+test("StringTable estimate memory usage")
+	file uni data           "data";
+	file uni mem_usage_ax   "data/mem_usage.axx";
+	file uni mem_usage_bx   "data/mem_usage.bx";
+	file uni mem_usage_ax_j "data/mem_usage.axx-j";
+	file uni mem_usage_bx_j "data/mem_usage.bx-j";
+{
+	StringTable t;
+	EmlParser parser;
+	int i;
+	OpString uni_word;
+	char *word;
+	size_t mem_usage_0, mem_usage_1, mem_usage_2, mem_usage_3;
+
+	delete_file(mem_usage_ax);
+	delete_file(mem_usage_bx);
+	delete_file(mem_usage_ax_j);
+	delete_file(mem_usage_bx_j);
+
+	verify_success(t.Open(data, UNI_L("mem_usage")));
+	verify_success(t.Clear());
+
+	mem_usage_0 = t.EstimateMemoryUsed();
+
+	i = 0;
+	iterate (filename) from EmailTestFiles
+	{
+		parser.Construct(filename);
+
+		while ((word = parser.ReadWord()) != NULL)
+		{
+			uni_word.Set(word);
+			verify_success(t.Insert(uni_word.CStr(), i));
+		}
+
+		++i;
+	}
+	
+	mem_usage_1 = t.EstimateMemoryUsed();
+
+	verify_success(t.Commit());
+
+	mem_usage_2 = t.EstimateMemoryUsed();
+
+	verify_success(t.Close());
+
+	mem_usage_3 = t.EstimateMemoryUsed();
+
+	delete_file(mem_usage_ax);
+	delete_file(mem_usage_bx);
+	
+	verify(mem_usage_0 < 1024);
+	verify(mem_usage_1 > 32768);  // In my test (Linux-64) it was 118145
+	verify(mem_usage_1 < 262144);
+	verify(mem_usage_2 < 1024);
+	verify(mem_usage_3 < 1024);
+	verify(mem_usage_2 == mem_usage_0);
+	verify(mem_usage_3 <= mem_usage_2);
+}
+
+test("CheckConsistency detect subindex inconsistencies, CORE-28327")
+	file uni st_         "data/st";
+	file uni st_table_ax "data/st/table.axx";
+	file uni st_table_bx "data/st/table.bx";
+{
+	StringTable st;
+	TVector<INT32> res;
+
+	verify_success(st.Open(st_, UNI_L("table")));
+	verify_success(st.Clear());
+
+	verify_success(st.Insert(UNI_L("spam"), 2));
+	verify_success(st.Commit());
+
+	// These operations should be undone
+	verify_success(st.Delete(UNI_L("spam"), 2));
+	verify_success(st.Insert(UNI_L("trash"), 2));
+	verify_success(st.PreFlush());
+	verify_success(st.Flush());
+
+	// Make the ACT seem already committed before Commit
+	st.GetACT()->Abort();
+	verify_success(st.Commit());
+
+	verify_success(st.Close()); // Rollback on close
+
+	verify_success(st.Open(st_, UNI_L("table")));
+	verify(st.CheckConsistency() == OpBoolean::IS_FALSE);
+
+	verify_success(st.Close());
+
+	delete_file(st_table_ax);
+	delete_file(st_table_bx);
+	delete_file(st_);
+}
+
+test("disk full during commit, CORE-28327")
+	file uni st_         "data/st";
+	file uni st_table_ax "data/st/table.axx";
+	file uni st_table_bx "data/st/table.bx";
+{
+	StringTable st;
+	TVector<INT32> res;
+
+	verify_success(st.Open(st_, UNI_L("table")));
+	verify_success(st.Clear());
+
+	verify_success(st.Insert(UNI_L("spam"), 2));
+	verify_success(st.Commit());
+
+	// These operations should be undone
+	verify_success(st.Delete(UNI_L("spam"), 2));
+	verify_success(st.Insert(UNI_L("trash"), 2));
+	verify_success(st.PreFlush());
+
+	// Fake a st.Commit() where disk goes full while committing the ACT
+	verify_success(st.Flush());
+	verify_success(st.GetBT()->Commit());
+	st.GetACT()->Abort();
+
+	verify_success(st.Close()); // Rollback on close
+
+	verify_success(st.Open(st_, UNI_L("table")));
+	verify(st.CheckConsistency() == OpBoolean::IS_TRUE);
+
+	verify_success(st.Search(UNI_L("spam"), &res));
+	verify(res.GetCount() == 1 && res[0] == 2);
+	verify_success(st.Search(UNI_L("trash"), &res));
+	verify(res.GetCount() == 0);
+
+	verify_success(st.Close());
+
+	delete_file(st_table_ax);
+	delete_file(st_table_bx);
+	delete_file(st_);
+}
+
+test("killed during commit, CORE-28327")
+	file uni st_         "data/st";
+	file uni st_table_ax "data/st/table.axx";
+	file uni st_table_bx "data/st/table.bx";
+{
+	StringTable st;
+	TVector<INT32> res;
+
+	verify_success(st.Open(st_, UNI_L("table")));
+	verify_success(st.Clear());
+
+	verify_success(st.Insert(UNI_L("spam"), 2));
+	verify_success(st.Commit());
+
+	// These operations should be undone
+	verify_success(st.Delete(UNI_L("spam"), 2));
+	verify_success(st.Insert(UNI_L("trash"), 2));
+	verify_success(st.PreFlush());
+
+	// Fake a st.Commit() where Opera is killed while committing the ACT
+	verify_success(st.Flush());
+	verify_success(st.GetBT()->Commit());
+	st.GetACT()->GetStorage()->Crash();
+
+	verify_success(st.Close());
+
+	verify_success(st.Open(st_, UNI_L("table"))); // Rollback on open
+	verify(st.CheckConsistency() == OpBoolean::IS_TRUE);
+
+	verify_success(st.Search(UNI_L("spam"), &res));
+	verify(res.GetCount() == 1 && res[0] == 2);
+	verify_success(st.Search(UNI_L("trash"), &res));
+	verify(res.GetCount() == 0);
+
+	verify_success(st.Close());
+
+	delete_file(st_table_ax);
+	delete_file(st_table_bx);
+	delete_file(st_);
+}
+
+test("atomic commit, CORE-30016")
+	file uni st_          "data/st";
+	file uni st_table_ax  "data/st/table.axx";
+	file uni st_table_bx  "data/st/table.bx";
+	file uni st_table_axj "data/st/table.axx-j";
+	file uni st_table_bxj "data/st/table.bx-j";
+	file uni st_table_axd "data/st/table.axx-d";
+	file uni bs_wr        "data/bs.wr";
+	file uni bs_wrj       "data/bs.wr-j";
+{
+	StringTable st;
+	BlockStorage dummy;
+	TVector<INT32> res;
+
+	verify_success(st.Open(st_, UNI_L("table")));
+	verify_success(st.Clear());
+
+	verify_success(st.Insert(UNI_L("spam"), 2));
+	verify_success(st.Commit());
+	verify_success(st.Close());
+
+	delete_file(bs_wr);
+	st.GroupWith(dummy);
+	verify_success(dummy.Open(bs_wr, BlockStorage::OpenReadWrite, 256));
+	verify_success(dummy.BeginTransaction());
+	verify(BlockStorage::FileExists(bs_wrj) == OpBoolean::IS_TRUE);
+
+	verify_success(st.Open(st_, UNI_L("table")));
+
+	// These operations should not be undone
+	verify_success(st.Delete(UNI_L("spam"), 2));
+	verify_success(st.Insert(UNI_L("trash"), 2));
+	verify_success(st.PreFlush());
+	verify_success(st.Flush());
+
+	verify_success(st.Commit());
+	// Should not be fully committed because of the uncommitted dummy group member
+	verify(BlockStorage::FileExists(st_table_axj) == OpBoolean::IS_TRUE);
+	verify(BlockStorage::FileExists(st_table_bxj) == OpBoolean::IS_TRUE);
+	verify(BlockStorage::FileExists(st_table_axd) == OpBoolean::IS_FALSE);
+	delete_file(st_table_axj); // Pretend that one index was fully committed anyway
+	verify(BlockStorage::FileExists(st_table_axj) == OpBoolean::IS_FALSE);
+
+	// Create atomic commit marker file, indicating atomic commit in progress
+	verify_success(st.GetGroupMember().GetFirstInGroup()->CreateAssociatedFile(UNI_L("-d")));
+	st.GetACT()->GetStorage()->Crash(); // So that close doesn't clean up and roll back
+	st.GetBT()->GetStorage()->Crash();
+	OpStatus::Ignore(st.Close());
+	// Check that everything is set up for an "atomic commit" resume on open
+	verify(BlockStorage::FileExists(st_table_axj) == OpBoolean::IS_FALSE);
+	verify(BlockStorage::FileExists(st_table_bxj) == OpBoolean::IS_TRUE);
+	verify(BlockStorage::FileExists(st_table_axd) == OpBoolean::IS_TRUE);
+
+	dummy.UnGroup();
+	dummy.Close();
+	verify(BlockStorage::FileExists(bs_wrj) == OpBoolean::IS_FALSE);
+
+	verify_success(st.Open(st_, UNI_L("table"))); // No rollback on open
+	// All journal and marker files should be cleaned up
+	verify(BlockStorage::FileExists(st_table_axj) == OpBoolean::IS_FALSE);
+	verify(BlockStorage::FileExists(st_table_bxj) == OpBoolean::IS_FALSE);
+	verify(BlockStorage::FileExists(st_table_axd) == OpBoolean::IS_FALSE);
+	verify(st.CheckConsistency() == OpBoolean::IS_TRUE);
+
+	// Check that it worked
+	verify_success(st.Search(UNI_L("spam"), &res));
+	verify(res.GetCount() == 0);
+	verify_success(st.Search(UNI_L("trash"), &res));
+	verify(res.GetCount() == 1 && res[0] == 2);
+
+	verify_success(st.Close());
+
+	delete_file(st_table_ax);
+	delete_file(st_table_bx);
+	delete_file(st_table_axj);
+	delete_file(st_table_bxj);
+	delete_file(st_table_axd);
+	delete_file(st_);
+	delete_file(bs_wr);
+	delete_file(bs_wrj);
+}

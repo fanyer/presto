@@ -1,0 +1,68 @@
+uniform sampler2D src;
+uniform sampler2D stencilSrc;
+uniform sampler2D maskSrc;
+
+uniform bool stencilComponentBased;
+uniform bool straightAlpha;
+uniform float uSrcY;
+
+uniform vec3 uFocusPoint;  // p0
+uniform vec3 uCenterPoint; // p1
+
+varying vec4 vert_color;
+varying vec2 vTexCoord0;
+varying vec2 vTexCoord2;
+varying vec2 vTexCoord3;
+
+const vec3 lumfactors = vec3(0.2125, 0.7154, 0.0721);
+
+void main() {
+  // see formula in modules/libvega/src/vegagradient.cpp
+  vec3 cd = uCenterPoint - uFocusPoint;
+  // storing r0 in pdr allows dot on entire vectors when computing b
+  vec3 pd;
+  pd.xy = vTexCoord0 - uFocusPoint.xy;
+  pd.z  = uFocusPoint.z;
+
+  float a = dot(cd.xy, cd.xy) - cd.z*cd.z; // invariant
+  float b = dot(pd, cd);
+  float c = dot(pd.xy, pd.xy) - pd.z*pd.z;
+
+  float offset;
+  float scale = texture2D(maskSrc, vTexCoord3).a;
+
+  if (abs(a) < 0.001)
+  {
+    offset = c / (2.0 * b);
+    // if (abs(b) < epsilon) result is undefined
+    scale *= step(0.001, abs(b));
+  }
+  else
+  {
+    float bbac = b*b-a*c;
+    // if (bbac < 0) result is undefined
+    scale *= step(0.0, bbac);
+    bbac = sqrt(bbac) / a;
+    b /= a;
+    offset = b + bbac;
+    // if (offset*cdr < -r0) result is undefined so use b - sqrt(bb-ac) instead
+    offset -= step(offset*cd.z, -uFocusPoint.z)*2.0*bbac;
+  }
+  // if (offset*cdr < -r0) result is undefined
+  scale *= step(-uFocusPoint.z, offset*cd.z);
+
+  vec4 stencil = texture2D(stencilSrc, vTexCoord2);
+  if (stencilComponentBased)
+  {
+    float lum = dot(stencil.rgb, lumfactors);
+    stencil = vec4(lum);
+  }
+
+  // Same as "maskColor = straightAlpha ? 1.0 : scale", without conditional
+  float maskColor = max(float(straightAlpha), scale);
+  vec4 mask = vec4(maskColor, maskColor, maskColor, scale);
+
+  vec4 col = texture2D(src, vec2(offset, uSrcY)) * stencil * mask * vert_color;
+
+  gl_FragColor = col;
+}

@@ -1,0 +1,36 @@
+/**
+ * List of common passwords with length greater or equal to 5.
+ */
+static const uni_char* common_passwords[] = 
+{ 
+	UNI_L("12345"),
+	UNI_L("123456"),
+	UNI_L("1234567"),
+	UNI_L("12345678"),
+	UNI_L("123456789"),
+	UNI_L("696969"),
+	UNI_L("abc123"),
+	UNI_L("password"),
+	UNI_L("Password"),
+	UNI_L("password1"),
+	UNI_L("princess"),
+	UNI_L("rockyou"),
+	UNI_L("iloveyou"),
+	UNI_L("jesus"),
+	UNI_L("letmein"),
+	UNI_L("master"),
+	UNI_L("dragon"),
+	UNI_L("mustang"),
+	UNI_L("michael"),
+	UNI_L("shadow"),
+	UNI_L("monkey"),
+	UNI_L("qweasd"),
+	UNI_L("asdzxc"),
+	UNI_L("qwezxc"),
+	UNI_L("qwerty"),
+	UNI_L("Qwerty"),
+	UNI_L("qazwsx"),
+	UNI_L("wsxedc"),
+	UNI_L("qazedc"),
+	UNI_L("qazwsxedc")
+};

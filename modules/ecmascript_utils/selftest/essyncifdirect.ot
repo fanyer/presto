@@ -1,0 +1,1593 @@
+/* -*- Mode: c++; tab-width: 4; indent-tabs-mode: t; c-basic-offset: 4; -*-
+**
+** Copyright (C) 2002 Opera Software AS.  All rights reserved.
+**
+** This file is part of the Opera web browser.  It may not be distributed
+** under any circumstances.
+*/
+
+group "ESUtils.SyncInterface.Direct";
+require init;
+require ESUTILS_ES_ENVIRONMENT_SUPPORT;
+require ESUTILS_SYNCIF_SUPPORT;
+
+include "modules/ecmascript_utils/essyncif.h";
+include "modules/ecmascript_utils/esenvironment.h";
+include "modules/ecmascript_utils/essched.h";
+include "modules/ecmascript/ecmascript.h";
+include "modules/util/str.h";
+include "modules/doc/frm_doc.h";
+
+global
+{
+	ES_Environment *g_esEnvironment;
+
+	class SyncCallback
+		: public ES_SyncInterface::Callback
+	{
+	public:
+		void Reset()
+		{
+			if (value.type == VALUE_STRING)
+				OP_DELETEA((uni_char *) value.value.string);
+			else if (value.type == VALUE_OBJECT)
+				environment->GetRuntime()->Unprotect(value.value.object);
+		}
+
+		virtual OP_STATUS HandleCallback(Status status, const ES_Value &value)
+		{
+			Reset();
+
+			this->status = status;
+
+			if (status == ES_SyncInterface::Callback::ESSYNC_STATUS_SUCCESS ||
+			    status == ES_SyncInterface::Callback::ESSYNC_STATUS_EXCEPTION)
+			{
+				this->value = value;
+
+				if (value.type == VALUE_STRING)
+				{
+					this->value.value.string = UniSetNewStr(value.value.string);
+					if (!this->value.value.string)
+					{
+						this->value.type = VALUE_UNDEFINED;
+						return OpStatus::ERR_NO_MEMORY;
+					}
+				}
+				else if (value.type == VALUE_OBJECT)
+					if (!environment->GetRuntime()->Protect(value.value.object))
+					{
+						this->value.type = VALUE_UNDEFINED;
+						return OpStatus::ERR_NO_MEMORY;
+					}
+			}
+
+			return OpStatus::OK;
+		}
+
+		ES_Environment *environment;
+		ES_SyncInterface::Callback::Status status;
+		ES_Value value;
+	} g_syncCallback;
+
+#ifdef ESUTILS_SYNCIF_CALL_SUPPORT
+	class SyncMessageObject
+		: public MessageObject,
+		  public ES_ThreadListener
+	{
+	public:
+		SyncMessageObject(ES_Environment *environment, SyncCallback *callback)
+			: environment(environment),
+			  thread(environment->GetScheduler()->GetCurrentThread()),
+			  callback(callback)
+		{
+			thread->AddListener(this);
+		}
+		~SyncMessageObject()
+		{
+			if (thread && OpStatus::IsError(thread->Unblock()))
+				output("SyncMessageObject::~SyncMessageObject: thread->Unblock failed!\n");
+			g_main_message_handler->UnsetCallBacks(this);
+		}
+
+		OP_STATUS Setup()
+		{
+			thread->Block();
+			RETURN_IF_ERROR(g_main_message_handler->SetCallBack(this, MSG_ES_ASYNC_MESSAGE, 0));
+			g_main_message_handler->PostMessage(MSG_ES_ASYNC_MESSAGE, 0, 0);
+			return OpStatus::OK;
+		}
+
+		virtual void HandleCallback(OpMessage msg, MH_PARAM_1 par1, MH_PARAM_2 par2)
+		{
+			ES_SyncInterface syncif(environment);
+			ES_Value arguments[1];
+			arguments[0].type = VALUE_STRING;
+			arguments[0].value.string = UNI_L("dummy");
+
+			ES_SyncInterface::CallData data;
+			data.this_object = environment->GetGlobalObject();
+			data.method = UNI_L("hasOwnProperty");
+			data.arguments = arguments;
+			data.arguments_count = 1;
+
+			if (OpStatus::IsError(syncif.Call(data, callback)))
+				output("SyncMessageObject::HandleCallback: syncif.Call failed!\n");
+			else if (callback->status != ES_SyncInterface::Callback::ESSYNC_STATUS_SUCCESS)
+				output("SyncMessageObject::HandleCallback: evaluation failed!\n");
+
+			OP_DELETE(this);
+		}
+
+		virtual OP_STATUS Signal(ES_Thread *signalled, ES_ThreadSignal signal)
+		{
+			switch (signal)
+			{
+			case ES_SIGNAL_FINISHED:
+			case ES_SIGNAL_FAILED:
+			case ES_SIGNAL_CANCELLED:
+				ES_ThreadListener::Remove();
+				thread = NULL;
+			}
+
+			return OpStatus::OK;
+		}
+
+		ES_Environment *environment;
+		ES_Thread *thread;
+		SyncCallback *callback;
+	};
+
+	class SyncSpecialFunction
+		: public EcmaScript_Object
+	{
+	public:
+		SyncSpecialFunction(ES_Environment *environment, SyncCallback *callback)
+			: environment(environment),
+			  callback(callback)
+		{
+		}
+
+		OP_STATUS Initialize()
+		{
+			return SetFunctionRuntime(environment->GetRuntime(), UNI_L("special"), "Function", NULL);
+		}
+
+		virtual int Call(ES_Object *this_object, ES_Value *argv, int argc, ES_Value *return_value, ES_Runtime *origining_runtime)
+		{
+			if (argc == 0)
+			{
+				SyncMessageObject *smo = OP_NEW(SyncMessageObject, (environment, callback));
+				if (!smo || OpStatus::IsError(smo->Setup()))
+				{
+					OP_DELETE(smo);
+					return ES_NO_MEMORY;
+				}
+				else
+					return ES_SUSPEND | ES_RESTART;
+			}
+			else
+				return ES_FAILED;
+		}
+
+		ES_Environment *environment;
+		SyncCallback *callback;
+	};
+#endif // ESUTILS_SYNCIF_CALL_SUPPORT
+}
+
+setup
+{
+	g_esEnvironment = NULL;
+}
+
+exit
+{
+	if (g_esEnvironment)
+		ES_Environment::Destroy(g_esEnvironment);
+
+	g_syncCallback.Reset();
+}
+
+test("Setup")
+{
+	OP_STATUS status = ES_Environment::Create(g_esEnvironment);
+	verify(status == OpStatus::OK);
+	verify(g_esEnvironment != NULL);
+	verify(g_esEnvironment->Enabled());
+	g_syncCallback.environment = g_esEnvironment;
+}
+
+test("Eval (undefined)")
+	require success "Setup";
+	require ESUTILS_SYNCIF_EVAL_SUPPORT;
+{
+	ES_SyncInterface syncif(g_esEnvironment);
+
+	ES_SyncInterface::EvalData data;
+	data.program = UNI_L("undefined;");
+	data.allow_nested_message_loop = FALSE;
+
+	verify(syncif.Eval(data, &g_syncCallback) == OpStatus::OK);
+	verify(g_syncCallback.status == ES_SyncInterface::Callback::ESSYNC_STATUS_SUCCESS);
+	verify(g_syncCallback.value.type == VALUE_UNDEFINED);
+}
+
+test("Eval (null)")
+	require success "Setup";
+	require ESUTILS_SYNCIF_EVAL_SUPPORT;
+{
+	ES_SyncInterface syncif(g_esEnvironment);
+
+	ES_SyncInterface::EvalData data;
+	data.program = UNI_L("null;");
+	data.allow_nested_message_loop = FALSE;
+
+	verify(syncif.Eval(data, &g_syncCallback) == OpStatus::OK);
+	verify(g_syncCallback.status == ES_SyncInterface::Callback::ESSYNC_STATUS_SUCCESS);
+	verify(g_syncCallback.value.type == VALUE_NULL);
+}
+
+test("Eval (true)")
+	require success "Setup";
+	require ESUTILS_SYNCIF_EVAL_SUPPORT;
+{
+	ES_SyncInterface syncif(g_esEnvironment);
+
+	ES_SyncInterface::EvalData data;
+	data.program = UNI_L("true;");
+	data.allow_nested_message_loop = FALSE;
+
+	verify(syncif.Eval(data, &g_syncCallback) == OpStatus::OK);
+	verify(g_syncCallback.status == ES_SyncInterface::Callback::ESSYNC_STATUS_SUCCESS);
+	verify(g_syncCallback.value.type == VALUE_BOOLEAN);
+	verify(g_syncCallback.value.value.boolean == TRUE);
+}
+
+test("Eval (false)")
+	require success "Setup";
+	require ESUTILS_SYNCIF_EVAL_SUPPORT;
+{
+	ES_SyncInterface syncif(g_esEnvironment);
+
+	ES_SyncInterface::EvalData data;
+	data.program = UNI_L("false;");
+	data.allow_nested_message_loop = FALSE;
+
+	verify(syncif.Eval(data, &g_syncCallback) == OpStatus::OK);
+	verify(g_syncCallback.status == ES_SyncInterface::Callback::ESSYNC_STATUS_SUCCESS);
+	verify(g_syncCallback.value.type == VALUE_BOOLEAN);
+	verify(g_syncCallback.value.value.boolean == FALSE);
+}
+
+test("Eval (10.0)")
+	require success "Setup";
+	require ESUTILS_SYNCIF_EVAL_SUPPORT;
+{
+	ES_SyncInterface syncif(g_esEnvironment);
+
+	ES_SyncInterface::EvalData data;
+	data.program = UNI_L("10.0;");
+	data.allow_nested_message_loop = FALSE;
+
+	verify(syncif.Eval(data, &g_syncCallback) == OpStatus::OK);
+	verify(g_syncCallback.status == ES_SyncInterface::Callback::ESSYNC_STATUS_SUCCESS);
+	verify(g_syncCallback.value.type == VALUE_NUMBER);
+	verify(g_syncCallback.value.value.number == 10);
+}
+
+test("Eval ('string')")
+	require success "Setup";
+	require ESUTILS_SYNCIF_EVAL_SUPPORT;
+{
+	ES_SyncInterface syncif(g_esEnvironment);
+
+	ES_SyncInterface::EvalData data;
+	data.program = UNI_L("'string';");
+	data.allow_nested_message_loop = FALSE;
+
+	verify(syncif.Eval(data, &g_syncCallback) == OpStatus::OK);
+	verify(g_syncCallback.status == ES_SyncInterface::Callback::ESSYNC_STATUS_SUCCESS);
+	verify(g_syncCallback.value.type == VALUE_STRING);
+	verify(uni_strcmp(g_syncCallback.value.value.string, "string") == 0);
+}
+
+test("Eval (Object)")
+	require success "Setup";
+	require ESUTILS_SYNCIF_EVAL_SUPPORT;
+{
+	ES_SyncInterface syncif(g_esEnvironment);
+
+	ES_SyncInterface::EvalData data;
+	data.program = UNI_L("Object.prototype;");
+	data.allow_nested_message_loop = FALSE;
+
+	verify(syncif.Eval(data, &g_syncCallback) == OpStatus::OK);
+	verify(g_syncCallback.status == ES_SyncInterface::Callback::ESSYNC_STATUS_SUCCESS);
+	verify(g_syncCallback.value.type == VALUE_OBJECT);
+	verify(g_syncCallback.value.value.object == g_esEnvironment->GetRuntime()->GetObjectPrototype());
+}
+
+test("Eval (10.0) to string")
+	require success "Setup";
+	require ESUTILS_SYNCIF_EVAL_SUPPORT;
+{
+	ES_SyncInterface syncif(g_esEnvironment);
+
+	ES_SyncInterface::EvalData data;
+	data.program = UNI_L("10.0");
+	data.want_string_result = TRUE;
+	data.allow_nested_message_loop = FALSE;
+
+	verify(syncif.Eval(data, &g_syncCallback) == OpStatus::OK);
+	verify(g_syncCallback.status == ES_SyncInterface::Callback::ESSYNC_STATUS_SUCCESS);
+	verify(g_syncCallback.value.type == VALUE_STRING);
+	verify(uni_strcmp(g_syncCallback.value.value.string, "10") == 0);
+}
+
+test("Eval ('string') to string")
+	require success "Setup";
+	require ESUTILS_SYNCIF_EVAL_SUPPORT;
+{
+	ES_SyncInterface syncif(g_esEnvironment);
+
+	ES_SyncInterface::EvalData data;
+	data.program = UNI_L("'string'");
+	data.want_string_result = TRUE;
+	data.allow_nested_message_loop = FALSE;
+
+	verify(syncif.Eval(data, &g_syncCallback) == OpStatus::OK);
+	verify(g_syncCallback.status == ES_SyncInterface::Callback::ESSYNC_STATUS_SUCCESS);
+	verify(g_syncCallback.value.type == VALUE_STRING);
+	verify(uni_strcmp(g_syncCallback.value.value.string, "string") == 0);
+}
+
+test("Eval (Object) to string")
+	require success "Setup";
+	require ESUTILS_SYNCIF_EVAL_SUPPORT;
+{
+	ES_SyncInterface syncif(g_esEnvironment);
+
+	ES_SyncInterface::EvalData data;
+	data.program = UNI_L("Object.prototype");
+	data.want_string_result = TRUE;
+	data.allow_nested_message_loop = FALSE;
+
+	verify(syncif.Eval(data, &g_syncCallback) == OpStatus::OK);
+	verify(g_syncCallback.status == ES_SyncInterface::Callback::ESSYNC_STATUS_SUCCESS);
+	verify(g_syncCallback.value.type == VALUE_STRING);
+	verify(uni_strcmp(g_syncCallback.value.value.string, "[object Object]") == 0);
+}
+
+test("Eval (throw undefined)")
+	require success "Setup";
+	require ESUTILS_SYNCIF_EVAL_SUPPORT;
+{
+	ES_SyncInterface syncif(g_esEnvironment);
+
+	ES_SyncInterface::EvalData data;
+	data.program = UNI_L("throw undefined");
+	data.want_exceptions = TRUE;
+	data.allow_nested_message_loop = FALSE;
+
+	verify(syncif.Eval(data, &g_syncCallback) == OpStatus::OK);
+	verify(g_syncCallback.status == ES_SyncInterface::Callback::ESSYNC_STATUS_EXCEPTION);
+	verify(g_syncCallback.value.type == VALUE_UNDEFINED);
+}
+
+test("Eval (throw null)")
+	require success "Setup";
+	require ESUTILS_SYNCIF_EVAL_SUPPORT;
+{
+	ES_SyncInterface syncif(g_esEnvironment);
+
+	ES_SyncInterface::EvalData data;
+	data.program = UNI_L("throw null");
+	data.want_exceptions = TRUE;
+	data.allow_nested_message_loop = FALSE;
+
+	verify(syncif.Eval(data, &g_syncCallback) == OpStatus::OK);
+	verify(g_syncCallback.status == ES_SyncInterface::Callback::ESSYNC_STATUS_EXCEPTION);
+	verify(g_syncCallback.value.type == VALUE_NULL);
+}
+
+test("Eval (throw true)")
+	require success "Setup";
+	require ESUTILS_SYNCIF_EVAL_SUPPORT;
+{
+	ES_SyncInterface syncif(g_esEnvironment);
+
+	ES_SyncInterface::EvalData data;
+	data.program = UNI_L("throw true");
+	data.want_exceptions = TRUE;
+	data.allow_nested_message_loop = FALSE;
+
+	verify(syncif.Eval(data, &g_syncCallback) == OpStatus::OK);
+	verify(g_syncCallback.status == ES_SyncInterface::Callback::ESSYNC_STATUS_EXCEPTION);
+	verify(g_syncCallback.value.type == VALUE_BOOLEAN);
+	verify(g_syncCallback.value.value.boolean == TRUE);
+}
+
+test("Eval (throw false)")
+	require success "Setup";
+	require ESUTILS_SYNCIF_EVAL_SUPPORT;
+{
+	ES_SyncInterface syncif(g_esEnvironment);
+
+	ES_SyncInterface::EvalData data;
+	data.program = UNI_L("throw false");
+	data.want_exceptions = TRUE;
+	data.allow_nested_message_loop = FALSE;
+
+	verify(syncif.Eval(data, &g_syncCallback) == OpStatus::OK);
+	verify(g_syncCallback.status == ES_SyncInterface::Callback::ESSYNC_STATUS_EXCEPTION);
+	verify(g_syncCallback.value.type == VALUE_BOOLEAN);
+	verify(g_syncCallback.value.value.boolean == FALSE);
+}
+
+test("Eval (throw 10.0)")
+	require success "Setup";
+	require ESUTILS_SYNCIF_EVAL_SUPPORT;
+{
+	ES_SyncInterface syncif(g_esEnvironment);
+
+	ES_SyncInterface::EvalData data;
+	data.program = UNI_L("throw 10");
+	data.want_exceptions = TRUE;
+	data.allow_nested_message_loop = FALSE;
+
+	verify(syncif.Eval(data, &g_syncCallback) == OpStatus::OK);
+	verify(g_syncCallback.status == ES_SyncInterface::Callback::ESSYNC_STATUS_EXCEPTION);
+	verify(g_syncCallback.value.type == VALUE_NUMBER);
+	verify(g_syncCallback.value.value.number == 10.0);
+}
+
+test("Eval (throw 'string')")
+	require success "Setup";
+	require ESUTILS_SYNCIF_EVAL_SUPPORT;
+{
+	ES_SyncInterface syncif(g_esEnvironment);
+
+	ES_SyncInterface::EvalData data;
+	data.program = UNI_L("throw 'string'");
+	data.want_exceptions = TRUE;
+	data.allow_nested_message_loop = FALSE;
+
+	verify(syncif.Eval(data, &g_syncCallback) == OpStatus::OK);
+	verify(g_syncCallback.status == ES_SyncInterface::Callback::ESSYNC_STATUS_EXCEPTION);
+	verify(g_syncCallback.value.type == VALUE_STRING);
+	verify(uni_strcmp(g_syncCallback.value.value.string, "string") == 0);
+}
+
+test("Eval (throw Object)")
+	require success "Setup";
+	require ESUTILS_SYNCIF_EVAL_SUPPORT;
+{
+	ES_SyncInterface syncif(g_esEnvironment);
+
+	ES_SyncInterface::EvalData data;
+	data.program = UNI_L("throw Object.prototype");
+	data.want_exceptions = TRUE;
+	data.allow_nested_message_loop = FALSE;
+
+	verify(syncif.Eval(data, &g_syncCallback) == OpStatus::OK);
+	verify(g_syncCallback.status == ES_SyncInterface::Callback::ESSYNC_STATUS_EXCEPTION);
+	verify(g_syncCallback.value.type == VALUE_OBJECT);
+	verify(g_syncCallback.value.value.object == g_esEnvironment->GetRuntime()->GetObjectPrototype());
+}
+
+test("Call (Object.hasProperty)")
+	require success "Setup";
+	require ESUTILS_SYNCIF_CALL_SUPPORT;
+{
+	ES_SyncInterface syncif(g_esEnvironment);
+	ES_Value arguments[1];
+	arguments[0].type = VALUE_STRING;
+	arguments[0].value.string = UNI_L("dummy");
+
+	ES_SyncInterface::CallData data;
+	data.this_object = g_esEnvironment->GetGlobalObject();
+	data.method = UNI_L("hasOwnProperty");
+	data.arguments = arguments;
+	data.arguments_count = 1;
+	data.allow_nested_message_loop = FALSE;
+
+	verify(syncif.Call(data, &g_syncCallback) == OpStatus::OK);
+	verify(g_syncCallback.status == ES_SyncInterface::Callback::ESSYNC_STATUS_SUCCESS);
+	verify(g_syncCallback.value.type == VALUE_BOOLEAN);
+	verify(g_syncCallback.value.value.boolean == FALSE);
+}
+
+test("Call (Object.hasProperty) to string")
+	require success "Setup";
+	require ESUTILS_SYNCIF_CALL_SUPPORT;
+{
+	ES_SyncInterface syncif(g_esEnvironment);
+	ES_Value arguments[1];
+	arguments[0].type = VALUE_STRING;
+	arguments[0].value.string = UNI_L("dummy");
+
+	ES_SyncInterface::CallData data;
+	data.this_object = g_esEnvironment->GetGlobalObject();
+	data.method = UNI_L("hasOwnProperty");
+	data.arguments = arguments;
+	data.arguments_count = 1;
+	data.want_string_result = TRUE;
+	data.allow_nested_message_loop = FALSE;
+
+	verify(syncif.Call(data, &g_syncCallback) == OpStatus::OK);
+	verify(g_syncCallback.status == ES_SyncInterface::Callback::ESSYNC_STATUS_SUCCESS);
+	verify(g_syncCallback.value.type == VALUE_STRING);
+	verify(uni_strcmp(g_syncCallback.value.value.string, "false") == 0);
+}
+
+test("Call (custom add() function)")
+	require success "Setup";
+	require ESUTILS_SYNCIF_EVAL_SUPPORT;
+	require ESUTILS_SYNCIF_CALL_SUPPORT;
+{
+	ES_SyncInterface syncif(g_esEnvironment);
+
+	ES_SyncInterface::EvalData evaldata;
+	evaldata.program = UNI_L("(function (arg1, arg2) { return arg1 + arg2; })");
+	evaldata.allow_nested_message_loop = FALSE;
+
+	verify(syncif.Eval(evaldata, &g_syncCallback) == OpStatus::OK);
+	verify(g_syncCallback.status == ES_SyncInterface::Callback::ESSYNC_STATUS_SUCCESS);
+	verify(g_syncCallback.value.type == VALUE_OBJECT);
+	verify(op_strcmp(ES_Runtime::GetClass(g_syncCallback.value.value.object), "Function") == 0);
+
+	ES_Value arguments[2];
+	arguments[0].type = VALUE_NUMBER;
+	arguments[0].value.number = 3.0;
+	arguments[1].type = VALUE_NUMBER;
+	arguments[1].value.number = 4.5;
+
+	ES_SyncInterface::CallData calldata;
+	calldata.function = g_syncCallback.value.value.object;
+	calldata.arguments = arguments;
+	calldata.arguments_count = 2;
+	calldata.allow_nested_message_loop = FALSE;
+
+	verify(syncif.Call(calldata, &g_syncCallback) == OpStatus::OK);
+	verify(g_syncCallback.status == ES_SyncInterface::Callback::ESSYNC_STATUS_SUCCESS);
+	verify(g_syncCallback.value.type == VALUE_NUMBER);
+	verify(g_syncCallback.value.value.number == 7.5);
+}
+
+test("Call (custom function that throws exception)")
+	require success "Setup";
+	require ESUTILS_SYNCIF_EVAL_SUPPORT;
+	require ESUTILS_SYNCIF_CALL_SUPPORT;
+{
+	ES_SyncInterface syncif(g_esEnvironment);
+
+	ES_SyncInterface::EvalData evaldata;
+	evaldata.program = UNI_L("(function () { throw true; })");
+	evaldata.allow_nested_message_loop = FALSE;
+
+	verify(syncif.Eval(evaldata, &g_syncCallback) == OpStatus::OK);
+	verify(g_syncCallback.status == ES_SyncInterface::Callback::ESSYNC_STATUS_SUCCESS);
+	verify(g_syncCallback.value.type == VALUE_OBJECT);
+	verify(op_strcmp(ES_Runtime::GetClass(g_syncCallback.value.value.object), "Function") == 0);
+
+	ES_SyncInterface::CallData calldata;
+	calldata.function = g_syncCallback.value.value.object;
+	calldata.want_exceptions = TRUE;
+	calldata.allow_nested_message_loop = FALSE;
+
+	verify(syncif.Call(calldata, &g_syncCallback) == OpStatus::OK);
+	verify(g_syncCallback.status == ES_SyncInterface::Callback::ESSYNC_STATUS_EXCEPTION);
+	verify(g_syncCallback.value.type == VALUE_BOOLEAN);
+	verify(g_syncCallback.value.value.boolean == (BOOL) TRUE);
+}
+
+test("GetSlot (undefined) by name")
+	require success "Setup";
+	require ESUTILS_SYNCIF_EVAL_SUPPORT;
+	require ESUTILS_SYNCIF_PROPERTIES_SUPPORT;
+{
+	ES_SyncInterface syncif(g_esEnvironment);
+
+	ES_SyncInterface::EvalData evaldata;
+	evaldata.program = UNI_L("({ dummy1: true, dummy2: true })");
+	evaldata.allow_nested_message_loop = FALSE;
+
+	verify(syncif.Eval(evaldata, &g_syncCallback) == OpStatus::OK);
+	verify(g_syncCallback.status == ES_SyncInterface::Callback::ESSYNC_STATUS_SUCCESS);
+	verify(g_syncCallback.value.type == VALUE_OBJECT);
+
+	ES_SyncInterface::SlotData slotdata;
+	slotdata.object = g_syncCallback.value.value.object;
+	slotdata.name = UNI_L("slot");
+	slotdata.allow_nested_message_loop = FALSE;
+
+	verify(syncif.GetSlot(slotdata, &g_syncCallback) == OpStatus::OK);
+	verify(g_syncCallback.status == ES_SyncInterface::Callback::ESSYNC_STATUS_SUCCESS);
+	verify(g_syncCallback.value.type == VALUE_UNDEFINED);
+}
+
+test("GetSlot (undefined) by index")
+	require success "Setup";
+	require ESUTILS_SYNCIF_EVAL_SUPPORT;
+	require ESUTILS_SYNCIF_PROPERTIES_SUPPORT;
+{
+	ES_SyncInterface syncif(g_esEnvironment);
+
+	ES_SyncInterface::EvalData evaldata;
+	evaldata.program = UNI_L("[ true ]");
+	evaldata.allow_nested_message_loop = FALSE;
+
+	verify(syncif.Eval(evaldata, &g_syncCallback) == OpStatus::OK);
+	verify(g_syncCallback.status == ES_SyncInterface::Callback::ESSYNC_STATUS_SUCCESS);
+	verify(g_syncCallback.value.type == VALUE_OBJECT);
+
+	ES_SyncInterface::SlotData slotdata;
+	slotdata.object = g_syncCallback.value.value.object;
+	slotdata.index = 1;
+	slotdata.allow_nested_message_loop = FALSE;
+
+	verify(syncif.GetSlot(slotdata, &g_syncCallback) == OpStatus::OK);
+	verify(g_syncCallback.status == ES_SyncInterface::Callback::ESSYNC_STATUS_SUCCESS);
+	verify(g_syncCallback.value.type == VALUE_UNDEFINED);
+}
+
+test("GetSlot (null) by name")
+	require success "Setup";
+	require ESUTILS_SYNCIF_EVAL_SUPPORT;
+	require ESUTILS_SYNCIF_PROPERTIES_SUPPORT;
+{
+	ES_SyncInterface syncif(g_esEnvironment);
+
+	ES_SyncInterface::EvalData evaldata;
+	evaldata.program = UNI_L("({ dummy1: true, slot: null, dummy2: true })");
+	evaldata.allow_nested_message_loop = FALSE;
+
+	verify(syncif.Eval(evaldata, &g_syncCallback) == OpStatus::OK);
+	verify(g_syncCallback.status == ES_SyncInterface::Callback::ESSYNC_STATUS_SUCCESS);
+	verify(g_syncCallback.value.type == VALUE_OBJECT);
+
+	ES_SyncInterface::SlotData slotdata;
+	slotdata.object = g_syncCallback.value.value.object;
+	slotdata.name = UNI_L("slot");
+	slotdata.allow_nested_message_loop = FALSE;
+
+	verify(syncif.GetSlot(slotdata, &g_syncCallback) == OpStatus::OK);
+	verify(g_syncCallback.status == ES_SyncInterface::Callback::ESSYNC_STATUS_SUCCESS);
+	verify(g_syncCallback.value.type == VALUE_NULL);
+}
+
+test("GetSlot (null) by index")
+	require success "Setup";
+	require ESUTILS_SYNCIF_EVAL_SUPPORT;
+	require ESUTILS_SYNCIF_PROPERTIES_SUPPORT;
+{
+	ES_SyncInterface syncif(g_esEnvironment);
+
+	ES_SyncInterface::EvalData evaldata;
+	evaldata.program = UNI_L("[ true, null, true ]");
+	evaldata.allow_nested_message_loop = FALSE;
+
+	verify(syncif.Eval(evaldata, &g_syncCallback) == OpStatus::OK);
+	verify(g_syncCallback.status == ES_SyncInterface::Callback::ESSYNC_STATUS_SUCCESS);
+	verify(g_syncCallback.value.type == VALUE_OBJECT);
+
+	ES_SyncInterface::SlotData slotdata;
+	slotdata.object = g_syncCallback.value.value.object;
+	slotdata.index = 1;
+	slotdata.allow_nested_message_loop = FALSE;
+
+	verify(syncif.GetSlot(slotdata, &g_syncCallback) == OpStatus::OK);
+	verify(g_syncCallback.status == ES_SyncInterface::Callback::ESSYNC_STATUS_SUCCESS);
+	verify(g_syncCallback.value.type == VALUE_NULL);
+}
+
+test("GetSlot (true) by name")
+	require success "Setup";
+	require ESUTILS_SYNCIF_EVAL_SUPPORT;
+	require ESUTILS_SYNCIF_PROPERTIES_SUPPORT;
+{
+	ES_SyncInterface syncif(g_esEnvironment);
+
+	ES_SyncInterface::EvalData evaldata;
+	evaldata.program = UNI_L("({ dummy1: false, slot: true, dummy2: false })");
+	evaldata.allow_nested_message_loop = FALSE;
+
+	verify(syncif.Eval(evaldata, &g_syncCallback) == OpStatus::OK);
+	verify(g_syncCallback.status == ES_SyncInterface::Callback::ESSYNC_STATUS_SUCCESS);
+	verify(g_syncCallback.value.type == VALUE_OBJECT);
+
+	ES_SyncInterface::SlotData slotdata;
+	slotdata.object = g_syncCallback.value.value.object;
+	slotdata.name = UNI_L("slot");
+	slotdata.allow_nested_message_loop = FALSE;
+
+	verify(syncif.GetSlot(slotdata, &g_syncCallback) == OpStatus::OK);
+	verify(g_syncCallback.status == ES_SyncInterface::Callback::ESSYNC_STATUS_SUCCESS);
+	verify(g_syncCallback.value.type == VALUE_BOOLEAN);
+	verify(g_syncCallback.value.value.boolean == TRUE);
+}
+
+test("GetSlot (true) by index")
+	require success "Setup";
+	require ESUTILS_SYNCIF_EVAL_SUPPORT;
+	require ESUTILS_SYNCIF_PROPERTIES_SUPPORT;
+{
+	ES_SyncInterface syncif(g_esEnvironment);
+
+	ES_SyncInterface::EvalData evaldata;
+	evaldata.program = UNI_L("[ false, true, false ]");
+	evaldata.allow_nested_message_loop = FALSE;
+
+	verify(syncif.Eval(evaldata, &g_syncCallback) == OpStatus::OK);
+	verify(g_syncCallback.status == ES_SyncInterface::Callback::ESSYNC_STATUS_SUCCESS);
+	verify(g_syncCallback.value.type == VALUE_OBJECT);
+
+	ES_SyncInterface::SlotData slotdata;
+	slotdata.object = g_syncCallback.value.value.object;
+	slotdata.index = 1;
+	slotdata.allow_nested_message_loop = FALSE;
+
+	verify(syncif.GetSlot(slotdata, &g_syncCallback) == OpStatus::OK);
+	verify(g_syncCallback.status == ES_SyncInterface::Callback::ESSYNC_STATUS_SUCCESS);
+	verify(g_syncCallback.value.type == VALUE_BOOLEAN);
+	verify(g_syncCallback.value.value.boolean == TRUE);
+}
+
+test("GetSlot (false) by name")
+	require success "Setup";
+	require ESUTILS_SYNCIF_EVAL_SUPPORT;
+	require ESUTILS_SYNCIF_PROPERTIES_SUPPORT;
+{
+	ES_SyncInterface syncif(g_esEnvironment);
+
+	ES_SyncInterface::EvalData evaldata;
+	evaldata.program = UNI_L("({ dummy1: true, slot: false, dummy2: true })");
+	evaldata.allow_nested_message_loop = FALSE;
+
+	verify(syncif.Eval(evaldata, &g_syncCallback) == OpStatus::OK);
+	verify(g_syncCallback.status == ES_SyncInterface::Callback::ESSYNC_STATUS_SUCCESS);
+	verify(g_syncCallback.value.type == VALUE_OBJECT);
+
+	ES_SyncInterface::SlotData slotdata;
+	slotdata.object = g_syncCallback.value.value.object;
+	slotdata.name = UNI_L("slot");
+	slotdata.allow_nested_message_loop = FALSE;
+
+	verify(syncif.GetSlot(slotdata, &g_syncCallback) == OpStatus::OK);
+	verify(g_syncCallback.status == ES_SyncInterface::Callback::ESSYNC_STATUS_SUCCESS);
+	verify(g_syncCallback.value.type == VALUE_BOOLEAN);
+	verify(g_syncCallback.value.value.boolean == FALSE);
+}
+
+test("GetSlot (false) by index")
+	require success "Setup";
+	require ESUTILS_SYNCIF_EVAL_SUPPORT;
+	require ESUTILS_SYNCIF_PROPERTIES_SUPPORT;
+{
+	ES_SyncInterface syncif(g_esEnvironment);
+
+	ES_SyncInterface::EvalData evaldata;
+	evaldata.program = UNI_L("[ true, false, true ]");
+	evaldata.allow_nested_message_loop = FALSE;
+
+	verify(syncif.Eval(evaldata, &g_syncCallback) == OpStatus::OK);
+	verify(g_syncCallback.status == ES_SyncInterface::Callback::ESSYNC_STATUS_SUCCESS);
+	verify(g_syncCallback.value.type == VALUE_OBJECT);
+
+	ES_SyncInterface::SlotData slotdata;
+	slotdata.object = g_syncCallback.value.value.object;
+	slotdata.index = 1;
+	slotdata.allow_nested_message_loop = FALSE;
+
+	verify(syncif.GetSlot(slotdata, &g_syncCallback) == OpStatus::OK);
+	verify(g_syncCallback.status == ES_SyncInterface::Callback::ESSYNC_STATUS_SUCCESS);
+	verify(g_syncCallback.value.type == VALUE_BOOLEAN);
+	verify(g_syncCallback.value.value.boolean == FALSE);
+}
+
+test("GetSlot (10.0) by name")
+	require success "Setup";
+	require ESUTILS_SYNCIF_EVAL_SUPPORT;
+	require ESUTILS_SYNCIF_PROPERTIES_SUPPORT;
+{
+	ES_SyncInterface syncif(g_esEnvironment);
+
+	ES_SyncInterface::EvalData evaldata;
+	evaldata.program = UNI_L("({ dummy1: 5, slot: 10, dummy2: 15 })");
+	evaldata.allow_nested_message_loop = FALSE;
+
+	verify(syncif.Eval(evaldata, &g_syncCallback) == OpStatus::OK);
+	verify(g_syncCallback.status == ES_SyncInterface::Callback::ESSYNC_STATUS_SUCCESS);
+	verify(g_syncCallback.value.type == VALUE_OBJECT);
+
+	ES_SyncInterface::SlotData slotdata;
+	slotdata.object = g_syncCallback.value.value.object;
+	slotdata.name = UNI_L("slot");
+	slotdata.allow_nested_message_loop = FALSE;
+
+	verify(syncif.GetSlot(slotdata, &g_syncCallback) == OpStatus::OK);
+	verify(g_syncCallback.status == ES_SyncInterface::Callback::ESSYNC_STATUS_SUCCESS);
+	verify(g_syncCallback.value.type == VALUE_NUMBER);
+	verify(g_syncCallback.value.value.number == 10.0);
+}
+
+test("GetSlot (10.0) by index")
+	require success "Setup";
+	require ESUTILS_SYNCIF_EVAL_SUPPORT;
+	require ESUTILS_SYNCIF_PROPERTIES_SUPPORT;
+{
+	ES_SyncInterface syncif(g_esEnvironment);
+
+	ES_SyncInterface::EvalData evaldata;
+	evaldata.program = UNI_L("[ 5, 10, 15 ]");
+	evaldata.allow_nested_message_loop = FALSE;
+
+	verify(syncif.Eval(evaldata, &g_syncCallback) == OpStatus::OK);
+	verify(g_syncCallback.status == ES_SyncInterface::Callback::ESSYNC_STATUS_SUCCESS);
+	verify(g_syncCallback.value.type == VALUE_OBJECT);
+
+	ES_SyncInterface::SlotData slotdata;
+	slotdata.object = g_syncCallback.value.value.object;
+	slotdata.index = 1;
+	slotdata.allow_nested_message_loop = FALSE;
+
+	verify(syncif.GetSlot(slotdata, &g_syncCallback) == OpStatus::OK);
+	verify(g_syncCallback.status == ES_SyncInterface::Callback::ESSYNC_STATUS_SUCCESS);
+	verify(g_syncCallback.value.type == VALUE_NUMBER);
+	verify(g_syncCallback.value.value.number == 10.0);
+}
+
+test("GetSlot ('string') by name")
+	require success "Setup";
+	require ESUTILS_SYNCIF_EVAL_SUPPORT;
+	require ESUTILS_SYNCIF_PROPERTIES_SUPPORT;
+{
+	ES_SyncInterface syncif(g_esEnvironment);
+
+	ES_SyncInterface::EvalData evaldata;
+	evaldata.program = UNI_L("({ dummy1: 'dummy1', slot: 'string', dummy2: 'dummy2' })");
+	evaldata.allow_nested_message_loop = FALSE;
+
+	verify(syncif.Eval(evaldata, &g_syncCallback) == OpStatus::OK);
+	verify(g_syncCallback.status == ES_SyncInterface::Callback::ESSYNC_STATUS_SUCCESS);
+	verify(g_syncCallback.value.type == VALUE_OBJECT);
+
+	ES_SyncInterface::SlotData slotdata;
+	slotdata.object = g_syncCallback.value.value.object;
+	slotdata.name = UNI_L("slot");
+	slotdata.allow_nested_message_loop = FALSE;
+
+	verify(syncif.GetSlot(slotdata, &g_syncCallback) == OpStatus::OK);
+	verify(g_syncCallback.status == ES_SyncInterface::Callback::ESSYNC_STATUS_SUCCESS);
+	verify(g_syncCallback.value.type == VALUE_STRING);
+	verify(uni_strcmp(g_syncCallback.value.value.string, "string") == 0);
+}
+
+test("GetSlot ('string') by index")
+	require success "Setup";
+	require ESUTILS_SYNCIF_EVAL_SUPPORT;
+	require ESUTILS_SYNCIF_PROPERTIES_SUPPORT;
+{
+	ES_SyncInterface syncif(g_esEnvironment);
+
+	ES_SyncInterface::EvalData evaldata;
+	evaldata.program = UNI_L("[ 'dummy1', 'string', 'dummy2' ]");
+	evaldata.allow_nested_message_loop = FALSE;
+
+	verify(syncif.Eval(evaldata, &g_syncCallback) == OpStatus::OK);
+	verify(g_syncCallback.status == ES_SyncInterface::Callback::ESSYNC_STATUS_SUCCESS);
+	verify(g_syncCallback.value.type == VALUE_OBJECT);
+
+	ES_SyncInterface::SlotData slotdata;
+	slotdata.object = g_syncCallback.value.value.object;
+	slotdata.index = 1;
+	slotdata.allow_nested_message_loop = FALSE;
+
+	verify(syncif.GetSlot(slotdata, &g_syncCallback) == OpStatus::OK);
+	verify(g_syncCallback.status == ES_SyncInterface::Callback::ESSYNC_STATUS_SUCCESS);
+	verify(g_syncCallback.value.type == VALUE_STRING);
+	verify(uni_strcmp(g_syncCallback.value.value.string, "string") == 0);
+}
+
+test("GetSlot (Object) by name")
+	require success "Setup";
+	require ESUTILS_SYNCIF_EVAL_SUPPORT;
+	require ESUTILS_SYNCIF_PROPERTIES_SUPPORT;
+{
+	ES_SyncInterface syncif(g_esEnvironment);
+
+	ES_SyncInterface::EvalData evaldata;
+	evaldata.program = UNI_L("({ dummy1: {}, slot: Object.prototype, dummy2: {} })");
+	evaldata.allow_nested_message_loop = FALSE;
+
+	verify(syncif.Eval(evaldata, &g_syncCallback) == OpStatus::OK);
+	verify(g_syncCallback.status == ES_SyncInterface::Callback::ESSYNC_STATUS_SUCCESS);
+	verify(g_syncCallback.value.type == VALUE_OBJECT);
+
+	ES_SyncInterface::SlotData slotdata;
+	slotdata.object = g_syncCallback.value.value.object;
+	slotdata.name = UNI_L("slot");
+	slotdata.allow_nested_message_loop = FALSE;
+
+	verify(syncif.GetSlot(slotdata, &g_syncCallback) == OpStatus::OK);
+	verify(g_syncCallback.status == ES_SyncInterface::Callback::ESSYNC_STATUS_SUCCESS);
+	verify(g_syncCallback.value.type == VALUE_OBJECT);
+	verify(g_syncCallback.value.value.object == g_esEnvironment->GetRuntime()->GetObjectPrototype());
+}
+
+test("GetSlot (Object) by index")
+	require success "Setup";
+	require ESUTILS_SYNCIF_EVAL_SUPPORT;
+	require ESUTILS_SYNCIF_PROPERTIES_SUPPORT;
+{
+	ES_SyncInterface syncif(g_esEnvironment);
+
+	ES_SyncInterface::EvalData evaldata;
+	evaldata.program = UNI_L("[ {}, Object.prototype, {} ]");
+	evaldata.allow_nested_message_loop = FALSE;
+
+	verify(syncif.Eval(evaldata, &g_syncCallback) == OpStatus::OK);
+	verify(g_syncCallback.status == ES_SyncInterface::Callback::ESSYNC_STATUS_SUCCESS);
+	verify(g_syncCallback.value.type == VALUE_OBJECT);
+
+	ES_SyncInterface::SlotData slotdata;
+	slotdata.object = g_syncCallback.value.value.object;
+	slotdata.index = 1;
+	slotdata.allow_nested_message_loop = FALSE;
+
+	verify(syncif.GetSlot(slotdata, &g_syncCallback) == OpStatus::OK);
+	verify(g_syncCallback.status == ES_SyncInterface::Callback::ESSYNC_STATUS_SUCCESS);
+	verify(g_syncCallback.value.type == VALUE_OBJECT);
+	verify(g_syncCallback.value.value.object == g_esEnvironment->GetRuntime()->GetObjectPrototype());
+}
+
+test("SetSlot (undefined) by name")
+	require success "Setup";
+	require ESUTILS_SYNCIF_EVAL_SUPPORT;
+	require ESUTILS_SYNCIF_PROPERTIES_SUPPORT;
+{
+	ES_SyncInterface syncif(g_esEnvironment);
+
+	ES_SyncInterface::EvalData evaldata;
+	evaldata.program = UNI_L("({})");
+	evaldata.allow_nested_message_loop = FALSE;
+
+	verify(syncif.Eval(evaldata, &g_syncCallback) == OpStatus::OK);
+	verify(g_syncCallback.status == ES_SyncInterface::Callback::ESSYNC_STATUS_SUCCESS);
+	verify(g_syncCallback.value.type == VALUE_OBJECT);
+
+	ES_Value value;
+	value.type = VALUE_UNDEFINED;
+
+	ES_SyncInterface::SlotData slotdata;
+	slotdata.object = g_syncCallback.value.value.object;
+	slotdata.name = UNI_L("slot");
+	slotdata.allow_nested_message_loop = FALSE;
+
+	verify(syncif.SetSlot(slotdata, value, &g_syncCallback) == OpStatus::OK);
+	verify(g_syncCallback.status == ES_SyncInterface::Callback::ESSYNC_STATUS_SUCCESS);
+
+	verify(syncif.GetSlot(slotdata, &g_syncCallback) == OpStatus::OK);
+	verify(g_syncCallback.status == ES_SyncInterface::Callback::ESSYNC_STATUS_SUCCESS);
+	verify(g_syncCallback.value.type == VALUE_UNDEFINED);
+}
+
+test("SetSlot (undefined) by index")
+	require success "Setup";
+	require ESUTILS_SYNCIF_EVAL_SUPPORT;
+	require ESUTILS_SYNCIF_PROPERTIES_SUPPORT;
+{
+	ES_SyncInterface syncif(g_esEnvironment);
+
+	ES_SyncInterface::EvalData evaldata;
+	evaldata.program = UNI_L("[]");
+	evaldata.allow_nested_message_loop = FALSE;
+
+	verify(syncif.Eval(evaldata, &g_syncCallback) == OpStatus::OK);
+	verify(g_syncCallback.status == ES_SyncInterface::Callback::ESSYNC_STATUS_SUCCESS);
+	verify(g_syncCallback.value.type == VALUE_OBJECT);
+
+	ES_Value value;
+	value.type = VALUE_UNDEFINED;
+
+	ES_SyncInterface::SlotData slotdata;
+	slotdata.object = g_syncCallback.value.value.object;
+	slotdata.index = 1;
+	slotdata.allow_nested_message_loop = FALSE;
+
+	verify(syncif.SetSlot(slotdata, value, &g_syncCallback) == OpStatus::OK);
+	verify(g_syncCallback.status == ES_SyncInterface::Callback::ESSYNC_STATUS_SUCCESS);
+
+	verify(syncif.GetSlot(slotdata, &g_syncCallback) == OpStatus::OK);
+	verify(g_syncCallback.status == ES_SyncInterface::Callback::ESSYNC_STATUS_SUCCESS);
+	verify(g_syncCallback.value.type == VALUE_UNDEFINED);
+}
+
+test("SetSlot (null) by name")
+	require success "Setup";
+	require ESUTILS_SYNCIF_EVAL_SUPPORT;
+	require ESUTILS_SYNCIF_PROPERTIES_SUPPORT;
+{
+	ES_SyncInterface syncif(g_esEnvironment);
+
+	ES_SyncInterface::EvalData evaldata;
+	evaldata.program = UNI_L("({ dummy1: true, slot: true, dummy2: true })");
+	evaldata.allow_nested_message_loop = FALSE;
+
+	verify(syncif.Eval(evaldata, &g_syncCallback) == OpStatus::OK);
+	verify(g_syncCallback.status == ES_SyncInterface::Callback::ESSYNC_STATUS_SUCCESS);
+	verify(g_syncCallback.value.type == VALUE_OBJECT);
+
+	ES_Value value;
+	value.type = VALUE_NULL;
+
+	ES_SyncInterface::SlotData slotdata;
+	slotdata.object = g_syncCallback.value.value.object;
+	slotdata.name = UNI_L("slot");
+	slotdata.allow_nested_message_loop = FALSE;
+
+	verify(syncif.SetSlot(slotdata, value, &g_syncCallback) == OpStatus::OK);
+	verify(g_syncCallback.status == ES_SyncInterface::Callback::ESSYNC_STATUS_SUCCESS);
+
+	verify(syncif.GetSlot(slotdata, &g_syncCallback) == OpStatus::OK);
+	verify(g_syncCallback.status == ES_SyncInterface::Callback::ESSYNC_STATUS_SUCCESS);
+	verify(g_syncCallback.value.type == VALUE_NULL);
+}
+
+test("SetSlot (null) by index")
+	require success "Setup";
+	require ESUTILS_SYNCIF_EVAL_SUPPORT;
+	require ESUTILS_SYNCIF_PROPERTIES_SUPPORT;
+{
+	ES_SyncInterface syncif(g_esEnvironment);
+
+	ES_SyncInterface::EvalData evaldata;
+	evaldata.program = UNI_L("[ true, true, true ]");
+	evaldata.allow_nested_message_loop = FALSE;
+
+	verify(syncif.Eval(evaldata, &g_syncCallback) == OpStatus::OK);
+	verify(g_syncCallback.status == ES_SyncInterface::Callback::ESSYNC_STATUS_SUCCESS);
+	verify(g_syncCallback.value.type == VALUE_OBJECT);
+
+	ES_Value value;
+	value.type = VALUE_NULL;
+
+	ES_SyncInterface::SlotData slotdata;
+	slotdata.object = g_syncCallback.value.value.object;
+	slotdata.index = 1;
+	slotdata.allow_nested_message_loop = FALSE;
+
+	verify(syncif.SetSlot(slotdata, value, &g_syncCallback) == OpStatus::OK);
+	verify(g_syncCallback.status == ES_SyncInterface::Callback::ESSYNC_STATUS_SUCCESS);
+
+	verify(syncif.GetSlot(slotdata, &g_syncCallback) == OpStatus::OK);
+	verify(g_syncCallback.status == ES_SyncInterface::Callback::ESSYNC_STATUS_SUCCESS);
+	verify(g_syncCallback.value.type == VALUE_NULL);
+}
+
+test("SetSlot (true) by name")
+	require success "Setup";
+	require ESUTILS_SYNCIF_EVAL_SUPPORT;
+	require ESUTILS_SYNCIF_PROPERTIES_SUPPORT;
+{
+	ES_SyncInterface syncif(g_esEnvironment);
+
+	ES_SyncInterface::EvalData evaldata;
+	evaldata.program = UNI_L("({ dummy1: false, slot: false, dummy2: false })");
+	evaldata.allow_nested_message_loop = FALSE;
+
+	verify(syncif.Eval(evaldata, &g_syncCallback) == OpStatus::OK);
+	verify(g_syncCallback.status == ES_SyncInterface::Callback::ESSYNC_STATUS_SUCCESS);
+	verify(g_syncCallback.value.type == VALUE_OBJECT);
+
+	ES_Value value;
+	value.type = VALUE_BOOLEAN;
+	value.value.boolean = TRUE;
+
+	ES_SyncInterface::SlotData slotdata;
+	slotdata.object = g_syncCallback.value.value.object;
+	slotdata.name = UNI_L("slot");
+	slotdata.allow_nested_message_loop = FALSE;
+
+	verify(syncif.SetSlot(slotdata, value, &g_syncCallback) == OpStatus::OK);
+	verify(g_syncCallback.status == ES_SyncInterface::Callback::ESSYNC_STATUS_SUCCESS);
+
+	verify(syncif.GetSlot(slotdata, &g_syncCallback) == OpStatus::OK);
+	verify(g_syncCallback.status == ES_SyncInterface::Callback::ESSYNC_STATUS_SUCCESS);
+	verify(g_syncCallback.value.type == VALUE_BOOLEAN);
+	verify(g_syncCallback.value.value.boolean == TRUE);
+}
+
+test("SetSlot (true) by index")
+	require success "Setup";
+	require ESUTILS_SYNCIF_EVAL_SUPPORT;
+	require ESUTILS_SYNCIF_PROPERTIES_SUPPORT;
+{
+	ES_SyncInterface syncif(g_esEnvironment);
+
+	ES_SyncInterface::EvalData evaldata;
+	evaldata.program = UNI_L("[ false, false, false ]");
+	evaldata.allow_nested_message_loop = FALSE;
+
+	verify(syncif.Eval(evaldata, &g_syncCallback) == OpStatus::OK);
+	verify(g_syncCallback.status == ES_SyncInterface::Callback::ESSYNC_STATUS_SUCCESS);
+	verify(g_syncCallback.value.type == VALUE_OBJECT);
+
+	ES_Value value;
+	value.type = VALUE_BOOLEAN;
+	value.value.boolean = TRUE;
+
+	ES_SyncInterface::SlotData slotdata;
+	slotdata.object = g_syncCallback.value.value.object;
+	slotdata.index = 1;
+	slotdata.allow_nested_message_loop = FALSE;
+
+	verify(syncif.SetSlot(slotdata, value, &g_syncCallback) == OpStatus::OK);
+	verify(g_syncCallback.status == ES_SyncInterface::Callback::ESSYNC_STATUS_SUCCESS);
+
+	verify(syncif.GetSlot(slotdata, &g_syncCallback) == OpStatus::OK);
+	verify(g_syncCallback.status == ES_SyncInterface::Callback::ESSYNC_STATUS_SUCCESS);
+	verify(g_syncCallback.value.type == VALUE_BOOLEAN);
+	verify(g_syncCallback.value.value.boolean == TRUE);
+}
+
+test("SetSlot (false) by name")
+	require success "Setup";
+	require ESUTILS_SYNCIF_EVAL_SUPPORT;
+	require ESUTILS_SYNCIF_PROPERTIES_SUPPORT;
+{
+	ES_SyncInterface syncif(g_esEnvironment);
+
+	ES_SyncInterface::EvalData evaldata;
+	evaldata.program = UNI_L("({ dummy1: true, slot: true, dummy2: true })");
+	evaldata.allow_nested_message_loop = FALSE;
+
+	verify(syncif.Eval(evaldata, &g_syncCallback) == OpStatus::OK);
+	verify(g_syncCallback.status == ES_SyncInterface::Callback::ESSYNC_STATUS_SUCCESS);
+	verify(g_syncCallback.value.type == VALUE_OBJECT);
+
+	ES_Value value;
+	value.type = VALUE_BOOLEAN;
+	value.value.boolean = FALSE;
+
+	ES_SyncInterface::SlotData slotdata;
+	slotdata.object = g_syncCallback.value.value.object;
+	slotdata.name = UNI_L("slot");
+	slotdata.allow_nested_message_loop = FALSE;
+
+	verify(syncif.SetSlot(slotdata, value, &g_syncCallback) == OpStatus::OK);
+	verify(g_syncCallback.status == ES_SyncInterface::Callback::ESSYNC_STATUS_SUCCESS);
+
+	verify(syncif.GetSlot(slotdata, &g_syncCallback) == OpStatus::OK);
+	verify(g_syncCallback.status == ES_SyncInterface::Callback::ESSYNC_STATUS_SUCCESS);
+	verify(g_syncCallback.value.type == VALUE_BOOLEAN);
+	verify(g_syncCallback.value.value.boolean == FALSE);
+}
+
+test("SetSlot (false) by index")
+	require success "Setup";
+	require ESUTILS_SYNCIF_EVAL_SUPPORT;
+	require ESUTILS_SYNCIF_PROPERTIES_SUPPORT;
+{
+	ES_SyncInterface syncif(g_esEnvironment);
+
+	ES_SyncInterface::EvalData evaldata;
+	evaldata.program = UNI_L("[ true, true, true ]");
+	evaldata.allow_nested_message_loop = FALSE;
+
+	verify(syncif.Eval(evaldata, &g_syncCallback) == OpStatus::OK);
+	verify(g_syncCallback.status == ES_SyncInterface::Callback::ESSYNC_STATUS_SUCCESS);
+	verify(g_syncCallback.value.type == VALUE_OBJECT);
+
+	ES_Value value;
+	value.type = VALUE_BOOLEAN;
+	value.value.boolean = FALSE;
+
+	ES_SyncInterface::SlotData slotdata;
+	slotdata.object = g_syncCallback.value.value.object;
+	slotdata.index = 1;
+	slotdata.allow_nested_message_loop = FALSE;
+
+	verify(syncif.SetSlot(slotdata, value, &g_syncCallback) == OpStatus::OK);
+	verify(g_syncCallback.status == ES_SyncInterface::Callback::ESSYNC_STATUS_SUCCESS);
+
+	verify(syncif.GetSlot(slotdata, &g_syncCallback) == OpStatus::OK);
+	verify(g_syncCallback.status == ES_SyncInterface::Callback::ESSYNC_STATUS_SUCCESS);
+	verify(g_syncCallback.value.type == VALUE_BOOLEAN);
+	verify(g_syncCallback.value.value.boolean == FALSE);
+}
+
+test("SetSlot (10.0) by name")
+	require success "Setup";
+	require ESUTILS_SYNCIF_EVAL_SUPPORT;
+	require ESUTILS_SYNCIF_PROPERTIES_SUPPORT;
+{
+	ES_SyncInterface syncif(g_esEnvironment);
+
+	ES_SyncInterface::EvalData evaldata;
+	evaldata.program = UNI_L("({ dummy1: 5, slot: 7, dummy2: 15 })");
+	evaldata.allow_nested_message_loop = FALSE;
+
+	verify(syncif.Eval(evaldata, &g_syncCallback) == OpStatus::OK);
+	verify(g_syncCallback.status == ES_SyncInterface::Callback::ESSYNC_STATUS_SUCCESS);
+	verify(g_syncCallback.value.type == VALUE_OBJECT);
+
+	ES_Value value;
+	value.type = VALUE_NUMBER;
+	value.value.number = 10.0;
+
+	ES_SyncInterface::SlotData slotdata;
+	slotdata.object = g_syncCallback.value.value.object;
+	slotdata.name = UNI_L("slot");
+	slotdata.allow_nested_message_loop = FALSE;
+
+	verify(syncif.SetSlot(slotdata, value, &g_syncCallback) == OpStatus::OK);
+	verify(g_syncCallback.status == ES_SyncInterface::Callback::ESSYNC_STATUS_SUCCESS);
+
+	verify(syncif.GetSlot(slotdata, &g_syncCallback) == OpStatus::OK);
+	verify(g_syncCallback.status == ES_SyncInterface::Callback::ESSYNC_STATUS_SUCCESS);
+	verify(g_syncCallback.value.type == VALUE_NUMBER);
+	verify(g_syncCallback.value.value.number == 10.0);
+}
+
+test("SetSlot (10.0) by index")
+	require success "Setup";
+	require ESUTILS_SYNCIF_EVAL_SUPPORT;
+	require ESUTILS_SYNCIF_PROPERTIES_SUPPORT;
+{
+	ES_SyncInterface syncif(g_esEnvironment);
+
+	ES_SyncInterface::EvalData evaldata;
+	evaldata.program = UNI_L("[ 5, 10, 15 ]");
+	evaldata.allow_nested_message_loop = FALSE;
+
+	verify(syncif.Eval(evaldata, &g_syncCallback) == OpStatus::OK);
+	verify(g_syncCallback.status == ES_SyncInterface::Callback::ESSYNC_STATUS_SUCCESS);
+	verify(g_syncCallback.value.type == VALUE_OBJECT);
+
+	ES_Value value;
+	value.type = VALUE_NUMBER;
+	value.value.number = 10.0;
+
+	ES_SyncInterface::SlotData slotdata;
+	slotdata.object = g_syncCallback.value.value.object;
+	slotdata.index = 1;
+	slotdata.allow_nested_message_loop = FALSE;
+
+	verify(syncif.SetSlot(slotdata, value, &g_syncCallback) == OpStatus::OK);
+	verify(g_syncCallback.status == ES_SyncInterface::Callback::ESSYNC_STATUS_SUCCESS);
+
+	verify(syncif.GetSlot(slotdata, &g_syncCallback) == OpStatus::OK);
+	verify(g_syncCallback.status == ES_SyncInterface::Callback::ESSYNC_STATUS_SUCCESS);
+	verify(g_syncCallback.value.type == VALUE_NUMBER);
+	verify(g_syncCallback.value.value.number == 10.0);
+}
+
+test("SetSlot ('string') by name")
+	require success "Setup";
+	require ESUTILS_SYNCIF_EVAL_SUPPORT;
+	require ESUTILS_SYNCIF_PROPERTIES_SUPPORT;
+{
+	ES_SyncInterface syncif(g_esEnvironment);
+
+	ES_SyncInterface::EvalData evaldata;
+	evaldata.program = UNI_L("({ dummy1: 'dummy1', slot: 'dummyX', dummy2: 'dummy2' })");
+	evaldata.allow_nested_message_loop = FALSE;
+
+	verify(syncif.Eval(evaldata, &g_syncCallback) == OpStatus::OK);
+	verify(g_syncCallback.status == ES_SyncInterface::Callback::ESSYNC_STATUS_SUCCESS);
+	verify(g_syncCallback.value.type == VALUE_OBJECT);
+
+	ES_Value value;
+	value.type = VALUE_STRING;
+	value.value.string = UNI_L("string");
+
+	ES_SyncInterface::SlotData slotdata;
+	slotdata.object = g_syncCallback.value.value.object;
+	slotdata.name = UNI_L("slot");
+	slotdata.allow_nested_message_loop = FALSE;
+
+	verify(syncif.SetSlot(slotdata, value, &g_syncCallback) == OpStatus::OK);
+	verify(g_syncCallback.status == ES_SyncInterface::Callback::ESSYNC_STATUS_SUCCESS);
+
+	verify(syncif.GetSlot(slotdata, &g_syncCallback) == OpStatus::OK);
+	verify(g_syncCallback.status == ES_SyncInterface::Callback::ESSYNC_STATUS_SUCCESS);
+	verify(g_syncCallback.value.type == VALUE_STRING);
+	verify(uni_strcmp(g_syncCallback.value.value.string, "string") == 0);
+}
+
+test("SetSlot ('string') by index")
+	require success "Setup";
+	require ESUTILS_SYNCIF_EVAL_SUPPORT;
+	require ESUTILS_SYNCIF_PROPERTIES_SUPPORT;
+{
+	ES_SyncInterface syncif(g_esEnvironment);
+
+	ES_SyncInterface::EvalData evaldata;
+	evaldata.program = UNI_L("[ 'dummy1', 'dummyX', 'dummy2' ]");
+	evaldata.allow_nested_message_loop = FALSE;
+
+	verify(syncif.Eval(evaldata, &g_syncCallback) == OpStatus::OK);
+	verify(g_syncCallback.status == ES_SyncInterface::Callback::ESSYNC_STATUS_SUCCESS);
+	verify(g_syncCallback.value.type == VALUE_OBJECT);
+
+	ES_Value value;
+	value.type = VALUE_STRING;
+	value.value.string = UNI_L("string");
+
+	ES_SyncInterface::SlotData slotdata;
+	slotdata.object = g_syncCallback.value.value.object;
+	slotdata.index = 1;
+	slotdata.allow_nested_message_loop = FALSE;
+
+	verify(syncif.SetSlot(slotdata, value, &g_syncCallback) == OpStatus::OK);
+	verify(g_syncCallback.status == ES_SyncInterface::Callback::ESSYNC_STATUS_SUCCESS);
+
+	verify(syncif.GetSlot(slotdata, &g_syncCallback) == OpStatus::OK);
+	verify(g_syncCallback.status == ES_SyncInterface::Callback::ESSYNC_STATUS_SUCCESS);
+	verify(g_syncCallback.value.type == VALUE_STRING);
+	verify(uni_strcmp(g_syncCallback.value.value.string, "string") == 0);
+}
+
+test("SetSlot (Object) by name")
+	require success "Setup";
+	require ESUTILS_SYNCIF_EVAL_SUPPORT;
+	require ESUTILS_SYNCIF_PROPERTIES_SUPPORT;
+{
+	ES_SyncInterface syncif(g_esEnvironment);
+
+	ES_SyncInterface::EvalData evaldata;
+	evaldata.program = UNI_L("({ dummy1: {}, slot: {}, dummy2: {} })");
+	evaldata.allow_nested_message_loop = FALSE;
+
+	verify(syncif.Eval(evaldata, &g_syncCallback) == OpStatus::OK);
+	verify(g_syncCallback.status == ES_SyncInterface::Callback::ESSYNC_STATUS_SUCCESS);
+	verify(g_syncCallback.value.type == VALUE_OBJECT);
+
+	ES_Value value;
+	value.type = VALUE_OBJECT;
+	value.value.object = g_esEnvironment->GetRuntime()->GetObjectPrototype();
+
+	ES_SyncInterface::SlotData slotdata;
+	slotdata.object = g_syncCallback.value.value.object;
+	slotdata.name = UNI_L("slot");
+	slotdata.allow_nested_message_loop = FALSE;
+
+	verify(syncif.SetSlot(slotdata, value, &g_syncCallback) == OpStatus::OK);
+	verify(g_syncCallback.status == ES_SyncInterface::Callback::ESSYNC_STATUS_SUCCESS);
+
+	verify(syncif.GetSlot(slotdata, &g_syncCallback) == OpStatus::OK);
+	verify(g_syncCallback.status == ES_SyncInterface::Callback::ESSYNC_STATUS_SUCCESS);
+	verify(g_syncCallback.value.type == VALUE_OBJECT);
+	verify(g_syncCallback.value.value.object == g_esEnvironment->GetRuntime()->GetObjectPrototype());
+}
+
+test("SetSlot (Object) by index")
+	require success "Setup";
+	require ESUTILS_SYNCIF_EVAL_SUPPORT;
+	require ESUTILS_SYNCIF_PROPERTIES_SUPPORT;
+{
+	ES_SyncInterface syncif(g_esEnvironment);
+
+	ES_SyncInterface::EvalData evaldata;
+	evaldata.program = UNI_L("[ {}, {}, {} ]");
+	evaldata.allow_nested_message_loop = FALSE;
+
+	verify(syncif.Eval(evaldata, &g_syncCallback) == OpStatus::OK);
+	verify(g_syncCallback.status == ES_SyncInterface::Callback::ESSYNC_STATUS_SUCCESS);
+	verify(g_syncCallback.value.type == VALUE_OBJECT);
+
+	ES_Value value;
+	value.type = VALUE_OBJECT;
+	value.value.object = g_esEnvironment->GetRuntime()->GetObjectPrototype();
+
+	ES_SyncInterface::SlotData slotdata;
+	slotdata.object = g_syncCallback.value.value.object;
+	slotdata.index = 1;
+	slotdata.allow_nested_message_loop = FALSE;
+
+	verify(syncif.SetSlot(slotdata, value, &g_syncCallback) == OpStatus::OK);
+	verify(g_syncCallback.status == ES_SyncInterface::Callback::ESSYNC_STATUS_SUCCESS);
+
+	verify(syncif.GetSlot(slotdata, &g_syncCallback) == OpStatus::OK);
+	verify(g_syncCallback.status == ES_SyncInterface::Callback::ESSYNC_STATUS_SUCCESS);
+	verify(g_syncCallback.value.type == VALUE_OBJECT);
+	verify(g_syncCallback.value.value.object == g_esEnvironment->GetRuntime()->GetObjectPrototype());
+}
+
+test("HasSlot/RemoveSlot/HasSlot by name")
+	require success "Setup";
+	require ESUTILS_SYNCIF_EVAL_SUPPORT;
+	require ESUTILS_SYNCIF_PROPERTIES_SUPPORT;
+{
+	ES_SyncInterface syncif(g_esEnvironment);
+
+	ES_SyncInterface::EvalData evaldata;
+	evaldata.program = UNI_L("({ dummy1: true, slot: true, dummy2: true })");
+	evaldata.allow_nested_message_loop = FALSE;
+
+	verify(syncif.Eval(evaldata, &g_syncCallback) == OpStatus::OK);
+	verify(g_syncCallback.status == ES_SyncInterface::Callback::ESSYNC_STATUS_SUCCESS);
+	verify(g_syncCallback.value.type == VALUE_OBJECT);
+
+	ES_SyncInterface::SlotData slotdata;
+	slotdata.object = g_syncCallback.value.value.object;
+	slotdata.name = UNI_L("slot");
+	slotdata.allow_nested_message_loop = FALSE;
+
+	verify(syncif.HasSlot(slotdata, &g_syncCallback) == OpStatus::OK);
+	verify(g_syncCallback.status == ES_SyncInterface::Callback::ESSYNC_STATUS_SUCCESS);
+	verify(g_syncCallback.value.type == VALUE_BOOLEAN);
+	verify(g_syncCallback.value.value.boolean == TRUE);
+
+	verify(syncif.RemoveSlot(slotdata, &g_syncCallback) == OpStatus::OK);
+	verify(g_syncCallback.status == ES_SyncInterface::Callback::ESSYNC_STATUS_SUCCESS);
+	verify(g_syncCallback.value.type == VALUE_BOOLEAN);
+	verify(g_syncCallback.value.value.boolean == TRUE);
+
+	verify(syncif.HasSlot(slotdata, &g_syncCallback) == OpStatus::OK);
+	verify(g_syncCallback.status == ES_SyncInterface::Callback::ESSYNC_STATUS_SUCCESS);
+	verify(g_syncCallback.value.type == VALUE_BOOLEAN);
+	verify(g_syncCallback.value.value.boolean == FALSE);
+}
+
+test("HasSlot/RemoveSlot/HasSlot by index")
+	require success "Setup";
+	require ESUTILS_SYNCIF_EVAL_SUPPORT;
+	require ESUTILS_SYNCIF_PROPERTIES_SUPPORT;
+{
+	ES_SyncInterface syncif(g_esEnvironment);
+
+	ES_SyncInterface::EvalData evaldata;
+	evaldata.program = UNI_L("[ true, true, true ]");
+	evaldata.allow_nested_message_loop = FALSE;
+
+	verify(syncif.Eval(evaldata, &g_syncCallback) == OpStatus::OK);
+	verify(g_syncCallback.status == ES_SyncInterface::Callback::ESSYNC_STATUS_SUCCESS);
+	verify(g_syncCallback.value.type == VALUE_OBJECT);
+
+	ES_SyncInterface::SlotData slotdata;
+	slotdata.object = g_syncCallback.value.value.object;
+	slotdata.index = 1;
+	slotdata.allow_nested_message_loop = FALSE;
+
+	verify(syncif.HasSlot(slotdata, &g_syncCallback) == OpStatus::OK);
+	verify(g_syncCallback.status == ES_SyncInterface::Callback::ESSYNC_STATUS_SUCCESS);
+	verify(g_syncCallback.value.type == VALUE_BOOLEAN);
+	verify(g_syncCallback.value.value.boolean == TRUE);
+
+	verify(syncif.RemoveSlot(slotdata, &g_syncCallback) == OpStatus::OK);
+	verify(g_syncCallback.status == ES_SyncInterface::Callback::ESSYNC_STATUS_SUCCESS);
+	verify(g_syncCallback.value.type == VALUE_BOOLEAN);
+	verify(g_syncCallback.value.value.boolean == TRUE);
+
+	verify(syncif.HasSlot(slotdata, &g_syncCallback) == OpStatus::OK);
+	verify(g_syncCallback.status == ES_SyncInterface::Callback::ESSYNC_STATUS_SUCCESS);
+	verify(g_syncCallback.value.type == VALUE_BOOLEAN);
+	verify(g_syncCallback.value.value.boolean == FALSE);
+}
+
+test("Blocking function triggering nested synchronous evaluation")
+	require success "Setup";
+	require ESUTILS_SYNCIF_CALL_SUPPORT;
+{
+	SyncSpecialFunction *ssf = OP_NEW(SyncSpecialFunction, (g_esEnvironment, &g_syncCallback));
+	verify(ssf);
+	verify(OpStatus::IsSuccess(ssf->Initialize()));
+	verify(*ssf);
+
+	ES_SyncInterface syncif(g_esEnvironment);
+	ES_SyncInterface::CallData data;
+	data.function = *ssf;
+	data.allow_nested_message_loop = FALSE;
+
+	verify(syncif.Call(data, &g_syncCallback) == OpStatus::ERR);
+	verify(g_syncCallback.status == ES_SyncInterface::Callback::ESSYNC_STATUS_CANCELLED);
+}
+
+html
+{
+  "<html><body>Empty page.</body></html>"
+}
+
+test("alert ('Click the OK button.')")
+	require ESUTILS_OBTRUSIVE_TESTS;
+	require success "Setup";
+{
+	ES_SyncInterface syncif(state.doc->GetESRuntime(), state.doc->GetESAsyncInterface());
+
+	ES_SyncInterface::EvalData data;
+	data.program = UNI_L("alert ('Click the OK button.');");
+
+	verify(syncif.Eval(data, &g_syncCallback) == OpStatus::OK);
+	verify(g_syncCallback.status == ES_SyncInterface::Callback::ESSYNC_STATUS_SUCCESS);
+	verify(g_syncCallback.value.type == VALUE_UNDEFINED);
+}
+
+test("confirm ('Do you see a confirm dialog?')")
+	require ESUTILS_OBTRUSIVE_TESTS;
+	require success "Setup";
+{
+	ES_SyncInterface syncif(state.doc->GetESRuntime(), state.doc->GetESAsyncInterface());
+
+	ES_SyncInterface::EvalData data;
+	data.program = UNI_L("confirm ('Click the OK button.');");
+
+	verify(syncif.Eval(data, &g_syncCallback) == OpStatus::OK);
+	verify(g_syncCallback.status == ES_SyncInterface::Callback::ESSYNC_STATUS_SUCCESS);
+	verify(g_syncCallback.value.type == VALUE_BOOLEAN);
+	verify(g_syncCallback.value.value.boolean == TRUE);
+}
+
+test("prompt ('Type \"string\" and click the OK button.')")
+	require ESUTILS_OBTRUSIVE_TESTS;
+	require success "Setup";
+{
+	ES_SyncInterface syncif(state.doc->GetESRuntime(), state.doc->GetESAsyncInterface());
+
+	ES_SyncInterface::EvalData data;
+	data.program = UNI_L("prompt ('Type \"string\" and click the OK button.');");
+
+	verify(syncif.Eval(data, &g_syncCallback) == OpStatus::OK);
+	verify(g_syncCallback.status == ES_SyncInterface::Callback::ESSYNC_STATUS_SUCCESS);
+	verify(g_syncCallback.value.type == VALUE_STRING);
+	verify(uni_strcmp(g_syncCallback.value.value.string, "string") == 0);
+}
+
+test("alert ('Click the OK button.') (direct => failure)")
+	require success "Setup";
+{
+	ES_SyncInterface syncif(state.doc->GetESRuntime(), state.doc->GetESAsyncInterface());
+
+	ES_SyncInterface::EvalData data;
+	data.program = UNI_L("alert ('Click the OK button.');");
+	data.allow_nested_message_loop = FALSE;
+
+	verify(syncif.Eval(data, &g_syncCallback) == OpStatus::ERR);
+	verify(g_syncCallback.status == ES_SyncInterface::Callback::ESSYNC_STATUS_CANCELLED);
+}
+
+test("confirm ('Do you see a confirm dialog?') (direct => failure)")
+	require success "Setup";
+{
+	ES_SyncInterface syncif(state.doc->GetESRuntime(), state.doc->GetESAsyncInterface());
+
+	ES_SyncInterface::EvalData data;
+	data.program = UNI_L("confirm ('Click the OK button.');");
+	data.allow_nested_message_loop = FALSE;
+
+	verify(syncif.Eval(data, &g_syncCallback) == OpStatus::ERR);
+	verify(g_syncCallback.status == ES_SyncInterface::Callback::ESSYNC_STATUS_CANCELLED);
+}
+
+test("prompt ('Type \"string\" and click the OK button.') (direct => failure)")
+	require success "Setup";
+{
+	ES_SyncInterface syncif(state.doc->GetESRuntime(), state.doc->GetESAsyncInterface());
+
+	ES_SyncInterface::EvalData data;
+	data.program = UNI_L("prompt ('Type \"string\" and click the OK button.');");
+	data.allow_nested_message_loop = FALSE;
+
+	verify(syncif.Eval(data, &g_syncCallback) == OpStatus::ERR);
+	verify(g_syncCallback.status == ES_SyncInterface::Callback::ESSYNC_STATUS_CANCELLED);
+}
+
+
+test("Long running eval (direct => failure)")
+	require success "Setup";
+{
+	ES_SyncInterface syncif(state.doc->GetESRuntime(), state.doc->GetESAsyncInterface());
+
+	uni_char slow_program[200]; // ARRAY ok bratell 2010-11-08
+	uni_sprintf(slow_program,
+		UNI_L("var x=(new Date).getTime(); y=1; while ((new Date).getTime() - x < %d) y *= 1.0001"),
+		static_cast<int>(ESUTILS_SYNC_TIMESLICE_LENGTH*2));
+	ES_SyncInterface::EvalData data;
+	data.program = slow_program;
+	data.allow_nested_message_loop = FALSE;
+
+	verify(syncif.Eval(data, &g_syncCallback) == OpStatus::ERR);
+	verify(g_syncCallback.status == ES_SyncInterface::Callback::ESSYNC_STATUS_CANCELLED);
+}

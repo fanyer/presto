@@ -1,0 +1,146 @@
+/* -*- Mode: c++; tab-width: 4; indent-tabs-mode: t; c-basic-offset: 4 -*-
+**
+** Copyright (C) 2004-2006 Opera Software ASA.  All rights reserved.
+**
+** This file is part of the Opera web browser.  It may not be distributed
+** under any circumstances.
+**
+*/
+
+//
+// This self test was created to track regressions for a fix of a memory leak 
+// occuring when the disk quota was exceeded.
+// This self test enables the urlManager::emulateOutOfDisk flag and flood three 
+// different contexts with generated dummy files of varying sizes.
+//
+
+group "cache context out of disk";
+require init;
+require DYNAMIC_FOLDER_SUPPORT;
+require CACHE_FAST_INDEX;
+include "modules/cache/cache_int.h";
+include "modules/cache/cache_common.h";
+include "modules/dochand/winman.h";
+include "modules/cache/cache_st_helpers.h";
+include "modules/prefs/prefsmanager/collections/pc_network.h";
+include "modules/cache/cache_selftest.h";
+
+global
+{
+	OpFileFolder defSizeFolder;
+	OpFileFolder custSizeFolder;
+	URL_CONTEXT_ID defSizeContext;
+	URL_CONTEXT_ID custSizeContext;
+	MessageHandler *mh;
+	WaitURLs *wait;
+
+	int oldCacheSize;
+	int kCacheSize;
+
+	int kMaxFileSize;
+	int kMinFileSize;
+}
+
+
+setup
+{
+	kCacheSize = 0x40000;	// 256KB
+	kMaxFileSize = 0x4000;	// 16KB
+	kMinFileSize = 0x8;     // 8B
+	defSizeContext = urlManager->GetNewContextID();
+	custSizeContext = urlManager->GetNewContextID();
+	mh = OP_NEW(MessageHandler, (NULL));
+
+	
+	g_folder_manager->AddFolder(OPFILE_CACHE_FOLDER, UNI_L("ood_default_size"), &defSizeFolder);
+	CacheFileTest::DeleteCacheDir(defSizeFolder);
+	urlManager->AddContextL(defSizeContext, defSizeFolder, defSizeFolder, defSizeFolder, defSizeFolder, FALSE);
+	output("Created custom context: %d \n", defSizeContext);
+
+	g_folder_manager->AddFolder(OPFILE_CACHE_FOLDER, UNI_L("ood_custom_size"), &custSizeFolder);
+	CacheFileTest::DeleteCacheDir(custSizeFolder);
+	urlManager->AddContextL(custSizeContext, custSizeFolder, custSizeFolder, custSizeFolder, custSizeFolder, FALSE);
+	urlManager->FindContextManager(custSizeContext)->SetCacheSize(kCacheSize);
+	output("Created custom context: %d \n", custSizeContext);
+
+	OpMessage messages[]={MSG_URL_DATA_LOADED, MSG_URL_LOADING_FAILED, MSG_URLMAN_DELETE_SOMEFILES};
+	
+	wait = OP_NEW(WaitURLs, (defSizeFolder, custSizeFolder, mh));
+	mh->SetCallBackList(wait, 0, messages, 3);
+	
+	CacheHelpers::CloseUnusedWindows();
+	
+	oldCacheSize = g_pcnet->GetIntegerPref(PrefsCollectionNetwork::DiskCacheSize);
+
+	int newCacheSize = kCacheSize / 1024;
+	TRAPD(op_err, g_pcnet->WriteIntegerL(PrefsCollectionNetwork::DiskCacheSize, newCacheSize));
+
+	// Set the Cache manager to emulate out of disk.
+	output("Enabling out of disk emulation\n");
+	urlManager->emulateOutOfDisk = TRUE;
+}
+
+exit
+{
+	OP_STATUS op_err;
+	TRAP(op_err, g_pcnet->WriteIntegerL(PrefsCollectionNetwork::DiskCacheSize, oldCacheSize));
+
+	mh->UnsetCallBacks(wait);
+	OP_DELETE(mh);
+	mh=NULL;
+	OP_DELETE(wait);
+	wait=NULL;
+
+	output("Disabling out of disk emulation\n");
+	urlManager->emulateOutOfDisk = FALSE;
+}
+
+// Helper test to clear out the cache.
+subtest EmptyCache()
+{
+	wait->SetExpectedSize(0, 0);
+	urlManager->EmptyDCache();
+	mh->PostDelayedMessage(MSG_URLMAN_DELETE_SOMEFILES, 0, 0, 1000);  // Wait to delete the files
+}
+
+
+table Table1(int, char*)
+{
+  { 0, "[main]" },
+  { 1, "[defsize]" },
+  { 2, "[custsize]" },
+}
+
+test("Context - Empty cache") async;
+{
+	EmptyCache();
+}
+
+// Flood all of the contexts.
+foreach (run, contextName) from Table1
+{
+	test("Context - Flood context " contextName)
+	{
+		int context = 0;
+		if (run == 1)
+			context = defSizeContext;
+		else if (run == 2)
+			context = custSizeContext;
+
+		CacheHelpers::CacheBogusURLs(context, kMinFileSize, kMaxFileSize, 0, kCacheSize * 2); 
+	}
+}
+
+test("Context - Empty cache") async;
+{
+	EmptyCache();
+}
+
+test("Delete context directories")
+{
+	urlManager->RemoveContext(defSizeContext, TRUE);
+	urlManager->RemoveContext(custSizeContext, TRUE);
+	
+	verify(OpStatus::IsSuccess(CacheFileTest::DeleteCacheDir(defSizeFolder)));
+	verify(OpStatus::IsSuccess(CacheFileTest::DeleteCacheDir(custSizeFolder)));
+}

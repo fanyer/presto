@@ -1,0 +1,171 @@
+/* -*- Mode: c++; tab-width: 4; indent-tabs-mode: t; c-basic-offset: 4 -*-
+**
+** Copyright (C) 2004-2010 Opera Software ASA.  All rights reserved.
+**
+** This file is part of the Opera web browser.  It may not be distributed
+** under any circumstances.
+**
+** Yngve N. Pettersen
+*/
+
+group "url namecomplete load simple";
+
+language c++;
+require ADD_PERMUTE_NAME_PARTS;
+
+include "core/pch.h";
+
+include "modules/network_selftest/urldoctestman.h";
+include "modules/util/opfile/opfile.h";
+include "modules/prefs/prefsmanager/collections/pc_network.h";
+
+global {
+
+	URL_DocSelfTest_Manager *url_name_tests = NULL;
+	OpString name_complete_prefix_temp;
+	OpString name_complete_postfix_temp;
+	BOOL name_complete_enabled_temp=FALSE;
+	BOOL init_success = FALSE;
+}
+
+table filename_list (const char *) filelist "testfiles/namecomplete";
+
+table url_list (const char *, const char *) 
+{
+  {"operalogo.gif", "http://opera/img/operalogo.gif"},
+}
+
+setup 
+{
+	init_success = OpStatus::IsSuccess(name_complete_prefix_temp.Set(g_pcnet->GetStringPref(PrefsCollectionNetwork::HostNameExpansionPrefix)));
+	init_success = init_success && OpStatus::IsSuccess(name_complete_postfix_temp.Set(g_pcnet->GetStringPref(PrefsCollectionNetwork::HostNameExpansionPostfix)));
+#ifdef PREFS_WRITE
+	TRAPD(op_err, g_pcnet->WriteStringL(PrefsCollectionNetwork::HostNameExpansionPrefix, UNI_L("www")));
+	init_success = init_success && OpStatus::IsSuccess(op_err);
+	TRAP(op_err, g_pcnet->WriteStringL(PrefsCollectionNetwork::HostNameExpansionPostfix, UNI_L("no,com")));
+	init_success = init_success && OpStatus::IsSuccess(op_err);
+#else
+	init_success = init_success && !name_complete_prefix_temp.Compare("www");
+	init_success = init_success && !name_complete_postfix_temp.Compare("no,com");
+#endif
+	name_complete_enabled_temp = (BOOL) g_pcnet->GetIntegerPref(PrefsCollectionNetwork::CheckPermutedHostNames);
+	url_name_tests = OP_NEW(URL_DocSelfTest_Manager, ());
+}
+
+exit
+{
+#ifdef PREFS_WRITE
+	TRAPD(op_err, g_pcnet->WriteStringL(PrefsCollectionNetwork::HostNameExpansionPrefix, name_complete_prefix_temp));
+	TRAP(op_err, g_pcnet->WriteStringL(PrefsCollectionNetwork::HostNameExpansionPostfix, name_complete_postfix_temp));
+	TRAP(op_err, g_pcnet->WriteIntegerL(PrefsCollectionNetwork::CheckPermutedHostNames, name_complete_enabled_temp));
+#endif
+
+	OP_DELETE(url_name_tests);
+	url_name_tests = NULL;
+}
+
+test("Initialized")
+{
+	verify(url_name_tests != NULL);
+	verify(init_success);
+}
+
+subtest AddSimpleTest(URL_DocSelfTest_Batch *batch, const OpStringC8 &url, URL &ref_url, const OpStringC8 &filename)
+{
+	verify(batch != NULL);
+	verify(filename.HasContent());
+
+	OpAutoPtr<URL_DocVerySimpleTest> test(OP_NEW(URL_DocVerySimpleTest, ()));
+	verify(test.get() != NULL);
+
+	verify(OpStatus::IsSuccess(test->Construct(url, ref_url, filename, FALSE)));
+	test->url.Unload();
+
+	verify(batch->AddTestCase(test.release()));
+}
+
+subtest AddBatch(URL_DocSelfTest_Batch *batch)
+{
+	verify(batch != NULL);
+	verify(url_name_tests->AddBatch(batch));
+}
+
+subtest StartTestSet()
+{
+	verify(url_name_tests->SetLastBatch());
+}
+
+subtest ConfigureATest(URL_DocSelfTest_Batch *batch, const OpStringC8 &filename, URL &ref_url)
+{
+	verify(batch != NULL);
+
+	iterate(name, url) from url_list
+	{
+		OpString a_filename;
+		verify(OpStatus::IsSuccess(a_filename.Set(filename)));
+
+		OpFile a_file;
+
+		verify(OpStatus::IsSuccess(a_file.Construct(a_filename)));
+
+		OpStringC a_name(a_file.GetName());
+
+		verify(a_name.HasContent());
+
+		if(a_name.Compare(name) == 0)
+		{
+			verify(AddSimpleTest(batch, url, ref_url, filename));
+		}
+	}
+}
+
+
+subtest Setup_SingleTest(const OpStringC8 &filename, URL &ref_url)
+{
+	OpAutoPtr<URL_DocSelfTest_Batch> batch(OP_NEW(URL_DocSelfTest_Batch, ()));
+
+	verify(batch.get() != NULL);
+
+	verify(ConfigureATest(batch.get(), filename, ref_url));
+
+	verify(!batch->Empty());
+
+	verify(AddBatch(batch.release()));
+}
+
+subtest Setup_Batchtest()
+{
+	int count = 0;
+	URL ref_url;
+	OpAutoPtr<URL_DocSelfTest_Batch> batch(OP_NEW(URL_DocSelfTest_Batch, ()));
+
+	verify(batch.get() != NULL);
+
+	iterate(filename) from filename_list
+	{
+		verify(ConfigureATest(batch.get(), filename, ref_url));
+		count++;
+	}
+
+	verify(batch->Cardinal() == count);
+
+	verify(AddBatch(batch.release()));
+}
+
+test("Load Namecomplete URLs")
+	require success "Initialized";
+	require success "Initialized";
+	async;
+{
+	URL ref_url;
+	iterate(filename) from filename_list
+	{
+		if (!Setup_SingleTest(filename, ref_url))
+			ST_failed("Could not setup test");
+	}
+	if (!StartTestSet())
+		ST_failed("Could not start test set");
+}
+
+
+

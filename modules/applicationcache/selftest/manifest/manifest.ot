@@ -1,0 +1,557 @@
+group "offline_app.manifest.normilize";
+
+require APPLICATION_CACHE_SUPPORT;
+
+include "modules/util/opfile/opfile.h";
+include "modules/applicationcache/src/manifest_parser.h";
+include "modules/applicationcache/manifest.h";
+
+include "modules/applicationcache/selftest/manifest/constants.h";
+
+table ValidManifests (const char*const) filelist "./data/exotic-manifests/" name "OK-*.manifest";
+table NormalizationManifests (const char*const) filelist "./data/normalization-tests/" name "OK-*.manifest";
+
+global {
+
+    typedef const uni_char*const const_str_type;
+    typedef const_str_type (two_string_type)[2];
+
+    URL BuildURL (const uni_char*const url_str) {
+        const OpStringC tmp_rul_str (url_str);
+        return  g_url_api->GetURL (tmp_rul_str);
+    }
+
+    const OpString* ReadManifestContent (const char*const file_path) {
+        OpString* result = NULL;
+
+        OpString uni_path;
+        uni_path.Set(file_path);
+
+        OpFile file;
+        if (OpStatus::IsSuccess(file.Construct(uni_path))) {
+            BOOL exists = FALSE;
+
+            if (OpStatus::IsSuccess(file.Exists(exists)) && OpStatus::IsSuccess(file.Open(OPFILE_READ))) {
+                OpFileLength file_size = file.GetFileLength();
+
+                if (char* buff = OP_NEWA(char, (unsigned int)file_size + 1)) {
+                    OpFileLength left_to_read = file_size;
+                    while (left_to_read > 0 && !file.Eof())
+                    {
+                        OpFileLength bytes_read;
+                        if (OpStatus::IsSuccess(file.Read(buff + (file_size - left_to_read), left_to_read, &bytes_read)))
+                            left_to_read -= bytes_read;
+                        else
+                            return NULL;
+                    }
+                    buff[file_size] = 0;
+                    result = OP_NEW_L(OpString, ());
+                    result->SetFromUTF8(buff);
+                    OP_DELETEA(buff);
+                }
+            }
+            else {
+                OP_ASSERT (exists && "Test file is absent!!!");
+            }
+        }
+
+        return result;
+    }
+
+}
+
+
+subtest PositiveNegativeTest (BOOL is_positive, unsigned ix, BOOL is_achived, const uni_char *key) {
+	OpString8 key8;
+	verify_success(key8.SetUTF8FromUTF16(key));
+	output(
+            "\t\t\t\t %s test no: %u - %s, key: %s\n",
+            is_positive ? "positive" : "negative",
+            ix,
+            is_achived  ? "OK" : "NOK",
+            key8.CStr()
+	);
+
+	verify (is_achived);
+}
+
+subtest VerifyParser (ManifestParser* const manifest_parser, const OpStringC*const manifest_content) {
+    verify (NULL != manifest_parser);
+
+    // initial values => all them must be changed
+    unsigned parsed_chars = static_cast<unsigned> (-1);
+
+    const OP_STATUS parse_status = manifest_parser->Parse (
+            manifest_content->CStr (),
+            static_cast<unsigned>(manifest_content->Length ()),
+            TRUE,
+            parsed_chars
+    );
+
+    verify (OpStatus::IsSuccess (parse_status));
+    verify (static_cast<unsigned> (manifest_content->Length ()) == parsed_chars);
+}
+
+subtest VerifyEntryPresence (
+    const char*const case_name,
+    const uni_char*const*const array,
+    const unsigned array_size,
+    const Manifest*const manifest,
+    BOOL (Manifest::*const manifest_fns)(const uni_char* const url) const
+) {
+    output("\t\t test `%s' entries\n", case_name);
+    for (unsigned ix = 0; ix < array_size; ix++) {
+        const BOOL result = (manifest->*manifest_fns)(array [ix]);
+        output("\t\t\t no: %u - %s\n", ix, result ? "OK" : "NOK");
+        verify (TRUE == result);
+    }
+}
+
+subtest VerifyManifestDeep (const Manifest* const manifest) {
+    static
+    const uni_char*const EXPLICIT_CACHE_ENTRIES [] = {
+            UNI_L ("http://www.opera.com/img/logo.png"),
+            UNI_L ("http://www.opera.com/img/empty.png"),
+            UNI_L ("http://www.opera.com/img/background.png"),
+            UNI_L ("http://www.opera.com/img/menu.png"),
+            UNI_L ("http://www.opera.com/img/line.png"),
+            UNI_L ("http://www.opera.com/src/script.js"),
+            UNI_L ("http://www.opera.com/src/login.js"),
+    };
+
+    /**
+     * Test data structure:
+     *  [0] - full namespace
+     *  [1] - fallback entry
+     *  [2] - URL that matches
+     *  [3] - URL that doesn't match
+     */
+    typedef const uni_char*const (four_dim_array_type)[4];
+    static
+    const four_dim_array_type FALLBACK_ENTRIES [] = {
+            {
+                    UNI_L ("http://www.opera.com/img/"),
+                    UNI_L ("http://www.opera.com/img/empty.png"),
+                    UNI_L ("http://www.opera.com/img/test.png"),
+                    UNI_L ("http://www.opera.com/a/img/y.png"),
+            },
+            {
+                    UNI_L ("http://www.opera.com/src/"),
+                    UNI_L ("http://www.opera.com/data/sorry-data.xml"),
+                    UNI_L ("http://www.opera.com/src/test.xml"),
+                    UNI_L ("http://www.opera.com/a/src/test.xml"),
+            },
+            {
+                    UNI_L ("http://www.opera.com/bin/"),
+                    UNI_L ("http://www.opera.com/data/offline.xml"),
+                    UNI_L ("http://www.opera.com/bin/test.jsp"),
+                    UNI_L ("http://www.opera.com/a/bin/test.jsp"),
+            },
+            {
+                    UNI_L ("http://www.opera.com/bin/user-data.jsp?request=http%3A%2F%2Fwww.opera.com%2Findex.jsp%3Fuser-id%3D1%26country-name%3Dukraine"),
+                    UNI_L ("http://www.opera.com/bin/user-data.jsp?request=http%3A%2F%2Fwww.opera.com%2Findex.jsp%3Fuser-id%3D0%26country-name%3Dunknown"),
+                    UNI_L ("http://www.opera.com/bin/user-data.jsp?request=http%3A%2F%2Fwww.opera.com%2Findex.jsp%3Fuser-id%3D1%26country-name%3Dukraine&extra-arg=something"),
+                    UNI_L ("http://www.opera.com/a/bin/user-data.jsp?"),
+
+            },
+    };
+
+    static
+    const uni_char*const NETWORK_ENTRIES []= {
+            UNI_L ("http://www.opera.com/bin/server.jsp?who-are-you=ghost"),
+            UNI_L ("http://www.opera.com/bin/data.jsp"),
+    };
+
+    static
+    const unsigned EXPLICIT_CACHE_ENTRIES_SIZE = sizeof (EXPLICIT_CACHE_ENTRIES)/sizeof (const uni_char*const);
+
+    static
+    const unsigned FALLBACK_ENTRIES_SIZE = sizeof (FALLBACK_ENTRIES)/sizeof (four_dim_array_type);
+
+    static
+    const unsigned NETWORK_ENTRIES_SIZE = sizeof (NETWORK_ENTRIES)/sizeof (const uni_char*const);
+
+    // fill hash map with data
+    OpAutoStringHashTable<char> CACHED_DATA (TRUE);
+    for (unsigned ix = 0; ix < EXPLICIT_CACHE_ENTRIES_SIZE; ix++) {
+        verify_success(CACHED_DATA.Add (EXPLICIT_CACHE_ENTRIES[ix], 0));
+    }
+
+    for (unsigned ix = 0; ix < FALLBACK_ENTRIES_SIZE; ix++) {
+        OpStatus::Ignore (CACHED_DATA.Add (FALLBACK_ENTRIES[ix][1], 0));
+    }
+
+    verify(VerifyEntryPresence ("CACHE", EXPLICIT_CACHE_ENTRIES, EXPLICIT_CACHE_ENTRIES_SIZE, manifest, &Manifest::CheckCacheUrl));
+    verify(VerifyEntryPresence ("NETWORK", NETWORK_ENTRIES, NETWORK_ENTRIES_SIZE, manifest, &Manifest::MatchNetworkUrl));
+
+    output("\t\t test `%s'\n", "FALLBACK");
+    output("\t\t\t test FALLBACK entries \n");
+    for (unsigned ix = 0; ix < FALLBACK_ENTRIES_SIZE; ix++) {
+        const BOOL result = manifest->CheckCacheUrl(FALLBACK_ENTRIES[ix][1]);
+        verify(PositiveNegativeTest (TRUE, ix, result, FALLBACK_ENTRIES[ix][1]));
+    }
+
+    // reverse test
+    // the test checks that no extra URLs (CACHE and FALLBACk) have been added
+
+    // next go through all URL in manifest and check that they must be there
+    output("\t\t\t test that no extra CACHE and FALLBACK URLs have been added \n");
+    OpAutoPtr <OpHashIterator> it (const_cast<Manifest*>(manifest)->GetCacheIterator());
+    verify (NULL != it.get());
+    verify (OpStatus::IsSuccess(it->First()));
+
+    unsigned ix = 0;
+    do {
+        const_str_type key = static_cast<const_str_type>(it->GetKey ());
+        const BOOL result = CACHED_DATA.Contains (key);
+        verify(PositiveNegativeTest (TRUE, ix, result, static_cast<const_str_type>(it->GetKey ())));
+        ix++;
+    } while (OpStatus::IsSuccess(it->Next ()));
+
+
+
+    output("\t\t\t test FALLBACK namespaces matches\n");
+    for (unsigned ix = 0; ix < FALLBACK_ENTRIES_SIZE; ix++) {
+        const uni_char* tmp_url_str;
+        const BOOL ok_return_result = manifest->MatchFallback (FALLBACK_ENTRIES[ix][2], tmp_url_str);
+        const OpStringC ok_url (tmp_url_str);
+        const BOOL ok_match_result = 0 == ok_url.Compare (FALLBACK_ENTRIES[ix][1]);
+        const BOOL ok_result = ok_return_result && ok_match_result;
+        verify(PositiveNegativeTest (TRUE, ix, ok_result, FALLBACK_ENTRIES[ix][1]));
+
+        const BOOL nok_return_result = !manifest->MatchFallback (FALLBACK_ENTRIES[ix][3], tmp_url_str);
+        const BOOL nok_match_result = NULL == tmp_url_str;
+        const BOOL nok_result = nok_return_result && nok_match_result;
+        verify(PositiveNegativeTest (FALSE, ix, nok_result, FALLBACK_ENTRIES[ix][3]));
+    }
+}
+
+/**
+ *  Build Manifest Parser
+ *
+ *  This is a standard routine for biding a manifest parser.
+ *  The function takes all manifest content data as UNICODE characters and parse them as one chunk.
+ *  @param[manifest_content] completed content of the manifest in UNICODE
+ *
+ *  @return an instance of manifest parser
+ *  @note the returned manifest parser may be used for getting manifest itself
+ *
+ */
+subtest VerifyManifest (const char* const test_file_path, BOOL deep_validation) {
+    OpAutoPtr<const Manifest> manifest (NULL);
+    {// block to test how manifest works when manifest parser has already been deleted
+
+        OpAutoPtr<ManifestParser> manifest_parser (NULL);
+        { // block to test how the parser works when the content data have already been deleted
+            ManifestParser* tmp_manifest_parser;
+            const OpAutoPtr<const OpString> manifest_content (ReadManifestContent (test_file_path));
+
+            const OpStringC test_manifest_url_str (UNI_L (TEST_MANIFEST_URL));
+
+            const URL test_manifest_url = g_url_api->GetURL (test_manifest_url_str);
+
+            verify (OpStatus::IsSuccess (ManifestParser::BuildManifestParser (test_manifest_url, tmp_manifest_parser)));
+            verify (NULL != tmp_manifest_parser);
+
+            manifest_parser.reset (tmp_manifest_parser);
+            verify(VerifyParser (tmp_manifest_parser, manifest_content.get ()));
+        }
+        verify (NULL != manifest_parser.get ());
+
+        Manifest* tmp_manifest;
+        verify (OpStatus::IsSuccess (manifest_parser->BuildManifest (tmp_manifest)));
+        manifest.reset (tmp_manifest);
+    }
+
+    verify (NULL != manifest.get ());
+
+    if (deep_validation) {
+        verify(VerifyManifestDeep (manifest.get ()));
+    }
+}
+
+foreach (test_file_path) from ValidManifests {
+    test ("Check Manifest Parsing - $(test_file_path)") leakcheck; {
+        verify(VerifyManifest (test_file_path, FALSE));
+    }
+}
+
+foreach (test_file_path) from NormalizationManifests {
+    test ("Test Manifest Normalization - $(test_file_path)") leakcheck; {
+        verify(VerifyManifest (test_file_path, TRUE));
+    }
+}
+
+subtest DefaultManifestCheck (
+    const uni_char*const test_manifest_str,
+    Manifest*& new_manifest
+) {
+    ManifestParser* tmp_manifest_parser;
+
+    verify_success(
+        ManifestParser::BuildManifestParser (
+            BuildURL (UNI_L (TEST_MANIFEST_URL)),
+            tmp_manifest_parser
+        )
+    );
+    OpAutoPtr <ManifestParser> manifest_parser (tmp_manifest_parser);
+
+    new_manifest = NULL;
+    // note that this extra block has been introduced in order to delete
+    //  parser, while the content of the manifest is used used
+    {
+        const OpStringC manifest_str (test_manifest_str);
+        verify(VerifyParser (tmp_manifest_parser, &manifest_str));
+
+        verify_success(manifest_parser->BuildManifest (new_manifest));
+
+        verify (NULL != new_manifest);
+    }
+
+}
+
+subtest OnlineWhiteListTest (
+    const char*const test_descr,
+    const char*const test_manifest_str,
+    BOOL expected_online_value
+) {
+
+    output("\n\tthe case: %s", test_descr);
+    OpString tmp_test_manifest_str;
+    verify_success(tmp_test_manifest_str.Set (test_manifest_str));
+
+    Manifest* tmp_manifest;
+    verify(DefaultManifestCheck (tmp_test_manifest_str.CStr(), tmp_manifest));
+    const OpAutoPtr <const Manifest> manifest (tmp_manifest);
+
+    verify (expected_online_value == manifest->IsOnlineOpen ());
+}
+
+test ("Check online whitelist wildcard flag") leakcheck; {
+
+    verify(OnlineWhiteListTest (
+        "the default value of the online whitelist wildcard flag must be `closed'",
+
+        "CACHE MANIFEST\n"
+        , // just empty manifest
+
+        FALSE
+    ));
+
+    verify(OnlineWhiteListTest (
+        "the wildcard is taken into consideration in NETWORK section",
+
+                "CACHE MANIFEST\n"
+                "NETWORK:\n"
+                "       \t\t    *       \t\t" // the test also checks how leading and trailing white spaces are processed
+        ,
+
+        TRUE
+    ));
+
+    verify(OnlineWhiteListTest (
+        "the wildcard is taken into consideration neither is CACHE nor FALLBACK sections",
+
+                "CACHE MANIFEST\n"
+                "*\n" // default CACHE section
+                "FALLBACK:"
+                "* /img/x.png\n" // wildcard in namespace
+                "/img/ *" // wildcard in fallback entry
+        ,
+
+        FALSE
+    ));
+
+}
+
+subtest FallbackNamespaceMatching (
+    const char*const test_descr,
+    const uni_char*const test_manifest_str,
+    const two_string_type* ok_tests,
+    const const_str_type* nok_tests
+) {
+    output("\n\tthe case: %s\n", test_descr);
+
+    Manifest* tmp_manifest;
+    verify(DefaultManifestCheck (test_manifest_str, tmp_manifest));
+    const OpAutoPtr <const Manifest> manifest (tmp_manifest);
+
+    for (unsigned ix = 0; **ok_tests; ok_tests++, ix++) {
+        const uni_char*const url_in = (*ok_tests)[0];
+        const uni_char*const url_out = (*ok_tests)[1];
+        const uni_char* tmp_url_out;
+        const BOOL match_return_ok = manifest->MatchFallback(url_in, tmp_url_out);
+        const BOOL match_str_ok = 0 == OpStringC(url_out).Compare(tmp_url_out);
+        const BOOL result = match_return_ok && match_str_ok;
+
+        verify(PositiveNegativeTest (TRUE, ix, result, url_in));
+    }
+
+    for (unsigned ix = 0; *nok_tests; nok_tests++, ix++) {
+        const uni_char* const url_in = *nok_tests;
+        const uni_char* tmp_url_out;
+        const BOOL match_return_nok = FALSE == manifest->MatchFallback(url_in, tmp_url_out);
+        const BOOL match_str_nok = NULL == tmp_url_out;
+        const BOOL result = match_return_nok && match_str_nok;
+
+        verify(PositiveNegativeTest (FALSE, ix, result, url_in));
+    }
+}
+
+test ("Check FALLBACK namespace matching")  leakcheck; {
+
+    OpString manifest1;
+    verify_success(
+        manifest1.Set (
+            "CACHE MANIFEST\n"
+            "/img/background.png\n"
+            "\n"
+            "FALLBACK:\n"
+            "/img/ /img/blank.png\n"
+        )
+    );
+    const two_string_type test1_ok [] = {
+             // URL => URL after matching
+            {UNI_L("http://www.opera.com/img/x.png"),   UNI_L("http://www.opera.com/img/blank.png")},
+            {UNI_L("http://www.opera.com/img/a/b/c/d/e/f/g/h/i/x.png"), UNI_L("http://www.opera.com/img/blank.png")},
+            {NULL, NULL},
+    };
+    const const_str_type test1_nok [] = {
+            // there is no matching
+            UNI_L("http://www.opera.com/cgi/server.cgi?some-query=xyz"),
+
+            // different base URL
+            //  protocol: http vs. httpS
+            UNI_L("https://www.opera.com/img/x.png"),
+
+            // host: www.opera.com vs. www.opera.NET
+            UNI_L("http://www.opera.net/img/x.png"),
+
+            // port 80 (def.) vs. 8080
+            UNI_L("http://www.opera.com:8080/img/x.png"),
+
+            // protocol and host
+            UNI_L("https://www.opera.net/img/x.png"),
+
+            // protocol and port
+            UNI_L("https://www.opera.com:8080/img/x.png"),
+
+            // host and port
+            UNI_L("http://www.opera.net:8080/img/x.png"),
+
+            // all: protocol, host, port
+            UNI_L("https://www.opera.net:8080/img/x.png"),
+
+            NULL,
+    };
+
+    verify (
+        FallbackNamespaceMatching (
+            "basic test (smoke test)",
+            manifest1.CStr (),
+            test1_ok,
+            test1_nok
+        )
+    );
+
+    OpString manifest2;
+    OP_STATUS status = manifest2.Set (
+            "CACHE MANIFEST\n"
+            "/img/background.png\n"
+            "\n"
+
+            "FALLBACK:\n"
+            // this namespace matches everything
+            "/        /data/data.xml\n"
+
+            // img related pattersn (a bit artificial though)
+            "/img/ /img/blank.png\n"
+            "/img/a /img/a.png\n"
+            "/img/a/b /img/a.b.png\n"
+            "/img/a/b/c /img/a.b.c.png\n"
+            "/img/a/b/c/d /img/a.b.c.d.png\n"
+
+            // another patterns
+            "/src/ /src/default.js\n"
+
+            // patterns with query
+            "/cgi/server.jsp? /data/unknown-error.txt\n"
+    );
+    verify_success(status);
+
+    const  two_string_type test2_ok [] = {
+            {UNI_L("http://www.opera.com/img/x.png"), UNI_L("http://www.opera.com/img/blank.png")},
+            {UNI_L("http://www.opera.com/img/a/x.png"), UNI_L("http://www.opera.com/img/a.png")},
+            {UNI_L("http://www.opera.com/img/a/b/x.png"), UNI_L("http://www.opera.com/img/a.b.png")},
+            {UNI_L("http://www.opera.com/img/a/b/c/x.png"), UNI_L("http://www.opera.com/img/a.b.c.png")},
+            {UNI_L("http://www.opera.com/img/a/b/ccccccccccc/x.png"), UNI_L("http://www.opera.com/img/a.b.c.png")},
+            {UNI_L("http://www.opera.com/img/a/b/c/d/x.png"), UNI_L("http://www.opera.com/img/a.b.c.d.png")},
+
+            // namespace that matches everything (1st namespace)
+            {UNI_L("http://www.opera.com/everything.xml"), UNI_L("http://www.opera.com/data/data.xml")},
+
+            // yet another case, but now port 80 defined explicitly (default for HTTP)
+            // the case will be handled automatically by URL
+            // all strings to Manifest have already been normilized
+            // {UNI_L("http://www.opera.com:80/everything.xml"), UNI_L("http://www.opera.com/data/data.xml")},
+
+            // src pattern
+            {UNI_L("http://www.opera.com/src/some-data/no-data.xml"), UNI_L("http://www.opera.com/src/default.js")},
+
+            // patterns with query
+            {UNI_L("http://www.opera.com/cgi/server.jsp?my-name=dima&city=odessa"), UNI_L("http://www.opera.com/data/unknown-error.txt")},
+
+            {NULL, NULL},
+    };
+
+    const const_str_type test2_nok [] = {
+            // different host (universal pattern must not work here)
+            UNI_L("https://www.opera.com/index.html"),
+            NULL,
+    };
+
+    verify (
+        FallbackNamespaceMatching (
+            "complex test with multiple namespaces and finding the longest one",
+            manifest2.CStr (),
+            test2_ok,
+            test2_nok
+        )
+    );
+}
+
+
+test ("Check how the same namespace in FALLBACK is handled") leakcheck; {
+    OpString test_manifest_str;
+     OP_STATUS status = test_manifest_str.Set (
+         "CACHE MANIFEST\n"
+         "FALLBACK:\n"
+         "/img/ /img/valid.image.png\n" // the first one MUST be taken into account
+         "/img/ /img/wrong.image.png\n" // the second is ignored
+    );
+    verify_success(status);
+
+    Manifest* tmp_manifest;
+    verify(DefaultManifestCheck (test_manifest_str.CStr (), tmp_manifest));
+    const OpAutoPtr <const Manifest> manifest (tmp_manifest);
+
+    const uni_char*const url_in = UNI_L ("http://www.opera.com/img/test.image.png");
+    const uni_char*const url_out = UNI_L ("http://www.opera.com/img/valid.image.png");
+    const uni_char* tmp_url_out = NULL;
+
+    output("\n\tthe first namespace must be taken into account and the entity of the second line should be excluded\n");
+    // check that matching is valid
+    {
+        const BOOL return_result = manifest->MatchFallback(url_in, tmp_url_out);
+        const BOOL match_resutl = 0 == OpStringC (url_out).Compare (tmp_url_out);
+        const BOOL result = return_result && match_resutl;
+
+        verify(PositiveNegativeTest (TRUE, 0, result, url_in));
+    }
+
+    // check that invalid resource (the second one in the namespace) has not been added
+    {
+        const BOOL result = !manifest->CheckCacheUrl ( UNI_L ("http://www.opera.com/img/wrong.image.png"));
+        verify(PositiveNegativeTest (FALSE, 0, result, UNI_L ("http://www.opera.com/img/wrong.image.png")));
+    }
+}

@@ -1,0 +1,403 @@
+/* -*- Mode: c++; tab-width: 4; indent-tabs-mode: t; c-basic-offset: 4 -*-
+**
+** Copyright (C) 2004-2007 Opera Software ASA.  All rights reserved.
+**
+** This file is part of the Opera web browser.  It may not be distributed
+** under any circumstances.
+**
+** Peter Karlsson
+*/
+
+group "prefsfile.ini.create.escaped";
+require initialization;
+require PREFS_HAS_INI_ESCAPED;
+require PREFS_HAS_PREFSFILE;
+
+include "modules/prefsfile/prefsfile.h";
+include "modules/util/opfile/opfile.h";
+
+// -- Global variables ---------------------------------------------------
+
+global
+{
+	PrefsFile *pfp;
+	OpFile *ofp;
+}
+
+setup
+{
+	pfp = NULL;
+	ofp = NULL;
+
+	// Create a new file for the test
+	ofp = OP_NEW(OpFile, ());
+	ofp->Construct(UNI_L("createde.ini"), OPFILE_HOME_FOLDER);
+	BOOL exists = FALSE;
+	ofp->Exists(exists);
+	if (exists)
+	{
+		ofp->Delete();
+	}
+
+	// Create the PrefsFile object
+	pfp = OP_NEW(PrefsFile, (PREFS_INI_ESCAPED));
+	pfp->ConstructL();
+	pfp->SetFileL(ofp);
+}
+
+// -- Load the file ------------------------------------------------------
+
+test("Loading a non-existant INI file")
+{
+	TRAPD(rc, pfp->LoadAllL());
+	verify(OpStatus::IsSuccess(rc));
+}
+
+// -- Write strings ------------------------------------------------------
+
+table newstrings(const uni_char *, const uni_char *, const uni_char *)
+{
+	// Simple
+	{ UNI_L("Section1"), UNI_L("StringKey1"), UNI_L("Value1") },
+	{ UNI_L("Section1"), UNI_L("StringKey2"), UNI_L("Value2") },
+	{ UNI_L("Section2"), UNI_L("StringKey1"), UNI_L("Value1") },
+	{ UNI_L("Section2"), UNI_L("StringKey2"), UNI_L("Value2") },
+	// Complex
+	{ UNI_L("Section3"), UNI_L("="),          UNI_L("Value1") },
+	{ UNI_L("Section3"), UNI_L("\""),         UNI_L("Value2") },
+	{ UNI_L("Section3"), UNI_L("\"\""),       UNI_L("Value3") },
+	{ UNI_L("Section3"), UNI_L("[Section1]"), UNI_L("Value5") },
+	{ UNI_L("Section3"), UNI_L("["),          UNI_L("Value6") },
+	{ UNI_L("Section3"), UNI_L("]"),          UNI_L("Value7") },
+	{ UNI_L("Section3"), UNI_L(";"),          UNI_L("Value8") },
+	{ UNI_L("Section3"), UNI_L("Nul"),        NULL },
+	{ UNI_L("Section3"), UNI_L("Empty"),      UNI_L("") },
+	{ UNI_L("Section3"), UNI_L("Spaced"),     UNI_L("   ") },
+	// Escaped
+	{ UNI_L("Section"), UNI_L("LF"), UNI_L("\n") },
+	{ UNI_L("Section"), UNI_L("CR"), UNI_L("\r") },
+	{ UNI_L("Section"), UNI_L("Tab"), UNI_L("\t") },
+	{ UNI_L("Section"), UNI_L("Hex"), UNI_L("\x80") },
+	{ UNI_L("Section"), UNI_L("Backslash"), UNI_L("\\") },
+}
+
+test("Writing strings to empty INI file")
+	require PREFSFILE_WRITE;
+{
+	iterate(section, key, value) from newstrings
+	{
+		OP_MEMORY_VAR OP_STATUS rc1 = OpStatus::OK;
+		TRAPD(rc2, rc1 = pfp->WriteStringL(section, key, value));
+		verify(OpStatus::IsSuccess(rc2));
+		verify(OpStatus::IsSuccess(rc1));
+	}
+}
+
+test("Checking that strings were cached")
+	require success "Writing strings to empty INI file";
+{
+	OpString s;
+
+	iterate(section, key, value) from newstrings
+	{
+		TRAPD(rc, pfp->ReadStringL(section, key, s));
+		verify(OpStatus::IsSuccess(rc));
+		verify(s.Compare(value) == 0);
+	}
+}
+
+// -- Write integers -----------------------------------------------------
+
+table newints(const uni_char *, const uni_char *, int)
+{
+	// Simple
+	{ UNI_L("Section1"), UNI_L("IntegerKey1"), 42 },
+	{ UNI_L("Section1"), UNI_L("IntegerKey2"), 4711 },
+	{ UNI_L("Section2"), UNI_L("IntegerKey1"), 4711 },
+	{ UNI_L("Section2"), UNI_L("IntegerKey2"), 42 },
+	// Complex
+	{ UNI_L("Section4"), UNI_L("="),          1 },
+	{ UNI_L("Section4"), UNI_L("\""),         2 },
+	{ UNI_L("Section4"), UNI_L("\"\""),       3 },
+	{ UNI_L("Section4"), UNI_L("[Section1]"), 4 },
+	{ UNI_L("Section4"), UNI_L("["),          5 },
+	{ UNI_L("Section4"), UNI_L("]"),          6 },
+}
+
+test("Writing integers to empty INI file")
+	require PREFSFILE_WRITE;
+{
+	iterate(section, key, value) from newints
+	{
+		OP_MEMORY_VAR OP_STATUS rc1 = OpStatus::OK;
+		TRAPD(rc2, rc1 = pfp->WriteIntL(section, key, value));
+		verify(OpStatus::IsSuccess(rc2));
+		verify(OpStatus::IsSuccess(rc1));
+	}
+}
+
+test("Checking that integers were cached")
+	require success "Writing integers to empty INI file";
+{
+	OP_MEMORY_VAR int x;
+
+	iterate(section, key, value) from newints
+	{
+		TRAPD(rc, x = pfp->ReadIntL(section, key, -1));
+		verify(OpStatus::IsSuccess(rc));
+		verify(x == value);
+	}
+}
+
+// -- Test modifying the value -------------------------------------------
+
+test("Modifying integers")
+	require PREFSFILE_WRITE;
+{
+	// Change the values to something else
+	OP_MEMORY_VAR int x;
+
+	iterate(section, key, value) from newints
+	{
+		OP_MEMORY_VAR OP_STATUS rc1 = OpStatus::OK;
+		TRAPD(rc2, rc1 = pfp->WriteIntL(section, key, 123456789));
+		verify(OpStatus::IsSuccess(rc2));
+		verify(OpStatus::IsSuccess(rc1));
+
+		TRAPD(rc, x = pfp->ReadIntL(section, key, -1));
+		verify(OpStatus::IsSuccess(rc));
+		verify(x == 123456789);
+	}
+
+	// Now change them back
+	iterate(section, key, value) from newints
+	{
+		OP_MEMORY_VAR OP_STATUS rc1 = OpStatus::OK;
+		TRAPD(rc2, rc1 = pfp->WriteIntL(section, key, value));
+		verify(OpStatus::IsSuccess(rc2));
+		verify(OpStatus::IsSuccess(rc1));
+
+		TRAPD(rc, x = pfp->ReadIntL(section, key, -1));
+		verify(OpStatus::IsSuccess(rc));
+		verify(x == value);
+	}
+}
+
+test("Modifying strings: increasing length")
+	require PREFSFILE_WRITE;
+{
+	OpString s;
+
+	// Test increasing string lengths (reallocates container)
+	iterate(section, key, value) from newstrings
+	{
+		OP_MEMORY_VAR OP_STATUS rc1 = OpStatus::OK;
+		OpString newvalue;
+		newvalue.Set(value);
+		newvalue.Append("...longer");
+		TRAPD(rc2, rc1 = pfp->WriteStringL(section, key, newvalue));
+		verify(OpStatus::IsSuccess(rc2));
+		verify(OpStatus::IsSuccess(rc1));
+
+		TRAPD(rc3, pfp->ReadStringL(section, key, s));
+		verify(OpStatus::IsSuccess(rc3));
+		verify(s.Compare(newvalue) == 0);
+	}
+}
+
+test("Modifying strings: changing back")
+	require PREFSFILE_WRITE;
+{
+	OpString s;
+
+	// Test changing strings back (no reallocation)
+	iterate(section, key, value) from newstrings
+	{
+		OP_MEMORY_VAR OP_STATUS rc1 = OpStatus::OK;
+		TRAPD(rc2, rc1 = pfp->WriteStringL(section, key, value));
+		verify(OpStatus::IsSuccess(rc2));
+		verify(OpStatus::IsSuccess(rc1));
+
+		TRAPD(rc3, pfp->ReadStringL(section, key, s));
+		verify(OpStatus::IsSuccess(rc3));
+		verify(s.Compare(value) == 0);
+	}
+}
+
+test("Modifying strings: setting to NULL")
+	require PREFSFILE_WRITE;
+{
+	OpString s;
+
+	// Test changing into null strings (no reallocation)
+	iterate(section, key, value) from newstrings
+	{
+		OP_MEMORY_VAR OP_STATUS rc1 = OpStatus::OK;
+		TRAPD(rc2, rc1 = pfp->WriteStringL(section, key, NULL));
+		verify(OpStatus::IsSuccess(rc2));
+		verify(OpStatus::IsSuccess(rc1));
+
+		TRAPD(rc3, pfp->ReadStringL(section, key, s));
+		verify(OpStatus::IsSuccess(rc3));
+		verify(s.CStr() == NULL);
+	}
+}
+
+test("Modifying strings: changing back")
+	require PREFSFILE_WRITE;
+{
+	OpString s;
+
+	// Test changing strings back (will reallocate since it has lost
+	// information about the allocated length)
+	iterate(section, key, value) from newstrings
+	{
+		OP_MEMORY_VAR OP_STATUS rc1 = OpStatus::OK;
+		TRAPD(rc2, rc1 = pfp->WriteStringL(section, key, value));
+		verify(OpStatus::IsSuccess(rc2));
+		verify(OpStatus::IsSuccess(rc1));
+
+		TRAPD(rc3, pfp->ReadStringL(section, key, s));
+		verify(OpStatus::IsSuccess(rc3));
+		verify(s.Compare(value) == 0);
+	}
+}
+
+// -- Dump to disk and read it back --------------------------------------
+
+test("Dumping data to disk")
+{
+	TRAPD(rc, pfp->CommitL(TRUE, TRUE));
+	verify(OpStatus::IsSuccess(rc));
+}
+
+test("Creating a new PrefsFile object for the file")
+{
+	OP_DELETE(pfp);
+	pfp = NULL;
+
+	pfp = OP_NEW(PrefsFile, (PREFS_INI_ESCAPED));
+	pfp->ConstructL();
+	pfp->SetFileL(ofp);
+}
+
+// -- Check that the data is intact --------------------------------------
+
+test("Checking that strings were written properly")
+	require success "Dumping data to disk";
+	require success "Creating a new PrefsFile object for the file";
+	require PREFSFILE_WRITE;
+{
+	OpString s;
+
+	iterate(section, key, value) from newstrings
+	{
+		TRAPD(rc, pfp->ReadStringL(section, key, s));
+		verify(OpStatus::IsSuccess(rc));
+		verify(s.Compare(value) == 0);
+	}
+}
+
+test("Checking that integers were written properly")
+	require success "Dumping data to disk";
+	require success "Creating a new PrefsFile object for the file";
+	require PREFSFILE_WRITE;
+{
+	OP_MEMORY_VAR int x;
+
+	iterate(section, key, value) from newints
+	{
+		TRAPD(rc, x = pfp->ReadIntL(section, key, -1));
+		verify(OpStatus::IsSuccess(rc));
+		verify(x == value);
+	}
+}
+
+// -- Delete everything --------------------------------------------------
+
+test("Deleting all data")
+	require success "Checking that integers were written properly";
+	require PREFS_DELETE_ALL_SECTIONS;
+{
+	TRAPD(rc, pfp->DeleteAllSectionsL());
+
+	OpString s;
+
+	iterate(section, key, value) from newstrings
+	{
+		TRAPD(rc, pfp->ReadStringL(section, key, s, UNI_L("n/a")));
+		verify(OpStatus::IsSuccess(rc));
+		verify(s.Compare(UNI_L("n/a")) == 0);
+	}
+
+	int x;
+
+	iterate(section, key, value) from newints
+	{
+		TRAPD(rc, x = pfp->ReadIntL(section, key, -1));
+		verify(OpStatus::IsSuccess(rc));
+		verify(-1 == x);
+	}
+}
+
+// -- Dump to disk and read it back (now empty) --------------------------
+
+test("Dumping the now empty file to disk")
+	require PREFS_DELETE_ALL_SECTIONS;
+{
+	TRAPD(rc, pfp->CommitL(TRUE, TRUE));
+	verify(OpStatus::IsSuccess(rc));
+}
+
+test("Creating a new PrefsFile object for the now empty file")
+	require PREFS_DELETE_ALL_SECTIONS;
+{
+	OP_DELETE(pfp);
+	pfp = NULL;
+
+	pfp = OP_NEW(PrefsFile, (PREFS_INI_ESCAPED));
+	pfp->ConstructL();
+	pfp->SetFileL(ofp);
+}
+
+// -- Check that the file is indeed empty now ----------------------------
+
+test("Check that the file is indeed empty now")
+	require success "Deleting all data";
+	require success "Dumping the now empty file to disk";
+	require success "Creating a new PrefsFile object for the now empty file";
+{
+	OpString s;
+
+	iterate(section, key, value) from newstrings
+	{
+		TRAPD(rc, pfp->ReadStringL(section, key, s, UNI_L("n/a")));
+		verify(OpStatus::IsSuccess(rc));
+		verify(s.Compare(UNI_L("n/a")) == 0);
+	}
+
+	OP_MEMORY_VAR int x;
+
+	iterate(section, key, value) from newints
+	{
+		TRAPD(rc, x = pfp->ReadIntL(section, key, -1));
+		verify(OpStatus::IsSuccess(rc));
+		verify(-1 == x);
+	}
+}
+
+// -- Global cleanup -----------------------------------------------------
+
+exit
+{
+	OP_DELETE(pfp);
+
+	// Remove the generated file
+	BOOL exists = FALSE;
+	ofp->Exists(exists);
+	if (exists)
+	{
+		ofp->Delete();
+	}
+	OP_DELETE(ofp);
+}

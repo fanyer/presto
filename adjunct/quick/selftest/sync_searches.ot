@@ -1,0 +1,455 @@
+/* -*- Mode: c++; tab-width: 4; indent-tabs-mode: t; c-basic-offset: 4 -*- */
+
+
+group "quick_sync.search";
+require init;
+require SUPPORT_DATA_SYNC;
+require SUPPORT_SYNC_SEARCHES;
+
+include "adjunct/quick/selftest/src/ST_SyncSearchEntries.h";
+include "adjunct/desktop_util/selftest/src/ST_search_net.h";
+include "adjunct/desktop_util/string/stringutils.h";
+include "modules/sync/sync_coordinator.h";
+include "modules/sync/sync_dataitem.h";
+include "modules/sync/sync_util.h";
+include "adjunct/quick/Application.h";
+include "adjunct/desktop_util/search/search_types.h";
+include "adjunct/quick/managers/SyncManager.h";
+
+language C++;
+
+table url_samples (const uni_char *, const uni_char*, const uni_char*)
+{
+	{ UNI_L("http://www.webmonkey.com/"),                         UNI_L("Title 1"), UNI_L("a")}, 
+	{ UNI_L("http://www.whatismyip.com/"),                        UNI_L("Title 2"), UNI_L("b")},
+}
+
+
+table url_samples2 (const uni_char *, const uni_char*, const uni_char*)
+{
+	{ UNI_L("opera:%s"),                        UNI_L("Title 3"), UNI_L("c")}, 
+	{ UNI_L("opera:%s"),                        UNI_L("Title 4"), UNI_L("d")},
+}
+
+//	iterate(search_guid, url, name, key, is_post, post, type, position) from search_samples
+table search_samples (const uni_char*, const uni_char*, const uni_char*, BOOL, const uni_char*, SearchType, int)
+{
+	{ UNI_L("www.ap.no"), UNI_L("Title 5"), UNI_L("c"), TRUE,  UNI_L(""), SEARCH_TYPE_GOOGLE, 0}, 
+	{ UNI_L("www.db.no"), UNI_L("Title 6"), UNI_L("d"), FALSE, UNI_L(""), SEARCH_TYPE_DICTIONARY, 10},
+
+}
+
+/////////////////////////////////////////////////////////////////
+
+/////////// ProcessSyncItem ////////////////////////////////////////
+
+/////////// Receiving items from the server ////////////////////////
+
+////////////////////////////////////////////////////////////////////
+
+// test("listening")
+// {
+// 	ST_SyncSearchEntries searchSyncer;
+// 	g_sync_coordinator->SetSyncDataClient(&searchSyncer, OpSyncDataItem::DATAITEM_SEARCH);
+// 	//verify(listening);
+// 	// test process
+// 	// remove listening
+// }
+
+/***
+ *
+ * ProcessSyncItem - 
+ * checks that the value of IsReceivingItems is reset after the call
+ * that the item is added to searches
+ *
+ *
+ */
+test("ProcessSyncItem")
+{
+
+	g_sync_manager->SetSupportsType(SyncManager::SYNC_SEARCHES, TRUE);
+
+	ST_SyncSearchEntries searchSyncer;
+	
+	// --- Store away original value of m_is_recieving_items
+	BOOL stored_value = searchSyncer.IsProcessingIncomingItems();
+	
+	OpSyncItem *item = 0;
+	
+	OpString guid;
+		
+	// --- Generate a GUID and get the SyncItem
+	verify(OpStatus::IsSuccess(StringUtils::GenerateClientID(guid)));
+	verify(OpStatus::IsSuccess(g_sync_coordinator->GetSyncItem(&item, OpSyncDataItem::DATAITEM_SEARCH, OpSyncItem::SYNC_KEY_ID, guid.CStr()))); //
+
+	// -- Set action and a set of elements / attributes on the item
+	item->SetStatus(OpSyncDataItem::DATAITEM_ACTION_ADDED);
+	verify(OpStatus::IsSuccess(item->SetData(OpSyncItem::SYNC_KEY_GROUP, UNI_L("custom"))));
+	verify(OpStatus::IsSuccess(item->SetData(OpSyncItem::SYNC_KEY_URI, UNI_L("opera:%s"))));
+	verify(OpStatus::IsSuccess(item->SetData(OpSyncItem::SYNC_KEY_TITLE, UNI_L("opera page"))));
+	OpString hidden_value;
+	if (OpStatus::IsSuccess(hidden_value.AppendFormat(UNI_L("%d"), 0)))
+	{
+		verify(OpStatus::IsSuccess(item->SetData(OpSyncItem::SYNC_KEY_HIDDEN, hidden_value.CStr())));
+	}			
+	
+	OpString key;
+	key.Set(UNI_L("o"));
+	verify(OpStatus::IsSuccess(item->SetData(OpSyncItem::SYNC_KEY_KEY, key.CStr())));
+	
+	// -- Test ProcessSyncItem on the item 
+	verify(OpStatus::IsSuccess(searchSyncer.ProcessSyncItem(item)));
+	g_sync_coordinator->ReleaseSyncItem(item);
+
+	// --- Check that m_is_receiving_items value has been reset
+	verify(searchSyncer.IsProcessingIncomingItems() == stored_value);
+
+	// -- Check item now in search engines list
+	// -- Note: currently we just add searches even if there is already a search with the same key
+	SearchTemplate* synced_search = g_searchEngineManager->GetSearchEngineByKey(key);
+	verify(synced_search);
+
+	// Remove item
+	g_searchEngineManager->RemoveItem(synced_search);
+
+}
+
+test("ProcessSyncItem on null item")
+{
+	ST_SyncSearchEntries searchSyncer;
+
+	// --- Store away original value of m_is_recieving_items
+	BOOL stored_value = searchSyncer.IsProcessingIncomingItems();
+
+	// Test add null item
+	OpSyncItem* empty_item = 0;
+	verify(OpStatus::IsError(searchSyncer.ProcessSyncItem(empty_item)));
+
+	// --- Check that m_is_receiving_items value has been reset
+	verify(searchSyncer.IsProcessingIncomingItems() == stored_value);
+}
+
+test("ProcessSyncItem(Search) on bookmark item")
+{
+	ST_SyncSearchEntries searchSyncer;
+
+	// --- Store away original value of m_is_recieving_items
+	BOOL stored_value = searchSyncer.IsProcessingIncomingItems();
+
+	// Test add bookmark 
+	OpString guid;
+	OpSyncItem* bookmark = 0;
+	verify(OpStatus::IsSuccess(StringUtils::GenerateClientID(guid)));
+	verify(OpStatus::IsSuccess(g_sync_coordinator->GetSyncItem(&bookmark, OpSyncDataItem::DATAITEM_BOOKMARK, OpSyncItem::SYNC_KEY_ID, guid.CStr())));
+	verify(OpStatus::IsError(searchSyncer.ProcessSyncItem(bookmark)));
+
+	// --- Check that m_is_receiving_items value has been reset
+	verify(searchSyncer.IsProcessingIncomingItems() == stored_value);
+
+	g_sync_coordinator->ReleaseSyncItem(bookmark);
+}
+
+// test("SearchEngineChanged")
+// {
+// 	ST_SyncSearchEntries searchSyncer;
+	
+// 	SearchTemplate* search = 0;
+// 	searchSyncer.OnSearchEngineItemAdded(search);
+
+// 	SearchTemplate* search_template = g_searchEngineManager->GetSearchEngine(0);
+// 	verify(search_template); // Deleting the last one is not allowed
+
+// 	searchSyncer.OnSearchEngineItemChanged(search);
+// 	searchSyncer.OnSearchEngineItemRemoved(search);
+// }
+
+// Test OpSyncItemToSearchTemplate(SearchTemplateToOpSyncItem(search))
+test("SearchTemplate to OpSyncItem and back ")
+{
+	ST_SyncSearchEntries searchSyncer;
+
+	// Ensure we actually read back the personalbar position
+	g_sync_manager->SetSupportsType(SyncManager::SYNC_PERSONALBAR, TRUE);
+
+	iterate(url, name, key, is_post, post, type, position) from search_samples
+	{
+
+		ST_SearchTemplate* st_item = 0;
+		st_item = OP_NEW(ST_SearchTemplate, ());
+
+		OpString guid;
+		// --- Generate a GUID and get the SyncItem
+		verify(OpStatus::IsSuccess(StringUtils::GenerateClientID(guid)));
+		st_item->SetUniqueGUID(guid);
+
+		st_item->SetURL(url);
+		st_item->SetName(name);
+		st_item->SetKey(key);
+		st_item->SetIsPost(is_post);
+		st_item->SetQuery(post);
+		st_item->SetSearchType(type);
+		//st_item->SetEncoding();
+		st_item->SetPersonalbarPos(position);
+
+		OpSyncItem* sync_item = 0; 
+		verify(OpStatus::IsSuccess(searchSyncer.SearchTemplateToOpSyncItem(st_item, sync_item, OpSyncDataItem::DATAITEM_ACTION_MODIFIED, SearchEngineManager::FLAG_UNKNOWN)));
+		
+		SearchTemplate* synced_search = OP_NEW(SearchTemplate, ()); 
+		verify(synced_search);
+		verify(OpStatus::IsSuccess(searchSyncer.OpSyncItemToSearchTemplate(sync_item, synced_search)));
+
+		verify(synced_search->GetName().Compare(st_item->GetName()) == 0);
+		verify(synced_search->GetUrl().Compare(st_item->GetUrl()) == 0);
+		verify(synced_search->GetKey().Compare(st_item->GetKey()) == 0);
+		verify(synced_search->GetIsPost() == st_item->GetIsPost());
+		verify(synced_search->GetQuery().Compare(st_item->GetQuery()) == 0);
+		verify(synced_search->GetPersonalbarPos() == st_item->GetPersonalbarPos());
+		
+		OP_DELETE(synced_search);
+		g_sync_coordinator->ReleaseSyncItem(sync_item);
+	}	
+}
+
+
+/**
+ * Default search engine that is deleted
+ *
+ * 1) the default search exists on this client already
+ *       a) it has not been synced yet on the sending client, so it's sent as added
+ *       b) it has been synced already on the sending client, so it's sent as changed
+ *
+ */
+test("Receive default search that was deleted") 
+{
+	int i = 0;
+
+	iterate(url, name, key) from url_samples
+	{
+
+		ST_SearchTemplate* st_item = 0;
+
+		// Create and add package/default search item to Searches 
+		OpString search_guid;
+		st_item = OP_NEW(ST_SearchTemplate, ());
+		
+		// --- Generate a GUID and get the SyncItem
+		verify(OpStatus::IsSuccess(StringUtils::GenerateClientID(search_guid)));
+		st_item->SetUniqueGUID(search_guid);
+		
+		st_item->SetURL(url);
+		st_item->SetName(name);
+		st_item->SetKey(key);
+		st_item->SetIsPackageSearch(); // "Fake" default search
+		verify(st_item->IsCustomOrModified() == FALSE);
+		
+		g_searchEngineManager->AddItem(st_item);
+
+		SearchTemplate* search = g_searchEngineManager->GetByUniqueGUID(search_guid);
+		verify(search);
+		
+		// Remove the item (sets it to hidden)
+		g_searchEngineManager->RemoveItem(search);
+		
+		OpString guid;
+		guid.Set(search->GetUniqueGUID());
+		UINT32 num_engines = g_searchEngineManager->GetSearchEnginesCount();
+		
+		// 1) Create OpSyncItem From SearchTemplate
+		OpSyncItem* item = 0;
+		ST_SyncSearchEntries searchSyncer;
+
+		if (i % 2 ==  0)
+			searchSyncer.SearchTemplateToOpSyncItem(search, item, OpSyncDataItem::DATAITEM_ACTION_ADDED, SearchEngineManager::FLAG_UNKNOWN);
+		else
+			searchSyncer.SearchTemplateToOpSyncItem(search, item, OpSyncDataItem::DATAITEM_ACTION_MODIFIED, SearchEngineManager::FLAG_UNKNOWN);
+		
+		++i;
+
+		// --- Store away original value of m_is_recieving_items
+		BOOL stored_value = searchSyncer.IsProcessingIncomingItems();
+
+		// 2) Give the OpSyncItem to ProcessSyncItem a) as added
+		SearchTemplate* received_search = 0;
+		verify(OpStatus::IsSuccess(searchSyncer.ProcessSyncItem(item, &received_search)));
+
+		// --- Check that m_is_receiving_items value has been reset
+		verify(searchSyncer.IsProcessingIncomingItems() == stored_value);
+
+		// The item is already in searches so this should not create a new item
+		// 3) Check the GUID of the received item and num items on receiving end
+		verify(g_searchEngineManager->GetSearchEnginesCount() == num_engines);
+		if (received_search && received_search->GetUniqueGUID().HasContent())
+		{
+			verify(received_search->GetUniqueGUID().Compare(guid) == 0);
+			// item was deleted, so shouldnt be accessible (filtered out)
+			verify(!g_searchEngineManager->GetByUniqueGUID(received_search->GetUniqueGUID()));
+			// verify that the search is changed so will be written to custom searches file
+			verify(received_search->IsCustomOrModified());
+		
+			// Reset so it won't be written (cleanup)
+			received_search->SetIsCustomOrModified(); // ?????
+		}
+
+		if(item)
+		{
+			g_sync_coordinator->ReleaseSyncItem(item);
+		}
+
+	}
+
+}
+
+
+/**
+ * Default search engine that is changed
+ *
+ * 1) the default search exists on this client already
+ *       a) it has not been synced yet on the sending client so it's sent as added
+ *       b) it has been synced already on the sending client, so it's sent as changed
+ */
+test("Receive default search that was changed")
+{
+	int i = 0;
+	iterate(url, name, key) from url_samples2
+	{
+		ST_SearchTemplate* st_item = OP_NEW(ST_SearchTemplate, ());
+		
+		OpString search_guid;
+		// --- Generate a GUID and get the SyncItem
+		verify(OpStatus::IsSuccess(StringUtils::GenerateClientID(search_guid)));
+		st_item->SetUniqueGUID(search_guid);
+		
+		st_item->SetURL(url);
+		st_item->SetName(name);
+		st_item->SetKey(key);
+		st_item->SetIsPackageSearch(); // "Fake" default search
+		verify(st_item->IsCustomOrModified() == FALSE);
+		
+		g_searchEngineManager->AddItem(st_item);
+
+		SearchTemplate* search = g_searchEngineManager->GetByUniqueGUID(search_guid);
+		verify(search);
+		
+		OpString guid;
+		guid.Set(search->GetUniqueGUID());
+
+		UINT32 num_engines = g_searchEngineManager->GetSearchEnginesCount();
+		
+		// 1) Create OpSyncItem From SearchTemplate
+		OpSyncItem* item = 0;
+
+		ST_SyncSearchEntries searchSyncer;
+		if (i == 0)
+			searchSyncer.SearchTemplateToOpSyncItem(search, item, OpSyncDataItem::DATAITEM_ACTION_ADDED, SearchEngineManager::FLAG_UNKNOWN);
+		else
+			searchSyncer.SearchTemplateToOpSyncItem(search, item, OpSyncDataItem::DATAITEM_ACTION_MODIFIED, SearchEngineManager::FLAG_UNKNOWN);
+
+		++i;
+
+		// --- Store away original value of m_is_recieving_items
+		BOOL stored_value = searchSyncer.IsProcessingIncomingItems();
+		
+		// 2) Give the OpSyncItem to ProcessSyncItem a) as added
+		SearchTemplate* received_search = 0;
+		searchSyncer.ProcessSyncItem(item, &received_search);
+
+		// --- Check that m_is_receiving_items value has been reset
+		verify(searchSyncer.IsProcessingIncomingItems() == stored_value);
+
+		// 3) Check the GUID of the received item and num items on receiving end
+		verify(g_searchEngineManager->GetSearchEnginesCount() == num_engines);
+
+		if (received_search && received_search->GetUniqueGUID().HasContent())
+		{
+			verify(received_search->GetUniqueGUID().Compare(guid) == 0);
+			verify(g_searchEngineManager->GetByUniqueGUID(received_search->GetUniqueGUID()));
+			// Reset so it won't be written (cleanup)
+			received_search->SetIsCustomOrModified();
+			g_searchEngineManager->RemoveItem(received_search);
+		}
+
+		if(item)
+		{
+			g_sync_coordinator->ReleaseSyncItem(item);
+		}
+
+	}	
+}
+
+test("ProcessSyncItem not resulting in send to server")
+{
+	ST_SyncSearchEntries syncer;
+	g_sync_coordinator->SetSyncDataClient(&syncer, OpSyncDataItem::DATAITEM_SEARCH);
+
+	verify(g_sync_manager->SupportsType(SyncManager::SYNC_SEARCHES));
+	verify(syncer.IsListening());
+	
+	// --- Store away original value of m_is_recieving_items
+	BOOL stored_value = syncer.IsProcessingIncomingItems();
+
+	OpSyncItem *item = 0;
+	OpString guid;
+		
+	// --- Generate a GUID and get the SyncItem
+	verify(OpStatus::IsSuccess(StringUtils::GenerateClientID(guid)));
+	verify(OpStatus::IsSuccess(g_sync_coordinator->GetSyncItem(&item, OpSyncDataItem::DATAITEM_SEARCH, OpSyncItem::SYNC_KEY_ID, guid.CStr()))); //
+
+	// -- Set action and a set of elements / attributes on the item
+	item->SetStatus(OpSyncDataItem::DATAITEM_ACTION_ADDED);
+	verify(OpStatus::IsSuccess(item->SetData(OpSyncItem::SYNC_KEY_GROUP, UNI_L("custom"))));
+	verify(OpStatus::IsSuccess(item->SetData(OpSyncItem::SYNC_KEY_URI, UNI_L("opera:%s"))));
+	verify(OpStatus::IsSuccess(item->SetData(OpSyncItem::SYNC_KEY_TITLE, UNI_L("opera page"))));
+	OpString hidden_value;
+	if (OpStatus::IsSuccess(hidden_value.AppendFormat(UNI_L("%d"), 0)))
+	{
+		verify(OpStatus::IsSuccess(item->SetData(OpSyncItem::SYNC_KEY_HIDDEN, hidden_value.CStr())));
+	}			
+	
+	OpString key;
+	key.Set(UNI_L("o"));
+	verify(OpStatus::IsSuccess(item->SetData(OpSyncItem::SYNC_KEY_KEY, key.CStr())));
+	
+	// -- Test ProcessSyncItem on the item 
+	verify(OpStatus::IsSuccess(syncer.ProcessSyncItem(item)));
+	
+	SearchTemplate* search_out = 0;
+	// -- Test ProcessSyncItem on the item 
+	verify(OpStatus::IsSuccess(syncer.ProcessSyncItem(item, &search_out)));
+	verify(syncer.ReceivedNotification());
+	syncer.ResetNotification();
+	g_sync_coordinator->ReleaseSyncItem(item);
+
+	// --- Check that m_is_receiving_items value has been reset
+	verify(syncer.IsProcessingIncomingItems() == stored_value);
+	verify(!syncer.ItemsSentToServer());
+	syncer.ResetSentToServer();
+
+	g_sync_coordinator->RemoveSyncDataClient(&syncer, OpSyncDataItem::DATAITEM_SEARCH);
+	//verify(!syncer.IsListening());
+
+}
+
+// test("Receive custom search that was added")
+// {
+
+// }
+// test("Receive custom search that was changed")
+// {
+
+// }
+// test("Receive custom search that was deleted")
+// {
+
+// }
+
+// test("OnSyncData notifications for searches not supported")
+// {
+
+// }
+
+// test("Test Sync Flush")
+// {
+
+
+// }
+

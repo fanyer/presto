@@ -1,0 +1,299 @@
+group "DOM.Events.EventCaller";
+require init;
+require ECMASCRIPT_DEBUGGER;
+
+include "modules/dom/src/domevents/domeventtarget.h";
+include "modules/dom/src/domevents/domeventlistener.h";
+include "modules/dom/src/domobj.h";
+
+include "modules/ecmascript_utils/esdebugger.h";
+include "modules/dochand/winman.h";
+include "modules/doc/frm_doc.h";
+
+global
+{
+	class DumbAccepter : public ES_DebugWindowAccepter
+	{
+		Window* selftest_window;
+	public:
+		DumbAccepter() : selftest_window(0) {}
+
+		virtual BOOL AcceptWindow(Window* window)
+		{
+			return window == selftest_window;
+		}
+
+		void SetSelftestWindow(Window* window)
+		{
+			selftest_window = window;
+		}
+
+		Window* GetSelftestWindow() const { return selftest_window; }
+	};
+
+	class DumbDebugger
+		: public ES_DebugFrontend
+	{
+	public:
+		void output_dbg(const char* msg) {
+			//output(msg);
+		}
+		void output_dbg(const uni_char* msg) { output_dbg(ST_down(msg)); }
+
+		DumbAccepter accepter;
+
+		DumbDebugger()
+		{
+			ES_DebugFrontend::ConstructEngineBackend(&accepter);
+			FramesDocument::SetAlwaysCreateDOMEnvironment(TRUE);
+			// Make sure we don't stop on new scripts
+			SetStopAt(STOP_TYPE_SCRIPT, FALSE);
+		}
+
+		~DumbDebugger() {
+			ES_DebugFrontend::Detach();
+			FramesDocument::SetAlwaysCreateDOMEnvironment(FALSE);
+		}
+
+		virtual OP_STATUS RuntimeStarted(unsigned dbg_runtime_id, const ES_DebugRuntimeInformation* runtimeinfo)
+		{
+			output_dbg("In RuntimeStarted\n");
+			return OpStatus::OK;
+		}
+
+		virtual OP_STATUS RuntimeStopped(unsigned dbg_runtime_id, const ES_DebugRuntimeInformation* runtimeinfo)
+		{
+			output_dbg("In RuntimeStopped\n");
+			return OpStatus::OK;
+		}
+
+		virtual OP_STATUS RuntimesReply(unsigned tag, OpVector<ES_DebugRuntimeInformation>& runtimes)
+		{
+			output_dbg("In RuntimesReply\n");
+			return OpStatus::OK;
+		}
+
+		virtual OP_STATUS NewScript(unsigned dbg_runtime_id, ES_DebugScriptData *data, const ES_DebugRuntimeInformation *runtimeinfo = NULL)
+		{
+			output_dbg("In NewScript\n");
+			return OpStatus::OK;
+		}
+
+		virtual OP_STATUS ParseError(unsigned dbg_runtime_id, ES_ErrorInfo *err)
+		{
+			return OpStatus::OK;
+		}
+
+		virtual OP_STATUS ThreadStarted(unsigned dbg_runtime_id, unsigned dbg_thread_id, unsigned dbg_parent_thread_id, ThreadType type, const uni_char *namespace_uri, const uni_char *event_type, const ES_DebugRuntimeInformation *runtimeinfo = NULL)
+		{
+			output_dbg("In ThreadStarted\n");
+			return OpStatus::OK;
+		}
+
+		virtual OP_STATUS ThreadMigrated(unsigned dbg_thread_id, unsigned dbg_from_runtime_id, unsigned dbg_to_runtime_id)
+		{
+			return OpStatus::OK;
+		}
+
+		virtual OP_STATUS ThreadFinished(unsigned dbg_runtime_id, unsigned dbg_thread_id, ThreadStatus status, ES_DebugReturnValue *dbg_return_value)
+		{
+			output_dbg("In ThreadFinished\n");
+			OP_DELETE(dbg_return_value);
+			return OpStatus::OK;
+		}
+
+		virtual OP_STATUS StoppedAt(unsigned dbg_runtime_id, unsigned dbg_thread_id, const ES_DebugStoppedAtData &data)
+		{
+			output_dbg("In StoppedAt\n");
+			Continue(dbg_runtime_id, RUN);
+			return OpStatus::OK;
+		}
+
+		virtual OP_STATUS EvalReply(unsigned tag, EvalStatus status, const ES_DebugValue &result)
+		{
+			return OpStatus::OK;
+		}
+
+		virtual OP_STATUS ExamineObjectsReply(unsigned int,unsigned int object_count, ES_DebugObjectChain *result)
+		{
+			return OpStatus::OK;
+		}
+
+	} *dumb_debugger;
+}
+
+setup
+{
+	dumb_debugger = NULL;
+}
+
+exit
+{
+	OP_DELETE(dumb_debugger);
+	dumb_debugger = NULL;
+}
+
+// Run this before the debugger is attached to ensure caller information has not been recorded
+
+html
+{
+	//! <html>
+	//!   <head>
+	//!   </head>
+	//!   <body>
+	//!     <div id="this_one">Event target</div>
+	//!     <script>
+	//!       var div = document.getElementById("this_one");
+	//!       function do_key(e) { alert(); };
+	//!       div.addEventListener("keypress", do_key);
+	//!       div.addEventListener("keydown", do_key, true);
+	//!     </script>
+	//!   </body>
+	//! </html>
+}
+
+// There should be no caller information as the runtimes are not debugged
+
+test("Check call information")
+{
+	FramesDocument *doc = state.doc;
+	DOM_Environment *env = doc->GetDOMEnvironment();
+	HTML_Element *elm = find_element("div", 1);
+	verify(elm != NULL);
+
+	DOM_Object *dom_obj;
+	verify_success(env->ConstructNode(dom_obj, elm));
+
+	DOM_EventTarget *target = dom_obj->GetEventTarget();
+	verify(target != NULL);
+
+	DOM_EventTarget::NativeIterator it = target->NativeListeners();
+	verify(!it.AtEnd());
+
+	unsigned count = 0;
+	BOOL has_keypress = FALSE;
+	BOOL has_keydown = FALSE;
+	for (; !it.AtEnd(); it.Next() )
+	{
+		const DOM_EventListener *listener = it.Current();
+		verify(listener != NULL);
+		verify(listener->IsNativeHandler());
+		if (listener->GetKnownType() == ONKEYPRESS)
+		{
+			verify(!has_keypress);
+			verify(!listener->IsFromAttribute());
+			verify(!listener->HasCallerInformation());
+			has_keypress = TRUE;
+		}
+		else if (listener->GetKnownType() == ONKEYDOWN)
+		{
+			verify(!has_keydown);
+			verify(!listener->IsFromAttribute());
+			verify(!listener->HasCallerInformation());
+			has_keydown = TRUE;
+		}
+		++count;
+	}
+	verify(count == 2);
+	verify(has_keypress);
+	verify(has_keydown);
+}
+
+html
+{
+	//! <html>
+	//!   <head>
+	//!     <title>DEBUGGER WINDOW - DEBUG ME!</title>
+	//!   </head>
+	//!   <body>
+	//!   </body>
+	//! </html>
+}
+
+test("Setup window filtering")
+{
+	verify(!dumb_debugger);
+	Window* selftest_window = 0;
+	for ( Window* w = g_windowManager->FirstWindow() ; w != NULL ; w = w->Suc() )
+	{
+		if (w->GetWindowTitle() && uni_strcmp(w->GetWindowTitle(), UNI_L("DEBUGGER WINDOW - DEBUG ME!")) == 0)
+		{
+			verify(selftest_window == 0);
+			selftest_window = w;
+		}
+	}
+	verify(selftest_window != 0);
+	dumb_debugger = OP_NEW(DumbDebugger, ());
+	dumb_debugger->accepter.SetSelftestWindow(selftest_window);
+}
+
+html
+{
+	//! <html>
+	//!   <head>
+	//!   </head>
+	//!   <body>
+	//!     <div id="this_one">Event target</div>
+	//!     <script>
+	//!       var div = document.getElementById("this_one");
+	//!       function do_key(e) { alert(); };
+	//!       div.addEventListener("keypress", do_key);
+	//!       div.addEventListener("keydown", do_key, true);
+	//!     </script>
+	//!   </body>
+	//! </html>
+}
+
+test("Get call information") require success "Setup window filtering";
+{
+	FramesDocument *doc = state.doc;
+	DOM_Environment *env = doc->GetDOMEnvironment();
+	HTML_Element *elm = find_element("div", 1);
+	verify(elm != NULL);
+
+	DOM_Object *dom_obj;
+	verify_success(env->ConstructNode(dom_obj, elm));
+
+	DOM_EventTarget *target = dom_obj->GetEventTarget();
+	verify(target != NULL);
+
+	DOM_EventTarget::NativeIterator it = target->NativeListeners();
+	verify(!it.AtEnd());
+
+	unsigned count = 0;
+	BOOL has_keypress = FALSE;
+	BOOL has_keydown = FALSE;
+	unsigned guid_keypress = ~0u;
+	unsigned guid_keydown= ~0u;
+	for (; !it.AtEnd(); it.Next() )
+	{
+		const DOM_EventListener *listener = it.Current();
+		verify(listener != NULL);
+		verify(listener->IsNativeHandler());
+		if (listener->GetKnownType() == ONKEYPRESS)
+		{
+			verify(!has_keypress);
+			verify(!listener->IsFromAttribute());
+			verify(listener->HasCallerInformation());
+			guid_keypress = listener->GetCallerScriptGuid();
+			verify(guid_keypress != ~0u);
+			verify(listener->GetCallerLineNo() == 4);
+			has_keypress = TRUE;
+		}
+		else if (listener->GetKnownType() == ONKEYDOWN)
+		{
+			verify(!has_keydown);
+			verify(!listener->IsFromAttribute());
+			verify(listener->HasCallerInformation());
+			guid_keydown = listener->GetCallerScriptGuid();
+			verify(guid_keydown != ~0u);
+			verify(listener->GetCallerLineNo() == 5);
+			has_keydown = TRUE;
+		}
+		++count;
+	}
+	verify(count == 2);
+	verify(has_keypress);
+	verify(has_keydown);
+	verify(guid_keypress == guid_keydown);
+}

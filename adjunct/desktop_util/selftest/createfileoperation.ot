@@ -1,0 +1,371 @@
+/* -*- Mode: c++; tab-width: 4; indent-tabs-mode: t; c-basic-offset: 4 -*-
+ *
+ * Copyright (C) 1995-2010 Opera Software AS.  All rights reserved.
+ *
+ * This file is part of the Opera web browser.	It may not be distributed
+ * under any circumstances.
+ *
+ * @author Wojciech Dzierzanowski (wdzierzanowski)
+ */
+
+group "desktop_util.createfileoperation";
+
+include "adjunct/desktop_util/transactions/CreateFileOperation.h";
+include "modules/util/opfile/opfile.h";
+include "modules/util/path.h";
+
+global
+{
+	typedef CreateFileOperation::PathComponent PathComponent;
+	typedef CreateFileOperation::PathComponentList PathComponentList;
+
+	static BOOL Touch(const OpStringC& path, OpFileInfo::Mode mode)
+	{
+		OpFile file;
+		RETURN_VALUE_IF_ERROR(file.Construct(path), FALSE);
+		switch (mode)
+		{
+			case OpFileInfo::FILE:
+				RETURN_VALUE_IF_ERROR(file.Open(OPFILE_WRITE), FALSE);
+				break;
+			case OpFileInfo::DIRECTORY:
+				RETURN_VALUE_IF_ERROR(file.MakeDirectory(), FALSE);
+				break;
+			default:
+				OP_ASSERT(!"Can't test this file mode");
+				return FALSE;
+		}
+		return TRUE;
+	}
+
+	static BOOL FileExists(const OpStringC& path)
+	{
+		OpFile file;
+		RETURN_VALUE_IF_ERROR(file.Construct(path), FALSE);
+		BOOL file_exists = FALSE;
+		RETURN_VALUE_IF_ERROR(file.Exists(file_exists), FALSE);
+		return file_exists;
+	}
+
+	static void DeleteFile(OpFile& dir)
+	{
+		const BOOL deleted = OpStatus::IsSuccess(dir.Delete(TRUE));
+		OP_ASSERT(deleted || !"Failed to delete temporary test files");
+	}
+
+	BOOL PathComponentsEqual(const PathComponentList& components,
+			const uni_char* const* exp_components, size_t count)
+	{
+		for (const PathComponent* component = components.Last();
+				NULL != component; component = component->Pred())
+		{
+			if (0 == count)
+			{
+				return FALSE;
+			}
+			if (!(component->Get() == OpStringC(exp_components[--count])))
+			{
+				return FALSE;
+			}
+		}
+		return 0 == count;
+	}
+}
+
+
+subtest NewOperation(const OpStringC& file_path, OpFileInfo::Mode mode,
+		OpAutoPtr<CreateFileOperation>& operation)
+{
+	// The fact that `file' goes out of scope before the `operation->Undo()'
+	// call is what makes the test case a bit more interesting.
+	OpFile file;
+	verify_success(file.Construct(file_path));
+
+	operation.reset(OP_NEW(CreateFileOperation, (file, mode)));
+
+	// This need not really create the file...
+	verify_success(operation->Do());
+
+	// ...so create it explicitely.
+	verify(Touch(file_path, mode));
+
+	verify(FileExists(file_path));
+}
+
+
+test("Simple create file, delete file")
+		file uni root_path	"testfiles/tmp";
+		file uni file_path	"testfiles/tmp/create-and-delete";
+{
+	OpFile root_dir;
+	verify_success(root_dir.Construct(root_path));
+	verify_success(root_dir.MakeDirectory());
+
+	OpAutoPtr<CreateFileOperation> operation;
+	verify(NewOperation(file_path, OpFileInfo::FILE, operation));
+
+	operation->Undo();
+	verify(!FileExists(file_path));
+	verify(FileExists(root_path));
+}
+finally
+{
+	DeleteFile(root_dir);
+}
+
+test("Create file and path components, no foreign files")
+		file uni root_path		"testfiles/tmp";
+		file uni subdir_path	"testfiles/tmp/subdir0";
+		file uni file_path		"testfiles/tmp/subdir0/subdir1/create-and-delete";
+{
+	OpFile root_dir;
+	verify_success(root_dir.Construct(root_path));
+	verify_success(root_dir.MakeDirectory());
+
+	OpAutoPtr<CreateFileOperation> operation;
+	verify(NewOperation(file_path, OpFileInfo::FILE, operation));
+
+	operation->Undo();
+	verify(!FileExists(file_path));
+	verify(!FileExists(subdir_path));
+	verify(FileExists(root_path));
+}
+finally
+{
+	DeleteFile(root_dir);
+}
+
+test("Create file and path components, add a foreign file")
+		file uni root_path		"testfiles/tmp";
+		file uni subdir_path0	"testfiles/tmp/subdir0";
+		file uni foreign_path	"testfiles/tmp/subdir0/i-am-a-foreigner";
+		file uni subdir_path1	"testfiles/tmp/subdir0/subdir1";
+		file uni file_path		"testfiles/tmp/subdir0/subdir1/create-and-delete";
+{
+	OpFile root_dir;
+	verify_success(root_dir.Construct(root_path));
+	verify_success(root_dir.MakeDirectory());
+
+	OpAutoPtr<CreateFileOperation> operation;
+	verify(NewOperation(file_path, OpFileInfo::FILE, operation));
+
+	verify(Touch(foreign_path, OpFileInfo::FILE));
+	verify(FileExists(foreign_path));
+
+	operation->Undo();
+
+	verify(!FileExists(file_path));
+	verify(!FileExists(subdir_path1));
+	verify(FileExists(foreign_path));
+}
+finally
+{
+	DeleteFile(root_dir);
+}
+
+
+table SubdirNames(const uni_char*, const uni_char*)
+{
+	{ UNI_L("create-and-delete0"),		UNI_L("create-and-delete1") }
+	{ UNI_L("create-and-delete0/"),		UNI_L("create-and-delete1/") }
+}
+
+test("Create dir and path component followed by create dir")
+		file uni root_path		"testfiles/tmp";
+		file uni subdir_path	"testfiles/tmp/subdir";
+{
+	OpFile root_dir;
+	verify_success(root_dir.Construct(root_path));
+	verify_success(root_dir.MakeDirectory());
+
+	iterate (name0, name1) from SubdirNames
+	{
+		OpString dir_path0;
+		verify_success(OpPathDirFileCombine(dir_path0, OpStringC(subdir_path),
+					OpStringC(name0)));
+		OpAutoPtr<CreateFileOperation> operation0;
+		verify(NewOperation(dir_path0, OpFileInfo::DIRECTORY, operation0));
+
+		OpString dir_path1;
+		verify_success(OpPathDirFileCombine(dir_path1, OpStringC(subdir_path),
+					OpStringC(name1)));
+		OpAutoPtr<CreateFileOperation> operation1;
+		verify(NewOperation(dir_path1, OpFileInfo::DIRECTORY, operation1));
+
+		operation1->Undo();
+		operation0->Undo();
+
+		verify(!FileExists(subdir_path));
+		verify(FileExists(root_path));
+	}
+}
+finally
+{
+	DeleteFile(root_dir);
+}
+
+test("Create dir and path component followed by create dir, add a foreign dir")
+		file uni root_path		"testfiles/tmp";
+		file uni subdir_path	"testfiles/tmp/subdir";
+		file uni foreign_path	"testfiles/tmp/subdir/i-am-a-foreigner";
+{
+	OpFile root_dir;
+	verify_success(root_dir.Construct(root_path));
+	verify_success(root_dir.MakeDirectory());
+
+	iterate (name0, name1) from SubdirNames
+	{
+		OpString dir_path0;
+		verify_success(OpPathDirFileCombine(dir_path0, OpStringC(subdir_path),
+					OpStringC(name0)));
+		OpAutoPtr<CreateFileOperation> operation0;
+		verify(NewOperation(dir_path0, OpFileInfo::DIRECTORY, operation0));
+
+		OpString dir_path1;
+		verify_success(OpPathDirFileCombine(dir_path1, OpStringC(subdir_path),
+					OpStringC(name1)));
+		OpAutoPtr<CreateFileOperation> operation1;
+		verify(NewOperation(dir_path1, OpFileInfo::DIRECTORY, operation1));
+
+		verify(Touch(foreign_path, OpFileInfo::DIRECTORY));
+
+		operation1->Undo();
+		operation0->Undo();
+
+		verify(FileExists(foreign_path));
+		verify(!FileExists(dir_path0));
+		verify(!FileExists(dir_path1));
+	}
+}
+finally
+{
+	DeleteFile(root_dir);
+}
+
+test("Create file fails if file exists and is not writable")
+		file uni file_path	"testfiles/read-only";
+{
+	OpFile read_only_file;
+	verify_success(read_only_file.Construct(file_path));
+
+	verify(Touch(read_only_file.GetFullPath(), OpFileInfo::FILE));
+	OpFileInfoChange change = {OpFileInfoChange::WRITABLE, FALSE, 0, 0};
+	verify_success(read_only_file.ChangeFileInfo(&change));
+
+	CreateFileOperation operation(read_only_file, OpFileInfo::FILE);
+	verify_status(OpStatus::ERR, operation.Do());
+}
+finally
+{
+	OpFileInfoChange change_back = {OpFileInfoChange::WRITABLE, TRUE, 0, 0};
+	read_only_file.ChangeFileInfo(&change_back);
+	DeleteFile(read_only_file);
+}
+
+test("Create file fails if file is a directory")
+		file uni dir_path	"testfiles/tmp";
+{
+	OpFile dir;
+	verify_success(dir.Construct(dir_path));
+	verify_success(dir.MakeDirectory());
+
+	CreateFileOperation operation(dir, OpFileInfo::FILE);
+	verify_status(OpStatus::ERR, operation.Do());
+}
+finally
+{
+	DeleteFile(dir);
+}
+
+test("Create dir fails if dir is a file")
+		file uni file_path	"testfiles/tmp";
+{
+	OpFile file;
+	verify_success(file.Construct(file_path));
+	verify(Touch(file.GetFullPath(), OpFileInfo::FILE));
+
+	CreateFileOperation operation(file, OpFileInfo::DIRECTORY);
+	verify_status(OpStatus::ERR, operation.Do());
+}
+finally
+{
+	DeleteFile(file);
+}
+
+test("Create file fails if part of path names an existing file")
+		file uni file_path		"testfiles/foo/bar/baz";
+		file uni blocker_path	"testfiles/foo/bar";
+		file uni dir_path		"testfiles/foo";
+{
+	OpFile dir;
+	verify_success(dir.Construct(dir_path));
+
+	OpFile blocker_file;
+	verify_success(blocker_file.Construct(blocker_path));
+
+	OpFile file;
+	verify_success(file.Construct(file_path));
+
+	{
+		CreateFileOperation operation(file, OpFileInfo::FILE);
+		verify_success(operation.Do());
+	}
+
+	verify(Touch(blocker_file.GetFullPath(), OpFileInfo::FILE));
+
+	{
+		CreateFileOperation operation(file, OpFileInfo::FILE);
+		verify_status(OpStatus::ERR, operation.Do());
+	}
+}
+finally
+{
+	DeleteFile(dir);
+}
+
+test("Do() is idempotent")
+		file uni file_path			"testfiles/foo/bar/baz";
+		file uni parent_path		"testfiles/foo/bar";
+		file uni grandparent_path	"testfiles/foo";
+{
+	OpFile file;
+	verify_success(file.Construct(file_path));
+
+	const uni_char* components[] = {parent_path, grandparent_path};
+
+	CreateFileOperation operation(file, OpFileInfo::FILE);
+	verify_success(operation.Do());
+	verify(PathComponentsEqual(operation.GetPathComponents(), components,
+				ARRAY_SIZE(components)));
+	verify_success(operation.Do());
+	verify(PathComponentsEqual(operation.GetPathComponents(), components,
+				ARRAY_SIZE(components)));
+}
+
+test("GetPathComponents() gives meaningful results even if Do() fails")
+		file uni file_path			"testfiles/foo/bar/baz/qux/quux";
+		file uni parent_path		"testfiles/foo/bar/baz/qux";
+		file uni grandparent_path	"testfiles/foo/bar/baz";
+		file uni blocker_path		"testfiles/foo/bar";
+		file uni dir_path			"testfiles/foo";
+{
+	OpFile dir;
+	verify_success(dir.Construct(dir_path));
+
+	OpFile blocker_file;
+	verify_success(blocker_file.Construct(blocker_path));
+
+	OpFile file;
+	verify_success(file.Construct(file_path));
+	verify(Touch(blocker_file.GetFullPath(), OpFileInfo::FILE));
+	CreateFileOperation operation(file, OpFileInfo::FILE);
+	verify_status(OpStatus::ERR, operation.Do());
+
+	const uni_char* components[] = {parent_path, grandparent_path};
+	verify(PathComponentsEqual(operation.GetPathComponents(), components,
+				ARRAY_SIZE(components)));
+}
+finally
+{
+	DeleteFile(dir);
+}

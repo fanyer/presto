@@ -1,0 +1,372 @@
+/* -*- Mode: c++; tab-width: 4; indent-tabs-mode: t; c-basic-offset: 4; c-file-style:"stroustrup" -*-
+**
+** Copyright (C) 1995-2007 Opera Software AS.  All rights reserved.
+**
+** This file is part of the Opera web browser.  It may not be distributed
+** under any circumstances.
+**
+*/
+
+group "hotlist.parsing";
+require init;
+require USE_HOTLIST;
+
+include "adjunct/quick/hotlist/HotlistModel.h";
+include "adjunct/quick/hotlist/hotlistparser.h";
+
+global
+{
+	OP_STATUS SetupPathString(OpString& str, const char* filename) {
+		RETURN_IF_ERROR(g_folder_manager->GetFolderPath(OPFILE_SELFTEST_DATA_FOLDER, str));
+		RETURN_IF_ERROR(str.AppendFormat("data%s%s"), UNI_L(PATHSEP), filename);
+
+		return OpStatus::OK;
+	}
+}
+
+
+// parse opera6.adr with 6490 items, test performance
+test("parse bookmarks performance") 
+{
+	double tmp_time_before = g_op_time_info->GetWallClockMS();
+	OpString path;
+
+	OP_STATUS status = SetupPathString(path, "opera6.adr");
+	verify(OpStatus::IsSuccess(status));
+
+	HotlistParser parser;
+	HotlistModel bookmarks_model(HotlistModel::BookmarkRoot, FALSE);
+	status = parser.Parse( path, bookmarks_model, -1, HotlistModel::OperaBookmark, FALSE, FALSE);
+	verify(OpStatus::IsSuccess(status));
+
+	double tmp_time_after = g_op_time_info->GetWallClockMS();
+	output("(%d ms) ", (int)(tmp_time_after - tmp_time_before));
+
+}
+
+// parse opera6.adr, test item count, trash folder, active item
+// TODO: Add test active id
+test("parse bookmarks correctness") 
+{
+	OpString path;
+
+	OP_STATUS status = SetupPathString(path, "opera6.adr");
+	verify(OpStatus::IsSuccess(status));
+
+	HotlistParser parser;
+	HotlistModel model(HotlistModel::BookmarkRoot, FALSE);
+	status = parser.Parse( path, model, -1, HotlistModel::OperaBookmark, FALSE, FALSE);
+	verify(OpStatus::IsSuccess(status));
+
+	verify(model.GetCount() == 6490);
+
+	HotlistModelItem* trash = model.GetTrashFolder();
+	verify(trash != 0);
+	INT32 id = model.GetTrashFolderId();
+	verify(trash->GetID() == id);
+
+	id = model.GetActiveFolderId();
+	verify(id != -1);
+
+	HotlistModelItem* active = model.GetItemByID(id);
+	if (active->IsFolder())
+		verify(active->GetIsActiveFolder());
+	
+}
+
+// parse small_opera6.adr, test trash folder
+// import trash_opera6.adr into same model, test extra trash folder skipped and items put in trash folder
+test("import opera bookmarks")
+{
+	OpString path;
+
+	OP_STATUS status = SetupPathString(path, "small_opera6.adr");
+	verify(OpStatus::IsSuccess(status));
+	
+	// parse / build model
+	HotlistParser parser;
+	HotlistModel bookmarks_model(HotlistModel::BookmarkRoot, FALSE);
+	status = parser.Parse( path, bookmarks_model, -1, HotlistModel::OperaBookmark, FALSE, FALSE);
+	verify(OpStatus::IsSuccess(status));
+
+	HotlistModelItem* trash = bookmarks_model.GetTrashFolder();
+	verify(trash);
+	verify(trash->GetChildCount() == 1);
+	OpString trash_guid;
+	trash_guid.Set(trash->GetUniqueGUID());
+
+	path.Empty();
+	status = SetupPathString(path, "import_opera6.adr");
+	verify(OpStatus::IsSuccess(status));
+
+	// Import
+	status = parser.Parse( path, bookmarks_model, -1, HotlistModel::OperaBookmark, FALSE, FALSE);
+	verify(OpStatus::IsSuccess(status));
+
+	// Bug 265624 - Bookmark Import: Items in imported trash folder should go to 'real' trash folder.
+	trash = bookmarks_model.GetTrashFolder();
+	verify(trash->GetIsTrashFolder());
+	verify(trash->GetChildCount() == 2);
+	
+}
+
+
+// parse opera6.adr, export bookmarks to opera6_exported.adr
+// import opera6_exported.adr and check that nothing was imported (same guids)
+test("export and import opera bookmarks")
+{
+	OpString path;
+
+	OP_STATUS status = SetupPathString(path, "opera6.adr");
+	verify(OpStatus::IsSuccess(status));
+
+	// Parse and build model
+	HotlistParser parser;
+	HotlistModel bookmarks_model(HotlistModel::BookmarkRoot, FALSE);
+	status = parser.Parse( path, bookmarks_model, -1, HotlistModel::OperaBookmark, FALSE, FALSE);
+	verify(OpStatus::IsSuccess(status));
+	
+	INT32 num_items = bookmarks_model.GetCount();
+
+	// Export bookmarks
+	path.Empty();
+	status = SetupPathString(path, "opera6_exported.adr");
+	verify(OpStatus::IsSuccess(status));
+	status = parser.Write( path, bookmarks_model, TRUE, FALSE );
+	verify(OpStatus::IsSuccess(status));
+
+	// TODO: verify equal files
+	// TODO: delete file
+
+	// import again -> should have same number of bookmarks
+	status = parser.Parse( path, bookmarks_model, -1, HotlistModel::OperaBookmark, FALSE, FALSE);
+	verify(OpStatus::IsSuccess(status));
+	verify(bookmarks_model.GetCount() == num_items);
+}
+
+// import firefox bookmarks
+test("import firefox bookmarks")
+{
+	OpString path;
+
+	OP_STATUS status = SetupPathString(path, "firefox-bms.html");
+	verify(OpStatus::IsSuccess(status));
+
+	HotlistParser parser;
+	BookmarkModel bookmarks_model;
+	status = parser.Parse( path, bookmarks_model, -1, HotlistModel::NetscapeBookmark, FALSE, TRUE);
+	verify(OpStatus::IsSuccess(status));
+}
+
+// recognize firefox sqlite db
+test("recognize firefox sqlite db")
+{
+	OpString path;
+
+	verify(OpStatus::IsSuccess(SetupPathString(path, "firefox-bms.sqlite")));
+	verify(HotlistParser::FileIsPlacesSqlite(path));
+	verify(OpStatus::IsSuccess(SetupPathString(path, "firefox-bms.html")));
+	verify(!HotlistParser::FileIsPlacesSqlite(path));
+	verify(OpStatus::IsSuccess(SetupPathString(path, "phony-bms.sqlite")));
+	verify(!HotlistParser::FileIsPlacesSqlite(path));
+}
+
+// import firefox sqlite bookmarks
+test("import firefox sqlite bookmarks")
+{
+	OpString path;
+
+	OP_STATUS status = SetupPathString(path, "firefox-bms.sqlite");
+	verify(OpStatus::IsSuccess(status));
+
+	HotlistParser parser;
+	BookmarkModel bookmarks_model;
+	status = parser.Parse( path, bookmarks_model, -1, HotlistModel::NetscapeBookmark, FALSE, TRUE);
+	verify(OpStatus::IsSuccess(status));
+}
+
+// On model: parse small_opera6.adr, export it to html
+// On bookmarks_model: import the exported html bookmarks, test that it has same number of items
+// check that separators where imported
+// test("export and import firefox bookmarks")
+// {
+// 	OpString path;
+// 	OP_STATUS status = SetupPathString(path, "small_opera6.adr");
+// 	verify(OpStatus::IsSuccess(status));
+
+// 	// Parse and build model
+// 	HotlistParser parser;
+// 	//HotlistModel model(HotlistModel::BookmarkRoot, FALSE);
+// 	BookmarkModel model;
+// 	status = parser.Parse( path, model, -1, HotlistModel::OperaBookmark, FALSE, FALSE);
+// 	verify(OpStatus::IsSuccess(status));
+
+// 	INT32 count = model.GetCount();
+
+// 	path.Empty();
+// 	status = SetupPathString(path, "bookmarks_exported.html");
+
+// 	// read opera6.adr - > export it as html -> import firefox bookmarks into new model -> they should be equal
+// 	parser.WriteHTML( path, model, TRUE, FALSE );
+
+// 	// Import into New bookmarks model
+// 	HotlistModel bookmarks_model(HotlistModel::BookmarkRoot, FALSE);
+// 	status = parser.Parse( path, bookmarks_model, -1, HotlistModel::NetscapeBookmark, FALSE, TRUE);
+// 	verify(OpStatus::IsSuccess(status));
+	
+// 	// verify same number of items as small_opera6.adr model
+// 	verify(count = bookmarks_model.GetCount());
+
+// 	// Bug 263808 - HTML Bookmark Import Ignores Separators
+// 	INT32 num_sep = 0;
+// 	for (INT32 i = 0; i < model.GetCount(); i++)
+// 	{
+// 		if (model.GetItemByIndex(i)->IsSeparator())
+// 			num_sep++;
+// 	}
+// 	verify(num_sep == 2);
+// }
+
+// Import IE favorites, and test some bugs for regressions
+test("import IE bookmarks")
+
+{
+	OpString path;
+
+	OP_STATUS status = SetupPathString(path, "Favorites");
+	verify(OpStatus::IsSuccess(status));
+
+	HotlistParser parser;
+	HotlistModel bookmarks_model(HotlistModel::BookmarkRoot, FALSE);
+	status = parser.Parse( path, bookmarks_model, -1, HotlistModel::ExplorerBookmark, FALSE, TRUE);
+	verify(OpStatus::IsSuccess(status));
+
+	// verify number of bookmarks after import
+
+	//www.sau.no.url -  Bug 320421 - Imported Internet Explorer Favorites include ".url" in name
+	HotlistModelItem* sau = bookmarks_model.GetByName(UNI_L("www.sau.no"));
+	verify(sau != 0);
+	
+	sau = bookmarks_model.GetByName(UNI_L("www.sau.no.url"));
+	verify(sau == 0);
+	
+	sau = bookmarks_model.GetByName(UNI_L("www.sau.no.URL"));
+	verify(sau == 0);
+
+	// Bug 306621 - Error importing Internet Explorer Favorites with extension in capital letters (*.URL)
+	HotlistModelItem* ulv = bookmarks_model.GetByName(UNI_L("www.ulv.no"));
+	HotlistModelItem* ulv_url = bookmarks_model.GetByName(UNI_L("www.ulv.no.URL"));
+	verify(ulv != 0 && ulv_url == 0);
+
+
+    // Bug 173518 - folder name cut off after dot on import IE favorites
+	HotlistModelItem* folder     = bookmarks_model.GetByName(UNI_L("Links.with_dot"));
+	HotlistModelItem* folder_cut = bookmarks_model.GetByName(UNI_L("Links"));
+	verify(folder != 0 && folder_cut == 0);
+}
+
+
+test("import konqueror bookmarks")
+{
+	// Bug 263334 - Not possible to import Konqueror bookmarks
+
+	OpString path;
+
+	OP_STATUS status = SetupPathString(path, "bookmarks.xml");
+	verify(OpStatus::IsSuccess(status));
+
+	HotlistParser parser;
+	HotlistModel bookmarks_model(HotlistModel::BookmarkRoot, FALSE);
+	status = parser.Parse( path, bookmarks_model, -1, HotlistModel::KonquerorBookmark, FALSE, TRUE);
+	verify(OpStatus::IsSuccess(status));
+}
+
+test("parse notes")
+{
+	OpString path;
+
+	OP_STATUS status = SetupPathString(path, "notes.adr");
+	verify(OpStatus::IsSuccess(status));
+
+	HotlistParser parser;
+	HotlistModel model(HotlistModel::NoteRoot, FALSE);
+	status = parser.Parse( path, model, -1, HotlistModel::OperaNote, FALSE, FALSE);
+	verify(OpStatus::IsSuccess(status));
+
+	verify(model.GetCount() == 18);
+
+	HotlistModelItem* trash = model.GetTrashFolder();
+	verify(trash != 0);
+	INT32 id = model.GetTrashFolderId();
+	verify(trash->GetID() == id);
+
+	id = model.GetActiveFolderId();
+	verify(id != -1);
+}
+
+
+// test that importing notes into bookmarks doesn't work
+test("import wrong types into bookmarks")
+{
+	// Bug 256347 - Notes, contacts and widgets can be imported into bookmarks
+	OpString path;
+
+	OP_STATUS status = SetupPathString(path, "notes.adr");
+	verify(OpStatus::IsSuccess(status));
+
+	HotlistParser parser;
+	HotlistModel model(HotlistModel::BookmarkRoot, FALSE);
+	status = parser.Parse( path, model, -1, HotlistModel::OperaNote, FALSE, FALSE);
+	verify(OpStatus::IsError(status));
+	// no items should be imported
+	verify(model.GetCount() == 0);
+
+	// test importing them as bookmarks
+	status = parser.Parse( path, model, -1, HotlistModel::OperaBookmark, FALSE, FALSE);
+	verify(OpStatus::IsSuccess(status));
+
+	// only the folders should be imported
+	verify(model.GetCount() == 3);
+
+	for (INT32 i = 0; i < model.GetCount(); i++)
+	{
+		verify(!model.GetItemByIndex(i)->IsNote());
+	}
+}
+
+
+// test("parse contacts")
+// {
+
+// }
+
+// test("parse gadgets")
+// {
+// 	OpString path;
+
+// 	OP_STATUS status = SetupPathString(path, "simple_widgets.adr");
+// 	verify(OpStatus::IsSuccess(status));
+
+// 	HotlistParser parser;
+// 	HotlistModel model(HotlistModel::GadgetRoot, FALSE);
+// 	status = parser.Parse( path, model, -1, HotlistModel::OperaGadget, FALSE, FALSE);
+// 	verify(OpStatus::IsSuccess(status));
+
+// 	for (INT32 i = 0; i< model.GetCount(); i++)
+// 	{
+// 		HotlistModelItem* item = model.GetItemByIndex(i);
+// 		verify(item != 0);
+// 	}
+
+// 	// 3 items because of special separator
+// 	verify(model.GetCount() == 3);
+
+// 	HotlistModelItem* trash = model.GetTrashFolder();
+// 	verify(trash != 0);
+// 	INT32 id = model.GetTrashFolderId();
+// 	verify(trash->GetID() == id);
+
+// 	id = model.GetActiveFolderId();
+// 	verify(id != -1);
+// }
+

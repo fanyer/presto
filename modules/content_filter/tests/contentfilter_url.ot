@@ -1,0 +1,585 @@
+/* -*- Mode: c++; tab-width: 4; indent-tabs-mode: t; c-basic-offset: 4; c-file-style:"stroustrup" -*-
+**
+** Copyright (C) 1995-2007 Opera Software AS.  All rights reserved.
+**
+** This file is part of the Opera web browser.  It may not be distributed
+** under any circumstances.
+**
+** Tests developed for checking that content_filter is working from an higher level POV; in particular, the
+** integration with the URL module is checked, and the integration with layout is simulated (it requires
+** SUPPORT_VISUAL_ADBLOCK, which used to be disabled in gogi; now it is enabled in Desktop, but we still keep the simulation in the selftests)
+**
+** Luca Venturi
+**
+*/
+
+group "content_filter.url";
+require URL_FILTER;
+require WEBSERVER_SUPPORT;
+
+include "modules/content_filter/content_filter.h";
+include "modules/pi/OpSystemInfo.h";
+include "modules/url/url2.h";
+include "modules/url/url_man.h";
+include "modules/cache/cache_selftest.h";
+include "modules/dochand/fraud_check.h";
+include "modules/rootstore/auto_update_versions.h";
+include "modules/doc/frm_doc.h";
+include "modules/gadgets/OpGadget.h";
+include "modules/gadgets/OpGadgetManager.h";
+
+#include "../../cache/selftest/cache_html.oth";
+
+table oex_files(const char *) filelist "data/extension.oex" recursively;
+
+global
+{
+	URLFilter* urlfilterURLTest;
+	URLFilter* urlfilterLayoutTest;
+	URLFilter* urlfilterOriginal;
+	FilterURLnode *node;
+	FilterURLnode *node2;
+	MultiContext *mctx;
+	URL_CONTEXT_ID ctx;			// Context used to test content_filter
+	URL url_1;
+	URL url_2;
+	URL url_install;
+	UniteCacheTester uct;
+	OpGadget *ext_ptr;
+	OpString pattern1;
+	OpString pattern2;
+	URL url_site_patch;
+	URL url_update;
+	URL url_update2;
+	URL url_fraud;
+	URL url_pub_suffix;
+	URL url_test;
+	URL url_addons;
+	URL url_addons2;
+	URL url_ext_host;
+	URL url_ext_host_sub;
+	OpGadget *extension_gadget = NULL;
+	BOOL extension_already_loaded = FALSE;
+}
+
+setup
+{
+	mctx = OP_NEW(MultiContext, (TRUE));
+	
+	uct.SetWindow(state.GetWindow());
+	ext_ptr = (OpGadget *)1;  // Just a pointer to nowhere
+}
+
+exit
+{
+	OP_DELETE(urlfilterURLTest);
+	urlfilterURLTest = NULL;
+	OP_DELETE(urlfilterLayoutTest);
+	urlfilterLayoutTest = NULL;
+	
+	OP_DELETE(mctx);
+	g_urlfilter = urlfilterOriginal;
+}
+
+table Table_WhiteList(char *, URL &, int, BOOL)
+{
+	{ " [Browser JS]", url_site_patch, 404, TRUE }
+	{ " [Auto Update]", url_update, 400, TRUE }
+	{ " [Auto Update2]", url_update2, 400, TRUE }
+	{ " [Fraud check]", url_fraud, 404, TRUE }
+	{ " [Pub Suffix]", url_pub_suffix, 404, TRUE }
+	{ " [Addons HTTPS]", url_addons, 404, TRUE }
+	{ " [Addons HTTP]", url_addons2, 404, TRUE }
+	{ " [Extension host]", url_ext_host, 404, TRUE }
+	{ " [Extension host subdomain]", url_ext_host_sub, 404, FALSE }
+}
+
+test("create object")
+{
+	urlfilterURLTest = OP_NEW(URLFilter, ());
+	verify(urlfilterURLTest != NULL);
+	
+	urlfilterLayoutTest = OP_NEW(URLFilter, ());
+	verify(urlfilterLayoutTest != NULL);
+	
+	verify_success(mctx->CreateNewContext(ctx, UNI_L("content_filter"), TRUE, NULL));
+
+	urlfilterOriginal = g_urlfilter;
+}
+
+test("Load extension if required")
+	file uni oex_file "data/extension.oex";
+{
+	UINT32 main=g_urlfilter->GetCount(FALSE);
+	UINT32 full=g_urlfilter->GetCount(TRUE);
+	
+	if(full>main)
+		extension_already_loaded = TRUE;
+	else
+		extension_already_loaded = FALSE;
+}
+
+subtest testJSExtension()
+{
+	URLFilter* urlTempFilter=g_urlfilter;
+
+	g_urlfilter = urlfilterOriginal;
+
+	UINT32 main=g_urlfilter->GetCount(FALSE);
+	UINT32 full=g_urlfilter->GetCount(TRUE);
+
+	if(full<=main)
+		output("*** WARNING: Extension not installed or executed! ***");
+	else
+	{
+		// The extension is supposed to add 2 rules, then immediately remove 1 of them
+		verify(full==main+1);
+		
+		URL url_js_blocked = g_url_api->GetURL("http://www.opera_ex_block.com", ctx);
+		URL url_js_allowed = g_url_api->GetURL("http://www.opera_ex_allow.com", ctx);
+		
+		TestLayout(url_js_blocked, FALSE);
+		TestLayout(url_js_allowed, TRUE);
+		
+		g_urlfilter->RemoveAllExtensions();
+		main=g_urlfilter->GetCount(FALSE);
+		full=g_urlfilter->GetCount(TRUE);
+		
+		verify(main==full);
+		
+		TestLayout(url_js_blocked, TRUE);
+		TestLayout(url_js_allowed, TRUE);
+	}
+}
+finally
+{
+	g_urlfilter = urlTempFilter;
+}
+
+test("Create whitelist URLs")
+{
+	OpString tmp;
+	OpString8 tmp8;
+	
+	#ifdef GOGI_SITEPATCH_BROWSERJS_URL
+		tmp.Set(GOGI_SITEPATCH_BROWSERJS_URL);
+		url_site_patch=g_url_api->GetURL(tmp.CStr(), ctx);
+	#endif
+	#ifdef DEFAULT_AUTOUPDATE_SERVER
+		tmp.Set(DEFAULT_AUTOUPDATE_SERVER);
+		url_update=g_url_api->GetURL(tmp.CStr(), ctx);
+		tmp.Append("test");
+		url_update2=g_url_api->GetURL(tmp.CStr(), ctx);
+	#endif
+	#ifdef TRUST_RATING
+		tmp.Set("");
+		tmp.AppendFormat(UNI_L("http://%s/test"), UNI_L(SITECHECK_HOST));
+		url_fraud=g_url_api->GetURL(tmp.CStr(), ctx);
+	#endif
+	#ifdef AUTOUPDATE_SERVER
+		tmp.Set("");
+		tmp8.AppendFormat("%s://%s/*", AUTOUPDATE_SCHEME, AUTOUPDATE_SERVER);
+		url_pub_suffix=g_url_api->GetURL(tmp8.CStr(), ctx);
+	#endif
+	
+	url_test=g_url_api->GetURL("http://www.opera.com");
+	url_addons=g_url_api->GetURL("https://addons.opera.com/en/extensions/");
+	url_addons2=g_url_api->GetURL("http://addons.opera.com/en/extensions/");
+	url_ext_host=g_url_api->GetURL("http://extension-host.opera.com/");
+	url_ext_host_sub=g_url_api->GetURL("http://subdomain.extension-host.opera.com/");
+}
+
+test("Start WebServer if required") async;
+{
+	uct.StartWebServer();
+}
+
+test("Check WebServer and create the service")
+async;
+{
+	uct.StartService(UNI_L("cache_js_selftest"), UNI_L("webserver/cache_js_selftest_service/"));
+}
+
+test("Install JS service")
+	language ecmascript;
+{
+	InstallCacheServices();
+}
+
+test("Load from JS service")
+async;
+{
+	url_install=uct.JScreatePage(65536, -1, ctx);
+}
+
+test("Verify JS Service")
+{
+	int bytes=uct.GetLastTransfer();
+
+	output("Transferred bytes: %d - cache type: %d - Expired: %d ", 65536, (int)url_install.GetAttribute(URL::KCacheType), (int)url_install.Expired(FALSE, FALSE));
+	verify(bytes>(int)65536);
+}
+
+test("Create 2 pages")
+{
+	url_1=uct.JScreatePage(1024, 10000, ctx, FALSE);
+	url_2=uct.JScreatePage(4096, 10000, ctx, FALSE);
+}
+
+test("Create the patterns")
+{
+	pattern1.AppendFormat(UNI_L("*%s"), url_1.GetAttribute(URL::KUniName).CStr());
+	pattern2.AppendFormat(UNI_L("*%s"), url_2.GetAttribute(URL::KUniName).CStr());
+}
+
+
+//////////////////////////////////// URL test
+test("g_urlfilter substitution for URL")
+{
+	// Tactical temporary change, to avoid the presence of other rules
+	g_urlfilter = urlfilterURLTest;
+	
+	verify(g_urlfilter->GetCount(TRUE)==0);
+}
+
+test("Test no filter - URL 1") require success "create object";
+async;
+{
+	uct.SetExpectedTransferRange(1024, 1024+1024);
+	uct.LoadOK(url_1, NULL);
+}
+
+test("Test no filter - URL 2") require success "create object";
+async;
+{
+	uct.SetExpectedTransferRange(4096, 4096+1024);
+	uct.LoadOK(url_2, NULL);
+}
+
+test("block from extension")
+{
+	node = OP_NEW(FilterURLnode, ());
+		
+	node->SetIsExclude(TRUE);
+	node->SetURL(pattern1.CStr());
+	
+	verify_success(g_urlfilter->AddURL(node, ext_ptr, NULL));
+	verify(g_urlfilter->GetCount(TRUE)==1);
+}
+
+test("Test URL 1 (blocked) with extension filter") require success "create object";
+async;
+{
+	uct.LoadError(url_1);
+}
+
+test("Test URL 2 (allowed) with extension filter") require success "create object";
+async;
+{
+	uct.SetExpectedTransferRange(4096, 4096+1024);
+	uct.LoadOK(url_2, NULL);
+}
+
+test("Remove the extension rule")
+{
+	g_urlfilter->RemoveExtension(ext_ptr);
+	verify(g_urlfilter->GetCount(TRUE)==0);
+}
+
+test("Test URL 1 after extension removal")
+async;
+{
+	uct.SetExpectedTransferRange(1024, 1024+1024);
+	uct.LoadOK(url_1, NULL);
+}
+
+test("block from main rule")
+{
+	node = OP_NEW(FilterURLnode, ());
+	
+	node->SetIsExclude(TRUE);
+	node->SetURL(pattern2.CStr());
+	
+	// Add inclusion for main list
+	node2 = OP_NEW(FilterURLnode, ());
+	node2->SetIsExclude(FALSE);
+	node2->SetURL(UNI_L("*"));
+
+	verify_success(g_urlfilter->AddURL(node2, NULL, NULL));
+	
+	verify_success(g_urlfilter->AddURL(node, NULL, NULL));
+	verify(g_urlfilter->GetCount(TRUE)==2);
+}
+
+test("Test URL 1 (allowed) with main filter") require success "create object";
+async;
+{
+	uct.SetExpectedTransferRange(1024, 1024+1024);
+	uct.LoadOK(url_1, NULL);
+}
+
+test("Test URL 2(blocked) with main filter") require success "create object";
+async;
+{
+	uct.LoadError(url_2);
+}
+
+test("Remove the main rule")
+{
+	verify(g_urlfilter->DeleteURL(node));
+	verify(g_urlfilter->GetCount(TRUE)==1);
+}
+
+test("Test URL 1 after main rule removal")
+async;
+{
+	uct.SetExpectedTransferRange(1024, 1024+1024);
+	uct.LoadOK(url_1, NULL);
+}
+
+test("Test URL 2 after main rule removal")
+async;
+{
+	uct.SetExpectedTransferRange(4096, 4096+1024);
+	uct.LoadOK(url_2, NULL);
+}
+
+test("Remove inclusion rule (impossible)")
+{
+	verify(g_urlfilter->DeleteURL(node2, FALSE));
+	// Opera restores the rule, so it's impossible to come back to this situation again
+	verify(g_urlfilter->GetCount(TRUE)==1);
+}
+
+test("Test again URL 1 after main rule removal")
+async;
+{
+	uct.SetExpectedTransferRange(1024, 1024+1024);
+	uct.LoadOK(url_1, NULL);
+}
+
+test("Test again URL 2 after main rule removal")
+async;
+{
+	uct.SetExpectedTransferRange(4096, 4096+1024);
+	uct.LoadOK(url_2, NULL);
+}
+
+//////////////////////////////////// Layout simulation
+subtest TestLayout(URL url, BOOL expected_load)
+{
+	if(g_urlfilter->HasExcludeRules())
+	{
+		BOOL load=!expected_load;
+
+		verify_success(g_urlfilter->CheckURL(url.GetAttribute(URL::KUniName), load));
+		verify(load==expected_load);
+	}
+	else
+		verify(expected_load);
+}
+
+test("g_urlfilter substitution for Layout simulation")
+{
+	// Tactical temporary change, to avoid the presence of other rules
+	g_urlfilter = urlfilterLayoutTest;
+	
+	verify(g_urlfilter->GetCount(TRUE)==0);
+}
+
+test("Test no filter - Layout 1") require success "create object";
+{
+	verify(TestLayout(url_1, TRUE));
+}
+
+test("Test no filter - Layout 2") require success "create object";
+{
+	verify(TestLayout(url_2, TRUE));
+}
+
+test("block from extension - Layout")
+{
+	node = OP_NEW(FilterURLnode, ());
+		
+	node->SetIsExclude(TRUE);
+	node->SetURL(pattern1.CStr());
+	
+	verify_success(g_urlfilter->AddURL(node, ext_ptr, NULL));
+	verify(g_urlfilter->GetCount(TRUE)==1);
+}
+
+test("Test Layout 1 (blocked) with extension filter") require success "create object";
+{
+	verify(TestLayout(url_1, FALSE));
+}
+
+test("Test Layout 2 (allowed) with extension filter") require success "create object";
+{
+	verify(TestLayout(url_2, TRUE));
+}
+
+test("Remove the extension rule for Layout")
+{
+	g_urlfilter->RemoveExtension(ext_ptr);
+	verify(g_urlfilter->GetCount(TRUE)==0);
+}
+
+test("Test Layout 1 after extension removal")
+{
+	verify(TestLayout(url_1, TRUE));
+}
+
+test("block from main rule for Layout")
+{
+	node = OP_NEW(FilterURLnode, ());
+	
+	node->SetIsExclude(TRUE);
+	node->SetURL(pattern2.CStr());
+	
+	// Add inclusion for main list
+	node2 = OP_NEW(FilterURLnode, ());
+	node2->SetIsExclude(FALSE);
+	node2->SetURL(UNI_L("*"));
+
+	verify_success(g_urlfilter->AddURL(node2, NULL, NULL));
+	
+	verify_success(g_urlfilter->AddURL(node, NULL, NULL));
+	verify(g_urlfilter->GetCount(TRUE)==2);
+}
+
+test("Test Layout 1 (allowed) with main filter") require success "create object";
+{
+	verify(TestLayout(url_1, TRUE));
+}
+
+test("Test Layout 2(blocked) with main filter") require success "create object";
+{
+	verify(TestLayout(url_2, FALSE));
+}
+
+test("Remove the main rule")
+{
+	verify(g_urlfilter->DeleteURL(node));
+	verify(g_urlfilter->GetCount(TRUE)==1);
+}
+
+test("Test Layout URL 1 after main rule removal")
+{
+	verify(TestLayout(url_1, TRUE));
+}
+
+test("Test Layout URL 2 after main rule removal")
+{
+	verify(TestLayout(url_2, TRUE));
+}
+
+test("Remove inclusion rule (impossible)")
+{
+	verify(g_urlfilter->DeleteURL(node2, FALSE));
+	// Opera restores the rule, so it's impossible to come back to this situation again
+	verify(g_urlfilter->GetCount(TRUE)==1);
+}
+
+test("Test again Layout URL 1 after main rule removal")
+{
+	verify(TestLayout(url_1, TRUE));
+}
+
+test("Test again Layout URL 2 after main rule removal")
+{
+	verify(TestLayout(url_2, TRUE));
+}
+
+//////////////////////////////////// WhiteList check
+
+test("Test opera.com")
+{
+	verify(TestLayout(url_test, TRUE));
+}
+
+test("block internet from extension")
+{
+	FilterURLnode *node = OP_NEW(FilterURLnode, ());
+	
+	node->SetIsExclude(TRUE);
+	node->SetURL(UNI_L("*.*"));
+	
+	verify_success(g_urlfilter->AddURL(node, ext_ptr, NULL));
+}
+
+test("ReTest opera.com")
+{
+	verify(TestLayout(url_test, FALSE));
+}
+
+test("block internet also from main")
+{
+	FilterURLnode *node = OP_NEW(FilterURLnode, ());
+	
+	node->SetIsExclude(TRUE);
+	node->SetURL(UNI_L("*.*"));
+	
+	verify_success(g_urlfilter->AddURL(node, NULL, NULL));
+}
+
+test("ReTest opera.com again")
+{
+	verify(TestLayout(url_test, FALSE));
+}
+
+// White list test
+foreach (descr, url, http_status_code, network_testable) from Table_WhiteList
+{
+	test("URL simulation " descr)
+	async;
+	{
+		if (!network_testable)
+			ST_passed();
+		else
+		{
+			output("Testing %s", url.GetAttribute(URL::KName).CStr()); 
+			if(!url.IsEmpty())
+				uct.LoadStatus(url, http_status_code);
+			else
+				ST_passed();
+		}
+	}
+
+	test("Layout simulation " descr)
+	{
+		if(!url.IsEmpty())
+			verify(TestLayout(url, TRUE));
+	}
+}
+
+//////////////////////////////////// Javascript tests
+test("Load extension if required")
+	file uni oex_file "data/extension.oex";
+	require EXTENSION_SUPPORT;
+{
+
+	if(!extension_already_loaded)
+	{
+		if (OpStatus::IsError(g_gadget_manager->CreateGadget(&extension_gadget, oex_file, URL_EXTENSION_INSTALL_CONTENT)))
+			ST_failed("CreateGadget() failed");
+		if (OpStatus::IsError(g_gadget_manager->OpenGadget(extension_gadget)))
+		    ST_failed("OpenGadget() failed");
+
+		verify(extension_gadget->HasURLFilterAccess());
+		output("*** Gadget loaded *** ");
+	}
+	else
+		output("*** Gadget already loaded *** ");
+}
+
+test("Try to Test extension")
+require EXTENSION_SUPPORT;
+{
+	verify(testJSExtension());
+}
+
+//////////////////////////////////// Cleaning
+test("Restore WebServer if required")
+{
+	uct.StopWebServer();
+}

@@ -1,0 +1,124 @@
+/* -*- Mode: c++; tab-width: 4; indent-tabs-mode: t; c-basic-offset: 4 -*-
+**
+** Copyright (C) 2006-2011 Opera Software ASA.  All rights reserved.
+**
+** This file is part of the Opera web browser.  It may not be distributed
+** under any circumstances.
+**
+** Peter Krefting
+*/
+
+group "console.opconsoleengine";
+require init;
+require OPERA_CONSOLE;
+
+include "modules/console/opconsoleengine.h";
+include "modules/dochand/win.h";
+include "modules/windowcommander/OpWindowCommander.h";
+include "modules/windowcommander/src/WindowCommander.h";
+
+// -- Global variables ---------------------------------------------------
+
+global
+{
+	unsigned int msgnum;
+}
+
+setup
+{
+	msgnum = static_cast<unsigned int>(-1);
+}
+
+// -- Tests --------------------------------------------------------------
+
+test("Post message")
+{
+	unsigned int highest = g_console->GetHighestId();
+
+	OpConsoleEngine::Message msg(OpConsoleEngine::SelfTest, OpConsoleEngine::Verbose);
+	verify(OpStatus::IsSuccess(msg.context.Set("SelfTest")));
+	verify(OpStatus::IsSuccess(msg.message.Set("TestSelf")));
+	TRAPD(rc, msgnum = g_console->PostMessageL(&msg));
+	verify(OpStatus::IsSuccess(rc));
+	if (!g_console->IsLogging())
+	{
+		verify(msgnum == OpConsoleEngine::MESSAGE_BLOCKED);
+	}
+	else
+	{
+		verify(msgnum >= highest);
+		verify(msgnum == g_console->GetHighestId());
+		verify(g_console->GetHighestId() >= g_console->GetLowestId());
+	}
+}
+
+test("Get message")
+	require success "Post message";
+	require undefined CON_NO_BACKLOG;
+{
+	const OpConsoleEngine::Message *msg = g_console->GetMessage(msgnum);
+	verify(msg);
+	verify(msg->source == OpConsoleEngine::SelfTest);
+	verify(msg->severity == OpConsoleEngine::Verbose);
+	verify(msg->context.Compare("SelfTest") == 0);
+	verify(msg->message.Compare("TestSelf") == 0);
+}
+
+test("Clear")
+	require undefined CON_NO_BACKLOG;
+{
+	unsigned int lowest  = g_console->GetLowestId();
+	unsigned int highest = g_console->GetHighestId();
+
+	g_console->Clear();
+	verify(g_console->GetLowestId()   > lowest);
+	verify(g_console->GetHighestId() == highest);
+	verify(g_console->GetLowestId()   > highest);
+	verify(g_console->GetMessage(msgnum) == NULL);
+}
+
+test("Blocking messages for private windows")
+{
+	Window *win = state.GetWindow();
+
+	OpConsoleEngine::Message msg(OpConsoleEngine::SelfTest, OpConsoleEngine::Verbose);
+	verify(OpStatus::IsSuccess(msg.context.Set("SelfTest")));
+	verify(OpStatus::IsSuccess(msg.message.Set("TestSelf")));
+	msg.window = win->Id();
+
+	BOOL old_privacy_mode = win->GetPrivacyMode();
+	win->SetPrivacyMode(TRUE);
+	TRAPD(rc, msgnum = g_console->PostMessageL(&msg));
+	win->SetPrivacyMode(old_privacy_mode);
+
+	verify(OpStatus::IsSuccess(rc));
+	verify(msgnum == OpConsoleEngine::MESSAGE_BLOCKED);
+}
+
+test("Initializing from window pointer")
+{
+	Window *win = state.GetWindow();
+
+	OpConsoleEngine::Message msg1(OpConsoleEngine::SelfTest, OpConsoleEngine::Verbose, win->Id());
+	OpConsoleEngine::Message msg2(OpConsoleEngine::SelfTest, OpConsoleEngine::Verbose, win);
+	OpConsoleEngine::Message msg3(OpConsoleEngine::SelfTest, OpConsoleEngine::Verbose, win->GetWindowCommander());
+
+	verify(msg1.window == msg2.window);
+	verify(msg1.window == msg3.window);
+}
+
+test("GetSourceKeyword")
+	require CON_GET_SOURCE_KEYWORD;
+{
+	for (unsigned i = 0; i < unsigned(OpConsoleEngine::SourceTypeLast); ++i)
+	{
+		OpConsoleEngine::Source source = static_cast<OpConsoleEngine::Source>(i);
+		const char *str = g_console->GetSourceKeyword(source);
+		verify(str != NULL);
+		verify(str != '\0');
+
+		// Verify that string contains only alphanumeric characters and underscores.
+		for (const char *c = str; *c != '\0'; ++c)
+			verify(op_isalnum(*c) || *c == '_');
+	}
+}

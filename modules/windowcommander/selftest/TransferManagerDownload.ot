@@ -1,0 +1,253 @@
+/* -*- Mode: c++; tab-width: 4; indent-tabs-mode: t; c-basic-offset: 4; -*-
+**
+** Copyright (C) 2002-2010 Opera Software AS.  All rights reserved.
+**
+** This file is part of the Opera web browser.  It may not be distributed
+** under any circumstances.
+*/
+
+group "windowcommander.TransferManagerDownload";
+
+require initialization;
+require WINDOW_COMMANDER_TRANSFER;
+require WIC_USE_DOWNLOAD_CALLBACK;
+
+include "modules/windowcommander/OpTransferManager.h";
+include "modules/windowcommander/src/TransferManager.h";
+include "modules/windowcommander/src/TransferManagerDownload.h";
+
+global
+{
+	class DownloadCallbackDoneListener : public URLInformation::DoneListener
+	{
+	public:
+		DownloadCallbackDoneListener() : m_done(FALSE) {}
+		virtual BOOL OnDone(URLInformation* url_info)
+		{
+			m_done = TRUE;
+			return TRUE;
+		}
+		BOOL IsDone() { return m_done; }
+	private:
+		BOOL m_done;
+	};
+
+	class TransferManagerListener : public OpTransferManagerListener
+	{
+	public:
+		virtual BOOL OnTransferItemAdded(OpTransferItem* transferItem, BOOL is_populating=FALSE, double last_speed=0) { return TRUE; }
+		virtual void OnTransferItemRemoved(OpTransferItem* transferItem) { }
+		virtual void OnTransferItemStopped(OpTransferItem* transferItem) { }
+		virtual void OnTransferItemResumed(OpTransferItem* transferItem) { }
+		virtual BOOL OnTransferItemCanDeleteFiles(OpTransferItem* transferItem) { return TRUE; }
+		virtual void OnTransferItemDeleteFiles(OpTransferItem* transferItem) { }
+	};
+
+	class TransferListener : public OpTransferListener
+	{
+	public:
+		TransferListener() : m_transfer_item(0) {}
+		void SetTransferItem(OpTransferItem* transferItem) { m_transfer_item = transferItem; }
+
+		virtual void OnProgress(OpTransferItem* transferItem, TransferStatus status)
+		{
+			switch (status)
+			{
+			case TRANSFER_FAILED:
+				ST_failed("TransferListener::OnProgress() status = TRANSFER_FAILED");
+				break;
+
+			case TRANSFER_DONE:
+				if (transferItem == m_transfer_item)
+				{
+					ST_passed();
+				}
+				else
+				{
+					ST_failed("TransferListener::OnProgress() transferItem != m_transfer_item");
+				}
+				break;
+			}
+		}
+
+		virtual void OnReset(OpTransferItem* transferItem) { }
+		virtual void OnRedirect(OpTransferItem* transferItem, URL* redirect_from, URL* redirect_to) { }
+
+	private:
+		OpTransferItem* m_transfer_item;
+	};
+
+	TransferManagerListener transfer_manager_listener;
+	TransferListener transfer_listener;
+	OpTransferItem* transfer_item_1;
+	OpTransferItem* transfer_item_2;
+}
+
+setup
+{
+	transfer_item_1 = 0;
+	transfer_item_2 = 0;
+}
+
+exit
+{
+	if (transfer_item_2 && transfer_item_2 != transfer_item_1)
+		g_transferManager->ReleaseTransferItem(transfer_item_2);
+	if (transfer_item_1)
+		g_transferManager->ReleaseTransferItem(transfer_item_1);
+}
+
+test("check initial state")
+{
+	verify(g_transferManager->GetTransferItemCount() == 0);
+	verify(!g_transferManager->GetTransferItem(0));
+}
+
+test("set OpTransferManagerListener")
+	require success "check initial state";
+{
+	verify(OpStatus::IsSuccess(g_transferManager->AddTransferManagerListener(&transfer_manager_listener)));
+}
+
+test("create transfer item")
+	require success "set OpTransferManagerListener";
+{
+	DownloadCallbackDoneListener done_listener;
+
+	URL url = g_url_api->GetURL(UNI_L("http://www.opera.com/"));
+	TransferManagerDownloadCallback * tmdc = OP_NEW(TransferManagerDownloadCallback, (NULL, url, NULL, ViewActionFlag()));
+	verify(tmdc);
+	tmdc->SetDoneListener(&done_listener);
+	verify(OpBoolean::IS_FALSE == tmdc->Execute());
+	verify(!done_listener.IsDone());
+
+	OpString filename;
+	verify(OpStatus::IsSuccess(g_folder_manager->GetFolderPath(OPFILE_SELFTEST_DATA_FOLDER, filename)));
+	verify(OpStatus::IsSuccess(filename.AppendFormat(UNI_L("modules%cwindowcommander%cselftest%cdump%ctmdc-downloaded-file"), PATHSEPCHAR, PATHSEPCHAR, PATHSEPCHAR, PATHSEPCHAR)));
+	verify(TRUE == tmdc->Save(filename.CStr()));
+	verify(done_listener.IsDone());
+
+	verify(g_transferManager->GetTransferItemCount() == 1);
+	transfer_item_1 = g_transferManager->GetTransferItem(0);
+	verify(transfer_item_1);
+	verify(transfer_item_1->GetStorageFilename());
+	verify(filename.Compare(*transfer_item_1->GetStorageFilename()) == 0);
+}
+finally
+{
+	if (tmdc && !done_listener.IsDone())
+	{
+		OP_DELETE(tmdc);
+	}
+}
+
+test("transfer file")
+	require success "create transfer item";
+	async;
+{
+	transfer_listener.SetTransferItem(transfer_item_1);
+	transfer_item_1->SetTransferListener(&transfer_listener);
+	transfer_item_1->Clear();
+	transfer_item_1->Continue();
+}
+
+test("create second transfer item for the same URL")
+	require success "transfer file";
+{
+	DownloadCallbackDoneListener done_listener;
+
+	URL url = g_url_api->GetURL(UNI_L("http://www.opera.com/"));
+	TransferManagerDownloadCallback * tmdc = OP_NEW(TransferManagerDownloadCallback, (NULL, url, NULL, ViewActionFlag()));
+	verify(tmdc);
+	tmdc->SetDoneListener(&done_listener);
+	verify(OpBoolean::IS_FALSE == tmdc->Execute());
+	verify(!done_listener.IsDone());
+
+	OpString filename;
+	verify(OpStatus::IsSuccess(g_folder_manager->GetFolderPath(OPFILE_SELFTEST_DATA_FOLDER, filename)));
+	verify(OpStatus::IsSuccess(filename.AppendFormat(UNI_L("modules%cwindowcommander%cselftest%cdump%ctmdc-downloaded-file-1"), PATHSEPCHAR, PATHSEPCHAR, PATHSEPCHAR, PATHSEPCHAR)));
+	verify(TRUE == tmdc->Save(filename.CStr()));
+	verify(done_listener.IsDone());
+
+	verify(g_transferManager->GetTransferItemCount() == 2);
+	verify(transfer_item_1 == g_transferManager->GetTransferItem(0));
+	transfer_item_2 = g_transferManager->GetTransferItem(1);
+	verify(transfer_item_2);
+	verify(transfer_item_2->GetStorageFilename());
+	verify(filename.Compare(*transfer_item_2->GetStorageFilename()) == 0);
+
+	// check that second transfer did not reset state of the first transfer item
+	verify(((TransferItem*)transfer_item_1)->GetIsFinished());
+}
+finally
+{
+	if (tmdc && !done_listener.IsDone())
+	{
+		OP_DELETE(tmdc);
+	}
+}
+
+test("transfer file second time")
+	require success "create second transfer item for the same URL";
+	async;
+{
+	transfer_listener.SetTransferItem(transfer_item_2);
+	transfer_item_2->SetTransferListener(&transfer_listener);
+	transfer_item_2->Clear();
+	transfer_item_2->Continue();
+}
+
+test("unset OpTransferManagerListener")
+	require success "transfer file second time";
+{
+	verify(OpStatus::IsSuccess(g_transferManager->RemoveTransferManagerListener(&transfer_manager_listener)));
+}
+
+test("FilePathName for already downloaded file")
+{
+	URL url = g_url_api->GetURL(UNI_L("http://www.opera.com/"));
+	const BOOL was_downloaded = TRUE;
+	const uni_char* already_downloaded_file_path = UNI_L("foo");
+	TransferManagerDownloadCallback* tmdc = NULL;
+	tmdc = OP_NEW(TransferManagerDownloadCallback,
+				  (NULL, url, NULL, ViewActionFlag(),
+				   was_downloaded));
+	verify(tmdc);
+	verify_success(tmdc->Init(already_downloaded_file_path));
+
+	verify_string(tmdc->FilePathName(), already_downloaded_file_path);
+}
+finally
+{
+	if (tmdc)
+		OP_DELETE(tmdc);
+}
+
+table test_TransferManagerDownloadCallback_FilePathName(const char* test_name, BOOL was_downloaded)
+{
+	{ "already downloaded file - no file path", TRUE }
+	{ "new download", FALSE }
+}
+
+foreach (test_name, was_downloaded) from test_TransferManagerDownloadCallback_FilePathName
+{
+	test("FilePathName for " test_name)
+	{
+		TransferManagerDownloadCallback* tmdc = NULL;
+        URL url = g_url_api->GetURL(UNI_L("http://www.opera.com/"));
+		OpString expected_file_path;
+		verify_success(url.GetAttribute(URL::KFilePathName, expected_file_path, TRUE));
+        tmdc = OP_NEW(TransferManagerDownloadCallback,
+                      (NULL, url, NULL, ViewActionFlag(), was_downloaded));
+        verify(tmdc);
+		verify_success(tmdc->Init(NULL));
+
+		OpStringC file_path_name(tmdc->FilePathName());
+		verify_string(file_path_name, expected_file_path);
+	}
+	finally
+	{
+		if (tmdc)
+			OP_DELETE(tmdc);
+	}
+}

@@ -1,0 +1,338 @@
+/* -*- Mode: c++; tab-width: 4; indent-tabs-mode: t; c-basic-offset: 4 -*-
+**
+** Copyright (C) 1995-2009 Opera Software AS.  All rights reserved.
+**
+** This file is part of the Opera web browser.
+** It may not be distributed under any circumstances.
+**
+*/
+
+group "dom.storage.database.quotas";
+
+require initialization;
+require DATABASE_STORAGE_SUPPORT;
+require PREFS_WRITE;
+require DATABASE_MODULE_MANAGER_SUPPORT;
+
+include "modules/database/opdatabasemanager.h";
+include "modules/database/prefscollectiondatabase.h";
+include "modules/database/sec_policy.h";
+include "modules/doc/frm_doc.h";
+include "modules/dom/src/domobj.h";
+include "modules/dom/src/domenvironmentimpl.h";
+
+global
+{
+	OP_STATUS status;
+	OpFileLength quota;
+	int handling;
+	unsigned query_timeout;
+	PS_Policy* db_policy;
+	const uni_char* st_domain;
+	const Window* st_win;
+	URL_CONTEXT_ID ctx_id;
+}
+
+html "http://foo.local/" { "<body>" }
+
+language c++;
+
+test("initialization")
+{
+	verify(g_selftest.utils->doc);
+	verify(g_database_manager);
+	st_win = g_selftest.utils->GetWindow();
+	if (g_selftest.utils->doc->GetURL().GetServerName())
+		st_domain = g_selftest.utils->doc->GetURL().GetServerName()->UniName();
+	else
+		st_domain = NULL;
+	ctx_id = g_selftest.utils->doc->GetURL().GetContextId();
+
+	db_policy = g_database_policies->GetPolicy(PS_ObjectTypes::KWebDatabases);
+
+	quota         = db_policy->GetAttribute(PS_Policy::KOriginQuota, ctx_id, st_domain, st_win);
+	handling      = db_policy->GetAttribute(PS_Policy::KOriginExceededHandling, ctx_id, st_domain, st_win);
+	query_timeout = db_policy->GetAttribute(PS_Policy::KQueryExecutionTimeout, ctx_id, st_domain, st_win);
+
+	db_policy->SetAttribute(PS_Policy::KOriginQuota, ctx_id, 25000, st_domain, st_win);
+	db_policy->SetAttribute(PS_Policy::KOriginExceededHandling, ctx_id, PS_Policy::KQuotaDeny, st_domain, st_win);
+
+	/**
+	 * This dom function allows the selftest to define a really small timeout value
+	 * for queries, else it would take a bit longer to run the tests using the
+	 * value in the preferences
+	 */
+	class SetQueryTimeoutFn : public DOM_Object
+	{
+	public:
+		PS_Policy* m_db_policy;
+		unsigned m_default_timeout;
+		SetQueryTimeoutFn(PS_Policy* db_policy, unsigned default_timeout) :
+			m_db_policy(db_policy), m_default_timeout(default_timeout) {}
+		virtual int Call( ES_Object* /*this_object*/, ES_Value* argv, int argc,
+				  ES_Value* return_value, ES_Runtime* origining_runtime)
+		{
+			FramesDocument *frames_doc = GetRuntime()->GetEnvironment()->GetFramesDocument();
+			if (!frames_doc)
+				return ES_FAILED;
+			BOOL limit = 0 < argc && argv[0].type == VALUE_BOOLEAN && argv[0].value.boolean;
+			OpString domain;
+			CALL_FAILED_IF_ERROR(frames_doc->GetURL().GetAttribute(URL::KUniHostName, domain));
+
+			m_db_policy->SetAttribute(PS_Policy::KQueryExecutionTimeout,
+				frames_doc->GetURL().GetContextId(),
+				limit ? 100 : m_default_timeout,
+				domain.CStr(),
+				frames_doc->GetWindow());
+			return ES_VALUE;
+		}
+	};
+
+	verify_success(g_selftest.utils->doc->ConstructDOMEnvironment());
+	ES_Runtime *runtime = g_selftest.utils->doc->GetESRuntime();
+	verify(runtime != NULL);
+
+	SetQueryTimeoutFn *fn_set_timeout = OP_NEW(SetQueryTimeoutFn, (db_policy, query_timeout));
+	verify_not_oom(fn_set_timeout);
+	verify_success(fn_set_timeout->SetFunctionRuntime(runtime, UNI_L("__limitQueryTimeout"), NULL, "b"));
+	verify_success(runtime->PutInGlobalObject(fn_set_timeout, UNI_L("__limitQueryTimeout")));
+
+	g_database_manager->m_self_test_instance = TRUE;
+}
+
+
+language ecmascript;
+
+test("databaseStorage.quota")
+	require success "initialization";
+	async;
+{
+	opera.deleteDatabase("testquota");
+
+	var bigstr = (new Array(0xffff)).join("aaaa");
+
+	function fail(error) {
+		ST_failed("ERROR 1 " + error.code + ": " + error.message, "databasestorage.ot", 0);
+		opera.deleteDatabase("testquota");
+	}
+
+	var passed = false;
+	var timeoutid = setTimeout(function(){
+		opera.deleteDatabase("testquota");
+		verify(!"Timeout");
+	}, 2000);
+
+	function handle_error(tx, error) {
+		if(timeoutid) {
+			clearTimeout(timeoutid);
+			timeoutid = null;
+		}
+
+		if(!passed) {
+			if(error.code == 4) {
+				passed = true;
+				opera.deleteDatabase("testquota");
+				ST_passed();
+			} else {
+				fail(error);
+			}
+		}
+	}
+
+	var timeoutid = setTimeout(function(){
+		fail("Test timeout");
+	}, 4000);
+
+	var db = openDatabase("testquota", "", "bleh", 2000000);
+	verify(db);
+
+	db.transaction(function(tx) {
+		tx.executeSql("drop table if exists t", [], null, handle_error);
+		tx.executeSql("create table t (id INTEGER PRIMARY KEY AUTOINCREMENT, data TEXT)", [], null, handle_error);
+		for (var i=0; i < 20; i=i+1) {
+			tx.executeSql("insert into t (data) values (?)", [bigstr], null, handle_error);
+		}
+	});
+}
+
+test("databaseStorage.quota recovery")
+	require success "initialization";
+	async;
+{
+	opera.deleteDatabase("testquota");
+
+	var bigstr = (new Array(0xffff)).join("aaaa");
+	var query = '';
+
+	function fail() {
+		if (!fail._has_failed)
+		{
+			fail._has_failed = 1;
+			error = arguments.length == 1 ? arguments[0] : arguments[1];
+			ST_failed(typeof error == 'string' ? error : "ERROR 2 " + error.code + ": " + error.message + "\n" + query, "databasestorage.ot", 0);
+			opera.deleteDatabase("testquota");
+		}
+	}
+
+	var timeoutid = setTimeout(function(){
+		fail("Test timeout");
+	}, 4000);
+
+	var db = openDatabase("testquota", "", "bleh", 2000000);
+	verify(db);
+
+	db.transaction(function(tx) {
+		function executeSql(query0, args, c1, c2){
+			return tx.executeSql(query0, args, c1, function(){
+				query = query0;
+				return c2 ? c2.apply(this, arguments) : undefined;
+			});
+		}
+		executeSql("create table t (data TEXT)");
+		executeSql("insert into t (data) values (?)", ["hello"]);
+		executeSql("insert into t (data) values (?)", [bigstr], function(){
+			throw "Big string failed to throw quota error";
+		}, function(t, e){
+			verify(e.code == SQLError.QUOTA_ERR);
+			return false;
+		});
+		executeSql("insert into t (data) values (?)", [bigstr], function(){
+			throw "Big string failed to throw quota error";
+		}, function(t, e){
+			verify(e.code == SQLError.QUOTA_ERR);
+			return false;
+		});
+		executeSql("insert into t (data) values (?)", ["world"]);
+		executeSql("insert into t (data) values (?)", [bigstr], function(){
+			throw "Big string failed to throw quota error";
+		}, function(t, e){
+			verify(e.code == SQLError.QUOTA_ERR);
+			return false;
+		});
+		executeSql("select * from t", null, function(t, r){
+			verify(r);
+			verify(r.rows);
+			verify(r.rows.length == 2);
+			verify(r.rows[0].data == "hello");
+			verify(r.rows[1].data == "world");
+		});
+	}, fail);
+	//recheck if everything got commited
+	db.transaction(function(tx) {
+		function executeSql(query0, args, c1, c2){
+			return tx.executeSql(query0, args, c1, function(){
+				query = query0;
+				return c2 ? c2.apply(this, arguments) : undefined;
+			});
+		}
+		executeSql("select * from t order by 1", null, function(t, r){
+			verify(r);
+			verify(r.rows);
+			verify(r.rows.length == 2);
+			verify(r.rows[0].data == "hello");
+			verify(r.rows[1].data == "world");
+		});
+	}, fail, function(){
+		ST_passed();
+	});
+}
+
+test("databaseStorage.timeout recovery")
+	require success "initialization";
+	async;
+{
+	opera.deleteDatabase("testquota");
+
+	var bigstr = (new Array(0xffff)).join("aaaa");
+	var query = '';
+
+	function fail() {
+		if (!fail._has_failed)
+		{
+			fail._has_failed = 1;
+			error = arguments.length == 1 ? arguments[0] : arguments[1];
+			ST_failed(typeof error == 'string' ? error : "ERROR 3 " + error.code + ": " + error.message + "\n" + query, "databasestorage.ot", 0);
+			opera.deleteDatabase("testquota");
+		}
+	}
+
+	var timeoutid = setTimeout(function(){
+		fail("Test timeout");
+	}, 4000);
+
+	var db = openDatabase("testquota", "", "bleh", 2000000);
+	verify(db);
+
+	db.transaction(function(tx) {
+		function executeSql(query0, args, c1, c2){
+			return tx.executeSql(query0, args, c1, function(){
+				query = query0;
+				return c2 ? c2.apply(this, arguments) : undefined;
+			});
+		}
+		executeSql("create table t (data TEXT)");
+
+		executeSql("insert into t (data) values (?)", ["hello"]);
+
+		executeSql("create view big_view as "+
+				"select random() rand from "+
+				"	(select 1 union all select 1), "+
+				"	(select 1 union all select 1), "+
+				"	(select 1 union all select 1), "+
+				"	(select 1 union all select 1), "+
+				"	(select 1 union all select 1), "+
+				"	(select 1 union all select 1), "+
+				"	(select 1 union all select 1), "+
+				"	(select 1 union all select 1), "+
+				"	(select 1 union all select 1), "+
+				"	(select 1 union all select 1);", null, function(){
+					__limitQueryTimeout(true);
+					executeSql("select a.rand from big_view a, big_view b, big_view c, big_view d order by 1", null, function(){
+						__limitQueryTimeout(false);
+						throw "Long query failed to throw timeout error";
+					}, function(t, e){
+						__limitQueryTimeout(false);
+						verify(e.code == SQLError.TIMEOUT_ERR);
+						return false;
+					});
+
+					executeSql("insert into t (data) values (?)", ["world"]);
+					executeSql("select * from t", null, function(t, r){
+						verify(r);
+						verify(r.rows);
+						verify(r.rows.length == 2);
+						verify(r.rows[0].data == "hello");
+						verify(r.rows[1].data == "world");
+					});
+				});
+
+	}, fail);
+
+	//recheck if everything got commited
+	db.transaction(function(tx) {
+		query = "select * from t order by 1";
+		tx.executeSql(query, null, function(t, r){
+			verify(r);
+			verify(r.rows);
+			verify(r.rows.length == 2);
+			verify(r.rows[0].data == "hello");
+			verify(r.rows[1].data == "world");
+		});
+	}, fail, function(){
+		ST_passed();
+	});
+}
+
+exit
+{
+	if (g_database_manager)
+		g_database_manager->m_self_test_instance = FALSE;
+
+	if (g_database_policies)
+	{
+		// restore previous quota
+		db_policy->SetAttribute(PS_Policy::KOriginQuota, ctx_id, quota, st_domain, st_win);
+		db_policy->SetAttribute(PS_Policy::KOriginExceededHandling, ctx_id, handling, st_domain, st_win);
+		db_policy->SetAttribute(PS_Policy::KQueryExecutionTimeout, ctx_id, query_timeout, st_domain, st_win);
+	}
+}

@@ -1,0 +1,804 @@
+/* -*- Mode: c++; tab-width: 4; indent-tabs-mode: t; c-basic-offset: 4 -*-
+ *
+ * Copyright (C) 1995-2011 Opera Software AS.  All rights reserved.
+ *
+ * This file is part of the Opera web browser.
+ * It may not be distributed under any circumstances.
+ */
+
+group "sync.item";
+require SUPPORT_DATA_SYNC;
+
+include "modules/sync/sync_dataitem.h";
+include "modules/sync/sync_coordinator.h";
+include "modules/sync/testcases/sync_ST_factory.h";
+
+test("AddChild")
+{
+	/* verifies that OpSyncDataItem::AddChild(key, data) adds a new child to an
+	 * OpSyncDataItem */
+	OpSyncDataCollection auto_delete;
+	OpSyncDataItem* item = OP_NEW(OpSyncDataItem, ());
+	verify(item);
+	auto_delete.AddItem(item);
+	verify(!item->HasChildren());
+	OpSyncDataItem* added_child = 0;
+	verify_success(item->AddChild(UNI_L("foo"), UNI_L("bar"), &added_child));
+	verify(added_child);
+	verify(item->HasChildren());
+	verify_string(added_child->m_key, "foo");
+	verify_string(added_child->m_data, "bar");
+	verify(item->FindChildById(UNI_L("foo")) == added_child);
+}
+
+test("RemoveChild")
+require success "AddChild";
+{
+	/* verifies that OpSyncDataItem::RemoveChild(key) removes a child from an
+	 * OpSyncDataItem */
+	OpSyncDataCollection auto_delete;
+	OpSyncDataItem* item = OP_NEW(OpSyncDataItem, ());
+	verify(item);
+	auto_delete.AddItem(item);
+	verify(!item->HasChildren());
+	verify_success(item->AddChild(UNI_L("foo"), UNI_L("bar"), 0));
+	verify(item->HasChildren());
+	verify(item->FindChildById(UNI_L("foo")));
+	item->RemoveChild(UNI_L("foo"));
+	verify(!item->HasChildren());
+	verify(item->FindChildById(UNI_L("foo")) == 0);
+}
+
+test("AddAttribute")
+{
+	/* verifies that OpSyncDataItem::AddAttribute(key, data) adds a new
+	 * attribute to an OpSyncDataItem */
+	OpSyncDataCollection auto_delete;
+	OpSyncDataItem* item = OP_NEW(OpSyncDataItem, ());
+	verify(item);
+	auto_delete.AddItem(item);
+	verify(!item->HasAttributes());
+	OpSyncDataItem* added_attribute = 0;
+	verify_success(item->AddAttribute(UNI_L("foo"), UNI_L("bar"), &added_attribute));
+	verify(added_attribute);
+	verify(item->HasAttributes());
+	verify_string(added_attribute->m_key, "foo");
+	verify_string(added_attribute->m_data, "bar");
+	verify(item->FindAttributeById(UNI_L("foo")) == added_attribute);
+}
+
+test("RemoveAttribute")
+require success "AddAttribute";
+{
+	/* verifies that OpSyncDataItem::RemoveAttribute(key) removes an attribute
+	 * from an OpSyncDataItem */
+	OpSyncDataCollection auto_delete;
+	OpSyncDataItem* item = OP_NEW(OpSyncDataItem, ());
+	verify(item);
+	auto_delete.AddItem(item);
+	verify(!item->HasAttributes());
+	verify_success(item->AddAttribute(UNI_L("foo"), UNI_L("bar"), 0));
+	verify(item->HasAttributes());
+	verify(item->FindAttributeById(UNI_L("foo")));
+	item->RemoveAttribute(UNI_L("foo"));
+	verify(!item->HasAttributes());
+	verify(item->FindAttributeById(UNI_L("foo")) == 0);
+}
+
+/**
+ * This table is used in the test "Merge" to verify that calling
+ * OpSyncDataItem::Merge() merges two data items.
+ */
+table merge_tests(const char* test_name, enum OpSyncDataItem::DataItemStatus status1, enum OpSyncDataItem::DataItemStatus status2, enum OpSyncDataItem::MergeStatus expected_merge_status, enum OpSyncDataItem::DataItemStatus expected_status, const char* expected_value)
+{
+	{
+		"delete+delete",
+			OpSyncDataItem::DATAITEM_ACTION_DELETED,
+			OpSyncDataItem::DATAITEM_ACTION_DELETED,
+			OpSyncDataItem::MERGE_STATUS_UNCHANGED,
+			OpSyncDataItem::DATAITEM_ACTION_DELETED, (const char*)NULL
+	},
+	{
+		"add+delete",
+			OpSyncDataItem::DATAITEM_ACTION_ADDED,
+			OpSyncDataItem::DATAITEM_ACTION_DELETED,
+			OpSyncDataItem::MERGE_STATUS_DELETED,
+			OpSyncDataItem::DATAITEM_ACTION_NONE, (const char*)NULL
+	},
+	{
+		"modify+delete",
+			OpSyncDataItem::DATAITEM_ACTION_MODIFIED,
+			OpSyncDataItem::DATAITEM_ACTION_DELETED,
+			OpSyncDataItem::MERGE_STATUS_MERGED,
+			OpSyncDataItem::DATAITEM_ACTION_DELETED, (const char*)NULL
+	},
+
+	{
+		"delete+modify",
+			OpSyncDataItem::DATAITEM_ACTION_DELETED,
+			OpSyncDataItem::DATAITEM_ACTION_MODIFIED,
+			OpSyncDataItem::MERGE_STATUS_MERGED,
+			OpSyncDataItem::DATAITEM_ACTION_MODIFIED, "modified"
+	},
+	{
+		"add+modify",
+			OpSyncDataItem::DATAITEM_ACTION_ADDED,
+			OpSyncDataItem::DATAITEM_ACTION_MODIFIED,
+			OpSyncDataItem::MERGE_STATUS_MERGED,
+			OpSyncDataItem::DATAITEM_ACTION_ADDED, "modified"
+	},
+	{
+		"modify+modify",
+			OpSyncDataItem::DATAITEM_ACTION_MODIFIED,
+			OpSyncDataItem::DATAITEM_ACTION_MODIFIED,
+			/* Here we expect the result to be unchanged, because we create two
+			 * data items with the same content: */
+			OpSyncDataItem::MERGE_STATUS_UNCHANGED,
+			OpSyncDataItem::DATAITEM_ACTION_MODIFIED, "modified"
+	},
+
+	{
+		"delete+add",
+			OpSyncDataItem::DATAITEM_ACTION_DELETED,
+			OpSyncDataItem::DATAITEM_ACTION_ADDED,
+			OpSyncDataItem::MERGE_STATUS_MERGED,
+			OpSyncDataItem::DATAITEM_ACTION_MODIFIED, "added"
+	},
+	{
+		"add+add",
+			OpSyncDataItem::DATAITEM_ACTION_ADDED,
+			OpSyncDataItem::DATAITEM_ACTION_ADDED,
+			/* Here we expect the result to be unchanged, because we create two
+			 * data items with the same content: */
+			OpSyncDataItem::MERGE_STATUS_UNCHANGED,
+			OpSyncDataItem::DATAITEM_ACTION_ADDED, "added"
+	},
+	{
+		"modify+add",
+			OpSyncDataItem::DATAITEM_ACTION_MODIFIED,
+			OpSyncDataItem::DATAITEM_ACTION_ADDED,
+			OpSyncDataItem::MERGE_STATUS_MERGED,
+			OpSyncDataItem::DATAITEM_ACTION_MODIFIED, "added"
+	}
+}
+
+/**
+ * Creates a new OpSyncDataItem (of type bookmark and with primary key
+ * "foo"="bar") with the specified OpSyncDataItem::DataItemStatus.
+ *
+ * @note The primary key "foo"="bar" is added as attribute.
+ *
+ * If the status is OpSyncDataItem::DATAITEM_ACTION_ADDED, the item will receive
+ * one attribute "attr"="added" and one child "child"="added".
+ * If the status is OpSyncDataItem::DATAITEM_ACTION_MODIFIED, the item will
+ * receive one attribute "attr"="modified" and one child "child"="modified".
+ * If the status is OpSyncDataItem::DATAITEM_ACTION_DELETED, the item will not
+ * have any children or attributes (apart from the primary key).
+ *
+ * @note This subtest fails if generating the item fails.
+ *
+ * @param collection The newly created OpSyncDataItem is added to this
+ *  OpSyncDataCollection.
+ * @param item receives on success the pointer to the created item.
+ * @param status The item's status is set to this value.
+ */
+subtest CreateSyncDataItem(OpSyncDataCollection* collection, OpSyncDataItem** item, enum OpSyncDataItem::DataItemStatus status)
+{
+	*item = OP_NEW(OpSyncDataItem, ());
+	verify(*item);
+	collection->AddItem(*item);
+	(*item)->SetType(OpSyncDataItem::DATAITEM_BOOKMARK);
+	verify_success((*item)->m_key.Set(UNI_L("foo")));
+	verify_success((*item)->m_data.Set(UNI_L("bar")));
+	(*item)->AddAttribute(UNI_L("foo"), UNI_L("bar"), 0);
+	(*item)->SetStatus(status);
+	switch (status) {
+	case OpSyncDataItem::DATAITEM_ACTION_ADDED:
+		verify_success((*item)->AddChild(UNI_L("child"), UNI_L("added"), 0));
+		verify_success((*item)->AddAttribute(UNI_L("attr"), UNI_L("added"), 0));
+		break;
+
+	case OpSyncDataItem::DATAITEM_ACTION_MODIFIED:
+		verify_success((*item)->AddChild(UNI_L("child"), UNI_L("modified"), 0));
+		verify_success((*item)->AddAttribute(UNI_L("attr"), UNI_L("modified"), 0));
+		break;
+
+	case OpSyncDataItem::DATAITEM_ACTION_DELETED:
+		break;
+
+	default:
+		verify(!"Unsupported status");
+	}
+}
+
+foreach (test_name, status1, status2, expected_merge_status, expected_status, expected_value) from merge_tests
+{
+	test("Merge " test_name)
+	{
+		OpSyncDataCollection auto_delete;
+		OpSyncDataItem* item1 = 0;
+		verify(CreateSyncDataItem(&auto_delete, &item1, status1));
+		OpSyncDataItem* item2 = 0;
+		verify(CreateSyncDataItem(&auto_delete, &item2, status2));
+		verify(auto_delete.GetCount() == 2);
+
+		/* Merge item1 with item2 */
+		enum OpSyncDataItem::MergeStatus merge_status = OpSyncDataItem::MERGE_STATUS_UNCHANGED;
+		verify_success(item1->Merge(item2, merge_status));
+
+		verify(merge_status == expected_merge_status);
+		if (expected_merge_status == OpSyncDataItem::MERGE_STATUS_DELETED)
+			/* item1 was deleted (only item2 remains in auto_delete): */
+			verify(auto_delete.GetCount() == 1);
+		else
+		{
+			/* both item1 and item2 are expected to be in the collection: */
+			verify(auto_delete.GetCount() == 2);
+			// The primary key is still the same:
+			verify_string(item1->m_key, "foo");
+			verify_string(item1->m_data, "bar");
+			// and there shall be an attribute for that:
+			OpSyncDataItem* key = item1->FindAttributeById(UNI_L("foo"));
+			verify(key);
+			verify_string(key->m_data, "bar");
+			// test the expected status:
+			verify(item1->GetStatus() == expected_status);
+
+			switch (expected_status) {
+			case OpSyncDataItem::DATAITEM_ACTION_NONE:
+				break;
+
+			case OpSyncDataItem::DATAITEM_ACTION_DELETED:
+				/* If the resulting status is "deleted", then the primary key is
+				 * expected to be the only attribute, and there shall be no
+				 * children: */
+				verify(item1->FindAttributeById(UNI_L("attr")) == 0);
+				verify(item1->FindChildById(UNI_L("child")) == 0);
+				verify(!item1->HasChildren());
+				verify(item1->GetFirstAttribute() == key);
+				verify(key->Next() == 0);
+				break;
+
+			case OpSyncDataItem::DATAITEM_ACTION_MODIFIED:
+			case OpSyncDataItem::DATAITEM_ACTION_ADDED:
+			{	/* If the resulting status is "modified", then we expect to have
+				 * the attribute "attr=modified" and child "child=modified" */
+				OpSyncDataItem* i = item1->FindAttributeById(UNI_L("attr"));
+				verify(i);
+				verify_string(i->m_data, expected_value);
+				i = item1->FindChildById(UNI_L("child"));
+				verify(i);
+				verify_string(i->m_data, expected_value);
+				break;
+			}
+
+			}
+		}
+	}
+}
+
+subtest CreateDirtySyncDataItem(OpSyncDataCollection* collection, OpSyncDataItem** data_item, const char* key, const char* value, enum OpSyncDataItem::DataItemStatus status)
+{
+	*data_item = 0;
+	OpSyncDataItem* item = OP_NEW(OpSyncDataItem, ());
+	verify(item);
+	collection->AddItem(item);
+	item->SetType(OpSyncDataItem::DATAITEM_BOOKMARK);
+	verify_success(item->m_key.Set(key));
+	verify_success(item->m_data.Set(value));
+	item->AddAttribute(item->m_key.CStr(), item->m_data.CStr(), 0);
+	item->SetStatus(status);
+	*data_item = item;
+}
+
+/**
+ * Verifies that the specified item has the same children as the expected_item.
+ */
+subtest CompareChildren(OpSyncDataItem* item, OpSyncDataItem* expected_item)
+{
+	unsigned int expected_count = 0;
+	for (OpSyncDataItemIterator expected_child(expected_item->GetFirstChild()); *expected_child; ++expected_child)
+	{
+		expected_count++;
+		OpSyncDataItem* child = item->FindChildById(expected_child->m_key.CStr());
+		verify(child);
+		verify_string(child->m_key, expected_child->m_key);
+		verify_string(child->m_data, expected_child->m_data);
+	}
+	unsigned int count = 0;
+	for (OpSyncDataItemIterator child(item->GetFirstChild()); *child; ++child)
+		count++;
+	verify(count == expected_count);
+}
+
+/**
+ * Verifies that the specified item has the same attributes as the expected_item
+ */
+subtest CompareAttributes(OpSyncDataItem* item, OpSyncDataItem* expected_item)
+{
+	unsigned int expected_count = 0;
+	for (OpSyncDataItemIterator expected_attr(expected_item->GetFirstAttribute()); *expected_attr; ++expected_attr)
+	{
+		expected_count++;
+		OpSyncDataItem* attr = item->FindAttributeById(expected_attr->m_key.CStr());
+		verify(attr);
+		verify_string(attr->m_key, expected_attr->m_key);
+		verify_string(attr->m_data, expected_attr->m_data);
+	}
+	unsigned int count = 0;
+	for (OpSyncDataItemIterator attr(item->GetFirstAttribute()); *attr; ++attr)
+		count++;
+	verify(count == expected_count);
+}
+
+/**
+ * Verifies that the specified collection contains the expected item.
+ */
+subtest CollectionContainsItem(OpSyncDataCollection& collection, OpSyncDataItem* expected_item)
+{
+	verify(expected_item);
+	OpSyncDataItem* item = collection.FindPrimaryKey(expected_item->GetBaseType(), expected_item->m_key, expected_item->m_data);
+	verify(item);
+	verify_string(item->m_key, expected_item->m_key);
+	verify_string(item->m_data, expected_item->m_data);
+	verify(CompareChildren(item, expected_item));
+	verify(CompareAttributes(item, expected_item));
+}
+
+/**
+ * Compares the two specified collection and fails if one of them has an item
+ * that is not in the other collection.
+ */
+subtest CompareCollections(OpSyncDataCollection& collection, OpSyncDataCollection& expected_collection)
+{
+	verify(collection.GetCount() == expected_collection.GetCount());
+	for (OpSyncDataItemIterator expected_item(expected_collection.First()); *expected_item; ++expected_item)
+		verify(CollectionContainsItem(collection, *expected_item));
+}
+
+test("MergeDirtySyncItems")
+{
+	/*
+	 */
+	ST_SyncFactory* factory = OP_NEW(ST_SyncFactory, ());
+	verify(factory);
+	OpSyncCoordinator coordinator;
+	OpSyncCoordinator::SelftestHelper sync_helper(&coordinator);
+	verify_success(coordinator.Init(factory, FALSE));
+	factory = 0;
+
+	OpSyncDataItem* item;
+	OpSyncDataCollection items_from_client;
+	OpSyncDataCollection items_from_server;
+	OpSyncDataCollection expected_missing_on_client;
+	OpSyncDataCollection expected_missing_on_server;
+
+	/* added+added: Create two items with status added that have the same data
+	 * on both client and server: */
+	verify(CreateDirtySyncDataItem(&items_from_client, &item, "id", "1: added+added", OpSyncDataItem::DATAITEM_ACTION_ADDED));
+	verify_success(item->AddChild(UNI_L("1.child"), UNI_L("1.value")));
+	verify_success(item->AddAttribute(UNI_L("1.a1"), UNI_L("1.v1")));
+	verify_success(item->AddAttribute(UNI_L("1.a2"), UNI_L("1.v2")));
+	item = item->Copy();
+	verify(item);
+	items_from_server.AddItem(item);
+
+	/* modified+modified: Create two items with status modified that have the
+	 * same data on both client and server: */
+	verify(CreateDirtySyncDataItem(&items_from_client, &item, "id", "2: modified+modified", OpSyncDataItem::DATAITEM_ACTION_MODIFIED));
+	verify_success(item->AddChild(UNI_L("2.child"), UNI_L("2.value")));
+	verify_success(item->AddAttribute(UNI_L("2.attr"), UNI_L("2.v")));
+	item = item->Copy();
+	verify(item);
+	items_from_server.AddItem(item);
+
+	/* added+modified: Create two items, one with status added (on the client)
+	 * and one modified (on the server), that have the same data on both client
+	 * and server: */
+	verify(CreateDirtySyncDataItem(&items_from_client, &item, "id", "3: added+modified", OpSyncDataItem::DATAITEM_ACTION_ADDED));
+	verify_success(item->AddChild(UNI_L("3.child"), UNI_L("3.value")));
+	verify_success(item->AddAttribute(UNI_L("3.a1"), UNI_L("3.v1")));
+	verify_success(item->AddAttribute(UNI_L("3.a2"), UNI_L("3.v2")));
+	item = item->Copy();
+	verify(item);
+	item->SetStatus(OpSyncDataItem::DATAITEM_ACTION_MODIFIED);
+	items_from_server.AddItem(item);
+
+	/* modified+added: Create two items, one with status modified (on the
+	 * client) and one added (on the server), that have the same data on both
+	 * client and server: */
+	verify(CreateDirtySyncDataItem(&items_from_client, &item, "id", "4: modified+added", OpSyncDataItem::DATAITEM_ACTION_MODIFIED));
+	verify_success(item->AddChild(UNI_L("4.child"), UNI_L("4.value")));
+	verify_success(item->AddAttribute(UNI_L("4.attr"), UNI_L("4.v")));
+	item = item->Copy();
+	verify(item);
+	item->SetStatus(OpSyncDataItem::DATAITEM_ACTION_ADDED);
+	items_from_server.AddItem(item);
+
+	/* added+deleted: Create two items, one with status added (on the client)
+	 * and one deleted (on the server): */
+	verify(CreateDirtySyncDataItem(&items_from_client, &item, "id", "5: added+deleted", OpSyncDataItem::DATAITEM_ACTION_ADDED));
+	verify_success(item->AddChild(UNI_L("5.c"), UNI_L("5.x")));
+	verify_success(item->AddAttribute(UNI_L("5.a"), UNI_L("5.y")));
+	verify(CreateDirtySyncDataItem(&items_from_server, &item, "id", "5: added+deleted", OpSyncDataItem::DATAITEM_ACTION_DELETED));
+	// the deleted item is expected as missing on the client:
+	item = item->Copy();
+	verify(item);
+	expected_missing_on_client.AddItem(item);
+
+	/* modified+deleted: Create two items, one with status modified (on the
+	 * client) and one deleted (on the server): */
+	verify(CreateDirtySyncDataItem(&items_from_client, &item, "id", "6: modified+deleted", OpSyncDataItem::DATAITEM_ACTION_MODIFIED));
+	verify_success(item->AddChild(UNI_L("6.c"), UNI_L("6.x")));
+	verify_success(item->AddAttribute(UNI_L("6.a"), UNI_L("6.y")));
+	verify(CreateDirtySyncDataItem(&items_from_server, &item, "id", "6: modified+deleted", OpSyncDataItem::DATAITEM_ACTION_DELETED));
+	// the deleted item is expected as missing on the client:
+	item = item->Copy();
+	verify(item);
+	expected_missing_on_client.AddItem(item);
+
+	/* modified: Create one item with status modified on the client, that is
+	 * missing on the server: */
+	verify(CreateDirtySyncDataItem(&items_from_client, &item, "id", "7: modified", OpSyncDataItem::DATAITEM_ACTION_MODIFIED));
+	verify_success(item->AddChild(UNI_L("7.c"), UNI_L("7.x")));
+	verify_success(item->AddAttribute(UNI_L("7.a"), UNI_L("7.y")));
+	// this item is expected as missing on the server:
+	item = item->Copy();
+	verify(item);
+	expected_missing_on_server.AddItem(item);
+
+	/* added: Create one item with status added on the client, that is missing
+	 * on the server: */
+	verify(CreateDirtySyncDataItem(&items_from_client, &item, "id", "8: added", OpSyncDataItem::DATAITEM_ACTION_ADDED));
+	verify_success(item->AddChild(UNI_L("8.c"), UNI_L("8.x")));
+	verify_success(item->AddAttribute(UNI_L("8.a"), UNI_L("8.y")));
+	// this item is expected as missing on the server:
+	item = item->Copy();
+	verify(item);
+	expected_missing_on_server.AddItem(item);
+
+	/* modified: Create one item with status modified on the server, that is
+	 * missing on the client: */
+	verify(CreateDirtySyncDataItem(&items_from_server, &item, "id", "9: modified", OpSyncDataItem::DATAITEM_ACTION_MODIFIED));
+	verify_success(item->AddChild(UNI_L("9.c"), UNI_L("9.x")));
+	verify_success(item->AddAttribute(UNI_L("9.a"), UNI_L("9.y")));
+	// this item is expected as missing on the client:
+	item = item->Copy();
+	verify(item);
+	expected_missing_on_client.AddItem(item);
+
+	/* added: Create one item with status added on the server, that is missing
+	 * on the client: */
+	verify(CreateDirtySyncDataItem(&items_from_server, &item, "id", "10: added", OpSyncDataItem::DATAITEM_ACTION_ADDED));
+	verify_success(item->AddChild(UNI_L("10.c"), UNI_L("10.x")));
+	verify_success(item->AddAttribute(UNI_L("10.a"), UNI_L("10.y")));
+	// this item is expected as missing on the client:
+	item = item->Copy();
+	verify(item);
+	expected_missing_on_client.AddItem(item);
+
+	/* modified+modified with different data: Create two items with the same id,
+	 * one on the server, the other on the client, but each with different
+	 * attributes and children and one common attribute and one common child: */
+	verify(CreateDirtySyncDataItem(&items_from_client, &item, "id", "11: modified+modified", OpSyncDataItem::DATAITEM_ACTION_MODIFIED));
+	// common child/attribute:
+	verify_success(item->AddChild(UNI_L("11.same child"), UNI_L("11.value")));
+	verify_success(item->AddAttribute(UNI_L("11.same attr"), UNI_L("11.v")));
+	OpSyncDataItem* copy = item->Copy();
+	verify(copy);
+	items_from_server.AddItem(copy);
+	verify_success(item->AddChild(UNI_L("11.common child"), UNI_L("11.client value")));
+	verify_success(copy->AddChild(UNI_L("11.common child"), UNI_L("11.server value")));
+	verify_success(item->AddAttribute(UNI_L("11.common attr"), UNI_L("11.client v")));
+	verify_success(copy->AddAttribute(UNI_L("11.common attr"), UNI_L("11.server v")));
+	verify_success(item->AddChild(UNI_L("11.client child"), UNI_L("11.new value")));
+	verify_success(copy->AddChild(UNI_L("11.server child"), UNI_L("11.another value")));
+	verify_success(item->AddAttribute(UNI_L("11.client attr"), UNI_L("11.new v")));
+	verify_success(copy->AddAttribute(UNI_L("11.server attr"), UNI_L("11.another v")));
+	/* in the collections items_missing_on_client/server we expect the data from
+	 * the merged items, where the values from the server overwrite the values
+	 * from the client: */
+	verify(CreateDirtySyncDataItem(&expected_missing_on_client, &item, "id", "11: modified+modified", OpSyncDataItem::DATAITEM_ACTION_MODIFIED));
+	verify_success(item->AddChild(UNI_L("11.same child"), UNI_L("11.value")));
+	verify_success(item->AddAttribute(UNI_L("11.same attr"), UNI_L("11.v")));
+	verify_success(item->AddChild(UNI_L("11.common child"), UNI_L("11.server value")));
+	verify_success(item->AddAttribute(UNI_L("11.common attr"), UNI_L("11.server v")));
+	verify_success(item->AddChild(UNI_L("11.server child"), UNI_L("11.another value")));
+	verify_success(item->AddAttribute(UNI_L("11.server attr"), UNI_L("11.another v")));
+	verify_success(item->AddChild(UNI_L("11.client child"), UNI_L("11.new value")));
+	verify_success(item->AddAttribute(UNI_L("11.client attr"), UNI_L("11.new v")));
+	item = item->Copy();
+	verify(item);
+	expected_missing_on_server.AddItem(item);
+
+	/* modified+modified with different data: Create two items with the same id,
+	 * one on the server, the other on the client, but the server entry has
+	 * different values and new attributes and children, so we expect to update
+	 * the client but not the server: */
+	verify(CreateDirtySyncDataItem(&items_from_client, &item, "id", "12: modified+modified", OpSyncDataItem::DATAITEM_ACTION_MODIFIED));
+	// common child/attribute:
+	verify_success(item->AddChild(UNI_L("12.same child"), UNI_L("12.value")));
+	verify_success(item->AddAttribute(UNI_L("12.same attr"), UNI_L("12.v")));
+	copy = item->Copy();
+	verify(copy);
+	items_from_server.AddItem(copy);
+	verify_success(item->AddChild(UNI_L("12.common child"), UNI_L("12.client value")));
+	verify_success(copy->AddChild(UNI_L("12.common child"), UNI_L("12.server value")));
+	verify_success(item->AddAttribute(UNI_L("12.common attr"), UNI_L("12.client v")));
+	verify_success(copy->AddAttribute(UNI_L("12.common attr"), UNI_L("12.server v")));
+	verify_success(copy->AddChild(UNI_L("12.server child"), UNI_L("12.another value")));
+	verify_success(copy->AddAttribute(UNI_L("12.server attr"), UNI_L("12.another v")));
+	/* in the collection items_missing_on_client we expect the data from the
+	 * merged items, where the values from the server overwrite the values
+	 * from the client: */
+	verify(CreateDirtySyncDataItem(&expected_missing_on_client, &item, "id", "12: modified+modified", OpSyncDataItem::DATAITEM_ACTION_MODIFIED));
+	verify_success(item->AddChild(UNI_L("12.same child"), UNI_L("12.value")));
+	verify_success(item->AddAttribute(UNI_L("12.same attr"), UNI_L("12.v")));
+	verify_success(item->AddChild(UNI_L("12.common child"), UNI_L("12.server value")));
+	verify_success(item->AddAttribute(UNI_L("12.common attr"), UNI_L("12.server v")));
+	verify_success(item->AddChild(UNI_L("12.server child"), UNI_L("12.another value")));
+	verify_success(item->AddAttribute(UNI_L("12.server attr"), UNI_L("12.another v")));
+
+	/* modified+modified with different data: Create two items with the same id,
+	 * one on the server, the other on the client, but the server entry has
+	 * the same values as the client and the client entry has new attributes and
+	 * children, so we expect to update server but not the client: */
+	verify(CreateDirtySyncDataItem(&items_from_client, &item, "id", "13: modified+modified", OpSyncDataItem::DATAITEM_ACTION_MODIFIED));
+	// common child/attribute:
+	verify_success(item->AddChild(UNI_L("13.same child"), UNI_L("13.value")));
+	verify_success(item->AddAttribute(UNI_L("13.same attr"), UNI_L("13.v")));
+	copy = item->Copy();
+	verify(copy);
+	items_from_server.AddItem(copy);
+	verify_success(item->AddChild(UNI_L("13.client child"), UNI_L("13.new value")));
+	verify_success(item->AddAttribute(UNI_L("13.client attr"), UNI_L("13.new v")));
+	/* in the collections items_missing_on_client/server we expect the data from
+	 * the merged items, where the values from the server overwrite the values
+	 * from the client: */
+	verify(CreateDirtySyncDataItem(&expected_missing_on_server, &item, "id", "13: modified+modified", OpSyncDataItem::DATAITEM_ACTION_MODIFIED));
+	verify_success(item->AddChild(UNI_L("13.same child"), UNI_L("13.value")));
+	verify_success(item->AddAttribute(UNI_L("13.same attr"), UNI_L("13.v")));
+	verify_success(item->AddChild(UNI_L("13.client child"), UNI_L("13.new value")));
+	verify_success(item->AddAttribute(UNI_L("13.client attr"), UNI_L("13.new v")));
+
+	OpSyncDataCollection items_missing_on_client;
+	OpSyncDataCollection items_missing_on_server;
+	verify_success(sync_helper.MergeDirtySyncItems(items_from_client, items_from_server, items_missing_on_client, items_missing_on_server));
+
+	verify(CompareCollections(items_missing_on_client, expected_missing_on_client));
+	verify(CompareCollections(items_missing_on_server, expected_missing_on_server));
+}
+finally
+{
+	OP_DELETE(factory);
+}
+
+
+/**
+ * Creates a new OpSyncItem (of type bookmark and with primary key
+ * "id"="1") with the specified OpSyncDataItem::DataItemStatus.
+ *
+ * If the status is OpSyncDataItem::DATAITEM_ACTION_ADDED, the item will receive
+ * the title "added".
+ * If the status is OpSyncDataItem::DATAITEM_ACTION_MODIFIED, the item will
+ * receive the title "modified".
+ * If the status is OpSyncDataItem::DATAITEM_ACTION_DELETED, the item will not
+ * have any children or attributes (apart from the primary key).
+ *
+ * @note This subtest fails if generating the item fails.
+ *
+ * @note The call needs to delete the returned item (even if this
+ *  subtest fails).
+ *
+ * @param coordinator The associated OpSyncCoordinator.
+ * @param item receives on success the pointer to the created item.
+ * @param status The item's status is set to this value.
+ */
+subtest CreateSyncItem(OpSyncCoordinator& coordinator, OpSyncItem** item, enum OpSyncDataItem::DataItemStatus status, const uni_char* id)
+{
+	*item = 0;
+	verify_success(coordinator.GetSyncItem(item, OpSyncDataItem::DATAITEM_BOOKMARK, OpSyncItem::SYNC_KEY_ID, id));
+	verify(*item);
+	(*item)->SetStatus(status);
+	switch (status) {
+	case OpSyncDataItem::DATAITEM_ACTION_ADDED:
+		break;
+
+	case OpSyncDataItem::DATAITEM_ACTION_MODIFIED:
+		verify_success((*item)->SetData(OpSyncItem::SYNC_KEY_TITLE, UNI_L("modified")));
+		break;
+
+	case OpSyncDataItem::DATAITEM_ACTION_DELETED:
+		break;
+
+	default:
+		verify(!"Unsupported status");
+	}
+}
+
+test("AddItemOrdered")
+{
+	OpSyncItem* item = 0;
+	ST_SyncFactory* factory = OP_NEW(ST_SyncFactory, ());
+	OpSyncCoordinator coordinator;
+	OpSyncCoordinator::SelftestHelper sync_helper(&coordinator);
+	verify(factory);
+	verify_success(coordinator.Init(factory, FALSE));
+	factory = 0;
+
+	// Create a first item with status added:
+	verify_success(coordinator.GetSyncItem(&item, OpSyncDataItem::DATAITEM_BOOKMARK, OpSyncItem::SYNC_KEY_ID, UNI_L("1")));
+	verify(item);
+	item->SetStatus(OpSyncDataItem::DATAITEM_ACTION_ADDED);
+	verify_success(item->SetData(OpSyncItem::SYNC_KEY_TITLE, UNI_L("1.Title")));
+	verify_success(item->CommitItem(FALSE, TRUE));
+	OP_DELETE(item); item = 0;
+
+	/* Create a second item with status added, which has the first item as
+	 * previous item: */
+	verify_success(coordinator.GetSyncItem(&item, OpSyncDataItem::DATAITEM_BOOKMARK, OpSyncItem::SYNC_KEY_ID, UNI_L("2")));
+	verify(item);
+	item->SetStatus(OpSyncDataItem::DATAITEM_ACTION_ADDED);
+	verify_success(item->SetData(OpSyncItem::SYNC_KEY_TITLE, UNI_L("2.Title")));
+	verify_success(item->SetData(OpSyncItem::SYNC_KEY_PREV, UNI_L("1")));
+	verify_success(item->CommitItem(FALSE, TRUE));
+	OP_DELETE(item); item = 0;
+
+	// Create a third item
+	verify_success(coordinator.GetSyncItem(&item, OpSyncDataItem::DATAITEM_BOOKMARK, OpSyncItem::SYNC_KEY_ID, UNI_L("3")));
+	verify(item);
+	item->SetStatus(OpSyncDataItem::DATAITEM_ACTION_ADDED);
+	verify_success(item->SetData(OpSyncItem::SYNC_KEY_TITLE, UNI_L("3.Title")));
+	verify_success(item->CommitItem(FALSE, TRUE));
+	OP_DELETE(item); item = 0;
+
+	// Change the order of the item with id 1, such that 1's previous is 3:
+	verify_success(coordinator.GetSyncItem(&item, OpSyncDataItem::DATAITEM_BOOKMARK, OpSyncItem::SYNC_KEY_ID, UNI_L("1")));
+	verify(item);
+	item->SetStatus(OpSyncDataItem::DATAITEM_ACTION_MODIFIED);
+	verify_success(item->SetData(OpSyncItem::SYNC_KEY_PREV, UNI_L("3")));
+	verify_success(item->CommitItem(FALSE, TRUE));
+	OP_DELETE(item); item = 0;
+
+	// Now verify the order:
+	OpSyncDataCollection* collection = sync_helper.GetSyncDataQueue()->GetSyncDataCollection(OpSyncDataQueue::SYNCQUEUE_ACTIVE);
+	verify(collection);
+	// we expect 3 items:
+	verify(collection->GetCount() == 3);
+	// in the order "3" <- "1" <- "2":
+	verify_string(collection->First()->m_data, "3");
+	verify_string(collection->First()->Next()->m_data, "1");
+	verify_string(collection->First()->Next()->Next()->m_data, "2");
+}
+finally
+{
+	if (item)
+		OP_DELETE(item);
+}
+
+test("AddItem Not Ordered + Ordered")
+{
+	OpSyncItem* item = 0;
+	ST_SyncFactory* factory = OP_NEW(ST_SyncFactory, ());
+	OpSyncCoordinator coordinator;
+	OpSyncCoordinator::SelftestHelper sync_helper(&coordinator);
+	verify(factory);
+	verify_success(coordinator.Init(factory, FALSE));
+	factory = 0;
+
+	// Create a first item with status added:
+	verify_success(coordinator.GetSyncItem(&item, OpSyncDataItem::DATAITEM_BOOKMARK, OpSyncItem::SYNC_KEY_ID, UNI_L("1")));
+	verify(item);
+	item->SetStatus(OpSyncDataItem::DATAITEM_ACTION_MODIFIED);
+	verify_success(item->SetData(OpSyncItem::SYNC_KEY_TITLE, UNI_L("1.Title")));
+	verify_success(item->SetData(OpSyncItem::SYNC_KEY_PREV, UNI_L("3")));
+	verify_success(item->CommitItem(FALSE, FALSE));
+	OP_DELETE(item); item = 0;
+
+	/* Create a second item with status added, which has the first item as
+	 * previous item: */
+	verify_success(coordinator.GetSyncItem(&item, OpSyncDataItem::DATAITEM_BOOKMARK, OpSyncItem::SYNC_KEY_ID, UNI_L("2")));
+	verify(item);
+	item->SetStatus(OpSyncDataItem::DATAITEM_ACTION_ADDED);
+	verify_success(item->SetData(OpSyncItem::SYNC_KEY_TITLE, UNI_L("2.Title")));
+	verify_success(item->SetData(OpSyncItem::SYNC_KEY_PREV, UNI_L("1")));
+	verify_success(item->CommitItem(FALSE, FALSE));
+	OP_DELETE(item); item = 0;
+
+	// Create a third item
+	verify_success(coordinator.GetSyncItem(&item, OpSyncDataItem::DATAITEM_BOOKMARK, OpSyncItem::SYNC_KEY_ID, UNI_L("3")));
+	verify(item);
+	item->SetStatus(OpSyncDataItem::DATAITEM_ACTION_ADDED);
+	verify_success(item->SetData(OpSyncItem::SYNC_KEY_TITLE, UNI_L("3.Title")));
+	verify_success(item->CommitItem(FALSE, FALSE));
+	OP_DELETE(item); item = 0;
+
+	/* Now commit item "1" again, without modifying the existing item, but now
+	 * add it with ordered=TRUE: */
+	verify_success(coordinator.GetSyncItem(&item, OpSyncDataItem::DATAITEM_BOOKMARK, OpSyncItem::SYNC_KEY_ID, UNI_L("1")));
+	verify(item);
+	item->SetStatus(OpSyncDataItem::DATAITEM_ACTION_MODIFIED);
+	verify_success(item->SetData(OpSyncItem::SYNC_KEY_PREV, UNI_L("3")));
+	verify_success(item->CommitItem(FALSE, TRUE));
+	OP_DELETE(item); item = 0;
+
+	// Now verify the order:
+	OpSyncDataCollection* collection = sync_helper.GetSyncDataQueue()->GetSyncDataCollection(OpSyncDataQueue::SYNCQUEUE_ACTIVE);
+	verify(collection);
+	// we expect 3 items:
+	verify(collection->GetCount() == 3);
+	// in the order "3" <- "1" <- "2":
+	verify_string(collection->First()->m_data, "3");
+	verify_string(collection->First()->Next()->m_data, "1");
+	verify_string(collection->First()->Next()->Next()->m_data, "2");
+}
+finally
+{
+	if (item)
+		OP_DELETE(item);
+}
+
+subtest CreateSyncDataItem(OpSyncDataCollection& collection, const uni_char* value)
+{
+	OpSyncDataItem* item = OP_NEW(OpSyncDataItem, ());
+	verify(item);
+	collection.AddItem(item);
+	verify_success(item->m_key.Set(UNI_L("id")));
+	verify_success(item->m_data.Set(value));
+}
+
+test("OpSyncDataItemIterator")
+{
+	OpSyncDataCollection collection;
+	verify(CreateSyncDataItem(collection, UNI_L("1")));
+	verify(CreateSyncDataItem(collection, UNI_L("2")));
+	verify(CreateSyncDataItem(collection, UNI_L("3")));
+	verify(collection.GetCount() == 3);
+
+	{
+		OpSyncDataItemIterator iter(collection.First());
+		verify(*iter);
+		verify_string((*iter)->m_key, "id");
+		verify_string((*iter)->m_data, "1");
+		verify(++iter);
+		verify(*iter);
+		verify_string((*iter)->m_key, "id");
+		verify_string((*iter)->m_data, "2");
+		collection.RemoveItem(*iter);
+		verify(++iter);
+		verify(*iter);
+		verify_string((*iter)->m_key, "id");
+		verify_string((*iter)->m_data, "3");
+		verify(++iter == 0);
+		verify(*iter == 0);
+		verify(++iter == 0);
+		verify(*iter == 0);
+	}
+
+	{
+		OpSyncDataItemIterator iter(collection.First());
+		verify(*iter);
+		verify_string((*iter)->m_key, "id");
+		verify_string((*iter)->m_data, "1");
+		verify(++iter);
+		verify(*iter);
+		verify_string((*iter)->m_key, "id");
+		verify_string((*iter)->m_data, "3");
+		verify(++iter == 0);
+		verify(*iter == 0);
+	}
+}
+
+test("data.CStr() is NULL if no value was found by GetData")
+{
+	OpString data;
+	verify_success(data.Set(""));
+	OpSyncDataItem* data_item = OP_NEW(OpSyncDataItem, ());
+	verify(data_item);
+	OpSyncItem sync_item;
+	sync_item.SetDataSyncItem(data_item);
+	verify_success(sync_item.GetData(OpSyncItem::SYNC_KEY_ID, data));
+	// From documentation of GetData: "the data will be set to empty
+	// (i.e. data.CStr() will be NULL) if no value was found".
+	verify(data.CStr() == NULL);
+}

@@ -1,0 +1,299 @@
+/* -*- Mode: c++; tab-width: 4; indent-tabs-mode: t; c-basic-offset: 4 -*-
+ *
+ * Copyright (C) 2004-2011 Opera Software ASA.  All rights reserved.
+ *
+ * This file is part of the Opera web browser.
+ * It may not be distributed under any circumstances.
+ *
+ * Tests used to check that the cache is able to work even the the files are deleted
+ *
+ * Luca Venturi
+ */
+group "cache.delete";
+require init;
+require DISK_CACHE_SUPPORT;
+require WEBSERVER_SUPPORT;
+include "modules/url/url_loading.h";
+include "modules/cache/cache_selftest.h";
+include "modules/cache/cache_st_helpers.h";
+
+#include "cache_unite.oth";
+
+global
+{
+	UniteCacheTester uct;
+	MultiContext mctx;
+	URL url;
+
+	// Managed contexts
+	URL_CONTEXT_ID ctx_del;			// Used to test the delete
+	OpFileFolder folder_del;
+	CS_MessageHandler *mh;
+	WaitSingleURL *wait_ok;
+}
+
+setup
+{
+	wait_ok=OP_NEW(WaitSingleURL, (NULL));
+	mh=OP_NEW(CS_MessageHandler, ());
+
+	if(wait_ok)
+	{
+		wait_ok->SetAutoDelete(FALSE);
+		wait_ok->SetNumberOfLoading(-1);
+	}
+}
+
+exit
+{
+	if(mh)
+		mh->UnsetCallBacks(wait_ok);
+	OP_DELETE(mh);
+	OP_DELETE(wait_ok);
+}
+
+
+test("Create contexts")
+{
+	verify_success(mctx.CreateNewContext(ctx_del, UNI_L("del_files"), TRUE, &folder_del));
+}
+
+table TableDelete(char *, int, int, &URL, BOOL, CacheType, char * )
+{
+	{ "embedded", SIZE_EMBEDDED, 0, url, FALSE, TYPE_EMBEDDED, "emb" },
+	{ "containers - RAM", SIZE_CONTAINERS, 0, url, FALSE, TYPE_CONTAINER, "cnt_ram" },
+	{ "containers - Disk", SIZE_CONTAINERS, SIZE_CONTAINERS, url, TRUE, TYPE_CONTAINER, "cnt_disk" },
+	{ "plain", SIZE_PLAIN, SIZE_PLAIN, url, FALSE, TYPE_PLAIN, "plain" }
+}
+
+test("Info")
+{
+	#ifdef URL_REDUCED_CHECK_FOR_CACHE_DATA_PRESENT
+		ST_failed("URL_REDUCED_CHECK_FOR_CACHE_DATA_PRESENT must be disabled!");
+	#endif
+}
+
+test("Emtpy main cache")
+async;
+{
+	mctx.EmptyDCache(0);
+}
+
+subtest deleteFileAndDownload(int size_transfer, URL &url, BOOL drop_containers, CacheType type, BOOL normal_load, BOOL allow_no_file)
+{
+	OpString name;
+	OpString8 name8;
+
+	CacheTester::SaveFiles(ctx_del, FALSE);
+	CacheTester::FlushContainers(ctx_del, drop_containers); // If drop containers is TRUE, the RAm buffer are cleaned
+	CacheTester::VerifyType(url, type);
+
+	url.GetAttribute(URL::KFileName, name);
+	name8.Set(name.CStr());
+
+	output("File: %s\n", name8.CStr());
+
+	if(!name.IsEmpty())
+	{
+		Cache_Storage *cs=url.GetRep()->GetDataStorage()->GetCacheStorage();
+
+		if(cs && !cs->DataPresent())
+		{
+			if(!allow_no_file)
+			{
+				ST_failed("Storage should be present!");
+
+				return 0;
+			}
+			else
+				output("*** Storage not present");
+		}
+
+		OpFile file;
+		BOOL found=FALSE;
+
+		if(OpStatus::IsError(file.Construct(name.CStr(), folder_del)) ||
+		   OpStatus::IsError(file.Exists(found)))
+		{
+			ST_failed("Construct error");
+
+			return 0;
+		}
+
+		if(!found)
+		{
+			if(!allow_no_file)
+			{
+				ST_failed("File %s not found!", name8.CStr());
+
+				return 0;
+			}
+			else
+				output("*** Cache File not present");
+		}
+
+		if(OpStatus::IsError(file.Delete(FALSE)))
+		{
+			ST_failed("File not deleted!");
+
+			return 0;
+		}
+
+		if(cs && cs->DataPresent() && drop_containers)
+		{
+			ST_failed("Storage should have been deleted!");
+
+			return 0;
+		}
+	}
+
+	if(size_transfer)
+		uct.SetExpectedTransferRange(size_transfer, size_transfer+1024);
+	else
+		uct.SetExpectedTransferRange(0, 0);
+
+	if(normal_load)
+		uct.LoadNormalOK(url, NULL);
+	else
+		uct.LoadNoReloadOK(url, NULL, FALSE);
+}
+
+foreach (desc, size, size_transfer, url, drop_containers, type, id) from TableDelete
+{
+	test("Download " desc)
+	async;
+	{
+		url=uct.JScreatePage(size, 300000, ctx_del, TRUE);
+
+		mh->LoadNormal(url, 200, wait_ok, NULL);
+	}
+
+	test("Cache check " desc)
+	async;
+	{
+		uct.SetExpectedTransferRange(0, 0);
+		uct.LoadNormalOK(url, NULL);
+	}
+
+	// Delete
+	test("File delete and download normal " desc)
+	async;
+	{
+		deleteFileAndDownload(size_transfer, url, drop_containers, type, TRUE, FALSE);
+	}
+
+	test("Cache re check " desc)
+	async;
+	{
+		uct.SetExpectedTransferRange(0, 0);
+		uct.LoadNormalOK(url, NULL);
+	}
+
+	// Delete
+	test("File delete and download 2 - no reload " desc)
+	async;
+	{
+		deleteFileAndDownload(size_transfer, url, drop_containers, type, FALSE, FALSE);
+	}
+
+	test("Cache re check 2 " desc)
+	async;
+	{
+		uct.SetExpectedTransferRange(0, 0);
+		uct.LoadNoReloadOK(url, NULL);
+	}
+
+	// Delete
+	test("File delete and download 3 - normal" desc)
+	async;
+	{
+		// The storage could be missing in this case, if no reload does not really reload it
+		deleteFileAndDownload(size_transfer, url, drop_containers, type, TRUE, TRUE);
+	}
+
+	test("Cache re check 3 " desc)
+	async;
+	{
+		uct.SetExpectedTransferRange(0, 0);
+		uct.LoadNormalOK(url, NULL);
+	}
+}
+
+test("activity.opr test 1")
+{
+	verify(urlManager->AllFilesDeletedInContext(ctx_del));
+	CacheTester::WriteIndex(ctx_del);
+	verify(CacheTester::IsCacheToSync(ctx_del));
+
+	CacheHelpers::CacheBogusURLs(ctx_del, SIZE_PLAIN, SIZE_PLAIN, CACHE_NUM_FILES_PER_DELETELIST_PASS*3);
+
+	verify(CacheTester::IsCacheToSync(ctx_del));
+	CacheTester::WriteIndex(ctx_del);
+	verify(CacheTester::IsCacheToSync(ctx_del));
+}
+
+test("activity.opr test 2")
+async;
+{
+	// Verify that after EmptyDCache() there is activity.opr
+	mctx.EmptyDCache(ctx_del);
+
+	if(urlManager->AllFilesDeletedInContext(ctx_del))
+		ST_failed("Files already deleted after EmptyDCache()!");
+	else if(!CacheTester::IsCacheToSync(ctx_del))
+		ST_failed("Cache should not be synchronized after EmptyDCache!");
+	else if(OpStatus::IsError(CacheTester::WriteIndex(ctx_del)))
+		ST_failed("Error while writing the index");
+	else if(OpStatus::IsError(CacheTester::SaveFiles(ctx_del, TRUE)))
+		ST_failed("Error while saving the files");
+	// Verify that saving the index does not delete activity.opr when there are still files to delete around
+	else if(urlManager->AllFilesDeletedInContext(ctx_del))
+		ST_failed("Files already deleted after WriteIndex()!");
+	else if(!CacheTester::IsCacheToSync(ctx_del))
+		ST_failed("Cache should not be synchronized just after WriteIndex()!");
+}
+
+// Verify that after all the files have been deleted, saving the index does not removes activity.opr
+test("post delete check")
+{
+	verify(urlManager->AllFilesDeletedInContext(ctx_del));
+	verify(CacheTester::IsCacheToSync(ctx_del)); // It's basically a small bug, but for now fix it is not worth the pain
+
+	CacheTester::WriteIndex(ctx_del);
+	verify(urlManager->AllFilesDeletedInContext(ctx_del));
+	verify(CacheTester::IsCacheToSync(ctx_del));
+}
+
+
+// No files need to be deleted, but activity.opr file should still be there
+test("post delete check 2")
+async;
+{
+	mctx.EmptyDCache(ctx_del);
+	if(!urlManager->AllFilesDeletedInContext(ctx_del))
+		ST_failed("Cache should be empty after mctx.EmptyDCache()!");
+	else if(!CacheTester::IsCacheToSync(ctx_del))
+		ST_failed("Cache should still be out of sync!");
+	else
+	{
+		CacheTester::WriteIndex(ctx_del);
+
+		if(!urlManager->AllFilesDeletedInContext(ctx_del))
+			ST_failed("Cache should be empty after mctx.EmptyDCache()!");
+		else if(!CacheTester::IsCacheToSync(ctx_del))
+			ST_failed("Cache should still be out of sync - 2!");
+		else if(!CacheTester::IsCacheToSync(folder_del))
+			ST_failed("Cache should still be out of sync - 3!");
+	}
+}
+
+// ForgetContext() cannot be called before EmptyDCache() has finished, or the messages will not arrive
+test("Post check 3")
+{
+	mctx.ForgetContext(ctx_del, FALSE, TRUE);
+	CacheTester::BrutalDelete(&url, FALSE);
+	urlManager->RemoveContext(ctx_del, TRUE);
+
+	if(CacheTester::IsCacheToSync(folder_del))
+		ST_failed("Cache should be in sync after RemoveContext()!");
+}

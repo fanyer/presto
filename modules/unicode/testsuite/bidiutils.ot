@@ -1,0 +1,768 @@
+/* -*- Mode: c++; tab-width: 4; indent-tabs-mode: t; c-basic-offset: 4 -*-
+**
+** Copyright (C) 2007-2012 Opera Software ASA.  All rights reserved.
+**
+** This file is part of the Opera web browser.  It may not be distributed
+** under any circumstances.
+**
+** Peter Krefting
+** Magnus Gasslander
+*/
+
+group "unicode.bidiutils";
+require SUPPORT_TEXT_DIRECTION;
+
+include "modules/unicode/unicode_bidiutils.h";
+
+include "modules/unicode/testsuite/bidi_reference.h";
+
+global
+{
+	BidiCategory parse_category(int lineno, const char *s)
+	{
+		if (!op_strcmp(s, "L"))
+			return BIDI_L;
+		if (!op_strcmp(s, "R"))
+			return BIDI_R;
+		if (!op_strcmp(s, "AL"))
+			return BIDI_AL;
+		if (!op_strcmp(s, "LRE"))
+			return BIDI_LRE;
+		if (!op_strcmp(s, "LRO"))
+			return BIDI_LRO;
+		if (!op_strcmp(s, "RLE"))
+			return BIDI_RLE;
+		if (!op_strcmp(s, "RLO"))
+			return BIDI_RLO;
+		if (!op_strcmp(s, "PDF"))
+			return BIDI_PDF;
+		if (!op_strcmp(s, "EN"))
+			return BIDI_EN;
+		if (!op_strcmp(s, "ES"))
+			return BIDI_ES;
+		if (!op_strcmp(s, "ET"))
+			return BIDI_ET;
+		if (!op_strcmp(s, "AN"))
+			return BIDI_AN;
+		if (!op_strcmp(s, "CS"))
+			return BIDI_CS;
+		if (!op_strcmp(s, "NSM"))
+			return BIDI_NSM;
+		if (!op_strcmp(s, "BN"))
+			return BIDI_BN;
+		if (!op_strcmp(s, "B"))
+			return BIDI_B;
+		if (!op_strcmp(s, "S"))
+			return BIDI_S;
+		if (!op_strcmp(s, "WS"))
+			return BIDI_WS;
+		if (!op_strcmp(s, "ON"))
+			return BIDI_ON;
+
+		output("\nBidiTests.txt(%d): Unknown token: %s ", lineno, s);
+		return BIDI_UNDEFINED;
+	}
+}
+
+test("BidiStatus: trivial")
+{
+	BidiLevelStack bs;
+	verify(bs.GetCurrentLevel() == 0);
+	verify(bs.GetOverrideStatus() == BIDI_UNDEFINED);
+	verify(bs.GetEmbeddingDir() == BIDI_L);
+}
+
+test("BidiStatus: resolve 0 - 0")
+{
+	BidiLevelStack bs;
+	verify(0 == bs.GetResolvedLevel(BIDI_L));
+}
+
+test("BidiStatus: resolve 0 - 1")
+{
+	BidiLevelStack bs;
+	verify(1 == bs.GetResolvedLevel(BIDI_R));
+}
+
+test("BidiStatus: resolve 0 - 2")
+{
+	BidiLevelStack bs;
+	verify(2 == bs.GetResolvedLevel(BIDI_AN));
+}
+
+test("BidiStatus: resolve 1 - 1")
+{
+	BidiLevelStack bs;
+	bs.SetParagraphLevel(BIDI_R, FALSE);
+	verify(bs.GetCurrentLevel() == 1);
+	verify(1 == bs.GetResolvedLevel(BIDI_R));
+}
+
+test("BidiStatus: resolve 1 - 2")
+{
+	BidiLevelStack bs;
+	bs.SetParagraphLevel(BIDI_R, FALSE);
+	verify(bs.GetCurrentLevel() == 1);
+	verify(2 == bs.GetResolvedLevel(BIDI_L));
+}
+
+test("BidiStatus: PushLevel()")
+{
+	BidiLevelStack stack1, stack2;
+	int base_level = stack2.GetCurrentLevel();
+
+	// The Unicode bi-di algorithm says the maximum nesting depth is 61;
+	// make sure we do not crash if we go deeper (see CORE-35177).
+	for (int i = 0; i < 1024; ++ i)
+	{
+		// Remember current depth, if we do not go deeper, the push
+		// should have no effect.
+		int old_depth1 = stack1.GetCurrentStackDepth();
+		stack1.PushLevel(CSS_VALUE_ltr, TRUE);
+		verify(stack1.GetCurrentStackDepth() >= old_depth1);
+		verify(stack1.GetCurrentStackDepth() == old_depth1 || stack1.GetCurrentLevel() % 2 == 0);
+		old_depth1 = stack1.GetCurrentStackDepth();
+		stack1.PushLevel(CSS_VALUE_rtl, TRUE);
+		verify(stack1.GetCurrentStackDepth() >= old_depth1);
+		verify(stack1.GetCurrentStackDepth() == old_depth1 || stack1.GetCurrentLevel() % 2 == 1);
+
+		// Push a level so that all have the same value.
+		int old_depth2 = stack2.GetCurrentStackDepth();
+		stack2.PushLevel();
+		verify(stack2.GetCurrentStackDepth() >= old_depth2);
+		verify(stack2.GetCurrentLevel() == base_level);
+		old_depth2 = stack1.GetCurrentStackDepth();
+		stack2.PushLevel();
+		verify(stack2.GetCurrentStackDepth() >= old_depth2);
+		verify(stack2.GetCurrentLevel() == base_level);
+	}
+
+	verify(stack1.GetCurrentStackDepth() <= stack1.GetMaxStackDepth());
+	verify(stack2.GetCurrentStackDepth() <= stack2.GetMaxStackDepth());
+}
+
+/* missing:
+   BidiLevelStack::PopLevel()
+   BidiLevelStack::Reset()
+*/
+
+test("ParagraphBidiSegment")
+{
+	// Just a simple container class
+	ParagraphBidiSegment pbs(42, NULL, 33, 4711);
+	verify(pbs.width == 42);
+	verify(pbs.start_element == NULL);
+	verify(pbs.level == 33);
+	verify(pbs.virtual_position == 4711);
+}
+
+/* See documentation in modules/unicode/testsuite/bidi_reference.h 
+ * to see how the BidiCalculation selftests work
+ */
+
+test("BidiCalculation.sanity")
+{
+	Head bidi_segments;
+	BidiCalculation calc;
+	calc.Reset();
+	calc.SetParagraphLevel(BIDI_L, FALSE);
+	calc.SetSegments(&bidi_segments);
+	calc.AppendStretch(BIDI_L, 20, NULL, 0);
+	calc.AppendStretch(BIDI_R, 20, NULL, 0);
+	verify (bidi_segments.Cardinal() == 2);
+	verify(((ParagraphBidiSegment*)(bidi_segments.First()))->level == 0);
+	verify(((ParagraphBidiSegment*)(bidi_segments.First()->Suc()))->level == 1);
+}
+finally
+{
+	bidi_segments.Clear();
+}
+
+constant BIDI_TEST_MAX_CHARS = 500;
+
+test("BidiReference.sanity")
+{
+	int levels[BIDI_TEST_MAX_CHARS];
+
+	verify(ResolvePhonyString(0, "APA", levels, BIDI_TEST_MAX_CHARS) == 0);
+	verify(levels[0] == 1);
+
+	verify(ResolvePhonyString(0, "]a^", levels, BIDI_TEST_MAX_CHARS) == 0);
+	verify(levels[0] == 2);
+}
+
+test("BidiReference.PhonyPhonyCharToBidiCategory")
+{
+	verify(PhonyCharToBidiCategory('a') == BIDI_L);
+	verify(PhonyCharToBidiCategory('b') == BIDI_L);
+	verify(PhonyCharToBidiCategory('c') == BIDI_L);
+	verify(PhonyCharToBidiCategory('d') == BIDI_L);
+	verify(PhonyCharToBidiCategory('e') == BIDI_L);
+	verify(PhonyCharToBidiCategory('f') == BIDI_L);
+	verify(PhonyCharToBidiCategory('g') == BIDI_L);
+	verify(PhonyCharToBidiCategory('h') == BIDI_L);
+	verify(PhonyCharToBidiCategory('i') == BIDI_L);
+	verify(PhonyCharToBidiCategory('j') == BIDI_L);
+	verify(PhonyCharToBidiCategory('k') == BIDI_L);
+	verify(PhonyCharToBidiCategory('l') == BIDI_L);
+	verify(PhonyCharToBidiCategory('m') == BIDI_L);
+	verify(PhonyCharToBidiCategory('n') == BIDI_L);
+	verify(PhonyCharToBidiCategory('o') == BIDI_L);
+	verify(PhonyCharToBidiCategory('p') == BIDI_L);
+	verify(PhonyCharToBidiCategory('q') == BIDI_L);
+	verify(PhonyCharToBidiCategory('r') == BIDI_L);
+	verify(PhonyCharToBidiCategory('s') == BIDI_L);
+	verify(PhonyCharToBidiCategory('t') == BIDI_L);
+	verify(PhonyCharToBidiCategory('u') == BIDI_L);
+	verify(PhonyCharToBidiCategory('v') == BIDI_L);
+	verify(PhonyCharToBidiCategory('x') == BIDI_L);
+	verify(PhonyCharToBidiCategory('y') == BIDI_L);
+	verify(PhonyCharToBidiCategory('z') == BIDI_L);
+
+	verify(PhonyCharToBidiCategory('A') == BIDI_AL);
+	verify(PhonyCharToBidiCategory('B') == BIDI_AL);
+	verify(PhonyCharToBidiCategory('C') == BIDI_AL);
+	verify(PhonyCharToBidiCategory('D') == BIDI_AL);
+	verify(PhonyCharToBidiCategory('E') == BIDI_AL);
+	verify(PhonyCharToBidiCategory('F') == BIDI_AL);
+
+	verify(PhonyCharToBidiCategory('G') == BIDI_R);
+	verify(PhonyCharToBidiCategory('H') == BIDI_R);
+	verify(PhonyCharToBidiCategory('I') == BIDI_R);
+	verify(PhonyCharToBidiCategory('J') == BIDI_R);
+	verify(PhonyCharToBidiCategory('K') == BIDI_R);
+	verify(PhonyCharToBidiCategory('L') == BIDI_R);
+	verify(PhonyCharToBidiCategory('M') == BIDI_R);
+	verify(PhonyCharToBidiCategory('N') == BIDI_R);
+	verify(PhonyCharToBidiCategory('O') == BIDI_R);
+	verify(PhonyCharToBidiCategory('P') == BIDI_R);
+	verify(PhonyCharToBidiCategory('Q') == BIDI_R);
+	verify(PhonyCharToBidiCategory('R') == BIDI_R);
+	verify(PhonyCharToBidiCategory('S') == BIDI_R);
+	verify(PhonyCharToBidiCategory('T') == BIDI_R);
+	verify(PhonyCharToBidiCategory('U') == BIDI_R);
+	verify(PhonyCharToBidiCategory('V') == BIDI_R);
+	verify(PhonyCharToBidiCategory('X') == BIDI_R);
+	verify(PhonyCharToBidiCategory('Y') == BIDI_R);
+	verify(PhonyCharToBidiCategory('Z') == BIDI_R);
+
+	verify(PhonyCharToBidiCategory('0') == BIDI_EN);
+	verify(PhonyCharToBidiCategory('1') == BIDI_EN);
+	verify(PhonyCharToBidiCategory('2') == BIDI_EN);
+	verify(PhonyCharToBidiCategory('3') == BIDI_EN);
+	verify(PhonyCharToBidiCategory('4') == BIDI_EN);
+	verify(PhonyCharToBidiCategory('5') == BIDI_EN);
+
+	verify(PhonyCharToBidiCategory('6') == BIDI_AN);
+	verify(PhonyCharToBidiCategory('7') == BIDI_AN);
+	verify(PhonyCharToBidiCategory('8') == BIDI_AN);
+	verify(PhonyCharToBidiCategory('9') == BIDI_AN);
+
+//	verify(PhonyCharToBidiCategory('?') == BIDI_UNDEFINED);
+
+	verify(PhonyCharToBidiCategory('[') == BIDI_LRE);
+	verify(PhonyCharToBidiCategory('{') == BIDI_LRO);
+	verify(PhonyCharToBidiCategory('^') == BIDI_PDF);
+	verify(PhonyCharToBidiCategory(']') == BIDI_RLE);
+	verify(PhonyCharToBidiCategory('}') == BIDI_RLO);
+
+	verify(PhonyCharToBidiCategory('/') == BIDI_ES);
+	verify(PhonyCharToBidiCategory('+') == BIDI_ES);
+
+	verify(PhonyCharToBidiCategory('$') == BIDI_ET);
+
+	verify(PhonyCharToBidiCategory('.') == BIDI_CS);
+	verify(PhonyCharToBidiCategory(',') == BIDI_CS);
+	verify(PhonyCharToBidiCategory(':') == BIDI_CS);
+
+	verify(PhonyCharToBidiCategory('`') == BIDI_NSM);
+
+	verify(PhonyCharToBidiCategory('|') == BIDI_B);
+
+	verify(PhonyCharToBidiCategory(' ') == BIDI_WS);
+
+	verify(PhonyCharToBidiCategory('\\') == BIDI_ON);
+	verify(PhonyCharToBidiCategory('*') == BIDI_ON);
+	verify(PhonyCharToBidiCategory('(') == BIDI_ON);
+	verify(PhonyCharToBidiCategory(')') == BIDI_ON);
+	verify(PhonyCharToBidiCategory('!') == BIDI_ON);
+}
+
+test("BidiReference.calculation")
+{
+	int levels[BIDI_TEST_MAX_CHARS];
+
+	const char* str = "APA hej";
+
+	Head bidi_segments;
+
+
+	verify(ResolvePhonyString(0, str, levels, BIDI_TEST_MAX_CHARS) == 0);
+
+
+	BidiCalculation calc;
+	calc.Reset();
+	calc.SetParagraphLevel(BIDI_L, FALSE);
+	calc.SetSegments(&bidi_segments);
+
+	const char* count = str;
+
+	while (*count)
+	{
+		char c = *count;
+
+		BidiCategory cat = PhonyCharToBidiCategory(c);
+		calc.AppendStretch(cat, 1, NULL, 0);
+		count++;	
+	}
+
+	calc.HandleNeutralsAtRunChange();
+
+	verify (bidi_segments.Cardinal() == 2);
+
+	verify(VerifyLevelsVersusBidiSegments(levels, bidi_segments));
+}
+finally
+{
+	bidi_segments.Clear();
+}
+
+test("BidiReference.explicit.sanity")
+{
+	verify(VerifyReferenceVersusCalculation("[AB^c", TRUE));
+}
+
+test("BidiReference.calculation.2")
+{
+	verify (VerifyReferenceVersusCalculation("ABC av B sdf !! ", TRUE));
+}
+
+// 1. Implicit levels (I1 & I2 and also accompanying weak rules W2 & W7)
+// 1.1 Ordinary left to right text
+// abcdef
+// 1.2 Left to right with european numbers (also W7)
+// abcdef123ghi234jkl
+// 1.3 Left to right text with arabic indic numbers
+// abcdef678ghijk789lmno
+// 1.4 Left to right text and right to left text mixed
+// abcdefABCDEFghijNOPGHIJklm
+// 1.5 Arabic Right to left
+// ABCDEF
+// 1.6 Right to left
+// NOPQRST
+// 1.7 Arabic Right to left text with european numbers (also W2)
+// ABCDEF123GHIJ234KL
+// 1.8 Right to left text with european numbers
+// NOPQRST123UVX234YZ
+// 1.9 Arabic Right to left text with arabic-indic digits
+// ABCDEF6678GHIJ6789KL
+// 1.10 Right to left text with arabic indic digits
+// NOPQRST6678UVX6789YZ
+// 1.11 European numbers
+// 1234
+// 1.12 Arabic indic numbers
+// 6789
+// 1.13 European and arabic indic numbers (and initial R sign to cancel W7 and no W2)
+// N123667234678
+
+
+table implicit1(const char*)
+{
+ {"abcdef"},
+ {"abcdef123ghi234jkl"},
+ {"abcdef678ghijk789lmno"},
+ {"abcdefABCDEFghijNOPGHIJklm"},
+ {"ABCDEF"},
+ {"NOPQRST"},
+ {"ABCDEF123GHIJ234KL"},
+ {"NOPQRST123UVX234YZ"},
+ {"ABCDEF6678GHIJ6789KL"},
+ {"NOPQRST6678UVX6789YZ"},
+ {"1234"},
+ {"6789"},
+ {"N123667234678"},
+}
+
+test("BidiReference.implicit.ltr")
+{
+	foreach (str) from implicit1
+	{
+		verify (VerifyReferenceVersusCalculation(str, TRUE));
+	}
+}
+
+test("BidiReference.implicit.rtl")
+{
+	foreach (str) from implicit1
+	{
+		verify (VerifyReferenceVersusCalculation(str, FALSE));
+	}
+}
+
+
+// 2. Neutral types (rules N1 - N2)
+// 2.1 Neutral types with ltr chars
+// hej hopp din banan
+// 2.2 Neutral types with arabic rtl chars
+// ABCDE FAB !&  ABC
+// 2.3 Neutral types with hebrew rtl chars
+// QPR !& XYZ
+// 2.4 Neutral types with various directions
+// QPR !& abc !& ABC !& abc
+// 2.5 Neutrals with numbers
+// N 123 !& abcd !& 766 !& ABC 123 !& QPR 123 !& 676 abcd !& 123
+
+table neutral1(const char*)
+{
+  {"hej hopp din banan"},
+  {"ABCDE FAB !&  ABC"},
+  {"QPR !& XYZ"},
+  {"QPR !& abc !& ABC !& abc"},
+  {"N 123 !& abcd !& 766 !& ABC 123 !& QPR 123 !& 676 abcd !& 123"}
+}
+
+test("BidiReference.neutral.ltr")
+{
+	foreach (str) from neutral1
+	{
+		verify (VerifyReferenceVersusCalculation(str, TRUE));
+	}
+}
+
+
+test("BidiReference.neutral.rtl")
+{
+	foreach (str) from neutral1
+	{
+		verify (VerifyReferenceVersusCalculation(str, FALSE));
+	}
+}
+
+
+
+
+// 3. Explicit embedding rules (X1 - X10)
+// 3.1 Embedding
+// 3.1.1
+// [AB[BC[CD[DE^EF^FA^BC^DE
+// [ab[bc[cd[de^ef^fg^gh^hi
+// [12[23[34[43^32^21^10^01
+// [67[89[67[96^67^78^89^66
+// ]AB]BC]CD]DE^EF^FA^BC^DE
+// ]ab]bc]cd]de^ef^fg^gh^hi
+// ]12]23]34]43^32^21^10^01
+// ]67]89]67]96^67^78^89^66
+// 3.2 Overrides
+// }this is written backwards^now it is normal
+// {ABCDE^ABCDE
+// 3.3 Mixed
+// [AB[cd{ef]GG}IJ^kl^MN^OP^qr^st
+// 3.4 Explicit and neutrals
+// [!!$AB!#[!#ST!^#!cd#^#EF!
+// ]!!$AB!#]!#ST!^#!cd#^#EF!
+// }!!$AB!#}!#ST!^#!cd#^#EF!
+// }!!$AB!#}!#ST!^#!cd#^#EF!
+// 3.5 Explicit and weak types
+// 3.5.1 Explicit and W2
+// 3.5.2 Explicit and W4
+// 3.5.3 Explicit and W5
+// 3.5.4 Explicit and W7
+
+table explicit1(const char*)
+{
+{"[AB[BC[CD[DE^EF^FA^BC^DE"},
+{"[ab[bc[cd[de^ef^fg^gh^hi"},
+{"[12[23[34[43^32^21^10^01"},
+{"[67[89[67[96^67^78^89^67"},
+{"]AB]BC]CD]DE^EF^FA^BC^DE"},
+{"]ab]bc]cd]de^ef^fg^gh^hi"},
+{"]12]23]34]43^32^21^10^01"},
+{"]67]89]67]96^67^78^89^67"},
+{"}this is written backwards^now it is normal"},
+{"{ABCDE^ABCDE"},
+{"[AB[cd{ef]GG}IJ^kl^MN^OP^qr^st"},
+{"]!!$AB!#]!#ST!^#!cd#^#EF!"},
+{"[!!$AB!#[!#ST!^#!cd#^#EF!"},
+{"}!!$AB!#}!#ST!^#!cd#^#EF!"},
+{"}!!$AB!#}!#ST!^#!cd#^#EF!"},
+{"]a^ ]b^"}, /* bug CORE-393 */
+{"]3^ ]0^"}, /* bug CORE-393 */
+{"]3^ - ]0^"}, /* bug CORE-393 */
+{"]3^ & ]0^"}, /* bug CORE-393 */
+{"]3^ : ]0^"}, /* bug CORE-393 */
+{"]3^   ]0^"}, /* bug CORE-393 */
+{"]AB^#"},
+{"!a b, [c d ]fe^^"},
+{"!a b, {c d }fe^^"},
+{"!a b, ]c d [fe^^"},
+{"!a b, }c d {fe^^"}
+}
+
+test("BidiReference.explicit.ltr")
+{
+	foreach (str) from explicit1
+	{
+		verify (VerifyReferenceVersusCalculation(str, TRUE));
+	}
+}
+
+test("BidiReference.explicit.rtl")
+{
+	foreach (str) from explicit1
+	{
+		verify (VerifyReferenceVersusCalculation(str, FALSE));
+	}
+}
+
+// 4. Weak type rules (W1 - W7)
+// 4.1 W1
+// see chapter 6.<br>
+// 4.2 W2
+// 4.2.1 W2 and W4 combination (tricky!)
+// A123,789
+// 4.3 W3 (make sure to cancel W7 here!)
+// 4.3.1 AL should cancel W7
+// abcdeN123 234
+// abcde123 234
+// 4.4 W4
+// 4.4.1 ES between EN
+// N123/234/012
+// 4.4.2 EN ES AN
+// N123/678/234
+// 4.4.3 EN CS AN
+// N123,678:234
+// 4.4.4 AN CS EN
+// N678,123:789
+// 4.4.5 AN CS AN
+// N678:789,667
+// 4.4.6 AN CS CS AN
+// N678,,789::678
+// 4.4.7 EN ES ES EN
+// N123//234//123
+// <H3>4.5 W5</H3>
+// 4.5.1 First case below should follow W5, second case not
+// N123$$$##ABC
+// N789$$$##ABC
+// 4.5.2 First case below should follow W5, second case not
+// N789$$$##123
+// N789$$$##789
+// 4.5.3 W7 does not cancel W5, so these two cases should have the same order between the $'s and the numbers (but 'a' should be replaced with aleph)
+// a##$$$123
+// N##$$$123
+// 4.6 W6
+// N/A
+// 4.7 W7
+// 4.7.1 W5 & W7 (W5 should be in effect before W7)
+// Aa$$$$123
+// 4.7.2 W4 & W7 (W4 should be in effect before W7)
+// Aa123/234
+
+
+table weak1(const char*)
+{
+{"A123,789"},
+{"abcdeN123 234"},
+{"abcde123 234"},
+{"N123/234/012"},
+{"N123/678/234"},
+{"N123,678:234"},
+{"N678,123:789"},
+{"N678:789,667"},
+{"N678,,789::678"},
+{"N123//234//123"},
+{"N123$$$##ABC"},
+{"N789$$$##ABC"},
+{"N789$$$##123"},
+{"N789$$$##789"},
+{"a##$$$123"},
+{"N##$$$123"},
+{"Aa$$$$123"},
+{"Aa123/234"}
+}
+
+test("BidiReference.weak.ltr")
+{
+	foreach (str) from weak1
+	{
+		verify (VerifyReferenceVersusCalculation(str, TRUE));
+	}
+}
+
+test("BidiReference.weak.rtl")
+{
+	foreach (str) from weak1
+	{
+		verify (VerifyReferenceVersusCalculation(str, FALSE));
+	}
+}
+
+test("All unicode bidi tests")
+	file uni testdata "BidiTest.txt";
+	fails; /* Filed as CORE-39659 */
+{
+	Head bidi_segments;
+
+	// Open the test file
+	OpFile testf;
+	verify_success(testf.Construct(testdata));
+	OP_STATUS rc = testf.Open(OPFILE_READ);
+
+	if (!OpStatus::IsSuccess(rc))
+	{
+		output("\nCannot read %s ", ST_down(testdata));
+		verify_success(rc);
+	}
+
+	int levels[4]; /* ARRAY OK peter 2011-06-27 */
+
+	OpString8 line;
+	int lineno = 0, ok_test = 0, fail_test = 0;
+	while (!testf.Eof())
+	{
+		OP_STATUS rc = testf.ReadLine(line);
+		if (OpStatus::IsError(rc))
+			break;
+
+		lineno++;
+		if (line[0] == '#')
+			continue;
+
+		if (line[0] == '@')
+		{
+			// Update expected results
+			if (line.Compare("@Levels:", 8) == 0)
+			{
+				// Parse the list of expected levels
+				size_t j = 0;
+				for (int i = 0, n = line.Length(); i < n; ++ i)
+				{
+					verify(j < ARRAY_SIZE(levels));
+					if (Unicode::IsDigit(line[i]))
+						levels[j ++] = line[i] - '0';
+					else if (line[i] == 'x')
+						levels[j ++] = SHRT_MAX;
+				}
+
+				// Fill the list with -1 to indicate unused portions
+				while (j < 4)
+					levels[j ++] = -1;
+			}
+			else if (line.Compare("@Reorder:", 9) == 0)
+			{
+				// This line defines the expected visual ordering; we ignore
+				// that as ordering is done in the layout engine.
+			}
+			else
+			{
+				output("\nBidiTests.txt(%d): Unknown directive: %s", lineno, line.CStr());
+			}
+			continue;
+		}
+
+		// Everything else is a line with a test (unless empty)
+		BidiCategory category[4]; /* ARRAY OK 2011-06-27 peter */
+		char token[4]; /* ARRAY OK 2011-06-27 peter */
+		size_t tokenlen = 0;
+		size_t inputlen = 0;
+		int bitset;
+		for (int i = 0, n = line.Length(); i < n; ++ i)
+		{
+			switch (line[i])
+			{
+			case ';': // end of input, bitset comes next
+				verify(inputlen < ARRAY_SIZE(category));
+				verify(tokenlen < ARRAY_SIZE(token));
+				token[tokenlen] = 0;
+				category[inputlen ++] = parse_category(lineno, token);
+				bitset = op_atoi(line.CStr() + i + 1);
+				goto perform_test;
+
+			case ' ': // end of token
+			case '\t':
+				verify(inputlen < ARRAY_SIZE(category));
+				verify(tokenlen < ARRAY_SIZE(token));
+				token[tokenlen] = 0;
+				category[inputlen ++] = parse_category(lineno, token);
+				tokenlen = 0;
+				break;
+
+			default: // part of a token
+				verify(tokenlen < ARRAY_SIZE(token));
+				token[tokenlen ++] = line[i];
+				break;
+			}
+		}
+		// If we fall out, we could not parse anything meaningful from the
+		// line, bail out.
+		continue;
+
+perform_test:
+		for (int paragraph_level = 0; paragraph_level < 2; ++ paragraph_level)
+		{
+			// The bitset indicated which paragraph levels to test; we only
+			// support explicit LTR or RTL, so ignore the "auto" mode (bit 0).
+			if ((0/*LTR*/ == paragraph_level && (bitset & 2) == 0) ||
+				(1/*RTL*/ == paragraph_level && (bitset & 4) == 0))
+				continue;
+
+			// Run the characters through the bi-di algorithm
+			bidi_segments.Clear();
+			BidiCalculation calc;
+			calc.Reset();
+			calc.SetParagraphLevel(paragraph_level == 0 ? BIDI_L : BIDI_R, FALSE);
+			calc.SetSegments(&bidi_segments);
+
+			for (size_t i = 0; i < inputlen; ++ i)
+			{
+				calc.AppendStretch(category[i], 1, NULL, 0);
+			}
+
+			calc.HandleParagraphEnd();
+
+			// Check that levels are as expected
+			ParagraphBidiSegment *s = static_cast<ParagraphBidiSegment *>(bidi_segments.First());
+			size_t count = 0;
+			while (s)
+			{
+				long int seg_len = s->width;
+				for (size_t i = 0; i < static_cast<size_t>(seg_len); ++ i)
+				{
+					verify(count + i < ARRAY_SIZE(levels));
+					verify(levels[count + i] != -1);
+					if (levels[count + i] != s->level)
+						if (levels[count + i] != SHRT_MAX /*ignore*/)
+						{
+							if (fail_test ++ < 10)
+								output("\nBidiTests.txt(%d): \"%s\" index %d order %c got unexpected level %d != %d ", lineno, line.CStr(), count + i, paragraph_level == 0 ? 'L' : 'R', s->level, levels[count + i]);
+							// verify(levels[count + i] == s->level);
+							goto fail;
+						}
+					}
+				count += seg_len;
+				s = static_cast<ParagraphBidiSegment *>(s->Suc());
+			}
+		}
+
+		ok_test ++;
+fail:;
+		bidi_segments.Clear();
+	}
+
+	if (fail_test)
+	{
+		if (fail_test > 10)
+			output("\n(...and %d more...) ", fail_test - 10);
+		output("Failed\n"
+			   "  Ran %7d tests; failed %7d tests ....................... ",
+			   ok_test, fail_test);
+	}
+	else
+		output("Passed\n"
+			   "  Ran %7d tests ............................................. ",
+			   ok_test);
+	verify(fail_test == 0);
+}
+finally
+{
+	bidi_segments.Clear();
+}

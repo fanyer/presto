@@ -1,0 +1,405 @@
+group "search_engine.m2";
+
+disabled;
+
+require SEARCH_ENGINE;
+require M2_SUPPORT;
+
+include "adjunct/m2/src/engine/engine.h";
+include "adjunct/m2/src/engine/account.h";
+include "adjunct/m2/src/engine/accountmgr.h";
+include "adjunct/m2/src/engine/store.h";
+include "adjunct/m2/src/engine/indexer.h";
+include "adjunct/m2/src/engine/message.h";
+include "adjunct/m2/src/engine/lexicon.h";
+include "modules/util/opfile/opfile.h";
+include "modules/search_engine/tests/test_util.h";
+include "modules/search_engine/WordSegmenter.h";
+
+global
+{
+//#define MSG_M2_LEXICON_FLUSH 34659
+
+OP_STATUS ClearDir(const uni_char *path)
+{
+	OpFolderLister *dirfiles;
+	OpString s;
+	BOOL next;
+
+	dirfiles = OpFile::GetFolderLister(OPFILE_ABSOLUTE_FOLDER, UNI_L("*"), path);
+
+	next = dirfiles->Next();
+	while (next)
+	{
+		if (uni_strcmp(dirfiles->GetFileName(), UNI_L(".")) == 0 ||
+			uni_strcmp(dirfiles->GetFileName(), UNI_L("..")) == 0)
+		{
+			next = dirfiles->Next();
+			continue;
+		}
+
+		if (dirfiles->IsFolder())
+		{
+			s.Set(dirfiles->GetFullPath());
+			RETURN_IF_ERROR(ClearDir(s.CStr()));
+			next = dirfiles->Next();
+		}
+		else {
+			BlockStorage::DeleteFile(dirfiles->GetFullPath());
+			next = dirfiles->Next();
+		}
+	}
+
+	return OpStatus::OK;
+}
+
+class EmlParser
+{
+	OpString body;
+	OpString word;
+	WordSegmenter *tok;
+	Message *email;
+public:
+	EmlParser(void) {tok = NULL; email = NULL;}
+	~EmlParser(void) {Close();}
+	void Construct(const uni_char *fname);
+	void Close(void);
+	uni_char *ReadWord(void);
+	Message *ReleaseMessage(void) {Message *m = email; email = NULL; Close(); return m;}
+};
+
+void EmlParser::Construct(const uni_char *fname)
+{
+	OpFile f;
+	char *buf;
+
+	Close();
+
+	f.Construct(fname);
+	f.Open(OPFILE_READ);
+
+	buf = OP_NEWA(char, (int)f.GetFileLength() + 1);
+
+	f.Read(buf, f.GetFileLength());
+	buf[f.GetFileLength()] = 0;
+	f.Close();
+
+	email = OP_NEW(Message, ());
+	email->Init(1);
+
+	email->SetRawMessage(buf);
+	email->SetId(0);
+
+	OP_DELETEA(buf);
+}
+
+uni_char *EmlParser::ReadWord(void)
+{
+	if (tok == NULL)
+	{
+		if (email == NULL)
+			return NULL;
+
+		email->GetBodyText(body);
+		tok = OP_NEW(WordSegmenter, ());
+		tok->Set(body);
+	}
+
+	do {
+		tok->GetNextToken(word);
+
+		if (!word.HasContent())
+			return NULL;
+	} while (word.Length() >= 30);
+
+	return word.CStr();
+}
+
+void EmlParser::Close(void)
+{
+	if (tok != NULL)
+	{
+		OP_DELETE(tok);
+		tok = NULL;
+	}
+
+	if (email != NULL)
+	{
+		OP_DELETE(email);
+		email = NULL;
+	}
+}
+
+}
+
+test ("conversion")
+	file uni indexer "data/indexer";
+{
+	OpINT32Vector result1, result2;
+	Lexicon *lex;
+	StringTable t;
+
+	lex = OP_NEW(Lexicon, ());
+	verify(lex->Init(indexer, UNI_L("cnv")) == OpStatus::OK);
+	lex->AddWord(UNI_L("word1"), 1);
+	lex->AddWord(UNI_L("word2"), 1);
+	lex->AddWord(UNI_L("word1"), 2);
+
+	t.Open(indexer, UNI_L("cnv"));
+	lex->ConvertTo(t);
+	Lexicon::Erase(lex);
+
+	t.Search(UNI_L("word"), &result1, 8);
+	t.Search(UNI_L("word2"), &result2);
+
+	t.Close();
+
+	ClearDir(indexer);
+
+	verify(result1.GetCount() == 2 && result1.Find(1) != -1 && result1.Find(2) != -1);
+	verify(result2.GetCount() == 1 && result2.Get(0) == 1);
+}
+
+test("index and search")
+	file uni eml     "data/eml";
+	file uni indexer "data/indexer";
+{
+	OpFolderLister *dirfiles;
+	message_gid_t mid;
+	OpString8 dummy;
+	Account *account1;
+	OpString old_mail_path;
+	int i;
+	int errors, warnings;
+	EmlParser parser;
+	uni_char *uni_word;
+	OpINT32BinaryTree result;
+
+	ClearDir(indexer);
+
+	OpString tmp_storage;
+	old_mail_path.Set(g_folder_manager->GetFolderPathIgnoreErrors(OPFILE_MAIL_FOLDER, tmp_storage));
+	g_folder_manager->SetFolderPath(OPFILE_MAIL_FOLDER, indexer);
+
+	dirfiles = OpFile::GetFolderLister(OPFILE_ABSOLUTE_FOLDER, UNI_L("*"), eml);
+
+	if (!dirfiles)
+	{
+		g_folder_manager->SetFolderPath(OPFILE_MAIL_FOLDER, old_mail_path.CStr());
+        return 0;
+	}
+
+	MessageEngine::GetInstance()->ReInit(indexer, dummy);
+	account1 = OP_NEW(Account, ());
+	account1->Init(1, dummy);
+	((AccountManager *)(MessageEngine::GetInstance()->GetAccountManager()))->AddAccount(account1);
+
+	i = 0;
+	warnings = 0;
+	while (dirfiles->Next())
+	{
+		if (dirfiles->IsFolder())
+			continue;
+
+		parser.Construct(dirfiles->GetFullPath());
+
+		MessageEngine::GetInstance()->GetStore()->AddMessage(mid, parser.ReleaseMessage());
+
+		if (mid != (message_gid_t)(i + 1))
+			++warnings;
+
+		parser.Close();
+
+		if (++i % 200 == 0)
+			MessageEngine::GetInstance()->GetIndexer()->Receive(MSG_M2_LEXICON_FLUSH);
+	}
+
+	if (i % 200 != 1)
+		MessageEngine::GetInstance()->GetIndexer()->Receive(MSG_M2_LEXICON_FLUSH);
+
+	OP_DELETE(dirfiles);
+
+	dirfiles = OpFile::GetFolderLister(OPFILE_ABSOLUTE_FOLDER, UNI_L("*"), eml);
+
+	i = 0;
+	errors = 0;
+	while (dirfiles->Next())
+	{
+		if (dirfiles->IsFolder())
+			continue;
+
+		parser.Construct(dirfiles->GetFullPath());
+
+		while ((uni_word = parser.ReadWord()) != NULL)
+		{
+			result.Clear();
+			OpStringC token(uni_word);
+			MessageEngine::GetInstance()->GetIndexer()->FindWords(token, result);
+
+			if (!result.Contains(i + 1))
+				++errors;
+		}
+
+		parser.Close();
+
+		++i;
+	}
+
+	OP_DELETE(dirfiles);
+
+	g_folder_manager->SetFolderPath(OPFILE_MAIL_FOLDER, old_mail_path.CStr());
+
+	MessageEngine::GetInstance()->ReInit(old_mail_path.CStr(), dummy);
+
+	verify(warnings == 0);
+	verify(errors == 0);
+}
+
+test("index performance") disabled;
+	file uni f18261  "data/18261";
+	file uni indexer "data/indexer";
+{
+	OpFolderLister *dirfiles;
+	EmlParser parser;
+	Message *email;
+	message_gid_t mid;
+	OpString8 dummy;
+	OpString old_mail_path;
+	int i;
+	time_t start;
+	int warnings;
+	int id_offset;
+
+	dirfiles = OpFile::GetFolderLister(OPFILE_ABSOLUTE_FOLDER, UNI_L("*"), f18261);
+	verify(dirfiles != NULL);
+
+	ClearDir(indexer);
+
+	OpString tmp_storage;
+	old_mail_path.Set(g_folder_manager->GetFolderPathIgnoreErrors(OPFILE_MAIL_FOLDER, tmp_storage));
+	g_folder_manager->SetFolderPath(OPFILE_MAIL_FOLDER, indexer);
+
+	MessageEngine::GetInstance()->ReInit(indexer, dummy);
+
+	email = OP_NEW(Message, ());
+	email->Init(0);
+
+	email->SetRawMessage("Message-ID: <42E77DE6.6020407@opera.com>\r\n"
+		"Date: Wed, 27 Jul 2005 14:28:22 +0200\r\n"
+		"From: Email Sender <emails@opera.com>\r\n"
+		"To: account@opera.com\r\n"
+		"Content-Type: text/plain; charset=ISO-8859-1\r\n"
+		"Content-Transfer-Encoding: 7bit\r\n"
+		"Subject: survey\r\n"
+		"\r\n"
+		"tlachapoud\r\n");
+	email->SetId(0);
+
+	MessageEngine::GetInstance()->GetStore()->AddMessage(mid, email);
+	MessageEngine::GetInstance()->GetIndexer()->Receive(MSG_M2_LEXICON_FLUSH);
+
+	id_offset = mid + 1;
+
+	start = op_time(NULL);
+
+	i = 0;
+	warnings = 0;
+	while (dirfiles->Next())
+	{
+		if (dirfiles->IsFolder())
+			continue;
+
+		parser.Construct(dirfiles->GetFullPath());
+
+		MessageEngine::GetInstance()->GetStore()->AddMessage(mid, parser.ReleaseMessage());
+
+		parser.Close();
+
+		if (mid != (message_gid_t)(i + id_offset))
+			++warnings;
+
+		if (++i % 200 == 0)
+			MessageEngine::GetInstance()->GetIndexer()->Receive(MSG_M2_LEXICON_FLUSH);
+	}
+
+	MessageEngine::GetInstance()->GetIndexer()->Receive(MSG_M2_LEXICON_FLUSH);
+
+	output("%i s", op_time(NULL) - start);
+
+	OP_DELETE(dirfiles);
+
+	g_folder_manager->SetFolderPath(OPFILE_MAIL_FOLDER, old_mail_path.CStr());
+
+	MessageEngine::GetInstance()->ReInit(old_mail_path.CStr(), dummy);
+
+	verify(warnings == 0);
+}
+
+test("search performance") disabled;
+	file uni f18261  "data/18261";
+	file uni indexer "data/indexer";
+{
+	OpFolderLister *dirfiles;
+	OpFile f;
+	OpString8 dummy;
+	OpString old_mail_path;
+	uni_char *uni_word;
+	int i;
+	EmlParser parser;
+	OpINT32BinaryTree result;
+	time_t start;
+	int errors;
+	int id_offset;
+
+	dirfiles = OpFile::GetFolderLister(OPFILE_ABSOLUTE_FOLDER, UNI_L("*"), f18261);
+	verify(dirfiles != NULL);
+
+	OpString tmp_storage;
+	old_mail_path.Set(g_folder_manager->GetFolderPathIgnoreErrors(OPFILE_MAIL_FOLDER, tmp_storage));
+	g_folder_manager->SetFolderPath(OPFILE_MAIL_FOLDER, indexer);
+
+	MessageEngine::GetInstance()->ReInit(indexer, dummy);
+
+	MessageEngine::GetInstance()->GetIndexer()->FindWords(UNI_L("tlachapoud"), result);
+	if (result.GetCount() == 1)
+		id_offset = result.GetByIndex(0) + 1;
+	else id_offset = 1;
+
+	start = op_time(NULL);
+
+	i = 0;
+	errors = 0;
+	while (dirfiles->Next())
+	{
+		if (dirfiles->IsFolder())
+			continue;
+
+		parser.Construct(dirfiles->GetFullPath());
+
+		while ((uni_word = parser.ReadWord()) != NULL)
+		{
+			result.Clear();
+			OpStringC token(uni_word);
+			MessageEngine::GetInstance()->GetIndexer()->FindWords(token, result);
+
+			if (!result.Contains(i + id_offset))
+				++errors;
+		}
+
+		parser.Close();
+
+		++i;
+	}
+
+	output("%i s", op_time(NULL) - start);
+
+	OP_DELETE(dirfiles);
+
+	g_folder_manager->SetFolderPath(OPFILE_MAIL_FOLDER, old_mail_path.CStr());
+
+	MessageEngine::GetInstance()->ReInit(old_mail_path.CStr(), dummy);
+
+	verify(errors == 0);
+}
+
+

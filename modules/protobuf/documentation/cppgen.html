@@ -1,0 +1,350 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN"
+          "http://www.w3.org/TR/html4/loose.dtd">
+<html>
+<head>
+	<link rel="stylesheet" href="../../coredoc/coredoc.css" type="text/css" media="all">
+ 	<link rel="contents" href="../../coredoc/index.html" type="text/html" title="Core API">
+	<title>cppgen - Code generator</title>
+</head>
+
+<body>
+
+<h1>cppgen - Code generator</h1>
+
+<h2>Introduction</h2>
+
+<p>cppgen is a Python package which takes care of generating the
+necessary C++ classes/files from the proto files. The package is
+designed to be reused in custom tools but is also integrated with the
+operasetup system. This makes it easy to use proto files as the C++
+files are generated when a new build is started. </p>
+
+<h2>Requirements</h2>
+
+<p>cppgen requires Python 2.4 or higher (untested in Python 3), no
+external libraries are needed</p>
+
+<h2>Structure</h2>
+
+<p>The Python package is located in modules/protobuf/cppgen. The main
+starting point is in the script.py file, both the CLI script and the
+operasetup call happens via this file.</p>
+
+<p>The files in the package are:</p>
+
+<ul>
+	<li>cpp.py - General code for generating C++ code</li>
+	<li>extension.py - The extension registration file for hob, no longer needed</li>
+	<li>message.py - Handles generation of C++ classes from protobuf messages</li>
+	<li>op_message.py - Handles generation of OpMessage classes</li>
+	<li>scope_manager.py - Handles generation of the global scope manager class</li>
+	<li>scope_service.py - Handles generation of scope services</li>
+	<li>script.py - The main logic for the generator</li>
+	<li>utils.py - Various utility functions/classes</li>
+</ul>
+
+<p>Additionally the package also contains selected files from the
+external tool called <a href="http://pypi.python.org/pypi/hob">hob</a>,
+these files handles parsing of the .proto files into Python structures.
+Care must be taken to avoid modifying these files, if they are modified
+then the updates must also be applied to hob. These files are located in
+the <em>ext/hob</em> subfolder.</p>
+
+<p>The tests subfolder contains unittests (run by nose) but is currently
+outdated.</p>
+
+<h2>Running</h2>
+
+<p>The generator can be started in three ways. The first is by calling
+the script.py file using Python, it has several options, use -h to get
+an overview. Calling the script is safe as it only checks what files
+needs to created or updated. The second is via the operasetup process,
+this will generate/update the code when run. The third is an extension
+to hob, this is how the tool was originally used and is no longer
+relevant.It should be removed in the future. </p>
+
+<p>Example run - Display files which are to be created or updated.</p>
+
+<code>python modules/protobuf/cppgen/script.py</code>
+
+<p>A useful option is the --diff option, if supplied it changes the
+output to show the difference between the current codebase and what will
+be updated. This is quite handy when modifying the cppgen generator, you
+should be able to spot mistakes quite quickly.</p>
+
+<code>python modules/protobuf/cppgen/script.py --diff</code>
+
+<p>Running it via operasetup is normally done when starting a new build,
+but it also possible by calling
+<em>modules\hardcore\scripts\operasetup.py</em></p>
+
+<h2>Configuration</h2>
+
+<p>The generator can be configured on a per-module basis by creating a
+file called cpp.conf in the root of the module. It controls how the
+generated code looks like for that module, e.g. to add additional helper
+methods or change names to avoid conflicts. For more details see
+<a href="../cpp.conf">cpp.conf</a> </p>
+
+<h2>How it works</h2>
+
+<p>The generator consists of several steps, they are:</p>
+
+<h3>Discovery</h3>
+
+<p>The first step is to scan the modules in the source tree for proto
+files. This is done by looking for <em>modules.proto</em> files in each
+module. This file contains a list of filenames or directories which are
+to be included, if a directory is specified it will include all files
+which look like proto files (ends in .proto). The system will also find
+proto files in non-core setups, for instance Desktop adds new scope
+services.</p>
+
+<p>Each <em>module.proto</em> is scanned by stripping away comments
+(starts with a #) and inspecting each line in the file. An example:</p>
+
+<pre>
+<code>
+# The following files are included
+# The ecmascript service
+ecmascript.proto
+
+# Include all .proto files in the services sub-folder
+services
+</code>
+</pre>
+
+<p>This is handled by <em>script.ProtobufSystem.scan</em>.</p>
+
+<h3>Parsing</h3>
+
+<p>Once all files are known the system parses the proto files and builds
+a structure for each one. The result will be placed in cache files by
+pickling the Python structure to speed up parsing the next time it is
+run.  The parsing is handled by <em>script.ProtoFile.loadPackage</em> or
+<em>script.ProtoFile.loadCache</em>.</p>
+
+<p>After the proto structure is available it builds the corresponding
+C++ structure by attaching objects representing the C++ classes, enums
+and other types (see <em>cpp.py</em>). This is initiated by
+<em>script.ProtoFile.scan</em> by calling <em>cpp.buildCppElements</em>
+on the package object. It will iterate over all proto objects and attach
+a builder object (subclass of <em>cpp.CppBuilder</em>). Each builder
+object contains a set of properties and methods which the generators
+will later on use, for instance they can return the names of C++ types
+or objects representing types (e.g. an enum). The builder is accessible
+on the proto object via the <em>cpp</em> property. </p>
+
+<p>Any message which is marked as an OpMessage will be added to a
+<em>script.OpMessageSystem</em> which will be processed after the scan
+is done. This is needed to generate global unique IDs for each
+OpMessage.</p>
+
+<h3>Generate</h3>
+
+<p>The final step is to generate the C++ code and write them out to the
+.cpp and .h files. The system is designed to avoid writing to the files
+if no changes are found, this is very important as the build systems
+used by Opera will always recompile any changed C++ file, in some cases
+the entire source tree will be recompiled. The system also tries to
+figure out if it even needs to parse and generate the code to speed up
+the process. This has in some cases in the past led to problems were
+code were not updated, see <a href="#troubleshooting">Troubleshooting</a>
+below for more details.</p>
+
+<p>What gets generated depends on what is found in the proto files. For
+instance if a service declaration is found it assumes it is a scope
+service and will use <em>scope_service.py</em>, if it finds messages
+marked as <em>OpMessage</em> it will use <em>op_message.py</em>. Both of
+them will use <em>message.py</em> to generate the C++ classes for the
+messages but will embed the generated code in different ways. They are
+currently mutually exclusive, this is something that could be improved
+in the future, for instance by having the message classes in a separate
+namespace/class and generate the service or OpMessage classes if
+needed.</p>
+
+<p>Additionally a global service manager class is created, it keeps
+track of all service classes in the system and manages object lifetime
+and service registration. This is generated by <em>scope_manager.py</em>
+and the <em>scope_manager.CppManagerGenerator</em> class. This
+manager is used in the scope module only.</p>
+
+<h2>Generators</h2>
+
+<p>The various generators used in the system are explained in more
+detail below.</p>
+
+<h3>Proto messages</h3>
+
+<p>Each message which are found in the proto files (including nested ones)
+will be converted to a C++ class which represents the message file. The
+C++ class will for the most part reflect the message by having members
+with similar names to the fields. All messages are placed in an outer
+class called the message-set, ideally this should have been a namespace
+but that cannot be used yet.</p>
+
+<p>
+The nested structure of the messages are not reflected in the C++ code
+as there are problems referencing classes which have not yet been defined.
+Instead a flat structure is used with the name of the C++ class reflecting
+the nested structure, for instance consider following structure:
+</p>
+
+<pre>
+message Points
+{
+	message Point
+	{
+	}
+}
+</pre>
+
+<p>The inner message <em>Point</em> will get a name reflecting the
+entire path of the message, i.e. the class would be named something like
+<em>Points_Point</em>. To make it easier for the C++ developers
+additional typedefs are added to mimic the original structure, e.g. a
+typedef is placed inside the Points class to the <em>Points_Point</em>
+class but with the name <em>Point</em>, this makes it possible to
+reference the class with just <em>Points::Point</em>. </p>
+
+<p>The generator is handled by <em>message.py</em> and the Python class
+<em>CppMessageGenerator</em>. It generates a list of C++ methods by
+inspecting the message fields, their types and their options. </p>
+
+<h3>Service generation</h3>
+
+<p>The services are generated by the
+<em>scope_service.CppServiceGenerator</em> class, it generates both the
+header and implementation code. The class
+<em>scope_service.CppScopeServiceGenerator</em> handles configuration
+and knows which files to generate.</p>
+
+<h3>OpMessage generation</h3>
+
+<p>Each marked proto message will be converted to a C++ class which is a
+subclass of <em>OpTypedMessage</em>. It will first generate the class
+for the proto message itself using <em>message.py</em>, then it will
+generate the OpMessage wrapper class which contains the specific methods
+and constructors, the actual data is stored in a private member using
+the generated proto class. The Python class
+<em>CppOpMessageGenerator</em> is responsible for generating the files,
+while the classes <em>CppOpMessageDeclaration</em> and
+<em>CppOpMessageImplementation</em> handles the actual code generation.
+All generated classes for a single module is placed in a message-set,
+this is handled by <em>CppOpMessageSetGenerator</em>. </p>
+
+<p>All OpMessages in the system are assigned a unique enum which is used
+for knowing which type a serialized message has. The Python class
+<em>CppOpMessageGlobalGenerator</em> handles the generated files for
+this system and the generator are handled by the classes
+<em>CppOpTypedMessageBaseDeclaration</em> and
+<em>CppOpTypedMessageBaseImplementation</em> </p>
+
+<h3>cpp</h3>
+
+<p>The <em>cppgen</em> module contains lots of functionality for
+representing C++ code as Python objects and generating text output from
+them. All C++ elements inherit from the CppElement class, it maintains a
+child/parent relationship and has convenience properties for docblocks,
+comments, spacing and a link to the Proto object (if any) that it was
+created from. Several subclasses exists such as Class, Enum, Method and
+TypeDef, however it does not cover all C++ types and keywords (yet).
+
+<h2 id="troubleshooting">Troubleshooting</h2>
+
+<h3>Corrupt code</h3>
+
+<p>There has been some issues in the past with code being corrupted at
+times. This problem comes from the caching and mtime checking which
+has caused only some files to be updated. The result is that the compiler
+will only recompile those modified files leaving existing files untouched.
+When the code is linked there may be different offsets used for fetching
+attributes in objects leading to memory corruption.
+The main cause of this issue has been switching between changesets in
+git which contain different versions of the protobuf Python module.
+</p>
+
+<p>The easy fix to this is to clear the cache folder/files and run
+operasetup again. The proper fix is to change the build system as
+outlined in Future Improvements.</p>
+
+
+<h2>Future Improvements</h2>
+
+<h3>Python cleanup</h3>
+
+<p>The current Python code is a mix of coding styles and should be
+standardized to just one. The best would be to use the
+<a href="http://www.python.org/dev/peps/pep-0008/">PEP8</a> standard.
+</p>
+
+<h3>C++ generation</h3>
+
+<p>The code generation to C++ is a mix of C++ Python objects and direct
+text output. When the generator was first created it relied only on
+text/template output and the C++ objects was added little by little
+afterwards. Ideally the generation should be made by creating the Python
+C++ objects only and then serializing them to text. Doing that will
+require adding more CppElement subclasses and improving existing ones as
+well as convert a lot of the old manual text output to use the new
+system.</p>
+
+<p>For instance it could all start with a File object which contains
+CppElements, such as:</p>
+
+<pre>
+File
+  - Comment
+  - MacroIf
+      - Class
+        - Method
+        - Method
+        ...
+</pre>
+
+<p>Then all that needs to be done is serialize the File object.</p>
+
+<h3>Unified message-sets</h3>
+
+<p>Currently the scope service generator creates the message-set a bit
+different than the one created when no service is defined. The best
+solution would be to always create the message-set outside the service
+class and make the service file reuse that. Ideally all message-sets
+should be managed by the protobuf module, currently the scope module
+manages the message-sets found in services.</p>
+
+<h3>Improved build process</h3>
+
+<p>Currently <em>script.py</em> partially implements its own build system
+by keeping track of dependencies and managing mtime and pickle caches.
+This makes the codebase bigger than it needs to be and it also contains
+bugs from time to time.
+The better approach would be to separate the process, the first run would
+only take care of discovering proto files and writing out a set of text
+files which contain information about which proto files are to be used.
+For instance there could be one file listing all proto files which are
+used to generate message-sets, another for scope services and a third
+for OpMessages, these files could also contain dependency information.
+The real build system will then use that information to generate the files
+if needed (mtime, dependencies etc.) by calling specific Python scripts,
+e.g. "generate_messages.py".
+</p>
+
+<h3>Fix imports</h3>
+
+<p>Currently the protobuf import mechanism is a bit lacking. The system
+will import proto files from the current working directory instead of
+either relative to the current file or from the root of the opera source
+tree. This could potentially be fixed by setting up a list of include
+paths and use these paths to find the file to include.
+</p>
+
+<h3>More C++ customizations</h3>
+
+<p>The customization of the generated code could be improved. For
+instance supporting setting a list of C++ include files to be added to
+all generated files or just for a given .proto file.
+</p>
+
+</body>
+</html>

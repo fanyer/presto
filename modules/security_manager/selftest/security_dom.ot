@@ -1,0 +1,152 @@
+/* -*- Mode: c++; tab-width: 4; indent-tabs-mode: t; c-basic-offset: 4 -*-
+**
+** Copyright 2009-2010 Opera Software ASA.  All rights reserved.
+**
+** This file is part of the Opera web browser.  It may not be distributed
+** under any circumstances.
+*/
+
+group "security_manager.security_dom";
+
+include "modules/security_manager/include/security_manager.h";
+
+/* Test checks if a registration of the http handler is not permitted and
+ * the registration of the mailto handler is. This should always pass no matter if we have black or white list of protocols handlers.
+ * This also check if proper list file is in place (if not CheckSecurity will fail).
+ *
+ * The protocols black or white list is handlers-ignore.ini file located in OPFILE_INI_FOLDER
+ */
+
+test("Protocols [White|Black]List")
+require WEB_HANDLERS_SUPPORT;
+{
+	BOOL allowed = FALSE;
+	URL empty;
+	OpSecurityContext test_source(empty);
+	OpSecurityContext test_target(empty);
+	test_target.AddText(UNI_L("http"));
+	verify_success(g_secman_instance->CheckSecurity(OpSecurityManager::WEB_HANDLER_REGISTRATION, test_source, test_target, allowed));
+	verify(!allowed);
+	test_target.AddText(UNI_L("mailto"));
+	verify_success(g_secman_instance->CheckSecurity(OpSecurityManager::WEB_HANDLER_REGISTRATION, test_source, test_target, allowed));
+	verify(allowed);
+}
+
+test("Protocols matching ranks")
+require WEB_HANDLERS_SUPPORT;
+{
+	OpString pattern1;
+	OpString pattern2;
+	OpString protocol;
+	double rank1, rank2;
+	verify_success(protocol.Set(UNI_L("abc")));
+	verify_success(pattern1.Set(UNI_L("a*c")));
+	verify_success(pattern2.Set(UNI_L("a?c")));
+	rank1 = g_secman_instance->GetProtocolMatchRank(protocol, pattern1);
+	rank2 = g_secman_instance->GetProtocolMatchRank(protocol, pattern2);
+	verify(rank1 < rank2);
+	verify_success(pattern1.Set(UNI_L("abc?")));
+	verify_success(pattern2.Set(UNI_L("a??")));
+	rank1 = g_secman_instance->GetProtocolMatchRank(protocol, pattern1);
+	rank2 = g_secman_instance->GetProtocolMatchRank(protocol, pattern2);
+	verify(rank1 > rank2);
+	verify_success(pattern1.Set(UNI_L("a*")));
+	verify_success(pattern2.Set(UNI_L("a**")));
+	rank1 = g_secman_instance->GetProtocolMatchRank(protocol, pattern1);
+	rank2 = g_secman_instance->GetProtocolMatchRank(protocol, pattern2);
+	verify(rank1 > rank2);
+	verify_success(pattern1.Set(UNI_L("a*bc")));
+	verify_success(pattern2.Set(UNI_L("a?bc")));
+	rank1 = g_secman_instance->GetProtocolMatchRank(protocol, pattern1);
+	rank2 = g_secman_instance->GetProtocolMatchRank(protocol, pattern2);
+	verify(rank1 < rank2);
+	verify_success(pattern1.Set(UNI_L("abc")));
+	rank1 = g_secman_instance->GetProtocolMatchRank(protocol, pattern1); // perfect match
+	verify(rank1 == 1.0);
+	verify_success(protocol.Set(UNI_L("abcdefgh")));
+	verify_success(pattern1.Set(UNI_L("a*")));
+	verify_success(pattern2.Set(UNI_L("a???????")));
+	rank1 = g_secman_instance->GetProtocolMatchRank(protocol, pattern1);
+	rank2 = g_secman_instance->GetProtocolMatchRank(protocol, pattern2);
+	verify(rank1 < rank2);
+	verify_success(pattern1.Set(UNI_L("a*h")));
+	verify_success(pattern2.Set(UNI_L("a??????h")));
+	rank1 = g_secman_instance->GetProtocolMatchRank(protocol, pattern1);
+	rank2 = g_secman_instance->GetProtocolMatchRank(protocol, pattern2);
+	verify(rank1 < rank2);
+	verify_success(pattern2.Set(UNI_L("a*d*h")));
+	rank2 = g_secman_instance->GetProtocolMatchRank(protocol, pattern2);
+	verify(rank1 < rank2);
+	verify_success(pattern1.Set(UNI_L("a*e*h")));
+	verify_success(pattern2.Set(UNI_L("a*efgh")));
+	rank1 = g_secman_instance->GetProtocolMatchRank(protocol, pattern1);
+	rank2 = g_secman_instance->GetProtocolMatchRank(protocol, pattern2);
+	verify(rank1 < rank2);
+	verify_success(protocol.Set(UNI_L("thisisaveryveryverylongprotocolname")));
+	verify_success(pattern1.Set(UNI_L("*"))); // a very generic pattern
+	rank1 = g_secman_instance->GetProtocolMatchRank(protocol, pattern1);
+	// a very generic pattern vs a very long protocol name. The rank should be very small
+	verify(rank1 > 0 && rank1 < 0.01);
+}
+
+table test_script_file_import(const char* testname, BOOL expected, const uni_char* url1, const uni_char* url2)
+{
+	{ "Same directory: allow", TRUE,
+		  UNI_L("file://localhost/home/users/a/a.js"),
+		  UNI_L("file://localhost/home/users/a/b.js")},
+	{ "Same directory: allow", TRUE,
+		  UNI_L("file://localhost/home/users/a/a.js"),
+		  UNI_L("file://localhost/home/users/a/b..js")},
+	{ "Same directory: allow", TRUE,
+		  UNI_L("file://localhost/home/users/a/a.js"),
+		  UNI_L("file://localhost/home/users/a/b..|..#...#..js")},
+	{ "Sub directory: allow", TRUE,
+		  UNI_L("file://localhost/home/users/a/a.js"),
+		  UNI_L("file://localhost/home/users/a/b/c.js")},
+	{ "Parent directory: disallow", FALSE,
+		  UNI_L("file://localhost/home/users/a/b/c.js"),
+		  UNI_L("file://localhost/home/users/a/a.js")},
+	{ "Parent directory: disallow", FALSE,
+		  UNI_L("file://localhost/home/users/a/b/c.js"),
+		  UNI_L("file://localhost/home/users/a\\a.js")},
+	{ "Relative directory: disallow", FALSE,
+		  UNI_L("file://localhost/home/users/a/b/c.js"),
+		  UNI_L("file://localhost/home/users/a/b/c/../../a.js")},
+	{ "Relative directory: disallow", FALSE,
+		  UNI_L("file://localhost/home/users/a/b/c.js"),
+		  UNI_L("file://localhost/home/users/a/b/c/../../a.js")},
+	{ "Relative directory: disallow", FALSE,
+		  UNI_L("file://localhost/home/users/a/b/c.js"),
+		  UNI_L("file://localhost/home/users/a/b/c/%2e%2e%2f%2e%2e%2fa.js")},
+	{ "Relative directory: disallow", FALSE,
+		  UNI_L("file://localhost/home/users/a/b/c.js"),
+		  UNI_L("file://localhost/home/users/a/b/c/%2e%2e%5c%2e%2e%5ca.js")},
+	{ "Relative directory: disallow", FALSE,
+		  UNI_L("file://localhost/home/users/a/b/c.js"),
+		  UNI_L("file://localhost/home/users/a/b/c/..%5c%2e%2e%5ca.js")},
+	{ "Relative directory: disallow", FALSE,
+		  UNI_L("file://localhost/home/users/a/b/c.js"),
+		  UNI_L("file://localhost/home/users/a/b/c/..%2f..%5ca.js")},
+
+	    // Attempts at overlong sequences..which fails to decode as wished-for.
+	    // The result is a valid path per syntactic rules, but one that doesn't
+	    // refer to a directory above the base.
+	{ "Relative directory: disallow", TRUE,
+		  UNI_L("file://localhost/home/users/a/b/c.js"),
+		  UNI_L("file://localhost/home/users/a/b/c/..%c1%1c..%c0%afa.js")}
+}
+
+foreach (testname, expected, u1, u2) from test_script_file_import
+{
+	test(testname)
+		require DOM_WEBWORKERS_SUPPORT;
+	{
+		URL url1 = g_url_api->GetURL(u1);
+		URL url2 = g_url_api->GetURL(u2);
+		OpSecurityContext context1(url1);
+		OpSecurityContext context2(url2);
+		BOOL allowed = FALSE;
+		verify_success(OpSecurityManager::CheckSecurity(OpSecurityManager::WEB_WORKER_SCRIPT_IMPORT, context1, context2, allowed));
+		verify(allowed == expected);
+	}
+}

@@ -1,0 +1,310 @@
+/* -*- Mode: c++; tab-width: 4; indent-tabs-mode: t; c-basic-offset: 4 -*-
+ *
+ * Plugin tests for general NPAPI functions.
+ *
+ * Copyright (C) 2009-2011 Opera Software AS.  All rights reserved.
+ *
+ * This file is part of the Opera web browser.
+ * It may not be distributed under any circumstances.
+ */
+
+group "ns4plugins.npapi";
+
+language c++;
+
+require _PLUGIN_SUPPORT_;
+require init;
+
+include "modules/doc/frm_doc.h";
+include "modules/ns4plugins/src/pluginhandler.h";
+include "modules/ns4plugins/src/pluginlibhandler.h";
+include "modules/prefs/prefsmanager/collections/pc_display.h";
+include "modules/viewers/viewers.h";
+include "modules/windowcommander/src/WindowCommander.h";
+
+global
+{
+	UINT ns4p_active_plugins_count;
+
+	/**
+	 * This function is required to check the number of running plugins before
+	 * and after NPP_ClearSiteData. Since NPP_ClearSiteData loads all plugins,
+	 * it should not shut down any plugins the user currently has loaded, nor
+	 * should it leave any plugins it has loaded purely for clearing site data.
+	 */
+	static UINT ns4p_CountActivePlugins()
+	{
+		UINT count = 0;
+		UINT num_plugins = g_plugin_viewers->GetPluginViewerCount();
+		for (UINT i = 0; i < num_plugins; ++i)
+		{
+			PluginViewer *cand = g_plugin_viewers->GetPluginViewer(i);
+			if (!cand) continue;
+
+			const uni_char *path = cand->GetPath();
+			if (!path) continue;
+
+			PluginLib *lib = g_pluginhandler->GetPluginLibHandler()->FindPluginLib(path);
+			if (lib)
+			++count;
+		}
+		return count;
+	}
+}
+
+
+/**
+ * Ensure that plugins are enabled.
+ */
+test("Plugins enabled")
+{
+	verify(g_pcdisplay->GetIntegerPref(PrefsCollectionDisplay::PluginsEnabled));
+	verify(g_pcdisplay->GetIntegerPref(PrefsCollectionDisplay::EnableOnDemandPlugin) == 0);
+}
+
+/**
+ * Ensure the test plugin is available.
+ */
+test("Test plugin installed")
+	require success "Plugins enabled";
+{
+	OpString16 mime_type;
+	mime_type.Set("application/x-vnd.opera-test-plugin");
+	verify(g_viewers->FindViewerByMimeType(mime_type) != 0);
+}
+
+/**
+ * Set current document, instantiating a test plugin object
+ * available for the following javascript tests.
+ */
+html {
+	//! <html>
+	//! <head>
+	//! <title> Plugin tests for NPAPI's event related methods </title>
+	//! </head>
+	//! <body>
+	//! <object id="plugin" type="application/x-vnd.opera-test-plugin"
+	//!   width="8" height="8" windowless="true">Fallback</object>
+	//! <script>window.plugin = document.getElementById("plugin");</script>
+	//! </body>
+	//! </html>
+}
+
+test("Test plugin scriptable object")
+	require success "Test plugin installed";
+	language ecmascript;
+{
+	verify(plugin.toString() == "[OperaTestPlugin]");
+}
+
+test("NPN_UserAgent")
+	language ecmascript;
+	require success "Test plugin scriptable object";
+{
+	verify(plugin.testUserAgent() == navigator.userAgent);
+}
+
+test("NPN_Status")
+	language ecmascript;
+	require success "Test plugin scriptable object";
+{
+	var s = "Oh, to be a quine.";
+	plugin.testStatus(s);
+	verify(window.status == s);
+}
+
+test("NPN_MemFlush")
+	language ecmascript;
+	require success "Test plugin scriptable object";
+{
+	/*
+	 * We don't really have a way to test that this call did what it should,
+	 * so we'll take it in good faith if we don't crash.
+	 */
+	 plugin.testMemFlush(1000);
+}
+
+test("NPN_GetJavaEnv")
+	language ecmascript;
+	require success "Test plugin scriptable object";
+{
+	/* Verify that we return NULL. When we don't, a proper test is to be written. */
+	verify(plugin.testGetJavaEnv() != undefined);
+}
+
+test("NPN_GetJavaPeer")
+	language ecmascript;
+	require success "Test plugin scriptable object";
+{
+	/* Verify that we return NULL. When we don't, a proper test is to be written. */
+	verify(plugin.testGetJavaPeer() != undefined);
+}
+
+test("Enable privacy mode")
+	language c++;
+{
+	WindowCommander* wc = state.doc->GetWindow()->GetWindowCommander();
+	wc->SetPrivacyMode(TRUE);
+}
+
+test("Verify privacy mode on")
+	language ecmascript;
+	require success "Enable privacy mode";
+	require success "Test plugin scriptable object";
+{
+	verify(plugin.testGetValue(18 /* NPNVprivateModeBool */) == true);
+}
+
+test("Disable privacy mode")
+	language c++;
+	require success "Enable privacy mode";
+{
+	WindowCommander* wc = state.doc->GetWindow()->GetWindowCommander();
+	wc->SetPrivacyMode(FALSE);
+}
+
+/**
+ * Disabling privacy mode destroys elements, so we need to re-create the
+ * document.
+ */
+html {
+	//! <html>
+	//! <head>
+	//! <title> Plugin tests for NPAPI's event related methods </title>
+	//! </head>
+	//! <body>
+	//! <object id="plugin" type="application/x-vnd.opera-test-plugin"
+	//!   width="8" height="8" windowless="true">Fallback</object>
+	//! <script>window.plugin = document.getElementById("plugin");</script>
+	//! </body>
+	//! </html>
+}
+
+test("Verify privacy mode off")
+	language ecmascript;
+	require success "Disable privacy mode";
+	require success "Test plugin scriptable object";
+{
+	verify(plugin.testGetValue(18 /* NPNVprivateModeBool */) == false);
+}
+
+test("NPN_PluginAsyncThreadCall")
+	async;
+	language ecmascript;
+	require success "Test plugin scriptable object";
+{
+	var async_call_received = false;
+
+	var finalize = function() {
+		plugin.onAsyncCall = undefined;
+		verify(async_call_received);
+		ST_passed();
+	};
+
+	plugin.onAsyncCall = function() {
+		async_call_received = true;
+		finalize();
+	};
+
+	plugin.testPluginThreadAsyncCall();
+	setTimeout(finalize, 3000);
+}
+
+test("Set some cookies")
+	language ecmascript;
+	require success "Test plugin scriptable object";
+{
+	plugin.setCookie("opera:selftest", "cookie 1");
+	verify(plugin.getCookieCount() == 1);
+}
+
+test("Clear all site data")
+	language c++;
+	require success("Set some cookies");
+{
+	ns4p_active_plugins_count = ns4p_CountActivePlugins();
+	verify(g_pluginhandler->GetPluginLibHandler()->ClearAllSiteData());
+}
+
+test("Verify all cookies are deleted")
+	language ecmascript;
+	require success "Clear all site data";
+{
+	verify(plugin.getCookieCount() == 0);
+}
+
+test("Verify NPP_ClearSiteData does not add or remove any plugins")
+	language c++;
+	require success "Clear all site data";
+{
+#ifdef PLUGIX_PLUGINS
+
+	/**
+	 * This test doesn't really make sense since plugin proxy will always be
+	 * loaded at this point. For testing of NPP_ClearSiteData, please see
+	 * plugix.clearsitedata selftest.
+	 */
+	PluginViewer *cand = g_plugin_viewers->GetPluginViewer(0);
+	verify(cand);
+	verify(cand->GetPath());
+	verify(g_pluginhandler->GetPluginLibHandler()->FindPluginLib(cand->GetPath()));
+
+#else
+
+	verify(ns4p_CountActivePlugins() == ns4p_active_plugins_count);
+
+#endif
+}
+
+/**
+ * Regression test for CORE-36363, remove empty string parameter names from NPP_New()'s input arguments.
+ * Depending on the arguments, return value from onNew() is returned to NPP_New() and to Opera,
+ * which fails if the return value is different from NPERR_NO_ERROR (0).
+ * The test checks if the plugin instance is still present.
+ */
+html {
+	//! <html>
+	//! <head>
+	//! <title> Plugin test for NPP_New() </title>
+	//! <script>function onNew(arguments) {
+	//! var i=0;
+	//! while (arguments[i])
+	//! {
+	//!   if (arguments[i].name === "")
+	//!     return 9; // NPERR_INVALID_PARAM
+	//!   i++;
+	//! }
+	//! return 0; // NPERR_NO_ERROR
+	//! };</script>
+	//! </head>
+	//! <body>
+	//! <object id="plugin" type="application/x-vnd.opera-test-plugin">
+	//!   <param name="" value=""/>Fallback</object>
+	//! <script>window.plugin = document.getElementById("plugin");</script>
+	//! </body>
+	//! </html>
+}
+
+test("NPP_New with empty string argument name")
+	language ecmascript;
+	require success "Test plugin scriptable object";
+{
+	verify(plugin.toString() == "[OperaTestPlugin]");
+}
+
+test("no crash for NPN_UTF8FromIdentifier(NULL)")
+	language c++;
+{
+	verify(NPN_UTF8FromIdentifier(NULL) == NULL);
+}
+
+/*
+ * Verify that we handle a plugin crash gracefully.
+ */
+test("Plugin crash")
+	disabled; // Opera will try to re-use the same library after crash.
+	language ecmascript;
+	require success "Test plugin scriptable object";
+{
+	plugin.crash();
+}

@@ -1,0 +1,282 @@
+<html>
+<head>
+<title>RSS Aggregator Server</title>
+<script>
+
+
+//FIXME: This script still does not support all RSS formats,  
+//e.g. it did not work for www.vg.no/export/Alle/rdf.hbs on 30.01.2006.
+
+MakeFeeds(
+	//"file://localhost/D:/Div/index.rss",
+	//"file://localhost/D:/Div/slashdot.xml",
+	//"file://localhost/D:/Div/vg_rss.xml",
+	//"http://slashdot.org/index.rss",
+	//"http://www.nytimes.com/services/xml/rss/nyt/Technology.xml",
+	//"http://www.theregister.co.uk/excerpts.rss",
+	//"http://www.nytimes.com/services/xml/rss/nyt/MovieNews.xml",
+	"http://www.dagbladet.no/rss/oppdatert.xml",
+	//"http://www.vg.no/export/Alle/rdf.hbs",
+	//"http://pub.tv2.no/nettavisen/ut/rss/nettavisen.xml",
+	"file://localhost/D:/Div/nettavisen_litt.xml"
+);
+
+
+var rss_feeds;  // Map from URL to object with internal state
+var ms_per_hour = 1000*60*60;
+var ms_per_day = 1000*60*60*24;
+var max_hours = 3; // edit as needed
+var max_days = 1;  // edit as needed
+var max_age = max_hours*ms_per_hour; // use either this one
+//var max_age = max_days*ms_per_day; // ... or this one.
+var current_timestamp = Number(new Date);
+var expires = current_timestamp - max_age;
+
+
+
+function Multiple(elt, tag) { return elt.getElementsByTagName(tag); }
+
+function Unique(elt, tag) { 
+	var list = Multiple(elt, tag);
+	if ( list!=null && list.length>0 ) 
+		return list[0];
+	//alert("Unique got list.length="+list.length+" for elt="+elt+" and tag="+tag);
+	return null; 
+}
+
+function UniqueText(elt, tag) { 
+	var elm = Unique(elt,tag);
+	if ( elm != null ) {
+		var child = elm.firstChild;
+		if ( child != null && child.nodeType == Node.TEXT_NODE ) 
+			return child.data;
+	}
+	return "no text found for tag=" + tag;
+}
+
+/*
+//just for debugging:
+function traverse(elt, level) {
+	alert("traverse level "+level+", elt="+elt+", elt.tagName="+elt.tagName);
+	var child = elt.firstChild;
+	if ( child != null )
+		level++;
+	while ( child != null ) {
+		traverse(child, level);
+		child = child.nextSibling;
+	}
+}
+*/
+
+
+function FeedRSS()
+{
+    var allitems = new Array();
+
+    // Read feeds and extract items
+    for ( var rss in rss_feeds )
+    {
+		var doc = GetRemoteDocument(rss);
+		if ( doc == undefined || doc == null ) {
+			alert("WARNING: doc undefined or doc==null in FeedRSS()");
+			continue;
+		}
+
+		//debugging:
+		//traverse(doc, 0);
+
+		var items = Multiple(doc,"item");
+		if ( items == undefined || items == null ) {
+			alert("WARNING: items undefined or items==null in FeedRSS()");
+			continue;
+		}
+
+		var channel = Unique(doc,"channel");
+		if ( channel == undefined || channel == null ) {
+			alert("WARNING: channel undefined or channel==null in FeedRSS()");
+			continue;
+		}
+
+		var channel_title = UniqueText(channel,"title");
+
+        for ( var i=0 ; i < items.length ; i++ )
+        {
+			var date = RSSDate(items[i]);  // a number
+			if ( date == undefined || date == null ) {
+				alert("we got returned date == undefined or null");
+				continue;
+			}
+			if ( date < expires ) {
+				//alert("we found an expired date"); // useful during development
+				continue;
+			}
+
+			var dateobj = new Date(date);
+			var datestr = dateobj.toLocaleDateString() + " " + dateobj.toLocaleTimeString();
+
+			var title = UniqueText(items[i],"title");
+			if ( title == undefined || title == null ) 
+				title = "undefined title";
+			else
+				title = ReplaceEntities(title);
+
+			var body = UniqueText(items[i],"description");
+			if ( body == undefined || body == null ) 
+				body = "undefined body";
+			else
+				body = ReplaceEntities(body);
+
+			var x = {         title: title,
+					  channel_title: channel_title,
+                               link: ArticleLink(items[i]),
+                               date: date,
+                            datestr: datestr,
+                               body: body };
+			allitems.push(x);
+
+        } // for ( var i=0 ; i < items.length ; i++ )
+    } // for ( var rss in rss_feeds )
+
+    // Sort all items in date order, newest first
+    allitems.sort( function(a,b) { return b.date - a.date; } );
+
+    // Presentation below this point
+    var s="";
+    for ( var i=0 ; i < allitems.length ; i++ )
+    {
+		var l = allitems[i].link;
+		s += "<p><font size=-1><b>" + 
+	      allitems[i].channel_title + ": " + 
+          (l ? "<a href=\"" + l + "\">" : "") + 
+		  allitems[i].title + (l ? "</a>" : "") +
+	      "</b><br>" +
+          allitems[i].datestr + 
+	      "<div style='margin-left: 1em'>" + allitems[i].body + "</div>" +
+	      "</font></p>";
+    }
+
+	if ( s == "" ) 
+		return "<html><body>No RSS feeds found</body></html>";
+	else
+	    return "<html><body>" + s + "</body></html>";
+}
+
+
+function RSSDate(it)
+{
+	var dates = it.getElementsByTagNameNS("*", "date"); // "*" means any namespace
+    if (dates.length)
+    {
+		var child = dates[0].firstChild;
+		if (child.nodeType != Node.TEXT_NODE) {
+			alert("dates[0].firstChild.nodeType != Node.TEXT_NODE in RSSDate(it) for date");
+			return null;
+		}
+
+        var d = child.data; //do not use innerText here
+		if ( d == undefined ) {
+			alert("dates[0].firstChild.data undefined in RSSDate(it) for date");
+			return d;
+		}
+
+		//alert("ready to return Number(Date.parse(d.replace(..))) for date="+d);
+        return Number(Date.parse(d.replace(/\+\d\d:\d\d/,"").split('T').join(' ')));
+    }
+
+    dates=it.getElementsByTagNameNS("*", "pubDate"); // "*" means any namespace
+    if (dates.length)
+    {
+		var child = dates[0].firstChild;
+		if (child.nodeType != Node.TEXT_NODE) {
+			alert("dates[0].firstChild.nodeType != Node.TEXT_NODE in RSSDate(it) for pubDate");
+			return null;
+		}
+
+        var d = child.data; //do not use innerText here
+		if ( d == undefined || d == null ) {
+			alert("dates[0].firstChild.data undefined or null in RSSDate(it) for pubDate");
+			return d;
+		}
+
+		var p = Date.parse(d); 
+		if ( p == undefined || p == null ) {
+			alert("Date.parse(dates[0].firstChild.data) undefined or null in RSSDate(it) for pubDate");
+			return p;
+		}
+
+		var n = Number(p);
+		if ( n == undefined || n == null ) {
+			alert("Number(Date.parse(dates[0].firstChild.data)) undefined or null in RSSDate(it) for pubDate");
+		}
+
+		//alert("ready to return Number(Date.parse(d)) for pubDate="+d);
+		return n;
+
+		//or perhaps the above is overkill, and the following would suffice?
+        //return Number(Date.parse(d));
+    }
+    return Number(Date());    
+}
+
+function ArticleLink(it)
+{
+    var link = it.getAttribute("about");
+    if ( link != undefined && link != null && link != "" ) {
+		//alert("in ArticleLink(it) it.getAttribute(about) returned link="+link); // use for debugging
+        return link;
+	}
+
+    link = UniqueText(it,"link");
+    if ( link != undefined && link != null && link != "" ) {
+		//alert("in ArticleLink(it) UniqueText(it, link) returned link="+link); // use for debugging
+        return link;
+	}
+
+    alert("FAILURE in function ArticleLink(it): it="+it);
+    return false;
+}
+
+function ReplaceEntities(text)
+{
+    return text.replace(/&lt;/g, "<").
+	        replace(/&gt;/g, ">").
+                replace(/&quot;/g,"\"").
+                replace(/&amp;/g,"&");
+}
+
+function MakeFeeds()
+{
+    var o = new Object;
+    for ( var i=0 ; i < arguments.length ; i++ )
+        o[arguments[i]] = { time: 0, document: null };
+    rss_feeds = o;
+}
+
+function GetRemoteDocument(url)
+{
+    var x = rss_feeds[url];
+	if ( x != undefined  ) {
+		if ( Number(new Date()) - x.time < ms_per_hour && x.document != null )
+			return x.document;
+	} else {
+		alert("WARNING: x==undefined in GetRemoteDocument()");
+	}
+
+    var d;
+    try {
+        d = document.implementation.createLSParser(1,"").parseURI(url);
+    } catch (e) {
+		alert("EXCEPTION in GetRemoteDocument(): "+e);
+		delete rss_feeds[url];
+		return false;
+    }
+
+    rss_feeds[url] = { time: Number(new Date()), document: d };
+    return d;
+}
+
+
+</script>
+</head>
+</html>
+

@@ -1,0 +1,442 @@
+/* -*- Mode: c++; tab-width: 4; indent-tabs-mode: t; c-basic-offset: 4 -*-
+**
+** Copyright (C) 2008 Opera Software AS.  All rights reserved.
+**
+** This file is part of the Opera web browser.  It may not be distributed
+** under any circumstances.
+**
+** Test for encoding scope transport protocol v1
+**
+** Jan Borsodi
+*/
+
+group "scope.stp_writer";
+
+require init;
+
+// TODO: Figure out a way to test the chunked encoding, probably needs a way to control the chunk sizes.
+
+global {
+	class OtProtocolTester : public OpScopeTPWriter
+	{
+	public:
+		OtProtocolTester(unsigned int version = 0, BOOL send_directly = FALSE);
+		virtual ~OtProtocolTester();
+		
+		OP_STATUS SetExpectedData(OpHeapArrayAnchor<char> &e_data, int e_len)
+		{
+			expected_data = e_data.release();
+			expected_cur = expected_data;
+			expected_len = e_len;
+			// Skip UTF-16 BOM
+			if ((unsigned char)expected_cur[0] == 0xfe && (unsigned char)expected_cur[1] == 0xff)
+			{
+				expected_cur += 2;
+			    expected_len -= 2;
+			}
+			return OpStatus::OK;
+		}
+
+		unsigned MessageCount() const { return message_count; }
+		int QueuedDataLength() const { return buf.Length(); }
+		BOOL IsVerified() const { return expected_len == 0; }
+		OP_STATUS DoSendData(size_t send_size);
+
+	protected:
+		/*virtual*/ OP_STATUS SendData(const char *data, size_t len);
+		/*virtual*/ OP_STATUS OnMessageSent(const OpScopeTPMessage &message);
+
+	private:
+		ByteBuffer   buf;
+		unsigned int message_count;
+		char        *expected_data;
+		const char  *expected_cur;
+		unsigned int expected_len;
+		BOOL         send_directly;
+	};
+	
+	OtProtocolTester::OtProtocolTester(unsigned int version, BOOL send_directly)
+		: OpScopeTPWriter(TRUE, version)
+		, message_count(0)
+		, expected_data(NULL)
+		, expected_cur(NULL)
+		, expected_len(0)
+		, send_directly(send_directly)
+	{
+	}
+
+	OtProtocolTester::~OtProtocolTester()
+	{
+		OP_DELETEA(expected_data);
+	}
+
+	OP_STATUS
+	OtProtocolTester::SendData(const char *data, size_t len)
+	{
+		OP_ASSERT(len > 0);
+		RETURN_IF_ERROR(buf.AppendBytes(data, len));
+		if (send_directly)
+			return DoSendData(len);
+		return OpStatus::OK;
+	}
+
+	OP_STATUS
+	OtProtocolTester::DoSendData(size_t send_size)
+	{
+		size_t write = MIN(buf.Length(), send_size);
+		BOOL same = TRUE;
+		unsigned int i;
+		for (i = 0; i < write; ++i)
+		{
+			char to_send_data = buf.Extract1(i);
+			if (expected_cur[i] != to_send_data)
+			{
+				same = FALSE;
+				break;
+			}
+		}
+		if (!same)
+		{
+			TempBuffer str;
+			// TODO: Need to handle binary data, message is not text anymore
+			str.Append("Expected: ");
+			unsigned int e_len = MIN(write, expected_len);
+			for (i = 0; i < e_len; ++i)
+			{
+				char tmp[10]; // ARRAY OK 2009-05-05 jhoff
+				unsigned int v = (expected_cur[i] & 0xff);
+				op_snprintf(tmp, sizeof(tmp), " %02x", v);
+				str.Append(tmp);
+			}
+			str.Append("\nReceived: ");
+			for (i = 0; i < write; ++i)
+			{
+				char tmp[10]; // ARRAY OK 2009-05-05 jhoff
+				unsigned int v = (buf.Extract1(i) & 0xff);
+				op_snprintf(tmp, sizeof(tmp), " %02x", v);
+				str.Append(tmp);
+			}
+#ifdef DEBUG_ENABLE_PRINTF
+			dbg_printf("Failed to generate valid STP data:\n%S\n", str.GetStorage());
+#endif // DEBUG_ENABLE_PRINTF
+			return OpStatus::ERR;
+		}
+		buf.Consume(write);
+		OP_ASSERT(expected_len >= write);
+		expected_cur += write;
+		expected_len -= write;
+		RETURN_IF_ERROR(OnDataSent(write));
+		return OpStatus::OK;
+	}
+	
+	OP_STATUS
+	OtProtocolTester::OnMessageSent(const OpScopeTPMessage &message)
+	{
+		++message_count;
+		return OpStatus::OK;
+	}
+	
+	OP_STATUS OtLoadStp0MessageParts(OtProtocolTester &pt, const char *infile)
+	{
+		// Hmm, this code is very messy
+		OpFile out, in;
+		BOOL exists;
+		OpFileLength length = 0, bytes_read;
+		
+		OpString outfile;
+		outfile.SetFromUTF8L(infile, op_strlen(infile)-10); // Skip .parts.txt
+		RETURN_IF_ERROR(outfile.Append(".net.txt"));
+
+		// Load file containing expected network data
+		RETURN_IF_ERROR(out.Construct(outfile));
+		RETURN_IF_ERROR(out.Exists(exists));
+		if (!exists)
+			return OpStatus::ERR;
+		RETURN_IF_ERROR(out.Open(OPFILE_READ));
+		RETURN_IF_ERROR(out.GetFileLength(length));
+		unsigned int data_length = (unsigned int)length;
+		OpHeapArrayAnchor<char> out_data(OP_NEWA(char, data_length));
+		RETURN_OOM_IF_NULL(out_data.Get());
+		RETURN_IF_ERROR(out.Read(out_data.Get(), length, &bytes_read));
+		if (bytes_read != length)
+			return OpStatus::ERR;
+		RETURN_IF_ERROR(out.Close());
+
+		// Load file containing input for a message
+		RETURN_IF_ERROR(in.Construct(OpString().SetFromUTF8L(infile)));
+		RETURN_IF_ERROR(in.Exists(exists));
+		if (!exists)
+			return OpStatus::ERR;
+		RETURN_IF_ERROR(in.Open(OPFILE_READ));
+		RETURN_IF_ERROR(in.GetFileLength(length));
+
+		OpString8 serviceName;
+		RETURN_IF_ERROR(in.ReadLine(serviceName));
+
+		OpFileLength pos;
+		RETURN_IF_ERROR(in.GetFilePos(pos));
+		int buf_length = (int)(length - pos);
+		OpHeapArrayAnchor<char> in_data(OP_NEWA(char, buf_length));
+		RETURN_OOM_IF_NULL(in_data.Get());
+		RETURN_IF_ERROR(in.Read(in_data.Get(), buf_length, &bytes_read));
+		if (bytes_read != static_cast<OpFileLength>(buf_length))
+			return OpStatus::ERR;
+		RETURN_IF_ERROR(in.Close());
+
+		RETURN_IF_ERROR(pt.SetExpectedData(out_data, data_length));
+
+		short command_id, tag;
+		OpScopeTPMessage::MessageType type;
+		if (serviceName[0] == '*')
+		{
+			command_id = 0;
+			type = OpScopeTPMessage::JSON; // FIXME: Temporary solution
+			tag = 0;
+		}
+		else
+		{
+			command_id = 1;
+			type = OpScopeTPMessage::JSON;
+			tag = 5;
+		}
+
+		OpAutoPtr<ByteBuffer> buf;
+		if (buf_length > 0)
+		{
+			buf = OP_NEW(ByteBuffer, ());
+			RETURN_OOM_IF_NULL(buf.get());
+			OpString uni_in_data;
+			uni_in_data.SetL(in_data.Get(), buf_length);
+			RETURN_IF_ERROR(buf->AppendBytes((const char *)uni_in_data.CStr(), uni_in_data.Length()*2));
+		}
+		OpString serviceName_uni;
+		serviceName_uni.SetFromUTF8L(serviceName.CStr());
+		OpAutoPtr<OpScopeTPMessage> msg(OP_NEW(OpScopeTPMessage, (OpScopeTPMessage::STP_Call, serviceName_uni, command_id, OpScopeTPMessage::OK, tag, OpScopeTPMessage::Version_0)));
+		RETURN_OOM_IF_NULL(msg.get());
+		if (buf_length > 0)
+		{
+			RETURN_IF_ERROR(msg->Construct(*buf.get(), type));
+		}
+		else
+		{
+			RETURN_IF_ERROR(msg->CreateEmptyData(type));
+		}
+		OpString uni_serviceName;
+		uni_serviceName.SetL(serviceName);
+		RETURN_IF_ERROR(msg->SetServiceName(uni_serviceName.CStr()));
+		RETURN_IF_ERROR(pt.EnqueueMessage(msg));
+
+		return OpStatus::OK;
+	}
+
+	OP_STATUS OtLoadStp1MessageParts(OtProtocolTester &pt, const char *infile)
+	{
+		// Hmm, this code is very messy
+		OpFile out, in;
+		BOOL exists;
+		OpFileLength length = 0, bytes_read;
+		
+		OpString outfile;
+		outfile.SetFromUTF8L(infile, op_strlen(infile)-10); // Skip .parts.txt
+		RETURN_IF_ERROR(outfile.Append(".net.txt"));
+
+		// Load file containing expected network data
+		RETURN_IF_ERROR(out.Construct(outfile));
+		RETURN_IF_ERROR(out.Exists(exists));
+		if (!exists)
+			return OpStatus::ERR;
+		RETURN_IF_ERROR(out.Open(OPFILE_READ));
+		RETURN_IF_ERROR(out.GetFileLength(length));
+		unsigned int data_length = (unsigned int)length;
+		OpHeapArrayAnchor<char> out_data(OP_NEWA(char, data_length));
+		RETURN_IF_ERROR(out.Read(out_data.Get(), length, &bytes_read));
+		if (bytes_read != length)
+			return OpStatus::ERR;
+		RETURN_IF_ERROR(out.Close());
+
+		// Load file containing input for a message
+		RETURN_IF_ERROR(in.Construct(OpString().SetFromUTF8L(infile)));
+		RETURN_IF_ERROR(in.Exists(exists));
+		if (!exists)
+			return OpStatus::ERR;
+		RETURN_IF_ERROR(in.Open(OPFILE_READ));
+		RETURN_IF_ERROR(in.GetFileLength(length));
+		short transport_type, command_id, type, tag, status;
+		OpString8 service_name;
+
+		RETURN_IF_ERROR(in.ReadShort(transport_type));
+		if (transport_type != OpScopeTPMessage::STP_Call && transport_type != OpScopeTPMessage::STP_Response &&
+			transport_type != OpScopeTPMessage::STP_Event && transport_type != OpScopeTPMessage::STP_Error)
+			return OpStatus::ERR;
+		RETURN_IF_ERROR(in.ReadLine(service_name));
+		RETURN_IF_ERROR(in.ReadShort(command_id));
+		if (command_id < 0)
+			return OpStatus::ERR;
+		RETURN_IF_ERROR(in.ReadShort(type));
+		if (type < OpScopeTPMessage::MessageTypeMin || type > OpScopeTPMessage::MessageTypeMax)
+			return OpStatus::ERR;
+		RETURN_IF_ERROR(in.ReadShort(status));
+		if (status < OpScopeTPMessage::MessageStatusMin || status > OpScopeTPMessage::MessageStatusMax)
+			return OpStatus::ERR;
+		RETURN_IF_ERROR(in.ReadShort(tag));
+		if (tag < 0)
+			return OpStatus::ERR;
+		short tmp_cid;
+		RETURN_IF_ERROR(in.ReadShort(tmp_cid)); // cid is not used
+
+		OpFileLength pos;
+		RETURN_IF_ERROR(in.GetFilePos(pos));
+		int buf_length = (int)(length - pos);
+		OpHeapArrayAnchor<char> in_data(OP_NEWA(char, buf_length));
+		RETURN_IF_ERROR(in.Read(in_data.Get(), buf_length, &bytes_read));
+		if (bytes_read != static_cast<OpFileLength>(buf_length))
+			return OpStatus::ERR;
+		RETURN_IF_ERROR(in.Close());
+
+		RETURN_IF_ERROR(pt.SetExpectedData(out_data, data_length));
+
+		OpAutoPtr<ByteBuffer> buf;
+		if (buf_length > 0)
+		{
+			buf = OP_NEW(ByteBuffer, ());
+			if (buf.get() == NULL)
+				return OpStatus::ERR;
+			RETURN_IF_ERROR(buf->AppendBytes(in_data.Get(), buf_length));
+		}
+		OpString service_name_uni;
+		service_name_uni.SetFromUTF8L(service_name.CStr());
+		OpAutoPtr<OpScopeTPMessage> msg(OP_NEW(OpScopeTPMessage, ((OpScopeTPMessage::STPType)transport_type, service_name_uni, command_id, (OpScopeTPMessage::MessageStatus)status, tag, OpScopeTPMessage::Version_1)));
+		if (msg.get() == NULL)
+			return OpStatus::ERR;
+		if (buf_length > 0)
+		{
+			RETURN_IF_ERROR(msg->Construct(*buf.get(), (OpScopeTPMessage::MessageType)type));
+		}
+		else
+		{
+			RETURN_IF_ERROR(msg->CreateEmptyData((OpScopeTPMessage::MessageType)type));
+		}
+		RETURN_IF_ERROR(pt.EnqueueMessage(msg));
+
+		return OpStatus::OK;
+	}
+
+}
+
+setup {
+}
+
+language c++;
+
+include "modules/scope/src/scope_network.h";
+include "modules/util/adt/bytebuffer.h";
+include "modules/util/opfile/opfile.h";
+include "modules/util/opautoptr.h";
+include "modules/scope/src/scope_tp_message.h";
+include "modules/scope/src/scope_tp_writer.h";
+include "modules/protobuf/src/protobuf_utils.h";
+
+table valid_files(const char*) filelist "protocol/valid" name "*.parts.txt";
+
+test( "Write STP/1 message : $(infile)" )
+    multi valid_files(infile);
+{
+	OtProtocolTester pt(1);
+	verify(OpStatus::IsSuccess(OtLoadStp1MessageParts(pt, infile)));
+
+	OP_STATUS result = OpStatus::OK;
+	int cnt = 0;
+	while (pt.MessageCount() < 1)
+	{
+		result = pt.DoSendData(20);
+		if (OpStatus::IsError(result))
+			break;
+		if (cnt > 10000)
+			result = OpStatus::ERR;
+		++cnt;
+	}
+	verify(OpStatus::IsSuccess(result));
+	verify(pt.IsVerified());
+	verify(pt.QueuedDataLength() == 0);
+}
+
+test( "Write STP/1 message (recursive calls) : $(infile)" )
+    multi valid_files(infile);
+{
+	OtProtocolTester pt(1, TRUE);
+	verify(OpStatus::IsSuccess(OtLoadStp1MessageParts(pt, infile)));
+
+	verify(pt.MessageCount() >= 1);
+	verify(pt.IsVerified());
+	verify(pt.QueuedDataLength() == 0);
+}
+
+table stp0_valid_files(const char*) filelist "stp0/valid" name "*.parts.txt";
+
+test( "Write STP/0 message : $(infile)" )
+    multi stp0_valid_files(infile);
+{
+	OtProtocolTester pt(0);
+	verify(OpStatus::IsSuccess(OtLoadStp0MessageParts(pt, infile)));
+
+	OP_STATUS result = OpStatus::OK;
+	int cnt = 0;
+	while (pt.MessageCount() < 1)
+	{
+		result = pt.DoSendData(20);
+		if (OpStatus::IsError(result))
+			break;
+		if (cnt > 10000)
+			result = OpStatus::ERR;
+		++cnt;
+	}
+	verify(OpStatus::IsSuccess(result));
+	verify(pt.IsVerified());
+	verify(pt.QueuedDataLength() == 0);
+}
+
+test( "Write STP/0 message (recursive calls) : $(infile)" )
+    multi stp0_valid_files(infile);
+{
+	OtProtocolTester pt(0, TRUE);
+	verify(OpStatus::IsSuccess(OtLoadStp0MessageParts(pt, infile)));
+
+	verify(pt.MessageCount() >= 1);
+	verify(pt.IsVerified());
+	verify(pt.QueuedDataLength() == 0);
+}
+
+table stp0_ext_valid_files(const char*) filelist "stp0_ext/valid" name "*.parts.txt";
+
+test( "Write STP/0 extended message : $(infile)" )
+    multi stp0_ext_valid_files(infile);
+{
+	OtProtocolTester pt(0);
+	verify(OpStatus::IsSuccess(OtLoadStp1MessageParts(pt, infile)));
+
+	OP_STATUS result = OpStatus::OK;
+	int cnt = 0;
+	while (pt.MessageCount() < 1)
+	{
+		result = pt.DoSendData(20);
+		if (OpStatus::IsError(result))
+			break;
+		if (cnt > 10000)
+			result = OpStatus::ERR;
+		++cnt;
+	}
+	verify(OpStatus::IsSuccess(result));
+	verify(pt.IsVerified());
+	verify(pt.QueuedDataLength() == 0);
+}
+
+test( "Write STP/0 extended message (recursive calls) : $(infile)" )
+    multi stp0_ext_valid_files(infile);
+{
+	OtProtocolTester pt(0, TRUE);
+	verify(OpStatus::IsSuccess(OtLoadStp1MessageParts(pt, infile)));
+
+	verify(pt.MessageCount() >= 1);
+	verify(pt.IsVerified());
+	verify(pt.QueuedDataLength() == 0);
+}

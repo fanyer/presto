@@ -1,0 +1,576 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN"
+          "http://www.w3.org/TR/html4/loose.dtd">
+<html>
+
+<head>
+<link rel="stylesheet" href="scope.css" />
+
+<title>ECMAScript debugger protocol</title>
+<style type="text/css">
+h3 { font-weight: bold; font-style: italic }
+h3::before { font-style: normal }
+</style>
+<script type="text/javascript" src="markup_grammar.js"></script>
+</head>
+
+<body onload="markup_grammar()">
+<h1>ECMAScript debugger protocol</h1>
+
+
+<h2>Origins</h2>
+
+<p>The current XML protocol is based on the old "version 3" binary
+protocol with some structuring. See the end of this
+document for a critique.</p>
+
+
+<h2>Versioning</h2>
+
+<p>This document describes version 3 of the protocol. This number is
+sent as the PROTOCOL-VERSION in the HELLO message.</p>
+
+<h2>Flow</h2>
+
+<p>Control flow is on the pattern
+<code>EVENT&nbsp;(COMMAND&nbsp;RESPONSE?)*&nbsp;COMMAND</code>: Opera
+(aka "the debugging host") sends an event to the debugger which may
+issue commands to Opera (some of which have responses), and finally
+issues a command to relinquish control until the next event. The only
+command that relinquishes control is "continue".</p>
+
+<p> The initial event is "hello" which is sent once Opera discovers
+that a debugger is present.</p>
+
+<p> There is one exception to this scheme. While the debugger is not in
+control it may send a "break" command to Opera to force it to stop
+execution, and signal breakpoint events for all threads.</p>
+
+
+<h2>Central data types and how they work</h2>
+
+<p> A "runtime" represents a document context in which threads execute.
+There is a one-to-one mapping between runtimes and HTML documents.</p>
+
+<p> A "thread" represents a thread of execution in a runtime.  A "parent"
+thread can be preempted by another "child" thread in order to respond
+to a priority event; the parent thread will not run again until the
+child thread has finished.</p>
+
+<p> A "script" is a pair (id, source code) where the id is globally
+unique and the source code is Unicode text.</p>
+
+<p> An "object" is represented by a globally unique ID that is assigned by
+the debugger.</p>
+
+<p> Globally unique means unique within a running Opera session; that is
+from starting Opera to stopping it.</p>
+
+
+<h2>Protocol principles</h2>
+
+<p> The main principle is that the data should be self-describing.  This
+means that even enumerated values are passed as strings and that element
+names are verbose.</p>
+
+
+<h2>BNF</h2>
+
+<p> Here is the grammar describing the data. Some of the data elements
+are described in more detail below.</p>
+
+<pre id="grammar">
+  ###
+  # The protocol can mostly be described as a context-free grammar of
+  # data flowing past an observer on the wire, where HELLO and EVENT
+  # flows from host to client, and COMMAND flows from client to HOST.
+  #
+
+  PROTOCOL ::= HELLO (COMMAND | EVENT)* ;
+
+  ###
+  # Events (messages from debugging host to debugger)
+  #
+
+  EVENT ::= RUNTIME-STARTED
+          | RUNTIME-STOPPED
+          | NEW-SCRIPT
+          | PARSE-ERROR
+          | THREAD-STARTED
+          | THREAD-FINISHED
+          | THREAD-STOPPED-AT
+          | EVAL-REPLY
+          | EXAMINE-REPLY
+          | BACKTRACE-REPLY
+          | RUNTIMES-REPLY
+          | HANDLE-EVENT
+          | OBJECT-SELECTED
+          ;
+
+  HELLO ::= "&lt;hello&gt;"
+              PROTOCOL-VERSION      # from debugging host
+              OPERATING-SYSTEM
+              PLATFORM
+              USER-AGENT            # the one that's statically configured
+            "&lt;/hello&gt;" ;
+
+  RUNTIME-STARTED ::= "&lt;runtime-started&gt;" RUNTIME "&lt;/runtime-started&gt;" ;
+
+  RUNTIME-STOPPED ::= "&lt;runtime-stopped&gt;" RUNTIME-ID "&lt;/runtime-stopped&gt;" ;
+
+  NEW-SCRIPT ::= "&lt;new-script&gt;"
+                   RUNTIME-ID
+                   SCRIPT-ID
+                   SCRIPT-TYPE
+                   SCRIPT-DATA
+                   URI?             # present if SCRIPT-TYPE is "linked"
+                 "&lt;/new-script&gt;" ;
+
+  # OFFSET represents the character offset in the script where the parse error occured
+
+  OFFSET ::= "&lt;offset&gt;" UNSIGNED "&lt;/offset&gt;" ;
+
+  # CONTEXT describes in what context the error occured
+
+  CONTEXT ::= "&lt;context&gt;" TEXT "&lt;/context&gt;" ;
+
+  # DESCRIPTION contains the human-readable description of the parse error
+
+  DESCRIPTION ::= "&lt;description&gt;" TEXT "&lt;/description&gt;" ;
+
+  PARSE-ERROR ::= "&lt;parse-error&gt;"
+                     RUNTIME-ID
+                     SCRIPT-ID
+                     LINE-NUMBER
+                     OFFSET
+                     CONTEXT
+                     DESCRIPTION
+                   "&lt;/parse-error&gt;" ;
+
+  THREAD-STARTED ::= "&lt;thread-started&gt;"
+                       RUNTIME-ID
+                       THREAD-ID
+                       PARENT-THREAD-ID
+                       THREAD-TYPE
+                       EVENT-DESC?  # present if THREAD-TYPE is "event"
+                     "&lt;/thread-started&gt;" ;
+
+  THREAD-FINISHED ::= "&lt;thread-finished&gt;"
+                        RUNTIME-ID
+                        THREAD-ID
+                        STATUS
+                      "&lt;/thread-finished&gt;" ;
+
+  # BREAKPOINT-ID is present if and only if STOPPED-REASON is "breakpoint"
+
+  THREAD-STOPPED-AT ::= "&lt;thread-stopped-at&gt;"
+                          RUNTIME-ID
+                          THREAD-ID
+                          SCRIPT-ID
+                          LINE-NUMBER
+                          STOPPED-REASON
+                          BREAKPOINT-ID?
+                        "&lt;/thread-stopped-at&gt;" ;
+
+  # If STATUS is "completed" or "unhandled-exception", then
+  # VALUE-DATA will be present.
+
+  EVAL-REPLY ::= "&lt;eval-reply&gt;"
+                   TAG
+                   STATUS
+                   VALUE-DATA?
+                 "&lt;/eval-reply&gt;" ;
+
+  EXAMINE-REPLY ::= "&lt;examine-reply&gt;"
+                      TAG
+                      OBJECT*
+                    "&lt;/examine-reply&gt;" ;
+
+  # Frames are in innermost-first order
+
+  BACKTRACE-REPLY ::= "&lt;backtrace-reply&gt;"
+                        TAG
+                        FRAME*
+                      "&lt;/backtrace-reply&gt;" ;
+
+  RUNTIMES-REPLY ::= "&lt;runtimes-reply&gt;"
+                       TAG
+                       RUNTIME*
+                     "&lt;/runtimes-reply&gt;" ;
+
+  # This event is issued for XML events on the host, if a corresponding
+  # ADD-EVENT-HANDLER has been issued earlier by the client.
+  # OBJECT-ID refers to the target of the event.
+
+  HANDLE-EVENT ::= "&lt;handle-event&gt;"
+                     OBJECT-ID
+                     HANDLER-ID
+                     EVENT-TYPE
+                   "&lt;/handle-event&gt;" ;
+
+  # Some hosts send this event to indicate that an object was selected for
+  # debugging, e.g., if the debugger was started by right-clicking an element
+  # and clicking "inspect" in the context menu, this event will be sent
+  # right after startup. A client may safely choose to ignore this event.
+
+  OBJECT-SELECTED ::= "&lt;object-selected&gt;"
+                        OBJECT-ID
+                        WINDOW-ID
+                      "&lt;/object-selected&gt;" ;
+
+  ###
+  # Commands (messages from debugger to debugging host)
+  #
+
+  COMMAND ::= RUNTIMES
+            | CONTINUE
+            | EVAL
+            | EXAMINE-FRAME
+            | EXAMINE-OBJECTS
+            | SPOTLIGHT-OBJECT
+            | ADD-BREAKPOINT
+            | REMOVE-BREAKPOINT
+            | ADD-EVENT-HANDLER
+            | REMOVE-EVENT-HANDLER
+            | SET-CONFIGURATION
+            | BACKTRACE
+            | BREAK
+            ;
+
+  RUNTIMES ::= "&lt;runtimes&gt;"
+                 TAG
+                 CREATE-ALL-RUNTIMES?
+                 RUNTIME-ID*        # list the ones you want to see, or none if you want all
+               "&lt;/runtimes&gt;" ;
+
+  # Create runtimes for all documents. Runtimes are normally not created for documents
+  # without ECMAScript.
+
+  CREATE-ALL-RUNTIMES ::= "&lt;create-all-runtimes /&gt;" ;
+
+  CONTINUE ::= "&lt;continue&gt;"
+                 RUNTIME-ID
+                 THREAD-ID
+                 MODE
+               "&lt;/continue&gt;" ;
+
+  # SCRIPT-DATA represents a script to be executed; PROPERTY values
+  # represent variables to set.
+  # If THREAD-ID, code is evaluated in the global scope.
+
+  EVAL ::= "&lt;eval&gt;"
+             TAG
+             RUNTIME-ID
+             THREAD-ID
+             FRAME-ID
+             SCRIPT-DATA
+             PROPERTY*
+           "&lt;/eval&gt;" ;
+
+  EXAMINE-FRAME ::= "&lt;examine-frame&gt;"
+                      TAG
+                      RUNTIME-ID
+                      THREAD-ID
+                      FRAME-ID
+                    "&lt;/examine-frame&gt;" ;
+
+  EXAMINE-OBJECTS ::= "&lt;examine-objects&gt;"
+                        TAG
+                        RUNTIME-ID
+                        OBJECT-ID+
+                      "&lt;/examine-objects&gt;" ;
+
+  # Using OBJECT-ID == 0 clears the spotlight.
+  # If SCROLL-INTO-VIEW is present, the object will be scrolled into the view (at least part of it),
+  # otherwise the viewport will remain where it is.
+
+  SPOTLIGHT-OBJECT ::= "&lt;spotlight-object&gt;"
+                         OBJECT-ID
+                         SCROLL-INTO-VIEW?
+                       "&lt;/spotlight-object&gt;" ;
+
+  SCROLL-INTO-VIEW ::= "&lt;scroll-into-view /&gt;" ;
+
+  # The SOURCE-POSITION element defines how
+  # to set the breakpoint.
+
+  ADD-BREAKPOINT ::= "&lt;add-breakpoint&gt;"
+                       BREAKPOINT-ID
+                       SOURCE-POSITION
+                     "&lt;/add-breakpoint&gt;" ;
+
+  REMOVE-BREAKPOINT ::= "&lt;remove-breakpoint&gt;" BREAKPOINT-ID "&lt;/remove-breakpoint&gt;" ;
+
+  # Add an event handler. This will generate a HANDLE-EVENT event every time the XML event defined
+  # by the pair (NAMESPACE, EVENT-TYPE) reaches the object defined by OBJECT-ID in the capturing
+  # phase. XML events are defined in http://www.w3.org/TR/xml-events
+  #
+  # HANDLER-ID is set by the client and is referred to by both client and host.
+  # NAMESPACE of the event: if empty, it will match any namespace.
+  # PREVENT-DEFAULT prevents the default event handler from running.
+  # STOP-PROPAGATION stops propagation of the event beyond this OBJECT-ID (it will however run for
+  # all handlers on the object).
+
+  ADD-EVENT-HANDLER ::= "&lt;add-event-handler&gt;"
+                         HANDLER-ID
+                         OBJECT-ID
+                         NAMESPACE
+                         EVENT-TYPE
+                         PREVENT-DEFAULT
+                         STOP-PROPAGATION
+                        "&lt;/add-event-handler&gt;" ;
+
+  REMOVE-EVENT-HANDLER ::= "&lt;remove-event-handler&gt;" HANDLER-ID "&lt;/remove-event-handler&gt;" ;
+
+  SET-CONFIGURATION ::= "&lt;set-configuration&gt;" STOP-AT+ "&lt;/set-configuration&gt;" ;
+
+  # If MAXFRAMES is omitted, all frames are returned.
+
+  BACKTRACE ::= "&lt;backtrace&gt;"
+                  TAG
+                  RUNTIME-ID
+                  THREAD-ID
+                  MAXFRAMES?
+                "&lt;/backtrace&gt;" ;
+
+  BREAK ::= "&lt;break&gt;"
+              RUNTIME-ID
+              THREAD-ID
+            "&lt;/break&gt;" ;
+
+  ###
+  # Basis-data
+  #
+
+  EVENT-DESC ::= "&lt;event-desc&gt;"
+                   NAMESPACE
+                   EVENT-TYPE
+                 "&lt;/event-desc&gt;" ;
+
+  PREVENT-DEFAULT ::= "&lt;prevent-default&gt;"
+                         YESNO                       # default is yes
+                      "&lt;/prevent-default&gt;" ;
+
+  STOP-PROPAGATION ::= "&lt;stop-propagation&gt;"
+                         YESNO                       # default is yes
+                       "&lt;/stop-propagation&gt;" ;
+
+  # If DATA-TYPE is ... then ... is present:
+  #   "object", OBJECT-ID
+  #   "number", STRING
+  #   "string", STRING
+  #   "boolean", STRING ("true" or "false")
+  # Otherwise ("undefined" or "null"), only DATA-TYPE is present.
+
+  VALUE-DATA ::= "&lt;value-data&gt;"
+                   DATA-TYPE
+                   ( OBJECT-VALUE | STRING )?
+                 "&lt;/value-data&gt;" ;
+
+  OBJECT-VALUE ::= "&lt;object-value&gt;"
+                     OBJECT-ID
+                     PROTOTYPE-ID?
+                     OBJECT-ATTRIBUTES
+                     NAME?
+                   "&lt;/object-value&gt;" ;
+
+  RUNTIME ::= "&lt;runtime&gt;"
+                RUNTIME-ID
+                HTML-FRAME-PATH
+                WINDOW-ID        # the ID of the window
+                OBJECT-ID        # the 'global' object
+                URI              # the document's URI
+              "&lt;/runtime&gt;" ;
+
+  FRAME ::= "&lt;frame&gt;"
+              FUNCTION-ID
+              ARGUMENT-OBJECT
+              VARIABLE-OBJECT
+              THIS-OBJECT
+              SOURCE-POSITION?
+              OBJECT-VALUE*
+            "&lt;/frame&gt;" ;
+
+  # Default values are NO for every STOP-TYPE, except
+  # "script", which is YES.
+
+  STOP-AT ::= "&lt;stop-at&gt;"
+                YESNO
+                STOP-TYPE
+              "&lt;/stop-at&gt;" ;
+
+  # Set this value to 0 to get all frames.
+
+  MAXFRAMES ::= "&lt;maxframes&gt;" UNSIGNED "&lt;/maxframes&gt;" ;
+
+  SOURCE-POSITION ::= "&lt;source-position&gt;"
+                        SCRIPT-ID
+                        LINE-NUMBER
+                      "&lt;/source-position&gt;" ;
+
+  SCRIPT-DATA ::= "&lt;script-data&gt;" TEXT "&lt;/script-data&gt;" ;
+
+  OBJECT ::= "&lt;object&gt;"
+               OBJECT-VALUE
+               PROPERTY*
+             "&lt;/object&gt;" ;
+
+  PROPERTY ::= "&lt;property&gt;"
+                 OBJECT-ID?         # if you want to set a property on an object
+                 PROPERTY-NAME
+                 VALUE-DATA
+               "&lt;/property&gt;" ;
+
+  PROPERTY-NAME ::= "&lt;property-name&gt;" TEXT "&lt;/property-name&gt;" ;
+
+  OBJECT-ATTRIBUTES ::= "&lt;object-attributes&gt;" OBJECT-ATTRIBUTE* "&lt;/object-attributes&gt;" ;
+
+  OBJECT-ATTRIBUTE ::= "&lt;iscallable/&gt;" | "&lt;isfunction/&gt;" ;
+
+  NAME ::= CLASS-NAME | FUNCTION-NAME ;
+
+  CLASS-NAME ::= "&lt;class-name&gt;" TEXT "&lt;/class-name&gt;" ;
+
+  FUNCTION-NAME ::= "&lt;function-name&gt;" TEXT "&lt;/function-name&gt;" ;
+
+  PROTOCOL-VERSION ::= "&lt;protocol-version&gt;" UNSIGNED "&lt;/protocol-version&gt;" ;
+
+  OPERATING-SYSTEM ::= "&lt;operating-system&gt;" TEXT "&lt;/operating-system&gt;" ;
+
+  PLATFORM ::= "&lt;platform&gt;" TEXT "&lt;/platform&gt;" ;
+
+  USER-AGENT ::= "&lt;user-agent&gt;" TEXT "&lt;/user-agent&gt;" ;
+
+  HTML-FRAME-PATH ::= "&lt;html-frame-path&gt;" TEXT "&lt;/html-frame-path&gt;" ;
+
+  STOP-TYPE ::= "&lt;stop-type&gt;"
+                  ( "script" | "exception" | "error" | "abort" )
+                "&lt;/stop-type&gt;" ;
+
+  SCRIPT-TYPE ::= "&lt;script-type&gt;"
+                     ( "inline" | "event" | "linked" | "timeout" | "java" | "generated" | "unknown" )
+                  "&lt;/script-type&gt;" ;
+
+  THREAD-TYPE ::= "&lt;thread-type&gt;"
+                     ( "inline" | "event" | "linked" | "timeout" | "java" | "unknown" )
+                  "&lt;/thread-type&gt;" ;
+
+  NAMESPACE ::= "&lt;namespace&gt;" TEXT "&lt;/namespace&gt;" ;
+
+  # The event type is e.g., "click", "mousemove"
+  # More examples are at http://www.w3.org/TR/2000/REC-DOM-Level-2-Events-20001113/events.html
+  # Exactly which events are implemented depends on the host, and is not defined in this protocol.
+
+  EVENT-TYPE ::= "&lt;event-type&gt;" TEXT "&lt;/event-type&gt;" ;
+
+  STATUS ::= "&lt;status&gt;"
+               ( "completed" | "unhandled-exception" | "aborted" | "cancelled-by-scheduler" )
+             "&lt;/status&gt;" ;
+
+  DATA-TYPE ::= "&lt;data-type&gt;"
+                 ( "number" | "boolean" | "string" | "null" | "undefined" | "object" )
+               "&lt;/data-type&gt;" ;
+
+  MODE ::= "&lt;mode&gt;"
+             ( "run" | "step-into-call" | "step-next-line" | "step-out-of-call" )
+           "&lt;/mode&gt;" ;
+
+  # "broken" is sent in response to a BREAK command.
+  # "breakpoint" is sent when the script hits a debugger-set breakpoint.
+
+  STOPPED-REASON ::= "&lt;stopped-reason&gt;"
+                       ( "broken" | "function-return" | "exception" | "debugger statement" | "breakpoint" | "unknown" )
+                     "&lt;/stopped-reason&gt;" ;
+
+  LINE-NUMBER ::= "&lt;line-number&gt;" UNSIGNED "&lt;/line-number&gt;" ;
+
+  ARGUMENT-OBJECT ::= "&lt;argument-object&gt;" UNSIGNED "&lt;/argument-object&gt;" ;
+
+  VARIABLE-OBJECT ::= "&lt;variable-object&gt;" UNSIGNED "&lt;/variable-object&gt;" ;
+
+  THIS-OBJECT ::= "&lt;this-object&gt;" UNSIGNED "&lt;/this-object&gt;" ;
+
+  ###
+  # Generic context-free data:
+  #
+  # A TAG represents a value passed from the client to the host and
+  # returned from the host with a reply.
+  #
+
+  TAG ::= "&lt;tag&gt;" UNSIGNED "&lt;/tag&gt;" ;
+
+  YESNO ::= "&lt;yes/&gt;" | "&lt;no/&gt;" ;
+
+  STRING ::= "&lt;string&gt;" TEXT "&lt;/string&gt;" ;
+
+  URI ::= "&lt;uri&gt;" TEXT "&lt;/uri&gt;" ;
+
+  ###
+  # Identifiers:  Most of these are globally unique (they're just the
+  # integer representation of some pointer).  THREAD-ID and PARENT-THREAD-ID
+  # are relative to a RUNTIME-ID.  FRAME-ID is relative to the current stack
+  # height in a stopped thread: 0 being the top-most frame (i.e., the most
+  # recently called), 1 being the caller for that, and so on.
+  #
+
+  RUNTIME-ID ::= "&lt;runtime-id&gt;" UNSIGNED "&lt;/runtime-id&gt;" ;
+
+  OBJECT-ID ::= "&lt;object-id&gt;" UNSIGNED "&lt;/object-id&gt;" ;
+
+  # The window ID is shared across scope. Notably, it's the same as in the console logger and window manager
+  # INTERNAL: The value is from Window::id
+
+  WINDOW-ID ::= "&lt;window-id&gt;" UNSIGNED "&lt;/window-id&gt;" ;
+
+  PROTOTYPE-ID ::= "&lt;prototype-id&gt;" UNSIGNED "&lt;/prototype-id&gt;" ;
+
+  FUNCTION-ID ::= "&lt;function-id&gt;" UNSIGNED "&lt;/function-id&gt;" ;
+
+  SCRIPT-ID ::= "&lt;script-id&gt;" UNSIGNED "&lt;/script-id&gt;" ;
+
+  BREAKPOINT-ID ::= "&lt;breakpoint-id&gt;" UNSIGNED "&lt;/breakpoint-id&gt;" ;
+
+  HANDLER-ID ::= "&lt;handler-id&gt;" UNSIGNED "&lt;/handler-id&gt;" ;
+
+  FRAME-ID ::= "&lt;frame-id&gt;" UNSIGNED "&lt;/frame-id&gt;" ;
+
+  THREAD-ID ::= "&lt;thread-id&gt;" UNSIGNED "&lt;/thread-id&gt;" ;
+
+  PARENT-THREAD-ID ::= "&lt;parent-thread-id&gt;" UNSIGNED "&lt;/parent-thread-id&gt;" ;
+
+  ###
+  # Primitive data:
+  #
+  # You may *NOT* assume that an UNSIGNED received from the host fits
+  # in 32 bits, but you may assume that 64 bits is enough.
+  #
+  # You must *NOT* send an UNSIGNED to the host that does not fit in 32
+  # bits unless it was received from the host.
+  #
+
+  UNSIGNED ::= [0-9]+ ;
+
+  TEXT ::= BASE64-ENCODED-DATA | textual-data ;
+
+  BASE64-ENCODED-DATA ::= "&lt;base64-encoded-data&gt;" textual-data "&lt;/base64-encoded-data&gt;" ;
+</pre>
+
+
+<h2>Critique</h2>
+
+<p> The USER-AGENT value is not actually static but can be different
+with every request.  It is strictly speaking an attribute of the
+script, not of the debugging host.  In practice we cannot know the user
+agent used for all scripts, but for "inline" and "linked" we do.</p>
+
+<p> The tagging system is probably too weak to support multiple
+clients: tags will need to contain information about the specific
+client that sent the command.  There are other ways to fix this, e.g., by
+making one (designated) client send a message on behalf of another,
+but fixing the tagging would probably be better.</p>
+
+<p> (The tagging failure may be a generic weakness in the way the
+protocols work, but most services won't have multiple clients so it is
+not so visible elsewhere.)</p>
+
+</body>
+</html>

@@ -1,0 +1,207 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN" 
+          "http://www.w3.org/TR/html4/loose.dtd">
+<html>
+
+<head>
+<link rel=stylesheet href="../../coredoc/coredoc.css" />
+<title>External Certificate Repository</title>
+</head>
+
+<body>
+
+<h1>External Certificate Repository</h1>
+
+<h2>Introduction</h2>
+
+<p>This API allows a product to register an extra Root Certificate Repository that Opera's native SSL implementation 
+can use to validate certificates.</p>
+
+<p>At present there are implementation APIs only defined for the OpenSSL mode of Opera's libssl module.</p>
+
+<h2>Design</h2>
+
+<p>The libssl module object contain the member LibSSL::external_repository, which is a list of all registred repositories. 
+The items in this list are processed in order when a lookup in Opera's own repository fails to provide a known authority certificate
+for an issuer.</p>
+
+<p>The first provider to return a certificate will be used.</p>
+
+<p>The product may temporarily, or permanently disable the local repository using the function g_ssl_api->SetDisableInternalLookupRepository(). 
+Disabling the repository will also disable certificate warnings, and any failure to locate a trusted certificate issuer will result in a 
+fatal TLS negotiation error being reported to the server, and the connection is then closed, and if appropriate, the error reported to the user.</p>
+
+<h2>Basic API</h2>
+
+<p>The fundamental base class, SSL_External_CertRepository_Base is defined in the includefile "modules/libssl/ext_certrepository.h". 
+Only implementations starting from fundamentals will need to reference this class or header file.</p>
+
+<p>The repository will be automatically unregistered when destroyed, and if there are no more repositories registered the local 
+repository will be automatically reactivated if it was disabled.</p>
+
+<h3>SSL_External_CertRepository_Base API</h3>	
+
+<dl>
+<dt>Constructor
+	<dd><p>Sets the library_type enum informing the libssl module what crypto library the API works with. Currently only SSL_External_CertRepository_Base::OpenSSL is defined</p>
+<dt>GetRepositoryType
+	<dd><p>This function returns the repository's library type.</p>
+<dt>SignalLookupCompleted
+	<dd> <p>This function is called by implementations that need to asynchronously retrieve a certificate when the certificate is available, or the operation failed. If the operation failed then the implementation MUST NOT attempt another retrieval immediately, but MUST wait at least several seconds (60 is recommended) before reactivating the attempts to retrieve the certificate.</p>
+<dt>Register
+	<dd> <p>Registers the repository in the module's list of repositories.</p>
+<dt>Unregister
+	<dd><p>Removes the repository from the  module's list of repositories.</p>
+</dl>
+
+<h3>SSL_API</h3>
+
+<dl>
+<dt>RegisterExternalCertLookupRepository
+	<dd><p>Insert the provided repository into the list of repositories. Does not take ownership of the object. Unregistration is done using the Unregister() function in the repository, or by deleting the repository object.</p>
+<dt>SetDisableInternalLookupRepository
+	<dd><p>If the provided value is TRUE, only the registered repository, not the local repository, will be used to 
+		look up certificate issuers. This will also disable UI certificate warnings, and in cases where a certificate is
+		not signed by an issuer in the external repositories, this will be reported as a handshake error due to unknown issuers.</p>
+
+</dl>
+
+<h2>OpenSSL API</h2>
+
+<p>The current version of libssl uses the OpenSSL crypto library for all certificate actions. This API is defined in the include file "modules/libssl/external/openssl/opeay_certrepository.h"</p>
+
+<p>The OpenSSL_External_Repository provide the basic API, as well as some utility functions, to look up certificates in a repository, and OpenSSL_External_Trusted_Repository_Table class provides the API for using a simple table of DER (binary) encoded certificates as the 
+source for the certificates.</p>
+
+<p>Implementors should note that while the API <i>is</i> OpenSSL based, the actual repository the implementation is using does <i>not</i> have to be
+based on OpenSSL, but in such cases the implementation must convert the provided datastructures to/from X509 to the repository's representation 
+using binary arrays. Utilities for this, including checking for whether the certificate was issued by the candidate is provided in the API</p>
+
+<p>The API allows the provider to asynchronously retrieve a certificate that is not in the repository (all such retrievals should be non-blocking).</p>
+
+<p>There is also nothing that prevents the implementation to perform independent verification of the certificate, but in such cases a negative result cannot be communicated back to Opera. Provided that the verification code uses OpenSSL, the implementation can do such verification on a copy of the context and certificate provided, and in such cases a successful signature verification for each certificate will be registered in the X509 objects, and Opera will not 
+duplicate the signature verification.</p>
+
+<h3>OpenSSL_External_Repository</h3>
+
+<dl>
+<dt>LookupCertificate
+	<dd><p>This is the function called by Opera's SSL code to retrieve the issuer for the provided certificate. It provides the location to 
+		store the returned X509 object of the issuer certificate, and the current certificate being verified and the context in which it is done.</p>
+		
+		<p>The function has the same API as the OpenSSL X509_STORE_CTX::get_issuer function.</p>
+		
+		<p>The implementation may return -1 to indicate an asynchronous lookup event, in which case errors MUST NOT be registered in the OpenSSL error system. 
+		When the Lookup is completed or times out (timeout should be less than 20 seconds) the function SignalLookupCompleted must be called. If the lookup
+		operation failed, then the implementation MUST wait several seconds (minimum 60 is recommended) before attempting a new lookup. Opera may abort the lookup
+		without notifying the implementation, for example if the connection is closed. Implementations MUST tolerate multiple lookups for the same certificate while
+		doing a dalayed lookup.</p>
+		 
+<dt>ConvertBinaryToX509 (static utility function)
+	<dd><p>Converts a DER encoded certificate stored in a binary buffer to an X509 object. The caller must use X509_free() to release it.</p>
+<dt>ConvertX509ToBinary (static utility function)
+	<dd><p>Converts an X509 object to a DER encoded certificate stored in an allocated binary buffer. The caller must free the buffer using OPENSSL_free().</p>
+<dt>CheckACandidate  (static utility function)
+	<dd><p>Checks if the candidate certificate issued the certificate currently being investigated</p>
+<dt>CheckACandidate  (static utility function)
+	<dd><p>Checks if the candidate certificate (stored as a DER encoded binary buffer) issued the certificate currently being investigated, and if 
+		so returns the allocated X509 object. The  caller must use X509_free() to release it. Return values are the same as for the LookupCertificate
+		function.</p>
+</dl>
+
+<h3>OpenSSL_External_Trusted_Repository_Table</h3>
+
+<p>This repository implementation is intialized with a table of certificate arrays, each array containing a single 
+DER encoded certificate.</p>
+
+<p>The structure (External_RepositoryItem) of the table entries is defined in "modules/libssl/repository_item.h".</p>
+
+<dl>
+	
+<dt>Create (static function)
+	<dd><p>Allocates and constructs a repository using the provided table of certificates.</p>
+<dt>Constructor
+	<dd><p>Initializes the object with the repository in the table provided by the caller.</p>
+<dt>LookupCertificate
+	<dd><p>Loops through the repository list to find the issuer of the certificate, if it's in the list.</p>
+</dl>
+		 
+<h2>OpenSSL based pseudo code implementation</h2>
+
+<pre>
+#include &quot;modules/libssl/sslbase.h&quot;
+#include &quot;modules/libssl/ssl_api.h&quot;
+#include &quot;modules/libssl/external/openssl/eayhead.h&quot;
+#include &quot;modules/libopeay/openssl/x509.h&quot;
+#include &quot;modules/libssl/external/openssl/opeay_certrepository.h&quot;
+
+class MyCertrepository : OpenSSL_External_Repository
+{
+private:
+	// Internal structures
+public:
+	// Constructor and destructor
+
+	// The lookup function called by the Opera verification code
+	virtual int LookupCertificate(X509 **issuer, X509_STORE_CTX *ctx, X509 *x)
+	{
+		OP_ASSERT(issuer) // Pointer to Return location
+		OP_ASSERT(ctx) // Context for the verification, contains the entire chain and utility functions
+		OP_ASSERT(x) // The certificate whose issuer we want to find
+		
+		// Using a temporary variable to be on the safe side
+		X509 *temp_issuer = NULL;
+		
+		// Call the specific lookup repository. The API used here is based on OpenSSL, and may vary
+		// return values are represented as one of 
+		//		FoundCertificate	// A certificate was found and an X509 certificate is returned in temp_issuer
+		//		WaitHaveToDownload 	// A certificate is known, but have to be downloaded first, will call SignalLookupCompleted when finished
+		//		DidNotFindAMatch	// No issuer for the certificate in x
+		int return_status = ProductSpecificLookupFunction(&amp;temp_issuer, ctx, x);
+		
+		switch(return_status)
+		{
+			case WaitHaveToDownload:
+				OP_ASSERT(ERR_peek_error() == 0); // No errors allowed
+				OP_ASSERT(temp_issuer == NULL); // No certificate returned
+			
+				return -1; // return code indicating (in combination with no error) that a delayed lookup is in progress
+				
+			case FoundCertificate:
+				OP_ASSERT(ERR_peek_error() == 0); // No errors allowed
+				OP_ASSERT(temp_issuer != NULL); // Must exist
+				OP_ASSERT(ctx->check_issued(x, temp_issuer)); // If correct certificate this will be true
+				
+				*issuer = temp_issuer; // return the issuer
+				temp_issuer = NULL;
+				return 1;  // Return "Yes we found one"
+				
+			case DidNotFindAMatch:
+				OP_ASSERT(ERR_peek_error() == 0);// No errors allowed
+				OP_ASSERT(temp_issuer == NULL);// No certificate returned
+				return 0; // Return "Not found" status
+				
+			case EncounteredError:
+			default: // Just to be on the safe side
+				OP_ASSERT(ERR_peek_error() != 0); // There must be an error
+				OP_ASSERT(temp_issuer == NULL);// No certificate returned
+				return -1; // Return error code
+		}
+	}
+	
+	// The listener must call this when an asynchronous lookup completes, or times out
+	void RemoteLookupCompleted()
+	{
+		SignalLookupCompleted(); // Pass on signal to certificate verifier
+	}
+};
+
+// Construct the repository object
+MyCertrepository repository;
+
+repository.Register(); // Register it
+
+repository.Unregister(); // Unregister it
+
+</pre>
+
+

@@ -1,0 +1,618 @@
+/* -*- Mode: c; tab-width: 4; c-basic-offset: 4 -*-
+ *
+ * Copyright (C) 2005-2009 Opera Software AS.  All rights reserved.
+ *
+ * This file is part of the Opera web browser.
+ * It may only be distributed as agreed with Opera Software.
+ */
+
+group "mime.TextMultiPartParser";
+
+/* Additional tests for modules/mime/binary_mpp.{h,cpp}
+ *
+ * Note that most of the selftests for this parser is done by multipart.ot
+ * by loading special testcase files from the testfiles/multipart_valid and
+ * testfiles/multipart_invalid subdirectories. See multipart.ot for more info.
+ */
+
+include "modules/mime/multipart_parser/text_mpp.h";
+
+global
+{
+	class TestMultiPartParser_Listener : public MultiPartParser_Listener
+	{
+		OpString8 warning;
+	public:
+		virtual void OnMultiPartParserWarning(AbstractMultiPartParser::Warning reason, unsigned int offset, unsigned int part) {
+			if (warning.HasContent()) warning.Append(",");
+			warning.Append(AbstractMultiPartParser::warningString(reason));
+		}
+		const char* getWarnings() {
+			return warning.HasContent() ? warning.CStr() : "";
+		}
+	};
+}
+
+subtest TestEqualHeaders(HeaderList* headers, const char* expectedHeaders)
+{
+	HeaderList expectedHeaderList;
+	expectedHeaderList.SetValueL(expectedHeaders);
+	HeaderEntry *he1 = headers->First();
+	HeaderEntry *he2 = expectedHeaderList.First();
+	while (he1 && he2) {
+		// he1 and he2 should be identical.
+		if (op_strcmp(he1->Name(),  he2->Name()) != 0 ||
+			op_strcmp(he1->Value(), he2->Value()) != 0)
+			output("\nExpected header entry: \"%s: %s\", found: \"%s: %s\"\n",he2->Name(),he2->Value(),he1->Name(),he1->Value());
+		verify_string(he1->Name(),  he2->Name());
+		verify_string(he1->Value(), he2->Value());
+
+		// Go to next entry in hl1 and hl2.
+		he1 = he1->Suc();
+		he2 = he2->Suc();
+	}
+	// At this point, both hl1 and hl2 should be exhausted, thus he1 and he2 should both be nullpointers.
+	if (he1)
+		output("\nUnexpected header entry: \"%s: %s\" found\n",he1->Name(),he1->Value());
+	if (he2)
+		output("\nExpected header entry: \"%s: %s\" not found\n",he2->Name(),he2->Value());
+	verify(!he1 && !he2);
+}
+
+/* Verify successful parsing of the given TextMultiPartParser object into
+ * which a complete binary multipart document has just been loaded.
+ */
+subtest TestValidTmp(const char *input, const char *boundary, const char *tcName, unsigned int numParts,
+		const char *expectedHeaders[], const char *expectedData[], const char* expectedWarnings, int inc)
+{
+	HeaderList *headers = 0;
+	TestMultiPartParser_Listener listener;
+	TextMultiPartParser tmp(boundary, 0, expectedWarnings ? &listener : 0);
+	int pos = 0, len = input ? (int)op_strlen(input) : 0;
+	char partBuffer[1000]; /* ARRAY OK roarl 2008-10-28 */
+
+// ***	output("Testing valid TMP document '%s' with %u expected valid parts.\n", tcName, numParts);
+	if (numParts == 0) {
+		tmp.load(input, len);
+		tmp.loadingFinished();
+		verify(tmp.getState() == TextMultiPartParser::STATE_FINISHED_MULTIPART);
+	}
+
+	// Verify each expected valid part.
+	unsigned int i;
+	for (i=0; i<numParts; i++) {
+		verify(!tmp.noMoreParts());
+		while (!tmp.beginNextPart()) {
+			verify(pos < len);
+			if (inc > len-pos)
+				inc = len-pos;
+			tmp.load(input+pos, inc);
+			pos += inc;
+			if (pos == len) {
+				tmp.loadingFinished();
+				// Verify that parser has successfully parsed the entire document.
+				verify(tmp.getState() == TextMultiPartParser::STATE_FINISHED_MULTIPART);
+			}
+		}
+
+		// Verify each part's sequence number.
+		verify((int)i+1 == tmp.getCurrentPartNumber());
+
+		// Verify part headers.
+		headers = tmp.getCurrentPartHeaders();
+		verify(headers != 0);
+		if (expectedHeaders)
+			verify(TestEqualHeaders(headers, expectedHeaders[i]));
+		OP_DELETE(headers);
+		headers = 0;
+
+		// Verify data
+		char *data = 0;
+		unsigned int dataLength;
+		if (inc > 9999) {
+			dataLength = tmp.getCurrentPartDataPointer(data);
+			verify(dataLength == 0 || data != 0);
+		} else {
+			data = partBuffer;
+			dataLength = tmp.getCurrentPartData(data, 1000);
+			while (!tmp.noMoreCurrentPartData()) {
+				verify(pos < len);
+				if (inc > len-pos)
+					inc = len-pos;
+				tmp.load(input+pos, inc);
+				pos += inc;
+				if (pos == len) {
+					tmp.loadingFinished();
+					// Verify that parser has successfully parsed the entire document.
+					verify(tmp.getState() == TextMultiPartParser::STATE_FINISHED_MULTIPART);
+				}
+				dataLength += tmp.getCurrentPartData(data+dataLength, 1000-dataLength);
+			}
+		}
+		if (expectedData) {
+			if (op_strlen(expectedData[i]) != dataLength ||
+				op_memcmp(expectedData[i], data, dataLength) != 0)
+				output("\nExpected data: \"%s\", found: \"%.*s\". (inc=%d)\n", expectedData[i], dataLength, data, inc);
+			verify(op_strlen(expectedData[i]) == dataLength); // Verify correct length
+			verify(op_memcmp(expectedData[i], data, dataLength) == 0); // Verify that data is correct.
+		}
+		if (inc > 9999)
+			tmp.consumeCurrentPartData(dataLength);
+
+		tmp.finishCurrentPart();
+	}
+	if (pos <= len) {
+		tmp.load(input+pos, len-pos);
+		tmp.loadingFinished();
+		// Verify that parser has successfully parsed the entire document.
+		verify(tmp.getState() == TextMultiPartParser::STATE_FINISHED_MULTIPART);
+	}
+
+	// Verify number of parts.
+	verify(i == numParts);
+	verify(tmp.noMoreParts());
+	if (expectedWarnings)
+	{
+		if (op_strcmp(listener.getWarnings(), expectedWarnings)!=0)
+			output("\nWarning was: \"%s\". (inc=%d)\n", listener.getWarnings(), inc);
+		verify_string(listener.getWarnings(), expectedWarnings);
+	}
+}
+finally
+{
+	OP_DELETE(headers);
+}
+
+table test_multi_part_document(
+    const char* testname,
+    const char *input,
+    const char *boundary,
+    const char *tcName,
+    unsigned int numParts,
+    const char *expectedHeaders1, const char *expectedHeaders2,
+    const char *expectedBody1, const char *expectedBody2,
+    const char* expectedWarnings)
+{
+    { "null TMP document", 0, 0, "null", 0, 0, 0, 0, 0, 0 },
+    { "empty TMP document", "", 0, "empty", 0, 0, 0, 0, 0, 0 },
+    { "missing newlines at start and end of multipart",
+            "--boundary\n" // Valid
+            "data..."
+            "\n--boundary", // Valid
+            0, "newline1", 1, 0, 0, 0, 0, 0 },
+
+    { "combination of CRLF, LF, and CR in boundaries",
+            // Valid
+            "\r\n--boundary\r\n" "1st part"
+            "\r\n--boundary\n"   "2nd part"
+            "\r\n--boundary\r"   "3rd part"
+            "\n--boundary\r\n"   "4th part"
+            "\n--boundary\n"     "5th part"
+            "\n--boundary\r"     "6th part"
+            "\r--boundary\r\n"   "7th part"
+            "\r--boundary\n"     "8th part"
+            "\r--boundary\r"     "9th part"
+
+            // Invalid
+            "...data..." "--boundary\r\n"
+            "...data..." "--boundary\n"
+            "...data..." "--boundary\r"
+            "\r\n--boundary" "...data..."
+            "\n--boundary" "...data..."
+            "\r--boundary" "...data..."  // Still 9th part
+
+            "\r\n--boundary\n" "\r--boundary\r\n" // 2 boundaries, 11th part
+            "\r\n--boundary\r" "\n--boundary\r\n" // 2 boundaries (with "shared" CRLF), 13th part
+            "And here is the last boundary"
+            "\n--boundary--\r"
+            "\r\r\r\r\r\nThis is epilogue",
+            0, "newline2", 13, 0, 0, 0, 0, 0 },
+
+    { "last boundary handling #1",
+            "\r\n--boundary\r\n" "1st part"
+            "\r\n--boundary--\r\n",
+            0, "lastboundary1", 1, 0, 0, 0, 0, 0 },
+
+    { "last boundary handling #2",
+            "--boundary\r\n" "1st part"
+            "\r\n--boundary--",
+            0, "lastboundary2", 1, 0, 0, 0, 0, 0 },
+
+    { "last boundary handling #3",
+            "\r--boundary\r" "1st part"
+            "\r--boundary--\r",
+            0, "lastboundary3", 1, 0, 0, 0, 0, 0 },
+
+    { "last boundary handling #4",
+            "\r--boundary\r" "1st part"
+            "\r--boundary--         ",
+            0, "lastboundary4", 1, 0, 0, 0, 0, 0 },
+
+    { "last boundary handling #5",
+            "\r\n--boundary\r\n" "1st part"
+            "\r\n--boundary--foobar\r\n" "Still 1st part"
+            "\r\n--boundary\r\n" "2nd part"
+            "\r\n--boundary--",
+            0, "lastboundary5", 2, 0, 0, 0, 0, 0 },
+
+    { "last boundary handling #6",
+            "\r--boundary\r" "1st part"
+            "\r--boundary-\r"
+            "\r--boundary-\r"
+            "\r--boundary-\r" "Still 1st part"
+            "\r--boundary\r" "2nd part"
+            "\r--boundary--",
+            0, "lastboundary6", 2, 0, 0, 0, 0, 0 },
+
+    { "last boundary handling #7",
+            "\r--boundary\r" "1st part"
+            "\r--boundary-\r"
+            "\r--boundary-\r"
+            "\r--boundary-\r" "Still 1st part"
+            "\r--boundary\r" "2nd part"
+            "\r--boundary--",
+            0, "lastboundary7", 2, 0, 0, 0, 0, 0 },
+
+    { "last boundary handling #8",
+            "\r--boundary\r" "1st part"
+            "\r--boundary-",
+            0, "lastboundary8", 1, 0, 0, 0, 0, 0 },
+
+    { "crazy document",
+            "--Boundary0123456789'()+_-,./:= ?\n"
+            "Content-Type: text/plain\n"
+            "Content-Transfer-Encoding: 7bit\n"
+            "\n"
+            "--Boundary0123456789'()+_-,./:= ?     This is not a boundary\n"
+            "--Boundary0123456789'()+_-,./:= ?--   Nor is this\n"
+            "--Boundary  ...not even close to a boundary\n"
+            "\n"
+            "--Boundary0123456789'()+_-,./:= ?\n   This is actually a boundary\n"
+            "--Boundary0123456789'()+_-,./:= ?--",
+            0, "crazy", 2, 0, 0, 0, 0, 0 },
+
+    { "100 empty parts",
+            "\r\n--boundary\r\n" // Valid
+            "\r\n--boundary\r\n" // Valid
+            "\r\n--boundary\r\n" // Valid
+            "\r\n--boundary\r\n" // Valid
+            "\r\n--boundary\r\n" // Valid
+            "\r\n--boundary\r\n" // Valid
+            "\r\n--boundary\r\n" // Valid
+            "\r\n--boundary\r\n" // Valid
+            "\r\n--boundary\r\n" // Valid
+            "\r\n--boundary\r\n" // Valid
+            "\r\n--boundary\r\n" // Valid
+            "\r\n--boundary\r\n" // Valid
+            "\r\n--boundary\r\n" // Valid
+            "\r\n--boundary\r\n" // Valid
+            "\r\n--boundary\r\n" // Valid
+            "\r\n--boundary\r\n" // Valid
+            "\r\n--boundary\r\n" // Valid
+            "\r\n--boundary\r\n" // Valid
+            "\r\n--boundary\r\n" // Valid
+            "\r\n--boundary\r\n" // Valid
+            "\r\n--boundary\r\n" // Valid
+            "\r\n--boundary\r\n" // Valid
+            "\r\n--boundary\r\n" // Valid
+            "\r\n--boundary\r\n" // Valid
+            "\r\n--boundary\r\n" // Valid
+            "\r\n--boundary\r\n" // Valid
+            "\r\n--boundary\r\n" // Valid
+            "\r\n--boundary\r\n" // Valid
+            "\r\n--boundary\r\n" // Valid
+            "\r\n--boundary\r\n" // Valid
+            "\r\n--boundary\r\n" // Valid
+            "\r\n--boundary\r\n" // Valid
+            "\r\n--boundary\r\n" // Valid
+            "\r\n--boundary\r\n" // Valid
+            "\r\n--boundary\r\n" // Valid
+            "\r\n--boundary\r\n" // Valid
+            "\r\n--boundary\r\n" // Valid
+            "\r\n--boundary\r\n" // Valid
+            "\r\n--boundary\r\n" // Valid
+            "\r\n--boundary\r\n" // Valid
+            "\r\n--boundary\r\n" // Valid
+            "\r\n--boundary\r\n" // Valid
+            "\r\n--boundary\r\n" // Valid
+            "\r\n--boundary\r\n" // Valid
+            "\r\n--boundary\r\n" // Valid
+            "\r\n--boundary\r\n" // Valid
+            "\r\n--boundary\r\n" // Valid
+            "\r\n--boundary\r\n" // Valid
+            "\r\n--boundary\r\n" // Valid
+            "\r\n--boundary\r\n" // Valid
+            "\r\n--boundary\r\n" // Valid
+            "\r\n--boundary\r\n" // Valid
+            "\r\n--boundary\r\n" // Valid
+            "\r\n--boundary\r\n" // Valid
+            "\r\n--boundary\r\n" // Valid
+            "\r\n--boundary\r\n" // Valid
+            "\r\n--boundary\r\n" // Valid
+            "\r\n--boundary\r\n" // Valid
+            "\r\n--boundary\r\n" // Valid
+            "\r\n--boundary\r\n" // Valid
+            "\r\n--boundary\r\n" // Valid
+            "\r\n--boundary\r\n" // Valid
+            "\r\n--boundary\r\n" // Valid
+            "\r\n--boundary\r\n" // Valid
+            "\r\n--boundary\r\n" // Valid
+            "\r\n--boundary\r\n" // Valid
+            "\r\n--boundary\r\n" // Valid
+            "\r\n--boundary\r\n" // Valid
+            "\r\n--boundary\r\n" // Valid
+            "\r\n--boundary\r\n" // Valid
+            "\r\n--boundary\r\n" // Valid
+            "\r\n--boundary\r\n" // Valid
+            "\r\n--boundary\r\n" // Valid
+            "\r\n--boundary\r\n" // Valid
+            "\r\n--boundary\r\n" // Valid
+            "\r\n--boundary\r\n" // Valid
+            "\r\n--boundary\r\n" // Valid
+            "\r\n--boundary\r\n" // Valid
+            "\r\n--boundary\r\n" // Valid
+            "\r\n--boundary\r\n" // Valid
+            "\r\n--boundary\r\n" // Valid
+            "\r\n--boundary\r\n" // Valid
+            "\r\n--boundary\r\n" // Valid
+            "\r\n--boundary\r\n" // Valid
+            "\r\n--boundary\r\n" // Valid
+            "\r\n--boundary\r\n" // Valid
+            "\r\n--boundary\r\n" // Valid
+            "\r\n--boundary\r\n" // Valid
+            "\r\n--boundary\r\n" // Valid
+            "\r\n--boundary\r\n" // Valid
+            "\r\n--boundary\r\n" // Valid
+            "\r\n--boundary\r\n" // Valid
+            "\r\n--boundary\r\n" // Valid
+            "\r\n--boundary\r\n" // Valid
+            "\r\n--boundary\r\n" // Valid
+            "\r\n--boundary\r\n" // Valid
+            "\r\n--boundary\r\n" // Valid
+            "\r\n--boundary\r\n" // Valid
+            "\r\n--boundary\r\n" // Valid
+            "\r\n--boundary\r\n" // Valid
+            "\r\n--boundary--\r\n", // Valid
+            0, "100_empty_parts", 100, 0, 0, 0, 0, 0 },
+
+    { "100 small parts with 1 header each",
+            "preamble..."
+            "\r\n--boundary\r\nContent-Type: text/plain\r\n\r\nPart #1" // Valid
+            "\r\n--boundary\r\nContent-Type: text/plain\r\n\nPart #2" // Valid
+            "\r\n--boundary\r\nContent-Type: text/plain\r\n\rPart #3" // Valid
+            "\r\n--boundary\r\nContent-Type: text/plain\n\r\nPart #4" // Valid
+            "\r\n--boundary\r\nContent-Type: text/plain\n\nPart #5" // Valid
+            "\r\n--boundary\r\nContent-Type: text/plain\n\rPart #6" // Valid
+            "\r\n--boundary\r\nContent-Type: text/plain\r\r\nPart #7" // Valid
+            // "\r\n--boundary\r\nContent-Type: text/plain\r\nPart #7" // Invalid
+            "\r\n--boundary\r\nContent-Type: text/plain\r\rPart #8" // Valid
+            "\r\n--boundary\nContent-Type: text/plain\r\n\r\nPart #9" // Valid
+            "\r\n--boundary\nContent-Type: text/plain\r\n\nPart #10" // Valid
+            "\r\n--boundary\nContent-Type: text/plain\r\n\rPart #11" // Valid
+            "\r\n--boundary\nContent-Type: text/plain\n\r\nPart #12" // Valid
+            "\r\n--boundary\nContent-Type: text/plain\n\nPart #13" // Valid
+            "\r\n--boundary\nContent-Type: text/plain\n\rPart #14" // Valid
+            "\r\n--boundary\nContent-Type: text/plain\r\r\nPart #15" // Valid
+            "\r\n--boundary\nContent-Type: text/plain\r\nPart #16" // Valid
+            "\r\n--boundary\rContent-Type: text/plain\r\n\r\nPart #17" // Valid
+            "\r\n--boundary\rContent-Type: text/plain\r\n\nPart #18" // Valid
+            "\r\n--boundary\rContent-Type: text/plain\r\n\rPart #19" // Valid
+            "\r\n--boundary\rContent-Type: text/plain\n\r\nPart #20" // Valid
+            "\r\n--boundary\rContent-Type: text/plain\n\nPart #21" // Valid
+            "\r\n--boundary\rContent-Type: text/plain\n\rPart #22" // Valid
+            "\r\n--boundary\rContent-Type: text/plain\r\r\nPart #23" // Valid
+            "\r\n--boundary\rContent-Type: text/plain\r\rPart #24" // Valid
+            "\n--boundary\r\nContent-Type: text/plain\r\n\r\nPart #25" // Valid
+            "\n--boundary\r\nContent-Type: text/plain\r\n\nPart #26" // Valid
+            "\n--boundary\r\nContent-Type: text/plain\r\n\rPart #27" // Valid
+            "\n--boundary\r\nContent-Type: text/plain\n\r\nPart #28" // Valid
+            "\n--boundary\r\nContent-Type: text/plain\n\nPart #29" // Valid
+            "\n--boundary\r\nContent-Type: text/plain\n\rPart #30" // Valid
+            "\n--boundary\r\nContent-Type: text/plain\r\r\nPart #31" // Valid
+            "\n--boundary\r\nContent-Type: text/plain\r\rPart #32" // Valid
+            "\n--boundary\nContent-Type: text/plain\r\n\r\nPart #33" // Valid
+            "\n--boundary\nContent-Type: text/plain\r\n\nPart #34" // Valid
+            "\n--boundary\nContent-Type: text/plain\r\n\rPart #35" // Valid
+            "\n--boundary\nContent-Type: text/plain\n\r\nPart #36" // Valid
+            "\n--boundary\nContent-Type: text/plain\n\nPart #37" // Valid
+            "\n--boundary\nContent-Type: text/plain\n\rPart #38" // Valid
+            "\n--boundary\nContent-Type: text/plain\r\r\nPart #39" // Valid
+            "\n--boundary\nContent-Type: text/plain\r\rPart #40" // Valid
+            "\n--boundary\rContent-Type: text/plain\r\n\r\nPart #41" // Valid
+            "\n--boundary\rContent-Type: text/plain\r\n\nPart #42" // Valid
+            "\n--boundary\rContent-Type: text/plain\r\n\rPart #43" // Valid
+            "\n--boundary\rContent-Type: text/plain\n\r\nPart #44" // Valid
+            "\n--boundary\rContent-Type: text/plain\n\nPart #45" // Valid
+            "\n--boundary\rContent-Type: text/plain\n\rPart #46" // Valid
+            "\n--boundary\rContent-Type: text/plain\r\r\nPart #47" // Valid
+            "\n--boundary\rContent-Type: text/plain\r\rPart #48" // Valid
+            "\r--boundary\r\nContent-Type: text/plain\r\n\r\nPart #49" // Valid
+            "\r--boundary\r\nContent-Type: text/plain\r\n\nPart #50" // Valid
+            "\r--boundary\r\nContent-Type: text/plain\r\n\rPart #51" // Valid
+            "\r--boundary\r\nContent-Type: text/plain\n\r\nPart #52" // Valid
+            "\r--boundary\r\nContent-Type: text/plain\n\nPart #53" // Valid
+            "\r--boundary\r\nContent-Type: text/plain\n\rPart #54" // Valid
+            "\r--boundary\r\nContent-Type: text/plain\r\r\nPart #55" // Valid
+            "\r--boundary\r\nContent-Type: text/plain\r\rPart #56" // Valid
+            "\r--boundary\nContent-Type: text/plain\r\n\r\nPart #57" // Valid
+            "\r--boundary\nContent-Type: text/plain\r\n\nPart #58" // Valid
+            "\r--boundary\nContent-Type: text/plain\r\n\rPart #59" // Valid
+            "\r--boundary\nContent-Type: text/plain\n\r\nPart #60" // Valid
+            "\r--boundary\nContent-Type: text/plain\n\nPart #61" // Valid
+            "\r--boundary\nContent-Type: text/plain\n\rPart #62" // Valid
+            "\r--boundary\nContent-Type: text/plain\r\r\nPart #63" // Valid
+            "\r--boundary\nContent-Type: text/plain\r\rPart #64" // Valid
+            "\r--boundary\rContent-Type: text/plain\r\n\r\nPart #65" // Valid
+            "\r--boundary\rContent-Type: text/plain\r\n\nPart #66" // Valid
+            "\r--boundary\rContent-Type: text/plain\r\n\rPart #67" // Valid
+            "\r--boundary\rContent-Type: text/plain\n\r\nPart #68" // Valid
+            "\r--boundary\rContent-Type: text/plain\n\nPart #69" // Valid
+            "\r--boundary\rContent-Type: text/plain\n\rPart #70" // Valid
+            "\r--boundary\rContent-Type: text/plain\r\r\nPart #71" // Valid
+            "\r--boundary\rContent-Type: text/plain\r\rPart #72" // Valid
+            "\r\n--boundary\r\nContent-Type: text/plain\r\n\r\nPart #73" // Valid
+            "\r\n--boundary\r\nContent-Type: text/plain\r\n\r\nPart #74" // Valid
+            "\r\n--boundary\r\nContent-Type: text/plain\r\n\r\nPart #75" // Valid
+            "\r\n--boundary\r\nContent-Type: text/plain\r\n\r\nPart #76" // Valid
+            "\r\n--boundary\r\nContent-Type: text/plain\r\n\r\nPart #77" // Valid
+            "\r\n--boundary\r\nContent-Type: text/plain\r\n\r\nPart #78" // Valid
+            "\r\n--boundary\r\nContent-Type: text/plain\r\n\r\nPart #79" // Valid
+            "\r\n--boundary\r\nContent-Type: text/plain\r\n\r\nPart #80" // Valid
+            "\r\n--boundary\r\nContent-Type: text/plain\r\n\r\nPart #81" // Valid
+            "\r\n--boundary\r\nContent-Type: text/plain\r\n\r\nPart #82" // Valid
+            "\r\n--boundary\r\nContent-Type: text/plain\r\n\r\nPart #83" // Valid
+            "\r\n--boundary\r\nContent-Type: text/plain\r\n\r\nPart #84" // Valid
+            "\r\n--boundary\r\nContent-Type: text/plain\r\n\r\nPart #85" // Valid
+            "\r\n--boundary\r\nContent-Type: text/plain\r\n\r\nPart #86" // Valid
+            "\r\n--boundary\r\nContent-Type: text/plain\r\n\r\nPart #87" // Valid
+            "\r\n--boundary\r\nContent-Type: text/plain\r\n\r\nPart #88" // Valid
+            "\r\n--boundary\r\nContent-Type: text/plain\r\n\r\nPart #89" // Valid
+            "\r\n--boundary\r\nContent-Type: text/plain\r\n\r\nPart #90" // Valid
+            "\r\n--boundary\r\nContent-Type: text/plain\r\n\r\nPart #91" // Valid
+            "\r\n--boundary\r\nContent-Type: text/plain\r\n\r\nPart #92" // Valid
+            "\r\n--boundary\r\nContent-Type: text/plain\r\n\r\nPart #93" // Valid
+            "\r\n--boundary\r\nContent-Type: text/plain\r\n\r\nPart #94" // Valid
+            "\r\n--boundary\r\nContent-Type: text/plain\r\n\r\nPart #95" // Valid
+            "\r\n--boundary\r\nContent-Type: text/plain\r\n\r\nPart #96" // Valid
+            "\r\n--boundary\r\nContent-Type: text/plain\r\n\r\nPart #97" // Valid
+            "\r\n--boundary\r\nContent-Type: text/plain\r\n\r\nPart #98" // Valid
+            "\r\n--boundary\r\nContent-Type: text/plain\r\n\r\nPart #99" // Valid
+            "\r\n--boundary\r\nContent-Type: text/plain\r\n\r\nPart #100" // Valid
+            "\r\n--boundary--\r\n" // Valid
+            "epilogue...",
+            0, "100_small_parts", 100, 0, 0, 0, 0, 0 },
+
+    { "part headers and content 1",
+            // Testig the self-test, so to speak
+            "--boundary\r\n"
+            "Content-Type: text/plain\r\n"
+            "\r\n"
+            "Opera!\r\n"
+            "\r\n"
+            "--boundary\r\n"
+            "Content-Type: text/plain\r\n"
+            "\r\n"
+            "Opera!\r\n"
+            "--boundary--\r\n",
+            "boundary", "headers_and_content_1", 2,
+            "Content-Type: text/plain", "Content-Type: text/plain", // headers
+            "Opera!\r\n", "Opera!", // bodies
+            /* warnings: */ "" },
+
+    { "part headers and content 2",
+            "--boundary\r\n"
+            "Content-Type: multipart/mixed; boundary=\"A    \r\n"
+            "     \r\n"
+            "     B\"\r\n"
+            "\r\n"
+            "Opera!\r\n"
+            "--boundary--\r\n",
+            "boundary", "headers_and_content_2", 1,
+            "Content-Type: multipart/mixed; boundary=\"A              B\"", 0, // headers
+            "Opera!", 0, // bodies
+            /* warnings: */ "" },
+
+    { "boundary that starts with two dashes",
+            "----boundary\r\n"      // Boundary should be shortened to "--boundary", with warning
+            "Content-Type: text/plain\r\n"
+            "\r\n"
+            "Opera!\r\n"
+            "--boundary\r\n"        // Should not shorten the boundary again
+            "------boundary--\r\n"  // Should not accept the original boundary any more
+            "\r\n"
+            "----boundary--\r\n",
+            "----boundary", "headers_and_content_1", 1,
+            "Content-Type: text/plain", 0, // headers
+            "Opera!\r\n--boundary\r\n------boundary--\r\n", 0, // bodies
+            /* warnings: */ "INVALID_BOUNDARY" },
+
+    { "empty body 1",
+            "--boundary\r\n\r\n\r\n--boundary--\r\n",
+            "boundary", "empty_body_1", 1, "", 0, "", 0, "" },
+
+    { "empty body 2",
+            "--boundary\r\n\r\n\r\n--boundary--",
+            "boundary", "empty_body_2", 1, "", 0, "", 0, "" },
+
+    { "empty body 3",
+            "--boundary\r\n\r\n--boundary--\r\n",
+            "boundary", "empty_body_3", 1, "", 0, "", 0,
+            "INCOMPLETE_PART_HEADER" },
+
+    { "empty body 4",
+            "--boundary\r\n--boundary--\r\n",
+            "boundary", "empty_body_4", 1, "", 0, "", 0,
+            "INCOMPLETE_PART_HEADER" },
+
+    { "empty body 5",
+            "--boundary\r\n--boundary--",
+            "boundary", "empty_body_5", 1, "", 0, "", 0,
+            "INCOMPLETE_PART_HEADER" },
+
+    { "empty body 6",
+            "--boundary\r\nContent-Type: text/plain\r\n--boundary--\r\n",
+            "boundary", "empty_body_6", 1,
+            "Content-Type: text/plain", 0, "", 0,
+            "INCOMPLETE_PART_HEADER" },
+
+    { "empty body 7",
+            "--boundary\r\nContent-Type: text/plain\r\n--boundary--",
+            "boundary", "empty_body_7", 1,
+            "Content-Type: text/plain", 0, "", 0,
+            "INCOMPLETE_PART_HEADER" },
+
+    { "empty body 8",
+            "--boundary\r\nContent-Type: text/plain\r\n\r\n--boundary--",
+            "boundary", "empty_body_8", 1,
+            "Content-Type: text/plain", 0, "", 0,
+            "INCOMPLETE_PART_HEADER" },
+
+    { "empty body 9",
+            "--boundary\r\nContent-Type: text/plain\r\n\r\n\r\n--boundary--",
+            "boundary", "empty_body_8", 1,
+            "Content-Type: text/plain", 0, "", 0, "" },
+
+    { "empty header",
+            "--boundary\n\nb\n--boundary--\n",
+            "boundary", "empty_header", 1,
+            "", 0, "b", 0, "" },
+
+    { "unfinished part 1",
+            "--boundary\r\nContent-Type: text/plain\r\n",
+            "boundary", "unfinished_part_1", 1,
+            "Content-Type: text/plain", 0, "", 0,
+            "INCOMPLETE_PART_HEADER,UNFINISHED_PART" },
+
+    { "unfinished part 2",
+            "--boundary\r\nContent-Type: text/plain\r\n\r\nOpera!\r\n",
+            "boundary", "unfinished_part_2", 1,
+            "Content-Type: text/plain", 0,
+            "Opera!\r\n", 0,
+            "UNFINISHED_PART" },
+
+    { "zero parts with final boundary",
+    		"--boundary--\r\n",
+    		"boundary", "zero_parts", 0, 0, 0, 0, 0, 0 }
+}
+
+/* Verify successful parsing of the given TextMultiPartParser object into
+ * which a complete binary multipart document has just been loaded.
+ */
+foreach (testname, input, boundary, tcName, numParts, expectedHeaders1, expectedHeaders2, expectedBody1, expectedBody2, expectedWarnings) from test_multi_part_document
+{
+    test("Testing " testname)
+    {
+        const char* data = input;
+        const char** headers = 0;
+        const char* expectedHeaders[2] =	// ARRAY OK 2011-06-01 markuso
+            { expectedHeaders1, expectedHeaders2 };
+        if (expectedHeaders1 || expectedHeaders2) headers = expectedHeaders;
+        const char** bodies = 0;
+        const char* expectedBodies[2] =		// ARRAY OK 2011-06-01 markuso
+            { expectedBody1, expectedBody2 };
+        if (expectedBody1 || expectedBody2) bodies = expectedBodies;
+        verify(TestValidTmp(data, boundary, tcName, numParts, headers, bodies, expectedWarnings, 10000));
+        for (int i=16; i>0; i--)
+            verify(TestValidTmp(data, boundary, tcName, numParts, headers, bodies, expectedWarnings, i));
+    }
+}

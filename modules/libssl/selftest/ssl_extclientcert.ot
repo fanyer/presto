@@ -1,0 +1,302 @@
+/* -*- Mode: c++; tab-width: 4; indent-tabs-mode: t; c-basic-offset: 4 -*-
+**
+** Copyright (C) 2004-2006 Opera Software ASA.  All rights reserved.
+**
+** This file is part of the Opera web browser.  It may not be distributed
+** under any circumstances.
+**
+** Yngve N. Pettersen
+*/
+
+group "libssl test external client cert provider";
+require init;
+
+require _NATIVE_SSL_SUPPORT_;
+require _SSL_USE_EXTERNAL_KEYMANAGERS_;
+
+language c++;
+
+include "core/pch.h";
+include "modules/dochand/win.h";
+include "modules/dochand/docman.h";
+include "modules/doc/frm_doc.h";
+
+include "modules/url/url_man.h";
+include "modules/libssl/sslbase.h";
+include "modules/libssl/ssl_api.h";
+include "modules/libssl/options/sslopt.h";
+include "modules/network_selftest/urldoctestman.h";
+include "modules/network_selftest/scanpass.h";
+include "modules/network_selftest/sslwincom.h";
+include "modules/network_selftest/ssl_waitupdate.h";
+include "modules/libssl/handshake/asn1certlist.h";
+include "modules/libssl/smartcard/smc_man.h";
+include "modules/libssl/methods/sslpubkey.h";
+
+global {
+	BOOL g_used_spdy2;
+	BOOL g_used_spdy3;
+	
+	URL_DocSelfTest_Manager *libssl_tests = NULL;
+	SSL_Options *opt = NULL;
+	
+	class SimpleClientAuthListener 
+		: public BasicSSLWindowListener
+	{
+	public:
+		SimpleClientAuthListener (URL_DocSelfTest_Manager *manager, OpSSLListener *fallback)
+			: BasicSSLWindowListener(manager, fallback) {}
+
+		virtual ~SimpleClientAuthListener (){}
+		
+		virtual void OnCertificateBrowsingNeeded(OpWindowCommander* wic, SSLCertificateContext* context, SSLCertificateReason reason, SSLCertificateOption options)
+		{
+			if(context)
+			{
+				context->OnCertificateBrowsingDone(FALSE, SSL_CERT_OPTION_REFUSE);
+			}
+
+			URL empty;
+			ReportFailure(empty,"Certificte dialog called when it should not have been");
+		}
+
+		virtual void OnSecurityPasswordNeeded(OpWindowCommander* wic, SSLSecurityPasswordCallback* callback)
+		{
+			if(callback)
+				callback->OnSecurityPasswordDone(FALSE, NULL, NULL);
+				
+			URL empty;
+			ReportFailure(empty,"Password dialog called when it should not have been");
+		}
+
+	};
+
+	class Selftest_Automatic_use_provider : public SSL_KeyManager
+	{
+	public:
+		BOOL used;
+		BOOL chose_cert;
+		OpString keyfilename;
+
+		Selftest_Automatic_use_provider():used(FALSE), chose_cert(FALSE){}
+		~Selftest_Automatic_use_provider(){}
+		virtual OP_STATUS	GetAvailableKeys(SSL_CertificateHandler_ListHead *cipherlist,  SSL_DistinguishedName_list &ca_names, ServerName *sn, uint16 port)
+		{
+			used = TRUE;
+			if(sn->GetName().Compare("certo3.opera.com") != 0 || port != 5010 || keyfilename.IsEmpty())
+				return OpStatus::OK;
+
+			SSL_varvector32 data;
+			OpAutoPtr<OpFile> reading_file(OP_NEW(OpFile, ()));
+
+			if(reading_file.get() == NULL)
+				return OpStatus::ERR_NO_MEMORY;				
+
+			RETURN_IF_ERROR(reading_file->Construct(keyfilename));
+		
+			RETURN_IF_ERROR(reading_file->Open(OPFILE_READ));
+			
+			// Load the P12 file
+			DataStream_GenericFile source_stream(reading_file.release(), TRUE);
+
+			extern OP_STATUS ExtractCertificates(SSL_varvector32 &input, const OpStringC8 &pkcs12_password,
+							  SSL_ASN1Cert_list &certificate_list, SSL_secure_varvector32 &private_key,
+							  SSL_varvector16 &pub_key_hash, uint16 &bits, SSL_BulkCipherType &type);
+
+
+			TRAPD(op_err, data.AddContentL(&source_stream));
+			RETURN_IF_ERROR(op_err);
+
+			SSL_ASN1Cert_list certificate_list;
+			SSL_secure_varvector32 private_key;
+			SSL_varvector16 dummy_pub_key_hash;
+			uint16 dummy_bits=0;
+			SSL_BulkCipherType type=SSL_NoCipher;
+
+			RETURN_IF_ERROR(ExtractCertificates(data, "secret", certificate_list, private_key, dummy_pub_key_hash, dummy_bits, type));
+
+			OpAutoPtr<SSL_PublicKeyCipher> key(g_ssl_api->CreatePublicKeyCipher(type, op_err));
+			RETURN_IF_ERROR(op_err);
+			key->LoadAllKeys(private_key);
+			RETURN_IF_ERROR(key->GetOPStatus());
+			key->Set_UseAutomatically(TRUE);
+	
+			RETURN_IF_ERROR(SetupCertificateEntry(cipherlist, UNI_L("Merry Men Auto Use Cert"), UNI_L("Merry Men"), certificate_list, key.release()));
+
+			chose_cert = TRUE;
+			return OpStatus::OK;
+		}
+		virtual void ConfirmKeysPresent(){}
+
+	};
+
+	Selftest_Automatic_use_provider cert_provider;
+    SimpleClientAuthListener *listener = NULL;
+	WindowCommander *wc=NULL;
+	
+#ifdef LIBSSL_AUTO_UPDATE
+	SSL_WaitForPendingAutoUpdate update_waiter;
+#endif
+}
+
+table url_list (const char *, const char *) 
+{
+  //{"https://certo.intern.opera.no:1003/index.cgi", "<td> SSL_CLIENT_VERIFY </td> <td class=\"fail\"> NONE </td>"}
+  //{"https://certo.opera.com:1003/index.cgi", "<td> SSL_CLIENT_VERIFY </td> <td class=\"pass\"> SUCCESS </td>"}
+    {"https://certo3.opera.com:5010", "<p><span class=\"PASS\">PASS</span>: client certificate 'client certificate' [serial: '96D661032D726329']</p>"}
+}
+
+html { "<html><body>Empty document, Client Authentication going on. A client authentication dialog is a failure.</body></html>" };
+
+setup 
+{
+	urlManager->RemoveSensitiveData();
+	opt = g_ssl_api->CreateSecurityManager(FALSE, OPFILE_ABSOLUTE_FOLDER);
+
+	if(opt 	!= NULL)
+	{
+		if(OpStatus::IsSuccess(opt->Init(SSL_LOAD_ALL_STORES)))
+		{
+			g_ssl_api->UnLoadSecurityManager();
+			g_ssl_api->CommitOptionsManager(opt);
+			g_ssl_api->LockSecurityManager(TRUE);
+		}
+	}
+
+	libssl_tests = OP_NEW(URL_DocSelfTest_Manager, ());
+
+	cert_provider.Register();
+	g_used_spdy2 = g_pcnet->GetIntegerPref(PrefsCollectionNetwork::UseSpdy2);
+	g_used_spdy3 = g_pcnet->GetIntegerPref(PrefsCollectionNetwork::UseSpdy3);
+
+	// Currently SPDY doesn't handle  client certificates.
+	// There are problems with apache server (see  http://code.google.com/p/mod-spdy/issues/detail?id=42).
+	// It might also be that our SPDY needs to implement an extra CREDENTIALS frame to send client certificates, 
+	// (See http://www.chromium.org/spdy/spdy-protocol/spdy-protocol-draft3#TOC-2.6.9-CREDENTIAL).
+	RETURN_IF_LEAVE(g_pcnet->WriteIntegerL(PrefsCollectionNetwork::UseSpdy2, FALSE));
+	RETURN_IF_LEAVE(g_pcnet->WriteIntegerL(PrefsCollectionNetwork::UseSpdy3, FALSE));
+}
+
+exit
+{
+	if(opt && opt->dec_reference() <= 0)
+		OP_DELETE(opt);
+	opt = NULL;
+	g_ssl_api->LockSecurityManager(FALSE);
+	g_ssl_api->UnLoadSecurityManager(TRUE);
+
+	OP_DELETE(libssl_tests);
+	libssl_tests = NULL;
+	
+	if(wc)
+	    wc->SetSSLListener(listener->GetFallback());
+	
+	OP_DELETE(listener);
+	listener = NULL;
+	
+	// reset the prefs
+	TRAPD(err, g_pcnet->WriteIntegerL(PrefsCollectionNetwork::UseSpdy2, g_used_spdy2));
+	TRAP(err, g_pcnet->WriteIntegerL(PrefsCollectionNetwork::UseSpdy3, g_used_spdy3));
+	OpStatus::Ignore(err);
+}
+
+test("Initialized")
+	file keyfile "testfiles/certinstall/certificate1_client-root1.p12";
+{
+	verify(opt != NULL);
+	verify(g_securityManager == opt);
+	verify(libssl_tests != NULL);
+	verify(cert_provider.InList());
+	verify(OpStatus::IsSuccess(cert_provider.keyfilename.Set(keyfile)));
+
+}
+
+subtest AddScanPassTest(URL_DocSelfTest_Batch *batch, const OpStringC8 &url, URL &ref_url, const OpStringC8 &test_string)
+{
+	verify(batch != NULL);
+	verify(url.HasContent());
+
+	OpAutoPtr<ScanPass_SimpleTester> test(OP_NEW(ScanPass_SimpleTester, ()));
+	verify(test.get() != NULL);
+
+	verify(OpStatus::IsSuccess(test->Construct(url, ref_url, test_string)));
+
+	verify(batch->AddTestCase(test.release()));
+}
+
+subtest AddBatch(URL_DocSelfTest_Batch *batch)
+{
+	verify(batch != NULL);
+	verify(libssl_tests->AddBatch(batch));
+}
+
+subtest StartTestSet()
+{
+	verify(libssl_tests->SetLastBatch());
+}
+
+subtest Setup_SingleSSLTest(const OpStringC8 &url, URL &ref_url, const OpStringC8 &test_string)
+{
+	OpAutoPtr<URL_DocSelfTest_Batch> batch(OP_NEW(URL_DocSelfTest_Batch, ()));
+
+	verify(batch.get() != NULL);
+	batch->Construct(state.doc->GetMessageHandler());
+
+	verify(AddScanPassTest(batch.get(), url, ref_url, test_string));
+
+	verify(!batch->Empty());
+
+	verify(AddBatch(batch.release()));
+}
+
+subtest Setup_BatchSSLtest()
+{
+	int count = 0;
+	URL ref_url;
+	OpAutoPtr<URL_DocSelfTest_Batch> batch(OP_NEW(URL_DocSelfTest_Batch, ()));
+
+	verify(batch.get() != NULL);
+	batch->Construct(state.doc->GetMessageHandler());
+
+	iterate(url, pass_string) from url_list
+	{
+		verify(AddScanPassTest(batch.get(), url, ref_url, pass_string));
+		count++;
+	}
+
+	verify(batch->Cardinal() == count);
+
+	verify(AddBatch(batch.release()));
+}
+
+test("Load SSL Cipher Suite Test URLs")
+	require success "Initialized";
+	async;
+{
+    wc = state.doc->GetWindow()->GetWindowCommander();
+    listener = OP_NEW(SimpleClientAuthListener, (libssl_tests, wc->GetSSLListener()));
+    wc->SetSSLListener(listener);
+
+	URL ref_url;
+	iterate(url, pass_string) from url_list
+	{
+		if (!Setup_SingleSSLTest(url, ref_url, pass_string))
+			ST_failed("Could not setup test %s", url);
+	}
+	//Setup_BatchSSLtest();
+	if (!StartTestSet())
+		ST_failed("Could not start test set");
+}
+
+test("Check actions performed")
+{
+	verify(cert_provider.used);
+	verify(cert_provider.chose_cert);
+}
+
+test("Flush auto updates") async;
+	require defined LIBSSL_AUTO_UPDATE;
+	require success "Initialized";
+{
+	update_waiter.Activate();
+}

@@ -1,0 +1,85 @@
+Texture2D srcTex;
+SamplerState srcSampler;
+
+cbuffer constants : register (b0)
+{
+	// Light source params
+	float3 light_color : packoffset (c0);
+	float3 light_position : packoffset (c1);
+	float light_kd : packoffset (c2);
+	float light_ks : packoffset (c3);
+	float light_specexp : packoffset (c4);
+
+	float surface_scale : packoffset (c5);
+
+	// Mix factors
+	float k1 : packoffset (c6);
+	float k2 : packoffset (c7);
+	float k3 : packoffset (c8);
+	float k4 : packoffset (c9);
+
+	float2 pixel_size : packoffset (c10); // 1/texture_width, 1/texture_height
+};
+
+static const float3 eye_vec = float3(0,0,1);
+
+
+float3 calc_surface_normal(float2 texpos)
+{
+	float2 tc = texpos + pixel_size * -1;
+	float2 co = pixel_size * float2(1,0);
+	float2 ro = pixel_size * float2(-2, 1);
+
+	// top row
+	float c00 = srcTex.Sample(srcSampler, tc).a;
+	tc += co;
+	float c01 = srcTex.Sample(srcSampler, tc).a;
+	tc += co;
+	float c02 = srcTex.Sample(srcSampler, tc).a;
+	tc += ro;
+
+	// middle row
+	float c10 = srcTex.Sample(srcSampler, tc).a;
+	tc += co;
+	float c12 = srcTex.Sample(srcSampler, tc).a;
+	tc += ro;
+	
+	// bottom row
+	float c20 = srcTex.Sample(srcSampler, tc).a;
+	tc += co;
+	float c21 = srcTex.Sample(srcSampler, tc).a;
+	tc += co;
+	float c22 = srcTex.Sample(srcSampler, tc).a;
+
+	return normalize(float3(-surface_scale * ((c02+2*c12+c22)-(c00+2*c10+c20))/4,
+		-surface_scale*((c20+2*c21+c22)-(c00+2*c01+c02))/4,
+		1));
+}
+
+float4 lighting_equation(float3 n_dot_l, float3 n_dot_h, float spot_att)
+{
+	float3 specular_color = saturate(light_color*spot_att*light_ks*pow(n_dot_h, light_specexp));
+	float3 diffuse_color = saturate(light_color*spot_att*light_kd*n_dot_l);
+
+	float alpha = max(specular_color.r, max(specular_color.g, specular_color.b));
+	float4 specular = float4(specular_color*alpha, alpha);
+	float4 diffuse = float4(diffuse_color, 1);
+
+	return saturate(k1*diffuse*specular + k2*diffuse + k3*specular + k4);
+}
+
+float4 op_main(float4 pos : SV_POSITION, float4 diffuse : COLOR0, float2 texpos : TEXCOORD0) : SV_Target
+{
+	float surf_height = srcTex.Sample(srcSampler, texpos).a * surface_scale;
+	float3 surf_pos = float3(texpos / pixel_size, surf_height);
+
+	float3 norm = calc_surface_normal(texpos);
+	
+	float3 l = normalize(light_position - surf_pos);
+
+	float n_dot_l = max(dot(norm, l), 0);
+	float n_dot_h = max(dot(norm, normalize(l+eye_vec)), 0);
+	
+	return lighting_equation(n_dot_l, n_dot_h, 1);
+}
+

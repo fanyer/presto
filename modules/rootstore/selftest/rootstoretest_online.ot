@@ -1,0 +1,139 @@
+/* -*- Mode: c++; tab-width: 4; indent-tabs-mode: t; c-basic-offset: 4 -*-
+**
+** Copyright (C) 2004-2006 Opera Software ASA.  All rights reserved.
+**
+** This file is part of the Opera web browser.  It may not be distributed
+** under any circumstances.
+**
+** Yngve N. Pettersen
+*/
+
+group "Rootstore online seclevel test";
+require defined _SSL_SUPPORT_;
+require undefined _EXTERNAL_SSL_SUPPORT_;
+
+require init;
+language c++;
+
+include "core/pch.h";
+
+include "modules/dochand/win.h";
+include "modules/dochand/docman.h";
+include "modules/doc/frm_doc.h";
+
+include "modules/libssl/sslv3.h";
+include "modules/libssl/ssl_api.h";
+include "modules/libssl/sslopt.h";
+
+include "modules/network_selftest/sslwincom.h";
+include "modules/network_selftest/ssl_waitupdate.h";
+
+include "modules/url/url_man.h";
+include "modules/network_selftest/remote_framework.h";
+
+global {
+#ifdef LIBSSL_AUTO_UPDATE
+	SSL_WaitForAutoUpdate update_waiter;
+#endif
+	RemoteFrameworkManager testmanager;
+
+	class SimpleClientAuthListener 
+		: public BasicSSLWindowListener
+	{
+	public:
+		SimpleClientAuthListener (URL_DocSelfTest_Manager *manager, OpSSLListener *fallback)
+			: BasicSSLWindowListener(manager, fallback) {}
+
+		virtual ~SimpleClientAuthListener (){}
+		
+		virtual void OnCertificateBrowsingNeeded(OpWindowCommander* wic, SSLCertificateContext* context, SSLCertificateReason reason, SSLCertificateOption options)
+		{
+			if(context)
+			{
+				context->OnCertificateBrowsingDone(TRUE, SSL_CERT_OPTION_ACCEPT);
+				return;
+			}
+		
+			URL empty;
+			ReportFailure(empty,"Certificate dialog called when it should not have been");
+		}
+
+		virtual void OnSecurityPasswordNeeded(OpWindowCommander* wic, SSLSecurityPasswordCallback* callback)
+		{
+			if(callback)
+				callback->OnSecurityPasswordDone(FALSE, NULL, NULL);
+				
+			URL empty;
+			ReportFailure(empty,"Password dialog called when it should not have been");
+		}
+
+	};
+	SimpleClientAuthListener *listener = NULL;
+	WindowCommander *wc=NULL;
+}
+
+html { "<html><body>Empty document, SSL testing going on. A displayed certificate dialog is a failure.</body></html>" };
+
+setup 
+{
+	urlManager->RemoveSensitiveData();
+	if(g_ssl_api->CheckSecurityManager())
+		g_securityManager->Init(SSL_LOAD_ALL_STORES);
+}
+
+exit
+{
+	if(wc)
+	    wc->SetSSLListener(listener->GetFallback());
+	
+	OP_DELETE(listener);
+	listener = NULL;
+
+	// Do a shutdown of the pending connections
+	urlManager->FreeUnusedResources(TRUE);
+}
+
+test("Initialized")
+{
+    wc = state.doc->GetWindow()->GetWindowCommander();
+    verify(wc != NULL);
+    listener = OP_NEW(SimpleClientAuthListener, (testmanager.GetTestManager(), wc->GetSSLListener()));
+    verify(listener != NULL);
+    wc->SetSSLListener(listener);
+}
+
+test("Check for updates")
+	require defined LIBSSL_AUTO_UPDATE;
+	require success "Initialized";
+	async;
+{
+	update_waiter.Activate();
+}
+
+subtest InitFramework(RemoteFrameworkManager &testman)
+{
+	verify(OpStatus::IsSuccess(testman.Construct(state.doc->GetMessageHandler())));
+}
+
+subtest setupframeworkfile(RemoteFrameworkManager &testman, const OpStringC &framework)
+{
+	verify(framework.HasContent());
+
+	OpString framework_url;
+	BOOL result = FALSE;
+
+	TRAPD(op_err, result = g_url_api->ResolveUrlNameL(framework, framework_url));
+	verify(OpStatus::IsSuccess(op_err));
+	verify(result);
+
+	verify(OpStatus::IsSuccess(testman.AddTestSuite(framework_url.CStr())));
+}
+
+test("Framework test") 
+	async;
+	require success "Initialized";
+{
+	if (!InitFramework(testmanager) ||
+		!setupframeworkfile(testmanager, UNI_L("http://testsuites.oslo.osa/core/selftest/rootstore/test1/check_roots_and_ev.xml")))
+		ST_failed("Could not start test");
+}

@@ -1,0 +1,828 @@
+/* -*- Mode: c++; tab-width: 4; indent-tabs-mode: t; c-basic-offset: 4 -*- */
+group "wand.sync";
+
+require init;
+
+require WAND_SUPPORT;
+require SYNC_HAVE_PASSWORD_MANAGER;
+
+language C++;
+
+include "core/pch.h";
+include "modules/wand/wandmanager.h";
+include "modules/wand/wand_internal.h";
+include "modules/sync/sync_util.h";
+include "modules/doc/frm_doc.h";
+
+html
+{
+//! <html><body> dummy window</body></html>
+}
+
+global
+{
+	const char *encryption_key = "HAWANNAHAVEABABA";
+
+	class TestCleanup
+	{
+	public:
+		TestCleanup(OpSyncCollection *sync_collection) { m_sync_collection = sync_collection; }
+		~TestCleanup() { m_sync_collection->Clear(); }
+
+		OpSyncCollection *m_sync_collection;
+
+	};
+
+	void CleanWandAndRemoveSyncMessages() 
+	{
+		self_test_helper->GetSyncDataQueue()->RemoveQueuedItems(OpSyncDataItem::DATAITEM_PM_FORM_AUTH);
+		self_test_helper->GetSyncDataQueue()->RemoveQueuedItems(OpSyncDataItem::DATAITEM_PM_HTTP_AUTH);
+		OpStatus::Ignore(g_wand_manager->ClearAll(TRUE, FALSE, FALSE));
+
+		g_wand_manager->SetSyncPasswordEncryptionKey((UINT8*)encryption_key);
+	}
+
+	OpSyncCoordinator::SelftestHelper *self_test_helper;
+
+	WandSecurityWrapper security;
+
+	BOOL used_disk_queue;
+	UINT8 previous_key[16];
+	BOOL had_encryption_key;
+
+	BOOL password_manager_pref;
+}
+
+setup
+{
+	password_manager_pref = g_pcsync->GetIntegerPref(PrefsCollectionSync::SyncPasswordManager);
+
+	RETURN_IF_ERROR(g_pcsync->WriteIntegerL(PrefsCollectionSync::SyncPasswordManager, TRUE));
+
+	OpStatus::Ignore(g_wand_manager->ClearAll(TRUE, FALSE, FALSE));
+
+	if (g_wand_manager->HasSyncPasswordEncryptionKey())
+	{
+		op_memcpy(previous_key, g_wand_manager->GetSyncPasswordEncryptionKey(), 16);
+		had_encryption_key = TRUE;
+	}
+	else
+		had_encryption_key = FALSE;
+
+	g_wand_manager->SetSyncPasswordEncryptionKey((UINT8*)encryption_key);
+
+	security.EnableWithoutWindow();
+
+	self_test_helper = OP_NEW(OpSyncCoordinator::SelftestHelper, (g_sync_coordinator));
+
+	used_disk_queue = g_sync_coordinator->UseDiskQueue();
+	g_sync_coordinator->SetUseDiskQueue(FALSE);
+}
+
+exit
+{
+	OpStatus::Ignore(g_pcsync->WriteIntegerL(PrefsCollectionSync::SyncPasswordManager, password_manager_pref));
+	g_sync_coordinator->SetUseDiskQueue(used_disk_queue);
+
+	OpStatus::Ignore(g_wand_manager->ClearAll(TRUE, FALSE, FALSE));
+
+	if (had_encryption_key)
+		g_wand_manager->SetSyncPasswordEncryptionKey(previous_key);
+
+	if (self_test_helper)
+	{
+		self_test_helper->GetSyncDataQueue()->RemoveQueuedItems(OpSyncDataItem::DATAITEM_PM_FORM_AUTH);
+		self_test_helper->GetSyncDataQueue()->RemoveQueuedItems(OpSyncDataItem::DATAITEM_PM_HTTP_AUTH);
+		OP_DELETE(self_test_helper);
+	}
+}
+
+
+test("Initialise")
+{
+	verify(self_test_helper);
+}
+
+/***** Some basic infrastructure ****/
+
+/** 
+* Creates a OpSyncItem from wand_sync_item. The OpSyncItem is then sent as incomming event
+* and a new copy of wand_sync_item will be added to wand.
+* Thus, this method simulates receiving new passwords from server.
+*/
+subtest ReceiveAddSyncItemEvent(WandSyncItem &wand_sync_item, OpSyncDataItem::DataItemType type, BOOL simulate_broken_item, const uni_char *force_sync_id)
+{
+	OpSyncCollection sync_collection;
+	TestCleanup test_cleanup(&sync_collection);
+
+	if (wand_sync_item.GetModifiedDate() == 0)
+		verify_success(wand_sync_item.SetModifiedDate());
+
+	if (force_sync_id)
+		verify_success(wand_sync_item.SelftestAssignSyncId(force_sync_id));
+	else
+		verify_success(wand_sync_item.AssignSyncId());
+
+	if (simulate_broken_item) // break encryption using wrong key
+		verify_success(g_wand_manager->SetSyncPasswordEncryptionKey((UINT8*)"0000000000000000"));
+
+	OpSyncItem *sync_item;
+	// We construct a sync item from the login. This will encrypt the data
+	verify_success(wand_sync_item.ConstructSyncItem(sync_item));
+	sync_item->SetStatus(OpSyncDataItem::DATAITEM_ACTION_ADDED);
+	sync_collection.AddItem(sync_item);
+
+	if (simulate_broken_item) // restore the correct key when decrypting
+		verify_success(g_wand_manager->SetSyncPasswordEncryptionKey((UINT8*)encryption_key));
+
+	/* we simulate an incoming sync item. The item will be decrypted and added to wand */
+	OpSyncDataError data_error;
+	if (type == OpSyncDataItem::DATAITEM_PM_HTTP_AUTH)
+		verify_success(g_wand_manager->SyncDataAvailable(&sync_collection, data_error));
+	else
+		verify_success(g_wand_manager->SelftestGetLogProfile().SyncDataAvailable(&sync_collection, data_error));
+
+	verify_success(StoreWandInfo());
+}
+finally
+{
+	// restore the correct key when decrypting, in case the 
+	// test was aborted before restoring it in the test.
+	if (simulate_broken_item)
+		g_wand_manager->SetSyncPasswordEncryptionKey((UINT8*)encryption_key);
+}
+
+/** Simulates receving a delete event for password with given sync id */
+subtest ReceiveDeleteEvent(const OpStringC& sync_id, OpSyncDataItem::DataItemType type)
+{
+	OpSyncCollection sync_collection;
+	TestCleanup test_cleanup(&sync_collection);
+	OpSyncItem *sync_item;
+	verify_success(g_sync_coordinator->GetSyncItem(&sync_item,
+												   type,
+												   OpSyncItem::SYNC_KEY_ID,
+												   sync_id.CStr()));
+	sync_item->SetStatus(OpSyncDataItem::DATAITEM_ACTION_DELETED);
+	sync_collection.AddItem(sync_item);
+
+	/* we simulate an incoming sync item. The item will be decrypted and added to wand */
+	OpSyncDataError data_error;
+	if (type == OpSyncDataItem::DATAITEM_PM_HTTP_AUTH)
+		verify_success(g_wand_manager->SyncDataAvailable(&sync_collection, data_error));
+	else
+		verify_success(g_wand_manager->SelftestGetLogProfile().SyncDataAvailable(&sync_collection, data_error));
+
+	verify_success(StoreWandInfo());
+}
+
+subtest SetDate(WandSyncItem &item, time_t time)
+{
+	OpString date_string;
+	verify_success(SyncUtil::CreateRFC3339Date(time, date_string));
+	verify_success(item.SetModifiedDate(date_string.CStr()));
+
+	verify(item.GetModifiedDateMilliseconds() == time*1000);
+}
+
+subtest SimulateReceiveHttpLoginFromSyncServer(const uni_char *server, const uni_char* user,  const uni_char* password, time_t time, BOOL should_be_added, OpString &added_sync_id, BOOL simulate_broken_item, const uni_char *force_sync_id)
+{
+	verify(g_wand_manager);
+
+	WandLogin login;
+	verify_success(login.Set(server, user, password, FALSE));
+
+	if (time)
+	{
+		verify(SetDate(login, time));
+	}
+
+	verify(ReceiveAddSyncItemEvent(login, OpSyncDataItem::DATAITEM_PM_HTTP_AUTH, simulate_broken_item, force_sync_id));
+	verify_success(added_sync_id.Set(login.GetSyncId()));
+
+	int page_list_index;
+	WandSyncItem *test_login = g_wand_manager->FindWandSyncItem(login.GetSyncId(), page_list_index);
+
+	verify((test_login != NULL) == should_be_added);
+
+	if (test_login)
+	{
+		/* Check we get the exact same login back */
+		verify(login.IsEqualTo(static_cast<WandLogin*>(test_login)));
+	}
+}
+
+subtest SimulateReceiveFormLoginFromSyncServer(const uni_char *server, const uni_char* user,  const uni_char* password, time_t time, UINT32 in_flags, BOOL should_be_added, OpString &added_sync_id, BOOL simulate_broken_item, const uni_char *force_sync_id)
+{
+	verify(g_wand_manager);
+
+	WandPage form_login;
+	verify_success(form_login.SelftestConstruct(server, NULL, UNI_L("do_it"), UNI_L("submitname"), 0, in_flags));
+	verify_success(form_login.SelftestAddObjectInfo(UNI_L("password"), password, TRUE, FALSE, TRUE));
+	verify_success(form_login.SelftestAddObjectInfo(UNI_L("user"), user, FALSE, TRUE, TRUE));
+	if (time > 0)
+	{
+		verify(SetDate(form_login, static_cast<time_t>(time)));
+	}
+	else if (time < 0)
+		verify_success(form_login.SetModifiedDate(UNI_L("123FOO")));
+
+	verify(ReceiveAddSyncItemEvent(form_login, OpSyncDataItem::DATAITEM_PM_FORM_AUTH, simulate_broken_item, force_sync_id));
+	verify_success(added_sync_id.Set(form_login.GetSyncId()));
+
+	int page_list_index = 0;
+	WandSyncItem *test_login = g_wand_manager->SelftestGetLogProfile().FindWandSyncItem(form_login.GetSyncId(), page_list_index);
+	if (should_be_added)
+	{
+		verify(g_wand_manager->GetWandPageCount() > 0);
+		/* Check we get the exact same form back */
+		verify(test_login);
+		verify(form_login.IsSameFormAndUsername(static_cast<WandPage*>(test_login), NULL));
+	}
+	else
+		verify(test_login == NULL);
+}
+
+/**
+ * @param type is the expected sync data type to find for the specified id.
+ * @param id is the sync-id to look for.
+ * @param status specifies the expected item-status (if the item is expected to
+ *  exist).
+ * @param should_exist specifies whether or not the item is expected to exist.
+ *  If this value is TRUE, the subtest passes if the item with the specified
+ *  id is found (and passes the other tests).
+ *  If this value is FALSE, the subtest passes if the item with the specified
+ *  id is not found (in that case the other tests are not executed).
+ * @param expected_keys may point to a vector of OpSyncItem::Key. This subtest
+ *  verifies that the sync-item contains the expected_data for the
+ *  expected_keys. This vector is expected to have the same number of elements
+ *  as expected_data.
+ * @param expected_data may point to a vector of strings. This subtest verifies
+ *  that the sync-item's data contains these values.
+ */
+subtest CheckMessagesSentToLink(OpSyncDataItem::DataItemType type, const uni_char *id, OpSyncDataItem::DataItemStatus status, BOOL should_exist, OpINT32Vector* expected_keys, OpVector<char>* expected_data)
+{
+	OpSyncItem* item_ptr = 0;
+	OP_STATUS result = g_sync_coordinator->GetExistingSyncItem(&item_ptr, type, OpSyncItem::SYNC_KEY_ID, id);
+	verify(!OpStatus::IsMemoryError(result));
+	OpAutoPtr<OpSyncItem> item(item_ptr);
+	if (should_exist)
+	{
+		verify_success(result);
+		//verify(item->GetStatus() == status);
+		if (expected_data && expected_keys)
+		{
+			verify(expected_data->GetCount() == expected_keys->GetCount());
+			for (unsigned int i = 0; i < expected_keys->GetCount(); i++)
+			{
+				OpString data;
+				item->GetData(static_cast<OpSyncItem::Key>(expected_keys->Get(i)), data);
+				verify_string(expected_data->Get(i), data);
+			}
+		}
+	}
+	else
+		verify(OpStatus::IsError(result));
+}
+
+/**** The actual tests ****/
+
+test("Receive http login from sync server")
+require success "Initialise";
+{
+	OpString added_sync_id;
+	verify(SimulateReceiveHttpLoginFromSyncServer(UNI_L("http://someserver.com"), UNI_L("me"), UNI_L("topsecret"), 0, TRUE, added_sync_id, FALSE,  NULL));
+
+	// Should not send sync messages for received items 
+	verify(CheckMessagesSentToLink(OpSyncDataItem::DATAITEM_PM_HTTP_AUTH, added_sync_id, OpSyncDataItem::DATAITEM_ACTION_ADDED, FALSE, 0, 0));
+}
+finally
+{
+	CleanWandAndRemoveSyncMessages();
+}
+
+test("Receive http login with empty password")
+require success "Initialise";
+{
+	OpString added_sync_id;
+	verify(SimulateReceiveHttpLoginFromSyncServer(
+			   UNI_L("http://empty.password.selftest.opera.osa"),
+			   UNI_L("me"), UNI_L(""), /* time= */ 0,
+			   /* verify that this login was added: */ TRUE,
+			   added_sync_id, FALSE,  NULL));
+
+	// Should not send sync messages for received items
+	verify(CheckMessagesSentToLink(OpSyncDataItem::DATAITEM_PM_HTTP_AUTH, added_sync_id, OpSyncDataItem::DATAITEM_ACTION_ADDED, FALSE, 0, 0));
+}
+finally
+{
+	CleanWandAndRemoveSyncMessages();
+}
+
+test("Receive form login from sync server")
+require success "Initialise";
+{
+	OpString added_sync_id;
+	verify(SimulateReceiveFormLoginFromSyncServer(UNI_L("http://someserver.com"), UNI_L("me"), UNI_L("topsecret"), 0, 0, TRUE, added_sync_id, FALSE, NULL));
+
+	// Should not send sync messages for received items 
+	verify(CheckMessagesSentToLink(OpSyncDataItem::DATAITEM_PM_FORM_AUTH, added_sync_id, OpSyncDataItem::DATAITEM_ACTION_ADDED, FALSE, 0, 0));
+}
+finally
+{
+	CleanWandAndRemoveSyncMessages();
+}
+
+test("Receive form login with empty password")
+require success "Initialise";
+{
+	OpString added_sync_id;
+	verify(SimulateReceiveFormLoginFromSyncServer(
+			   UNI_L("http://empty.password.selftest.opera.osa"),
+			   UNI_L("me"), UNI_L(""),
+			   /* time= */ 0, /* flags= */ 0,
+			   /* verify that this login was added: */ TRUE,
+			   added_sync_id, FALSE, NULL));
+
+	// Should not send sync messages for received items
+	verify(CheckMessagesSentToLink(OpSyncDataItem::DATAITEM_PM_FORM_AUTH, added_sync_id, OpSyncDataItem::DATAITEM_ACTION_ADDED, FALSE, 0, 0));
+}
+finally
+{
+	CleanWandAndRemoveSyncMessages();
+}
+
+test("Add new http login locally")
+require success "Initialise";
+{
+	verify_success(g_wand_manager->StoreLoginWithoutWindow(UNI_L("http://anotherserver.com"), UNI_L("me"), UNI_L("secret")));
+
+	WandLogin *login = g_wand_manager->FindLogin(UNI_L("http://anotherserver.com"), UNI_L("me"));
+	verify(login != NULL);
+
+	// A DATAITEM_ACTION_ADDED should now have been sent to link server
+	verify(CheckMessagesSentToLink(OpSyncDataItem::DATAITEM_PM_HTTP_AUTH, login->GetSyncId(), OpSyncDataItem::DATAITEM_ACTION_ADDED, TRUE, 0, 0));
+}
+finally
+{
+	CleanWandAndRemoveSyncMessages();
+}
+
+test("Add new form login locally")
+require success "Initialise";
+{
+	OpAutoPtr<WandPage> form_login(OP_NEW(WandPage, ()));
+	verify(form_login.get());
+	verify_success(form_login->SelftestConstruct(UNI_L("HTTP://yihawannahaveababa.com"), NULL, UNI_L("do_it"), UNI_L("submitname"), 0, 0));
+
+	verify_success(form_login->SelftestAddObjectInfo(UNI_L("password"), UNI_L("somepassword"), TRUE, FALSE, TRUE));
+	verify_success(form_login->SelftestAddObjectInfo(UNI_L("user"), UNI_L("username"), FALSE, TRUE, TRUE));
+
+	verify_success(form_login->Encrypt());
+	verify_success(g_wand_manager->SelftestGetLogProfile().Store(form_login.get()));
+	WandPage *added_page = form_login.release();
+
+	form_login.reset(OP_NEW(WandPage, ()));
+	verify(form_login.get());
+	verify_success(form_login->SelftestConstruct(UNI_L("HTTP://on_this_server.com"), NULL, UNI_L("do_it"), UNI_L("submitname"), 0, WAND_FLAG_ON_THIS_SERVER));
+
+	verify_success(form_login->SelftestAddObjectInfo(UNI_L("password"), UNI_L("somepassword"), TRUE, FALSE, TRUE));
+	verify_success(form_login->SelftestAddObjectInfo(UNI_L("user"), UNI_L("username"), FALSE, TRUE, TRUE));
+
+	verify_success(form_login->Encrypt());
+	verify_success(g_wand_manager->SelftestGetLogProfile().Store(form_login.get()));
+	WandPage *added_page2 = form_login.release();
+
+	// A DATAITEM_ACTION_ADDED should now have been sent to link server
+	OpINT32Vector expected_keys;
+	OpVector<char> expected_data;
+	OpVector<char> expected_data2;
+	expected_keys.Add(OpSyncItem::SYNC_KEY_PM_FORM_AUTH_SCOPE);
+	expected_data.Add(const_cast<char*>("page"));
+	expected_data2.Add(const_cast<char*>("server"));
+	verify(CheckMessagesSentToLink(OpSyncDataItem::DATAITEM_PM_FORM_AUTH, added_page->GetSyncId(), OpSyncDataItem::DATAITEM_ACTION_ADDED, TRUE, &expected_keys, &expected_data));
+	verify(CheckMessagesSentToLink(OpSyncDataItem::DATAITEM_PM_FORM_AUTH, added_page2->GetSyncId(), OpSyncDataItem::DATAITEM_ACTION_ADDED, TRUE, &expected_keys, &expected_data2));
+}
+finally
+{
+	CleanWandAndRemoveSyncMessages();
+}
+
+table test_sync_ws_form_login(const char* testname, const uni_char* name, const uni_char* value)
+{
+	{ "a b",		UNI_L("name"), UNI_L("a b") },
+	{ "a\\tb",		UNI_L("name"), UNI_L("a\tb") },
+	{ "\\tab\\t",	UNI_L("name"), UNI_L("\tab\t") },
+	{ "\\na\\nb\\n",UNI_L("name"), UNI_L("\\na\\nb\\n") },
+	{ "a&b",		UNI_L("name"), UNI_L("a&b") },
+	{ "name",		UNI_L("\t\na&m e\n\t"), UNI_L("value") }
+}
+
+foreach (testname, input_name, input_value) from test_sync_ws_form_login
+{
+	test("Handle ws in form-login correctly: '" testname "'")
+	{
+		OpAutoPtr<WandPage> form_login(OP_NEW(WandPage, ()));
+		verify(form_login.get());
+		verify_success(form_login->SelftestConstruct(
+						   UNI_L("https://white.selftest.opera.osa"),
+						   /* topdoc-url: */ NULL, /* action: */ NULL,
+						   UNI_L("submit"), /* formnr: */ 0, /* flags: */ 0));
+		verify_success(form_login->SelftestAddObjectInfo(
+						   input_name, input_value,
+						   FALSE /* no password to avoid encryption */,
+						   TRUE, TRUE));
+
+		OpSyncItem* sync_item_ptr;
+		verify_success(g_sync_coordinator->GetSyncItem(
+						   &sync_item_ptr, OpSyncDataItem::DATAITEM_PM_FORM_AUTH,
+						   OpSyncItem::SYNC_KEY_ID, UNI_L("123")));
+		OpAutoPtr<OpSyncItem> sync_item(sync_item_ptr);
+		sync_item->SetStatus(OpSyncDataItem::DATAITEM_ACTION_ADDED);
+		verify_success(form_login->ConstructSyncItemAuthTypeSpecificElements(sync_item.get()));
+
+		// Start a new WandPage instance:
+		form_login.reset(OP_NEW(WandPage, ()));
+		verify(form_login.get());
+		verify_success(form_login->InitAuthTypeSpecificElements(sync_item.get()));
+		verify(form_login->CountObjects() == 1);
+		WandObjectInfo* obj_info = form_login->GetObject(0);
+		verify(obj_info);
+		verify_string(obj_info->name, input_name);
+		verify_string(obj_info->value, input_value);
+	}
+}
+
+test("Modify form locally")
+require success "Initialise";
+{
+	OpAutoPtr<WandPage> form_login(OP_NEW(WandPage, ()));
+	verify(form_login.get());
+	verify_success(form_login->SelftestConstruct(UNI_L("HTTP://yihawannahaveababa.com"), NULL, UNI_L("do_it"), UNI_L("submitname"), 0, 0));
+
+	verify_success(form_login->SelftestAddObjectInfo(UNI_L("password"), UNI_L("somepassword"), TRUE, FALSE, TRUE));
+	verify_success(form_login->SelftestAddObjectInfo(UNI_L("user"), UNI_L("username"), FALSE, TRUE, TRUE));
+
+	verify_success(form_login->Encrypt());
+
+	verify(SetDate(*form_login.get(), 1));
+
+	verify_success(g_wand_manager->SelftestMaybeStorePageInDatabase(state.doc->GetWindow(), form_login.get()));
+	WandPage *added_page = form_login.release();
+
+	// A DATAITEM_ACTION_ADDED should now have been sent to link server
+	verify(CheckMessagesSentToLink(OpSyncDataItem::DATAITEM_PM_FORM_AUTH, added_page->GetSyncId(), OpSyncDataItem::DATAITEM_ACTION_ADDED, TRUE, 0, 0));
+
+	// Check that the password is modified
+	OpString password;
+	verify_success(added_page->FindPassword()->Decrypt(password));
+	verify_string(password, "somepassword");
+
+	OpString form_login_sync_id;
+	verify_success(form_login_sync_id.Set(added_page->GetSyncId()));
+
+	OpAutoPtr<WandPage> form_login_2(OP_NEW(WandPage, ()));
+	verify(form_login_2.get());
+	verify_success(form_login_2->SelftestConstruct(UNI_L("HTTP://yihawannahaveababa.com"), NULL, UNI_L("do_it"), UNI_L("submitname"), 0, 0));
+
+	verify_success(form_login_2->SelftestAddObjectInfo(UNI_L("password"), UNI_L("somepassword2"), TRUE, FALSE, TRUE));
+	verify_success(form_login_2->SelftestAddObjectInfo(UNI_L("user"), UNI_L("username"), FALSE, TRUE, TRUE));
+
+	verify_success(form_login_2->Encrypt());
+	WandPage form_login_2_copy;
+	form_login_2_copy.ReplaceWithOtherPage(form_login_2.get());
+
+	verify_success(g_wand_manager->SelftestMaybeStorePageInDatabase(state.doc->GetWindow(), form_login_2.get()));
+	form_login_2.release();
+
+	// A DATAITEM_ACTION_MODIFIED should now have been sent to link server
+	verify(CheckMessagesSentToLink(OpSyncDataItem::DATAITEM_PM_FORM_AUTH, form_login_sync_id.CStr(), OpSyncDataItem::DATAITEM_ACTION_MODIFIED, TRUE, 0, 0));
+
+	int page_list_index = 0;
+	WandSyncItem *test_login = g_wand_manager->SelftestGetLogProfile().FindWandSyncItem(form_login_sync_id.CStr(), page_list_index);
+	verify(test_login);
+
+	// Check that the password is modified
+	verify_success(static_cast<WandPage*>(test_login)->FindPassword()->Decrypt(password));
+	verify_string(password, "somepassword");
+}
+finally
+{
+	CleanWandAndRemoveSyncMessages();
+}
+
+test("Handle http login conflict")
+require success "Initialise";
+{
+	OpString added_sync_id;
+	verify(SimulateReceiveHttpLoginFromSyncServer(UNI_L("http://someserver.com"), UNI_L("me"), UNI_L("topsecret"), 10, TRUE, added_sync_id, FALSE, NULL));
+	verify(CheckMessagesSentToLink(OpSyncDataItem::DATAITEM_PM_HTTP_AUTH, added_sync_id, OpSyncDataItem::DATAITEM_ACTION_ADDED, FALSE, 0, 0));
+	verify(CheckMessagesSentToLink(OpSyncDataItem::DATAITEM_PM_HTTP_AUTH, added_sync_id, OpSyncDataItem::DATAITEM_ACTION_DELETED, FALSE, 0, 0));
+
+	OpString added_sync_id_2;
+	verify(SimulateReceiveHttpLoginFromSyncServer(UNI_L("http://someserver.com"), UNI_L("me"), UNI_L("topsecret2"), 15, TRUE, added_sync_id_2, FALSE, NULL)); // Should win
+	// The loosing item must be deleted on server.
+	verify(CheckMessagesSentToLink(OpSyncDataItem::DATAITEM_PM_HTTP_AUTH, added_sync_id, OpSyncDataItem::DATAITEM_ACTION_DELETED, TRUE, 0, 0));
+
+	OpString added_sync_id_3;
+	verify(SimulateReceiveHttpLoginFromSyncServer(UNI_L("http://someserver.com"), UNI_L("me"), UNI_L("topsecret3"), 5, FALSE, added_sync_id_3, FALSE, NULL)); // Should loose
+	verify(CheckMessagesSentToLink(OpSyncDataItem::DATAITEM_PM_HTTP_AUTH, added_sync_id_3, OpSyncDataItem::DATAITEM_ACTION_DELETED, TRUE, 0, 0));
+
+}
+finally
+{
+	CleanWandAndRemoveSyncMessages();
+}
+
+test("Handle http login conflict test 2, CT-620")
+require success "Initialise";
+{
+	//Simulate an already stored item
+	OpString locally_added_sync_id;
+	verify(SimulateReceiveHttpLoginFromSyncServer(UNI_L("aaa"), UNI_L("p"), UNI_L("p"), 100, TRUE, locally_added_sync_id, FALSE, UNI_L("ACC2E6E3E13EF2D6AD43B7384C0DDFC2")));
+
+	// Clear any messages that was sent since we simulate the item has been there a while
+	self_test_helper->GetSyncDataQueue()->RemoveQueuedItems(OpSyncDataItem::DATAITEM_PM_HTTP_AUTH);
+
+	OpString added_sync_id;
+	verify(SimulateReceiveHttpLoginFromSyncServer(UNI_L("bbb"), UNI_L("p"), UNI_L("p"), 1, TRUE, added_sync_id, FALSE, UNI_L("11111111111111111111111111111111")));
+
+	OpString added_sync_id_2;
+	verify(SimulateReceiveHttpLoginFromSyncServer(UNI_L("bbb"), UNI_L("p"), UNI_L("p"), 1, TRUE, added_sync_id_2, FALSE, UNI_L("22222222222222222222222222222222")));
+
+	verify(CheckMessagesSentToLink(OpSyncDataItem::DATAITEM_PM_HTTP_AUTH, added_sync_id_2, OpSyncDataItem::DATAITEM_ACTION_DELETED, FALSE, 0, 0));
+	verify(CheckMessagesSentToLink(OpSyncDataItem::DATAITEM_PM_HTTP_AUTH, added_sync_id, OpSyncDataItem::DATAITEM_ACTION_DELETED, TRUE, 0, 0));
+
+	int page_list_index;
+	verify(g_wand_manager->FindWandSyncItem(locally_added_sync_id.CStr(), page_list_index) != NULL);	
+}
+finally
+{
+	CleanWandAndRemoveSyncMessages();
+}
+
+test("Handle http login conflict, broken incoming item")
+require success "Initialise";
+{
+	OpString added_sync_id;
+	verify(SimulateReceiveHttpLoginFromSyncServer(UNI_L("http://someserver.com"), UNI_L("me"), UNI_L("topsecret"), 10, TRUE, added_sync_id, FALSE, NULL));
+	verify(CheckMessagesSentToLink(OpSyncDataItem::DATAITEM_PM_HTTP_AUTH, added_sync_id, OpSyncDataItem::DATAITEM_ACTION_ADDED, FALSE, 0, 0));
+	verify(CheckMessagesSentToLink(OpSyncDataItem::DATAITEM_PM_HTTP_AUTH, added_sync_id, OpSyncDataItem::DATAITEM_ACTION_DELETED, FALSE, 0, 0));
+
+	// We get a pointer to the added login item
+	int page_list_index;
+	WandSyncItem *test_login = g_wand_manager->FindWandSyncItem(added_sync_id.CStr(), page_list_index);
+	verify(added_sync_id.Compare(test_login->GetSyncId()) == 0);
+
+	// We simulate a broken item from the server
+	OpString added_sync_id_2;
+	verify(SimulateReceiveHttpLoginFromSyncServer(UNI_L("http://someserver.com"), UNI_L("me"), UNI_L("topsecret2"), 15, FALSE, added_sync_id_2, TRUE, added_sync_id. CStr())); // Should win
+
+	// The new item must be deleted on server, since it was broken
+	verify(CheckMessagesSentToLink(OpSyncDataItem::DATAITEM_PM_HTTP_AUTH, added_sync_id, OpSyncDataItem::DATAITEM_ACTION_DELETED, TRUE, 0, 0));
+
+	// The item already stored must have been assigned a new sync id, to distinguish it from the deleted item.
+	verify(added_sync_id.Compare(test_login->GetSyncId()) != 0);
+
+	// The local item with new sync id must be synced back to server
+	verify(CheckMessagesSentToLink(OpSyncDataItem::DATAITEM_PM_HTTP_AUTH, test_login->GetSyncId(), OpSyncDataItem::DATAITEM_ACTION_ADDED, TRUE, 0, 0));
+
+}
+finally
+{
+	CleanWandAndRemoveSyncMessages();
+}
+
+/** This test verifies that on receiving multiple form-login sync-item for the
+ * same form-login, the item with the newest modification time wins and the
+ * other item is sent back to the server as deleted. */
+test("Handle form login conflict")
+require success "Initialise";
+{
+	OpString added_sync_id;
+	/* First receive a new form-login sync-item from the Link server with
+	 * server="http://someserver.com"; user="me"; password="topsecret" */
+	verify(SimulateReceiveFormLoginFromSyncServer
+		   (UNI_L("http://someserver.com"), UNI_L("me"), UNI_L("topsecret"),
+			/* time= */ 10, /* flags= */ 0,
+			TRUE /* verify this was added */, added_sync_id, FALSE, NULL));
+	/* As this is a new form-login, we expect that we don't send an item-added
+	 * or item-deleted message back to the Link server: */
+	verify(CheckMessagesSentToLink(OpSyncDataItem::DATAITEM_PM_FORM_AUTH, added_sync_id, OpSyncDataItem::DATAITEM_ACTION_ADDED, FALSE, 0, 0));
+	verify(CheckMessagesSentToLink(OpSyncDataItem::DATAITEM_PM_FORM_AUTH, added_sync_id, OpSyncDataItem::DATAITEM_ACTION_DELETED, FALSE, 0, 0));
+
+	/* Now receive another form-login sync-item from the Link server with the
+	 * same data as the first one, but with a new password and a smaller time
+	 * value, i.e. the first item is expected to be newer (and thus shall
+	 * survive) and the second item is expected to be deleted, i.e. a
+	 * delete-item shall be sent to the server: */
+	OpString added_sync_id_2;
+	verify(SimulateReceiveFormLoginFromSyncServer
+		   (UNI_L("http://someserver.com"), UNI_L("me"), UNI_L("topsecret2"),
+			/* time= */ 5, /* flags= */ 0,
+			FALSE, added_sync_id_2, FALSE, NULL)); // Should loose
+	verify(CheckMessagesSentToLink(OpSyncDataItem::DATAITEM_PM_FORM_AUTH, added_sync_id_2, OpSyncDataItem::DATAITEM_ACTION_DELETED, TRUE, 0, 0));
+
+	/* Now receive a third form-login sync-item from the Link server with the
+	 * same data as the first one, again with a new password but now with a
+	 * newer modification time value, i.e. the third item is expected to win and
+	 * the first item is expected to be deleted: */
+	OpString added_sync_id_3;
+	verify(SimulateReceiveFormLoginFromSyncServer
+		   (UNI_L("http://someserver.com"), UNI_L("me"), UNI_L("topsecret3"),
+			/* time= */ 25, /* flags= */ 0,
+			TRUE /* verify this was added */, added_sync_id_3, FALSE, NULL)); // Should win
+	verify(CheckMessagesSentToLink(OpSyncDataItem::DATAITEM_PM_FORM_AUTH, added_sync_id_3, OpSyncDataItem::DATAITEM_ACTION_DELETED, FALSE, 0, 0));
+	verify(CheckMessagesSentToLink(OpSyncDataItem::DATAITEM_PM_FORM_AUTH, added_sync_id, OpSyncDataItem::DATAITEM_ACTION_DELETED, TRUE, 0, 0));
+}
+finally
+{
+	CleanWandAndRemoveSyncMessages();
+}
+
+test("Handle form login conflict test 2, CT-650")
+require success "Initialise";
+{
+	/* This test verifies the use-case where we resolve a conflict by keeping
+	 * the received item and deleting the local item.
+	 * I.e. we have a previous item with a different sync-id matching the
+	 * received item and WandSyncItem::ResolveConflictReplaceThisItem() returns
+	 * true and we delete the previous item. This test verifies that we delete
+	 * the correct local item. */
+
+	/* Simulate two already stored item: */
+	// The first item shall not match the received item:
+	OpString new_sync_id;
+	verify(SimulateReceiveFormLoginFromSyncServer(UNI_L("http://someserver2.com"), UNI_L("me"), UNI_L("topsecret"), 10, 0, TRUE, new_sync_id, FALSE, UNI_L("22")));
+
+	// The second item shall not match the received item:
+	OpString matching_sync_id;
+	verify(SimulateReceiveFormLoginFromSyncServer(UNI_L("http://someserver.com"), UNI_L("me"), UNI_L("topsecret"), 10, 0, TRUE, matching_sync_id, FALSE, UNI_L("11")));
+	/* Now it is expected that the index of the first item is lower than the
+	 * index of the second item */
+
+	// Clear any messages that was sent since we simulate the item has been there a while
+	self_test_helper->GetSyncDataQueue()->RemoveQueuedItems(OpSyncDataItem::DATAITEM_PM_FORM_AUTH);
+
+	/* Add a sync-item witch causes a conflict with matching_sync_id. This item */
+	OpString conflict_sync_id;
+	verify(SimulateReceiveFormLoginFromSyncServer(UNI_L("http://someserver.com"), UNI_L("me"), UNI_L("topsecret"), 10, 0, TRUE, conflict_sync_id, FALSE, UNI_L("33")));
+
+	/* We expect to keep conflict_sync_id and delete matching_sync_id: */
+	 // The matching_sync_id is expected in the outgoing queue:
+	verify(CheckMessagesSentToLink(OpSyncDataItem::DATAITEM_PM_FORM_AUTH, matching_sync_id, OpSyncDataItem::DATAITEM_ACTION_DELETED, TRUE, 0, 0));
+	// the conflict_sync_id is expected to not be in the outgoing queue:
+	verify(CheckMessagesSentToLink(OpSyncDataItem::DATAITEM_PM_FORM_AUTH, conflict_sync_id, OpSyncDataItem::DATAITEM_ACTION_DELETED, FALSE, 0, 0));
+	// the new_sync_id is also expected to not be in the outgoing queue:
+	verify(CheckMessagesSentToLink(OpSyncDataItem::DATAITEM_PM_FORM_AUTH, new_sync_id, OpSyncDataItem::DATAITEM_ACTION_DELETED, FALSE, 0, 0));
+
+	int page_list_index;
+	verify(g_wand_manager->SelftestGetLogProfile().FindWandSyncItem(new_sync_id.CStr(), page_list_index));
+	verify(g_wand_manager->SelftestGetLogProfile().FindWandSyncItem(conflict_sync_id.CStr(), page_list_index));
+	verify(g_wand_manager->SelftestGetLogProfile().FindWandSyncItem(matching_sync_id.CStr(), page_list_index) == 0);
+}
+finally
+{
+	CleanWandAndRemoveSyncMessages();
+}
+
+test("Receive form login with scope attribute")
+require success "Initialise";
+{
+	/* This test verifies that the GetOnThisServer() flag is correctly set when
+	 * receiving sync-items with the attribute set to "page" or "server". */
+
+	unsigned int pages_count = g_wand_manager->SelftestGetLogProfile().GetWandPageCount();
+	OpString sync_id1;
+	verify(SimulateReceiveFormLoginFromSyncServer(UNI_L("http://on_this_server.com"), UNI_L("me"), UNI_L("topsecret"), 10, WAND_FLAG_ON_THIS_SERVER, TRUE, sync_id1, FALSE, 0));
+	OpString sync_id2;
+	verify(SimulateReceiveFormLoginFromSyncServer(UNI_L("http://not_on_this_server.com"), UNI_L("me"), UNI_L("topsecret"), 10, 0, TRUE, sync_id2, FALSE, 0));
+
+	verify(g_wand_manager->SelftestGetLogProfile().GetWandPageCount() == pages_count+2);
+	WandPage* page_1 = g_wand_manager->SelftestGetLogProfile().GetWandPage(pages_count);
+	verify(page_1);
+	verify_string(page_1->GetUrl(), "http://on_this_server.com");
+	verify(page_1->GetOnThisServer());
+	WandPage* page_2 = g_wand_manager->SelftestGetLogProfile().GetWandPage(pages_count+1);
+	verify(page_2);
+	verify_string(page_2->GetUrl(), "http://not_on_this_server.com");
+	verify(!page_2->GetOnThisServer());
+}
+finally
+{
+	CleanWandAndRemoveSyncMessages();
+}
+
+test("Test low level resolving algorithm different dates")
+require success "Initialise";
+{
+	WandLogin item1, item2;
+
+	verify_success(item1.SelftestAssignSyncId(UNI_L("AA")));
+	verify_success(item2.SelftestAssignSyncId(UNI_L("BB")));
+	verify(SetDate(item1, 2));
+	verify(SetDate(item2, 1));
+
+	item1.SetLocalSyncStatus(WandSyncItem::SYNCED);
+	item2.SetLocalSyncStatus(WandSyncItem::SYNC_ADD);
+
+	verify(item1.ResolveConflictReplaceThisItem(&item2) == FALSE);
+
+	item1.SetLocalSyncStatus(WandSyncItem::SYNC_ADD);
+	item2.SetLocalSyncStatus(WandSyncItem::SYNCED);
+	verify(item2.ResolveConflictReplaceThisItem(&item1) == TRUE);
+
+	verify(CheckMessagesSentToLink(OpSyncDataItem::DATAITEM_PM_HTTP_AUTH, item1.GetSyncId(), OpSyncDataItem::DATAITEM_ACTION_DELETED, FALSE, 0, 0));
+	verify(CheckMessagesSentToLink(OpSyncDataItem::DATAITEM_PM_HTTP_AUTH, item2.GetSyncId(), OpSyncDataItem::DATAITEM_ACTION_DELETED, TRUE, 0, 0));
+}
+finally
+{
+	CleanWandAndRemoveSyncMessages();
+}
+
+test("Test low level resolving algorithm, equal dates, resolve by sync_id")
+require success "Initialise";
+{
+	WandLogin item1, item2;
+
+	verify_success(item1.SelftestAssignSyncId(UNI_L("AA")));
+	verify_success(item2.SelftestAssignSyncId(UNI_L("BB")));
+	verify(SetDate(item1, 2));
+	verify(SetDate(item2, 2));
+
+	item1.SetLocalSyncStatus(WandSyncItem::SYNCED);
+	item2.SetLocalSyncStatus(WandSyncItem::SYNCED);
+
+	verify(item1.ResolveConflictReplaceThisItem(&item2) == TRUE);
+	verify(item2.ResolveConflictReplaceThisItem(&item1) == FALSE);
+
+	verify(CheckMessagesSentToLink(OpSyncDataItem::DATAITEM_PM_HTTP_AUTH, item1.GetSyncId(), OpSyncDataItem::DATAITEM_ACTION_DELETED, TRUE, 0, 0));
+	verify(CheckMessagesSentToLink(OpSyncDataItem::DATAITEM_PM_HTTP_AUTH, item2.GetSyncId(), OpSyncDataItem::DATAITEM_ACTION_DELETED, FALSE, 0, 0));
+}
+finally
+{
+	CleanWandAndRemoveSyncMessages();
+}
+
+test("Receive http delete event from server")
+require success "Initialise";
+{
+	verify_success(g_wand_manager->StoreLoginWithoutWindow(UNI_L("http://anotherserver.com"), UNI_L("me"), UNI_L("secret")));
+
+	WandLogin *login = g_wand_manager->FindLogin(UNI_L("http://anotherserver.com"), UNI_L("me"));
+	verify(login != NULL);
+
+	// simulates incomming delete event from sync item
+	verify(ReceiveDeleteEvent(login->GetSyncId(), OpSyncDataItem::DATAITEM_PM_HTTP_AUTH));
+
+	login = g_wand_manager->FindLogin(UNI_L("http://anotherserver.com"), UNI_L("me"));
+	verify(login == NULL);
+}
+finally
+{
+	CleanWandAndRemoveSyncMessages();
+}
+
+test("Receive form delete event from server")
+require success "Initialise";
+{
+	OpAutoPtr<WandPage> form_login(OP_NEW(WandPage, ()));
+	verify(form_login.get());
+	verify_success(form_login->SelftestConstruct(UNI_L("HTTP://yihawannahaveababa.com"), NULL, UNI_L("do_it"), UNI_L("submitname"), 0, 0));
+
+	verify_success(form_login->SelftestAddObjectInfo(UNI_L("password"), UNI_L("somepassword"), TRUE, FALSE, TRUE));
+	verify_success(form_login->SelftestAddObjectInfo(UNI_L("user"), UNI_L("username"), FALSE, TRUE, TRUE));
+
+	verify_success(form_login->Encrypt());
+	verify_success(g_wand_manager->SelftestGetLogProfile().Store(form_login.get()));
+	WandPage *added_page = form_login.release();
+
+	OpString sync_id;
+	verify_success(sync_id.Set(added_page->GetSyncId()));
+	// simulates incomming delete event from sync item
+	verify(ReceiveDeleteEvent(sync_id.CStr(), OpSyncDataItem::DATAITEM_PM_FORM_AUTH));
+
+	int index = 0;
+	WandSyncItem *item = g_wand_manager->SelftestGetLogProfile().FindWandSyncItem(sync_id.CStr(), index);
+	verify(item == NULL);
+}
+finally
+{
+	CleanWandAndRemoveSyncMessages();
+}
+
+test("Receive form login with invalid modified date")
+require success "Initialise";
+{
+	/* This test verifies that a sync-item which has an invalid modified
+	 * attribute will not be accepted (and sent back as deleted to the Link
+	 * server. */
+
+	OpString sync_id;
+	verify(SimulateReceiveFormLoginFromSyncServer(UNI_L("http://someserver.com"), UNI_L("me"), UNI_L("topsecret"), -1, 0, FALSE, sync_id, FALSE, 0));
+	// The same item shall be sent as deleted to the server.
+	verify(CheckMessagesSentToLink(OpSyncDataItem::DATAITEM_PM_FORM_AUTH, sync_id, OpSyncDataItem::DATAITEM_ACTION_DELETED, TRUE, 0, 0));
+}
+finally
+{
+	CleanWandAndRemoveSyncMessages();
+}

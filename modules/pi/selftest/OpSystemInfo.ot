@@ -1,0 +1,538 @@
+/* -*- Mode: c++; tab-width: 4; indent-tabs-mode: t; c-basic-offset: 4; c-file-style:"stroustrup" -*-
+ *
+ * Copyright (C) 1995-2011 Opera Software ASA.  All rights reserved.
+ *
+ * This file is part of the Opera web browser.
+ * It may not be distributed under any circumstances.
+ */
+
+group "pi.opsysteminfo";
+require init;
+
+include "modules/pi/OpSystemInfo.h";
+include "modules/hardcore/keys/opkeys.h";
+include if PI_HOST_RESOLVER "modules/pi/network/OpSocketAddress.h";
+
+global
+{
+	OpSystemInfo* osi;
+	const uni_char* editor;
+	OpString drives;
+}
+
+test("create/destroy") repeat 17; leakcheck;
+{
+	osi = NULL;
+	OP_STATUS status = OpSystemInfo::Create(&osi);
+	verify(OpStatus::IsSuccess(status) && osi != NULL);
+	OP_DELETE(osi);
+	osi = NULL;
+}
+
+test("create")
+{
+	OP_STATUS status = OpSystemInfo::Create(&osi);
+	verify(OpStatus::IsSuccess(status) && osi != NULL);
+}
+
+
+
+test("GetPhysicalMemorySizeMB") leakcheck; require success "create";
+require OPSYSTEMINFO_GETPHYSMEM;
+{
+	UINT32 memsize = osi->GetPhysicalMemorySizeMB();
+	verify(memsize >= 1);
+	verify(memsize < 0x20000); // Notify module owner if you have more than TB/8 of memory !
+}
+
+test("GetBackChannelStatus") leakcheck; require success "create";
+require HAS_ATVEF_SUPPORT;
+{
+	OpSystemInfo::BackChannelStatus status = osi->GetBackChannelStatus();
+	verify(status == OpSystemInfo::BACKCHANNEL_PERMANENT ||
+			   status == OpSystemInfo::BACKCHANNEL_CONNECTED ||
+			   status == OpSystemInfo::BACKCHANNEL_DISCONNECTED ||
+			   status == OpSystemInfo::BACKCHANNEL_UNAVAILABLE);
+}
+
+table ProxyProtocols (char*) { { "http" }, { "https" }, { "ftp" }, { "gopher" }, { "wais" } }
+foreach (protocolname) from ProxyProtocols
+{
+	test("GetProxySettingsL: " protocolname) leakcheck; require success "create";
+	{
+		const uni_char* protocol = UNI_L(protocolname);
+		int enabled = -17;
+		OpString proxyserver;
+		verify(OpStatus::IsSuccess(proxyserver.Set("notcleared")));
+		TRAPD(status, osi->GetProxySettingsL(protocol, enabled, proxyserver));
+		verify(OpStatus::IsSuccess(status));
+		verify(enabled != -17);
+		verify(enabled == 0 || enabled == 1);
+		verify(proxyserver.Compare("notcleared") != 0);
+		if (enabled)
+		{
+			verify(proxyserver.HasContent());
+			verify(proxyserver.Find(":") != KNotFound);
+			verify(proxyserver.FindFirstOf(':') == proxyserver.FindLastOf(':'));
+			// ... but what about [IPv6 address]:port ?
+		}
+	}
+}
+
+test("GetAutoProxyURLL") leakcheck; require success "create";
+require SUPPORT_AUTO_PROXY_CONFIGURATION;
+{
+	OpString url;
+	verify(OpStatus::IsSuccess(url.Set("unchanged")));
+	BOOL enabled = TRUE;
+	TRAPD(err, osi->GetAutoProxyURLL(&url, &enabled));
+	verify(OpStatus::IsSuccess(err));
+	if (enabled)
+		verify(url.Compare("unchanged") != 0);
+}
+
+test("GetPluginPathL") leakcheck; require success "create";
+require _PLUGIN_SUPPORT_;
+{
+	char invalid[] = ":!\\/&;$`'#";
+	OpStringC dfpath(UNI_L(""));
+	OpString improved;
+	verify(OpStatus::IsSuccess(improved.Set(invalid)));
+	TRAPD(err, osi->GetPluginPathL(dfpath, improved));
+	verify(OpStatus::IsSuccess(err));
+	verify(0 != improved.Compare(invalid));
+	OpString reprise;
+	verify(OpStatus::IsSuccess(reprise.Set(invalid)));
+	TRAP(err, osi->GetPluginPathL(improved, reprise));
+	verify(OpStatus::IsSuccess(err));
+	verify(0 != reprise.Compare(invalid));
+	// Any entries that must be included should already be included:
+	verify(0 == reprise.Compare(improved));
+	// TODO: can we test content of the path ?
+}
+ 
+test("GetStaticPlugin") leakcheck; require success "create";
+require OPSYSTEMINFO_STATIC_PLUGIN;
+disabled; // TODO: test me
+{
+	verify(0);
+}
+
+test("IsInMainThread") leakcheck; require success "create";
+require USE_OP_THREAD_TOOLS;
+{
+	// tests should be running in our main thread
+	verify(osi->IsInMainThread());
+}
+
+test("GetCurrentProcessId") leakcheck; require success "create";
+require OPSYSTEMINFO_GETPID;
+disabled; // to be tested
+{
+	verify(0);
+}
+
+
+//========================
+
+test("GetSystemEncodingL") leakcheck; require success "create";
+{
+	const char* encoding = NULL;
+	TRAPD(status, encoding = osi->GetSystemEncodingL());
+	verify(OpStatus::IsSuccess(status));
+	verify(encoding != NULL);
+	verify(op_strlen(encoding) >= 2);
+}
+
+test("ExpandSystemVariablesInString") leakcheck; require success "create";
+require PI_EXPAND_ENV_VARIABLES;
+{
+	const uni_char *initial = UNI_L("There should be no expansion here !");
+	OpString answer;
+	verify(OpStatus::IsSuccess(osi->ExpandSystemVariablesInString(initial, &answer)));
+	verify(answer.Compare(initial) == 0);
+
+	// Further testing should be done by implementors !
+	// TODO: collude with OpLowlevelFile::GetSerializedName() ?
+}
+
+table FileNames (char*) { { "gogiopera.exe" }, { "textfile.txt" }, { "somethingbinary.bin" }, { "inifile.ini" } }
+foreach (name) from FileNames
+{
+	test("GetFileTypeName: " name) leakcheck; require success "create";
+	require OPSYSTEMINFO_GETFILETYPENAME;
+	{
+		const uni_char* filename = UNI_L(name);
+		uni_char *out = OP_NEWA(uni_char, 10);
+		int i;
+
+		verify(out);
+
+		for (i=0; i<10; i++)
+			out[i] = 0xfeff;
+		verify(OpStatus::IsSuccess(osi->GetFileTypeName(filename, out, 3)));
+		verify(out[0] != 0xfeff);
+		for (i=3; i<10; i++)
+			verify(out[i] == 0xfeff);
+	}
+	finally
+	{
+		OP_DELETEA(out);
+	}
+}
+
+test("GetProtocolHandler") leakcheck; require success "create";
+require OPSYSTEMINFO_GETPROTHANDLER;
+disabled; // to be tested
+{
+	verify(0);
+}
+
+test("GetFileHandler") leakcheck; require success "create";
+require OPSYSTEMINFO_FILEUTILS;
+disabled; // to be tested
+{
+	verify(0);
+}
+
+test("GetIsExecutable") leakcheck; require success "create";
+require OPSYSTEMINFO_FILEUTILS;
+disabled; // to be tested, but see test("GetIsExecutable - editor")
+{
+	verify(0);
+}
+
+test("GetShiftKeyState") leakcheck; require success "create";
+require OPSYSTEMINFO_SHIFTSTATE;
+disabled; // to be tested
+{
+	verify(0);
+}
+
+test("GetDefaultTextEditorL") leakcheck; require success "create";
+require EXTERNAL_APPLICATIONS_SUPPORT;
+{
+	const uni_char* const initial = UNI_L("notcleared");
+	editor = initial; // see globals
+	TRAPD(status, editor = osi->GetDefaultTextEditorL());
+	verify(OpStatus::IsSuccess(status) && editor != initial);
+}
+
+test("GetIsExecutable - editor") leakcheck; require success "GetDefaultTextEditorL";
+require OPSYSTEMINFO_FILEUTILS;
+{
+	if (editor)
+	{
+		OpString cmd;
+		verify(OpStatus::IsSuccess(cmd.Set(editor)));
+		verify(osi->GetIsExecutable(&cmd));
+	}
+	else
+		verify("fatuous test :-(");
+}
+
+test("ExecuteApplication") leakcheck; require success "create";
+require EXTERNAL_APPLICATIONS_SUPPORT;
+disabled; // to be tested
+{
+	verify(0);
+}
+
+test("GetPlatformStr") leakcheck; require success "create";
+{
+	const uni_char* plstr = osi->GetPlatformStr();
+	verify(plstr != NULL);
+	verify(uni_strlen(plstr) >= 2); // arbitrary
+}
+
+table FileLengthStrings (OpFileLength, char*)
+{
+	{ 0, "0" },
+	{ 13, "13" },
+	{ 4711, "4711" },
+	{ 489767845, "489767845" }
+}
+
+foreach (number, str) from FileLengthStrings
+{
+	test("OpFileLengthToString: " str) leakcheck; require success "create";
+	{
+		OpString8 result;
+		verify(OpStatus::IsSuccess(result.Set("notcleared")));
+		verify(OpStatus::IsSuccess(osi->OpFileLengthToString(number, &result)));
+		verify(result.Compare(str) == 0);
+	}
+}
+
+test("HasSyncLookup") leakcheck; require success "create";
+require SYNCHRONOUS_HOST_RESOLVING;
+{
+	BOOL synclookup = osi->HasSyncLookup();
+	verify(synclookup == TRUE || synclookup == FALSE);
+}
+
+test("GetDnsAddress") leakcheck; require success "create";
+require PI_HOST_RESOLVER;
+{
+	OpSocketAddress* dns_address = (OpSocketAddress*)0x17;
+	verify(OpStatus::IsSuccess(osi->GetDnsAddress(&dns_address)));
+	verify(dns_address != (OpSocketAddress*)0x17);
+	verify(dns_address != NULL);
+	verify(dns_address->IsValid());
+	OpString address_string;
+	verify(OpStatus::IsSuccess(dns_address->ToString(&address_string)));
+	verify(address_string.HasContent());
+	output("(got %s) ", ST_down(address_string.CStr()));
+}
+finally
+{
+	if (dns_address != (OpSocketAddress*)0x17)
+		OP_DELETE(dns_address);
+}
+
+test("ResolveExternalHost")
+require success "create";
+require PI_HOST_RESOLVER;
+{
+	OpAutoVector<OpSocketAddress>* addresses = 0;
+
+	OpSystemInfo::ResolveHostPolicy policy = osi->GetExternalResolvePolicy();
+
+	if (policy != OpSystemInfo::RESOLVE_EXTERNAL_IGNORE)
+	{
+		addresses = osi->ResolveExternalHost(UNI_L("localhost"));
+
+		verify(addresses);
+
+		// Hopefully reasonable to assume that all systems recognize "localhost":
+
+		verify(addresses->GetCount() > 0);
+	}
+}
+finally
+{
+	OP_DELETE(addresses);
+}
+
+test("GetDriveLetters") leakcheck; require success "create";
+require SYS_CAP_FILESYSTEM_HAS_MULTIPLE_DRIVES;
+{
+	verify(OpStatus::IsSuccess(osi->GetDriveLetters(&drives)));
+	for (int i = drives.Length(); i-- > 0; )
+	{
+		verify(uni_isalpha(drives[i])); // it's a letter
+		// sorted alphabetically:
+		verify(i == 0 || uni_toupper(drives[i]) > uni_toupper(drives[i-1]));
+	}
+}
+
+test("GetCurrentDriveLetter") leakcheck; require success "GetDriveLetters";
+require SYS_CAP_FILESYSTEM_HAS_MULTIPLE_DRIVES;
+{
+	uni_char now = osi->GetCurrentDriveLetter();
+	verify(now == 0 || drives.FindFirstOf(now) >= 0);
+}
+
+test("GetUserLanguages") leakcheck; require success "create";
+{
+	OpString result;
+	verify(OpStatus::IsSuccess(result.Set(UNI_L("notcleared"))));
+	verify(OpStatus::IsSuccess(osi->GetUserLanguages(&result)));
+	verify(result.Compare("notcleared"));
+}
+
+test("GetUserCountry") leakcheck; require success "create";
+{
+	uni_char *result = OP_NEWA(uni_char, 10);
+	int i;
+
+	verify(result);
+
+	for (i=0; i<10; i++)
+		result[i] = 0xfeff;
+
+	osi->GetUserCountry(result);
+	verify(result[0] != 0xfeff);
+
+	for (i=3; i<10; i++)
+		verify(result[i] == 0xfeff);
+}
+finally
+{
+	OP_DELETEA(result);
+}
+
+test("GetUniqueFileNamePattern") require success "create";
+require OPSYSTEM_GET_UNIQUE_FILENAME_PATTERN;
+{
+	const uni_char *pat = osi->GetUniqueFileNamePattern();
+	verify(pat);
+	verify(uni_strstr(pat, "%d"));
+	verify(!uni_strchr(pat, PATHSEPCHAR));
+}
+
+
+test("PathsEqual") require success "create";
+	file uni data_path "data";
+{
+	OpString str1;
+	OpString str2;
+	OpString str3;
+
+	verify_success(str1.Set(data_path));
+	verify_success(str2.Set(data_path));
+	verify_success(str3.Set(data_path));
+
+	verify_success(str1.Append(PATHSEP));
+	verify_success(str2.Append(PATHSEP));
+	verify_success(str2.Append(".."));
+	verify_success(str2.Append(PATHSEP));
+	verify_success(str2.Append("data"));
+	verify_success(str2.Append(PATHSEP));
+	verify_success(str3.Append(PATHSEP));
+
+	verify_success(str1.Append("files.txt"));
+	verify_success(str2.Append("files.txt"));
+	verify_success(str3.Append("folders.txt"));
+
+	BOOL equal = FALSE;
+
+	verify_success(osi->PathsEqual(str1, str2, &equal));
+	verify(equal);
+
+	verify_success(osi->PathsEqual(str1, str1, &equal));
+	verify(equal);
+
+	verify_success(osi->PathsEqual(str1, str3, &equal));
+	verify(!equal);
+
+	// More tests would be nice here, but which assumptions can we make safely?
+}
+
+test("PathsEqual used with dirs") require success "create";
+	file uni data_path "data";
+{
+	OpString str1;
+	OpString str2;
+	OpString str3;
+
+	verify_success(str1.Set(data_path));
+	verify_success(str2.Set(data_path));
+	verify_success(str3.Set(data_path));
+
+	verify_success(str1.Append(PATHSEP));
+
+	verify_success(str2.Append(PATHSEP));
+	verify_success(str2.Append(".."));
+	verify_success(str2.Append(PATHSEP));
+	verify_success(str2.Append("data"));
+
+	verify_success(str3.Append(PATHSEP));
+	verify_success(str3.Append(".."));
+	verify_success(str3.Append(PATHSEP));
+
+	BOOL equal = FALSE;
+
+	verify_success(osi->PathsEqual(str1, str2, &equal));
+	verify(equal);
+
+	verify_success(osi->PathsEqual(str1, str1, &equal));
+	verify(equal);
+
+	verify_success(osi->PathsEqual(str1, str3, &equal));
+	verify(!equal);
+}
+
+test("GetDRMVersion") require success "create";
+require OPSYSTEMINFO_GETDRMVERSION;
+{
+	const char* dv = osi->GetDRMVersion();
+	verify(dv); // of form MAJOR.MINOR, e.g. "2.0"
+	int i = 0;
+	verify(op_isdigit(dv[i]));
+	while (dv[++i] && op_isdigit(dv[i]))
+		/* skip */ ;
+	verify(dv[i] == '.');
+	verify(dv[++i] && op_isdigit(dv[i]));
+	while (dv[++i] && op_isdigit(dv[i]))
+		/* skip */ ;
+	verify(dv[i] == 0);
+}
+
+// Coverage tests for things whose *functionality* is hard to test:
+
+test("GetNewlineString") leakcheck; require success "create";
+require OPSYSTEMINFO_FILEUTILS;
+{
+	OpString nl;
+	verify(OpStatus::IsSuccess(nl.Append(NEWLINE)));
+	verify(nl.HasContent());
+	for (int i = nl.Length(); i-- > 0; )
+		verify(uni_isspace(nl[i]));
+
+	// TODO: collude with OpLowLevelFile::Readline ?
+}
+ 
+test("GetShiftKeyState") require success "create";
+require OPSYSTEMINFO_SHIFTSTATE;
+{
+	const ShiftKeyState mask = SHIFTKEY_NONE | // zero, but mentioned in spec
+		SHIFTKEY_CTRL | SHIFTKEY_SHIFT | SHIFTKEY_ALT | SHIFTKEY_META | SHIFTKEY_SUPER;
+	INT32 found = osi->GetShiftKeyState();
+	ShiftKeyState state = found; // narrower type
+	verify(!(found & ~mask));
+	verify(found == (INT32)state);
+}
+ 
+test("GetSystemIp") leakcheck; require success "create";
+require OPSYSTEMINFO_GETSYSTEMIP;
+{
+	OpString ip;
+	verify(OpStatus::IsSuccess(osi->GetSystemIp(ip)));
+	verify(ip.HasContent());
+	// It should be a valid public IP address:
+	verify(0 != ip.Compare("0.0.0.0"));
+	verify(0 != ip.Compare("127.0.0.1"));
+
+	// TODO: collude with OpSocketAddress, OpNetworkInterface ?
+}
+ 
+test("GetDnsSuffixes") leakcheck; require success "create";
+require PI_HOST_RESOLVER;
+{
+	OpString sfx;
+	verify(OpStatus::IsSuccess(osi->GetDnsSuffixes(&sfx)));
+	// and tacitly verify that we didn't crash
+ 
+	// TODO: what can we do to verify content ?
+}
+ 
+test("GenerateGuid") leakcheck; require success "create";
+require GUID_GENERATE_SUPPORT;
+{
+	OpGuid guid;
+	verify(OpStatus::IsSuccess(osi->GenerateGuid(guid)));
+	// and tacitly verify that we didn't crash
+
+	// TODO: what can we do to verify guid ?
+	// TODO: generate a second, verify distinctness: does OpGuid have an equality test ?
+}
+ 
+test("GetSubscriberID") require success "create";
+require OPSYSTEMINFO_GETSUBSCRIBERID;
+{
+	const char* id = osi->GetSubscriberID();
+	verify("We didn't just crash");
+}
+ 
+test("GetAppId") require success "create";
+require OPSYSTEMINFO_GETAPPID;
+{
+	const char* id = osi->GetAppId();
+	verify("We didn't just crash");
+}
+
+exit
+{
+	OP_DELETE(osi);
+}

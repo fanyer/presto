@@ -1,0 +1,461 @@
+/* -*- Mode: c++; tab-width: 4; indent-tabs-mode: t; c-basic-offset: 4 -*-
+**
+** Copyright (C) 2010 Opera Software AS.  All rights reserved.
+**
+** This file is part of the Opera web browser.  It may not be distributed
+** under any circumstances.
+*/
+
+group "scope.idtable";
+
+require init;
+require SCOPE_SUPPORT;
+
+language c++;
+
+include "modules/scope/src/scope_idtable.h";
+
+global
+{
+	class Observer
+	{
+	public:
+		Observer()
+			: objects_destroyed(0)
+		{
+		}
+
+		int GetObjectsDestroyed() const
+		{
+			return objects_destroyed;
+		}
+
+		void Inc()
+		{
+			++objects_destroyed;
+		}
+	private:
+		int objects_destroyed;
+	};
+
+	class Object
+	{
+	public:
+		Object(Observer &observer)
+			: observer(observer)
+		{
+		}
+
+		~Object()
+		{
+			observer.Inc();
+		}
+	private:
+		Observer &observer;
+	};
+}
+
+setup
+{
+}
+
+exit
+{
+}
+
+foreach (Classname, destroy) from
+	{
+		{OpScopeIDTable, FALSE},
+		{OpScopeAutoIDTable, TRUE}
+	}
+{
+
+test("$(Classname) constructor")
+{
+	// Don't crash.
+	Classname<Object> table;
+}
+
+test("$(Classname) add one object")
+{
+	Observer obs;
+	OpAutoPtr<Object> obj(OP_NEW(Object, (obs)));
+	verify_not_oom(obj.get());
+
+	{
+		Classname<Object> table;
+		unsigned id;
+		verify_success(table.GetID(obj.get(), id));
+		if (destroy)
+			obj.release();
+	}
+
+	verify(obs.GetObjectsDestroyed() == (destroy ? 1 : 0));
+}
+
+test("$(Classname) add 100 objects")
+{
+	Observer obs;
+
+	const unsigned max = 100;
+
+	OpAutoPtr<Object> objs[max];
+
+	{
+		Classname<Object> table;
+
+		// Create 100
+		for (unsigned i = 0; i<max; ++i)
+		{
+			objs[i].reset(OP_NEW(Object, (obs)));
+			verify_not_oom(objs[i].get());
+
+			unsigned id;
+			OP_STATUS status = table.GetID(objs[i].get(), id);
+			verify(!OpStatus::IsMemoryError(status));
+			if (destroy)
+				objs[i].release();
+			verify(OpStatus::IsSuccess(status));
+			verify(id == i+1);
+
+		}
+	}
+
+	verify(obs.GetObjectsDestroyed() == (destroy ? 100 : 0));
+}
+
+test("$(Classname) add 100 objects, and retrieve them")
+{
+	Observer obs;
+
+	const unsigned max = 100;
+
+	OpAutoPtr<Object> objs[max];
+	Object *objs_raw[max];
+
+	{
+		Classname<Object> table;
+
+		// Create 100
+		for (unsigned i = 0; i<max; ++i)
+		{
+			objs[i].reset(OP_NEW(Object, (obs)));
+			verify_not_oom(objs[i].get());
+
+			unsigned id;
+			OP_STATUS status = table.GetID(objs[i].get(), id);
+			verify(!OpStatus::IsMemoryError(status));
+			objs_raw[i] = objs[i].get();
+			if (destroy)
+				objs[i].release();
+			verify(OpStatus::IsSuccess(status));
+			verify(id == i+1);
+		}
+
+		// Retrieve 100
+		for (unsigned i = 0; i<max; ++i)
+		{
+			Object *obj = NULL;
+			OP_STATUS status = table.GetObject(i+1, obj);
+			verify(!OpStatus::IsMemoryError(status));
+			verify(OpStatus::IsSuccess(status));
+			verify(objs_raw[i] == obj);
+		}
+	}
+
+	verify(obs.GetObjectsDestroyed() == (destroy ? 100 : 0));
+}
+
+test("$(Classname) retrieve nonexisting object")
+{
+	Classname<Object> table;
+	Object *obj;
+	verify(OpStatus::IsError(table.GetObject(1337, obj)));
+	verify(OpStatus::IsError(table.GetObject(0, obj)));
+}
+
+test("$(Classname) add 100, then purge")
+{
+	Observer obs;
+
+	const unsigned max = 100;
+
+	OpAutoPtr<Object> objs[max];
+
+	{
+		Classname<Object> table;
+
+		// Create 100
+		for (unsigned i = 0; i<max; ++i)
+		{
+			objs[i].reset(OP_NEW(Object, (obs)));
+			verify_not_oom(objs[i].get());
+
+			unsigned id;
+			OP_STATUS status = table.GetID(objs[i].get(), id);
+			verify(!OpStatus::IsMemoryError(status));
+			if (destroy)
+				objs[i].release();
+			verify(OpStatus::IsSuccess(status));
+			verify(id == i+1);
+		}
+
+		table.Purge();
+
+		// Try to access (should fail).
+		for (unsigned i = 0; i<max; ++i)
+		{
+			Object *obj = NULL;
+			verify(OpStatus::IsError(table.GetObject(i+1, obj)));
+		}
+	}
+
+	verify(obs.GetObjectsDestroyed() == (destroy ? 100 : 0));
+}
+
+test("$(Classname) purge 100, id should be 1")
+{
+	Observer obs;
+
+	const unsigned max = 100;
+
+	OpAutoPtr<Object> objs[max];
+
+	{
+		Classname<Object> table;
+
+		// Create and purge 100
+		for (unsigned i = 0; i<max; ++i)
+		{
+			objs[i].reset(OP_NEW(Object, (obs)));
+			verify_not_oom(objs[i].get());
+
+			unsigned id;
+			OP_STATUS status = table.GetID(objs[i].get(), id);
+			verify(!OpStatus::IsMemoryError(status));
+			if (destroy)
+				objs[i].release();
+			verify(OpStatus::IsSuccess(status));
+			verify(id == 1);
+			table.Purge();
+		}
+	}
+
+	verify(obs.GetObjectsDestroyed() == (destroy ? 100 : 0));
+}
+
+test("$(Classname) Retain/Release")
+{
+	Classname<Object> table;
+	OpScopeIDTable<Object> *table_ptr = table.Retain();
+
+	Observer obs;
+	OpAutoPtr<Object> obj(OP_NEW(Object, (obs)));
+	verify_not_oom(obj.get());
+
+	// Add the object.
+	unsigned id;
+	OP_STATUS status = table_ptr->GetID(obj.get(), id);
+	verify(!OpStatus::IsMemoryError(status));
+	if (destroy)
+		obj.release();
+	verify(OpStatus::IsSuccess(status));
+	verify(id == 1);
+
+	table_ptr->Release();
+	verify(obs.GetObjectsDestroyed() == (destroy ? 1 : 0));
+}
+
+test("$(Classname) Reset")
+{
+	Classname<Object> table;
+	OpScopeIDTable<Object> *table_ptr = table.Retain();
+
+	Observer obs;
+	OpAutoPtr<Object> obj(OP_NEW(Object, (obs)));
+	verify_not_oom(obj.get());
+
+	// Add the object.
+	unsigned id;
+	OP_STATUS status = table_ptr->GetID(obj.get(), id);
+	verify(!OpStatus::IsMemoryError(status));
+	if (destroy)
+		obj.release();
+	verify(OpStatus::IsSuccess(status));
+	verify(id == 1);
+
+	table_ptr->Reset();
+	verify(obs.GetObjectsDestroyed() == (destroy ? 1 : 0));
+
+	table_ptr->Release();
+}
+
+test("$(Classname) RemoveID")
+{
+	Observer obs;
+
+	const unsigned max = 100;
+
+	OpAutoPtr<Object> objs[max];
+	unsigned ids[max];
+
+	{
+		Classname<Object> table;
+
+		// Create 100
+		for (unsigned i = 0; i<max; ++i)
+		{
+			objs[i].reset(OP_NEW(Object, (obs)));
+			verify_not_oom(objs[i].get());
+			unsigned id;
+			OP_STATUS status = table.GetID(objs[i].get(), id);
+			verify(!OpStatus::IsMemoryError(status));
+			ids[i] = id;
+
+			// When Classname = OpScopeAutoIDTable, the elements will be
+			// auto-freed, except the ones removed manually (even ones)
+			if (destroy)
+				objs[i].release();
+
+			verify(OpStatus::IsSuccess(status));
+			verify(id == i+1);
+		}
+
+		// Remove even IDs.
+		for (unsigned i = 0; i < max; ++i)
+		{
+			unsigned id = ids[i];
+
+			if (id % 2 == 0) // Even number:
+			{
+				// Get the pointer to the element, to be placed in auto-ptr below
+				Object *obj = NULL;
+				verify_success(table.GetObject(id, obj));
+
+				// Remove the element.
+				verify(OpStatus::IsSuccess(table.RemoveID(id)));
+
+				// Element has been removed from the table, but still exists in memory.
+				// We place the pointer back into an auto-ptr for automatic memory management.
+				if (destroy)
+					objs[i].reset(obj);
+
+				// Try to access it. (Should fail).
+				obj = NULL;
+				verify(OpStatus::IsError(table.GetObject(id, obj)));
+
+				// Try to remove it again. (Should fail).
+				verify(OpStatus::IsError(table.RemoveID(id)));
+			}
+			else // Odd number:
+			{
+				// Try to access it. (Should succeed).
+				Object *obj = NULL;
+				verify(OpStatus::IsSuccess(table.GetObject(id, obj)));
+			}
+		}
+	}
+}
+
+} // foreach
+
+test("OpScopeAutoIDTable DeleteID")
+{
+	Observer obs;
+
+	const unsigned max = 100;
+
+	OpAutoPtr<Object> objs[max];
+	unsigned ids[max];
+
+	{
+		OpScopeAutoIDTable<Object> table;
+
+		// Create 100
+		for (unsigned i = 0; i<max; ++i)
+		{
+			objs[i].reset(OP_NEW(Object, (obs)));
+			verify_not_oom(objs[i].get());
+
+			unsigned id;
+			OP_STATUS status = table.GetID(objs[i].get(), id);
+			verify(!OpStatus::IsMemoryError(status));
+			ids[i] = id;
+			objs[i].release();
+			verify(OpStatus::IsSuccess(status));
+			verify(id == i+1);
+		}
+
+		// Delete even IDs.
+		for (unsigned i = 1; i < max; i+=2)
+			verify(OpStatus::IsSuccess(table.DeleteID(ids[i])));
+
+		verify(obs.GetObjectsDestroyed() == max / 2);
+
+		// Verify that the correct objects are destroyed.
+		for (unsigned i = 0; i < max; ++i)
+		{
+			unsigned id = ids[i];
+			Object *obj = NULL;
+
+			if (id % 2 == 0) // Even number:
+				verify(OpStatus::IsError(table.GetObject(id, obj)));
+			else // Odd number:
+				verify(OpStatus::IsSuccess(table.GetObject(id, obj)));
+		}
+
+	}
+
+	verify(obs.GetObjectsDestroyed() == (int)max);
+}
+
+test("OpScopeAutoIDTable DeleteObject")
+{
+	Observer obs;
+
+	const unsigned max = 100;
+
+	OpAutoPtr<Object> objs[max];
+	Object *ptrs[max];
+	unsigned ids[max];
+
+	{
+		OpScopeAutoIDTable<Object> table;
+
+		// Create 100
+		for (unsigned i = 0; i<max; ++i)
+		{
+			objs[i].reset(OP_NEW(Object, (obs)));
+			verify_not_oom(objs[i].get());
+
+			unsigned id;
+			OP_STATUS status = table.GetID(objs[i].get(), id);
+			verify(!OpStatus::IsMemoryError(status));
+			ids[i] = id;
+			ptrs[i] = objs[i].release();
+			verify(OpStatus::IsSuccess(status));
+			verify(id == i+1);
+		}
+
+		// Delete every other object.
+		for (unsigned i = 0; i < max; i+=2)
+			verify(OpStatus::IsSuccess(table.DeleteObject(ptrs[i])));
+
+		verify(obs.GetObjectsDestroyed() == max / 2);
+
+		// Verify that the correct objects are destroyed.
+		for (unsigned i = 0; i < max; ++i)
+		{
+			unsigned id = ids[i];
+			Object *obj = NULL;
+
+			if (id % 2 == 0) // Even number:
+				verify(OpStatus::IsSuccess(table.GetObject(id, obj)));
+			else // Odd number:
+				verify(OpStatus::IsError(table.GetObject(id, obj)));
+		}
+
+	}
+
+	verify(obs.GetObjectsDestroyed() == (int)max);
+}

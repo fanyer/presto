@@ -1,0 +1,404 @@
+/* -*- Mode: c++; tab-width: 4; indent-tabs-mode: t; c-basic-offset: 4 -*-
+**
+** Copyright (C) 2004-2012 Opera Software ASA.  All rights reserved.
+**
+** This file is part of the Opera web browser.  It may not be distributed
+** under any circumstances.
+**
+** Peter Krefting
+*/
+
+group "prefs.prefslistener";
+require init;
+require PREFS_WRITE;
+
+include "modules/prefs/prefsmanager/opprefslistener.h";
+include "modules/prefs/prefsmanager/collections/pc_display.h";
+include "modules/prefs/prefsmanager/collections/pc_files.h";
+include "modules/prefs/prefsmanager/collections/pc_fontcolor.h";
+include "modules/util/opfile/opfile.h";
+include "modules/util/opstring.h";
+
+// -- Global variables ---------------------------------------------------
+
+global
+{
+	class SelfTestDisplayListener : public OpPrefsListener
+	{
+	public:
+		SelfTestDisplayListener()
+			: m_intok(FALSE), m_strok(FALSE)
+			, m_intcalls(0), m_strcalls(0)
+			, m_expected_int(0)
+			{}
+
+		virtual void PrefChanged(enum OpPrefsCollection::Collections id, int pref,
+		                         int newvalue)
+		{
+			++ m_intcalls;
+			if (OpPrefsCollection::Display == id &&
+			    PrefsCollectionDisplay::Scale == PrefsCollectionDisplay::integerpref(pref) &&
+			    m_expected_int == newvalue)
+			{
+				m_intok = TRUE;
+			}
+		}
+
+		virtual void PrefChanged(enum OpPrefsCollection::Collections id, int pref,
+		                         const OpStringC &newvalue)
+		{
+			++ m_strcalls;
+			if (OpPrefsCollection::Display == id &&
+			    PrefsCollectionDisplay::DefaultEncoding == PrefsCollectionDisplay::stringpref(pref) &&
+			    0 == newvalue.Compare(m_expected_str))
+			{
+				m_strok = TRUE;
+			}
+		}
+
+		void SetExpectInt(int val)
+		{
+			m_expected_int = val;
+		}
+
+		OP_STATUS SetExpectStr(const uni_char *s)
+		{
+			return m_expected_str.Set(s);
+		}
+
+		inline BOOL IntValid() { return m_intok; }
+		inline BOOL StrValid() { return m_strok; }
+
+		inline void ResetIntCalls() { m_intcalls = 0; }
+		inline void ResetStrCalls() { m_strcalls = 0; }
+
+		inline int IntCalls() { return m_intcalls; }
+		inline int StrCalls() { return m_strcalls; }
+
+	private:
+		BOOL m_intok, m_strok;
+		int m_intcalls, m_strcalls;
+		int m_expected_int;
+		OpString m_expected_str;
+	};
+
+#ifdef _LOCALHOST_SUPPORT_
+	class SelfTestFileListener : public PrefsCollectionFilesListener
+	{
+	public:
+		SelfTestFileListener()
+			: m_fileok(FALSE)
+			, m_filecalls(0)
+			{}
+
+		virtual void FileChangedL(PrefsCollectionFiles::filepref pref, const OpFile *newvalue)
+		{
+			++ m_filecalls;
+			if (PrefsCollectionFiles::BrowserCSSFile == pref &&
+			    m_expected_file &&
+				uni_str_eq(m_expected_file->GetSerializedName(), newvalue->GetSerializedName()))
+			{
+				m_fileok = TRUE;
+			}
+		}
+
+		inline BOOL FileValid(){ return m_fileok; }
+		inline void ResetFileCalls() { m_filecalls = 0; }
+		inline int FileCalls() { return m_filecalls; }
+
+		void SetExpectFile(OpFile *file)
+		{
+			m_expected_file = file;
+		}
+
+	private:
+		BOOL m_fileok;
+		OpFile *m_expected_file;
+		int m_filecalls;
+	};
+#endif
+
+	class SelfTestFontcolorListener : public OpPrefsListener
+	{
+	public:
+		SelfTestFontcolorListener()
+			: m_colorok(FALSE), m_fontok(FALSE)
+			, m_colorcalls(0), m_fontcalls(0)
+			{}
+
+		virtual void PrefChanged(enum OpPrefsCollection::Collections id, int pref,
+		                         int newvalue)
+		{
+			++ m_colorcalls;
+			if (OpPrefsCollection::FontsAndColors == id &&
+			    OP_SYSTEM_COLOR_DOCUMENT_BACKGROUND == pref &&
+			    OP_RGB(0xAB, 0xCD, 0xEF) == newvalue)
+			{
+				m_colorok = TRUE;
+			}
+		}
+
+		virtual void PrefChanged(enum OpPrefsCollection::Collections id, int pref,
+		                         const OpStringC &newvalue)
+		{
+			++ m_fontcalls;
+			if (OpPrefsCollection::FontsAndColors == id &&
+			    OP_SYSTEM_FONT_DOCUMENT_NORMAL == pref &&
+				newvalue.Compare(m_expected_font) == 0
+			   )
+			{
+				m_fontok = TRUE;
+			}
+		}
+
+		inline BOOL ColorValid() { return m_colorok; }
+		inline BOOL FontValid()  { return m_fontok; }
+
+		inline void ResetColorCalls() { m_colorcalls = 0; }
+		inline void ResetFontCalls()  { m_fontcalls = 0; }
+
+		inline int ColorCalls() { return m_colorcalls; }
+		inline int FontCalls()  { return m_fontcalls; }
+
+		void SetExpectFont(FontAtt &font)
+		{
+			OpString serialized;
+			font.Serialize(&m_expected_font);
+		}
+
+	private:
+		BOOL m_colorok, m_fontok;
+		int m_colorcalls, m_fontcalls;
+		OpString m_expected_font;
+	};
+
+	class SelfTestDisplayListener *displaylistener = NULL;
+	class SelfTestFileListener *filelistener = NULL;
+	class SelfTestFontcolorListener *fontcolorlistener = NULL;
+}
+
+setup
+{
+	displaylistener = OP_NEW(SelfTestDisplayListener, ());
+#ifdef _LOCALHOST_SUPPORT_
+	filelistener = OP_NEW(SelfTestFileListener, ());
+#endif
+	fontcolorlistener = OP_NEW(SelfTestFontcolorListener, ());
+}
+
+// -- Tests --------------------------------------------------------------
+
+test("PrefsCollectionDisplay::RegisterListenerL()")
+{
+	TRAPD(rc, g_pcdisplay->RegisterListenerL(displaylistener));
+	verify_success(rc);
+}
+
+test("Testing PrefChanged for integer value")
+	require success "PrefsCollectionDisplay::RegisterListenerL()";
+{
+	int original_scale = g_pcdisplay->GetIntegerPref(PrefsCollectionDisplay::Scale);
+	displaylistener->ResetIntCalls();
+	displaylistener->SetExpectInt(original_scale == 100 ? 200 : 100);
+	TRAPD(rc, g_pcdisplay->WriteIntegerL(PrefsCollectionDisplay::Scale, original_scale == 100 ? 200 : 100));
+	verify_success(rc);
+	verify(displaylistener->IntValid());
+	verify(displaylistener->IntCalls() == 1);
+}
+finally
+{
+	g_pcdisplay->WriteIntegerL(PrefsCollectionDisplay::Scale, original_scale);
+}
+
+test("Testing PrefChanged for string value")
+	require success "PrefsCollectionDisplay::RegisterListenerL()";
+{
+	OpString original_encoding;
+	TRAPD(rc, g_pcdisplay->GetStringPrefL(PrefsCollectionDisplay::DefaultEncoding, original_encoding));
+	verify_success(rc);
+	displaylistener->ResetStrCalls();
+	const uni_char *s = original_encoding.Compare("windows-1252") ? UNI_L("windows-1252") : UNI_L("utf-8");
+	verify_success(displaylistener->SetExpectStr(s));
+
+	TRAP(rc, g_pcdisplay->WriteStringL(PrefsCollectionDisplay::DefaultEncoding, s));
+	verify_success(rc);
+	verify(displaylistener->StrValid());
+	verify(displaylistener->StrCalls() == 1);
+}
+finally
+{
+	g_pcdisplay->WriteStringL(PrefsCollectionDisplay::DefaultEncoding, original_encoding);
+}
+
+test("Repeated calls for integer value")
+{
+	// CORE-28020: Writing the current value should not cause broadcast.
+	int original_scale = g_pcdisplay->GetIntegerPref(PrefsCollectionDisplay::Scale);
+	displaylistener->ResetIntCalls();
+
+	TRAPD(rc, g_pcdisplay->WriteIntegerL(PrefsCollectionDisplay::Scale, original_scale));
+	verify_success(rc);
+	verify(displaylistener->IntCalls() == 0);
+
+	TRAP(rc, g_pcdisplay->WriteIntegerL(PrefsCollectionDisplay::Scale, original_scale));
+	verify_success(rc);
+	verify(displaylistener->IntCalls() == 0);
+}
+
+test("Repeated calls for string value")
+{
+	// CORE-28020: Writing the current value should not cause broadcast.
+	OpString original_encoding;
+	displaylistener->ResetStrCalls();
+	TRAPD(rc, g_pcdisplay->GetStringPrefL(PrefsCollectionDisplay::DefaultEncoding, original_encoding));
+	verify_success(rc);
+
+	TRAP(rc, g_pcdisplay->WriteStringL(PrefsCollectionDisplay::DefaultEncoding, original_encoding));
+	verify_success(rc);
+	verify(displaylistener->StrCalls() == 0);
+
+	TRAP(rc, g_pcdisplay->WriteStringL(PrefsCollectionDisplay::DefaultEncoding, original_encoding));
+	verify_success(rc);
+	verify(displaylistener->StrCalls() == 0);
+}
+
+test("PrefsCollectionFiles::RegisterFilesListenerL()")
+	require _LOCALHOST_SUPPORT_;
+{
+	TRAPD(rc, g_pcfiles->RegisterFilesListenerL(filelistener));
+	verify_success(rc);
+}
+
+test("Testing FileChangedL")
+	require success "PrefsCollectionFiles::RegisterFilesListenerL()";
+	require _LOCALHOST_SUPPORT_;
+{
+	OpFile f;
+	TRAPD(rc, g_pcfiles->GetFileL(PrefsCollectionFiles::BrowserCSSFile, f));
+	verify_success(rc);
+
+	OpFile new_file;
+#ifdef SYS_CAP_FILESYSTEM_HAS_DRIVES
+	const uni_char *filename = UNI_L("C:\\a.css");
+#else
+	const uni_char *filename = UNI_L("/a.css");
+#endif
+	new_file.Construct(filename);
+	filelistener->SetExpectFile(&new_file);
+	filelistener->ResetFileCalls();
+	TRAP(rc, g_pcfiles->WriteFilePrefL(PrefsCollectionFiles::BrowserCSSFile, &new_file));
+	verify_success(rc);
+	verify(filelistener->FileValid());
+	verify(filelistener->FileCalls() == 1);
+}
+finally
+{
+	filelistener->SetExpectFile(NULL);
+	TRAP(rc, g_pcfiles->WriteFilePrefL(PrefsCollectionFiles::BrowserCSSFile, &f));
+	OpStatus::Ignore(rc);
+}
+
+test("Repeated calls for file value")
+{
+	// CORE-28020: Writing the current value should not cause broadcast.
+	OpFile f;
+	TRAPD(rc, g_pcfiles->GetFileL(PrefsCollectionFiles::BrowserCSSFile, f));
+	verify_success(rc);
+
+	filelistener->ResetFileCalls();
+	TRAP(rc, g_pcfiles->WriteFilePrefL(PrefsCollectionFiles::BrowserCSSFile, &f));
+	verify_success(rc);
+	verify(filelistener->FileCalls() == 0);
+
+	TRAP(rc, g_pcfiles->WriteFilePrefL(PrefsCollectionFiles::BrowserCSSFile, &f));
+	verify_success(rc);
+	verify(filelistener->FileCalls() == 0);
+}
+
+test("PrefsCollectionFontsAndColors::RegisterListenerL()")
+{
+	TRAPD(rc, g_pcfontscolors->RegisterListenerL(fontcolorlistener));
+	verify_success(rc);
+}
+
+test("Testing PrefChanged for colour value")
+	require success "PrefsCollectionFontsAndColors::RegisterListenerL()";
+{
+	COLORREF original_color = g_pcfontscolors->GetColor(OP_SYSTEM_COLOR_DOCUMENT_BACKGROUND);
+	fontcolorlistener->ResetColorCalls();
+	TRAPD(rc, g_pcfontscolors->WriteColorL(OP_SYSTEM_COLOR_DOCUMENT_BACKGROUND, OP_RGB(0xAB, 0xCD, 0xEF)));
+	verify_success(rc);
+	verify(fontcolorlistener->ColorValid());
+	verify(fontcolorlistener->ColorCalls() == 1);
+}
+finally
+{
+	g_pcfontscolors->WriteColorL(OP_SYSTEM_COLOR_DOCUMENT_BACKGROUND, original_color);
+}
+
+test("Testing PrefChanged for font value")
+	require success "PrefsCollectionFontsAndColors::RegisterListenerL()";
+{
+	FontAtt normalfont, modifiedfont;
+	g_pcfontscolors->GetFont(OP_SYSTEM_FONT_DOCUMENT_NORMAL, normalfont);
+	modifiedfont = normalfont;
+	modifiedfont.SetItalic(!normalfont.GetItalic());
+	fontcolorlistener->SetExpectFont(modifiedfont);
+	fontcolorlistener->ResetFontCalls();
+	TRAPD(rc, g_pcfontscolors->WriteFontL(OP_SYSTEM_FONT_DOCUMENT_NORMAL, modifiedfont));
+	verify_success(rc);
+	verify(fontcolorlistener->FontValid());
+	verify(fontcolorlistener->FontCalls() == 1);
+}
+finally
+{
+	TRAP(rc, g_pcfontscolors->WriteFontL(OP_SYSTEM_FONT_DOCUMENT_NORMAL, normalfont));
+	OpStatus::Ignore(rc);
+}
+
+test("Repeated calls for color value")
+{
+	// CORE-28020: Writing the current value should not cause broadcast.
+	COLORREF original_color = g_pcfontscolors->GetColor(OP_SYSTEM_COLOR_DOCUMENT_BACKGROUND);
+	fontcolorlistener->ResetColorCalls();
+
+	TRAPD(rc, g_pcfontscolors->WriteColorL(OP_SYSTEM_COLOR_DOCUMENT_BACKGROUND, original_color));
+	verify_success(rc);
+	verify(fontcolorlistener->ColorCalls() == 0);
+
+	TRAP(rc, g_pcfontscolors->WriteColorL(OP_SYSTEM_COLOR_DOCUMENT_BACKGROUND, original_color));
+	verify_success(rc);
+	verify(fontcolorlistener->ColorCalls() == 0);
+}
+
+test("Repeated calls for font value")
+{
+	// CORE-28020: Writing the current value should not cause broadcast.
+	FontAtt normalfont;
+	g_pcfontscolors->GetFont(OP_SYSTEM_FONT_DOCUMENT_NORMAL, normalfont);
+	fontcolorlistener->ResetFontCalls();
+
+	TRAPD(rc, g_pcfontscolors->WriteFontL(OP_SYSTEM_FONT_DOCUMENT_NORMAL, normalfont));
+	verify_success(rc);
+	verify(fontcolorlistener->FontCalls() == 0);
+
+	TRAP(rc, g_pcfontscolors->WriteFontL(OP_SYSTEM_FONT_DOCUMENT_NORMAL, normalfont));
+	verify_success(rc);
+	verify(fontcolorlistener->FontCalls() == 0);
+}
+
+// -- Global cleanup -----------------------------------------------------
+
+exit
+{
+	g_pcdisplay->UnregisterListener(displaylistener);
+	OP_DELETE(displaylistener);
+
+#ifdef _LOCALHOST_SUPPORT_
+	g_pcfiles->UnregisterFilesListener(filelistener);
+	OP_DELETE(filelistener);
+#endif
+
+	g_pcfontscolors->UnregisterListener(fontcolorlistener);
+	OP_DELETE(fontcolorlistener);
+}

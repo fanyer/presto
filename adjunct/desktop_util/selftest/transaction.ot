@@ -1,0 +1,166 @@
+/* -*- Mode: c++; tab-width: 4; indent-tabs-mode: t; c-basic-offset: 4 -*-
+ *
+ * Copyright (C) 1995-2010 Opera Software AS.  All rights reserved.
+ *
+ * This file is part of the Opera web browser.	It may not be distributed
+ * under any circumstances.
+ *
+ * @author Wojciech Dzierzanowski (wdzierzanowski)
+ */
+
+group "desktop_util.transaction";
+
+include "adjunct/desktop_util/transactions/OpUndoableOperation.h";
+include "adjunct/desktop_util/transactions/OpTransaction.h";
+include "modules/util/OpHashTable.h";
+
+global
+{
+	typedef OpIntegerHashTable OperationTrace;
+
+	template <OP_STATUS t_result>
+	class TraceableOperation : public OpUndoableOperation
+	{
+	public:
+		explicit TraceableOperation(INT32 id) : m_id(id), m_trace(NULL)  {}
+		TraceableOperation(INT32 id, OperationTrace& trace)
+				: m_id(id), m_trace(&trace)
+		{}
+
+		virtual OP_STATUS Do()
+		{
+			if (OpStatus::IsSuccess(t_result) && NULL != m_trace)
+			{
+				RETURN_IF_ERROR(m_trace->Add(m_id));
+			}
+			return t_result;
+		}
+		virtual void Undo()
+		{
+			if (NULL != m_trace)
+			{
+				OpStatus::Ignore(m_trace->Remove(m_id));
+			}
+		}
+
+		const INT32 m_id;
+
+	private:
+		OperationTrace* m_trace;
+	};
+
+	typedef TraceableOperation<OpStatus::OK> OkOperation;
+	typedef TraceableOperation<OpStatus::ERR> NokOperation;
+}
+
+
+test("Roll-back on going out of scope before Commit()")
+{
+	OperationTrace trace;
+	{
+		OpTransaction tx;
+		verify_success(tx.Continue(OpAutoPtr<OpUndoableOperation>(
+					OP_NEW(OkOperation, (0, trace)))));
+		verify_success(tx.Continue(OpAutoPtr<OpUndoableOperation>(
+					OP_NEW(OkOperation, (1, trace)))));
+		verify(trace.GetCount() == 2);
+	}
+
+	verify(trace.GetCount() == 0);
+}
+
+test("Successful Commit() makes the operations stay executed")
+{
+	OperationTrace trace;
+	{
+		OpTransaction tx;
+		verify_success(tx.Continue(OpAutoPtr<OpUndoableOperation>(
+					OP_NEW(OkOperation, (0, trace)))));
+		verify_success(tx.Continue(OpAutoPtr<OpUndoableOperation>(
+					OP_NEW(OkOperation, (1, trace)))));
+		verify_success(tx.Continue(OpAutoPtr<OpUndoableOperation>(
+					OP_NEW(OkOperation, (2, trace)))));
+		verify(trace.GetCount() == 3);
+		verify_success(tx.Commit());
+		verify(trace.GetCount() == 3);
+		verify_success(tx.Commit());
+	}
+
+	verify(trace.GetCount() == 3);
+}
+
+test("Impossible to Continue() with a NULL operation")
+{
+	OperationTrace trace;
+	OpTransaction tx;
+	verify_success(tx.Continue(OpAutoPtr<OpUndoableOperation>(
+				OP_NEW(OkOperation, (0, trace)))));
+	verify(trace.GetCount() == 1);
+	verify(OpStatus::IsError(tx.Continue(OpAutoPtr<OpUndoableOperation>())));
+	verify(trace.GetCount() == 1);
+}
+
+test("Impossible to Continue() after error")
+{
+	OperationTrace trace;
+	OpTransaction tx;
+	verify_success(tx.Continue(OpAutoPtr<OpUndoableOperation>(
+				OP_NEW(OkOperation, (0, trace)))));
+	verify(trace.GetCount() == 1);
+	verify_status(OpStatus::ERR, tx.Continue(OpAutoPtr<OpUndoableOperation>(
+				OP_NEW(NokOperation, (1, trace)))));
+	verify(trace.GetCount() == 1);
+	verify_status(OpStatus::ERR, tx.Continue(OpAutoPtr<OpUndoableOperation>(
+				OP_NEW(OkOperation, (2, trace)))));
+	verify(trace.GetCount() == 1);
+}
+
+test("Impossible to Continue() after commit")
+{
+	OperationTrace trace;
+	{
+		OpTransaction tx;
+		verify_success(tx.Continue(OpAutoPtr<OpUndoableOperation>(
+					OP_NEW(OkOperation, (0, trace)))));
+		verify(trace.GetCount() == 1);
+		verify_success(tx.Commit());
+		verify_status(OpStatus::ERR, tx.Continue(OpAutoPtr<OpUndoableOperation>(
+					OP_NEW(OkOperation, (1, trace)))));
+	}
+	verify(trace.GetCount() == 1);
+}
+
+test("Impossible to Commit() after error")
+{
+	OperationTrace trace;
+	{
+		OpTransaction tx;
+		verify_success(tx.Continue(OpAutoPtr<OpUndoableOperation>(
+					OP_NEW(OkOperation, (0, trace)))));
+		verify(trace.GetCount() == 1);
+		verify_status(OpStatus::ERR, tx.Continue(OpAutoPtr<OpUndoableOperation>(
+					OP_NEW(NokOperation, (1, trace)))));
+		verify(trace.GetCount() == 1);
+		verify_status(OpStatus::ERR, tx.Commit());
+	}
+
+	verify(trace.GetCount() == 0);
+}
+
+test("And committing twice doesn't help")
+{
+	OperationTrace trace;
+	{
+		OpTransaction tx;
+		verify_success(tx.Continue(OpAutoPtr<OpUndoableOperation>(
+					OP_NEW(OkOperation, (0, trace)))));
+		verify(trace.GetCount() == 1);
+		verify_status(OpStatus::ERR, tx.Continue(OpAutoPtr<OpUndoableOperation>(
+					OP_NEW(NokOperation, (1, trace)))));
+		verify(trace.GetCount() == 1);
+		verify_status(OpStatus::ERR, tx.Commit());
+		verify_status(OpStatus::ERR, tx.Commit());
+	}
+
+	verify(trace.GetCount() == 0);
+}

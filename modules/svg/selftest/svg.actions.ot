@@ -1,0 +1,268 @@
+// -*- Mode: c++; tab-width: 4; indent-tabs-mode: t; c-basic-offset: 4 -*-
+group "svg.actions";
+require init;
+require SVG_SUPPORT;
+
+language c++;
+
+include "modules/svg/SVGManager.h";
+include "modules/svg/svg_image.h";
+include "modules/svg/src/SVGImageImpl.h";
+include "modules/svg/src/SVGTextSelection.h";
+include "modules/svg/src/SVGDocumentContext.h";
+include "modules/pi/OpClipboard.h";
+include "modules/inputmanager/inputaction.h";
+include "modules/inputmanager/inputmanager.h";
+include "modules/doc/frm_doc.h";
+include "modules/dragdrop/clipboard_manager.h";
+
+global
+{
+	OP_STATUS do_input_action(const uni_char* action_str, HTML_Element* elm, FramesDocument* doc)
+	{
+		OpInputAction* input_action = NULL;
+		RETURN_IF_ERROR(OpInputAction::CreateInputActionsFromString(action_str, input_action));
+		/*BOOL handled = */
+			g_svg_manager->OnInputAction(input_action, elm, doc);
+		OP_DELETE(input_action);
+		return OpStatus::OK;
+	}
+
+#ifdef USE_OP_CLIPBOARD
+	class TestClipboardListener : public ClipboardListener
+	{
+	public:
+		BOOL clipboard_working;
+		const uni_char* clipboard_text;
+		TestClipboardListener() : clipboard_working(FALSE), clipboard_text(NULL) {}
+		void OnCopy(OpClipboard* clipboard)
+		{
+			clipboard->PlaceText(clipboard_text);
+		}
+
+		void OnCut(OpClipboard* clipboard) {}
+		void OnPaste(OpClipboard* clipboard)
+		{
+			OpString text;
+			clipboard->GetText(text);
+			clipboard_working = (text.Compare(clipboard_text) == 0);
+		}
+	};
+
+	TestClipboardListener test_clipboard_listener;
+#endif // USE_OP_CLIPBOARD
+}
+
+xml {
+//! <?xml version="1.0" encoding="UTF-8"?>
+//! <svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" viewBox="0 0 480 360" id="svgroot">
+//!    <circle id="c" cx="20" cy="20" r="10" fill="blue"/>
+//!	   <text id="t" y="100" x="10">For testing selection actions</text>
+//! </svg>
+}
+
+test("Test clipboard action")
+	require ACTION_COPY_IMAGE_ENABLED;
+{
+	HTML_Element* root = find_element("svg", 1);
+	verify(OpStatus::IsSuccess(do_input_action(UNI_L("Copy image"), root, state.doc)));	
+}
+
+test("Test SVG zoom in action")
+	require ACTION_SVG_ZOOM_IN_ENABLED;
+{
+	HTML_Element* root = find_element("svg", 1);
+	SVGImageImpl* image = static_cast<SVGImageImpl*>(g_svg_manager->GetSVGImage(state.doc->GetLogicalDocument(), root));
+	verify(image);
+	SVGDocumentContext* doc_ctx = image->GetSVGDocumentContext();
+	verify(doc_ctx);
+	Window* win = state.doc->GetWindow();
+	verify(win);
+	win->SetScale(100);
+	verify(OpStatus::IsSuccess(do_input_action(UNI_L("SVG zoom in, 10"), root, state.doc)));
+	verify(SVGNumber(1).Close(doc_ctx->GetCurrentScale()));
+	verify(110 == win->GetScale());
+}
+
+test("Test SVG zoom out action")
+	require ACTION_SVG_ZOOM_OUT_ENABLED;
+{
+	HTML_Element* root = find_element("svg", 1);
+	SVGImageImpl* image = static_cast<SVGImageImpl*>(g_svg_manager->GetSVGImage(state.doc->GetLogicalDocument(), root));
+	verify(image);
+	SVGDocumentContext* doc_ctx = image->GetSVGDocumentContext();
+	verify(doc_ctx);
+	Window* win = state.doc->GetWindow();
+	verify(win);
+	win->SetScale(100);
+	SVGNumber old_scale = doc_ctx->GetCurrentScale();
+	verify(OpStatus::IsSuccess(do_input_action(UNI_L("SVG zoom out, 10"), root, state.doc)));
+	verify((old_scale / SVGNumber(1)).Close(doc_ctx->GetCurrentScale()));
+	verify(90 == win->GetScale());
+}
+
+test("Test SVG zoom action")
+	require ACTION_SVG_ZOOM_ENABLED;
+{
+	HTML_Element* root = find_element("svg", 1);
+	SVGImageImpl* image = static_cast<SVGImageImpl*>(g_svg_manager->GetSVGImage(state.doc->GetLogicalDocument(), root));
+	verify(image);
+	SVGDocumentContext* doc_ctx = image->GetSVGDocumentContext();
+	verify(doc_ctx);
+	VisualDevice* visdev = doc_ctx->GetVisualDevice();
+	verify(visdev);
+	verify(OpStatus::IsSuccess(do_input_action(UNI_L("SVG zoom, 300"), root, state.doc)));
+	verify(SVGNumber(1).Close(doc_ctx->GetCurrentScale()));
+	verify(300 == visdev->GetScale());
+}
+
+test("Setup selection")
+	language ecmascript;
+	require SVG_SUPPORT_TEXTSELECTION;
+	require SVG_FULL_11;
+{
+	document.getElementById("t").selectSubString(2,5);
+}
+
+test("Check if g_op_clipboard works")
+	require USE_OP_CLIPBOARD;
+	require ACTION_COPY_ENABLED;
+	require SVG_SUPPORT_TEXTSELECTION;
+	require success "Setup selection";
+{
+	if(g_clipboard_manager)
+	{
+		test_clipboard_listener.clipboard_text = UNI_L("foo");
+		g_clipboard_manager->Copy(&test_clipboard_listener);
+		g_clipboard_manager->Paste(&test_clipboard_listener);
+	}
+}
+
+test("Test Copy action")
+	require USE_OP_CLIPBOARD;
+	require ACTION_COPY_ENABLED;
+	require SVG_SUPPORT_TEXTSELECTION;
+	require success "Check if g_op_clipboard works";
+{
+	if(test_clipboard_listener.clipboard_working)
+	{
+		test_clipboard_listener.clipboard_working = FALSE;
+		test_clipboard_listener.clipboard_text = UNI_L("r tes");
+		HTML_Element* root = find_element("svg", 1);
+		verify(OpStatus::IsSuccess(do_input_action(UNI_L("Copy"), root, state.doc)));
+		verify(g_clipboard_manager->HasText());
+		g_clipboard_manager->Paste(&test_clipboard_listener);
+		verify(test_clipboard_listener.clipboard_working);
+	}
+	else
+	{
+		output("Test skipped because clipboard isn't working. ");
+	}
+}
+
+test("Test Deselect all action")
+	require ACTION_DESELECT_ALL_ENABLED;
+	require SVG_SUPPORT_TEXTSELECTION;
+	require success "Setup selection";
+{
+	HTML_Element* root = find_element("svg", 1);
+	SVGImageImpl* image = static_cast<SVGImageImpl*>(g_svg_manager->GetSVGImage(state.doc->GetLogicalDocument(), root));
+	verify(image);
+	SVGDocumentContext* doc_ctx = image->GetSVGDocumentContext();
+	verify(doc_ctx);
+	verify(!doc_ctx->GetTextSelection().IsEmpty());
+	verify(OpStatus::IsSuccess(do_input_action(UNI_L("Deselect all"), root, state.doc)));
+	verify(doc_ctx->GetTextSelection().IsEmpty());
+}
+
+xml {
+//! <?xml version="1.0" encoding="UTF-8"?>
+//! <html xmlns="http://www.w3.org/1999/xhtml"><head><title>test</title></head><body>
+//!   <svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" viewBox="0 0 480 360" id="svgroot">
+//!      <circle id="c" cx="20" cy="20" r="10" fill="blue"/>
+//!	     <text id="t" y="100" x="10">For testing selection actions</text>
+//!   </svg>
+//!   <p>hello html</p>
+//!   <svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" viewBox="0 0 480 360" id="svgroot">
+//!      <circle id="c" cx="20" cy="20" r="10" fill="blue"/>
+//!	     <text id="t" y="100" x="10">For testing selection actions</text>
+//!   </svg>
+//! </body></html>
+}
+
+test("Test SVG zoom in action inline")
+	require ACTION_SVG_ZOOM_IN_ENABLED;
+{
+	HTML_Element* root = find_element("svg", 1);
+	verify(OpStatus::IsSuccess(do_input_action(UNI_L("SVG zoom in, 10"), root, state.doc)));
+	SVGImageImpl* image = static_cast<SVGImageImpl*>(g_svg_manager->GetSVGImage(state.doc->GetLogicalDocument(), root));
+	verify(image);
+	SVGDocumentContext* doc_ctx = image->GetSVGDocumentContext();
+	verify(doc_ctx);
+	verify(SVGNumber(1.1).Close(doc_ctx->GetCurrentScale()));
+
+	HTML_Element* root2 = find_element("svg", 2);
+	verify(OpStatus::IsSuccess(do_input_action(UNI_L("SVG zoom in, 20"), root2, state.doc)));
+	SVGImageImpl* image2 = static_cast<SVGImageImpl*>(g_svg_manager->GetSVGImage(state.doc->GetLogicalDocument(), root2));
+	verify(image2);
+	SVGDocumentContext* doc_ctx2 = image2->GetSVGDocumentContext();
+	verify(doc_ctx2);
+	verify(SVGNumber(1.2).Close(doc_ctx2->GetCurrentScale()));
+
+  // check to see the other one didn't change
+	verify(SVGNumber(1.1).Close(doc_ctx->GetCurrentScale()));
+}
+
+test("Test SVG zoom out action inline")
+	require ACTION_SVG_ZOOM_OUT_ENABLED;
+{
+	HTML_Element* root = find_element("svg", 1);
+	SVGImageImpl* image = static_cast<SVGImageImpl*>(g_svg_manager->GetSVGImage(state.doc->GetLogicalDocument(), root));
+	verify(image);
+	SVGDocumentContext* doc_ctx = image->GetSVGDocumentContext();
+	verify(doc_ctx);
+	SVGNumber old_scale = doc_ctx->GetCurrentScale();
+	verify(OpStatus::IsSuccess(do_input_action(UNI_L("SVG zoom out, 10"), root, state.doc)));
+	verify((old_scale / SVGNumber(1.1)).Close(doc_ctx->GetCurrentScale()));
+
+	HTML_Element* root2 = find_element("svg", 2);
+	SVGImageImpl* image2 = static_cast<SVGImageImpl*>(g_svg_manager->GetSVGImage(state.doc->GetLogicalDocument(), root2));
+	verify(image2);
+	SVGDocumentContext* doc_ctx2 = image2->GetSVGDocumentContext();
+	verify(doc_ctx2);
+	SVGNumber old_scale2 = doc_ctx2->GetCurrentScale();
+	verify(OpStatus::IsSuccess(do_input_action(UNI_L("SVG zoom out, 20"), root2, state.doc)));
+	verify((old_scale2 / SVGNumber(1.2)).Close(doc_ctx2->GetCurrentScale()));
+
+	// check to see the other one didn't change
+	verify((old_scale / SVGNumber(1.1)).Close(doc_ctx->GetCurrentScale()));
+}
+
+test("Test SVG zoom action inline")
+	require ACTION_SVG_ZOOM_ENABLED;
+{
+	HTML_Element* root = find_element("svg", 1);
+	SVGImageImpl* image = static_cast<SVGImageImpl*>(g_svg_manager->GetSVGImage(state.doc->GetLogicalDocument(), root));
+	verify(image);
+	SVGDocumentContext* doc_ctx = image->GetSVGDocumentContext();
+	verify(doc_ctx);
+	verify(OpStatus::IsSuccess(do_input_action(UNI_L("SVG zoom, 300"), root, state.doc)));
+	verify(SVGNumber(3).Close(doc_ctx->GetCurrentScale()));
+
+	HTML_Element* root2 = find_element("svg", 2);
+	SVGImageImpl* image2 = static_cast<SVGImageImpl*>(g_svg_manager->GetSVGImage(state.doc->GetLogicalDocument(), root2));
+	verify(image2);
+	SVGDocumentContext* doc_ctx2 = image2->GetSVGDocumentContext();
+	verify(doc_ctx2);
+	verify(OpStatus::IsSuccess(do_input_action(UNI_L("SVG zoom, 200"), root2, state.doc)));
+	verify(SVGNumber(2).Close(doc_ctx2->GetCurrentScale()));
+
+	// check to see the other one didn't change
+	verify(SVGNumber(3).Close(doc_ctx->GetCurrentScale()));
+}
+
+exit
+{
+  // make sure other tests don't get side-effects
+	state.doc->GetVisualDevice()->SetScale(100);
+}
