@@ -12,4 +12,5 @@ This repository contains the Presto rendering engine, used up to Opera 12.
 2. place curl sources to `modules`
 3. `./flower -v --without-kde4`
 
-you may need build plugin-wrapper manually on 64-bit systems, see `flower` output with `-j1` for additional info
+On 64-bit systems, you may need build plugin-wrapper manually.
+See `flower` output with `-j1` for additional info
