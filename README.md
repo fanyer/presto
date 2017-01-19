@@ -22,6 +22,7 @@ Torrent in i2p (setup i2p-router and use i2psnark)
 ```
 magnet:?xt=urn:btih:664901345132aa13322bf4eb5a03192dc4a16b40&tr=http://5m3pd32zx43xk3uz6hvrdksj6tlg7abnjsc3j5kkd2yzctet4nmq.b32.i2p/announce
 ```
+Please, support this torrent by seeding it, even if you already obtained source in different place
 
 ## discussions
 
