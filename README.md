@@ -24,6 +24,8 @@ magnet:?xt=urn:btih:664901345132aa13322bf4eb5a03192dc4a16b40&tr=http://5m3pd32zx
 ```
 Please, support this torrent by seeding it, even if you already obtained source in different place
 
+https://notabug.org/141243/presto - mirror of old version of this repo - found on ycombinator 
+
 ## discussions
 
 * https://geektimes.ru/post/284588/ (ru) (many useful tips)
