@@ -4,6 +4,7 @@
 ## build
 
 apply patches for your os and use 
+
 * `./flower -v -j 1` - on *nix systems 
 * visual studio and sln file in `platforms` on M$ OS
 
