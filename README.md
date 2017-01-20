@@ -30,4 +30,5 @@ https://notabug.org/141243/presto - mirror of old version of this repo - found o
 
 * https://geektimes.ru/post/284588/ (ru) (many useful tips)
 * https://boards.4chan.org/g/thread/58469437/well (en)
+* https://boards.4chan.org/g/thread/58567400 (new thread)
 * https://www.reddit.com/r/operabrowser/comments/5nk69m/presto_engine_source_code_available_on_github/ (en) (many build tips translated from geektimes)
